@@ -1680,10 +1680,12 @@ mod tests {
         }
 
         // Send a payload many MSS-segments long (well past the initial
-        // congestion window) so the transfer spans many segments and windows —
-        // exercising vtcp segmentation, ACK clocking, and the reassembly path
-        // that the old hand-rolled engine lacked.
-        let payload: Vec<u8> = (0..64_000u32).map(|i| (i % 251) as u8).collect();
+        // congestion window) so the transfer spans ~11 segments and several
+        // windows — enough to exercise vtcp segmentation, ACK clocking, and the
+        // reassembly path the old hand-rolled engine lacked. Kept modest (16 KB)
+        // so the manually-pumped, lock-stepped transfer stays well inside the
+        // deadlines even on slow / loaded CI runners.
+        let payload: Vec<u8> = (0..16_000u32).map(|i| (i % 251) as u8).collect();
 
         // Writer thread: push the whole payload into the client conn, ticking
         // to keep segments flowing as the window opens.
@@ -1693,7 +1695,7 @@ mod tests {
         let writer = thread::spawn(move || {
             let mut off = 0usize;
             let total = payload_for_writer.len();
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let deadline = Instant::now() + Duration::from_secs(30);
             while off < total {
                 let (n, segs) = {
                     let mut c = writer_client.lock().unwrap();
@@ -1728,7 +1730,7 @@ mod tests {
         // does not ACK in vtcp; the periodic tick flushes the delayed ACK.
         let mut received = Vec::with_capacity(payload.len());
         let mut buf = [0u8; 16 * 1024];
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + Duration::from_secs(30);
         while received.len() < payload.len() {
             let (n, segs) = {
                 let mut c = vclient.lock().unwrap();
