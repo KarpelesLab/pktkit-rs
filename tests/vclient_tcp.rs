@@ -119,3 +119,88 @@ fn dial_handshake_and_bidirectional_data() {
     let got = String::from_utf8_lossy(&buf[..n]);
     assert!(got.contains("200 OK"), "got: {got:?}");
 }
+
+const PEER_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 9);
+const PEER_PORT: u16 = 50000;
+const LISTEN_PORT: u16 = 8080;
+
+#[test]
+fn listen_accept_and_bidirectional_data() {
+    // The vclient `Client` is the *server*: it listens. A remote `vtcp::Conn`
+    // acts as the connecting client ("peer").
+    let client = pktkit::vclient::Client::new(pktkit::vclient::ClientConfig {
+        prefix: Some(IpPrefix::new(IpAddr::V4(CLIENT_IP), 24)),
+        dns: vec![],
+    });
+
+    let peer = Arc::new(Mutex::new(Conn::new(ConnConfig {
+        local_port: PEER_PORT,
+        remote_port: LISTEN_PORT,
+        local_addr: Some(SocketAddr::new(IpAddr::V4(PEER_IP), PEER_PORT)),
+        remote_addr: Some(SocketAddr::new(IpAddr::V4(CLIENT_IP), LISTEN_PORT)),
+        mss: 1460,
+        ..Default::default()
+    })));
+
+    // Client's outbound packets (server side) are delivered to the peer, and
+    // the peer's responses wrapped back into the client.
+    let client_for_handler = client.clone();
+    let peer_for_handler = peer.clone();
+    client.set_handler(Arc::new(move |pkt: &Packet| {
+        let seg = Segment::parse(pkt.payload()).expect("valid segment");
+        let resp = peer_for_handler.lock().unwrap().handle_segment(&seg);
+        for s in resp {
+            let ip = wrap(PEER_IP, CLIENT_IP, &s);
+            let _ = client_for_handler.send(Packet::from_slice(&ip));
+        }
+        Ok(())
+    }));
+
+    let listener = client.listen_tcp(LISTEN_PORT).unwrap();
+    assert_eq!(
+        listener.local_addr(),
+        SocketAddr::new(IpAddr::V4(CLIENT_IP), LISTEN_PORT)
+    );
+
+    // Drive the handshake: peer SYN → client accepts → SYN-ACK → peer ACK.
+    // This whole exchange runs synchronously through the handler.
+    let syns = peer.lock().unwrap().connect();
+    for s in syns {
+        let ip = wrap(PEER_IP, CLIENT_IP, &s);
+        client.send(Packet::from_slice(&ip)).unwrap();
+    }
+
+    // accept() blocks until the accept-waiter enqueues the established conn.
+    let mut accepted = listener.accept().expect("accept");
+    assert_eq!(
+        accepted.peer_addr(),
+        SocketAddr::new(IpAddr::V4(PEER_IP), PEER_PORT)
+    );
+
+    // Peer → server.
+    {
+        let (_n, segs) = peer.lock().unwrap().write(b"ping from peer");
+        for s in segs {
+            let ip = wrap(PEER_IP, CLIENT_IP, &s);
+            client.send(Packet::from_slice(&ip)).unwrap();
+        }
+    }
+    accepted.set_read_timeout(Some(Duration::from_secs(2)));
+    let mut buf = [0u8; 64];
+    let n = accepted.read(&mut buf).unwrap();
+    assert_eq!(&buf[..n], b"ping from peer");
+
+    // Server → peer (writing auto-delivers to the peer via the handler).
+    accepted.write_all(b"pong from server").unwrap();
+    let mut got = Vec::new();
+    for _ in 0..50 {
+        let mut b = [0u8; 64];
+        let r = peer.lock().unwrap().read(&mut b);
+        if r > 0 {
+            got.extend_from_slice(&b[..r]);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(&got, b"pong from server");
+}

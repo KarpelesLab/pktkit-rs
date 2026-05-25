@@ -67,6 +67,14 @@ impl Client {
         })
     }
 
+    /// Listen for inbound virtual TCP connections on `port` (bound to the
+    /// client's own address). [`Listener::accept`](super::Listener::accept)
+    /// yields each connection once its handshake completes.
+    pub fn listen_tcp(&self, port: u16) -> Result<super::Listener> {
+        let local_ip = self.addr().addr();
+        self.tcp.listen(local_ip, port)
+    }
+
     /// Open a connected UDP socket to `addr` over the virtual network.
     pub fn dial_udp(&self, addr: SocketAddr) -> Result<UdpConn> {
         let prefix = self.addr();

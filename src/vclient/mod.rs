@@ -6,6 +6,8 @@
 //!
 //! - [`Client::dial_tcp`] → a blocking [`TcpConn`] (`std::io::Read` + `Write`),
 //!   driven by a per-client TCP engine with a tick thread.
+//! - [`Client::listen_tcp`] → a [`Listener`] whose [`accept`](Listener::accept)
+//!   yields inbound [`TcpConn`]s (server side).
 //! - [`Client::dial_udp`] → a connected [`UdpConn`] over the virtual network.
 //! - [`Resolver`]: an RFC 1035 DNS resolver (A / AAAA), and [`Client::resolve`].
 //! - A hand-rolled HTTP/1.1 client ([`Request`] / [`Response`],
@@ -20,5 +22,5 @@ mod udp;
 pub use client::{Client, ClientConfig};
 pub use dns::{RecordType, Resolver, ResolverConfig};
 pub use http::{Request, Response};
-pub use tcp::TcpConn;
+pub use tcp::{Listener, TcpConn};
 pub use udp::UdpConn;

@@ -8,11 +8,13 @@
 //! client's L3 handler. A single tick thread per client drives RTO / keepalive
 //! timers for every connection.
 
+use crate::vtcp::segment::flags;
 use crate::vtcp::{segment::Segment, Conn, ConnConfig, State};
 use crate::{checksum, IpPrefix, Packet, Protocol};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -180,9 +182,77 @@ impl Drop for TcpConn {
     }
 }
 
+/// Shared state for a listening socket: an accept queue fed by the stack's
+/// inbound dispatcher when a SYN completes its handshake.
+pub(crate) struct ListenerState {
+    local_ip: IpAddr,
+    local_port: u16,
+    queue: Mutex<VecDeque<TcpConn>>,
+    signal: Condvar,
+    closed: AtomicBool,
+}
+
+const ACCEPT_QUEUE_CAP: usize = 128;
+
+/// A virtual TCP listener. [`accept`](Self::accept) blocks until an inbound
+/// connection completes its handshake.
+pub struct Listener {
+    state: Arc<ListenerState>,
+    stack: std::sync::Weak<TcpStack>,
+}
+
+impl core::fmt::Debug for Listener {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("vclient::Listener")
+            .field("local", &self.local_addr())
+            .finish()
+    }
+}
+
+impl Listener {
+    /// The address this listener is bound to.
+    pub fn local_addr(&self) -> SocketAddr {
+        SocketAddr::new(self.state.local_ip, self.state.local_port)
+    }
+
+    /// Block until an inbound connection completes its handshake and return it.
+    pub fn accept(&self) -> io::Result<TcpConn> {
+        let mut q = self.state.queue.lock().unwrap();
+        loop {
+            if let Some(conn) = q.pop_front() {
+                return Ok(conn);
+            }
+            if self.state.closed.load(Ordering::Acquire) {
+                return Err(io::Error::other("listener closed"));
+            }
+            q = self.state.signal.wait(q).unwrap();
+        }
+    }
+
+    /// Stop listening. Pending unaccepted connections are dropped.
+    pub fn close(&self) {
+        self.state.closed.store(true, Ordering::Release);
+        self.state.signal.notify_all();
+        if let Some(stack) = self.stack.upgrade() {
+            stack
+                .listeners
+                .lock()
+                .unwrap()
+                .remove(&self.state.local_port);
+        }
+    }
+}
+
+impl Drop for Listener {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
 /// TCP connection table + tick thread owned by a [`Client`](super::Client).
 pub(crate) struct TcpStack {
     conns: Mutex<HashMap<ConnKey, Arc<ConnState>>>,
+    listeners: Mutex<HashMap<u16, Arc<ListenerState>>>,
     sink: Arc<dyn Fn(&[u8]) + Send + Sync>,
     next_port: Mutex<u16>,
     stop: Arc<Mutex<bool>>,
@@ -192,6 +262,7 @@ impl TcpStack {
     pub fn new(sink: Arc<dyn Fn(&[u8]) + Send + Sync>) -> Arc<TcpStack> {
         let stack = Arc::new(TcpStack {
             conns: Mutex::new(HashMap::new()),
+            listeners: Mutex::new(HashMap::new()),
             sink,
             next_port: Mutex::new(49152),
             stop: Arc::new(Mutex::new(false)),
@@ -306,9 +377,34 @@ impl TcpStack {
         }
     }
 
-    /// Demultiplex an inbound TCP packet to the matching connection.
+    /// Register a listening socket on `local_ip:port`. Returns a [`Listener`]
+    /// whose `accept` yields completed inbound connections.
+    pub fn listen(self: &Arc<Self>, local_ip: IpAddr, port: u16) -> io::Result<Listener> {
+        let mut listeners = self.listeners.lock().unwrap();
+        if listeners.contains_key(&port) {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "port already has a listener",
+            ));
+        }
+        let state = Arc::new(ListenerState {
+            local_ip,
+            local_port: port,
+            queue: Mutex::new(VecDeque::new()),
+            signal: Condvar::new(),
+            closed: AtomicBool::new(false),
+        });
+        listeners.insert(port, state.clone());
+        Ok(Listener {
+            state,
+            stack: Arc::downgrade(self),
+        })
+    }
+
+    /// Demultiplex an inbound TCP packet to the matching connection, or accept
+    /// it against a registered listener if it's an opening SYN.
     /// Returns `true` if the packet was consumed.
-    pub fn handle_inbound(&self, pkt: &Packet) -> bool {
+    pub fn handle_inbound(self: &Arc<Self>, pkt: &Packet) -> bool {
         if pkt.ip_protocol() != Protocol::TCP {
             return false;
         }
@@ -327,18 +423,97 @@ impl TcpStack {
             remote: src,
             remote_port: seg.src_port,
         };
-        let state = match self.conns.lock().unwrap().get(&key) {
-            Some(s) => s.clone(),
-            None => return false,
+
+        // Existing connection (dialed or previously accepted)?
+        let existing = self.conns.lock().unwrap().get(&key).cloned();
+        if let Some(state) = existing {
+            let segs = {
+                let mut conn = state.conn.lock().unwrap();
+                conn.handle_segment(&seg)
+            };
+            state.wrap_and_send(segs);
+            state.signal.notify_all();
+            return true;
+        }
+
+        // No connection yet: a bare SYN to a registered listener opens one.
+        if seg.has_flag(flags::SYN) && !seg.has_flag(flags::ACK) {
+            let listener = self.listeners.lock().unwrap().get(&seg.dst_port).cloned();
+            if let Some(listener) = listener {
+                self.accept_syn(listener, dst, src, &seg);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Passively open a connection for an inbound SYN, send the SYN-ACK, and
+    /// spawn a waiter that enqueues the [`TcpConn`] to the listener once the
+    /// handshake reaches ESTABLISHED.
+    fn accept_syn(
+        self: &Arc<Self>,
+        listener: Arc<ListenerState>,
+        local_ip: IpAddr,
+        remote: IpAddr,
+        syn: &Segment,
+    ) {
+        let mss = if remote.is_ipv6() { 1440 } else { 1460 };
+        let cfg = ConnConfig {
+            local_addr: Some(SocketAddr::new(local_ip, syn.dst_port)),
+            remote_addr: Some(SocketAddr::new(remote, syn.src_port)),
+            local_port: syn.dst_port,
+            remote_port: syn.src_port,
+            mss,
+            keepalive: true,
+            ..Default::default()
         };
-        let _ = dst; // local addr is implied by the connection
-        let segs = {
-            let mut conn = state.conn.lock().unwrap();
-            conn.handle_segment(&seg)
+        let key = ConnKey {
+            local_port: syn.dst_port,
+            remote,
+            remote_port: syn.src_port,
         };
-        state.wrap_and_send(segs);
-        state.signal.notify_all();
-        true
+        let mut conn = Conn::new(cfg);
+        let synack = conn.accept_syn(syn);
+        let state = Arc::new(ConnState {
+            key,
+            local_ip,
+            conn: Mutex::new(conn),
+            signal: Condvar::new(),
+            sink: self.sink.clone(),
+        });
+        self.conns.lock().unwrap().insert(key, state.clone());
+        state.wrap_and_send(synack);
+
+        // Wait for ESTABLISHED off the dispatch path, then enqueue.
+        let waiter_state = state.clone();
+        let stop = self.stop.clone();
+        std::thread::spawn(move || {
+            let mut conn = waiter_state.conn.lock().unwrap();
+            loop {
+                match conn.state() {
+                    State::Established => break,
+                    State::Closed => return,
+                    _ => {}
+                }
+                if *stop.lock().unwrap() {
+                    return;
+                }
+                let (c, _) = waiter_state
+                    .signal
+                    .wait_timeout(conn, Duration::from_millis(200))
+                    .unwrap();
+                conn = c;
+            }
+            drop(conn);
+            if listener.closed.load(Ordering::Acquire) {
+                return;
+            }
+            let mut q = listener.queue.lock().unwrap();
+            if q.len() < ACCEPT_QUEUE_CAP {
+                q.push_back(TcpConn::new(waiter_state));
+                listener.signal.notify_one();
+            }
+        });
     }
 
     pub fn shutdown(&self) {
