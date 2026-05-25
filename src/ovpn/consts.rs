@@ -1,4 +1,9 @@
 //! Wire constants for OpenVPN.
+//!
+//! Several of these are not yet referenced because the control/data channel
+//! is still a work in progress; allow dead_code until the state machine that
+//! consumes them lands.
+#![allow(dead_code)]
 
 use core::fmt;
 
