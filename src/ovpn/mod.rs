@@ -1,28 +1,48 @@
-//! OpenVPN server (work in progress).
+//! OpenVPN server.
 //!
-//! This module ports the Go `ovpn` subpackage. The shape is in place —
-//! [`Options`] parses and renders the OpenVPN options string, and the wire
-//! types and constants are mirrored from the Go upstream — but the full
-//! TLS-control + AES-CBC/GCM data-channel implementation is not yet
-//! complete in this Rust port.
+//! This module ports the Go `ovpn` subpackage. The control channel runs a
+//! `rustls::ServerConnection` *inside* OpenVPN's own reliable transport (no TCP
+//! socket under the TLS); the data channel uses RustCrypto AES-GCM / AES-CBC.
 //!
 //! What works:
-//! - `Options` parse / `Display` (`V4,dev-type tun,…`)
-//! - `Opcode` and `CipherCrypto` / `CipherBlockMethod` enums
+//! - [`Options`] parse / `Display` (`V4,dev-type tun,…`).
+//! - TLS 1.2 control channel over the reliable layer (rustls in buffered mode).
+//! - Key-method 2 key exchange and TLS-1.0 PRF key derivation ([`prf`]).
+//! - Data channel: AES-256/128-GCM (AEAD) and AES-CBC + HMAC.
+//! - Replay window, PKCS#7 padding, control-packet framing.
+//! - UDP and TCP [`Server`]; per-peer [`Adapter`] over an `L3Connector` (tun)
+//!   or `L2Connector` (tap).
 //!
 //! TODO (tracked under `// TODO(ovpn): …` markers):
-//! - `Peer` connection state machine
-//! - Control-channel TLS 1.2 (currently hand-rolled — see notes in CLAUDE.md)
-//! - Data-channel AES-CBC and AES-GCM
-//! - PRF 1.2 key derivation
-//! - Replay window
-//! - UDP and TCP servers
-//! - L3/L2 adapter integration
+//! - tls-crypt / tls-auth HMAC wrapping of control packets.
+//! - Retransmission timers for unacknowledged control packets (the reliable
+//!   layer tracks them but the server does not yet retransmit).
+//! - Full PUSH_REPLY option negotiation beyond ifconfig/ping/comp-lzo.
+//! - Idle-peer reaping / keepalive ping generation.
 
+mod adapter;
+mod addr;
 mod consts;
+mod data;
+mod keys;
 mod options;
 mod opcode;
+mod packet_ctrl;
+mod peer;
+mod pkcs5;
+mod prf;
+mod reliable;
+mod server;
+#[cfg(test)]
+mod tests;
+mod window;
 
+pub use adapter::{Adapter, AdapterConfig, Connector};
+pub use addr::{PeerKey, Transport};
 pub use consts::{CipherBlockMethod, CipherCryptoAlg, AES, CBC, GCM};
 pub use opcode::Opcode;
 pub use options::Options;
+pub use peer::{AuthInfo, OnAuth, Peer, PeerConfig};
+pub use server::{
+    install_crypto_provider, OnConnect, OnData, OnDisconnect, Server, ServerConfig,
+};

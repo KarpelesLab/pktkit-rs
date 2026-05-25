@@ -33,6 +33,16 @@ impl AuthHash {
             AuthHash::Sha256 => "SHA256",
         }
     }
+
+    /// HMAC output size in bytes for this hash (0 for the null digest).
+    pub fn size(self) -> usize {
+        match self {
+            AuthHash::None => 0,
+            AuthHash::Sha1 => 20,
+            AuthHash::Sha224 => 28,
+            AuthHash::Sha256 => 32,
+        }
+    }
 }
 
 /// Parsed and renderable OpenVPN options string.

@@ -30,6 +30,17 @@ impl Opcode {
     pub fn to_byte(self, key_id: u8) -> u8 {
         (self.0 << 3) | (key_id & 0x07)
     }
+
+    /// True if this opcode is part of the reliable control channel (i.e. not a
+    /// data packet and within the known opcode range).
+    #[inline]
+    pub fn is_control(self) -> bool {
+        match self {
+            Opcode::DATA_V1 | Opcode::DATA_V2 | Opcode(0) => false,
+            Opcode(o) if o > 9 => false,
+            _ => true,
+        }
+    }
 }
 
 impl fmt::Debug for Opcode {
