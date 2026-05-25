@@ -20,11 +20,7 @@ use std::time::{Duration, Instant};
 /// Endpoint addressing for an accepted virtual connection. The "local" side is
 /// the listener (our virtual IP:port); the "remote" side is the peer inside the
 /// virtual network that connected to us.
-///
-/// The `V6` variant is plumbed end-to-end (wrap / addrs) but not yet wired into
-/// the dispatcher — see `TODO(slirp)` for v6 accept in `usernat`.
 #[derive(Copy, Clone, Debug)]
-#[allow(dead_code)]
 pub(crate) enum Endpoints {
     V4 {
         local_ip: Ipv4Addr,

@@ -1,28 +1,24 @@
-//! High-level virtual network client (work in progress).
+//! High-level virtual network client.
 //!
-//! The Go upstream layers `Dial`, `Listen`, `net.Conn`, DNS, and a minimal
-//! `http.Client` on top of [`vtcp`](crate::vtcp). This port lays out the
-//! shape and exposes the public types so dependent crates compile; the
-//! actual TCP layer integration lands once [`vtcp`](crate::vtcp)'s API
-//! stabilises.
+//! [`Client`] implements [`L3Device`](crate::L3Device), so it plugs into a
+//! `slirp::Stack`, a `wg::Adapter`, or any [`L3Connector`](crate::L3Connector).
+//! Layered on top of [`vtcp`](crate::vtcp), it provides:
 //!
-//! Anchors that are in place:
-//! - [`Client`] type and [`ClientConfig`] builder
-//! - DNS resolver scaffolding ([`Resolver`]) — query types parse, sending
-//!   is gated behind the vtcp wiring
-//! - Public `dial` / `listen` entry points (return `Unsupported` for now)
-//!
-//! TODO (tracked under `// TODO(vclient): …` markers):
-//! - Bind `vtcp::Conn` for the TCP path
-//! - UDP socket abstraction
-//! - HTTP/1.1 client (hand-rolled — no third-party HTTP crate)
+//! - [`Client::dial_tcp`] → a blocking [`TcpConn`] (`std::io::Read` + `Write`),
+//!   driven by a per-client TCP engine with a tick thread.
+//! - [`Client::dial_udp`] → a connected [`UdpConn`] over the virtual network.
+//! - [`Resolver`]: an RFC 1035 DNS resolver (A / AAAA), and [`Client::resolve`].
+//! - A hand-rolled HTTP/1.1 client ([`Request`] / [`Response`],
+//!   [`Client::http_get`]) — no third-party HTTP crate.
 
 mod client;
 mod dns;
 mod http;
 mod tcp;
+mod udp;
 
 pub use client::{Client, ClientConfig};
 pub use dns::{RecordType, Resolver, ResolverConfig};
 pub use http::{Request, Response};
 pub use tcp::TcpConn;
+pub use udp::UdpConn;

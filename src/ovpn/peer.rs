@@ -112,6 +112,9 @@ pub struct Peer {
     ctrl_buf: Vec<u8>,
     kx_done: bool,
     peer_cfg: Option<PeerConfig>,
+    /// Peer-info key/values (`IV_*`) the client advertised during the key
+    /// exchange, retained for post-auth queries / diagnostics.
+    peer_info: std::collections::HashMap<String, String>,
     /// Server random material (r1||r2) generated for the key exchange and
     /// reused by [`derive_keys`] so the PRF inputs match what was sent.
     server_random: [u8; 64],
@@ -150,6 +153,7 @@ impl Peer {
             ctrl_buf: Vec::new(),
             kx_done: false,
             peer_cfg: None,
+            peer_info: std::collections::HashMap::new(),
             server_random: [0u8; 64],
         })
     }
@@ -162,6 +166,24 @@ impl Peer {
     /// Layer (2 for tap, 3 for tun).
     pub fn layer(&self) -> u8 {
         self.layer
+    }
+
+    /// Drive periodic maintenance: retransmit any unacknowledged control
+    /// packets whose deadline has passed at `now`.
+    ///
+    /// The OpenVPN reliable layer must re-send `P_CONTROL` packets that the
+    /// peer has not ACKed within a timeout (~1s, backing off exponentially).
+    /// Because the crate is caller-driven (no per-peer background thread), the
+    /// server/[`Adapter`](super::Adapter) must call this on a timer — roughly
+    /// once per retransmit interval (~1s) — for each live peer. Returns the
+    /// datagrams to re-send in [`PeerOutput`]`::send`; if a packet exhausts its
+    /// retries the connection is abandoned and `PeerOutput::close` is set.
+    pub fn tick(&mut self, now: std::time::Instant) -> io::Result<PeerOutput> {
+        let mut out = PeerOutput::default();
+        let tick = self.reliable.tick(now);
+        out.send = tick.resend;
+        out.close = tick.timed_out;
+        Ok(out)
     }
 
     /// Process one inbound datagram from the peer.
@@ -314,29 +336,52 @@ impl Peer {
             "tap" => 2,
             _ => 3,
         };
+        self.peer_info = parsed.peer_info;
         self.opts = Some(parsed.opts);
         self.kx_done = true;
         self.phase = Phase::Established;
         Ok(())
     }
 
-    /// After authentication the only control traffic the happy path handles is
-    /// `PUSH_REQUEST` (NUL-terminated), to which we reply with a `PUSH_REPLY`.
+    /// After authentication the client keeps sending NUL-terminated control
+    /// messages over the TLS stream. Mirrors the post-auth loop in the Go
+    /// `peer-control.go`:
+    ///
+    /// - `PUSH_REQUEST` — (re)send the `PUSH_REPLY`. OpenVPN clients repeat the
+    ///   request until they see a reply, so every occurrence must be answered,
+    ///   not just the first.
+    /// - everything else (`PING`, `INFO`, additional `PUSH_*`, etc.) is
+    ///   gracefully ignored: we consume the message and keep the channel open.
     fn handle_post_auth_control(&mut self) -> io::Result<()> {
         while let Some(nul) = self.ctrl_buf.iter().position(|&b| b == 0) {
             let line: Vec<u8> = self.ctrl_buf.drain(..=nul).collect();
-            let s = String::from_utf8_lossy(&line[..line.len() - 1]).into_owned();
-            if s == "PUSH_REQUEST" {
+            // Drop the trailing NUL; empty (bare-NUL) keepalives are ignored.
+            let body = &line[..line.len() - 1];
+            if body.is_empty() {
+                continue;
+            }
+            let s = String::from_utf8_lossy(body).into_owned();
+            // OpenVPN control commands are comma-separated; the verb is the
+            // first field (`PUSH_REQUEST`, `PUSH_UPDATE,...`, etc.). Only
+            // `PUSH_REQUEST` is actioned; every other message (`PING`, `INFO`,
+            // additional `PUSH_*`, …) is gracefully consumed and ignored,
+            // matching the Go upstream's permissive post-auth loop.
+            let verb = s.split(',').next().unwrap_or("");
+            if verb == "PUSH_REQUEST" {
                 let reply = self.build_push_reply();
                 self.tls
                     .writer()
                     .write_all(reply.as_bytes())
                     .map_err(|e| invalid(format!("tls push reply: {e}")))?;
             }
-            // Other control messages are ignored on the happy path.
-            // TODO(ovpn): handle peer-info exchange / additional PUSH commands.
         }
         Ok(())
+    }
+
+    /// Peer-info (`IV_*`) key/values the client advertised during the key
+    /// exchange. Empty until the peer authenticates.
+    pub fn peer_info(&self) -> &std::collections::HashMap<String, String> {
+        &self.peer_info
     }
 
     fn build_push_reply(&self) -> String {
@@ -406,18 +451,7 @@ impl Peer {
             return Err(invalid("invalid options provided"));
         }
 
-        let mut peer_info = std::collections::HashMap::new();
-        for line in peer_info_raw.split('\n') {
-            if line.is_empty() {
-                continue;
-            }
-            match line.find('=') {
-                Some(i) => {
-                    peer_info.insert(line[..i].to_string(), line[i + 1..].to_string());
-                }
-                None => return Err(invalid("invalid string in peer_info")),
-            }
-        }
+        let peer_info = parse_peer_info(&peer_info_raw)?;
 
         let options_server = {
             let mut o = opts.clone();
@@ -560,7 +594,74 @@ fn write_control_string(buf: &mut Vec<u8>, s: &str) {
     buf.push(0);
 }
 
+/// Parse the client's peer-info block: newline-separated `KEY=VALUE` pairs
+/// (the `IV_*` advertisements OpenVPN clients send — `IV_VER`, `IV_PROTO`,
+/// `IV_CIPHERS`, etc.). Mirrors the loop in the Go `peer-control.go`: blank
+/// lines are skipped, a line without `=` is a hard error, and a value may
+/// itself contain `=` (only the first one separates key from value).
+fn parse_peer_info(raw: &str) -> io::Result<std::collections::HashMap<String, String>> {
+    let mut peer_info = std::collections::HashMap::new();
+    for line in raw.split('\n') {
+        // Tolerate CRLF line endings some clients emit.
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if line.is_empty() {
+            continue;
+        }
+        match line.find('=') {
+            Some(i) => {
+                peer_info.insert(line[..i].to_string(), line[i + 1..].to_string());
+            }
+            None => return Err(invalid("invalid string in peer_info")),
+        }
+    }
+    Ok(peer_info)
+}
+
 /// Cryptographic randomness for IVs and session material.
 pub(crate) fn fill_random(buf: &mut [u8]) -> io::Result<()> {
     getrandom::getrandom(buf).map_err(|e| io::Error::other(format!("getrandom: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_peer_info;
+
+    #[test]
+    fn peer_info_parses_iv_keys() {
+        let raw = "IV_VER=2.6.0\nIV_PLAT=linux\nIV_PROTO=6\nIV_CIPHERS=AES-256-GCM:AES-128-GCM\n";
+        let pi = parse_peer_info(raw).unwrap();
+        assert_eq!(pi.get("IV_VER").map(String::as_str), Some("2.6.0"));
+        assert_eq!(pi.get("IV_PLAT").map(String::as_str), Some("linux"));
+        assert_eq!(pi.get("IV_PROTO").map(String::as_str), Some("6"));
+        assert_eq!(
+            pi.get("IV_CIPHERS").map(String::as_str),
+            Some("AES-256-GCM:AES-128-GCM")
+        );
+        assert_eq!(pi.len(), 4);
+    }
+
+    #[test]
+    fn peer_info_value_may_contain_equals() {
+        // Only the first '=' splits key from value.
+        let pi = parse_peer_info("UV_OPT=a=b=c\n").unwrap();
+        assert_eq!(pi.get("UV_OPT").map(String::as_str), Some("a=b=c"));
+    }
+
+    #[test]
+    fn peer_info_skips_blank_and_crlf_lines() {
+        let pi = parse_peer_info("\nIV_VER=2.6\r\n\n").unwrap();
+        assert_eq!(pi.len(), 1);
+        assert_eq!(pi.get("IV_VER").map(String::as_str), Some("2.6"));
+    }
+
+    #[test]
+    fn peer_info_rejects_line_without_equals() {
+        assert!(parse_peer_info("IV_VER=2.6\nGARBAGE\n").is_err());
+    }
+
+    #[test]
+    fn peer_info_empty_is_ok() {
+        let pi = parse_peer_info("").unwrap();
+        assert!(pi.is_empty());
+    }
 }

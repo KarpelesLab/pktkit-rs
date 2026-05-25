@@ -170,12 +170,13 @@ impl Adapter {
             });
 
         let server_cfg = if let Some(mh) = cfg.multi_handler.clone() {
+            // Apply the unknown-peer callback to every handler already in the
+            // multiplexer. Handlers added later via MultiHandler::add_handler
+            // should be configured by the caller before they are added.
             if let Some(cb) = cfg.on_unknown_peer.clone() {
-                // TODO(wg): set per-handler unknown-peer callbacks. We can't
-                // mutate Handler.on_unknown_peer after construction without a
-                // setter; for now the callback set via AdapterConfig is only
-                // honoured in single-handler mode.
-                let _ = cb;
+                for h in mh.handlers() {
+                    h.set_on_unknown_peer(cb.clone());
+                }
             }
             ServerConfig {
                 handler: None,

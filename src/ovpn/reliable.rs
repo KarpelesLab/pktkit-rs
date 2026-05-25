@@ -14,10 +14,20 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::time::{Duration, Instant};
 
 use super::consts::{CONTROL_CHANNEL_MTU, TLS_RELIABLE_N_REC_BUFFERS};
 use super::packet_ctrl::ControlPacket;
 use super::Opcode;
+
+/// Initial retransmit timeout for an unacked control packet. OpenVPN's
+/// reliable layer starts at ~1s and backs off exponentially.
+pub const RETRANSMIT_INITIAL: Duration = Duration::from_secs(1);
+/// Cap on the backed-off retransmit interval (OpenVPN clamps around here).
+pub const RETRANSMIT_MAX_INTERVAL: Duration = Duration::from_secs(8);
+/// Maximum number of retransmit attempts before the packet is abandoned and
+/// the caller is told to tear the connection down.
+pub const RETRANSMIT_MAX_ATTEMPTS: u32 = 8;
 
 /// Outcome of feeding one control packet into the reliable layer.
 #[derive(Debug, Default)]
@@ -30,6 +40,28 @@ pub struct RecvOutcome {
     pub got_client_reset: bool,
 }
 
+/// An outgoing control packet awaiting acknowledgement, with the retransmit
+/// bookkeeping the [`Reliable::tick`] timer loop drives.
+#[derive(Debug, Clone)]
+struct Unacked {
+    pkt: ControlPacket,
+    /// When the packet was most recently (re)transmitted.
+    last_sent: Instant,
+    /// Number of times the packet has been transmitted (1 = original send).
+    attempts: u32,
+}
+
+/// Outcome of a retransmission tick: datagrams to resend and whether the
+/// connection has exhausted its retries and should be closed.
+#[derive(Debug, Default)]
+pub struct TickOutcome {
+    /// Re-serialized control datagrams to put back on the wire.
+    pub resend: Vec<Vec<u8>>,
+    /// True if some packet blew past [`RETRANSMIT_MAX_ATTEMPTS`]; the caller
+    /// should tear the connection down.
+    pub timed_out: bool,
+}
+
 /// Reliable transport state for one peer.
 #[derive(Debug)]
 pub struct Reliable {
@@ -38,7 +70,7 @@ pub struct Reliable {
 
     // Outgoing.
     out_counter: u32,
-    unacked: HashMap<u32, ControlPacket>,
+    unacked: HashMap<u32, Unacked>,
 
     // Incoming reorder buffer.
     in_counter: u32, // id of the next in-order packet we expect
@@ -46,6 +78,18 @@ pub struct Reliable {
 
     // ACKs we owe the peer for packets we've received.
     pending_ack: Vec<u32>,
+}
+
+/// Retransmit interval for a packet that has been sent `attempts` times,
+/// doubling each time from [`RETRANSMIT_INITIAL`] and clamped at
+/// [`RETRANSMIT_MAX_INTERVAL`]. `attempts` is 1 after the first send.
+fn backoff(attempts: u32) -> Duration {
+    // attempts==1 -> base, ==2 -> 2x, ==3 -> 4x, ... saturating at the cap.
+    let shift = attempts.saturating_sub(1).min(16);
+    let scaled = RETRANSMIT_INITIAL
+        .checked_mul(1u32 << shift)
+        .unwrap_or(RETRANSMIT_MAX_INTERVAL);
+    scaled.min(RETRANSMIT_MAX_INTERVAL)
 }
 
 fn invalid(msg: &str) -> io::Error {
@@ -157,8 +201,21 @@ impl Reliable {
         let pid = self.out_counter;
         pkt.set_pid(pid);
         self.out_counter += 1;
-        self.unacked.insert(pid, pkt.clone());
+        self.track_unacked(pid, pkt.clone());
         pkt
+    }
+
+    /// Record an outgoing reliable packet as unacknowledged, stamping its send
+    /// time so [`tick`](Self::tick) can drive retransmission.
+    fn track_unacked(&mut self, pid: u32, pkt: ControlPacket) {
+        self.unacked.insert(
+            pid,
+            Unacked {
+                pkt,
+                last_sent: Instant::now(),
+                attempts: 1,
+            },
+        );
     }
 
     /// Chunk a TLS-record byte stream into one or more outgoing control
@@ -191,7 +248,7 @@ impl Reliable {
         let pid = self.out_counter;
         pkt.set_pid(pid);
         self.out_counter += 1;
-        self.unacked.insert(pid, pkt.clone());
+        self.track_unacked(pid, pkt.clone());
         pkt
     }
 
@@ -203,18 +260,61 @@ impl Reliable {
 
     /// Packets still awaiting acknowledgement (for retransmission). Returns
     /// clones so the caller can re-serialize without holding a borrow.
-    ///
-    /// TODO(ovpn): the server does not yet drive retransmission timers; this is
-    /// the hook a future retransmit loop will use.
     #[allow(dead_code)]
     pub fn unacked_packets(&self) -> Vec<ControlPacket> {
-        self.unacked.values().cloned().collect()
+        self.unacked.values().map(|u| u.pkt.clone()).collect()
     }
 
     /// Number of unacknowledged outgoing packets.
     #[allow(dead_code)]
     pub fn unacked_count(&self) -> usize {
         self.unacked.len()
+    }
+
+    /// Drive retransmission timers. For every unacknowledged outgoing packet
+    /// whose retransmit deadline (`last_sent + backoff(attempts)`) has passed
+    /// at `now`, re-serialize it, bump its attempt count, double its backoff,
+    /// and reset its send time. Packets that exceed
+    /// [`RETRANSMIT_MAX_ATTEMPTS`] are dropped and flagged via
+    /// [`TickOutcome::timed_out`] so the caller can close the connection.
+    ///
+    /// This is the caller-driven equivalent of OpenVPN's per-packet
+    /// retransmit timer: there is no background thread, so the server (or the
+    /// [`Adapter`](super::Adapter)) must call this periodically — roughly every
+    /// [`RETRANSMIT_INITIAL`] — to make progress against packet loss.
+    ///
+    /// Pending ACKs are *not* re-attached here; a retransmit carries whatever
+    /// ACKs the packet was originally built with (none, in practice — ACKs ride
+    /// on freshly-built packets), which matches OpenVPN's behaviour of treating
+    /// the reliable packet body as immutable once queued.
+    pub fn tick(&mut self, now: Instant) -> TickOutcome {
+        let mut outcome = TickOutcome::default();
+
+        // Collect due pids first to avoid borrowing `self.unacked` mutably
+        // while iterating (the values are cheap u32s).
+        let mut due: Vec<u32> = Vec::new();
+        for (&pid, u) in self.unacked.iter() {
+            if now.duration_since(u.last_sent) >= backoff(u.attempts) {
+                due.push(pid);
+            }
+        }
+        // Deterministic order makes the resend stream predictable / testable.
+        due.sort_unstable();
+
+        for pid in due {
+            let u = self.unacked.get_mut(&pid).expect("pid just collected");
+            if u.attempts >= RETRANSMIT_MAX_ATTEMPTS {
+                outcome.timed_out = true;
+                self.unacked.remove(&pid);
+                continue;
+            }
+            u.attempts += 1;
+            u.last_sent = now;
+            // Re-send the packet exactly as first framed (no ACKs piggybacked).
+            outcome.resend.push(u.pkt.to_bytes(&[]));
+        }
+
+        outcome
     }
 }
 
@@ -321,5 +421,96 @@ mod tests {
         r.recv(&reset.to_bytes(&[])).unwrap();
         // pid way beyond the receive window.
         assert!(r.recv(&client_control(1000, sid, b"z")).is_err());
+    }
+
+    // --- retransmission timers ----------------------------------------------
+
+    #[test]
+    fn backoff_doubles_and_caps() {
+        assert_eq!(backoff(1), RETRANSMIT_INITIAL);
+        assert_eq!(backoff(2), RETRANSMIT_INITIAL * 2);
+        assert_eq!(backoff(3), RETRANSMIT_INITIAL * 4);
+        // Eventually clamps at the cap and never exceeds it.
+        assert_eq!(backoff(100), RETRANSMIT_MAX_INTERVAL);
+        assert!(backoff(50) <= RETRANSMIT_MAX_INTERVAL);
+    }
+
+    #[test]
+    fn unacked_past_deadline_is_resent() {
+        let mut r = Reliable::new(local());
+        let p = r.build_control(b"hello");
+        let start = Instant::now();
+
+        // Before the deadline: nothing to resend.
+        let early = r.tick(start + RETRANSMIT_INITIAL - Duration::from_millis(1));
+        assert!(early.resend.is_empty());
+        assert!(!early.timed_out);
+
+        // Past the deadline: the original packet comes back out verbatim.
+        let late = r.tick(start + RETRANSMIT_INITIAL + Duration::from_millis(1));
+        assert_eq!(late.resend.len(), 1);
+        assert_eq!(late.resend[0], p.to_bytes(&[]));
+        assert!(!late.timed_out);
+    }
+
+    #[test]
+    fn acked_packet_is_not_resent() {
+        let mut r = Reliable::new(local());
+        let _p = r.build_control(b"hello");
+        let start = Instant::now();
+        assert_eq!(r.unacked_count(), 1);
+
+        // Peer acks pid 0.
+        let sid = [9u8; 8];
+        let ack = ControlPacket::new(Opcode::ACK_V1, 0, sid, r.local_id);
+        r.recv(&ack.to_bytes(&[0])).unwrap();
+        assert_eq!(r.unacked_count(), 0);
+
+        // Well past the deadline, nothing is resent.
+        let out = r.tick(start + RETRANSMIT_INITIAL * 4);
+        assert!(out.resend.is_empty());
+    }
+
+    #[test]
+    fn backoff_increases_between_retransmits() {
+        let mut r = Reliable::new(local());
+        let _p = r.build_control(b"x");
+        let start = Instant::now();
+
+        // First retransmit fires after the base interval.
+        let t1 = start + RETRANSMIT_INITIAL;
+        assert_eq!(r.tick(t1).resend.len(), 1);
+
+        // A second tick only one base-interval later must NOT fire: the next
+        // deadline is now 2x the base from t1.
+        let t2 = t1 + RETRANSMIT_INITIAL;
+        assert!(r.tick(t2).resend.is_empty(), "backoff should have doubled");
+
+        // Waiting the doubled interval does fire the second retransmit.
+        let t3 = t1 + RETRANSMIT_INITIAL * 2;
+        assert_eq!(r.tick(t3).resend.len(), 1);
+    }
+
+    #[test]
+    fn retries_cap_and_signal_timeout() {
+        let mut r = Reliable::new(local());
+        let _p = r.build_control(b"x");
+        let mut t = Instant::now();
+        let mut timed_out = false;
+        // Advance well past each (growing) deadline until the packet is dropped.
+        for _ in 0..(RETRANSMIT_MAX_ATTEMPTS + 4) {
+            t += RETRANSMIT_MAX_INTERVAL * 2;
+            let out = r.tick(t);
+            if out.timed_out {
+                timed_out = true;
+                break;
+            }
+        }
+        assert!(timed_out, "packet should eventually time out");
+        // Once timed out the packet is gone; further ticks are quiet.
+        assert_eq!(r.unacked_count(), 0);
+        let after = r.tick(t + RETRANSMIT_MAX_INTERVAL * 2);
+        assert!(after.resend.is_empty());
+        assert!(!after.timed_out);
     }
 }

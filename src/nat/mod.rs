@@ -16,9 +16,10 @@
 //! - ALGs: [`FtpHelper`], [`TftpHelper`], [`IrcHelper`], [`SipHelper`],
 //!   [`H323Helper`], [`PptpHelper`].
 //! - [`UPnPHelper`] / [`UPnPConfig`] — SSDP discovery plus a SOAP control
-//!   handler ([`UPnPHelper::handle_soap`] returning [`SoapResult`]). Live TCP
-//!   termination of the control port awaits a virtual TCP server (see the
-//!   `TODO(nat)` in `upnp.rs`).
+//!   handler ([`UPnPHelper::handle_soap`] returning [`SoapResult`]). The
+//!   control port is terminated with the in-tree `vtcp` engine and a minimal
+//!   one-shot HTTP/1.1 server; pipelined / chunked requests are not handled
+//!   (see `TODO(nat)` in `upnp.rs`).
 
 mod alg_ftp;
 mod alg_h323;

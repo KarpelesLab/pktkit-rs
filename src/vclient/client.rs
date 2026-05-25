@@ -7,6 +7,7 @@
 //! demultiplexed to the matching connection.
 
 use super::tcp::{self, TcpConn, TcpStack};
+use super::udp::{UdpConn, UdpStack};
 use crate::{IpPrefix, L3Device, L3Handler, Packet, Result};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -28,6 +29,7 @@ pub struct Client {
     handler: Arc<Mutex<Option<L3Handler>>>,
     addr: Mutex<IpPrefix>,
     tcp: Arc<TcpStack>,
+    udp: Arc<UdpStack>,
 }
 
 impl core::fmt::Debug for Client {
@@ -53,14 +55,28 @@ impl Client {
                 let _ = handler(Packet::from_slice(bytes));
             }
         });
-        let tcp = TcpStack::new(sink);
+        let tcp = TcpStack::new(sink.clone());
+        let udp = UdpStack::new(sink);
 
         Arc::new(Client {
             cfg: Mutex::new(cfg),
             handler,
             addr: Mutex::new(addr),
             tcp,
+            udp,
         })
+    }
+
+    /// Open a connected UDP socket to `addr` over the virtual network.
+    pub fn dial_udp(&self, addr: SocketAddr) -> Result<UdpConn> {
+        let prefix = self.addr();
+        let local_ip = tcp::local_ip_for(prefix, addr.ip()).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "no local address in the right family for this destination",
+            )
+        })?;
+        Ok(self.udp.dial(local_ip, addr))
     }
 
     /// Open a TCP connection to `addr`, blocking until the handshake
@@ -105,9 +121,12 @@ impl L3Device for Client {
         *self.handler.lock().unwrap() = Some(h);
     }
     fn send(&self, pkt: &Packet) -> Result<()> {
-        // Inbound from the L3 network. Demux to a TCP connection; UDP/ICMP
-        // demux is TODO(vclient).
-        let _ = self.tcp.handle_inbound(pkt);
+        // Inbound from the L3 network: demux to a TCP connection, then a UDP
+        // socket. Unmatched packets (e.g. ICMP) are dropped.
+        if self.tcp.handle_inbound(pkt) {
+            return Ok(());
+        }
+        let _ = self.udp.handle_inbound(pkt);
         Ok(())
     }
     fn addr(&self) -> IpPrefix {

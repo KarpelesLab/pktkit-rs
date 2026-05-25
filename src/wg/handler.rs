@@ -229,6 +229,14 @@ impl Handler {
             .or_insert_with(|| PeerEntry::new(peer_key, NoisePresharedKey::zero(), false));
     }
 
+    /// Install (or replace) the callback invoked when a handshake arrives from
+    /// an unauthorized peer. Lets callers set the hook after construction —
+    /// notably the [`Adapter`](crate::wg::Adapter) applies it to every handler
+    /// in multi-handler mode.
+    pub fn set_on_unknown_peer(&self, cb: UnknownPeerFn) {
+        *self.on_unknown_peer.lock().expect("unknown lock") = Some(cb);
+    }
+
     /// Add (or refresh) an authorized peer with a preshared key.
     pub fn add_peer_with_psk(&self, peer_key: NoisePublicKey, psk: NoisePresharedKey) {
         let mut peers = self.peers.write().expect("peers lock");

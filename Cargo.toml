@@ -44,7 +44,8 @@ slirp = ["vtcp"]
 vclient = ["vtcp"]
 
 # Packet-level IPv4 NAT, NAT64, ALGs, defrag, UPnP.
-nat = []
+# UPnP terminates its SOAP control port with the virtual TCP engine (vtcp).
+nat = ["vtcp"]
 
 # WireGuard tunnel (Noise IK handshake + transport).
 wg = [

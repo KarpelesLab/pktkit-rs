@@ -75,6 +75,7 @@ struct Inner {
     udp6: Mutex<HashMap<Key6, Arc<UdpConn6>>>,
     // Inbound virtual TCP connections accepted by a Listener (vtcp-backed).
     virt_tcp: Mutex<HashMap<Key, Arc<ConnState>>>,
+    virt_tcp6: Mutex<HashMap<Key6, Arc<ConnState>>>,
     listeners: Mutex<HashMap<ListenerKey, Arc<Listener>>>,
     listeners6: Mutex<HashMap<ListenerKey6, Arc<Listener6>>>,
     // Per-namespace sides (each device attached via ConnectL3).
@@ -157,6 +158,7 @@ impl Stack {
             udp: Mutex::new(HashMap::new()),
             udp6: Mutex::new(HashMap::new()),
             virt_tcp: Mutex::new(HashMap::new()),
+            virt_tcp6: Mutex::new(HashMap::new()),
             listeners: Mutex::new(HashMap::new()),
             listeners6: Mutex::new(HashMap::new()),
             ns_sides: Mutex::new(HashMap::new()),
@@ -228,6 +230,25 @@ impl Stack {
             if !dead.is_empty() {
                 let mut t = inner.virt_tcp.lock().expect("poisoned");
                 for k in dead {
+                    t.remove(&k);
+                }
+            }
+            let conns6: Vec<(Key6, Arc<ConnState>)> = inner
+                .virt_tcp6
+                .lock()
+                .expect("poisoned")
+                .iter()
+                .map(|(k, v)| (*k, v.clone()))
+                .collect();
+            let mut dead6 = Vec::new();
+            for (k, cs) in conns6 {
+                if tick_conn(&cs) {
+                    dead6.push(k);
+                }
+            }
+            if !dead6.is_empty() {
+                let mut t = inner.virt_tcp6.lock().expect("poisoned");
+                for k in dead6 {
                     t.remove(&k);
                 }
             }
@@ -311,6 +332,13 @@ impl Stack {
             }
         }
         if let Ok(mut t) = self.inner.virt_tcp.lock() {
+            for (_, state) in t.drain() {
+                let segs = state.conn.lock().expect("poisoned").abort();
+                state.wrap_and_send(segs);
+                state.signal.notify_all();
+            }
+        }
+        if let Ok(mut t) = self.inner.virt_tcp6.lock() {
             for (_, state) in t.drain() {
                 let segs = state.conn.lock().expect("poisoned").abort();
                 state.wrap_and_send(segs);
@@ -743,11 +771,23 @@ impl Stack {
             dst_port,
         };
 
-        // TODO(slirp): v6 accept. Mirror `accept_syn_v4` for inbound SYNs that
-        // hit a registered `Listener6` — add a `virt_tcp6` table keyed by
-        // `Key6`, passive-open a `vtcp::Conn` with `Endpoints::V6`, and enqueue
-        // the resulting `TcpStream` onto the listener. Until then, inbound v6
-        // connections to a virtual listener fall through to the NAT path below.
+        // 1) Existing inbound virtual TCP connection (vtcp-backed)?
+        let virt = inner.virt_tcp6.lock().expect("poisoned").get(&key).cloned();
+        if let Some(state) = virt {
+            if let Ok(seg) = Segment::parse(tcp) {
+                state.deliver(&seg);
+            }
+            return Ok(());
+        }
+
+        // 2) SYN destined for a registered virtual listener? Passive-open a
+        //    server-side vtcp::Conn and drive the handshake.
+        if (flags & FLAG_SYN) != 0 {
+            let listener = Self::find_listener6(inner, dst, dst_port);
+            if let Some(listener) = listener {
+                return Self::accept_syn_v6(inner, ns, tcp, src, dst, src_port, dst_port, listener);
+            }
+        }
 
         let existing = inner.tcp6.lock().expect("poisoned").get(&key).cloned();
         if let Some(c) = existing {
@@ -788,6 +828,147 @@ impl Stack {
         let conn = TcpNatConn::accept_syn(src_port, dst_port, seq, remote, send_back)?;
         inner.tcp6.lock().expect("poisoned").insert(key, conn);
         Ok(())
+    }
+
+    /// Look up a registered IPv6 listener for `(dst, dst_port)`, falling back
+    /// to a wildcard (`::`) listener on the same port.
+    fn find_listener6(inner: &Arc<Inner>, dst: Ipv6Addr, dst_port: u16) -> Option<Arc<Listener6>> {
+        let m = inner.listeners6.lock().expect("poisoned");
+        if let Some(l) = m.get(&ListenerKey6 {
+            ip: dst.octets(),
+            port: dst_port,
+        }) {
+            return Some(l.clone());
+        }
+        m.get(&ListenerKey6 {
+            ip: Ipv6Addr::UNSPECIFIED.octets(),
+            port: dst_port,
+        })
+        .cloned()
+    }
+
+    /// IPv6 analogue of [`accept_syn_v4`](Self::accept_syn_v4): passive-open a
+    /// server-side `vtcp::Conn` for an inbound SYN to a virtual `Listener6`,
+    /// emit the SYN-ACK, register the connection in `virt_tcp6`, and spawn a
+    /// waiter that enqueues the [`TcpStream`](super::TcpStream) once ESTABLISHED.
+    #[allow(clippy::too_many_arguments)]
+    fn accept_syn_v6(
+        inner: &Arc<Inner>,
+        ns: u64,
+        tcp: &[u8],
+        src: Ipv6Addr,
+        dst: Ipv6Addr,
+        src_port: u16,
+        dst_port: u16,
+        listener: Arc<Listener6>,
+    ) -> Result<()> {
+        let key = Key6 {
+            ns,
+            src_ip: src.octets(),
+            src_port,
+            dst_ip: dst.octets(),
+            dst_port,
+        };
+        if inner.virt_tcp6.lock().expect("poisoned").len() >= MAX_VIRT_TCP_CONNS {
+            return Ok(()); // silently drop; client will retransmit
+        }
+        // TODO(slirp): when the accept queue is near-full, fall back to a
+        // stateless SYN-cookie (vtcp::SynCookies) SYN-ACK instead of dropping.
+        if listener.queue_full() {
+            return Ok(());
+        }
+        let seg = match Segment::parse(tcp) {
+            Ok(s) => s,
+            Err(_) => return Ok(()),
+        };
+
+        // Sink: wrap engine segments (built by ConnState) and inject them.
+        let inner_for_send = inner.clone();
+        let sink: Arc<dyn Fn(&[u8]) + Send + Sync> = Arc::new(move |p: &[u8]| {
+            let _ = Self::dispatch(&inner_for_send, ns, p);
+        });
+
+        let cfg = ConnConfig {
+            local_addr: Some(SocketAddr::new(std::net::IpAddr::V6(dst), dst_port)),
+            remote_addr: Some(SocketAddr::new(std::net::IpAddr::V6(src), src_port)),
+            local_port: dst_port,
+            remote_port: src_port,
+            mss: 1440,
+            keepalive: true,
+            ..Default::default()
+        };
+        let mut conn = Conn::new(cfg);
+        let synack = conn.accept_syn(&seg);
+
+        let state = Arc::new(ConnState {
+            endpoints: Endpoints::V6 {
+                local_ip: dst,
+                local_port: dst_port,
+                remote_ip: src,
+                remote_port: src_port,
+            },
+            conn: Mutex::new(conn),
+            signal: Condvar::new(),
+            sink,
+        });
+        inner
+            .virt_tcp6
+            .lock()
+            .expect("poisoned")
+            .insert(key, state.clone());
+        // Emit the SYN-ACK.
+        state.wrap_and_send(synack);
+
+        // Wait (off the dispatch path) for ESTABLISHED, then enqueue.
+        Self::spawn_accept_waiter6(inner.clone(), key, state, listener);
+        Ok(())
+    }
+
+    /// IPv6 analogue of [`spawn_accept_waiter`](Self::spawn_accept_waiter).
+    fn spawn_accept_waiter6(
+        inner: Arc<Inner>,
+        key: Key6,
+        state: Arc<ConnState>,
+        listener: Arc<Listener6>,
+    ) {
+        thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let st = state.conn.lock().expect("poisoned").state();
+                match st {
+                    VtcpState::Established
+                    | VtcpState::FinWait1
+                    | VtcpState::FinWait2
+                    | VtcpState::CloseWait
+                    | VtcpState::Closing
+                    | VtcpState::LastAck
+                    | VtcpState::TimeWait => {
+                        if !listener.enqueue(state.clone()) {
+                            // Listener closed or queue full: abort and drop.
+                            let segs = state.conn.lock().expect("poisoned").abort();
+                            state.wrap_and_send(segs);
+                            inner.virt_tcp6.lock().expect("poisoned").remove(&key);
+                        }
+                        return;
+                    }
+                    VtcpState::Closed => {
+                        inner.virt_tcp6.lock().expect("poisoned").remove(&key);
+                        return;
+                    }
+                    _ => {}
+                }
+                if conn_is_closed(&state) || Instant::now() >= deadline {
+                    inner.virt_tcp6.lock().expect("poisoned").remove(&key);
+                    return;
+                }
+                // Wait for an inbound segment / tick to advance the handshake.
+                let guard = state.conn.lock().expect("poisoned");
+                let _ = state
+                    .signal
+                    .wait_timeout(guard, Duration::from_millis(50))
+                    .expect("poisoned");
+            }
+        });
     }
 
     fn handle_ipv6_udp(
@@ -833,6 +1014,18 @@ impl Stack {
     fn cleanup_namespace(inner: &Arc<Inner>, ns: u64) {
         // Drop all per-namespace flows.
         if let Ok(mut t) = inner.virt_tcp.lock() {
+            t.retain(|k, state| {
+                if k.ns == ns {
+                    let segs = state.conn.lock().expect("poisoned").abort();
+                    state.wrap_and_send(segs);
+                    state.signal.notify_all();
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        if let Ok(mut t) = inner.virt_tcp6.lock() {
             t.retain(|k, state| {
                 if k.ns == ns {
                     let segs = state.conn.lock().expect("poisoned").abort();

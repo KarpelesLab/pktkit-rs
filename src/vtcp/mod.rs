@@ -16,15 +16,23 @@
 //! - RFC 2018: SACK.
 //! - SYN-cookie engine for stateless half-open completion.
 //!
-//! What was intentionally not ported in this initial cut:
-//! - `// TODO(vtcp)`: blocking [`Conn::read`]/[`Conn::write`] with deadlines —
-//!   the port is non-blocking; callers compose their own waiting strategy.
-//! - `// TODO(vtcp)`: Listener / accept-queue type (the Go upstream exposes
-//!   one; here we expose [`Conn::accept_syn`] and [`syncookie::SynCookies`]
-//!   so callers can build the listener that suits their loop).
-//! - `// TODO(vtcp)`: re-entrancy "trampoline" for synchronous mutual recursion
-//!   — Rust's borrow checker forces callers to drain `take_outgoing()`
-//!   themselves, sidestepping the issue.
+//! # Layering: blocking I/O and accept live above this engine
+//!
+//! `Conn` is intentionally a pure, non-blocking, socket-less state machine —
+//! it owns no I/O, so "blocking read/write" and "an accept queue" do not
+//! belong here; they belong to whatever drives the engine over a real
+//! transport. The crate provides exactly those drivers:
+//!
+//! - Blocking, `std::io::Read`/`Write` connection handles: `vclient::TcpConn`
+//!   (client side) and `slirp::TcpStream` (server side) wrap a `Conn` with a
+//!   `Condvar` and a tick thread (enable the `vclient` / `slirp` features).
+//! - Accept queues: `slirp::Listener` builds one on top of
+//!   [`Conn::accept_syn`], and [`syncookie::SynCookies`] is available for the
+//!   stateless-completion variant.
+//!
+//! Synchronous mutual recursion is avoided by the return-segments API: methods
+//! hand back outgoing bytes (`take_outgoing`) rather than calling a sink, so the
+//! caller drains them explicitly and the borrow checker keeps re-entrancy out.
 
 pub mod congestion;
 pub mod conn;

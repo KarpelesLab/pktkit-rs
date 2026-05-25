@@ -353,6 +353,75 @@ fn e2e_tls_handshake_and_key_exchange() {
     );
 }
 
+/// When the client withholds its ACK, the server's reliable layer must
+/// retransmit the unacknowledged control packet once its deadline passes; once
+/// the client finally ACKs it, the retransmit stops.
+#[test]
+fn retransmit_fires_when_ack_withheld() {
+    use super::packet_ctrl::ControlPacket;
+    use super::reliable::RETRANSMIT_INITIAL;
+    use super::Opcode;
+    use std::time::{Duration, Instant};
+
+    install_crypto_provider();
+
+    let mut server = Peer::new(server_config(), *b"SERVERID", auth_hook()).unwrap();
+    let mut client = TestClient::new(*b"CLIENTID");
+
+    // Client hard reset -> server. The server replies with its own hard reset
+    // (pid 0, an unacked reliable packet). We deliberately do NOT feed it back
+    // to the client, so it never gets ACKed.
+    let out = server.handle_packet(&client.hard_reset()).expect("reset");
+    let server_reset = out
+        .send
+        .iter()
+        .map(|d| ControlPacket::parse(d).unwrap())
+        .find(|p| p.opcode == Opcode::CONTROL_HARD_RESET_SERVER_V2)
+        .expect("server should emit a hard reset");
+    assert_eq!(server_reset.pid, Some(0));
+
+    // Before the retransmit deadline: tick is quiet.
+    let start = Instant::now();
+    let early = server
+        .tick(start + RETRANSMIT_INITIAL - Duration::from_millis(50))
+        .expect("tick early");
+    assert!(early.send.is_empty(), "no retransmit before the deadline");
+    assert!(!early.close);
+
+    // Past the deadline: the unacked hard reset is re-sent. Compare by
+    // opcode/pid/payload (the on-wire ACK list may differ from the first send).
+    let late = server
+        .tick(start + RETRANSMIT_INITIAL + Duration::from_millis(50))
+        .expect("tick late");
+    assert!(!late.close, "should not be closing yet");
+    let resent: Vec<ControlPacket> = late
+        .send
+        .iter()
+        .map(|d| ControlPacket::parse(d).unwrap())
+        .collect();
+    assert!(
+        resent.iter().any(|p| p.opcode == server_reset.opcode
+            && p.pid == server_reset.pid
+            && p.payload == server_reset.payload),
+        "server should retransmit the unacked hard reset"
+    );
+
+    // The client now ACKs pid 0. A standalone ACK references the server's
+    // session id as the remote id.
+    let ack = ControlPacket::new(Opcode::ACK_V1, 0, *b"CLIENTID", server_reset.session_id);
+    server.handle_packet(&ack.to_bytes(&[0])).expect("ack");
+
+    // With pid 0 acknowledged, a tick well past any deadline is quiet.
+    let quiet = server
+        .tick(start + RETRANSMIT_INITIAL * 8)
+        .expect("tick quiet");
+    assert!(
+        quiet.send.is_empty(),
+        "no retransmit once the packet is acked, got {}",
+        quiet.send.len()
+    );
+}
+
 // --- helpers ----------------------------------------------------------------
 
 fn auth_hook() -> OnAuth {

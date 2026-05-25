@@ -13,23 +13,34 @@
 //!   body and returns the response/fault body plus any NAT mutation. It is
 //!   driven by the unit tests directly.
 //!
-//! TODO(nat): wire the SOAP handler to live TCP control traffic. The Go
-//! upstream terminates a TCP connection on the control port using a virtual TCP
-//! stack (`vclient`) and runs `net/http` over it. The crate's `vclient` is
-//! still a scaffold (no inbound `Listen`), and the NAT core does not terminate
-//! TCP, so `handle_local`'s TCP branch currently only recognises traffic to the
-//! control port without driving a full HTTP/1.1 + TCP handshake. Once a virtual
-//! TCP server is available, decode the HTTP request there and call
-//! [`UPnPHelper::handle_soap`].
+//! **SOAP over live TCP** is terminated by the crate's virtual TCP engine
+//! ([`vtcp::Conn`]). When an inside client opens a TCP connection to the NAT's
+//! inside IP on the control port, [`UPnPHelper::handle_local`] mints a
+//! server-side `vtcp::Conn` (passive open via `accept_syn`), drives the
+//! handshake, accumulates the HTTP/1.1 request bytes off the established
+//! stream, parses the request line + headers + Content-Length body, calls
+//! [`UPnPHelper::handle_soap`], writes the HTTP/1.1 response (with the SOAP XML
+//! body) back over the connection, and then closes. This is a minimal embedded
+//! HTTP/1.1 server over a single vtcp connection: one request/response, then
+//! close. Outgoing segments are wrapped in IPv4 (with correct IP + TCP
+//! checksums) and injected onto the inside via [`Nat::send_inside`].
 
 use crate::nat::helper::{Helper, LocalHelper, PortForward, PROTO_TCP, PROTO_UDP};
 use crate::nat::nat::Nat;
-use crate::{checksum, Packet};
-use std::net::Ipv4Addr;
+use crate::vtcp::segment::Segment;
+use crate::vtcp::{Conn, ConnConfig};
+use crate::{checksum, combine_checksums, pseudo_header_checksum, Packet, Protocol};
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 const SSDP_PORT: u16 = 1900;
 const SSDP_MCAST: Ipv4Addr = Ipv4Addr::new(239, 255, 255, 250);
+
+/// Cap on the buffered HTTP request size, to bound memory for a misbehaving or
+/// hostile client. A UPnP SOAP control request is a few hundred bytes.
+const MAX_REQUEST_BYTES: usize = 64 * 1024;
 
 /// Configuration knobs for the UPnP IGD helper.
 #[derive(Debug, Clone)]
@@ -66,11 +77,34 @@ pub struct SoapResult {
     pub body: String,
 }
 
+/// Identifies a control-port TCP connection by the inside client's 4-tuple.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+struct CtrlKey {
+    client_ip: Ipv4Addr,
+    client_port: u16,
+}
+
+/// Per-connection state for a terminated control-port TCP connection: the
+/// server-side [`vtcp::Conn`] plus the in-flight HTTP request buffer.
+#[derive(Debug)]
+struct CtrlConn {
+    conn: Conn,
+    client_ip: Ipv4Addr,
+    /// Accumulated request bytes read off the established stream.
+    req: Vec<u8>,
+    /// Set once we have parsed a complete request and written the response, so
+    /// further inbound bytes on this connection are ignored (single
+    /// request/response per connection — the common UPnP control flow).
+    responded: bool,
+}
+
 /// UPnP IGD helper. Register via
 /// [`Nat::add_local_helper`](crate::nat::Nat::add_local_helper).
 #[derive(Debug)]
 pub struct UPnPHelper {
     cfg: UPnPConfig,
+    /// Live control-port TCP connections, keyed by inside-client 4-tuple.
+    ctrl: Mutex<HashMap<CtrlKey, CtrlConn>>,
 }
 
 impl UPnPHelper {
@@ -79,7 +113,10 @@ impl UPnPHelper {
         if cfg.control_port == 0 {
             cfg.control_port = 5000;
         }
-        UPnPHelper { cfg }
+        UPnPHelper {
+            cfg,
+            ctrl: Mutex::new(HashMap::new()),
+        }
     }
 
     pub fn config(&self) -> &UPnPConfig {
@@ -138,6 +175,142 @@ EXT:\r\n\r\n",
         );
         let pkt = build_udp_packet(inside_ip, SSDP_PORT, dst_ip, dst_port, resp.as_bytes());
         nat.send_inside(Packet::from_slice(&pkt));
+    }
+
+    // ---- TCP control termination ---------------------------------------
+
+    /// Terminate inbound TCP traffic destined for the inside IP on the control
+    /// port with a server-side [`vtcp::Conn`], run a one-shot HTTP/1.1 server
+    /// over it, and call [`Self::handle_soap`]. Returns `true` if the packet was
+    /// addressed to the control port and consumed.
+    fn handle_tcp(&self, nat: &Nat, pkt: &[u8], ihl: usize) -> bool {
+        if pkt.len() < ihl + 20 {
+            return false;
+        }
+        let inside_ip = match nat.inside_addr() {
+            Some(a) => a,
+            None => return false,
+        };
+        let dst_ip = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
+        let dst_port = u16::from_be_bytes([pkt[ihl + 2], pkt[ihl + 3]]);
+        // Only intercept TCP to our own inside IP on the configured control
+        // port; everything else flows through normal NAT processing.
+        if dst_ip != inside_ip || dst_port != self.cfg.control_port {
+            return false;
+        }
+
+        let seg = match Segment::parse(&pkt[ihl..]) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        let client_ip = Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]);
+        let client_port = seg.src_port;
+        let key = CtrlKey {
+            client_ip,
+            client_port,
+        };
+
+        // Segments the engine wants to send back to the client (server->client).
+        let mut outgoing: Vec<Vec<u8>> = Vec::new();
+        let mut remove = false;
+        {
+            let mut table = self.ctrl.lock().unwrap();
+            // Mint a fresh server-side Conn on the opening SYN.
+            let mut fresh = false;
+            if seg.has_flag(crate::vtcp::flags::SYN)
+                && !seg.has_flag(crate::vtcp::flags::ACK)
+                && !table.contains_key(&key)
+            {
+                let cfg = ConnConfig {
+                    local_addr: Some(SocketAddr::new(
+                        IpAddr::V4(inside_ip),
+                        self.cfg.control_port,
+                    )),
+                    remote_addr: Some(SocketAddr::new(IpAddr::V4(client_ip), client_port)),
+                    local_port: self.cfg.control_port,
+                    remote_port: client_port,
+                    ..Default::default()
+                };
+                table.insert(
+                    key,
+                    CtrlConn {
+                        conn: Conn::new(cfg),
+                        client_ip,
+                        req: Vec::new(),
+                        responded: false,
+                    },
+                );
+                fresh = true;
+            }
+
+            let Some(cc) = table.get_mut(&key) else {
+                // No state for this tuple (e.g. a stray ACK/data after we tore
+                // the connection down). Consume it so it does not leak into the
+                // NAT mapping path for our own control endpoint.
+                return true;
+            };
+
+            // Drive the state machine: the opening SYN goes through the passive
+            // open (`accept_syn`); every later segment goes through the normal
+            // dispatcher.
+            if fresh {
+                outgoing.extend(cc.conn.accept_syn(&seg));
+            } else {
+                outgoing.extend(cc.conn.handle_segment(&seg));
+            }
+
+            // Once established, pull any decrypted bytes off the stream and try
+            // to satisfy a complete HTTP request.
+            if cc.conn.is_established() && !cc.responded {
+                let mut buf = [0u8; 2048];
+                loop {
+                    let n = cc.conn.read(&mut buf);
+                    if n == 0 {
+                        break;
+                    }
+                    if cc.req.len() + n > MAX_REQUEST_BYTES {
+                        // Oversized request: abort the connection.
+                        outgoing.extend(cc.conn.abort());
+                        remove = true;
+                        break;
+                    }
+                    cc.req.extend_from_slice(&buf[..n]);
+                }
+
+                if !remove {
+                    if let Some(req) = parse_http_request(&cc.req) {
+                        let res =
+                            self.handle_soap(nat, &req.soap_action, &req.body, Some(cc.client_ip));
+                        let resp = build_http_response(&res);
+                        let (_, segs) = cc.conn.write(&resp);
+                        outgoing.extend(segs);
+                        // Single request/response per connection: half-close.
+                        outgoing.extend(cc.conn.close());
+                        cc.responded = true;
+                    }
+                    // TODO(nat): pipelined / multi-request HTTP over a single
+                    // control connection is not handled — we serve exactly one
+                    // request then close, which matches the common UPnP control
+                    // flow (one AddPortMapping/DeletePortMapping/etc).
+                }
+            }
+
+            // Reap fully-closed connections so the table does not grow.
+            if cc.conn.is_closed() {
+                remove = true;
+            }
+        }
+
+        if remove {
+            self.ctrl.lock().unwrap().remove(&key);
+        }
+
+        // Wrap each emitted segment in IPv4 (server->client) and inject inside.
+        for seg in outgoing {
+            let ip = wrap_tcp_v4(inside_ip, client_ip, &seg);
+            nat.send_inside(Packet::from_slice(&ip));
+        }
+        true
     }
 
     // ---- SOAP ----------------------------------------------------------
@@ -370,13 +543,7 @@ impl LocalHelper for UPnPHelper {
         let ihl = (bytes[0] & 0x0F) as usize * 4;
         match bytes[9] {
             PROTO_UDP => self.handle_udp(nat, bytes, ihl),
-            PROTO_TCP => {
-                // TODO(nat): terminate TCP to the control port and run the SOAP
-                // handler over it. Needs a virtual TCP server (vclient.Listen),
-                // which is not yet available. We do not consume the packet so
-                // normal NAT processing continues.
-                false
-            }
+            PROTO_TCP => self.handle_tcp(nat, bytes, ihl),
             _ => false,
         }
     }
@@ -433,6 +600,118 @@ fn build_udp_packet(
     pkt[28..].copy_from_slice(payload);
     // pkt[26..28] UDP checksum left zero.
     pkt
+}
+
+/// Wrap a marshaled TCP segment (`src`->`dst`) in a minimal IPv4 header with a
+/// correct IP header checksum and TCP checksum. Mirrors the framing used by
+/// `vclient::tcp` / `slirp::tcp_stream`.
+fn wrap_tcp_v4(src: Ipv4Addr, dst: Ipv4Addr, seg: &[u8]) -> Vec<u8> {
+    let total = 20 + seg.len();
+    let mut ip = vec![0u8; total];
+    ip[0] = 0x45;
+    ip[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+    ip[8] = 64;
+    ip[9] = Protocol::TCP.as_u8();
+    ip[12..16].copy_from_slice(&src.octets());
+    ip[16..20].copy_from_slice(&dst.octets());
+    let cs = checksum(&ip[..20]);
+    ip[10..12].copy_from_slice(&cs.to_be_bytes());
+    ip[20..].copy_from_slice(seg);
+    // Patch the TCP checksum (pseudo-header + segment) into bytes 16..18.
+    let pseudo = pseudo_header_checksum(
+        Protocol::TCP,
+        IpAddr::V4(src),
+        IpAddr::V4(dst),
+        seg.len() as u16,
+    );
+    let body = !checksum(seg);
+    let tcp_cs = !combine_checksums(pseudo, body);
+    ip[20 + 16..20 + 18].copy_from_slice(&tcp_cs.to_be_bytes());
+    ip
+}
+
+/// A parsed HTTP/1.1 request: enough of one for the UPnP SOAP control flow.
+struct HttpRequest {
+    /// Value of the `SOAPAction` header (raw; `normalize_action` strips it).
+    soap_action: String,
+    /// The request body (Content-Length bytes).
+    body: Vec<u8>,
+}
+
+/// Parse a buffered HTTP/1.1 request. Returns `None` if the request is not yet
+/// complete (headers not terminated, or body shorter than `Content-Length`).
+///
+/// This is a deliberately small, std-only parser for the single
+/// request/response UPnP control exchange: it reads the request line + headers,
+/// honours `Content-Length`, and pulls out the `SOAPAction` header. Anything
+/// beyond that (chunked transfer-encoding, pipelining, trailers) is left as
+/// `// TODO(nat)`.
+fn parse_http_request(buf: &[u8]) -> Option<HttpRequest> {
+    // Find the end of the header block (CRLFCRLF).
+    let hdr_end = find_subslice(buf, b"\r\n\r\n")?;
+    let head = &buf[..hdr_end];
+    let body_start = hdr_end + 4;
+
+    let head_str = String::from_utf8_lossy(head);
+    let mut lines = head_str.split("\r\n");
+    // Request line (METHOD SP path SP version) — we accept any method; UPnP
+    // control uses POST.
+    let _request_line = lines.next()?;
+
+    let mut content_length: usize = 0;
+    let mut soap_action = String::new();
+    for line in lines {
+        if let Some((name, value)) = line.split_once(':') {
+            let name = name.trim();
+            let value = value.trim();
+            if name.eq_ignore_ascii_case("content-length") {
+                content_length = value.parse().unwrap_or(0);
+            } else if name.eq_ignore_ascii_case("soapaction") {
+                soap_action = value.to_string();
+            }
+            // TODO(nat): chunked Transfer-Encoding is not handled.
+        }
+    }
+
+    if buf.len() < body_start + content_length {
+        return None; // body not fully buffered yet
+    }
+    let body = buf[body_start..body_start + content_length].to_vec();
+    Some(HttpRequest { soap_action, body })
+}
+
+/// Build an HTTP/1.1 response carrying a SOAP result. A 200 status yields
+/// `200 OK`; anything else (a SOAP fault) yields `500 Internal Server Error`,
+/// matching the UPnP convention that faults travel with HTTP 500.
+fn build_http_response(res: &SoapResult) -> Vec<u8> {
+    let (code, reason) = if res.status == 200 {
+        (200u16, "OK")
+    } else {
+        (500u16, "Internal Server Error")
+    };
+    let body = res.body.as_bytes();
+    let head = format!(
+        "HTTP/1.1 {} {}\r\n\
+Content-Type: text/xml; charset=\"utf-8\"\r\n\
+Content-Length: {}\r\n\
+Connection: close\r\n\
+Server: pktkit/1.0 UPnP/1.1\r\n\r\n",
+        code,
+        reason,
+        body.len(),
+    );
+    let mut out = Vec::with_capacity(head.len() + body.len());
+    out.extend_from_slice(head.as_bytes());
+    out.extend_from_slice(body);
+    out
+}
+
+/// Find the first occurrence of `needle` in `haystack`, returning its offset.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 /// Strip surrounding quotes and the leading `urn...#` from a SOAPAction header.
@@ -756,5 +1035,126 @@ MAN: \"ssdp:discover\"\r\nST: urn:schemas-upnp-org:device:InternetGatewayDevice:
         let s = String::from_utf8_lossy(body);
         assert!(s.starts_with("HTTP/1.1 200 OK"), "body: {}", s);
         assert!(s.contains("rootDesc.xml"), "body: {}", s);
+    }
+
+    /// Drive a client `vtcp::Conn` through the NAT's UPnP control path: open a
+    /// TCP connection to the control port, POST an `AddPortMapping` SOAP
+    /// request, and assert that a port forward is created and a 200 HTTP
+    /// response with the SOAP envelope comes back.
+    #[test]
+    fn upnp_control_tcp_add_port_mapping_round_trip() {
+        use crate::vtcp::{Conn, ConnConfig};
+
+        let nat = Nat::new(pfx("10.0.0.1/24"), pfx("203.0.113.1/24"));
+        let h = UPnPHelper::new(UPnPConfig::default());
+        let inside_ip = Ipv4Addr::new(10, 0, 0, 1);
+        let client_ip = Ipv4Addr::new(10, 0, 0, 42);
+        let control_port = h.config().control_port;
+        let client_port = 51000u16;
+
+        // The helper injects server->client packets onto the inside via
+        // `send_inside`; capture them in a queue we pump back into the client.
+        let to_client = Arc::new(StdMutex::new(Vec::<Vec<u8>>::new()));
+        let tc = to_client.clone();
+        nat.inside().set_handler(Arc::new(move |p| {
+            tc.lock().unwrap().push(p.as_bytes().to_vec());
+            Ok(())
+        }));
+
+        // The virtual client (the inside host dialing the control port).
+        let mut client = Conn::new(ConnConfig {
+            local_addr: Some(SocketAddr::new(IpAddr::V4(client_ip), client_port)),
+            remote_addr: Some(SocketAddr::new(IpAddr::V4(inside_ip), control_port)),
+            local_port: client_port,
+            remote_port: control_port,
+            ..Default::default()
+        });
+
+        // Pump: feed every queued client segment into the helper, then feed
+        // every server->client packet the helper produced back into the client,
+        // until both stop emitting. Collected client-side payload accumulates in
+        // `recv_payload`.
+        let mut pending: Vec<Vec<u8>> = client.connect();
+        let mut recv_payload: Vec<u8> = Vec::new();
+        let mut http_sent = false;
+
+        for _round in 0..64 {
+            // Deliver client->server segments to the helper.
+            for seg in pending.drain(..) {
+                let ip = wrap_tcp_v4(client_ip, inside_ip, &seg);
+                let consumed = h.handle_local(&nat, crate::Packet::from_slice(&ip));
+                assert!(consumed, "control-port TCP should be consumed");
+            }
+
+            // Pull server->client packets and feed them into the client conn.
+            let server_pkts: Vec<Vec<u8>> = std::mem::take(&mut *to_client.lock().unwrap());
+            let mut produced: Vec<Vec<u8>> = Vec::new();
+            for pkt in server_pkts {
+                let ihl = (pkt[0] & 0x0F) as usize * 4;
+                let seg = Segment::parse(&pkt[ihl..]).expect("server segment parses");
+                produced.extend(client.handle_segment(&seg));
+            }
+
+            // Drain any HTTP response bytes the client received.
+            let mut buf = [0u8; 2048];
+            loop {
+                let n = client.read(&mut buf);
+                if n == 0 {
+                    break;
+                }
+                recv_payload.extend_from_slice(&buf[..n]);
+            }
+
+            // Once established, send the SOAP POST exactly once.
+            if client.is_established() && !http_sent {
+                let body = add_body(8080, 80, "10.0.0.42", "TCP", 3600);
+                let req = format!(
+                    "POST /ctl/WANIPConnection HTTP/1.1\r\n\
+Host: {inside}:{port}\r\n\
+Content-Type: text/xml; charset=\"utf-8\"\r\n\
+SOAPAction: \"urn:schemas-upnp-org:service:WANIPConnection:1#AddPortMapping\"\r\n\
+Content-Length: {len}\r\n\r\n",
+                    inside = inside_ip,
+                    port = control_port,
+                    len = body.len(),
+                );
+                let mut wire = req.into_bytes();
+                wire.extend_from_slice(&body);
+                let (n, segs) = client.write(&wire);
+                assert_eq!(
+                    n,
+                    wire.len(),
+                    "client send buffer should accept the request"
+                );
+                produced.extend(segs);
+                http_sent = true;
+            }
+
+            pending = produced;
+            if pending.is_empty()
+                && http_sent
+                && find_subslice(&recv_payload, b"\r\n\r\n").is_some()
+            {
+                break;
+            }
+        }
+
+        // The port forward must have been created by `handle_soap`.
+        let fwds = nat.list_port_forwards();
+        assert_eq!(fwds.len(), 1, "expected one port forward");
+        assert_eq!(fwds[0].outside_port, 8080);
+        assert_eq!(fwds[0].inside_port, 80);
+        assert_eq!(fwds[0].inside_ip, client_ip);
+        assert_eq!(fwds[0].proto, PROTO_TCP);
+
+        // The client must have received a 200 HTTP response with the SOAP body.
+        let resp = String::from_utf8_lossy(&recv_payload);
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "response: {}", resp);
+        assert!(
+            resp.contains("AddPortMappingResponse"),
+            "response: {}",
+            resp
+        );
+        assert!(resp.contains("s:Envelope"), "response: {}", resp);
     }
 }

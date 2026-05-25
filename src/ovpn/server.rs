@@ -131,6 +131,11 @@ impl Server {
             let s = server.clone();
             threads.push(thread::spawn(move || s.tcp_loop(tcp)));
         }
+        // Maintenance loop: drives control-channel retransmission timers.
+        {
+            let s = server.clone();
+            threads.push(thread::spawn(move || s.maintenance_loop()));
+        }
         drop(threads);
 
         Ok(server)
@@ -229,6 +234,50 @@ impl Server {
 
         // Connection closed: drop the peer.
         self.remove_peer(key);
+    }
+
+    /// Periodically drive each peer's control-channel retransmission timers.
+    ///
+    /// OpenVPN's reliable layer re-sends unacknowledged `P_CONTROL` packets on
+    /// a per-packet timer. The peer state machine is caller-driven
+    /// ([`Peer::tick`]), so this loop ticks every live peer on a fixed cadence
+    /// and ships whatever datagrams the tick produces. A peer whose retries are
+    /// exhausted (`PeerOutput::close`) is reaped.
+    fn maintenance_loop(self: Arc<Self>) {
+        // Tick at the base retransmit interval; finer granularity buys nothing
+        // since deadlines are at least RETRANSMIT_INITIAL apart.
+        let interval = super::reliable::RETRANSMIT_INITIAL;
+        loop {
+            thread::sleep(interval);
+            if self.closed.load(Ordering::SeqCst) {
+                return;
+            }
+            let now = std::time::Instant::now();
+            // Snapshot the entries so we don't hold the peers lock while
+            // ticking (which takes each peer's own lock and may send).
+            let entries: Vec<Arc<PeerEntry>> =
+                self.peers.read().unwrap().values().cloned().collect();
+            for entry in entries {
+                let key = PeerKey::new(entry.addr, entry.transport);
+                let out = {
+                    let mut peer = entry.peer.lock().unwrap();
+                    match peer.tick(now) {
+                        Ok(o) => o,
+                        Err(_) => {
+                            drop(peer);
+                            self.remove_peer(key);
+                            continue;
+                        }
+                    }
+                };
+                for dgram in &out.send {
+                    let _ = self.send_raw(&entry, dgram);
+                }
+                if out.close {
+                    self.remove_peer(key);
+                }
+            }
+        }
     }
 
     fn get_or_create_peer(

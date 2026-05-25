@@ -2,12 +2,18 @@
 
 use crate::slirp::packet::build_udp_packet6;
 use crate::Result;
+use std::io::ErrorKind;
 use std::net::{Ipv6Addr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 pub(crate) type SendFn = Arc<dyn Fn(&[u8]) -> Result<()> + Send + Sync>;
+
+/// How long the reader thread blocks in a single `recv` before re-checking the
+/// stop flag. `std::net::UdpSocket` exposes no `shutdown(2)`, so we wake the
+/// reader cooperatively rather than by closing the fd out from under it.
+const READ_TIMEOUT: Duration = Duration::from_millis(500);
 
 pub(crate) struct UdpConn6 {
     c_src_ip: Ipv6Addr,
@@ -29,6 +35,9 @@ impl UdpConn6 {
     ) -> Result<Arc<UdpConn6>> {
         let socket = UdpSocket::bind("[::]:0")?;
         socket.connect((dst_ip, dst_port))?;
+        // A bounded read timeout lets the reader thread observe `closed`
+        // promptly without relying on closing the fd (std has no UDP shutdown).
+        socket.set_read_timeout(Some(READ_TIMEOUT))?;
         let socket = Arc::new(socket);
         let closed = Arc::new(AtomicBool::new(false));
         let conn = Arc::new(UdpConn6 {
@@ -50,7 +59,14 @@ impl UdpConn6 {
                 }
                 let n = match socket.recv(&mut buf) {
                     Ok(n) if n > 0 => n,
-                    _ => return,
+                    Ok(_) => continue,
+                    // Timeout: loop back and re-check the stop flag.
+                    Err(e)
+                        if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut =>
+                    {
+                        continue
+                    }
+                    Err(_) => return,
                 };
                 let conn = match weak.upgrade() {
                     Some(c) => c,
@@ -93,8 +109,11 @@ impl UdpConn6 {
     }
 
     pub(crate) fn close(&self) {
+        // `std::net::UdpSocket` offers no `shutdown(2)` and slirp stays
+        // libc-free, so we cannot unblock the reader by tearing down the fd.
+        // Instead the reader uses a bounded read timeout (READ_TIMEOUT) and
+        // polls this flag, so it exits cleanly within one timeout window.
         self.closed.store(true, Ordering::Relaxed);
-        let _ = self.socket.set_nonblocking(true);
     }
 }
 
