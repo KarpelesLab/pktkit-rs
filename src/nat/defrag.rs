@@ -135,12 +135,12 @@ impl Defragger {
         let mut first_hdr: Option<Vec<u8>> = None;
         for f in entry.frags.iter() {
             let end = (f.offset + f.data.len()).min(total);
-            for i in f.offset..end {
-                if covered[i] {
+            for slot in &mut covered[f.offset..end] {
+                if *slot {
                     inner.entries.remove(&k);
                     return None;
                 }
-                covered[i] = true;
+                *slot = true;
             }
             if let Some(h) = &f.hdr {
                 first_hdr = Some(h.clone());

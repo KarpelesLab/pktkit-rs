@@ -210,7 +210,7 @@ impl TcpStack {
     fn alloc_port(&self) -> u16 {
         let mut p = self.next_port.lock().unwrap();
         let port = *p;
-        *p = if *p >= 65535 { 49152 } else { *p + 1 };
+        *p = if *p == 65535 { 49152 } else { *p + 1 };
         port
     }
 

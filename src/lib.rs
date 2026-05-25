@@ -27,6 +27,13 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![warn(missing_debug_implementations)]
 #![warn(rust_2018_idioms)]
+// A low-level networking crate carries inherently rich callback/handler types
+// and a few wide protocol constructors; and several modules mirror the Go
+// upstream's `pkg/pkg.rs` layout. These clippy lints fight that on purpose, so
+// we opt out crate-wide rather than scatter per-item allows.
+#![allow(clippy::type_complexity)]
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::module_inception)]
 
 // --- Core (always compiled) -------------------------------------------------
 

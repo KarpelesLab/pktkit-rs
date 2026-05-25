@@ -640,7 +640,7 @@ impl Nat64 {
         let start = inner.next_port;
         loop {
             let p = inner.next_port;
-            inner.next_port = if inner.next_port >= NAT_PORT_MAX {
+            inner.next_port = if inner.next_port == NAT_PORT_MAX {
                 NAT_PORT_MIN
             } else {
                 inner.next_port + 1

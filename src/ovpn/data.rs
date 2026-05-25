@@ -162,7 +162,7 @@ fn gcm_seal_in_place(
     key: &[u8],
     nonce: &[u8; GCM_NONCE],
     ad: &[u8],
-    buf: &mut Vec<u8>,
+    buf: &mut [u8],
 ) -> io::Result<[u8; GCM_TAG]> {
     let nonce = aes_gcm::Nonce::from_slice(nonce);
     let tag = match key.len() {

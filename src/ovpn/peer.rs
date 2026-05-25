@@ -323,10 +323,7 @@ impl Peer {
     /// After authentication the only control traffic the happy path handles is
     /// `PUSH_REQUEST` (NUL-terminated), to which we reply with a `PUSH_REPLY`.
     fn handle_post_auth_control(&mut self) -> io::Result<()> {
-        loop {
-            let Some(nul) = self.ctrl_buf.iter().position(|&b| b == 0) else {
-                break;
-            };
+        while let Some(nul) = self.ctrl_buf.iter().position(|&b| b == 0) {
             let line: Vec<u8> = self.ctrl_buf.drain(..=nul).collect();
             let s = String::from_utf8_lossy(&line[..line.len() - 1]).into_owned();
             if s == "PUSH_REQUEST" {
@@ -497,17 +494,15 @@ impl Peer {
         };
 
         let mut buf = data.to_vec();
-        match data::decrypt(opts, keys, &mut buf)? {
-            Some(dec) => {
-                if !self.replay.check(dec.pid) {
-                    return Ok(out); // replay — drop
-                }
-                if dec.is_ping {
-                    return Ok(out);
-                }
-                out.deliver = Some(dec.payload.to_vec());
+        // `None` = auth failure; drop silently.
+        if let Some(dec) = data::decrypt(opts, keys, &mut buf)? {
+            if !self.replay.check(dec.pid) {
+                return Ok(out); // replay — drop
             }
-            None => {} // auth failure — drop silently
+            if dec.is_ping {
+                return Ok(out);
+            }
+            out.deliver = Some(dec.payload.to_vec());
         }
         Ok(out)
     }
