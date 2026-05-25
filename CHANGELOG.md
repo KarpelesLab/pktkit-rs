@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format is loosely
 based on [Keep a Changelog](https://keepachangelog.com/); this crate follows
 semantic versioning once it reaches 1.0.
 
+## [0.1.2](https://github.com/KarpelesLab/pktkit-rs/compare/v0.1.1...v0.1.2) - 2026-05-25
+
+### Other
+
+- de-flake the outbound-vtcp large-transfer test
+- drive outbound TCP NAT with vtcp::Conn (parity with Go)
+- server-side Listen (inbound virtual TCP accept)
+
 ## [0.1.1](https://github.com/KarpelesLab/pktkit-rs/compare/v0.1.0...v0.1.1) - 2026-05-25
 
 ### Other
