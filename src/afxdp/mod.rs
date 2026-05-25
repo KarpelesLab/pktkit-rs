@@ -1,80 +1,35 @@
-//! Linux AF_XDP zero-copy sockets (work in progress).
+//! Linux AF_XDP zero-copy sockets.
 //!
-//! The Go upstream implements an AF_XDP socket driver with UMEM rings, a
-//! minimal eBPF program loaded via `BPF_PROG_LOAD`, and shared
-//! FILL/COMPLETION/RX/TX rings via `mmap`. Porting it to Rust requires
-//! reproducing roughly 1200 lines of low-level kernel-ABI code (`bpf(2)`,
-//! `mmap(2)` of `xsk_ring_offsets`, register allocation for eBPF, …) and
-//! is a separate work-package.
+//! A port of the Go upstream's `afxdp` package (`xdp.go`, `ring.go`,
+//! `bpf.go`). It opens an `AF_XDP` socket, registers a UMEM region, sizes and
+//! `mmap`s the FILL/COMPLETION/RX/TX rings, loads a minimal `XDP_REDIRECT`
+//! eBPF program into an XSKMAP, binds to an interface/queue, and runs a poll
+//! loop that delivers received Ethernet frames to an [`L2Handler`] while
+//! recycling UMEM frames back to the kernel.
 //!
-//! This stub exposes the public types so the `afxdp` feature compiles, but
-//! every constructor returns
-//! `io::Error::new(io::ErrorKind::Unsupported, "TODO(afxdp): not yet ported")`.
-//! Track progress under `// TODO(afxdp): …` markers.
+//! The device is presented as an [`L2Device`](crate::L2Device):
+//!
+//! - [`Device::open`] performs the full setup.
+//! - [`L2Device::send`](crate::L2Device::send) copies a frame into a free
+//!   UMEM slot and enqueues it on the TX ring.
+//! - the background poll loop invokes the installed handler per RX frame.
+//!
+//! # Requirements
+//!
+//! AF_XDP needs root (or `CAP_NET_ADMIN` + `CAP_BPF`) and a real NIC. The pure
+//! pieces — ring index math, eBPF byte encoding, netlink message layout,
+//! UMEM offset arithmetic — are unit-tested. Paths that require hardware are
+//! marked `// TODO(afxdp): needs hardware to verify`.
+//!
+//! # Module layout
+//!
+//! - [`ring`]: lock-free SPSC rings over the `mmap`'d shared memory.
+//! - [`bpf`]: eBPF program builder/loader and XSKMAP helpers.
+//! - `xdp` (private): socket setup and datapath; defines [`Config`]/[`Device`].
 
-use crate::{Frame, L2Device, L2Handler, MacAddr, Result};
-use std::io;
+mod xdp;
 
-/// Configuration for an AF_XDP socket. Mirrors the Go upstream's `Config`.
-#[derive(Debug, Clone)]
-pub struct Config {
-    /// Interface to bind, e.g. `"eth0"`.
-    pub interface: String,
-    /// NIC queue ID (usually 0).
-    pub queue_id: u32,
-    /// Ring size (must be a power of two). Default 2048.
-    pub ring_size: u32,
-    /// Frame size in bytes. Default 4096.
-    pub frame_size: u32,
-    /// Number of frames in the UMEM. Default 4096.
-    pub num_frames: u32,
-}
+pub mod bpf;
+pub mod ring;
 
-impl Default for Config {
-    fn default() -> Config {
-        Config {
-            interface: String::new(),
-            queue_id: 0,
-            ring_size: 2048,
-            frame_size: 4096,
-            num_frames: 4096,
-        }
-    }
-}
-
-/// AF_XDP socket presented as an [`L2Device`].
-///
-/// **TODO(afxdp):** the real implementation lives behind the `linux` cfg in
-/// the Go upstream (`xdp.go`, `ring.go`, `bpf.go`). This Rust stub returns
-/// `ErrorKind::Unsupported` from every constructor.
-#[derive(Debug)]
-pub struct Device {
-    _private: (),
-}
-
-impl Device {
-    /// Open an AF_XDP socket. Always returns `Unsupported` until the
-    /// implementation lands.
-    pub fn open(_cfg: Config) -> Result<Device> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "TODO(afxdp): not yet ported from Go upstream",
-        ))
-    }
-}
-
-impl L2Device for Device {
-    fn set_handler(&self, _h: L2Handler) {}
-    fn send(&self, _f: &Frame) -> Result<()> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "TODO(afxdp): send not yet implemented",
-        ))
-    }
-    fn hw_addr(&self) -> MacAddr {
-        MacAddr::zero()
-    }
-    fn close(&self) -> Result<()> {
-        Ok(())
-    }
-}
+pub use xdp::{Config, Device};

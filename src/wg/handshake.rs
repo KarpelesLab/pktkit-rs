@@ -20,7 +20,7 @@ use crate::wg::constants::{
 };
 use crate::wg::crypto::{
     aead_open_zero, aead_seal_zero, blake2s_mac_128, calculate_mac1_key, ct_eq, fill_random,
-    generate_private_key, initial_chain_key, initial_hash, mix_hash, mix_key, mix_psk,
+    generate_private_key, initial_chain_key, initial_hash, is_zero, mix_hash, mix_key, mix_psk,
     x25519_dh, x25519_public,
 };
 use crate::wg::handler::{Handler, Keypair, PacketResult, PacketType};
@@ -190,15 +190,13 @@ pub(crate) fn initiate_handshake(h: &Handler, peer_key: &NoisePublicKey) -> Resu
     pkt[INIT_OFF_STATIC..INIT_OFF_STATIC_END].copy_from_slice(&enc_static);
     pkt[INIT_OFF_TIMESTAMP..INIT_OFF_TIMESTAMP_END].copy_from_slice(&enc_timestamp);
 
-    // MAC1: Blake2s-MAC-128(key = MAC1_KEY(peer_static), msg = pkt[..MAC1 offset]).
-    let mac1_key = calculate_mac1_key(peer_key);
-    let mac1 = blake2s_mac_128(&mac1_key, &pkt[..INIT_OFF_MAC1]);
-    pkt[INIT_OFF_MAC1..INIT_OFF_MAC2].copy_from_slice(&mac1);
-    // MAC2 stays zero until we receive a cookie reply.
-    // TODO(wg): full cookie-aware MAC2 for under-load initiation.
-
-    // Persist handshake state.
+    // Persist handshake state *before* computing MACs so the cookie generator
+    // is the single source of truth for the peer's MAC1/MAC2.
     h.insert_handshake(sender_idx, hs)?;
+
+    // MAC1 (+ MAC2 if a cookie reply has been received for this peer). This
+    // writes the trailing 32 bytes of the packet.
+    h.cookie_add_macs(peer_key, &mut pkt);
 
     key.zeroize();
     Ok(pkt)
@@ -360,17 +358,30 @@ pub(crate) fn process_handshake_initiation(
     h.inc_active_handshakes();
     let _guard = DecGuard(h);
 
-    // Validate MAC1 against our public key.
-    if !check_mac1(h.public_key().as_bytes(), data) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid MAC1",
-        ));
+    // Validate MAC1 against our public key — always drop if invalid.
+    if !h.cookie_check_mac1(data) {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid MAC1"));
     }
 
-    // TODO(wg): full MAC2 + cookie-reply path. For now we accept regardless of
-    // load — that means the responder can be DoS'd by spammed initiations.
-    let _ = remote_addr;
+    // Under load: require a valid MAC2. The sender index lives at
+    // data[4..8]; MAC1 occupies data[116..132] on a 148-byte initiation.
+    if h.is_under_load() {
+        let sender = u32::from_le_bytes(
+            data[INIT_OFF_SENDER..INIT_OFF_EPHEMERAL].try_into().unwrap(),
+        );
+        let src = ip_bytes(remote_addr);
+        let mac2_ok = !is_zero(&data[INIT_OFF_MAC2..INIT_OFF_END])
+            && h.cookie_check_mac2(data, &src);
+        if !mac2_ok {
+            let reply = h.cookie_generate_reply(&src, sender, &data[INIT_OFF_MAC1..INIT_OFF_MAC2])?;
+            return Ok(PacketResult {
+                ty: PacketType::CookieReply,
+                response: reply,
+                data: Vec::new(),
+                peer_key: NoisePublicKey::zero(),
+            });
+        }
+    }
 
     let msg_type =
         u32::from_le_bytes(data[INIT_OFF_TYPE..INIT_OFF_SENDER].try_into().unwrap());
@@ -586,20 +597,38 @@ pub(crate) fn process_handshake_initiation(
 
 // === Cookie reply (initiator-side parse only — minimal) ====================
 
-pub(crate) fn process_cookie_reply(_h: &Handler, data: &[u8]) -> Result<PacketResult> {
+pub(crate) fn process_cookie_reply(h: &Handler, data: &[u8]) -> Result<PacketResult> {
     if data.len() < crate::wg::constants::MESSAGE_COOKIE_REPLY_SIZE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "cookie reply too short",
         ));
     }
-    // TODO(wg): decrypt the cookie under the per-peer cookie key and store it.
+    // Receiver index (our local sender index) identifies the pending handshake,
+    // which tells us which peer the reply is for.
+    let receiver = u32::from_le_bytes(data[4..8].try_into().unwrap());
+    let peer = h
+        .handshake_remote_static(receiver)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no pending handshake for cookie reply"))?;
+
+    let mut nonce = [0u8; 24];
+    nonce.copy_from_slice(&data[8..32]);
+    h.peer_consume_cookie(&peer, &nonce, &data[32..crate::wg::constants::MESSAGE_COOKIE_REPLY_SIZE])?;
+
     Ok(PacketResult {
         ty: PacketType::CookieReceived,
         response: Vec::new(),
         data: Vec::new(),
-        peer_key: NoisePublicKey::zero(),
+        peer_key: peer,
     })
+}
+
+/// Source-address bytes for cookie derivation: 4 for v4, 16 for v6.
+fn ip_bytes(addr: &SocketAddr) -> Vec<u8> {
+    match addr.ip() {
+        std::net::IpAddr::V4(a) => a.octets().to_vec(),
+        std::net::IpAddr::V6(a) => a.octets().to_vec(),
+    }
 }
 
 // === MAC1 check ============================================================

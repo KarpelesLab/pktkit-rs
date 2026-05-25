@@ -56,6 +56,8 @@ fn next() -> u64 {
 }
 
 /// Return a `u32` of non-crypto random bits.
+/// Used by DHCP (xid) and vclient (DNS id); unused under some feature sets.
+#[allow(dead_code)]
 pub fn u32() -> u32 {
     next() as u32
 }

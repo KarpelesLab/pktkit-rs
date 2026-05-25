@@ -33,6 +33,7 @@
 
 mod adapter;
 mod constants;
+mod cookie;
 mod crypto;
 mod handler;
 mod handshake;

@@ -188,7 +188,7 @@ impl Adapter {
             let h = Handler::new(HandlerConfig {
                 private_key: cfg.private_key.clone(),
                 on_unknown_peer: cfg.on_unknown_peer.clone(),
-                load_threshold: 0,
+                load_threshold: None,
             })?;
             ServerConfig {
                 handler: Some(h),

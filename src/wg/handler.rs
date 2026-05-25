@@ -36,9 +36,11 @@ pub struct Config {
     /// Optional callback for unauthorized peers.
     pub on_unknown_peer: Option<UnknownPeerFn>,
 
-    /// Concurrent handshakes before MAC2 cookie validation is required.
-    /// Zero uses the default (20).
-    pub load_threshold: usize,
+    /// Concurrent handshakes allowed before MAC2 cookie validation kicks in.
+    /// `None` uses the default ([`DEFAULT_LOAD_THRESHOLD`]); `Some(n)` sets it
+    /// exactly, so `Some(0)` makes every initiation under-load (useful in
+    /// tests to force the cookie path).
+    pub load_threshold: Option<usize>,
 }
 
 impl std::fmt::Debug for Config {
@@ -99,6 +101,24 @@ struct PeerEntry {
     last_handshake: Option<Instant>,
     last_timestamp: [u8; TAI64N_TIMESTAMP_SIZE],
     has_timestamp: bool,
+    /// Initiator-side cookie state: writes MAC1/MAC2 on outgoing handshakes.
+    cookie_gen: Mutex<crate::wg::cookie::CookieGenerator>,
+}
+
+impl PeerEntry {
+    fn new(key: NoisePublicKey, psk: NoisePresharedKey, has_psk: bool) -> PeerEntry {
+        PeerEntry {
+            public_key: key,
+            preshared_key: psk,
+            has_psk,
+            created_at: Instant::now(),
+            expires_at: None,
+            last_handshake: None,
+            last_timestamp: [0u8; TAI64N_TIMESTAMP_SIZE],
+            has_timestamp: false,
+            cookie_gen: Mutex::new(crate::wg::cookie::CookieGenerator::new(&key)),
+        }
+    }
 }
 
 /// A derived transport keypair (rotates on each handshake completion).
@@ -152,6 +172,8 @@ pub struct Handler {
     on_unknown_peer: Mutex<Option<UnknownPeerFn>>,
     load_threshold: usize,
     active_handshakes: AtomicUsize,
+    /// Responder-side cookie validator + reply generator.
+    cookie_checker: Mutex<crate::wg::cookie::CookieChecker>,
 }
 
 impl std::fmt::Debug for Handler {
@@ -174,11 +196,7 @@ impl Handler {
         };
         let pub_key = x25519_public(&priv_key);
 
-        let lt = if cfg.load_threshold == 0 {
-            DEFAULT_LOAD_THRESHOLD
-        } else {
-            cfg.load_threshold
-        };
+        let lt = cfg.load_threshold.unwrap_or(DEFAULT_LOAD_THRESHOLD);
 
         Ok(Arc::new(Handler {
             private_key: priv_key,
@@ -190,6 +208,7 @@ impl Handler {
             on_unknown_peer: Mutex::new(cfg.on_unknown_peer),
             load_threshold: lt,
             active_handshakes: AtomicUsize::new(0),
+            cookie_checker: Mutex::new(crate::wg::cookie::CookieChecker::new(&pub_key)),
         }))
     }
 
@@ -206,34 +225,15 @@ impl Handler {
     /// Add (or refresh) an authorized peer with no preshared key.
     pub fn add_peer(&self, peer_key: NoisePublicKey) {
         let mut peers = self.peers.write().expect("peers lock");
-        peers.entry(peer_key).or_insert_with(|| PeerEntry {
-            public_key: peer_key,
-            preshared_key: NoisePresharedKey::zero(),
-            has_psk: false,
-            created_at: Instant::now(),
-            expires_at: None,
-            last_handshake: None,
-            last_timestamp: [0u8; TAI64N_TIMESTAMP_SIZE],
-            has_timestamp: false,
-        });
+        peers
+            .entry(peer_key)
+            .or_insert_with(|| PeerEntry::new(peer_key, NoisePresharedKey::zero(), false));
     }
 
     /// Add (or refresh) an authorized peer with a preshared key.
     pub fn add_peer_with_psk(&self, peer_key: NoisePublicKey, psk: NoisePresharedKey) {
         let mut peers = self.peers.write().expect("peers lock");
-        peers.insert(
-            peer_key,
-            PeerEntry {
-                public_key: peer_key,
-                preshared_key: psk,
-                has_psk: true,
-                created_at: Instant::now(),
-                expires_at: None,
-                last_handshake: None,
-                last_timestamp: [0u8; TAI64N_TIMESTAMP_SIZE],
-                has_timestamp: false,
-            },
-        );
+        peers.insert(peer_key, PeerEntry::new(peer_key, psk, true));
     }
 
     /// Remove a peer and tear down all session state belonging to it.
@@ -609,6 +609,91 @@ impl Handler {
 
     pub(crate) fn inc_active_handshakes(&self) {
         self.active_handshakes.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// True when there are more concurrent handshakes in flight than the
+    /// configured load threshold — the trigger for requiring a valid MAC2.
+    pub(crate) fn is_under_load(&self) -> bool {
+        self.active_handshakes.load(Ordering::SeqCst) > self.load_threshold
+    }
+
+    // --- cookie integration ------------------------------------------------
+
+    /// Validate MAC1 on an incoming handshake against our own public key.
+    pub(crate) fn cookie_check_mac1(&self, data: &[u8]) -> bool {
+        self.cookie_checker.lock().expect("cookie lock").check_mac1(data)
+    }
+
+    /// Validate MAC2 (under-load path).
+    pub(crate) fn cookie_check_mac2(&self, data: &[u8], src: &[u8]) -> bool {
+        self.cookie_checker.lock().expect("cookie lock").check_mac2(data, src)
+    }
+
+    /// Mint a cookie-reply message for a requester.
+    pub(crate) fn cookie_generate_reply(
+        &self,
+        src: &[u8],
+        receiver_idx: u32,
+        init_mac1: &[u8],
+    ) -> Result<Vec<u8>> {
+        self.cookie_checker
+            .lock()
+            .expect("cookie lock")
+            .generate_reply(src, receiver_idx, init_mac1)
+    }
+
+    /// Write MAC1 (+ MAC2 if a cookie is held) into an outgoing handshake for
+    /// `peer`. Falls back to a plain MAC1 if the peer is unknown.
+    pub(crate) fn cookie_add_macs(&self, peer: &NoisePublicKey, pkt: &mut [u8]) {
+        let peers = self.peers.read().expect("peers lock");
+        if let Some(entry) = peers.get(peer) {
+            entry.cookie_gen.lock().expect("cookie_gen lock").add_macs(pkt);
+        } else {
+            // Unknown peer: still write a valid MAC1.
+            let n = pkt.len();
+            if n >= crate::wg::constants::BLAKE2S_128_SIZE * 2 {
+                let smac2 = n - crate::wg::constants::BLAKE2S_128_SIZE;
+                let smac1 = smac2 - crate::wg::constants::BLAKE2S_128_SIZE;
+                let key = crate::wg::crypto::calculate_mac1_key(peer);
+                let mac1 = crate::wg::crypto::blake2s_mac_128(&key, &pkt[..smac1]);
+                pkt[smac1..smac2].copy_from_slice(&mac1);
+            }
+        }
+    }
+
+    /// Look up the peer static key associated with a pending handshake by its
+    /// (our) local sender index.
+    pub(crate) fn handshake_remote_static(&self, idx: u32) -> Option<NoisePublicKey> {
+        self.handshakes
+            .lock()
+            .expect("handshakes lock")
+            .get(&idx)
+            .map(|hs| hs.remote_static)
+    }
+
+    /// Decrypt and store a cookie received in a reply, for `peer`.
+    pub(crate) fn peer_consume_cookie(
+        &self,
+        peer: &NoisePublicKey,
+        nonce: &[u8; 24],
+        ct: &[u8],
+    ) -> Result<()> {
+        let peers = self.peers.read().expect("peers lock");
+        let entry = match peers.get(peer) {
+            Some(e) => e,
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "no peer for cookie reply",
+                ))
+            }
+        };
+        let result = entry
+            .cookie_gen
+            .lock()
+            .expect("cookie_gen lock")
+            .consume_reply(nonce, ct);
+        result
     }
 
     pub(crate) fn dec_active_handshakes(&self) {
