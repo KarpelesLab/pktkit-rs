@@ -13,10 +13,12 @@
 //!
 //! - [`Defragger`] — IPv4 reassembly, enabled per-NAT via
 //!   [`Nat::enable_defrag`].
-//! - ALGs: [`FtpHelper`], [`TftpHelper`], [`IrcHelper`], plus stubs for SIP,
-//!   H.323, PPTP (see TODO markers).
-//! - [`UPnPHelper`] / [`UPnPConfig`] — scaffolding; the SOAP server depends
-//!   on the virtual TCP feature and is not yet wired up here.
+//! - ALGs: [`FtpHelper`], [`TftpHelper`], [`IrcHelper`], [`SipHelper`],
+//!   [`H323Helper`], [`PptpHelper`].
+//! - [`UPnPHelper`] / [`UPnPConfig`] — SSDP discovery plus a SOAP control
+//!   handler ([`UPnPHelper::handle_soap`] returning [`SoapResult`]). Live TCP
+//!   termination of the control port awaits a virtual TCP server (see the
+//!   `TODO(nat)` in `upnp.rs`).
 
 mod alg_ftp;
 mod alg_h323;
@@ -40,4 +42,4 @@ pub use defrag::Defragger;
 pub use helper::{Expectation, Helper, LocalHelper, NatMapping, PacketHelper, PortForward};
 pub use nat::Nat;
 pub use nat64::Nat64;
-pub use upnp::{UPnPConfig, UPnPHelper};
+pub use upnp::{SoapResult, UPnPConfig, UPnPHelper};

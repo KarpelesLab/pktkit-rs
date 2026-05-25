@@ -209,6 +209,30 @@ impl Nat {
         self.inner.lock().unwrap().expectations.push(e);
     }
 
+    /// Find and remove the first non-expired expectation matching the given
+    /// inside target `(proto, inside_ip, inside_port)`, returning it.
+    ///
+    /// Used by ALGs whose related traffic is not keyed by the inbound 5-tuple
+    /// matched in [`Self::add_expectation`]'s normal path — notably the PPTP
+    /// GRE marker, where the NAT core does not yet forward protocol 47. Tests
+    /// also use it to assert that an expectation was registered.
+    pub fn take_expectation(
+        &self,
+        proto: u8,
+        inside_ip: Ipv4Addr,
+        inside_port: u16,
+    ) -> Option<Expectation> {
+        let now = Instant::now();
+        let mut inner = self.inner.lock().unwrap();
+        let pos = inner.expectations.iter().position(|e| {
+            now <= e.expires
+                && e.proto == proto
+                && e.inside_ip == inside_ip
+                && e.inside_port == inside_port
+        })?;
+        Some(inner.expectations.remove(pos))
+    }
+
     /// Add or update a static port forward.
     pub fn add_port_forward(&self, pf: PortForward) -> Result<()> {
         let rk = NatRevKey {
