@@ -38,7 +38,7 @@ afxdp = ["dep:libc"]
 vtcp = []
 
 # Userspace NAT stack (L3Device) routing to real OS sockets.
-slirp = []
+slirp = ["vtcp"]
 
 # High-level virtual client (Dial / Listen / DNS / minimal HTTP).
 vclient = ["vtcp"]
@@ -68,6 +68,12 @@ ovpn = [
     "dep:rsa",
     "dep:rand_core",
     "dep:getrandom",
+    # TLS for the OpenVPN control channel. The data channel still uses the
+    # RustCrypto primitives above (AES-CBC/GCM keyed via PRF 1.2). rustls is
+    # accepted here as an opt-in exception to the "minimal third-party" rule
+    # because hand-rolling TLS 1.2 + X.509 is not worth the risk.
+    "dep:rustls",
+    "dep:rustls-pemfile",
 ]
 
 # Convenience: enable everything (matches the Go upstream featureset).
@@ -104,6 +110,11 @@ rsa                 = { version = "0.9", optional = true, default-features = fal
 zeroize             = { version = "1", optional = true, default-features = false, features = ["zeroize_derive"] }
 rand_core           = { version = "0.6", optional = true }
 getrandom           = { version = "0.2", optional = true }
+# TLS for OpenVPN's control channel only (ovpn feature). Uses the `ring`
+# crypto provider to avoid a C toolchain dependency; TLS 1.2 is required
+# because OpenVPN negotiates 1.2 by default.
+rustls              = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile      = { version = "2", optional = true }
 
 [dev-dependencies]
 # Tests may exercise OS sockets; nothing extra needed beyond std.

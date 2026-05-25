@@ -11,15 +11,16 @@
 //!
 //! # Limitations versus the Go upstream
 //!
-//! - The virtual TCP listener path (`Stack::listen` + `Listener::accept`)
-//!   currently registers ports but cannot accept connections — it needs
-//!   the in-tree `vtcp` crate, which isn't ported yet.
-//! - SYN-cookie defense (`vtcp::SYNCookies`) is similarly unimplemented.
-//! - The internal TCP NAT state machine is a hand-rolled subset of the
-//!   features `vtcp` will eventually provide. It handles the
-//!   SYN/SYN-ACK/ACK handshake, bulk data in both directions, FIN-initiated
-//!   graceful close, and RST. Out-of-order reassembly, SACK, and
-//!   congestion control are missing.
+//! - The virtual TCP listener path (`Stack::listen` + `Listener::accept`) is
+//!   wired through the in-tree `vtcp` engine: inbound SYNs destined for a
+//!   registered listener mint a server-side [`vtcp::Conn`](crate::vtcp::Conn)
+//!   and, on ESTABLISHED, surface a [`TcpStream`] to the application.
+//! - SYN-cookie defense (`vtcp::SynCookies`) for the accept-queue overflow
+//!   case is not yet wired in — see `TODO(slirp)` in `usernat`.
+//! - The *outbound* (virtual→real) NAT path still uses a hand-rolled subset
+//!   (see `tcp_nat`); it handles the SYN/SYN-ACK/ACK handshake, bulk data in
+//!   both directions, FIN-initiated graceful close, and RST. Out-of-order
+//!   reassembly, SACK, and congestion control are missing there.
 
 mod checksum;
 mod icmpv4;
@@ -29,10 +30,12 @@ mod listener;
 mod listener6;
 mod packet;
 mod tcp_nat;
+mod tcp_stream;
 mod udp;
 mod udp6;
 mod usernat;
 
 pub use listener::Listener;
 pub use listener6::Listener6;
+pub use tcp_stream::TcpStream;
 pub use usernat::{NsSide, Stack};

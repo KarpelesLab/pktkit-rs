@@ -24,15 +24,18 @@ use crate::slirp::ipv6::skip_extension_headers;
 use crate::slirp::listener::{resolve_v4, Listener, ListenerKey};
 use crate::slirp::listener6::{resolve_v6, Listener6, ListenerKey6};
 use crate::slirp::tcp_nat::{build_rst_for_stray, SendBack, TcpNatConn, FLAG_SYN};
+use crate::slirp::tcp_stream::{is_closed as conn_is_closed, tick_conn, ConnState, Endpoints};
 use crate::slirp::udp::{SendFn as UdpSendFn, UdpConn};
 use crate::slirp::udp6::{SendFn as UdpSendFn6, UdpConn6};
+use crate::vtcp::segment::Segment;
+use crate::vtcp::{Conn, ConnConfig, State as VtcpState};
 use crate::{connect_l3, IpPrefix, Result};
 
 use std::collections::HashMap;
 use std::io;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6, TcpStream};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -56,7 +59,6 @@ struct Key6 {
 
 /// Cap on simultaneous virtual-side TCP connections; mirrors the Go
 /// constant of the same name.
-#[allow(dead_code)]
 const MAX_VIRT_TCP_CONNS: usize = 10_000;
 
 /// Time a UDP flow may sit idle before its socket is reaped.
@@ -71,6 +73,8 @@ struct Inner {
     tcp6: Mutex<HashMap<Key6, Arc<TcpNatConn>>>,
     udp: Mutex<HashMap<Key, Arc<UdpConn>>>,
     udp6: Mutex<HashMap<Key6, Arc<UdpConn6>>>,
+    // Inbound virtual TCP connections accepted by a Listener (vtcp-backed).
+    virt_tcp: Mutex<HashMap<Key, Arc<ConnState>>>,
     listeners: Mutex<HashMap<ListenerKey, Arc<Listener>>>,
     listeners6: Mutex<HashMap<ListenerKey6, Arc<Listener6>>>,
     // Per-namespace sides (each device attached via ConnectL3).
@@ -152,6 +156,7 @@ impl Stack {
             tcp6: Mutex::new(HashMap::new()),
             udp: Mutex::new(HashMap::new()),
             udp6: Mutex::new(HashMap::new()),
+            virt_tcp: Mutex::new(HashMap::new()),
             listeners: Mutex::new(HashMap::new()),
             listeners6: Mutex::new(HashMap::new()),
             ns_sides: Mutex::new(HashMap::new()),
@@ -194,12 +199,48 @@ impl Stack {
             drop(inner);
         });
 
+        // Tick thread: drive vtcp timers (RTO / keepalive / TIME-WAIT) for
+        // every accepted virtual TCP connection every 100ms, and reap any that
+        // have reached CLOSED.
+        let weak_tick = Arc::downgrade(&inner);
+        thread::spawn(move || loop {
+            thread::sleep(Duration::from_millis(100));
+            let inner = match weak_tick.upgrade() {
+                Some(i) => i,
+                None => return,
+            };
+            if inner.closed.load(Ordering::Acquire) {
+                return;
+            }
+            let conns: Vec<(Key, Arc<ConnState>)> = inner
+                .virt_tcp
+                .lock()
+                .expect("poisoned")
+                .iter()
+                .map(|(k, v)| (*k, v.clone()))
+                .collect();
+            let mut dead = Vec::new();
+            for (k, cs) in conns {
+                if tick_conn(&cs) {
+                    dead.push(k);
+                }
+            }
+            if !dead.is_empty() {
+                let mut t = inner.virt_tcp.lock().expect("poisoned");
+                for k in dead {
+                    t.remove(&k);
+                }
+            }
+            drop(inner);
+        });
+
         Arc::new(Stack { inner })
     }
 
-    /// Open a virtual listener on the stack. Currently a stub: registers
-    /// the listening port so the stack knows about it, but `accept` will
-    /// fail until the vtcp engine is integrated.
+    /// Open a virtual listener on the stack. Inbound SYNs destined for the
+    /// registered (IP, port) are passive-opened against the in-tree vtcp
+    /// engine; [`Listener::accept`] yields a [`TcpStream`](super::TcpStream)
+    /// once the handshake completes.
     pub fn listen(&self, network: &str, address: &str) -> Result<Arc<Listener>> {
         match network {
             "tcp" | "tcp4" => {
@@ -267,6 +308,13 @@ impl Stack {
         if let Ok(mut u) = self.inner.udp6.lock() {
             for (_, c) in u.drain() {
                 c.close();
+            }
+        }
+        if let Ok(mut t) = self.inner.virt_tcp.lock() {
+            for (_, state) in t.drain() {
+                let segs = state.conn.lock().expect("poisoned").abort();
+                state.wrap_and_send(segs);
+                state.signal.notify_all();
             }
         }
         Ok(())
@@ -374,8 +422,25 @@ impl Stack {
             dst_port,
         };
 
-        // Existing virtual TCP connection? (TODO(slirp): vtcp not ported)
-        // Existing NAT connection?
+        // 1) Existing inbound virtual TCP connection (vtcp-backed)?
+        let virt = inner.virt_tcp.lock().expect("poisoned").get(&key).cloned();
+        if let Some(state) = virt {
+            if let Ok(seg) = Segment::parse(tcp) {
+                state.deliver(&seg);
+            }
+            return Ok(());
+        }
+
+        // 2) SYN destined for a registered virtual listener? Passive-open a
+        //    server-side vtcp::Conn and drive the handshake.
+        if (flags & FLAG_SYN) != 0 {
+            let listener = Self::find_listener(inner, dst, dst_port);
+            if let Some(listener) = listener {
+                return Self::accept_syn_v4(inner, ns, tcp, src, dst, src_port, dst_port, listener);
+            }
+        }
+
+        // 3) Existing outbound NAT connection?
         let existing = inner.tcp.lock().expect("poisoned").get(&key).cloned();
         if let Some(c) = existing {
             return c.handle_segment(tcp);
@@ -420,6 +485,148 @@ impl Stack {
         let conn = TcpNatConn::accept_syn(src_port, dst_port, seq, remote, send_back)?;
         inner.tcp.lock().expect("poisoned").insert(key, conn);
         Ok(())
+    }
+
+    /// Look up a registered IPv4 listener for `(dst, dst_port)`, falling back
+    /// to a wildcard (0.0.0.0) listener on the same port.
+    fn find_listener(inner: &Arc<Inner>, dst: Ipv4Addr, dst_port: u16) -> Option<Arc<Listener>> {
+        let m = inner.listeners.lock().expect("poisoned");
+        if let Some(l) = m.get(&ListenerKey {
+            ip: dst.octets(),
+            port: dst_port,
+        }) {
+            return Some(l.clone());
+        }
+        m.get(&ListenerKey {
+            ip: [0, 0, 0, 0],
+            port: dst_port,
+        })
+        .cloned()
+    }
+
+    /// Passive-open a server-side `vtcp::Conn` for an inbound SYN to a virtual
+    /// listener. Drives the SYN-ACK out, registers the connection, and spawns a
+    /// short-lived thread that enqueues the [`TcpStream`](super::TcpStream)
+    /// onto the listener once the handshake reaches ESTABLISHED.
+    #[allow(clippy::too_many_arguments)]
+    fn accept_syn_v4(
+        inner: &Arc<Inner>,
+        ns: u64,
+        tcp: &[u8],
+        src: Ipv4Addr,
+        dst: Ipv4Addr,
+        src_port: u16,
+        dst_port: u16,
+        listener: Arc<Listener>,
+    ) -> Result<()> {
+        let key = Key {
+            ns,
+            src_ip: src.octets(),
+            src_port,
+            dst_ip: dst.octets(),
+            dst_port,
+        };
+        if inner.virt_tcp.lock().expect("poisoned").len() >= MAX_VIRT_TCP_CONNS {
+            return Ok(()); // silently drop; client will retransmit
+        }
+        // TODO(slirp): when the accept queue is near-full, fall back to a
+        // stateless SYN-cookie (vtcp::SynCookies) SYN-ACK instead of dropping.
+        if listener.queue_full() {
+            return Ok(());
+        }
+        let seg = match Segment::parse(tcp) {
+            Ok(s) => s,
+            Err(_) => return Ok(()),
+        };
+
+        // Sink: wrap engine segments (built by ConnState) and inject them.
+        let inner_for_send = inner.clone();
+        let sink: Arc<dyn Fn(&[u8]) + Send + Sync> = Arc::new(move |p: &[u8]| {
+            let _ = Self::dispatch(&inner_for_send, ns, p);
+        });
+
+        let cfg = ConnConfig {
+            local_addr: Some(SocketAddr::new(std::net::IpAddr::V4(dst), dst_port)),
+            remote_addr: Some(SocketAddr::new(std::net::IpAddr::V4(src), src_port)),
+            local_port: dst_port,
+            remote_port: src_port,
+            mss: 1460,
+            keepalive: true,
+            ..Default::default()
+        };
+        let mut conn = Conn::new(cfg);
+        let synack = conn.accept_syn(&seg);
+
+        let state = Arc::new(ConnState {
+            endpoints: Endpoints::V4 {
+                local_ip: dst,
+                local_port: dst_port,
+                remote_ip: src,
+                remote_port: src_port,
+            },
+            conn: Mutex::new(conn),
+            signal: Condvar::new(),
+            sink,
+        });
+        inner
+            .virt_tcp
+            .lock()
+            .expect("poisoned")
+            .insert(key, state.clone());
+        // Emit the SYN-ACK.
+        state.wrap_and_send(synack);
+
+        // Wait (off the dispatch path) for ESTABLISHED, then enqueue.
+        Self::spawn_accept_waiter(inner.clone(), key, state, listener);
+        Ok(())
+    }
+
+    /// Background helper: block until the handshake completes (or the conn
+    /// dies), then hand the connection to the listener's accept queue.
+    fn spawn_accept_waiter(
+        inner: Arc<Inner>,
+        key: Key,
+        state: Arc<ConnState>,
+        listener: Arc<Listener>,
+    ) {
+        thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let st = state.conn.lock().expect("poisoned").state();
+                match st {
+                    VtcpState::Established
+                    | VtcpState::FinWait1
+                    | VtcpState::FinWait2
+                    | VtcpState::CloseWait
+                    | VtcpState::Closing
+                    | VtcpState::LastAck
+                    | VtcpState::TimeWait => {
+                        if !listener.enqueue(state.clone()) {
+                            // Listener closed or queue full: abort and drop.
+                            let segs = state.conn.lock().expect("poisoned").abort();
+                            state.wrap_and_send(segs);
+                            inner.virt_tcp.lock().expect("poisoned").remove(&key);
+                        }
+                        return;
+                    }
+                    VtcpState::Closed => {
+                        inner.virt_tcp.lock().expect("poisoned").remove(&key);
+                        return;
+                    }
+                    _ => {}
+                }
+                if conn_is_closed(&state) || Instant::now() >= deadline {
+                    inner.virt_tcp.lock().expect("poisoned").remove(&key);
+                    return;
+                }
+                // Wait for an inbound segment / tick to advance the handshake.
+                let guard = state.conn.lock().expect("poisoned");
+                let _ = state
+                    .signal
+                    .wait_timeout(guard, Duration::from_millis(50))
+                    .expect("poisoned");
+            }
+        });
     }
 
     fn handle_ipv4_udp(
@@ -549,6 +756,12 @@ impl Stack {
             dst_port,
         };
 
+        // TODO(slirp): v6 accept. Mirror `accept_syn_v4` for inbound SYNs that
+        // hit a registered `Listener6` — add a `virt_tcp6` table keyed by
+        // `Key6`, passive-open a `vtcp::Conn` with `Endpoints::V6`, and enqueue
+        // the resulting `TcpStream` onto the listener. Until then, inbound v6
+        // connections to a virtual listener fall through to the NAT path below.
+
         let existing = inner.tcp6.lock().expect("poisoned").get(&key).cloned();
         if let Some(c) = existing {
             return c.handle_segment(tcp);
@@ -633,6 +846,18 @@ impl Stack {
 
     fn cleanup_namespace(inner: &Arc<Inner>, ns: u64) {
         // Drop all per-namespace flows.
+        if let Ok(mut t) = inner.virt_tcp.lock() {
+            t.retain(|k, state| {
+                if k.ns == ns {
+                    let segs = state.conn.lock().expect("poisoned").abort();
+                    state.wrap_and_send(segs);
+                    state.signal.notify_all();
+                    false
+                } else {
+                    true
+                }
+            });
+        }
         if let Ok(mut t) = inner.tcp.lock() {
             t.retain(|k, c| {
                 if k.ns == ns {
