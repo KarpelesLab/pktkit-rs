@@ -1290,7 +1290,7 @@ impl Conn {
 
     /// Non-blocking read: copies up to `buf.len()` bytes from the receive
     /// queue into `buf`. Returns the number of bytes read, or `Ok(0)` when
-    /// no data is currently available. Use [`fin_received`] / [`is_closed`]
+    /// no data is currently available. Use [`Conn::fin_received`] / [`Conn::is_closed`]
     /// to distinguish "would block" from EOF.
     pub fn read(&mut self, buf: &mut [u8]) -> usize {
         let Some(rb) = self.recv_buf.as_mut() else {

@@ -125,7 +125,7 @@ unsafe impl Sync for AddrRing {}
 
 impl AddrRing {
     /// # Safety
-    /// See [`Cursors::new`]; additionally the element size at `off.desc` must
+    /// See `Cursors::new`; additionally the element size at `off.desc` must
     /// be `u64`.
     pub unsafe fn new(mem: *mut u8, off: RingOffset, size: u32) -> AddrRing {
         AddrRing {
@@ -202,7 +202,7 @@ unsafe impl Sync for DescRing {}
 
 impl DescRing {
     /// # Safety
-    /// See [`Cursors::new`]; additionally the element size at `off.desc` must
+    /// See `Cursors::new`; additionally the element size at `off.desc` must
     /// be `xdp_desc`.
     pub unsafe fn new(mem: *mut u8, off: RingOffset, size: u32) -> DescRing {
         DescRing {
@@ -271,7 +271,7 @@ impl DescRing {
         n as usize
     }
 
-    /// See [`Cursors::need_wakeup`].
+    /// See `Cursors::need_wakeup`.
     #[inline]
     pub fn need_wakeup(&self) -> bool {
         self.cur.need_wakeup()

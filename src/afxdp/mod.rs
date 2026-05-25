@@ -4,7 +4,7 @@
 //! `bpf.go`). It opens an `AF_XDP` socket, registers a UMEM region, sizes and
 //! `mmap`s the FILL/COMPLETION/RX/TX rings, loads a minimal `XDP_REDIRECT`
 //! eBPF program into an XSKMAP, binds to an interface/queue, and runs a poll
-//! loop that delivers received Ethernet frames to an [`L2Handler`] while
+//! loop that delivers received Ethernet frames to an [`L2Handler`](crate::L2Handler) while
 //! recycling UMEM frames back to the kernel.
 //!
 //! The device is presented as an [`L2Device`](crate::L2Device):

@@ -66,79 +66,119 @@ zero dependencies.
 
 ### Point-to-point L3
 
+Devices are shared as `Arc`s (the `Arc<T>: L3Device` blanket impl makes this
+ergonomic), and `connect_l3` cross-wires their handlers:
+
 ```rust
 use std::net::Ipv4Addr;
+use std::sync::Arc;
 use pktkit::{PipeL3, IpPrefix, connect_l3};
 
-let a = PipeL3::new(IpPrefix::new(Ipv4Addr::new(10, 0, 0, 1).into(), 24));
-let b = PipeL3::new(IpPrefix::new(Ipv4Addr::new(10, 0, 0, 2).into(), 24));
-connect_l3(&a, &b);
+let a = Arc::new(PipeL3::new(IpPrefix::new(Ipv4Addr::new(10, 0, 0, 1).into(), 24)));
+let b = Arc::new(PipeL3::new(IpPrefix::new(Ipv4Addr::new(10, 0, 0, 2).into(), 24)));
+connect_l3(a, b);
 ```
 
-### Virtual LAN with DHCP and NAT (with the right features)
+### Virtual LAN with DHCP and NAT
 
 ```rust,ignore
-# // requires --features "l2adapter,dhcp,slirp,vclient"
+// requires: --features "l2adapter dhcp slirp"
 use std::net::Ipv4Addr;
-use pktkit::{L2Hub, L2Adapter, IpPrefix, dhcp::DhcpServer};
+use std::sync::Arc;
+use pktkit::{L2Hub, L2Adapter, L2AdapterConfig, IpPrefix, L3Device};
+use pktkit::dhcp::{Server as DhcpServer, ServerConfig as DhcpConfig};
 use pktkit::slirp::Stack;
-use pktkit::vclient::Client;
 
-let hub = L2Hub::new();
+let hub = Arc::new(L2Hub::new());
 
-let dhcp = DhcpServer::builder()
-    .server_ip(Ipv4Addr::new(192, 168, 0, 1))
-    .range(Ipv4Addr::new(192, 168, 0, 10), Ipv4Addr::new(192, 168, 0, 100))
-    .router(Ipv4Addr::new(192, 168, 0, 1))
-    .dns(Ipv4Addr::new(1, 1, 1, 1))
-    .build();
-hub.connect(&dhcp);
+// DHCP server handing out 192.168.0.10–100.
+let mut dcfg = DhcpConfig::new(
+    Ipv4Addr::new(192, 168, 0, 1),
+    Ipv4Addr::new(192, 168, 0, 10),
+    Ipv4Addr::new(192, 168, 0, 100),
+);
+dcfg.router = Some(Ipv4Addr::new(192, 168, 0, 1));
+dcfg.dns = vec![Ipv4Addr::new(1, 1, 1, 1)];
+let _dhcp_handle = hub.connect(DhcpServer::new(dcfg));
 
+// NAT gateway: a slirp stack routing to the real network, bridged onto L2.
 let stack = Stack::new();
-stack.set_addr(IpPrefix::new(Ipv4Addr::new(192, 168, 0, 1).into(), 24));
-hub.connect(&L2Adapter::new(&stack, None));
+stack.set_addr(IpPrefix::new(Ipv4Addr::new(192, 168, 0, 1).into(), 24)).unwrap();
+let gw = L2Adapter::new_arc(stack.clone(), L2AdapterConfig::default());
+let _gw_handle = hub.connect_arc(gw);
+```
 
-let client = Client::new();
-let adapter = L2Adapter::new(&client, None);
-hub.connect(&adapter);
-adapter.start_dhcp();
+### Virtual client over the tunnel (DNS + TCP + HTTP)
 
-let resp = client.http_client().get("https://example.com")?;
+```rust,ignore
+// requires: --features "vclient"
+use std::net::Ipv4Addr;
+use pktkit::IpPrefix;
+use pktkit::vclient::{Client, ClientConfig};
+
+let client = Client::new(ClientConfig {
+    prefix: Some(IpPrefix::new(Ipv4Addr::new(10, 0, 0, 2).into(), 24)),
+    dns: vec![Ipv4Addr::new(1, 1, 1, 1).into()],
+});
+// Wire `client` into an L3 network (slirp, wg, hub) via its L3Device impl,
+// then:
+let resp = client.http_get("http://example.com/")?;
+println!("{} {}", resp.status, resp.text());
 ```
 
 ### WireGuard server with per-peer isolation
 
 ```rust,ignore
-# // requires --features "wg,slirp"
+// requires: --features "wg slirp"
 use std::net::{Ipv4Addr, UdpSocket};
-use pktkit::{IpPrefix, wg::Adapter};
+use std::sync::Arc;
+use pktkit::{IpPrefix, L3Device};
+use pktkit::wg::{Adapter, AdapterConfig};
 use pktkit::slirp::Stack;
 
 let stack = Stack::new();
-stack.set_addr(IpPrefix::new(Ipv4Addr::new(10, 0, 0, 1).into(), 24));
+stack.set_addr(IpPrefix::new(Ipv4Addr::new(10, 0, 0, 1).into(), 24)).unwrap();
 
-let adapter = Adapter::builder().connector(&stack).build()?;
+let adapter = Adapter::new(AdapterConfig {
+    private_key,                      // your server's WireGuard private key
+    multi_handler: None,
+    connector: stack,                 // each peer gets isolated NAT via L3Connector
+    addr: IpPrefix::new(Ipv4Addr::new(10, 0, 0, 1).into(), 24),
+    on_unknown_peer: None,
+})?;
 adapter.add_peer(client_public_key);
 
 let udp = UdpSocket::bind("0.0.0.0:51820")?;
-adapter.serve(udp);
+adapter.serve(udp)?;
 ```
 
 ### QEMU VM networking
 
 ```rust,ignore
-# // requires --features "qemu"
+// requires: --features "qemu"
+use std::sync::Arc;
 use pktkit::{L2Hub, serve};
 use pktkit::qemu;
 
 let listener = qemu::Listener::bind_unix("/tmp/qemu.sock")?;
-let hub = L2Hub::new();
-serve(&listener, &hub)?;
+let hub = Arc::new(L2Hub::new());
+serve(&listener, &hub)?;  // accept loop: each VM joins the hub
 ```
 
 ## Status
 
-Active development. The API is unstable until 0.1.0.
+Active development; the API is not yet stable. Most features are functionally
+complete and tested; a few have documented `// TODO(<feature>)` gaps:
+
+- **ovpn**: tls-crypt/tls-auth, control-packet retransmit timers, and fuller
+  PUSH_REPLY negotiation are not yet implemented.
+- **afxdp**: the datapath needs root + a real NIC; pure logic is unit-tested,
+  hardware paths are marked as needing verification.
+- **tuntap**: macOS `utun` is type-checked against the Apple target but not yet
+  exercised on a macOS host.
+- **slirp**: inbound virtual TCP accept is IPv4-only (IPv6 accept is a TODO).
+- **nat**: SIP/H.323/PPTP ALGs rewrite payloads; UPnP's live TCP control
+  endpoint awaits wiring through the virtual TCP listener.
 
 ## License
 

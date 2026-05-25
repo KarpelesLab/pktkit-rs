@@ -37,7 +37,7 @@ pub struct Config {
     pub on_unknown_peer: Option<UnknownPeerFn>,
 
     /// Concurrent handshakes allowed before MAC2 cookie validation kicks in.
-    /// `None` uses the default ([`DEFAULT_LOAD_THRESHOLD`]); `Some(n)` sets it
+    /// `None` uses the default (20); `Some(n)` sets it
     /// exactly, so `Some(0)` makes every initiation under-load (useful in
     /// tests to force the cookie path).
     pub load_threshold: Option<usize>,

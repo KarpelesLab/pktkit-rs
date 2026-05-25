@@ -1,9 +1,10 @@
 //! WireGuard tunnel: Noise IKpsk2 handshake + ChaCha20-Poly1305 transport.
 //!
 //! This module is a Rust port of the Go `wg` package. Use [`Adapter`] for the
-//! one-line setup that bridges WireGuard peers into a pktkit [`L3Connector`].
-//! For lower-level control, use [`Handler`] directly (one identity) or
-//! [`MultiHandler`] (multiple identities sharing a single UDP socket).
+//! one-line setup that bridges WireGuard peers into a pktkit
+//! [`L3Connector`](crate::L3Connector). For lower-level control, use
+//! [`Handler`] directly (one identity) or [`MultiHandler`] (multiple
+//! identities sharing a single UDP socket).
 //!
 //! # Wire format
 //!
@@ -16,9 +17,10 @@
 //! |   3  |  64  | responder → initiator   |
 //! |   4  | var  | both                    |
 //!
-//! Cookies (type 3) are partially supported: the responder ignores load and
-//! never emits cookie replies; initiators recognise the type but do not
-//! re-issue with a cookied MAC2 yet. See `// TODO(wg)` markers.
+//! Cookie replies (type 3) implement the DoS-mitigation path: under load the
+//! responder validates MAC2 and answers a missing/invalid one with an
+//! address-bound cookie reply; the initiator decrypts it and retries with a
+//! valid MAC2.
 //!
 //! # Crypto
 //!
@@ -29,7 +31,8 @@
 //! - Blake2s-128 / Blake2s-256 via `blake2`; HKDF is hand-rolled on top of
 //!   `hmac::Hmac<Blake2s256>`.
 //!
-//! See [`crypto`] for the helper layer.
+//! The `crypto` submodule wraps these into the KDF/AEAD helpers the handshake
+//! and transport layers use.
 
 mod adapter;
 mod constants;

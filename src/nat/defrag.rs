@@ -189,7 +189,7 @@ impl Defragger {
         Some(result)
     }
 
-    /// Drop entries older than [`DEFRAG_TIMEOUT`]. Call this periodically;
+    /// Drop entries older than the defrag timeout. Call this periodically;
     /// the NAT's maintenance thread invokes it on its own cadence.
     pub fn sweep(&self) {
         let now = Instant::now();

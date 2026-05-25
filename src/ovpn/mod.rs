@@ -7,7 +7,7 @@
 //! What works:
 //! - [`Options`] parse / `Display` (`V4,dev-type tun,…`).
 //! - TLS 1.2 control channel over the reliable layer (rustls in buffered mode).
-//! - Key-method 2 key exchange and TLS-1.0 PRF key derivation ([`prf`]).
+//! - Key-method 2 key exchange and TLS-1.0 PRF key derivation.
 //! - Data channel: AES-256/128-GCM (AEAD) and AES-CBC + HMAC.
 //! - Replay window, PKCS#7 padding, control-packet framing.
 //! - UDP and TCP [`Server`]; per-peer [`Adapter`] over an `L3Connector` (tun)
