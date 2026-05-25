@@ -4,6 +4,12 @@ All notable changes to this project are documented here. The format is loosely
 based on [Keep a Changelog](https://keepachangelog.com/); this crate follows
 semantic versioning once it reaches 1.0.
 
+## [0.1.1](https://github.com/KarpelesLab/pktkit-rs/compare/v0.1.0...v0.1.1) - 2026-05-25
+
+### Other
+
+- slirp v6 accept, ovpn retransmit/peer-info, nat UPnP TCP, vclient UDP, wg multi-handler
+
 ## [0.1.0] — unreleased
 
 First release: a feature-gated Rust port of the Go
