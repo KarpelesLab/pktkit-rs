@@ -1,14 +1,17 @@
 //! High-level virtual client built on top of [`vtcp`](crate::vtcp).
 //!
-//! See the module-level doc for the porting status. This file lays out the
-//! type surface so callers can hold a `Client` and ask it for DNS / TCP
-//! handles; the actual wire-level integration with `vtcp::Conn` lands once
-//! the TCP engine settles.
+//! `Client` implements [`L3Device`], so it plugs into `slirp::Stack`,
+//! `wg::Adapter`, or any [`L3Connector`](crate::L3Connector). Outbound TCP
+//! connections opened via [`Client::dial_tcp`] are driven by a per-client
+//! [`TcpStack`](super::tcp); inbound IP packets the client receives are
+//! demultiplexed to the matching connection.
 
+use super::tcp::{self, TcpConn, TcpStack};
 use crate::{IpPrefix, L3Device, L3Handler, Packet, Result};
 use std::io;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// Knobs for [`Client`].
 #[derive(Debug, Clone, Default)]
@@ -19,12 +22,12 @@ pub struct ClientConfig {
     pub dns: Vec<IpAddr>,
 }
 
-/// A virtual network client. Implements [`L3Device`] so it plugs into
-/// `slirp::Stack`, `wg::Adapter`, or any other [`L3Connector`](crate::L3Connector).
+/// A virtual network client. Implements [`L3Device`].
 pub struct Client {
     cfg: Mutex<ClientConfig>,
-    handler: Mutex<Option<L3Handler>>,
+    handler: Arc<Mutex<Option<L3Handler>>>,
     addr: Mutex<IpPrefix>,
+    tcp: Arc<TcpStack>,
 }
 
 impl core::fmt::Debug for Client {
@@ -37,27 +40,61 @@ impl Client {
     /// Build a new client.
     pub fn new(cfg: ClientConfig) -> Arc<Client> {
         let addr = cfg.prefix.unwrap_or_default();
+        let handler: Arc<Mutex<Option<L3Handler>>> = Arc::new(Mutex::new(None));
+
+        // The TCP stack pushes fully-framed IP packets back out the client's
+        // installed L3 handler.
+        let h = handler.clone();
+        let sink: Arc<dyn Fn(&[u8]) + Send + Sync> = Arc::new(move |bytes: &[u8]| {
+            let handler = h.lock().unwrap().clone();
+            if let Some(handler) = handler {
+                let _ = handler(Packet::from_slice(bytes));
+            }
+        });
+        let tcp = TcpStack::new(sink);
+
         Arc::new(Client {
             cfg: Mutex::new(cfg),
-            handler: Mutex::new(None),
+            handler,
             addr: Mutex::new(addr),
+            tcp,
         })
     }
 
-    /// Open a TCP connection to `addr`.
-    ///
-    /// **TODO(vclient):** wires through to `vtcp::Conn`. Currently returns
-    /// `Unsupported`.
-    pub fn dial_tcp(&self, _addr: std::net::SocketAddr) -> Result<TcpConn> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "TODO(vclient): TCP dial needs vtcp::Conn integration",
-        ))
+    /// Open a TCP connection to `addr`, blocking until the handshake
+    /// completes (or `timeout` elapses).
+    pub fn dial_tcp(&self, addr: SocketAddr) -> Result<TcpConn> {
+        self.dial_tcp_timeout(addr, Duration::from_secs(10))
+    }
+
+    /// Like [`dial_tcp`](Self::dial_tcp) with an explicit connect timeout.
+    pub fn dial_tcp_timeout(&self, addr: SocketAddr, timeout: Duration) -> Result<TcpConn> {
+        let prefix = self.addr();
+        let local_ip = tcp::local_ip_for(prefix, addr.ip()).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "no local address in the right family for this destination",
+            )
+        })?;
+        self.tcp.dial(local_ip, addr, timeout)
     }
 
     /// Configure DNS servers (overrides DHCP-learned values).
     pub fn set_dns(&self, dns: Vec<IpAddr>) {
         self.cfg.lock().unwrap().dns = dns;
+    }
+
+    /// Resolve `host` using the configured DNS servers (via the host's real
+    /// UDP sockets — see [`Resolver`](super::Resolver)).
+    pub fn resolve(&self, host: &str) -> Result<Vec<IpAddr>> {
+        let dns = self.cfg.lock().unwrap().dns.clone();
+        if dns.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "no DNS servers configured",
+            ));
+        }
+        super::Resolver::from_servers(dns).resolve(host)
     }
 }
 
@@ -65,9 +102,10 @@ impl L3Device for Client {
     fn set_handler(&self, h: L3Handler) {
         *self.handler.lock().unwrap() = Some(h);
     }
-    fn send(&self, _pkt: &Packet) -> Result<()> {
-        // Packets arriving from the L3 network. The full implementation
-        // will demultiplex them to vtcp::Conn / UDP / ICMP. For now we drop.
+    fn send(&self, pkt: &Packet) -> Result<()> {
+        // Inbound from the L3 network. Demux to a TCP connection; UDP/ICMP
+        // demux is TODO(vclient).
+        let _ = self.tcp.handle_inbound(pkt);
         Ok(())
     }
     fn addr(&self) -> IpPrefix {
@@ -78,14 +116,7 @@ impl L3Device for Client {
         Ok(())
     }
     fn close(&self) -> Result<()> {
+        self.tcp.shutdown();
         Ok(())
     }
-}
-
-/// TCP connection handle returned by [`Client::dial_tcp`].
-///
-/// **TODO(vclient):** placeholder. Will wrap `vtcp::Conn`.
-#[derive(Debug)]
-pub struct TcpConn {
-    _private: (),
 }

@@ -19,6 +19,10 @@
 
 mod client;
 mod dns;
+mod http;
+mod tcp;
 
 pub use client::{Client, ClientConfig};
-pub use dns::{Resolver, ResolverConfig};
+pub use dns::{RecordType, Resolver, ResolverConfig};
+pub use http::{Request, Response};
+pub use tcp::TcpConn;
