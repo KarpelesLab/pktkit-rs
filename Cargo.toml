@@ -1,0 +1,117 @@
+[package]
+name = "pktkit"
+version = "0.1.0-dev"
+edition = "2021"
+rust-version = "1.75"
+authors = ["Karpeles Lab Inc."]
+license = "MIT"
+description = "Zero-copy L2/L3 packet handling toolkit. Frames, packets, hubs, adapters, NAT, virtual TCP/IP, WireGuard, OpenVPN, QEMU networking, TUN/TAP, AF_XDP — all gated behind opt-in cargo features."
+repository = "https://github.com/KarpelesLab/pktkit-rs"
+homepage = "https://github.com/KarpelesLab/pktkit-rs"
+documentation = "https://docs.rs/pktkit"
+readme = "README.md"
+keywords = ["networking", "packet", "tcp", "wireguard", "tun"]
+categories = ["network-programming", "no-std::no-alloc"]
+
+[features]
+# By default we ship only the core: Frame, Packet, hubs, pipes, traits.
+# Every other capability is opt-in so users only pull the dependencies they need.
+default = []
+
+# Bridging an L3 device onto an L2 network (ARP, NDP, gateway routing).
+l2adapter = []
+
+# DHCP client codec + DHCPServer. The client is also used by l2adapter
+# when StartDHCP() is called.
+dhcp = []
+
+# QEMU userspace network socket protocol (client + listener).
+qemu = []
+
+# Linux/macOS TUN/TAP device support.
+tuntap = ["dep:libc"]
+
+# Linux AF_XDP zero-copy sockets.
+afxdp = ["dep:libc"]
+
+# Pure-Rust virtual TCP engine.
+vtcp = []
+
+# Userspace NAT stack (L3Device) routing to real OS sockets.
+slirp = []
+
+# High-level virtual client (Dial / Listen / DNS / minimal HTTP).
+vclient = ["vtcp"]
+
+# Packet-level IPv4 NAT, NAT64, ALGs, defrag, UPnP.
+nat = []
+
+# WireGuard tunnel (Noise IK handshake + transport).
+wg = [
+    "dep:curve25519-dalek",
+    "dep:chacha20poly1305",
+    "dep:blake2",
+    "dep:hmac",
+    "dep:zeroize",
+    "dep:rand_core",
+    "dep:getrandom",
+]
+
+# OpenVPN server (TLS control channel + AES-CBC/GCM data channel).
+ovpn = [
+    "dep:aes",
+    "dep:aes-gcm",
+    "dep:cbc",
+    "dep:hmac",
+    "dep:sha1",
+    "dep:sha2",
+    "dep:rsa",
+    "dep:rand_core",
+    "dep:getrandom",
+]
+
+# Convenience: enable everything (matches the Go upstream featureset).
+full = [
+    "l2adapter",
+    "dhcp",
+    "qemu",
+    "tuntap",
+    "afxdp",
+    "vtcp",
+    "slirp",
+    "vclient",
+    "nat",
+    "wg",
+    "ovpn",
+]
+
+[dependencies]
+# libc is the only OS-FFI shim we use, gated behind features that need it.
+libc = { version = "0.2", optional = true }
+
+# Vetted RustCrypto crates, only pulled in by the crypto-using features.
+# We do not write our own primitives.
+curve25519-dalek    = { version = "4", optional = true, default-features = false, features = ["alloc", "zeroize"] }
+chacha20poly1305    = { version = "0.10", optional = true, default-features = false, features = ["alloc"] }
+aes                 = { version = "0.8", optional = true }
+aes-gcm             = { version = "0.10", optional = true, default-features = false, features = ["alloc", "aes"] }
+cbc                 = { version = "0.1", optional = true, features = ["alloc"] }
+blake2              = { version = "0.10", optional = true }
+sha1                = { version = "0.10", optional = true }
+sha2                = { version = "0.10", optional = true }
+hmac                = { version = "0.12", optional = true }
+rsa                 = { version = "0.9", optional = true, default-features = false }
+zeroize             = { version = "1", optional = true, default-features = false, features = ["zeroize_derive"] }
+rand_core           = { version = "0.6", optional = true }
+getrandom           = { version = "0.2", optional = true }
+
+[dev-dependencies]
+# Tests may exercise OS sockets; nothing extra needed beyond std.
+
+[lib]
+name = "pktkit"
+path = "src/lib.rs"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
