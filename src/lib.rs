@@ -44,6 +44,7 @@ mod packet;
 mod pipe;
 mod pool;
 mod protocol;
+mod rand;
 
 pub use checksum::{checksum, combine_checksums, pseudo_header_checksum};
 pub use connect::{connect_l2, connect_l3};

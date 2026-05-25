@@ -86,9 +86,8 @@ impl MacAddr {
         self.0[0] & 2 != 0
     }
 
-    /// Generate a random locally-administered unicast MAC using the OS RNG.
+    /// Generate a random locally-administered unicast MAC.
     /// The first octet has the IG bit cleared and the LU bit set.
-    #[cfg(feature = "l2adapter")]
     pub fn random_local_unicast() -> MacAddr {
         let mut o = [0u8; 6];
         crate::rand::fill(&mut o);
