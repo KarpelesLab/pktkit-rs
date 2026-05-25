@@ -90,7 +90,7 @@ impl Listener {
                 return Ok(TcpStream::new(state));
             }
             if self.closed.load(Ordering::Acquire) {
-                return Err(io::Error::new(io::ErrorKind::Other, "listener closed"));
+                return Err(io::Error::other("listener closed"));
             }
             q = self.signal.wait(q).expect("poisoned");
         }

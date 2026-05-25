@@ -78,7 +78,9 @@ fn server_config() -> Arc<rustls::ServerConfig> {
     let cert = CertificateDer::from_pem_slice(TEST_CERT.as_bytes()).unwrap();
     let key = PrivateKeyDer::from_pem_slice(TEST_KEY.as_bytes()).unwrap();
     Arc::new(
-        rustls::ServerConfig::builder()
+        rustls::ServerConfig::builder_with_provider(super::server::crypto_provider())
+            .with_safe_default_protocol_versions()
+            .unwrap()
             .with_no_client_auth()
             .with_single_cert(vec![cert], key)
             .unwrap(),
@@ -132,7 +134,9 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
 }
 
 fn client_config() -> Arc<rustls::ClientConfig> {
-    let cfg = rustls::ClientConfig::builder()
+    let cfg = rustls::ClientConfig::builder_with_provider(super::server::crypto_provider())
+        .with_safe_default_protocol_versions()
+        .unwrap()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(NoVerify))
         .with_no_client_auth();

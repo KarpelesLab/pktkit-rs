@@ -281,7 +281,7 @@ impl Adapter {
             let _ = h.accept_unknown_peer(key, packet, &addr)?;
             Ok(())
         } else {
-            Err(io::Error::new(io::ErrorKind::Other, "no handler"))
+            Err(io::Error::other("no handler"))
         }
     }
 

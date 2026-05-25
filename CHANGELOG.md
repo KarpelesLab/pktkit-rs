@@ -43,7 +43,10 @@ First release: a feature-gated Rust port of the Go
 
 The default build pulls in **zero** third-party crates. `libc` is used only by
 `tuntap`/`afxdp`; RustCrypto primitive crates only by `wg`/`ovpn`; and `rustls`
-(an explicit, opt-in exception) only by `ovpn`'s control channel.
+(an explicit, opt-in exception) only by `ovpn`'s control channel — configured
+with the pure-Rust `rustls-rustcrypto` provider, so there is no vendored
+C/assembly (`ring`/`aws-lc-rs`) and no compile-time build script. The whole
+crate cross-compiles.
 
 ### Known gaps
 

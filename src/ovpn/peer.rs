@@ -568,5 +568,5 @@ fn write_control_string(buf: &mut Vec<u8>, s: &str) {
 /// Cryptographic randomness for IVs and session material.
 pub(crate) fn fill_random(buf: &mut [u8]) -> io::Result<()> {
     getrandom::getrandom(buf)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("getrandom: {e}")))
+        .map_err(|e| io::Error::other(format!("getrandom: {e}")))
 }

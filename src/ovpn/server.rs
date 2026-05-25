@@ -59,13 +59,22 @@ impl std::fmt::Debug for ServerConfig {
 
 static PROVIDER_INIT: Once = Once::new();
 
-/// Install the ring crypto provider for rustls exactly once. Safe to call from
-/// anywhere; subsequent calls are no-ops.
+/// Install the pure-Rust RustCrypto crypto provider for rustls as the
+/// process-wide default, exactly once. Safe to call from anywhere; subsequent
+/// calls (and a provider already installed elsewhere) are no-ops.
 pub fn install_crypto_provider() {
     PROVIDER_INIT.call_once(|| {
         // Ignore the error: if a provider is already installed, that's fine.
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls_rustcrypto::provider().install_default();
     });
+}
+
+/// The pure-Rust RustCrypto [`CryptoProvider`](rustls::crypto::CryptoProvider)
+/// used for the OpenVPN control channel. Pass it to
+/// `rustls::ServerConfig::builder_with_provider` so config construction does
+/// not depend on the process-wide default being installed first.
+pub fn crypto_provider() -> std::sync::Arc<rustls::crypto::CryptoProvider> {
+    std::sync::Arc::new(rustls_rustcrypto::provider())
 }
 
 struct PeerEntry {

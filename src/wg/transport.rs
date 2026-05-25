@@ -53,13 +53,12 @@ pub(crate) fn process_data_packet(h: &Handler, data: &[u8]) -> Result<PacketResu
 
     // Reject expired keypairs (forward secrecy).
     if Instant::now().duration_since(kp.created) > REJECT_AFTER_TIME {
-        return Err(io::Error::new(io::ErrorKind::Other, "keypair expired"));
+        return Err(io::Error::other("keypair expired"));
     }
 
     // Replay window check.
     if kp.replay_filter.check_replay(counter) {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
+        return Err(io::Error::other(
             format!("replay detected: counter={}", counter),
         ));
     }
@@ -149,7 +148,7 @@ pub(crate) fn encrypt_into(
     dst[8..16].copy_from_slice(&counter.to_le_bytes());
 
     aead_seal_in_place(
-        &kp_view.send_key,
+        kp_view.send_key,
         counter,
         data,
         &[],
@@ -196,7 +195,7 @@ impl From<EncryptError> for io::Error {
             EncryptError::DstTooSmall { .. } => io::Error::new(io::ErrorKind::InvalidInput, e),
             EncryptError::NoSession => io::Error::new(io::ErrorKind::NotConnected, e),
             EncryptError::KeypairExpired | EncryptError::MessageLimitExceeded => {
-                io::Error::new(io::ErrorKind::Other, e)
+                io::Error::other(e)
             }
             EncryptError::RekeyRequired(_) => io::Error::new(io::ErrorKind::WouldBlock, e),
         }

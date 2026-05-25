@@ -180,7 +180,7 @@ pub(crate) fn x25519_dh(
 pub fn generate_private_key() -> Result<NoisePrivateKey> {
     let mut buf = [0u8; 32];
     getrandom::getrandom(&mut buf)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("getrandom: {}", e)))?;
+        .map_err(|e| io::Error::other(format!("getrandom: {}", e)))?;
     clamp(&mut buf);
     Ok(NoisePrivateKey(buf))
 }
@@ -189,21 +189,21 @@ pub fn generate_private_key() -> Result<NoisePrivateKey> {
 pub fn generate_preshared_key() -> Result<NoisePresharedKey> {
     let mut buf = [0u8; 32];
     getrandom::getrandom(&mut buf)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("getrandom: {}", e)))?;
+        .map_err(|e| io::Error::other(format!("getrandom: {}", e)))?;
     Ok(NoisePresharedKey(buf))
 }
 
 /// Fill the buffer with OS randomness.
 pub(crate) fn fill_random(buf: &mut [u8]) -> Result<()> {
     getrandom::getrandom(buf)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("getrandom: {}", e)))
+        .map_err(|e| io::Error::other(format!("getrandom: {}", e)))
 }
 
 /// Derive the MAC1 key for a public key: `Blake2s256("mac1----" || pk)`.
 pub(crate) fn calculate_mac1_key(pk: &NoisePublicKey) -> [u8; 32] {
     let mut hasher = Blake2s256::new();
     Digest::update(&mut hasher, WG_LABEL_MAC1);
-    Digest::update(&mut hasher, &pk.0);
+    Digest::update(&mut hasher, pk.0);
     let out = hasher.finalize();
     let mut key = [0u8; 32];
     key.copy_from_slice(&out);
@@ -216,7 +216,7 @@ pub(crate) fn calculate_mac1_key(pk: &NoisePublicKey) -> [u8; 32] {
 pub(crate) fn calculate_cookie_key(pk: &NoisePublicKey) -> [u8; 32] {
     let mut hasher = Blake2s256::new();
     Digest::update(&mut hasher, WG_LABEL_COOKIE);
-    Digest::update(&mut hasher, &pk.0);
+    Digest::update(&mut hasher, pk.0);
     let out = hasher.finalize();
     let mut key = [0u8; 32];
     key.copy_from_slice(&out);

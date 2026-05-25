@@ -121,7 +121,7 @@ impl core::str::FromStr for MacAddr {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let mut octets = [0u8; 6];
         let mut i = 0;
-        for part in s.split(|c| c == ':' || c == '-') {
+        for part in s.split([':', '-']) {
             if i >= 6 {
                 return Err(ParseMacError(()));
             }

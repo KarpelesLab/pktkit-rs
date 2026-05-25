@@ -508,11 +508,7 @@ fn compute_expiry(lease_secs: u32, max: Option<Duration>) -> Option<Instant> {
             }
         }
         Some(Instant::now() + dur)
-    } else if let Some(m) = max {
-        Some(Instant::now() + m)
-    } else {
-        None
-    }
+    } else { max.map(|m| Instant::now() + m) }
 }
 
 fn port_mapping_entry_xml(pf: &PortForward, response_name: &str) -> String {

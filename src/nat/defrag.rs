@@ -124,10 +124,7 @@ impl Defragger {
             entry.total = Some(frag_offset + payload.len());
         }
 
-        let total = match entry.total {
-            Some(t) => t,
-            None => return None,
-        };
+        let total = entry.total?;
         if total > 65535 {
             inner.entries.remove(&k);
             return None;

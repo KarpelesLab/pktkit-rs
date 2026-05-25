@@ -250,10 +250,7 @@ impl TcpNatConn {
             if self.state.closed.load(Ordering::Acquire) {
                 return;
             }
-            let n = match remote_read.read(&mut buf) {
-                Ok(n) => n,
-                Err(_) => 0,
-            };
+            let n = remote_read.read(&mut buf).unwrap_or_default();
             if n == 0 {
                 // Remote closed; send FIN to client.
                 if !self.state.fin_sent.swap(true, Ordering::AcqRel) {

@@ -58,9 +58,13 @@ re-cast into idiomatic Rust:
 - RustCrypto primitive crates (`chacha20poly1305`, `aes-gcm`, `curve25519-dalek`,
   `sha2`, `hmac`, `blake2`, `rsa`, …) — only when the relevant tunnel feature is
   enabled. We do not roll our own crypto.
+- `rustls` for OpenVPN's control-channel TLS (only when `ovpn` is enabled),
+  configured with a **pure-Rust** crypto provider (`rustls-rustcrypto`, backed
+  by the same RustCrypto crates) — no `ring`, no `aws-lc-rs`, no vendored
+  C/assembly, and no compile-time build script.
 
-Nothing else. No async runtime. No framework. The default build pulls in
-zero dependencies.
+Nothing else. No async runtime. No framework. No native code beyond `libc`.
+Everything cross-compiles. The default build pulls in zero dependencies.
 
 ## Usage
 

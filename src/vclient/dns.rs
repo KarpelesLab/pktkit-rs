@@ -223,7 +223,7 @@ impl Resolver {
                 "no DNS servers configured",
             ));
         }
-        let mut last_err = io::Error::new(io::ErrorKind::Other, "no servers tried");
+        let mut last_err = io::Error::other("no servers tried");
         for server in &self.cfg.servers {
             match self.query_one(*server, name, rtype) {
                 Ok(addrs) => return Ok(addrs),

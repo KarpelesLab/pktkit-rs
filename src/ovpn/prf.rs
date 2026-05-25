@@ -278,7 +278,7 @@ impl<H: Hash + Default> Hmac<H> {
 
 /// Split a premaster secret in two as specified in RFC 4346 §5.
 fn split_premaster_secret(secret: &[u8]) -> (&[u8], &[u8]) {
-    let s1 = &secret[0..(secret.len() + 1) / 2];
+    let s1 = &secret[0..secret.len().div_ceil(2)];
     let s2 = &secret[secret.len() / 2..];
     (s1, s2)
 }

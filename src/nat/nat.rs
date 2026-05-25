@@ -294,10 +294,10 @@ impl Nat {
 
     // -- Internal --------------------------------------------------------
 
-    fn get_or_create_mapping_locked<'a>(
-        inner: &'a mut NatInner,
+    fn get_or_create_mapping_locked(
+        inner: &mut NatInner,
         k: NatKey,
-    ) -> Option<&'a mut Mapping> {
+    ) -> Option<&mut Mapping> {
         let now = Instant::now();
         if inner.mappings.contains_key(&k) {
             let m = inner.mappings.get_mut(&k).unwrap();
@@ -361,11 +361,11 @@ impl Nat {
         Some(inner.expectations.remove(pos))
     }
 
-    fn match_forward<'a>(
-        inner: &'a mut NatInner,
+    fn match_forward(
+        inner: &mut NatInner,
         proto: u8,
         outside_port: u16,
-    ) -> Option<&'a PortForward> {
+    ) -> Option<&PortForward> {
         let rk = NatRevKey {
             proto,
             port: outside_port,
@@ -375,7 +375,7 @@ impl Nat {
             .forwards
             .get(&rk)
             .and_then(|pf| pf.expires)
-            .map_or(false, |e| e < now);
+            .is_some_and(|e| e < now);
         if expired {
             inner.forwards.remove(&rk);
             return None;
@@ -446,7 +446,7 @@ impl Nat {
         inner.mappings.retain(|k, m| {
             let timeout = match k.proto {
                 PROTO_TCP => {
-                    if m.fin_seen && m.fin_time.map_or(false, |t| now - t > NAT_TCP_FIN_GRACE) {
+                    if m.fin_seen && m.fin_time.is_some_and(|t| now - t > NAT_TCP_FIN_GRACE) {
                         Duration::from_secs(0)
                     } else {
                         NAT_TCP_TIMEOUT

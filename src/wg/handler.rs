@@ -453,8 +453,7 @@ impl Handler {
     ) -> Result<()> {
         let mut g = self.handshakes.lock().expect("handshakes lock");
         if g.len() >= crate::wg::constants::MAX_HANDSHAKES && !g.contains_key(&idx) {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 "handshake table full",
             ));
         }
@@ -497,7 +496,7 @@ impl Handler {
 
     pub(crate) fn check_keypair_capacity(&self, cap: usize) -> Result<()> {
         if self.keypairs.read().expect("keypairs lock").len() >= cap {
-            return Err(io::Error::new(io::ErrorKind::Other, "keypair table full"));
+            return Err(io::Error::other("keypair table full"));
         }
         Ok(())
     }
@@ -505,7 +504,7 @@ impl Handler {
     pub(crate) fn check_session_capacity(&self, cap: usize, k: &NoisePublicKey) -> Result<()> {
         let g = self.sessions.read().expect("sessions lock");
         if g.len() >= cap && !g.contains_key(k) {
-            return Err(io::Error::new(io::ErrorKind::Other, "session table full"));
+            return Err(io::Error::other("session table full"));
         }
         Ok(())
     }

@@ -112,7 +112,7 @@ impl Nat64 {
         inner.mappings.retain(|k, m| {
             let timeout = match k.proto {
                 PROTO_TCP => {
-                    if m.fin_seen && m.fin_time.map_or(false, |t| now - t > NAT_TCP_FIN_GRACE) {
+                    if m.fin_seen && m.fin_time.is_some_and(|t| now - t > NAT_TCP_FIN_GRACE) {
                         Duration::from_secs(0)
                     } else {
                         NAT_TCP_TIMEOUT
@@ -587,19 +587,17 @@ impl Nat64 {
                 .copy_from_slice(&icmp[copy_from..copy_from + emb_transport_len]);
             let emb_transport_off = emb_ip6_off;
             match emb_proto_raw {
-                PROTO_TCP | PROTO_UDP => {
-                    if emb_transport_len >= 2 {
+                PROTO_TCP | PROTO_UDP
+                    if emb_transport_len >= 2 => {
                         out[emb_transport_off..emb_transport_off + 2]
                             .copy_from_slice(&mapping_key.port.to_be_bytes());
                     }
-                }
-                PROTO_ICMP => {
-                    if emb_transport_len >= 6 {
+                PROTO_ICMP
+                    if emb_transport_len >= 6 => {
                         out[emb_transport_off] = 128;
                         out[emb_transport_off + 4..emb_transport_off + 6]
                             .copy_from_slice(&mapping_key.port.to_be_bytes());
                     }
-                }
                 _ => {}
             }
         }

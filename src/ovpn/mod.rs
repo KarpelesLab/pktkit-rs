@@ -44,5 +44,6 @@ pub use opcode::Opcode;
 pub use options::Options;
 pub use peer::{AuthInfo, OnAuth, Peer, PeerConfig};
 pub use server::{
-    install_crypto_provider, OnConnect, OnData, OnDisconnect, Server, ServerConfig,
+    crypto_provider, install_crypto_provider, OnConnect, OnData, OnDisconnect, Server,
+    ServerConfig,
 };

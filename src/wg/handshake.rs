@@ -134,15 +134,14 @@ pub(crate) fn initiate_handshake(h: &Handler, peer_key: &NoisePublicKey) -> Resu
     let mut temp_ss = x25519_dh(&hs.local_ephemeral, peer_key);
     let mut key = [0u8; CHACHAPOLY_KEY_SIZE];
     let mut ck_next = [0u8; BLAKE2S_256_SIZE];
-    crate::wg::crypto::kdf2(&mut ck_next, &mut key_blake(&mut key), &hs.chain_key, &temp_ss);
+    crate::wg::crypto::kdf2(&mut ck_next, key_blake(&mut key), &hs.chain_key, &temp_ss);
     hs.chain_key = ck_next;
     temp_ss.zeroize();
 
     // Encrypt our static public key under k with AD=h.
     let enc_static = aead_seal_zero(&key, &client_pub.0, &hs.hash);
     if enc_static.len() != NOISE_PUBLIC_KEY_SIZE + CHACHAPOLY_OVERHEAD {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
+        return Err(io::Error::other(
             "unexpected static field size",
         ));
     }
@@ -153,7 +152,7 @@ pub(crate) fn initiate_handshake(h: &Handler, peer_key: &NoisePublicKey) -> Resu
     let mut ck_next = [0u8; BLAKE2S_256_SIZE];
     crate::wg::crypto::kdf2(
         &mut ck_next,
-        &mut key_blake(&mut key),
+        key_blake(&mut key),
         &hs.chain_key,
         &hs.precomputed_static_static,
     );
@@ -163,8 +162,7 @@ pub(crate) fn initiate_handshake(h: &Handler, peer_key: &NoisePublicKey) -> Resu
     let timestamp = tai64n_now();
     let enc_timestamp = aead_seal_zero(&key, &timestamp, &hs.hash);
     if enc_timestamp.len() != TAI64N_TIMESTAMP_SIZE + CHACHAPOLY_OVERHEAD {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
+        return Err(io::Error::other(
             "unexpected timestamp field size",
         ));
     }
@@ -328,7 +326,7 @@ pub(crate) fn process_handshake_response(h: &Handler, data: &[u8]) -> Result<Pac
     let keepalive = match crate::wg::transport::encrypt_data_packet(h, &[], &peer_key) {
         Ok(buf) => buf,
         Err(crate::wg::transport::EncryptError::RekeyRequired(buf)) => buf,
-        Err(e) => return Err(io::Error::new(io::ErrorKind::Other, e.to_string())),
+        Err(e) => return Err(io::Error::other(e.to_string())),
     };
 
     Ok(PacketResult {
@@ -483,8 +481,7 @@ pub(crate) fn process_handshake_initiation(
 
     // Timestamp replay: must be strictly greater than the last accepted one.
     if !h.accept_peer_timestamp(&hs.remote_static, &timestamp) {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
+        return Err(io::Error::other(
             "replayed handshake timestamp",
         ));
     }
@@ -528,8 +525,7 @@ pub(crate) fn process_handshake_initiation(
     // Encrypt empty under k with AD=h.
     let empty_ct = aead_seal_zero(&k, &[], &hs.hash);
     if empty_ct.len() != CHACHAPOLY_OVERHEAD {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
+        return Err(io::Error::other(
             "empty seal wrong size",
         ));
     }

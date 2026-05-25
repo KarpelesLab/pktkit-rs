@@ -11,7 +11,7 @@ homepage = "https://github.com/KarpelesLab/pktkit-rs"
 documentation = "https://docs.rs/pktkit"
 readme = "README.md"
 keywords = ["networking", "packet", "tcp", "wireguard", "tun"]
-categories = ["network-programming", "no-std::no-alloc"]
+categories = ["network-programming", "virtualization"]
 
 [features]
 # By default we ship only the core: Frame, Packet, hubs, pipes, traits.
@@ -73,6 +73,7 @@ ovpn = [
     # accepted here as an opt-in exception to the "minimal third-party" rule
     # because hand-rolling TLS 1.2 + X.509 is not worth the risk.
     "dep:rustls",
+    "dep:rustls-rustcrypto",
     "dep:rustls-pemfile",
 ]
 
@@ -110,10 +111,13 @@ rsa                 = { version = "0.9", optional = true, default-features = fal
 zeroize             = { version = "1", optional = true, default-features = false, features = ["zeroize_derive"] }
 rand_core           = { version = "0.6", optional = true }
 getrandom           = { version = "0.2", optional = true }
-# TLS for OpenVPN's control channel only (ovpn feature). Uses the `ring`
-# crypto provider to avoid a C toolchain dependency; TLS 1.2 is required
-# because OpenVPN negotiates 1.2 by default.
-rustls              = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
+# TLS for OpenVPN's control channel only (ovpn feature). We deliberately
+# disable rustls's built-in crypto backends (no `ring`, no `aws-lc-rs` — both
+# vendor C/assembly and run a build script) and supply a pure-Rust provider
+# from rustls-rustcrypto, which is backed by the same RustCrypto primitives the
+# data channel already uses. TLS 1.2 is required (OpenVPN negotiates it).
+rustls              = { version = "0.23", optional = true, default-features = false, features = ["std", "tls12"] }
+rustls-rustcrypto   = { version = "=0.0.2-alpha", optional = true }
 rustls-pemfile      = { version = "2", optional = true }
 
 [dev-dependencies]
