@@ -48,7 +48,9 @@ pub struct Tun {
 
 impl core::fmt::Debug for Tun {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("tuntap::Tun").field("name", &self.inner.name).finish()
+        f.debug_struct("tuntap::Tun")
+            .field("name", &self.inner.name)
+            .finish()
     }
 }
 
@@ -93,7 +95,12 @@ impl L3Device for Tun {
         let proto: u32 = match bytes[0] >> 4 {
             4 => libc::AF_INET as u32,
             6 => libc::AF_INET6 as u32,
-            _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "unknown IP version")),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "unknown IP version",
+                ))
+            }
         };
         let mut framed = Vec::with_capacity(4 + bytes.len());
         framed.extend_from_slice(&proto.to_be_bytes());

@@ -42,7 +42,11 @@ impl L2Device for PipeL2 {
     fn send(&self, f: &Frame) -> Result<()> {
         // Clone the Arc out, drop the lock, then invoke. This lets the handler
         // call back into another pipe without re-entering the same mutex.
-        let h = self.handler.lock().expect("PipeL2 handler poisoned").clone();
+        let h = self
+            .handler
+            .lock()
+            .expect("PipeL2 handler poisoned")
+            .clone();
         match h {
             Some(h) => h(f),
             None => Ok(()),
@@ -82,7 +86,9 @@ impl PipeL3 {
 
 impl core::fmt::Debug for PipeL3 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("PipeL3").field("addr", &self.addr()).finish()
+        f.debug_struct("PipeL3")
+            .field("addr", &self.addr())
+            .finish()
     }
 }
 
@@ -92,7 +98,11 @@ impl L3Device for PipeL3 {
     }
 
     fn send(&self, p: &Packet) -> Result<()> {
-        let h = self.handler.lock().expect("PipeL3 handler poisoned").clone();
+        let h = self
+            .handler
+            .lock()
+            .expect("PipeL3 handler poisoned")
+            .clone();
         match h {
             Some(h) => h(p),
             None => Ok(()),
@@ -117,8 +127,8 @@ impl L3Device for PipeL3 {
 mod tests {
     use super::*;
     use crate::{build_frame, EtherType};
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     #[test]
     fn pipe_l2_invokes_handler() {

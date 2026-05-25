@@ -149,7 +149,9 @@ impl Server {
         // Closing the UDP socket isn't directly possible; instead we rely on
         // the closed flag and let the read loop exit on its next error/timeout.
         // Set a short read timeout so the loop notices.
-        let _ = self.udp.set_read_timeout(Some(std::time::Duration::from_millis(100)));
+        let _ = self
+            .udp
+            .set_read_timeout(Some(std::time::Duration::from_millis(100)));
 
         let mut peers = self.peers.write().unwrap();
         for (k, _) in peers.drain() {
@@ -167,7 +169,10 @@ impl Server {
             }
             let (n, src) = match self.udp.recv_from(&mut buf) {
                 Ok(v) => v,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
+                Err(e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::TimedOut =>
+                {
                     continue;
                 }
                 Err(_) => return,
@@ -242,8 +247,12 @@ impl Server {
         }
         let mut local_id = [0u8; 8];
         let _ = super::peer::fill_random(&mut local_id);
-        let peer = Peer::new(self.cfg.tls_config.clone(), local_id, self.cfg.on_auth.clone())
-            .expect("peer creation");
+        let peer = Peer::new(
+            self.cfg.tls_config.clone(),
+            local_id,
+            self.cfg.on_auth.clone(),
+        )
+        .expect("peer creation");
         let entry = Arc::new(PeerEntry {
             peer: Mutex::new(peer),
             transport,

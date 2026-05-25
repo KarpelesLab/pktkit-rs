@@ -237,12 +237,11 @@ EXT:\r\n\r\n",
         if int_port == 0 {
             return soap_fault(402, "Invalid internal port");
         }
-        let inside_ip: Ipv4Addr = match xml_field(&xml, "NewInternalClient")
-            .and_then(|s| s.trim().parse().ok())
-        {
-            Some(a) => a,
-            None => return soap_fault(402, "Invalid internal client IP"),
-        };
+        let inside_ip: Ipv4Addr =
+            match xml_field(&xml, "NewInternalClient").and_then(|s| s.trim().parse().ok()) {
+                Some(a) => a,
+                None => return soap_fault(402, "Invalid internal client IP"),
+            };
         // A client may only forward to itself.
         if let Some(cip) = client_ip {
             if cip != inside_ip {
@@ -393,7 +392,10 @@ fn is_ssdp_msearch(payload: &[u8]) -> bool {
     }
     let upper = payload.to_ascii_uppercase();
     contains(&upper, b"SSDP:ALL")
-        || contains(payload, b"urn:schemas-upnp-org:device:InternetGatewayDevice")
+        || contains(
+            payload,
+            b"urn:schemas-upnp-org:device:InternetGatewayDevice",
+        )
         || contains(payload, b"urn:schemas-upnp-org:service:WANIPConnection")
         || contains(payload, b"upnp:rootdevice")
 }
@@ -407,7 +409,13 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 
 /// Build a raw IPv4+UDP packet (checksum on IP only; UDP checksum left zero,
 /// which is valid for IPv4).
-fn build_udp_packet(src: Ipv4Addr, sport: u16, dst: Ipv4Addr, dport: u16, payload: &[u8]) -> Vec<u8> {
+fn build_udp_packet(
+    src: Ipv4Addr,
+    sport: u16,
+    dst: Ipv4Addr,
+    dport: u16,
+    payload: &[u8],
+) -> Vec<u8> {
     let udp_len = 8 + payload.len();
     let total = 20 + udp_len;
     let mut pkt = vec![0u8; total];
@@ -508,7 +516,9 @@ fn compute_expiry(lease_secs: u32, max: Option<Duration>) -> Option<Instant> {
             }
         }
         Some(Instant::now() + dur)
-    } else { max.map(|m| Instant::now() + m) }
+    } else {
+        max.map(|m| Instant::now() + m)
+    }
 }
 
 fn port_mapping_entry_xml(pf: &PortForward, response_name: &str) -> String {
@@ -645,7 +655,12 @@ mod tests {
         let h = UPnPHelper::new(UPnPConfig::default());
         let client = Ipv4Addr::new(10, 0, 0, 42);
 
-        let res = h.handle_soap(&nat, "AddPortMapping", &add_body(9000, 9000, "10.0.0.42", "UDP", 0), Some(client));
+        let res = h.handle_soap(
+            &nat,
+            "AddPortMapping",
+            &add_body(9000, 9000, "10.0.0.42", "UDP", 0),
+            Some(client),
+        );
         assert_eq!(res.status, 200);
         assert_eq!(nat.list_port_forwards().len(), 1);
 

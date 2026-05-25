@@ -18,11 +18,11 @@ use hmac::SimpleHmac;
 use std::io;
 use zeroize::Zeroize;
 
-use crate::wg::constants::{
-    BLAKE2S_128_SIZE, BLAKE2S_256_SIZE, CHACHAPOLY_KEY_SIZE, NOISE_PUBLIC_KEY_SIZE,
-    WG_IDENTIFIER, WG_LABEL_COOKIE, WG_LABEL_MAC1,
-};
 use crate::wg::constants::{NoisePresharedKey, NoisePrivateKey, NoisePublicKey};
+use crate::wg::constants::{
+    BLAKE2S_128_SIZE, BLAKE2S_256_SIZE, CHACHAPOLY_KEY_SIZE, NOISE_PUBLIC_KEY_SIZE, WG_IDENTIFIER,
+    WG_LABEL_COOKIE, WG_LABEL_MAC1,
+};
 use crate::Result;
 
 // === Helpers ================================================================
@@ -65,12 +65,7 @@ pub(crate) fn hmac1(sum: &mut [u8; BLAKE2S_256_SIZE], key: &[u8], in0: &[u8]) {
 }
 
 /// HMAC-Blake2s-256 over two concatenated input chunks.
-pub(crate) fn hmac2(
-    sum: &mut [u8; BLAKE2S_256_SIZE],
-    key: &[u8],
-    in0: &[u8],
-    in1: &[u8],
-) {
+pub(crate) fn hmac2(sum: &mut [u8; BLAKE2S_256_SIZE], key: &[u8], in0: &[u8], in1: &[u8]) {
     let mut mac = <HmacBlake2s as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
     Mac::update(&mut mac, in0);
     Mac::update(&mut mac, in1);
@@ -140,7 +135,13 @@ pub(crate) fn mix_psk(
     let mut tau = [0u8; BLAKE2S_256_SIZE];
     let mut new_key = [0u8; BLAKE2S_256_SIZE];
     let saved_c = *chaining_key;
-    kdf3(chaining_key, &mut tau, &mut new_key, &saved_c, psk.as_bytes());
+    kdf3(
+        chaining_key,
+        &mut tau,
+        &mut new_key,
+        &saved_c,
+        psk.as_bytes(),
+    );
     key.copy_from_slice(&new_key);
     let h_copy = *hash;
     mix_hash(hash, &h_copy, &tau);
@@ -168,10 +169,7 @@ pub(crate) fn x25519_public(sk: &NoisePrivateKey) -> NoisePublicKey {
 }
 
 /// Diffie-Hellman: `sk * pk`. Returns 32 bytes (the shared u-coordinate).
-pub(crate) fn x25519_dh(
-    sk: &NoisePrivateKey,
-    pk: &NoisePublicKey,
-) -> [u8; 32] {
+pub(crate) fn x25519_dh(sk: &NoisePrivateKey, pk: &NoisePublicKey) -> [u8; 32] {
     let point = MontgomeryPoint(pk.0);
     point.mul_clamped(sk.0).to_bytes()
 }
@@ -179,8 +177,7 @@ pub(crate) fn x25519_dh(
 /// Generate a fresh, clamped Curve25519 private key from OS randomness.
 pub fn generate_private_key() -> Result<NoisePrivateKey> {
     let mut buf = [0u8; 32];
-    getrandom::getrandom(&mut buf)
-        .map_err(|e| io::Error::other(format!("getrandom: {}", e)))?;
+    getrandom::getrandom(&mut buf).map_err(|e| io::Error::other(format!("getrandom: {}", e)))?;
     clamp(&mut buf);
     Ok(NoisePrivateKey(buf))
 }
@@ -188,15 +185,13 @@ pub fn generate_private_key() -> Result<NoisePrivateKey> {
 /// Generate a random preshared key from OS randomness.
 pub fn generate_preshared_key() -> Result<NoisePresharedKey> {
     let mut buf = [0u8; 32];
-    getrandom::getrandom(&mut buf)
-        .map_err(|e| io::Error::other(format!("getrandom: {}", e)))?;
+    getrandom::getrandom(&mut buf).map_err(|e| io::Error::other(format!("getrandom: {}", e)))?;
     Ok(NoisePresharedKey(buf))
 }
 
 /// Fill the buffer with OS randomness.
 pub(crate) fn fill_random(buf: &mut [u8]) -> Result<()> {
-    getrandom::getrandom(buf)
-        .map_err(|e| io::Error::other(format!("getrandom: {}", e)))
+    getrandom::getrandom(buf).map_err(|e| io::Error::other(format!("getrandom: {}", e)))
 }
 
 /// Derive the MAC1 key for a public key: `Blake2s256("mac1----" || pk)`.
@@ -226,8 +221,8 @@ pub(crate) fn calculate_cookie_key(pk: &NoisePublicKey) -> [u8; 32] {
 /// Compute a Blake2s-MAC-128 over `data` with the given 32-byte key. The
 /// output (16 bytes) is the WireGuard MAC1/MAC2 form.
 pub(crate) fn blake2s_mac_128(key: &[u8], data: &[u8]) -> [u8; BLAKE2S_128_SIZE] {
-    let mut mac = <Blake2sMac128 as MacKeyInit>::new_from_slice(key)
-        .expect("Blake2sMac accepts <=32B keys");
+    let mut mac =
+        <Blake2sMac128 as MacKeyInit>::new_from_slice(key).expect("Blake2sMac accepts <=32B keys");
     Update::update(&mut mac, data);
     let out = mac.finalize().into_bytes();
     let mut buf = [0u8; BLAKE2S_128_SIZE];

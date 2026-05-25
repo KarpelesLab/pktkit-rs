@@ -147,7 +147,8 @@ fn decrypt_gcm<'a>(
     let mut tag_arr = [0u8; GCM_TAG];
     tag_arr.copy_from_slice(tag);
 
-    let pt_len = match gcm_open_in_place(&keys.cipher_decrypt[..nbytes], &nonce, &ad, &tag_arr, ct) {
+    let pt_len = match gcm_open_in_place(&keys.cipher_decrypt[..nbytes], &nonce, &ad, &tag_arr, ct)
+    {
         Ok(n) => n,
         Err(_) => return Ok(None), // auth failure — drop silently
     };
@@ -351,7 +352,9 @@ fn cbc_decrypt(key: &[u8], iv: &[u8; 16], buf: &mut [u8]) -> io::Result<()> {
     Ok(())
 }
 
-fn as_blocks_mut(buf: &mut [u8]) -> &mut [aes::cipher::generic_array::GenericArray<u8, aes::cipher::consts::U16>] {
+fn as_blocks_mut(
+    buf: &mut [u8],
+) -> &mut [aes::cipher::generic_array::GenericArray<u8, aes::cipher::consts::U16>] {
     use aes::cipher::generic_array::GenericArray;
     let n = buf.len() / 16;
     // SAFETY: GenericArray<u8, U16> is repr(transparent) over [u8; 16]; buf is
@@ -474,23 +477,25 @@ mod tests {
     }
 
     fn gcm_opts(size: u32) -> Options {
-        let mut o = Options::default();
-        o.cipher_crypto = CipherCryptoAlg::Aes;
-        o.cipher_size = size;
-        o.cipher_block = CipherBlockMethod::Gcm;
-        o.auth = AuthHash::None;
-        o.compression = "lzo".into();
-        o
+        Options {
+            cipher_crypto: CipherCryptoAlg::Aes,
+            cipher_size: size,
+            cipher_block: CipherBlockMethod::Gcm,
+            auth: AuthHash::None,
+            compression: "lzo".into(),
+            ..Default::default()
+        }
     }
 
     fn cbc_opts(size: u32) -> Options {
-        let mut o = Options::default();
-        o.cipher_crypto = CipherCryptoAlg::Aes;
-        o.cipher_size = size;
-        o.cipher_block = CipherBlockMethod::Cbc;
-        o.auth = AuthHash::Sha256;
-        o.compression = "lzo".into();
-        o
+        Options {
+            cipher_crypto: CipherCryptoAlg::Aes,
+            cipher_size: size,
+            cipher_block: CipherBlockMethod::Cbc,
+            auth: AuthHash::Sha256,
+            compression: "lzo".into(),
+            ..Default::default()
+        }
     }
 
     #[test]

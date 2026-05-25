@@ -64,7 +64,10 @@ impl PacketHelper for IrcHelper {
         };
         let dcc_end = dcc_start + 1 + dcc_end_rel;
         let body = &payload[dcc_start + 1..dcc_end];
-        let fields: Vec<&[u8]> = body.split(|b| b.is_ascii_whitespace()).filter(|f| !f.is_empty()).collect();
+        let fields: Vec<&[u8]> = body
+            .split(|b| b.is_ascii_whitespace())
+            .filter(|f| !f.is_empty())
+            .collect();
         if fields.len() < 4 {
             return pkt;
         }
@@ -82,11 +85,17 @@ impl PacketHelper for IrcHelper {
         } else {
             (fields.len() - 2, fields.len() - 1)
         };
-        let ip_val: u32 = match std::str::from_utf8(fields[ip_idx]).ok().and_then(|s| s.parse().ok()) {
+        let ip_val: u32 = match std::str::from_utf8(fields[ip_idx])
+            .ok()
+            .and_then(|s| s.parse().ok())
+        {
             Some(v) => v,
             None => return pkt,
         };
-        let port_val: u16 = match std::str::from_utf8(fields[port_idx]).ok().and_then(|s| s.parse().ok()) {
+        let port_val: u16 = match std::str::from_utf8(fields[port_idx])
+            .ok()
+            .and_then(|s| s.parse().ok())
+        {
             Some(v) => v,
             None => return pkt,
         };

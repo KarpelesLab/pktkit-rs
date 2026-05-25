@@ -189,7 +189,12 @@ pub fn encode_program(insns: &[Insn]) -> Vec<u8> {
 /// `attr` must point at a valid, initialized struct of at least `size` bytes
 /// matching `cmd`, and any pointers inside it must be valid for the call.
 unsafe fn bpf(cmd: i32, attr: *mut libc::c_void, size: usize) -> Result<i32> {
-    let r = libc::syscall(libc::SYS_bpf, cmd as libc::c_long, attr, size as libc::c_long);
+    let r = libc::syscall(
+        libc::SYS_bpf,
+        cmd as libc::c_long,
+        attr,
+        size as libc::c_long,
+    );
     if r < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -331,7 +336,10 @@ pub fn load_xdp_program(max_queues: u32) -> Result<(OwnedFd, OwnedFd)> {
         }
         Err(e) => {
             // Surface the verifier log to make load failures debuggable.
-            let end = log_buf.iter().position(|&c| c == 0).unwrap_or(log_buf.len());
+            let end = log_buf
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(log_buf.len());
             let log = String::from_utf8_lossy(&log_buf[..end]);
             if log.is_empty() {
                 Err(e)
@@ -482,14 +490,7 @@ fn attach_xdp_netlink(ifindex: u32, prog_fd: i32, flags: u32) -> Result<()> {
 
     // Read the ACK: an nlmsgerr whose error field is 0 on success.
     let mut buf = [0u8; 4096];
-    let n = unsafe {
-        libc::recv(
-            raw,
-            buf.as_mut_ptr() as *mut libc::c_void,
-            buf.len(),
-            0,
-        )
-    };
+    let n = unsafe { libc::recv(raw, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
     if n < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -588,14 +589,10 @@ mod tests {
             // r2 = *(u32*)(r1 + 16)
             0x61, 0x12, 16, 0, 0, 0, 0, 0,
             // r1 = map_fd (LD_IMM64, pseudo map fd, imm=0x42)
-            0x18, 0x11, 0, 0, 0x42, 0, 0, 0,
-            // LD_IMM64 second slot
-            0x00, 0x00, 0, 0, 0, 0, 0, 0,
-            // r3 = 0
-            0xb7, 0x03, 0, 0, 0, 0, 0, 0,
-            // call bpf_redirect_map (51)
-            0x85, 0x00, 0, 0, 51, 0, 0, 0,
-            // exit
+            0x18, 0x11, 0, 0, 0x42, 0, 0, 0, // LD_IMM64 second slot
+            0x00, 0x00, 0, 0, 0, 0, 0, 0, // r3 = 0
+            0xb7, 0x03, 0, 0, 0, 0, 0, 0, // call bpf_redirect_map (51)
+            0x85, 0x00, 0, 0, 51, 0, 0, 0, // exit
             0x95, 0x00, 0, 0, 0, 0, 0, 0,
         ];
         assert_eq!(&bytes[..], &expected[..]);
@@ -667,9 +664,6 @@ mod tests {
         // Detach is RTM_SETLINK with prog_fd = -1.
         let msg = build_setlink_xdp(3, -1, 0, 1);
         // IFLA_XDP_FD payload sits at the same offset as the attach case.
-        assert_eq!(
-            i32::from_le_bytes([msg[40], msg[41], msg[42], msg[43]]),
-            -1
-        );
+        assert_eq!(i32::from_le_bytes([msg[40], msg[41], msg[42], msg[43]]), -1);
     }
 }

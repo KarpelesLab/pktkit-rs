@@ -15,8 +15,8 @@ use zeroize::Zeroize;
 use crate::wg::constants::{
     HandshakeState, NoisePrivateKey, NoisePublicKey, BLAKE2S_128_SIZE, BLAKE2S_256_SIZE,
     CHACHAPOLY_KEY_SIZE, CHACHAPOLY_OVERHEAD, MAX_HANDSHAKES, MAX_SESSIONS,
-    MESSAGE_INITIATION_SIZE, MESSAGE_INITIATION_TYPE, MESSAGE_RESPONSE_SIZE,
-    MESSAGE_RESPONSE_TYPE, NOISE_PUBLIC_KEY_SIZE, TAI64N_TIMESTAMP_SIZE,
+    MESSAGE_INITIATION_SIZE, MESSAGE_INITIATION_TYPE, MESSAGE_RESPONSE_SIZE, MESSAGE_RESPONSE_TYPE,
+    NOISE_PUBLIC_KEY_SIZE, TAI64N_TIMESTAMP_SIZE,
 };
 use crate::wg::crypto::{
     aead_open_zero, aead_seal_zero, blake2s_mac_128, calculate_mac1_key, ct_eq, fill_random,
@@ -141,9 +141,7 @@ pub(crate) fn initiate_handshake(h: &Handler, peer_key: &NoisePublicKey) -> Resu
     // Encrypt our static public key under k with AD=h.
     let enc_static = aead_seal_zero(&key, &client_pub.0, &hs.hash);
     if enc_static.len() != NOISE_PUBLIC_KEY_SIZE + CHACHAPOLY_OVERHEAD {
-        return Err(io::Error::other(
-            "unexpected static field size",
-        ));
+        return Err(io::Error::other("unexpected static field size"));
     }
     let h_save = hs.hash;
     mix_hash(&mut hs.hash, &h_save, &enc_static);
@@ -162,9 +160,7 @@ pub(crate) fn initiate_handshake(h: &Handler, peer_key: &NoisePublicKey) -> Resu
     let timestamp = tai64n_now();
     let enc_timestamp = aead_seal_zero(&key, &timestamp, &hs.hash);
     if enc_timestamp.len() != TAI64N_TIMESTAMP_SIZE + CHACHAPOLY_OVERHEAD {
-        return Err(io::Error::other(
-            "unexpected timestamp field size",
-        ));
+        return Err(io::Error::other("unexpected timestamp field size"));
     }
     let h_save = hs.hash;
     mix_hash(&mut hs.hash, &h_save, &enc_timestamp);
@@ -222,8 +218,11 @@ pub(crate) fn process_handshake_response(h: &Handler, data: &[u8]) -> Result<Pac
 
     let sender_idx =
         u32::from_le_bytes(data[RESP_OFF_SENDER..RESP_OFF_RECEIVER].try_into().unwrap());
-    let receiver_idx =
-        u32::from_le_bytes(data[RESP_OFF_RECEIVER..RESP_OFF_EPHEMERAL].try_into().unwrap());
+    let receiver_idx = u32::from_le_bytes(
+        data[RESP_OFF_RECEIVER..RESP_OFF_EPHEMERAL]
+            .try_into()
+            .unwrap(),
+    );
 
     let mut hs = h
         .take_handshake(receiver_idx)
@@ -365,13 +364,16 @@ pub(crate) fn process_handshake_initiation(
     // data[4..8]; MAC1 occupies data[116..132] on a 148-byte initiation.
     if h.is_under_load() {
         let sender = u32::from_le_bytes(
-            data[INIT_OFF_SENDER..INIT_OFF_EPHEMERAL].try_into().unwrap(),
+            data[INIT_OFF_SENDER..INIT_OFF_EPHEMERAL]
+                .try_into()
+                .unwrap(),
         );
         let src = ip_bytes(remote_addr);
-        let mac2_ok = !is_zero(&data[INIT_OFF_MAC2..INIT_OFF_END])
-            && h.cookie_check_mac2(data, &src);
+        let mac2_ok =
+            !is_zero(&data[INIT_OFF_MAC2..INIT_OFF_END]) && h.cookie_check_mac2(data, &src);
         if !mac2_ok {
-            let reply = h.cookie_generate_reply(&src, sender, &data[INIT_OFF_MAC1..INIT_OFF_MAC2])?;
+            let reply =
+                h.cookie_generate_reply(&src, sender, &data[INIT_OFF_MAC1..INIT_OFF_MAC2])?;
             return Ok(PacketResult {
                 ty: PacketType::CookieReply,
                 response: reply,
@@ -381,16 +383,18 @@ pub(crate) fn process_handshake_initiation(
         }
     }
 
-    let msg_type =
-        u32::from_le_bytes(data[INIT_OFF_TYPE..INIT_OFF_SENDER].try_into().unwrap());
+    let msg_type = u32::from_le_bytes(data[INIT_OFF_TYPE..INIT_OFF_SENDER].try_into().unwrap());
     if msg_type != MESSAGE_INITIATION_TYPE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "wrong message type",
         ));
     }
-    let sender_idx =
-        u32::from_le_bytes(data[INIT_OFF_SENDER..INIT_OFF_EPHEMERAL].try_into().unwrap());
+    let sender_idx = u32::from_le_bytes(
+        data[INIT_OFF_SENDER..INIT_OFF_EPHEMERAL]
+            .try_into()
+            .unwrap(),
+    );
 
     let server_priv = h.private_key().clone();
     let server_pub = h.public_key();
@@ -445,9 +449,7 @@ pub(crate) fn process_handshake_initiation(
             "client static wrong length",
         ));
     }
-    hs.remote_static
-        .0
-        .copy_from_slice(&client_static);
+    hs.remote_static.0.copy_from_slice(&client_static);
 
     let h_save = hs.hash;
     mix_hash(&mut hs.hash, &h_save, enc_static);
@@ -481,9 +483,7 @@ pub(crate) fn process_handshake_initiation(
 
     // Timestamp replay: must be strictly greater than the last accepted one.
     if !h.accept_peer_timestamp(&hs.remote_static, &timestamp) {
-        return Err(io::Error::other(
-            "replayed handshake timestamp",
-        ));
+        return Err(io::Error::other("replayed handshake timestamp"));
     }
 
     // === Build response ===
@@ -525,9 +525,7 @@ pub(crate) fn process_handshake_initiation(
     // Encrypt empty under k with AD=h.
     let empty_ct = aead_seal_zero(&k, &[], &hs.hash);
     if empty_ct.len() != CHACHAPOLY_OVERHEAD {
-        return Err(io::Error::other(
-            "empty seal wrong size",
-        ));
+        return Err(io::Error::other("empty seal wrong size"));
     }
     let h_save = hs.hash;
     mix_hash(&mut hs.hash, &h_save, &empty_ct);
@@ -603,13 +601,20 @@ pub(crate) fn process_cookie_reply(h: &Handler, data: &[u8]) -> Result<PacketRes
     // Receiver index (our local sender index) identifies the pending handshake,
     // which tells us which peer the reply is for.
     let receiver = u32::from_le_bytes(data[4..8].try_into().unwrap());
-    let peer = h
-        .handshake_remote_static(receiver)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no pending handshake for cookie reply"))?;
+    let peer = h.handshake_remote_static(receiver).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "no pending handshake for cookie reply",
+        )
+    })?;
 
     let mut nonce = [0u8; 24];
     nonce.copy_from_slice(&data[8..32]);
-    h.peer_consume_cookie(&peer, &nonce, &data[32..crate::wg::constants::MESSAGE_COOKIE_REPLY_SIZE])?;
+    h.peer_consume_cookie(
+        &peer,
+        &nonce,
+        &data[32..crate::wg::constants::MESSAGE_COOKIE_REPLY_SIZE],
+    )?;
 
     Ok(PacketResult {
         ty: PacketType::CookieReceived,
@@ -658,8 +663,6 @@ impl<'a> Drop for DecGuard<'a> {
 fn key_blake(k: &mut [u8; CHACHAPOLY_KEY_SIZE]) -> &mut [u8; BLAKE2S_256_SIZE] {
     // Both arrays are 32 bytes; transmute by reborrow.
     // SAFETY: BLAKE2S_256_SIZE == CHACHAPOLY_KEY_SIZE == 32 at compile time.
-    let _: [(); 0] =
-        [(); (BLAKE2S_256_SIZE == CHACHAPOLY_KEY_SIZE) as usize - 1];
+    let _: [(); 0] = [(); (BLAKE2S_256_SIZE == CHACHAPOLY_KEY_SIZE) as usize - 1];
     unsafe { &mut *(k.as_mut_ptr() as *mut [u8; BLAKE2S_256_SIZE]) }
 }
-

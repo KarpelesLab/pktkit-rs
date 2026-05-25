@@ -257,10 +257,16 @@ impl L3Device for PeerL3Device {
 
     fn send(&self, packet: &crate::Packet) -> Result<()> {
         let Some(adapter) = self.adapter.upgrade() else {
-            return Err(io::Error::new(io::ErrorKind::NotConnected, "adapter dropped"));
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "adapter dropped",
+            ));
         };
         let Some(server) = adapter.server() else {
-            return Err(io::Error::new(io::ErrorKind::NotConnected, "server stopped"));
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "server stopped",
+            ));
         };
         server.send_to_peer(&self.key, packet.as_bytes())
     }
@@ -325,10 +331,16 @@ impl L2Device for PeerL2Device {
 
     fn send(&self, frame: &crate::Frame) -> Result<()> {
         let Some(adapter) = self.adapter.upgrade() else {
-            return Err(io::Error::new(io::ErrorKind::NotConnected, "adapter dropped"));
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "adapter dropped",
+            ));
         };
         let Some(server) = adapter.server() else {
-            return Err(io::Error::new(io::ErrorKind::NotConnected, "server stopped"));
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "server stopped",
+            ));
         };
         server.send_to_peer(&self.key, frame.as_bytes())
     }

@@ -60,5 +60,8 @@ pub(crate) fn resolve_v6(address: &str) -> Result<SocketAddrV6> {
             return Ok(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0));
         }
     }
-    Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid address"))
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "invalid address",
+    ))
 }

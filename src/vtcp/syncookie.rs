@@ -11,8 +11,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::rand;
 
-use super::segment::{flags, Segment};
 use super::options::mss_option;
+use super::segment::{flags, Segment};
 
 const COOKIE_COUNTER_PERIOD_SECS: u64 = 64;
 const COOKIE_SECRET_ROTATION: Duration = Duration::from_secs(60);

@@ -26,8 +26,8 @@
 //!   — Rust's borrow checker forces callers to drain `take_outgoing()`
 //!   themselves, sidestepping the issue.
 
-pub mod conn;
 pub mod congestion;
+pub mod conn;
 pub mod options;
 pub mod recvbuf;
 pub mod rto;
@@ -36,8 +36,8 @@ pub mod sendbuf;
 pub mod seqspace;
 pub mod syncookie;
 
-pub use conn::{Conn, ConnConfig, CongestionKind, State};
 pub use congestion::{CongestionController, HighSpeed, NewReno};
+pub use conn::{CongestionKind, Conn, ConnConfig, State};
 pub use options::{
     build_options, get_mss, get_sack_blocks, get_timestamp, get_wscale, has_sack_perm, kind,
     mss_option, parse_options, sack_option, sack_perm_option, timestamp_option, wscale_option,

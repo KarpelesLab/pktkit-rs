@@ -47,7 +47,9 @@ impl DevInner {
 
 impl core::fmt::Debug for Tun {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("tuntap::Tun").field("name", &self.inner.name).finish()
+        f.debug_struct("tuntap::Tun")
+            .field("name", &self.inner.name)
+            .finish()
     }
 }
 
@@ -104,7 +106,11 @@ impl Tap {
         let handler_t = handler.clone();
         std::thread::spawn(move || read_loop_l2(inner_t, handler_t));
 
-        Ok(Tap { inner, handler, mac })
+        Ok(Tap {
+            inner,
+            handler,
+            mac,
+        })
     }
 
     pub fn name(&self) -> &str {

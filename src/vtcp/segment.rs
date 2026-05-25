@@ -38,11 +38,17 @@ impl Segment {
     /// Parse a raw TCP segment (no IP header).
     pub fn parse(raw: &[u8]) -> Result<Self> {
         if raw.len() < 20 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "segment too short"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "segment too short",
+            ));
         }
         let data_off = (raw[12] >> 4) as usize * 4;
         if data_off < 20 || data_off > raw.len() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid data offset"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid data offset",
+            ));
         }
         let mut s = Segment {
             src_port: u16::from_be_bytes([raw[0], raw[1]]),
@@ -120,8 +126,8 @@ impl Segment {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::options::{get_mss, mss_option};
+    use super::*;
 
     #[test]
     fn parse_minimal() {
@@ -177,8 +183,10 @@ mod tests {
 
     #[test]
     fn seg_len_counts_syn_and_fin() {
-        let mut s = Segment::default();
-        s.payload = b"hello".to_vec();
+        let mut s = Segment {
+            payload: b"hello".to_vec(),
+            ..Default::default()
+        };
         assert_eq!(s.seg_len(), 5);
         s.flags = flags::SYN;
         assert_eq!(s.seg_len(), 6);

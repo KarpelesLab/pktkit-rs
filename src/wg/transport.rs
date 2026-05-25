@@ -58,9 +58,10 @@ pub(crate) fn process_data_packet(h: &Handler, data: &[u8]) -> Result<PacketResu
 
     // Replay window check.
     if kp.replay_filter.check_replay(counter) {
-        return Err(io::Error::other(
-            format!("replay detected: counter={}", counter),
-        ));
+        return Err(io::Error::other(format!(
+            "replay detected: counter={}",
+            counter
+        )));
     }
 
     let ciphertext = &data[MESSAGE_TRANSPORT_HEADER_SIZE..];
@@ -165,7 +166,10 @@ pub enum EncryptError {
     NoSession,
     KeypairExpired,
     MessageLimitExceeded,
-    DstTooSmall { needed: usize, got: usize },
+    DstTooSmall {
+        needed: usize,
+        got: usize,
+    },
     /// Encryption succeeded but the keypair is past its rekey threshold; the
     /// inner buffer is a valid wire packet that the caller may still send.
     RekeyRequired(Vec<u8>),
@@ -201,4 +205,3 @@ impl From<EncryptError> for io::Error {
         }
     }
 }
-

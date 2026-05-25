@@ -485,14 +485,7 @@ impl Nat64 {
         self.inside.deliver(Packet::from_slice(&out));
     }
 
-    fn inbound_icmp_error(
-        &self,
-        icmp: &[u8],
-        src_v4: Ipv4Addr,
-        ttl: u8,
-        v6_type: u8,
-        v6_code: u8,
-    ) {
+    fn inbound_icmp_error(&self, icmp: &[u8], src_v4: Ipv4Addr, ttl: u8, v6_type: u8, v6_code: u8) {
         if icmp.len() < 8 + IPV4_MIN_HEADER {
             return;
         }
@@ -536,9 +529,7 @@ impl Nat64 {
 
         let src_v6 = ipv4_to_mapped(src_v4);
         let dst_v6 = mapping_key.ip;
-        let emb_transport_len = icmp
-            .len()
-            .saturating_sub(emb_off + emb_ihl);
+        let emb_transport_len = icmp.len().saturating_sub(emb_off + emb_ihl);
         let emb_ipv6_len = IPV6_HEADER_LEN + emb_transport_len;
         let icmpv6_len = 8 + emb_ipv6_len;
         let out_len = IPV6_HEADER_LEN + icmpv6_len;
@@ -587,17 +578,15 @@ impl Nat64 {
                 .copy_from_slice(&icmp[copy_from..copy_from + emb_transport_len]);
             let emb_transport_off = emb_ip6_off;
             match emb_proto_raw {
-                PROTO_TCP | PROTO_UDP
-                    if emb_transport_len >= 2 => {
-                        out[emb_transport_off..emb_transport_off + 2]
-                            .copy_from_slice(&mapping_key.port.to_be_bytes());
-                    }
-                PROTO_ICMP
-                    if emb_transport_len >= 6 => {
-                        out[emb_transport_off] = 128;
-                        out[emb_transport_off + 4..emb_transport_off + 6]
-                            .copy_from_slice(&mapping_key.port.to_be_bytes());
-                    }
+                PROTO_TCP | PROTO_UDP if emb_transport_len >= 2 => {
+                    out[emb_transport_off..emb_transport_off + 2]
+                        .copy_from_slice(&mapping_key.port.to_be_bytes());
+                }
+                PROTO_ICMP if emb_transport_len >= 6 => {
+                    out[emb_transport_off] = 128;
+                    out[emb_transport_off + 4..emb_transport_off + 6]
+                        .copy_from_slice(&mapping_key.port.to_be_bytes());
+                }
                 _ => {}
             }
         }
@@ -751,7 +740,12 @@ fn compute_transport_checksum(proto: Protocol, src: IpAddr, dst: IpAddr, segment
 }
 
 fn compute_icmpv6_checksum(src: Ipv6Addr, dst: Ipv6Addr, data: &[u8]) -> u16 {
-    let ph = pseudo_header_checksum(Protocol::ICMPV6, IpAddr::V6(src), IpAddr::V6(dst), data.len() as u16);
+    let ph = pseudo_header_checksum(
+        Protocol::ICMPV6,
+        IpAddr::V6(src),
+        IpAddr::V6(dst),
+        data.len() as u16,
+    );
     let seg = checksum(data);
     combine_checksums(ph, seg)
 }
@@ -813,7 +807,8 @@ mod tests {
         p[24..40].copy_from_slice(&dst.octets());
         p[IPV6_HEADER_LEN..IPV6_HEADER_LEN + 2].copy_from_slice(&sport.to_be_bytes());
         p[IPV6_HEADER_LEN + 2..IPV6_HEADER_LEN + 4].copy_from_slice(&dport.to_be_bytes());
-        p[IPV6_HEADER_LEN + 4..IPV6_HEADER_LEN + 6].copy_from_slice(&(udp_len as u16).to_be_bytes());
+        p[IPV6_HEADER_LEN + 4..IPV6_HEADER_LEN + 6]
+            .copy_from_slice(&(udp_len as u16).to_be_bytes());
         p[IPV6_HEADER_LEN + 8..].copy_from_slice(payload);
         // Compute UDP checksum.
         let mut cs = compute_transport_checksum(
@@ -914,10 +909,7 @@ mod tests {
         assert_eq!(r[0] >> 4, 6);
         // Destination = original client IPv6.
         assert_eq!(&r[24..40], &client.octets());
-        let dport = u16::from_be_bytes([
-            r[IPV6_HEADER_LEN + 2],
-            r[IPV6_HEADER_LEN + 3],
-        ]);
+        let dport = u16::from_be_bytes([r[IPV6_HEADER_LEN + 2], r[IPV6_HEADER_LEN + 3]]);
         assert_eq!(dport, 44000);
     }
 }

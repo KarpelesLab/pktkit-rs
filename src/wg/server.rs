@@ -20,12 +20,10 @@ use crate::wg::NoisePublicKey;
 use crate::Result;
 
 /// Callback fired when decrypted transport data arrives.
-pub type OnPacketFn =
-    Arc<dyn Fn(&[u8], NoisePublicKey, &Arc<Handler>) + Send + Sync + 'static>;
+pub type OnPacketFn = Arc<dyn Fn(&[u8], NoisePublicKey, &Arc<Handler>) + Send + Sync + 'static>;
 
 /// Callback fired when a handshake completes.
-pub type OnPeerConnectedFn =
-    Arc<dyn Fn(NoisePublicKey, &Arc<Handler>) + Send + Sync + 'static>;
+pub type OnPeerConnectedFn = Arc<dyn Fn(NoisePublicKey, &Arc<Handler>) + Send + Sync + 'static>;
 
 /// Server configuration.
 #[derive(Clone)]
@@ -171,12 +169,10 @@ impl Server {
                     let data = buf[..n].to_vec();
                     self.process_incoming(&data, addr, &conn);
                 }
-                Err(e) => {
-                    match e.kind() {
-                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => continue,
-                        _ => break,
-                    }
-                }
+                Err(e) => match e.kind() {
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => continue,
+                    _ => break,
+                },
             }
         }
     }
@@ -246,9 +242,7 @@ impl Server {
                 .get(peer_key)
                 .cloned()
                 .or_else(|| mh.handlers().first().cloned())
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::NotFound, "no handler for peer")
-                })?
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no handler for peer"))?
         } else {
             self.handler.as_ref().unwrap().clone()
         };
@@ -302,7 +296,12 @@ impl Server {
         let h = self
             .handler
             .as_ref()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "use connect_with in multi mode"))?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "use connect_with in multi mode",
+                )
+            })?
             .clone();
         self.connect_with(peer_key, addr, &h)
     }
@@ -340,7 +339,12 @@ impl Server {
     pub fn close(&self) -> Result<()> {
         self.done.store(true, Ordering::SeqCst);
         // The reader thread (caller's serve()) will exit on the next timeout.
-        let handles: Vec<_> = self.threads.lock().expect("threads lock").drain(..).collect();
+        let handles: Vec<_> = self
+            .threads
+            .lock()
+            .expect("threads lock")
+            .drain(..)
+            .collect();
         for h in handles {
             let _ = h.join();
         }

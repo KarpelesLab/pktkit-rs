@@ -25,8 +25,8 @@ mod addr;
 mod consts;
 mod data;
 mod keys;
-mod options;
 mod opcode;
+mod options;
 mod packet_ctrl;
 mod peer;
 mod pkcs5;
@@ -44,6 +44,5 @@ pub use opcode::Opcode;
 pub use options::Options;
 pub use peer::{AuthInfo, OnAuth, Peer, PeerConfig};
 pub use server::{
-    crypto_provider, install_crypto_provider, OnConnect, OnData, OnDisconnect, Server,
-    ServerConfig,
+    crypto_provider, install_crypto_provider, OnConnect, OnData, OnDisconnect, Server, ServerConfig,
 };

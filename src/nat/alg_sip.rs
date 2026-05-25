@@ -94,11 +94,27 @@ impl SipHelper {
 
         let mut new_payload = payload.to_vec();
         // Headers carrying IP:port (more specific) first, then bare IP.
-        for prefix in [b"Via:".as_slice(), b"v:".as_slice(), b"Contact:".as_slice(), b"m:".as_slice()] {
-            new_payload = sip_rewrite_header(&new_payload, prefix, hp_from.as_bytes(), hp_to.as_bytes());
+        for prefix in [
+            b"Via:".as_slice(),
+            b"v:".as_slice(),
+            b"Contact:".as_slice(),
+            b"m:".as_slice(),
+        ] {
+            new_payload =
+                sip_rewrite_header(&new_payload, prefix, hp_from.as_bytes(), hp_to.as_bytes());
         }
-        for prefix in [b"Via:".as_slice(), b"v:".as_slice(), b"Contact:".as_slice(), b"m:".as_slice()] {
-            new_payload = sip_rewrite_header(&new_payload, prefix, addr_from.as_bytes(), addr_to.as_bytes());
+        for prefix in [
+            b"Via:".as_slice(),
+            b"v:".as_slice(),
+            b"Contact:".as_slice(),
+            b"m:".as_slice(),
+        ] {
+            new_payload = sip_rewrite_header(
+                &new_payload,
+                prefix,
+                addr_from.as_bytes(),
+                addr_to.as_bytes(),
+            );
         }
 
         // SDP body, separated from headers by a blank line.
@@ -131,12 +147,7 @@ impl SipHelper {
 /// Rewrite SDP `c=` connection lines and `m=` media lines outbound, swapping
 /// the inside address for the outside address and registering RTP/RTCP
 /// expectations for each media stream.
-fn rewrite_sdp_outbound(
-    nat: &Nat,
-    sdp: &[u8],
-    outside_addr: &str,
-    inside_ip: Ipv4Addr,
-) -> Vec<u8> {
+fn rewrite_sdp_outbound(nat: &Nat, sdp: &[u8], outside_addr: &str, inside_ip: Ipv4Addr) -> Vec<u8> {
     let inside_addr = inside_ip.to_string();
     let mut remote_ip = Ipv4Addr::UNSPECIFIED;
     let mut out: Vec<Vec<u8>> = Vec::new();
@@ -490,7 +501,8 @@ Content-Length: 0\r\n\r\n";
         }));
 
         let inside = Ipv4Addr::new(10, 0, 0, 5);
-        let sdp = "v=0\r\no=- 0 0 IN IP4 10.0.0.5\r\nc=IN IP4 10.0.0.5\r\nm=audio 8000 RTP/AVP 0\r\n";
+        let sdp =
+            "v=0\r\no=- 0 0 IN IP4 10.0.0.5\r\nc=IN IP4 10.0.0.5\r\nm=audio 8000 RTP/AVP 0\r\n";
         let body = format!(
             "INVITE sip:bob@example.com SIP/2.0\r\n\
 Via: SIP/2.0/UDP 10.0.0.5:5060\r\n\
@@ -499,7 +511,13 @@ Content-Length: {}\r\n\r\n{}",
             sdp.len(),
             sdp
         );
-        let pkt = build_sip_udp(inside, 5060, Ipv4Addr::new(198, 51, 100, 9), 5060, body.as_bytes());
+        let pkt = build_sip_udp(
+            inside,
+            5060,
+            Ipv4Addr::new(198, 51, 100, 9),
+            5060,
+            body.as_bytes(),
+        );
         nat.inside().send(Packet::from_slice(&pkt)).unwrap();
 
         let out = captured.lock().unwrap();
@@ -532,7 +550,11 @@ Content-Length: {}\r\n\r\n{}",
         );
         nat.outside().send(Packet::from_slice(&reply)).unwrap();
         let inbound = inbound.lock().unwrap();
-        assert_eq!(inbound.len(), 1, "RTP packet should reach inside via expectation");
+        assert_eq!(
+            inbound.len(),
+            1,
+            "RTP packet should reach inside via expectation"
+        );
         assert_eq!(&inbound[0][16..20], &[10, 0, 0, 5]);
     }
 

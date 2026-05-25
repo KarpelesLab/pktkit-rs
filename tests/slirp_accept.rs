@@ -135,7 +135,10 @@ fn inbound_accept_handshake_and_bidirectional_data() {
             if n > 0 {
                 break buf[..n].to_vec();
             }
-            assert!(Instant::now() < deadline, "client never received server data");
+            assert!(
+                Instant::now() < deadline,
+                "client never received server data"
+            );
             std::thread::sleep(Duration::from_millis(10));
         };
         assert_eq!(&got, b"hello from server");

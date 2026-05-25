@@ -38,7 +38,10 @@ pub fn parse_options(raw: &[u8]) -> Vec<TcpOption> {
             break;
         }
         if k == kind::Nop {
-            opts.push(TcpOption { kind: kind::Nop, data: Vec::new() });
+            opts.push(TcpOption {
+                kind: kind::Nop,
+                data: Vec::new(),
+            });
             i += 1;
             continue;
         }
@@ -80,15 +83,24 @@ pub fn build_options(opts: &[TcpOption]) -> Vec<u8> {
 }
 
 pub fn mss_option(mss: u16) -> TcpOption {
-    TcpOption { kind: kind::Mss, data: mss.to_be_bytes().to_vec() }
+    TcpOption {
+        kind: kind::Mss,
+        data: mss.to_be_bytes().to_vec(),
+    }
 }
 
 pub fn wscale_option(shift: u8) -> TcpOption {
-    TcpOption { kind: kind::WScale, data: vec![shift] }
+    TcpOption {
+        kind: kind::WScale,
+        data: vec![shift],
+    }
 }
 
 pub fn sack_perm_option() -> TcpOption {
-    TcpOption { kind: kind::SackPerm, data: Vec::new() }
+    TcpOption {
+        kind: kind::SackPerm,
+        data: Vec::new(),
+    }
 }
 
 pub fn sack_option(blocks: &[SackBlock]) -> TcpOption {
@@ -97,14 +109,20 @@ pub fn sack_option(blocks: &[SackBlock]) -> TcpOption {
         data.extend_from_slice(&b.left.to_be_bytes());
         data.extend_from_slice(&b.right.to_be_bytes());
     }
-    TcpOption { kind: kind::Sack, data }
+    TcpOption {
+        kind: kind::Sack,
+        data,
+    }
 }
 
 pub fn timestamp_option(ts_val: u32, ts_ecr: u32) -> TcpOption {
     let mut data = Vec::with_capacity(8);
     data.extend_from_slice(&ts_val.to_be_bytes());
     data.extend_from_slice(&ts_ecr.to_be_bytes());
-    TcpOption { kind: kind::Timestamp, data }
+    TcpOption {
+        kind: kind::Timestamp,
+        data,
+    }
 }
 
 /// Extract the MSS value from a list of options, or 0 if absent.
@@ -148,10 +166,16 @@ pub fn get_sack_blocks(opts: &[TcpOption]) -> Vec<SackBlock> {
             for i in 0..n {
                 let base = i * 8;
                 let l = u32::from_be_bytes([
-                    o.data[base], o.data[base + 1], o.data[base + 2], o.data[base + 3],
+                    o.data[base],
+                    o.data[base + 1],
+                    o.data[base + 2],
+                    o.data[base + 3],
                 ]);
                 let r = u32::from_be_bytes([
-                    o.data[base + 4], o.data[base + 5], o.data[base + 6], o.data[base + 7],
+                    o.data[base + 4],
+                    o.data[base + 5],
+                    o.data[base + 6],
+                    o.data[base + 7],
                 ]);
                 out.push(SackBlock { left: l, right: r });
             }
@@ -202,8 +226,14 @@ mod tests {
     #[test]
     fn sack_roundtrip() {
         let blocks = vec![
-            SackBlock { left: 100, right: 200 },
-            SackBlock { left: 300, right: 400 },
+            SackBlock {
+                left: 100,
+                right: 200,
+            },
+            SackBlock {
+                left: 300,
+                right: 400,
+            },
         ];
         let raw = build_options(&[sack_option(&blocks)]);
         let parsed = parse_options(&raw);

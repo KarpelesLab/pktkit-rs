@@ -47,7 +47,10 @@ mod tests {
 
         // Nanos field is independent of seconds.
         let ts = encode_tai64n(0, 123_456_789);
-        assert_eq!(u32::from_be_bytes(ts[8..12].try_into().unwrap()), 123_456_789);
+        assert_eq!(
+            u32::from_be_bytes(ts[8..12].try_into().unwrap()),
+            123_456_789
+        );
     }
 
     #[test]

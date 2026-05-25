@@ -207,7 +207,13 @@ mod tests {
     fn build_parse_roundtrip() {
         let s = MacAddr([1, 2, 3, 4, 5, 6]);
         let t = MacAddr([7, 8, 9, 10, 11, 12]);
-        let b = build_packet(OP_REQUEST, s, Ipv4Addr::new(10, 0, 0, 1), t, Ipv4Addr::new(10, 0, 0, 2));
+        let b = build_packet(
+            OP_REQUEST,
+            s,
+            Ipv4Addr::new(10, 0, 0, 1),
+            t,
+            Ipv4Addr::new(10, 0, 0, 2),
+        );
         let (op, sm, si, tm, ti) = parse(&b).unwrap();
         assert_eq!(op, OP_REQUEST);
         assert_eq!(sm, s);

@@ -330,12 +330,7 @@ impl Stack {
             }
             return Ok(());
         }
-        let side = inner
-            .ns_sides
-            .lock()
-            .expect("poisoned")
-            .get(&ns)
-            .cloned();
+        let side = inner.ns_sides.lock().expect("poisoned").get(&ns).cloned();
         if let Some(side) = side {
             let h = side.handler.lock().expect("poisoned").clone();
             if let Some(h) = h {
@@ -349,7 +344,10 @@ impl Stack {
     /// entry point is `<Stack as L3Device>::send`.
     fn handle_packet(inner: &Arc<Inner>, ns: u64, pkt: &[u8]) -> Result<()> {
         if pkt.len() < 20 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "packet too short"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "packet too short",
+            ));
         }
         match pkt[0] >> 4 {
             4 => Self::handle_ipv4(inner, ns, pkt),
@@ -660,9 +658,8 @@ impl Stack {
                 c.clone()
             } else {
                 let inner_for_send = inner.clone();
-                let send_fn: UdpSendFn = Arc::new(move |p: &[u8]| {
-                    Self::dispatch(&inner_for_send, ns, p)
-                });
+                let send_fn: UdpSendFn =
+                    Arc::new(move |p: &[u8]| Self::dispatch(&inner_for_send, ns, p));
                 let conn = UdpConn::new(src, src_port, dst, dst_port, send_fn)?;
                 t.insert(key, conn.clone());
                 conn
@@ -707,21 +704,11 @@ impl Stack {
                 if pkt.len() < transport_off + 8 {
                     return Ok(());
                 }
-                Self::handle_ipv6_udp(
-                    inner,
-                    ns,
-                    pkt,
-                    src,
-                    dst,
-                    src_addr,
-                    dst_addr,
-                    transport_off,
-                )
+                Self::handle_ipv6_udp(inner, ns, pkt, src, dst, src_addr, dst_addr, transport_off)
             }
             58 => {
                 // ICMPv6.
-                if let Some(reply) =
-                    build_icmpv6_echo_reply(pkt, src_addr, dst_addr, transport_off)
+                if let Some(reply) = build_icmpv6_echo_reply(pkt, src_addr, dst_addr, transport_off)
                 {
                     return Self::dispatch(inner, ns, &reply);
                 }
@@ -832,9 +819,8 @@ impl Stack {
                 c.clone()
             } else {
                 let inner_for_send = inner.clone();
-                let send_fn: UdpSendFn6 = Arc::new(move |p: &[u8]| {
-                    Self::dispatch(&inner_for_send, ns, p)
-                });
+                let send_fn: UdpSendFn6 =
+                    Arc::new(move |p: &[u8]| Self::dispatch(&inner_for_send, ns, p));
                 let conn = UdpConn6::new(src, src_port, dst, dst_port, send_fn)?;
                 t.insert(key, conn.clone());
                 conn

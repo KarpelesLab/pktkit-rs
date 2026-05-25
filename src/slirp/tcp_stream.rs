@@ -45,34 +45,46 @@ impl Endpoints {
     /// travels local→remote (server→client).
     fn wrap(&self, seg: &[u8]) -> Vec<u8> {
         match self {
-            Endpoints::V4 { local_ip, remote_ip, .. } => {
-                crate::slirp::packet::build_packet4(*local_ip, *remote_ip, seg)
-            }
-            Endpoints::V6 { local_ip, remote_ip, .. } => {
-                crate::slirp::packet::build_packet6(*local_ip, *remote_ip, seg)
-            }
+            Endpoints::V4 {
+                local_ip,
+                remote_ip,
+                ..
+            } => crate::slirp::packet::build_packet4(*local_ip, *remote_ip, seg),
+            Endpoints::V6 {
+                local_ip,
+                remote_ip,
+                ..
+            } => crate::slirp::packet::build_packet6(*local_ip, *remote_ip, seg),
         }
     }
 
     fn local_addr(&self) -> SocketAddr {
         match self {
-            Endpoints::V4 { local_ip, local_port, .. } => {
-                SocketAddr::new(IpAddr::V4(*local_ip), *local_port)
-            }
-            Endpoints::V6 { local_ip, local_port, .. } => {
-                SocketAddr::new(IpAddr::V6(*local_ip), *local_port)
-            }
+            Endpoints::V4 {
+                local_ip,
+                local_port,
+                ..
+            } => SocketAddr::new(IpAddr::V4(*local_ip), *local_port),
+            Endpoints::V6 {
+                local_ip,
+                local_port,
+                ..
+            } => SocketAddr::new(IpAddr::V6(*local_ip), *local_port),
         }
     }
 
     fn peer_addr(&self) -> SocketAddr {
         match self {
-            Endpoints::V4 { remote_ip, remote_port, .. } => {
-                SocketAddr::new(IpAddr::V4(*remote_ip), *remote_port)
-            }
-            Endpoints::V6 { remote_ip, remote_port, .. } => {
-                SocketAddr::new(IpAddr::V6(*remote_ip), *remote_port)
-            }
+            Endpoints::V4 {
+                remote_ip,
+                remote_port,
+                ..
+            } => SocketAddr::new(IpAddr::V4(*remote_ip), *remote_port),
+            Endpoints::V6 {
+                remote_ip,
+                remote_port,
+                ..
+            } => SocketAddr::new(IpAddr::V6(*remote_ip), *remote_port),
         }
     }
 }
@@ -161,7 +173,10 @@ impl TcpStream {
         while written < buf.len() {
             let mut conn = self.state.conn.lock().expect("poisoned");
             if conn.is_closed() {
-                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "connection closed"));
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "connection closed",
+                ));
             }
             let (n, segs) = conn.write(&buf[written..]);
             drop(conn);

@@ -212,7 +212,10 @@ impl L2Hub {
     fn disconnect(&self, id: u64) {
         self.ports.write().unwrap().retain(|p| p.id != id);
         // Drop any MAC table entries pointing at this port.
-        self.mac_table.lock().unwrap().retain(|_, e| e.port_id != id);
+        self.mac_table
+            .lock()
+            .unwrap()
+            .retain(|_, e| e.port_id != id);
     }
 }
 
@@ -360,9 +363,18 @@ mod tests {
         let b_mac: MacAddr = "02:00:00:00:00:02".parse().unwrap();
         let c_mac: MacAddr = "02:00:00:00:00:03".parse().unwrap();
 
-        let a = Spy { mac: a_mac, ..Default::default() };
-        let b = Spy { mac: b_mac, ..Default::default() };
-        let c = Spy { mac: c_mac, ..Default::default() };
+        let a = Spy {
+            mac: a_mac,
+            ..Default::default()
+        };
+        let b = Spy {
+            mac: b_mac,
+            ..Default::default()
+        };
+        let c = Spy {
+            mac: c_mac,
+            ..Default::default()
+        };
 
         let _ha = hub.connect(a.clone());
         let _hb = hub.connect(b.clone());

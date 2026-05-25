@@ -92,7 +92,10 @@ impl TcpConn {
         while written < buf.len() {
             let mut conn = self.state.conn.lock().unwrap();
             if conn.is_closed() {
-                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "connection closed"));
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "connection closed",
+                ));
             }
             let (n, segs) = conn.write(&buf[written..]);
             drop(conn);
@@ -438,7 +441,8 @@ mod tests {
         let pkt = wrap_v4(Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(10, 0, 0, 1), &seg);
         let recv_seg = &pkt[20..];
         // Verify: pseudo + full segment (with checksum filled) == 0xFFFF complement 0.
-        let pseudo = checksum::pseudo_header_checksum(Protocol::TCP, src, dst, recv_seg.len() as u16);
+        let pseudo =
+            checksum::pseudo_header_checksum(Protocol::TCP, src, dst, recv_seg.len() as u16);
         let body = !checksum::checksum(recv_seg);
         assert_eq!(checksum::combine_checksums(pseudo, body), 0xFFFF);
     }

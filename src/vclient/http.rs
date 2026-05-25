@@ -146,7 +146,10 @@ impl Client {
 
 fn parse_http_url(url: &str) -> io::Result<(String, u16, String)> {
     let rest = url.strip_prefix("http://").ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "only http:// URLs are supported")
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "only http:// URLs are supported",
+        )
     })?;
     let (authority, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
@@ -173,7 +176,12 @@ fn try_parse_complete(raw: &[u8]) -> Option<Response> {
     if let Some(te) = headers.get("transfer-encoding") {
         if te.eq_ignore_ascii_case("chunked") {
             let body = decode_chunked(&raw[header_end..])?;
-            return Some(Response { status, reason, headers, body });
+            return Some(Response {
+                status,
+                reason,
+                headers,
+                body,
+            });
         }
     }
     if let Some(cl) = headers.get("content-length") {
@@ -196,8 +204,8 @@ fn parse_response(raw: &[u8]) -> io::Result<Response> {
     let header_end = find_subsequence(raw, b"\r\n\r\n")
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no header terminator"))?
         + 4;
-    let (status, reason, headers) =
-        parse_head(&raw[..header_end]).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let (status, reason, headers) = parse_head(&raw[..header_end])
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
     let body = if headers
         .get("transfer-encoding")
@@ -210,7 +218,12 @@ fn parse_response(raw: &[u8]) -> io::Result<Response> {
         raw[header_end..].to_vec()
     };
 
-    Ok(Response { status, reason, headers, body })
+    Ok(Response {
+        status,
+        reason,
+        headers,
+        body,
+    })
 }
 
 fn parse_head(head: &[u8]) -> Result<(u16, String, BTreeMap<String, String>), &'static str> {
@@ -220,7 +233,11 @@ fn parse_head(head: &[u8]) -> Result<(u16, String, BTreeMap<String, String>), &'
     // HTTP/1.1 200 OK
     let mut sp = status_line.splitn(3, ' ');
     let _version = sp.next().ok_or("no version")?;
-    let status: u16 = sp.next().ok_or("no status")?.parse().map_err(|_| "bad status")?;
+    let status: u16 = sp
+        .next()
+        .ok_or("no status")?
+        .parse()
+        .map_err(|_| "bad status")?;
     let reason = sp.next().unwrap_or("").to_string();
 
     let mut headers = BTreeMap::new();
@@ -264,9 +281,7 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
     }
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 #[cfg(test)]

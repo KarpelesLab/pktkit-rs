@@ -107,17 +107,13 @@ impl Options {
                     "tun" | "tap" => o.dev_type = v.into(),
                     _ => return Err(format!("invalid dev-type {v:?}")),
                 },
-                "link-mtu" => {
-                    o.link_mtu = v.parse().map_err(|e| format!("link-mtu: {e}"))?
-                }
+                "link-mtu" => o.link_mtu = v.parse().map_err(|e| format!("link-mtu: {e}"))?,
                 "tun-mtu" => o.tun_mtu = v.parse().map_err(|e| format!("tun-mtu: {e}"))?,
                 "proto" => o.proto = v.into(),
                 "cipher" => o.parse_cipher(v)?,
                 "auth" => o.auth = AuthHash::from_str(v)?,
                 "keysize" => o.key_size = v.parse().map_err(|e| format!("keysize: {e}"))?,
-                "key-method" => {
-                    o.key_method = v.parse().map_err(|e| format!("key-method: {e}"))?
-                }
+                "key-method" => o.key_method = v.parse().map_err(|e| format!("key-method: {e}"))?,
                 _ => {} // ignore unknown options for forward-compat
             }
         }

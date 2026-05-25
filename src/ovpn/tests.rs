@@ -153,11 +153,9 @@ struct TestClient {
 
 impl TestClient {
     fn new(local_id: [u8; 8]) -> TestClient {
-        let tls = ClientConnection::new(
-            client_config(),
-            ServerName::try_from("ovpn-test").unwrap(),
-        )
-        .unwrap();
+        let tls =
+            ClientConnection::new(client_config(), ServerName::try_from("ovpn-test").unwrap())
+                .unwrap();
         TestClient {
             tls,
             reliable: Reliable::new(local_id),
@@ -273,7 +271,10 @@ fn e2e_tls_handshake_and_key_exchange() {
         }
     }
 
-    assert!(client.handshake_done(), "client TLS handshake did not complete");
+    assert!(
+        client.handshake_done(),
+        "client TLS handshake did not complete"
+    );
 
     // Send the key-method-2 client blob once the TLS handshake is done.
     if authenticated {
@@ -323,12 +324,14 @@ fn e2e_tls_handshake_and_key_exchange() {
     );
 
     // Build matching GCM options.
-    let mut opts = Options::default();
-    opts.cipher_crypto = CipherCryptoAlg::Aes;
-    opts.cipher_size = 256;
-    opts.cipher_block = CipherBlockMethod::Gcm;
-    opts.auth = super::options::AuthHash::None;
-    opts.compression = "lzo".into();
+    let opts = Options {
+        cipher_crypto: CipherCryptoAlg::Aes,
+        cipher_size: 256,
+        cipher_block: CipherBlockMethod::Gcm,
+        auth: super::options::AuthHash::None,
+        compression: "lzo".into(),
+        ..Default::default()
+    };
 
     // Client encrypts -> server-side keys decrypt. The server derived its keys
     // internally; we can't read them directly, but we *can* verify the client's
@@ -386,13 +389,15 @@ fn send_client_key_material(client: &mut TestClient) -> ([u8; 48], [u8; 32], [u8
     blob.extend_from_slice(&random2);
 
     // options string (must round-trip through Options::parse on the server).
-    let mut opts = Options::default();
-    opts.cipher_crypto = CipherCryptoAlg::Aes;
-    opts.cipher_size = 256;
-    opts.cipher_block = CipherBlockMethod::Gcm;
-    opts.auth = super::options::AuthHash::None;
-    opts.compression = "lzo".into();
-    opts.is_server = false;
+    let opts = Options {
+        cipher_crypto: CipherCryptoAlg::Aes,
+        cipher_size: 256,
+        cipher_block: CipherBlockMethod::Gcm,
+        auth: super::options::AuthHash::None,
+        compression: "lzo".into(),
+        is_server: false,
+        ..Default::default()
+    };
     let opt_str = opts.to_string();
     write_ctrl_string(&mut blob, &opt_str);
     write_ctrl_string(&mut blob, ""); // username
@@ -406,7 +411,11 @@ fn send_client_key_material(client: &mut TestClient) -> ([u8; 48], [u8; 32], [u8
 fn read_server_key_reply(client: &mut TestClient) -> [u8; 64] {
     // The server reply is in client.ctrl_buf: [0:4][2][r1:32][r2:32][strings..].
     let buf = &client.ctrl_buf;
-    assert!(buf.len() >= 4 + 1 + 64, "server reply too short: {}", buf.len());
+    assert!(
+        buf.len() >= 4 + 1 + 64,
+        "server reply too short: {}",
+        buf.len()
+    );
     assert_eq!(&buf[0..4], &[0, 0, 0, 0]);
     assert_eq!(buf[4], 2);
     let mut sr = [0u8; 64];

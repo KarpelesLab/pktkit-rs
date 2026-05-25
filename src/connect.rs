@@ -42,7 +42,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{build_frame, EtherType, Frame, IpPrefix, L2Handler, L3Handler, MacAddr, Packet, PipeL2, PipeL3, Result};
+    use crate::{
+        build_frame, EtherType, Frame, IpPrefix, L2Handler, L3Handler, MacAddr, Packet, PipeL2,
+        PipeL3, Result,
+    };
     use std::sync::{Arc, Mutex};
 
     // A minimal terminal L2Device that records every frame sent to it. Its

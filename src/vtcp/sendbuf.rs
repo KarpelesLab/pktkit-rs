@@ -229,7 +229,10 @@ mod tests {
         let mut s = SendBuf::new(100, 1000);
         s.write(b"0123456789");
         s.advance_sent(10);
-        s.mark_sacked(&[SackBlock { left: 1000, right: 1003 }]);
+        s.mark_sacked(&[SackBlock {
+            left: 1000,
+            right: 1003,
+        }]);
         let data = s.retransmit_data(10);
         assert_eq!(data, b"3456789");
     }
@@ -240,7 +243,10 @@ mod tests {
         let mut s = SendBuf::new(100, 1000);
         s.write(b"0123456789");
         s.advance_sent(10);
-        s.mark_sacked(&[SackBlock { left: 1003, right: 1006 }]);
+        s.mark_sacked(&[SackBlock {
+            left: 1003,
+            right: 1006,
+        }]);
         let data = s.retransmit_data(10);
         assert_eq!(data, b"0123456789");
     }

@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Deny warnings in our own crate. Cargo applies `--cap-lints allow` to
+  # dependencies, so this only gates pktkit's own code.
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  test:
+    name: Test (Linux, ${{ matrix.toolchain }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: [stable, beta]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ${{ matrix.toolchain }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Build (default features — must pull in zero dependencies)
+        run: cargo build --verbose
+      - name: Test (all features — lib, integration, and doc tests)
+        run: cargo test --all-features --verbose
+
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  docs:
+    name: Docs
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --all-features --no-deps
+
+  macos:
+    name: Build + test (macOS, no afxdp)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # afxdp is Linux-only (AF_XDP). tuntap builds on macOS (utun) but opening
+      # a device needs root, so it has no runtime tests. Everything else is
+      # pure-Rust + std and runs on the macOS runner.
+      - name: Build (all features except afxdp)
+        run: cargo build --features "l2adapter dhcp qemu tuntap vtcp slirp vclient nat wg ovpn"
+      - name: Test (socket + crypto features)
+        run: cargo test --features "l2adapter dhcp qemu vtcp slirp vclient nat wg ovpn"

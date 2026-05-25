@@ -221,11 +221,13 @@ impl L2Adapter {
                 } else {
                     let dst = pkt.ipv4_dst_addr().unwrap();
                     let prefix = self.l3.addr();
-                    let target = if prefix.is_valid() && prefix.is_v4() && !prefix.contains(IpAddr::V4(dst)) {
-                        self.gateway_v4.lock().unwrap().unwrap_or(dst)
-                    } else {
-                        dst
-                    };
+                    let target =
+                        if prefix.is_valid() && prefix.is_v4() && !prefix.contains(IpAddr::V4(dst))
+                        {
+                            self.gateway_v4.lock().unwrap().unwrap_or(dst)
+                        } else {
+                            dst
+                        };
                     match self.arp.lookup(target) {
                         Some(m) => (m, EtherType::IPV4),
                         None => {
@@ -241,15 +243,20 @@ impl L2Adapter {
             6 => {
                 if pkt.is_multicast() {
                     let d = pkt.ipv6_dst_addr().unwrap().octets();
-                    (MacAddr([0x33, 0x33, d[12], d[13], d[14], d[15]]), EtherType::IPV6)
+                    (
+                        MacAddr([0x33, 0x33, d[12], d[13], d[14], d[15]]),
+                        EtherType::IPV6,
+                    )
                 } else {
                     let dst = pkt.ipv6_dst_addr().unwrap();
                     let prefix = self.l3.addr();
-                    let target = if prefix.is_valid() && prefix.is_v6() && !prefix.contains(IpAddr::V6(dst)) {
-                        self.gateway_v6.lock().unwrap().unwrap_or(dst)
-                    } else {
-                        dst
-                    };
+                    let target =
+                        if prefix.is_valid() && prefix.is_v6() && !prefix.contains(IpAddr::V6(dst))
+                        {
+                            self.gateway_v6.lock().unwrap().unwrap_or(dst)
+                        } else {
+                            dst
+                        };
                     match self.ndp.lookup(target) {
                         Some(m) => (m, EtherType::IPV6),
                         None => {
@@ -291,7 +298,8 @@ impl L2Adapter {
             _ => return,
         };
         if op == arp::OP_REQUEST && target_ip == our_addr {
-            let payload = arp::build_packet(arp::OP_REPLY, self.mac, our_addr, sender_mac, sender_ip);
+            let payload =
+                arp::build_packet(arp::OP_REPLY, self.mac, our_addr, sender_mac, sender_ip);
             let frame = build_frame(sender_mac, self.mac, EtherType::ARP, &payload);
             self.send_l2(Frame::from_slice(&frame));
         }
@@ -302,7 +310,8 @@ impl L2Adapter {
             IpAddr::V4(a) => a,
             _ => Ipv4Addr::UNSPECIFIED,
         };
-        let payload = arp::build_packet(arp::OP_REQUEST, self.mac, our_addr, MacAddr::zero(), target);
+        let payload =
+            arp::build_packet(arp::OP_REQUEST, self.mac, our_addr, MacAddr::zero(), target);
         let frame = build_frame(MacAddr::broadcast(), self.mac, EtherType::ARP, &payload);
         self.send_l2(Frame::from_slice(&frame));
     }
@@ -327,7 +336,8 @@ impl L2Adapter {
 
                 // Learn sender unless source is unspecified (DAD).
                 if !src.is_unspecified() {
-                    if let Some(src_mac) = ndp::parse_option(&icmp[24..], ndp::OPT_SOURCE_LINK_ADDR) {
+                    if let Some(src_mac) = ndp::parse_option(&icmp[24..], ndp::OPT_SOURCE_LINK_ADDR)
+                    {
                         self.ndp.set(src, src_mac, ndp::DEFAULT_TTL);
                     }
                 }
@@ -355,7 +365,8 @@ impl L2Adapter {
                 let mut t = [0u8; 16];
                 t.copy_from_slice(&icmp[8..24]);
                 let target = Ipv6Addr::from(t);
-                if let Some(target_mac) = ndp::parse_option(&icmp[24..], ndp::OPT_TARGET_LINK_ADDR) {
+                if let Some(target_mac) = ndp::parse_option(&icmp[24..], ndp::OPT_TARGET_LINK_ADDR)
+                {
                     self.ndp.set(target, target_mac, ndp::DEFAULT_TTL);
                     if let Some(pending) = self.ndp_pending.lock().unwrap().remove(&target) {
                         for buf in pending {
@@ -423,7 +434,10 @@ struct AdapterDhcpTransport {
 #[cfg(feature = "dhcp")]
 impl crate::dhcp::ClientTransport for AdapterDhcpTransport {
     fn mac(&self) -> MacAddr {
-        self.weak.upgrade().map(|a| a.mac).unwrap_or(MacAddr::zero())
+        self.weak
+            .upgrade()
+            .map(|a| a.mac)
+            .unwrap_or(MacAddr::zero())
     }
     fn send_broadcast(&self, frame: &Frame) {
         if let Some(a) = self.weak.upgrade() {

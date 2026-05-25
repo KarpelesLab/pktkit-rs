@@ -198,9 +198,21 @@ impl Device {
     //
     // TODO(afxdp): the happy path past `socket()` needs hardware to verify.
     pub fn open(cfg: Config) -> Result<Device> {
-        let ring_size = if cfg.ring_size == 0 { 2048 } else { cfg.ring_size };
-        let frame_size = if cfg.frame_size == 0 { 4096 } else { cfg.frame_size };
-        let num_frames = if cfg.num_frames == 0 { 4096 } else { cfg.num_frames };
+        let ring_size = if cfg.ring_size == 0 {
+            2048
+        } else {
+            cfg.ring_size
+        };
+        let frame_size = if cfg.frame_size == 0 {
+            4096
+        } else {
+            cfg.frame_size
+        };
+        let num_frames = if cfg.num_frames == 0 {
+            4096
+        } else {
+            cfg.num_frames
+        };
 
         if ring_size & (ring_size - 1) != 0 {
             return Err(io::Error::new(
@@ -394,11 +406,7 @@ impl Inner {
         // SAFETY: addr+len is within the UMEM mapping: addr is a frame-aligned
         // offset from the TX pool (< umem.len) and len <= frame_size.
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                frame.as_ptr(),
-                self.umem.ptr().add(addr as usize),
-                len,
-            );
+            std::ptr::copy_nonoverlapping(frame.as_ptr(), self.umem.ptr().add(addr as usize), len);
         }
 
         let desc = [libc::xdp_desc {
@@ -451,7 +459,11 @@ impl Inner {
 //
 // TODO(afxdp): needs hardware to verify — no packets arrive in a sandbox.
 fn poll_loop(inner: Arc<Inner>) {
-    let mut rx_batch = [libc::xdp_desc { addr: 0, len: 0, options: 0 }; BATCH];
+    let mut rx_batch = [libc::xdp_desc {
+        addr: 0,
+        len: 0,
+        options: 0,
+    }; BATCH];
     let mut fill_batch = [0u64; BATCH];
 
     while !inner.closed.load(Ordering::Acquire) {
@@ -518,8 +530,9 @@ fn poll_loop(inner: Arc<Inner>) {
 
 /// `if_nametoindex`, mapping 0 (not found) to an error.
 fn if_nametoindex(name: &str) -> Result<u32> {
-    let c = std::ffi::CString::new(name)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "afxdp: interface name has NUL"))?;
+    let c = std::ffi::CString::new(name).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "afxdp: interface name has NUL")
+    })?;
     let idx = unsafe { libc::if_nametoindex(c.as_ptr()) };
     if idx == 0 {
         return Err(io::Error::new(
@@ -734,18 +747,22 @@ mod tests {
 
     #[test]
     fn ring_size_must_be_power_of_two() {
-        let mut c = Config::default();
-        c.interface = "lo".into();
-        c.ring_size = 1000; // not a power of 2
+        let c = Config {
+            interface: "lo".into(),
+            ring_size: 1000, // not a power of 2
+            ..Default::default()
+        };
         let err = Device::open(c).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
     fn unknown_interface_is_not_found() {
-        let mut c = Config::default();
         // A name that cannot exist (too long / unlikely).
-        c.interface = "pktkit_no_such_iface_xyz".into();
+        let c = Config {
+            interface: "pktkit_no_such_iface_xyz".into(),
+            ..Default::default()
+        };
         let err = Device::open(c).unwrap_err();
         // Either NotFound (if_nametoindex==0) or InvalidInput (NUL); the long
         // name path returns NotFound.
@@ -770,10 +787,7 @@ mod tests {
         assert_eq!(tx, vec![16384, 20480, 24576, 28672]);
         // No overlap and contiguous coverage of the whole UMEM.
         assert_eq!(*rx.first().unwrap(), 0);
-        assert_eq!(
-            *tx.last().unwrap(),
-            (num_frames as u64 - 1) * frame_size
-        );
+        assert_eq!(*tx.last().unwrap(), (num_frames as u64 - 1) * frame_size);
     }
 
     // The ring mmap length must cover cursors + descriptor array. Verify the

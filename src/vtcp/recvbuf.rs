@@ -105,7 +105,10 @@ impl RecvBuf {
             let e_end = e.seq.wrapping_add(e.data.len() as u32);
             if seq_after_eq(e.seq, end_seq) {
                 if !inserted {
-                    merged.push(OooEntry { seq, data: data.clone() });
+                    merged.push(OooEntry {
+                        seq,
+                        data: data.clone(),
+                    });
                     inserted = true;
                 }
                 merged.push(e);

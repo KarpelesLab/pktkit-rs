@@ -349,7 +349,10 @@ impl Conn {
 
         let iss = rand::u32();
         self.send_buf = Some(SendBuf::new(self.cfg.send_buf_size, iss));
-        self.recv_buf = Some(RecvBuf::new(syn.seq.wrapping_add(1), self.cfg.recv_buf_size));
+        self.recv_buf = Some(RecvBuf::new(
+            syn.seq.wrapping_add(1),
+            self.cfg.recv_buf_size,
+        ));
         self.state = State::SynReceived;
 
         let opts = self.build_syn_options();
@@ -395,7 +398,10 @@ impl Conn {
         if mss < self.mss {
             self.mss = mss;
         }
-        self.send_buf = Some(SendBuf::new(self.cfg.send_buf_size, our_iss.wrapping_add(1)));
+        self.send_buf = Some(SendBuf::new(
+            self.cfg.send_buf_size,
+            our_iss.wrapping_add(1),
+        ));
         self.recv_buf = Some(RecvBuf::new(remote_seq, self.cfg.recv_buf_size));
         self.state = State::Established;
         self.signal_established();
@@ -405,7 +411,10 @@ impl Conn {
         }
 
         if !initial_data.is_empty() {
-            self.recv_buf.as_mut().unwrap().insert(remote_seq, initial_data);
+            self.recv_buf
+                .as_mut()
+                .unwrap()
+                .insert(remote_seq, initial_data);
         }
 
         self.queue_ack();
@@ -446,7 +455,8 @@ impl Conn {
 
     fn add_options(&self, seg: &mut Segment) {
         if self.ts_ok {
-            seg.options.push(timestamp_option(self.ts_now(), self.ts_recent));
+            seg.options
+                .push(timestamp_option(self.ts_now(), self.ts_recent));
         }
         if self.sack_ok {
             if let Some(rb) = self.recv_buf.as_ref() {
@@ -647,7 +657,11 @@ impl Conn {
             let syn_rcvd_simopen = self.state == State::SynReceived
                 && seg.has_flag(flags::SYN)
                 && seg.has_flag(flags::ACK)
-                && self.send_buf.as_ref().map(|s| s.nxt() == seg.ack).unwrap_or(false);
+                && self
+                    .send_buf
+                    .as_ref()
+                    .map(|s| s.nxt() == seg.ack)
+                    .unwrap_or(false);
             if !syn_rcvd_simopen {
                 if !seg.has_flag(flags::RST) {
                     self.queue_ack();
@@ -740,7 +754,10 @@ impl Conn {
             self.send_buf.as_mut().unwrap().acknowledge(seg.ack);
             self.retries = 0;
             self.stop_rto();
-            self.recv_buf = Some(RecvBuf::new(seg.seq.wrapping_add(1), self.cfg.recv_buf_size));
+            self.recv_buf = Some(RecvBuf::new(
+                seg.seq.wrapping_add(1),
+                self.cfg.recv_buf_size,
+            ));
             self.snd_wnd = (seg.window as u32) << self.snd_wnd_shift;
             self.cc = make_cc(self.cfg.congestion, self.mss as u32);
             self.rto.ack_received(seg.ack);
@@ -762,7 +779,10 @@ impl Conn {
         }
 
         // Simultaneous open: bare SYN without ACK.
-        self.recv_buf = Some(RecvBuf::new(seg.seq.wrapping_add(1), self.cfg.recv_buf_size));
+        self.recv_buf = Some(RecvBuf::new(
+            seg.seq.wrapping_add(1),
+            self.cfg.recv_buf_size,
+        ));
         self.snd_wnd = (seg.window as u32) << self.snd_wnd_shift;
         self.state = State::SynReceived;
         self.retries = 0;
@@ -851,7 +871,11 @@ impl Conn {
             }
         } else if self.state == State::FinWait1
             && seg.has_flag(flags::ACK)
-            && self.send_buf.as_ref().map(|s| seg.ack == s.nxt()).unwrap_or(false)
+            && self
+                .send_buf
+                .as_ref()
+                .map(|s| seg.ack == s.nxt())
+                .unwrap_or(false)
         {
             self.state = State::FinWait2;
         }
@@ -917,7 +941,11 @@ impl Conn {
     }
 
     fn process_data(&mut self, seg: &Segment) {
-        let n = self.recv_buf.as_mut().unwrap().insert(seg.seq, &seg.payload);
+        let n = self
+            .recv_buf
+            .as_mut()
+            .unwrap()
+            .insert(seg.seq, &seg.payload);
 
         let mut fin_ready = false;
         if self.fin_pending && self.pending_fin_seq == self.recv_buf.as_ref().unwrap().nxt() {
@@ -1067,7 +1095,11 @@ impl Conn {
         }
 
         // Zero-window probing.
-        if self.send_buf.as_ref().map(|s| s.pending() > 0).unwrap_or(false)
+        if self
+            .send_buf
+            .as_ref()
+            .map(|s| s.pending() > 0)
+            .unwrap_or(false)
             && self.snd_wnd == 0
             && self.persist_deadline.is_none()
         {
@@ -1229,7 +1261,12 @@ impl Conn {
             return;
         }
         // 1-byte window probe.
-        if self.send_buf.as_ref().map(|s| s.pending() > 0).unwrap_or(false) {
+        if self
+            .send_buf
+            .as_ref()
+            .map(|s| s.pending() > 0)
+            .unwrap_or(false)
+        {
             let data: Vec<u8> = self.send_buf.as_ref().unwrap().peek_unsent(1).to_vec();
             if !data.is_empty() {
                 let snd_nxt = self.send_buf.as_ref().unwrap().nxt();

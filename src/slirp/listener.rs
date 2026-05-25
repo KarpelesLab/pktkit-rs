@@ -124,7 +124,10 @@ pub(crate) fn resolve_v4(address: &str) -> Result<SocketAddrV4> {
             return Ok(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port));
         }
     }
-    Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid address"))
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "invalid address",
+    ))
 }
 
 #[cfg(test)]

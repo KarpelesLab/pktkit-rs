@@ -3,9 +3,7 @@
 //! Rewrites `PORT`/`EPRT` commands outbound and `227`/`229` responses inbound
 //! so active and passive mode data connections work through the NAT.
 
-use crate::nat::helper::{
-    Expectation, Helper, NatMapping, PacketHelper, PROTO_TCP,
-};
+use crate::nat::helper::{Expectation, Helper, NatMapping, PacketHelper, PROTO_TCP};
 use crate::nat::nat::Nat;
 use crate::{checksum, combine_checksums, pseudo_header_checksum, Protocol};
 use std::net::{IpAddr, Ipv4Addr};
@@ -92,17 +90,26 @@ fn rewrite_port(nat: &Nat, pkt: &[u8], ihl: usize, data_off: usize, _m: &NatMapp
     }
     let mut ip = [0u8; 4];
     for i in 0..4 {
-        let v: u16 = match std::str::from_utf8(parts[i]).ok().and_then(|s| s.parse().ok()) {
+        let v: u16 = match std::str::from_utf8(parts[i])
+            .ok()
+            .and_then(|s| s.parse().ok())
+        {
             Some(v) if v <= 255 => v,
             _ => return pkt.to_vec(),
         };
         ip[i] = v as u8;
     }
-    let p1: u16 = match std::str::from_utf8(parts[4]).ok().and_then(|s| s.parse().ok()) {
+    let p1: u16 = match std::str::from_utf8(parts[4])
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
         Some(v) if v <= 255 => v,
         _ => return pkt.to_vec(),
     };
-    let p2: u16 = match std::str::from_utf8(parts[5]).ok().and_then(|s| s.parse().ok()) {
+    let p2: u16 = match std::str::from_utf8(parts[5])
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
         Some(v) if v <= 255 => v,
         _ => return pkt.to_vec(),
     };
@@ -233,11 +240,17 @@ fn register_227(nat: &Nat, pkt: &[u8], ihl: usize, data_off: usize, m: &NatMappi
             _ => return,
         };
     }
-    let p1: u16 = match std::str::from_utf8(parts[4]).ok().and_then(|s| s.parse().ok()) {
+    let p1: u16 = match std::str::from_utf8(parts[4])
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
         Some(v) => v,
         None => return,
     };
-    let p2: u16 = match std::str::from_utf8(parts[5]).ok().and_then(|s| s.parse().ok()) {
+    let p2: u16 = match std::str::from_utf8(parts[5])
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
         Some(v) => v,
         None => return,
     };
@@ -366,7 +379,12 @@ mod tests {
         p[33] = 0x18; // PSH | ACK
         p[40..].copy_from_slice(command);
         // TCP checksum
-        let ph = pseudo_header_checksum(Protocol::TCP, IpAddr::V4(src), IpAddr::V4(dst), 20 + command.len() as u16);
+        let ph = pseudo_header_checksum(
+            Protocol::TCP,
+            IpAddr::V4(src),
+            IpAddr::V4(dst),
+            20 + command.len() as u16,
+        );
         let seg = checksum(&p[20..]);
         let cs = combine_checksums(ph, seg);
         p[36..38].copy_from_slice(&cs.to_be_bytes());

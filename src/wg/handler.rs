@@ -24,8 +24,7 @@ use crate::Result;
 /// Callback invoked when a handshake arrives from a peer not in the authorized
 /// list. The packet slice is only valid for the call; the callback must copy
 /// it if it needs to keep the data (e.g. for later `accept_unknown_peer`).
-pub type UnknownPeerFn =
-    Arc<dyn Fn(NoisePublicKey, SocketAddr, &[u8]) + Send + Sync + 'static>;
+pub type UnknownPeerFn = Arc<dyn Fn(NoisePublicKey, SocketAddr, &[u8]) + Send + Sync + 'static>;
 
 /// Per-handler configuration.
 #[derive(Clone, Default)]
@@ -240,7 +239,11 @@ impl Handler {
     pub fn remove_peer(&self, peer_key: &NoisePublicKey) {
         self.peers.write().expect("peers lock").remove(peer_key);
 
-        let removed = self.sessions.write().expect("sessions lock").remove(peer_key);
+        let removed = self
+            .sessions
+            .write()
+            .expect("sessions lock")
+            .remove(peer_key);
         if let Some(sess) = removed {
             let mut kps = self.keypairs.write().expect("keypairs lock");
             if let Some(kp) = sess.keypair_current.as_ref() {
@@ -308,11 +311,7 @@ impl Handler {
     /// Check & update the per-peer last-timestamp. Returns true if the new
     /// timestamp is strictly greater than the previously stored one (or no
     /// previous one existed).
-    pub(crate) fn accept_peer_timestamp(
-        &self,
-        peer_key: &NoisePublicKey,
-        ts: &[u8],
-    ) -> bool {
+    pub(crate) fn accept_peer_timestamp(&self, peer_key: &NoisePublicKey, ts: &[u8]) -> bool {
         let mut peers = self.peers.write().expect("peers lock");
         let Some(p) = peers.get_mut(peer_key) else {
             return false;
@@ -453,9 +452,7 @@ impl Handler {
     ) -> Result<()> {
         let mut g = self.handshakes.lock().expect("handshakes lock");
         if g.len() >= crate::wg::constants::MAX_HANDSHAKES && !g.contains_key(&idx) {
-            return Err(io::Error::other(
-                "handshake table full",
-            ));
+            return Err(io::Error::other("handshake table full"));
         }
         g.insert(idx, hs);
         Ok(())
@@ -476,7 +473,10 @@ impl Handler {
     }
 
     pub(crate) fn install_keypair(&self, idx: u32, kp: Arc<Keypair>) {
-        self.keypairs.write().expect("keypairs lock").insert(idx, kp);
+        self.keypairs
+            .write()
+            .expect("keypairs lock")
+            .insert(idx, kp);
     }
 
     pub(crate) fn lookup_keypair(&self, idx: u32) -> Option<Arc<Keypair>> {
@@ -620,12 +620,18 @@ impl Handler {
 
     /// Validate MAC1 on an incoming handshake against our own public key.
     pub(crate) fn cookie_check_mac1(&self, data: &[u8]) -> bool {
-        self.cookie_checker.lock().expect("cookie lock").check_mac1(data)
+        self.cookie_checker
+            .lock()
+            .expect("cookie lock")
+            .check_mac1(data)
     }
 
     /// Validate MAC2 (under-load path).
     pub(crate) fn cookie_check_mac2(&self, data: &[u8], src: &[u8]) -> bool {
-        self.cookie_checker.lock().expect("cookie lock").check_mac2(data, src)
+        self.cookie_checker
+            .lock()
+            .expect("cookie lock")
+            .check_mac2(data, src)
     }
 
     /// Mint a cookie-reply message for a requester.
@@ -646,7 +652,11 @@ impl Handler {
     pub(crate) fn cookie_add_macs(&self, peer: &NoisePublicKey, pkt: &mut [u8]) {
         let peers = self.peers.read().expect("peers lock");
         if let Some(entry) = peers.get(peer) {
-            entry.cookie_gen.lock().expect("cookie_gen lock").add_macs(pkt);
+            entry
+                .cookie_gen
+                .lock()
+                .expect("cookie_gen lock")
+                .add_macs(pkt);
         } else {
             // Unknown peer: still write a valid MAC1.
             let n = pkt.len();

@@ -124,7 +124,8 @@ impl Parsed {
                 }
                 OPT_DNS if len % 4 == 0 => {
                     for chunk in data.chunks(4) {
-                        p.dns.push(Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]));
+                        p.dns
+                            .push(Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]));
                     }
                 }
                 OPT_LEASE_TIME if len == 4 => {
@@ -262,7 +263,10 @@ mod tests {
         assert_eq!(p.msg_type, MSG_OFFER);
         assert_eq!(p.subnet_mask, Some(Ipv4Addr::new(255, 255, 255, 0)));
         assert_eq!(p.router, Some(Ipv4Addr::new(10, 0, 0, 1)));
-        assert_eq!(p.dns, vec![Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(8, 8, 8, 8)]);
+        assert_eq!(
+            p.dns,
+            vec![Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(8, 8, 8, 8)]
+        );
         assert_eq!(p.lease_time, 3600);
         assert_eq!(p.server_id, Some(Ipv4Addr::new(10, 0, 0, 1)));
     }

@@ -96,7 +96,10 @@ impl MultiHandler {
         remote_addr: &SocketAddr,
     ) -> Result<MultiPacketResult> {
         if data.len() < 4 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "packet too short"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "packet too short",
+            ));
         }
         let msg_type = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
         match msg_type {
@@ -112,11 +115,7 @@ impl MultiHandler {
         }
     }
 
-    fn route_handshake(
-        &self,
-        data: &[u8],
-        remote_addr: &SocketAddr,
-    ) -> Result<MultiPacketResult> {
+    fn route_handshake(&self, data: &[u8], remote_addr: &SocketAddr) -> Result<MultiPacketResult> {
         let g = self.handlers.read().expect("multihandler lock");
         for h in g.iter() {
             if check_mac1(h.public_key().as_bytes(), data) {
@@ -133,11 +132,7 @@ impl MultiHandler {
         ))
     }
 
-    fn route_transport(
-        &self,
-        data: &[u8],
-        remote_addr: &SocketAddr,
-    ) -> Result<MultiPacketResult> {
+    fn route_transport(&self, data: &[u8], remote_addr: &SocketAddr) -> Result<MultiPacketResult> {
         if data.len() < 8 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

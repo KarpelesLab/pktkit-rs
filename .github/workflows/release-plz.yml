@@ -1,0 +1,61 @@
+name: release-plz
+
+# release-plz automates versioning, changelog generation, and publishing.
+# On every push to master it:
+#   * release-plz-pr   — opens/updates a "Release" PR that bumps the version
+#                        and updates CHANGELOG.md based on the commits.
+#   * release-plz-release — when that PR is merged (i.e. Cargo.toml's version
+#                        changed), publishes to crates.io and creates the git
+#                        tag + GitHub release.
+#
+# Requirements (configure once in the repo settings):
+#   * Secret `CARGO_REGISTRY_TOKEN` — a crates.io API token with publish scope.
+#   * Settings → Actions → General → Workflow permissions:
+#       - "Read and write permissions"
+#       - "Allow GitHub Actions to create and approve pull requests"
+
+on:
+  push:
+    branches: [master]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  # Publish to crates.io + tag/release when the release PR lands.
+  release-plz-release:
+    name: Release-plz release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run release-plz
+        uses: release-plz/action@v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  # Open / update the release PR (version bump + changelog).
+  release-plz-pr:
+    name: Release-plz PR
+    runs-on: ubuntu-latest
+    concurrency:
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run release-plz
+        uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

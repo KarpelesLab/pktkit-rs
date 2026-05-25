@@ -36,7 +36,11 @@ fn seed_now() -> u64 {
         h
     };
     let mix = nanos ^ counter ^ tid_hash;
-    if mix == 0 { 0x9E3779B97F4A7C15 } else { mix }
+    if mix == 0 {
+        0x9E3779B97F4A7C15
+    } else {
+        mix
+    }
 }
 
 #[inline]

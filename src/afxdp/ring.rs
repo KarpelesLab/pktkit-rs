@@ -371,12 +371,24 @@ mod tests {
         let ring = unsafe { DescRing::new(mem.as_mut_ptr(), offsets(), size) };
 
         let descs = [
-            libc::xdp_desc { addr: 0, len: 60, options: 0 },
-            libc::xdp_desc { addr: 4096, len: 1514, options: 0 },
+            libc::xdp_desc {
+                addr: 0,
+                len: 60,
+                options: 0,
+            },
+            libc::xdp_desc {
+                addr: 4096,
+                len: 1514,
+                options: 0,
+            },
         ];
         assert_eq!(ring.produce(&descs), 2);
 
-        let mut out = [libc::xdp_desc { addr: 0, len: 0, options: 0 }; 8];
+        let mut out = [libc::xdp_desc {
+            addr: 0,
+            len: 0,
+            options: 0,
+        }; 8];
         assert_eq!(ring.consume(&mut out), 2);
         assert_eq!(out[0].addr, 0);
         assert_eq!(out[0].len, 60);
@@ -414,7 +426,10 @@ mod tests {
     fn need_wakeup_true_without_flags() {
         let size = 4u32;
         let mut mem = backing(size, std::mem::size_of::<libc::xdp_desc>());
-        let off = RingOffset { flags: 0, ..offsets() };
+        let off = RingOffset {
+            flags: 0,
+            ..offsets()
+        };
         let ring = unsafe { DescRing::new(mem.as_mut_ptr(), off, size) };
         assert!(ring.need_wakeup());
     }

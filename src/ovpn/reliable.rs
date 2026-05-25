@@ -238,7 +238,8 @@ mod tests {
     fn hard_reset_sets_peer_id() {
         let mut r = Reliable::new(local());
         let client_sid = [9u8, 9, 9, 9, 9, 9, 9, 9];
-        let mut reset = ControlPacket::new(Opcode::CONTROL_HARD_RESET_CLIENT_V2, 0, client_sid, [0; 8]);
+        let mut reset =
+            ControlPacket::new(Opcode::CONTROL_HARD_RESET_CLIENT_V2, 0, client_sid, [0; 8]);
         reset.set_pid(0);
         let out = r.recv(&reset.to_bytes(&[])).unwrap();
         assert!(out.got_client_reset);
@@ -252,7 +253,8 @@ mod tests {
         let mut r = Reliable::new(local());
         let client_sid = [9u8; 8];
         // Establish session.
-        let mut reset = ControlPacket::new(Opcode::CONTROL_HARD_RESET_CLIENT_V2, 0, client_sid, [0; 8]);
+        let mut reset =
+            ControlPacket::new(Opcode::CONTROL_HARD_RESET_CLIENT_V2, 0, client_sid, [0; 8]);
         reset.set_pid(0);
         r.recv(&reset.to_bytes(&[])).unwrap();
 

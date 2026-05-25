@@ -220,7 +220,10 @@ mod tests {
         // Responder mints a cookie reply for it.
         let reply = checker.generate_reply(&src, 0x1234, &init_mac1).unwrap();
         assert_eq!(reply.len(), MESSAGE_COOKIE_REPLY_SIZE);
-        assert_eq!(u32::from_le_bytes(reply[0..4].try_into().unwrap()), MESSAGE_COOKIE_REPLY_TYPE);
+        assert_eq!(
+            u32::from_le_bytes(reply[0..4].try_into().unwrap()),
+            MESSAGE_COOKIE_REPLY_TYPE
+        );
 
         // Initiator consumes the reply, then a fresh initiation carries a MAC2
         // that validates at the checker.

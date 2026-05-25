@@ -70,9 +70,22 @@ impl Table {
 pub fn link_local_from_mac(mac: MacAddr) -> Ipv6Addr {
     let m = mac.octets();
     Ipv6Addr::from([
-        0xfe, 0x80, 0, 0, 0, 0, 0, 0,
-        m[0] ^ 0x02, m[1], m[2], 0xff,
-        0xfe, m[3], m[4], m[5],
+        0xfe,
+        0x80,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        m[0] ^ 0x02,
+        m[1],
+        m[2],
+        0xff,
+        0xfe,
+        m[3],
+        m[4],
+        m[5],
     ])
 }
 
@@ -81,8 +94,7 @@ pub fn link_local_from_mac(mac: MacAddr) -> Ipv6Addr {
 pub fn solicited_node_multicast(addr: Ipv6Addr) -> Ipv6Addr {
     let a = addr.octets();
     Ipv6Addr::from([
-        0xff, 0x02, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0x01, 0xff, a[13], a[14], a[15],
+        0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0xff, a[13], a[14], a[15],
     ])
 }
 

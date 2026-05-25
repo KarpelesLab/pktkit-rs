@@ -1,5 +1,10 @@
 # pktkit
 
+[![CI](https://github.com/KarpelesLab/pktkit-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/KarpelesLab/pktkit-rs/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/pktkit.svg)](https://crates.io/crates/pktkit)
+[![docs.rs](https://img.shields.io/docsrs/pktkit)](https://docs.rs/pktkit)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Zero-copy L2/L3 packet handling toolkit for Rust.
 
 `pktkit` is a feature-gated multi-tool for building virtual network topologies:

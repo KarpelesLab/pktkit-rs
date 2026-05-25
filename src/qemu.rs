@@ -58,7 +58,9 @@ pub struct Conn {
 
 impl core::fmt::Debug for Conn {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("qemu::Conn").field("mac", &self.mac).finish()
+        f.debug_struct("qemu::Conn")
+            .field("mac", &self.mac)
+            .finish()
     }
 }
 

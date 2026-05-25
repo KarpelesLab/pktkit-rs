@@ -54,11 +54,19 @@ pub(crate) enum SendBack {
 impl SendBack {
     fn write_seg(&self, seg: &[u8]) -> Result<()> {
         match self {
-            SendBack::V4 { local_ip, remote_ip, send } => {
+            SendBack::V4 {
+                local_ip,
+                remote_ip,
+                send,
+            } => {
                 let pkt = build_packet4(*local_ip, *remote_ip, seg);
                 send(&pkt)
             }
-            SendBack::V6 { local_ip, remote_ip, send } => {
+            SendBack::V6 {
+                local_ip,
+                remote_ip,
+                send,
+            } => {
                 let pkt = build_packet6(*local_ip, *remote_ip, seg);
                 send(&pkt)
             }
@@ -167,8 +175,9 @@ impl TcpNatConn {
         }
 
         // Retransmitted SYN (or SYN before our SYN-ACK was ACKed): re-send SYN-ACK.
-        if flags & FLAG_SYN != 0 && self.state.snd_nxt.load(Ordering::Acquire)
-            == self.state.snd_iss.load(Ordering::Acquire).wrapping_add(1)
+        if flags & FLAG_SYN != 0
+            && self.state.snd_nxt.load(Ordering::Acquire)
+                == self.state.snd_iss.load(Ordering::Acquire).wrapping_add(1)
             && !self.state.fin_sent.load(Ordering::Acquire)
         {
             let iss = self.state.snd_iss.load(Ordering::Acquire);

@@ -2,7 +2,7 @@
 
 use super::wire;
 use crate::{
-    checksum, build_frame, EtherType, Frame, L2Device, L2Handler, MacAddr, Protocol, Result,
+    build_frame, checksum, EtherType, Frame, L2Device, L2Handler, MacAddr, Protocol, Result,
 };
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -161,8 +161,7 @@ impl Server {
         }
 
         // Build the "assigned" set.
-        let mut assigned: std::collections::HashSet<Ipv4Addr> =
-            std::collections::HashSet::new();
+        let mut assigned: std::collections::HashSet<Ipv4Addr> = std::collections::HashSet::new();
         for l in leases.values() {
             if l.expiry > now {
                 assigned.insert(l.ip);
@@ -270,13 +269,7 @@ impl Server {
         Some(req)
     }
 
-    fn send_reply(
-        &self,
-        msg_type: u8,
-        xid: u32,
-        chaddr: MacAddr,
-        yiaddr: Option<Ipv4Addr>,
-    ) {
+    fn send_reply(&self, msg_type: u8, xid: u32, chaddr: MacAddr, yiaddr: Option<Ipv4Addr>) {
         let mut b = wire::Builder::new(2, xid, chaddr);
         if let Some(ip) = yiaddr {
             b.yiaddr(ip);

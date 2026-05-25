@@ -119,8 +119,12 @@ mod tests {
     #[test]
     fn display_prefixes() {
         let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
-        assert!(PeerKey::new(a, Transport::Tcp).to_string().starts_with("tcp/"));
-        assert!(PeerKey::new(a, Transport::Udp).to_string().starts_with("udp/"));
+        assert!(PeerKey::new(a, Transport::Tcp)
+            .to_string()
+            .starts_with("tcp/"));
+        assert!(PeerKey::new(a, Transport::Udp)
+            .to_string()
+            .starts_with("udp/"));
     }
 
     #[test]

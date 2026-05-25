@@ -32,7 +32,9 @@ pub struct Client {
 
 impl core::fmt::Debug for Client {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("vclient::Client").field("addr", &self.addr()).finish()
+        f.debug_struct("vclient::Client")
+            .field("addr", &self.addr())
+            .finish()
     }
 }
 

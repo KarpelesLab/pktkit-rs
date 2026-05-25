@@ -272,7 +272,13 @@ mod tests {
         body.extend_from_slice(&inside.octets());
         body.extend_from_slice(&0x1234u16.to_be_bytes());
         body.extend_from_slice(&[0xCC, 0xDD]);
-        let pkt = build_h323(inside, 40000, Ipv4Addr::new(198, 51, 100, 9), H323_PORT, &body);
+        let pkt = build_h323(
+            inside,
+            40000,
+            Ipv4Addr::new(198, 51, 100, 9),
+            H323_PORT,
+            &body,
+        );
         nat.inside().send(Packet::from_slice(&pkt)).unwrap();
 
         let out = captured.lock().unwrap();
@@ -332,7 +338,13 @@ mod tests {
             inside_port: 40000,
             outside_port: 20000,
         };
-        let pkt = build_h323(inside, 40000, Ipv4Addr::new(198, 51, 100, 9), H323_PORT, &body);
+        let pkt = build_h323(
+            inside,
+            40000,
+            Ipv4Addr::new(198, 51, 100, 9),
+            H323_PORT,
+            &body,
+        );
         let out = h.process_outbound(&nat, pkt, &m);
         let p = payload_of(&out);
         assert_eq!(&p[1..5], &[203, 0, 113, 1]);

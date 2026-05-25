@@ -89,7 +89,10 @@ fn dial_handshake_and_bidirectional_data() {
         )
         .expect("dial should succeed");
 
-    assert_eq!(conn.peer_addr(), SocketAddr::new(IpAddr::V4(SERVER_IP), SERVER_PORT));
+    assert_eq!(
+        conn.peer_addr(),
+        SocketAddr::new(IpAddr::V4(SERVER_IP), SERVER_PORT)
+    );
 
     // Client → server.
     let mut conn = conn;

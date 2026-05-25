@@ -15,14 +15,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// User-controllable knobs.
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ClientConfig {
     /// Override the client MAC. Defaults to whatever [`ClientTransport::mac`]
     /// returns at start time.
     pub mac: Option<MacAddr>,
 }
-
 
 /// What the client needs from its surroundings: a way to send Ethernet
 /// frames, the MAC to put in the chaddr / source fields, and a callback for
@@ -184,8 +182,10 @@ impl Client {
     fn send_discover(&self) {
         let xid = self.inner.lock().unwrap().xid;
         let mut b = wire::Builder::new(1, xid, self.mac);
-        b.message_type(wire::MSG_DISCOVER)
-            .option(wire::OPT_PARAM_REQUEST, &[wire::OPT_SUBNET_MASK, wire::OPT_ROUTER, wire::OPT_DNS]);
+        b.message_type(wire::MSG_DISCOVER).option(
+            wire::OPT_PARAM_REQUEST,
+            &[wire::OPT_SUBNET_MASK, wire::OPT_ROUTER, wire::OPT_DNS],
+        );
         let dhcp = b.finish();
         let frame = wrap_for_broadcast(self.mac, &dhcp);
         self.transport.send_broadcast(Frame::from_slice(&frame));
@@ -362,10 +362,7 @@ mod tests {
             mac: "02:00:00:00:00:01".parse().unwrap(),
             ..Default::default()
         });
-        let c = Client::new(
-            ArcTransport(r.clone()),
-            ClientConfig::default(),
-        );
+        let c = Client::new(ArcTransport(r.clone()), ClientConfig::default());
         c.start();
         assert!(c.is_active());
         // Sent DISCOVER
@@ -383,7 +380,7 @@ mod tests {
         let ack = make_ack(xid, r.mac);
         c.handle_packet(&ack);
 
-        let bound = r.bound.lock().unwrap().clone().expect("should have bound");
+        let bound = r.bound.lock().unwrap().expect("should have bound");
         assert_eq!(bound.0.bits(), 24);
         assert_eq!(bound.1, Some(Ipv4Addr::new(192, 168, 1, 1)));
     }

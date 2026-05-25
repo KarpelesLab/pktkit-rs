@@ -9,12 +9,10 @@
 
 use crate::nat::defrag::Defragger;
 use crate::nat::helper::{
-    Expectation, Helper, LocalHelper, NatMapping, PacketHelper, PortForward, PROTO_ICMP,
-    PROTO_TCP, PROTO_UDP,
+    Expectation, Helper, LocalHelper, NatMapping, PacketHelper, PortForward, PROTO_ICMP, PROTO_TCP,
+    PROTO_UDP,
 };
-use crate::{
-    checksum, connect_l3, IpPrefix, L3Connector, L3Device, L3Handler, Packet, Result,
-};
+use crate::{checksum, connect_l3, IpPrefix, L3Connector, L3Device, L3Handler, Packet, Result};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -294,10 +292,7 @@ impl Nat {
 
     // -- Internal --------------------------------------------------------
 
-    fn get_or_create_mapping_locked(
-        inner: &mut NatInner,
-        k: NatKey,
-    ) -> Option<&mut Mapping> {
+    fn get_or_create_mapping_locked(inner: &mut NatInner, k: NatKey) -> Option<&mut Mapping> {
         let now = Instant::now();
         if inner.mappings.contains_key(&k) {
             let m = inner.mappings.get_mut(&k).unwrap();
@@ -361,11 +356,7 @@ impl Nat {
         Some(inner.expectations.remove(pos))
     }
 
-    fn match_forward(
-        inner: &mut NatInner,
-        proto: u8,
-        outside_port: u16,
-    ) -> Option<&PortForward> {
+    fn match_forward(inner: &mut NatInner, proto: u8, outside_port: u16) -> Option<&PortForward> {
         let rk = NatRevKey {
             proto,
             port: outside_port,
@@ -588,12 +579,26 @@ impl Nat {
         update_ip_checksum(&mut out, old_src_ip, new_src_ip);
 
         if proto == PROTO_TCP && out.len() >= ihl + 18 {
-            update_l4_checksum(&mut out, ihl + 16, old_src_ip, new_src_ip, old_port, outside_port);
+            update_l4_checksum(
+                &mut out,
+                ihl + 16,
+                old_src_ip,
+                new_src_ip,
+                old_port,
+                outside_port,
+            );
         } else if proto == PROTO_UDP && out.len() >= ihl + 8 {
             let csum_off = ihl + 6;
             let cur = u16::from_be_bytes([out[csum_off], out[csum_off + 1]]);
             if cur != 0 {
-                update_l4_checksum(&mut out, csum_off, old_src_ip, new_src_ip, old_port, outside_port);
+                update_l4_checksum(
+                    &mut out,
+                    csum_off,
+                    old_src_ip,
+                    new_src_ip,
+                    old_port,
+                    outside_port,
+                );
             }
         }
 
@@ -710,7 +715,9 @@ impl Nat {
                     m.last_active = now;
                 }
                 (k, dst_port)
-            } else if let Some(e) = Self::match_expectation_locked(&mut inner, proto, src_ip, src_port) {
+            } else if let Some(e) =
+                Self::match_expectation_locked(&mut inner, proto, src_ip, src_port)
+            {
                 let k = NatKey {
                     ns: 0,
                     proto,
@@ -778,12 +785,26 @@ impl Nat {
         update_ip_checksum(&mut out, old_dst_ip, new_dst_ip);
 
         if proto == PROTO_TCP && out.len() >= ihl + 18 {
-            update_l4_checksum(&mut out, ihl + 16, old_dst_ip, new_dst_ip, old_port, mapping_key.port);
+            update_l4_checksum(
+                &mut out,
+                ihl + 16,
+                old_dst_ip,
+                new_dst_ip,
+                old_port,
+                mapping_key.port,
+            );
         } else if proto == PROTO_UDP && out.len() >= ihl + 8 {
             let csum_off = ihl + 6;
             let cur = u16::from_be_bytes([out[csum_off], out[csum_off + 1]]);
             if cur != 0 {
-                update_l4_checksum(&mut out, csum_off, old_dst_ip, new_dst_ip, old_port, mapping_key.port);
+                update_l4_checksum(
+                    &mut out,
+                    csum_off,
+                    old_dst_ip,
+                    new_dst_ip,
+                    old_port,
+                    mapping_key.port,
+                );
             }
         }
 
@@ -1150,7 +1171,12 @@ mod tests {
         p[32] = 0x50;
         p[33] = flags;
         // TCP checksum: pseudo-header + segment
-        let ph = crate::pseudo_header_checksum(crate::Protocol::TCP, IpAddr::V4(src), IpAddr::V4(dst), 20);
+        let ph = crate::pseudo_header_checksum(
+            crate::Protocol::TCP,
+            IpAddr::V4(src),
+            IpAddr::V4(dst),
+            20,
+        );
         let seg = crate::checksum(&p[20..]);
         let mut sum: u32 = (!ph) as u32 + (!seg) as u32;
         while sum >> 16 != 0 {
@@ -1308,7 +1334,12 @@ mod tests {
     #[test]
     fn icmp_echo_round_trip() {
         let (nat, i, o) = setup();
-        let p = build_icmp_echo(Ipv4Addr::new(10, 0, 0, 7), Ipv4Addr::new(1, 1, 1, 1), 0xAA, 1);
+        let p = build_icmp_echo(
+            Ipv4Addr::new(10, 0, 0, 7),
+            Ipv4Addr::new(1, 1, 1, 1),
+            0xAA,
+            1,
+        );
         nat.inside().send(Packet::from_slice(&p)).unwrap();
 
         let outbound = o.lock().unwrap();
@@ -1403,7 +1434,9 @@ mod tests {
     fn alloc_port_in_range() {
         let nat = Nat::new(pfx("10.0.0.1/24"), pfx("203.0.113.1/24"));
         for _ in 0..16 {
-            let port = nat.create_mapping(PROTO_TCP, Ipv4Addr::new(10, 0, 0, 2), 1234).unwrap();
+            let port = nat
+                .create_mapping(PROTO_TCP, Ipv4Addr::new(10, 0, 0, 2), 1234)
+                .unwrap();
             assert!((NAT_PORT_MIN..=NAT_PORT_MAX).contains(&port));
         }
     }

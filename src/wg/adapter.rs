@@ -112,7 +112,10 @@ impl L3Device for PeerL3Device {
 
     fn send(&self, packet: &Packet) -> Result<()> {
         let Some(adapter) = self.adapter.upgrade() else {
-            return Err(io::Error::new(io::ErrorKind::NotConnected, "adapter dropped"));
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "adapter dropped",
+            ));
         };
         adapter.server.send(packet.as_bytes(), &self.key)
     }
@@ -142,8 +145,8 @@ impl Adapter {
         let weak_for_cb_conn = weak_for_cb.clone();
 
         // OnPacket: deliver decrypted bytes to the matching peer device.
-        let on_packet: OnPacketFn = Arc::new(
-            move |data: &[u8], key: NoisePublicKey, _h: &Arc<Handler>| {
+        let on_packet: OnPacketFn =
+            Arc::new(move |data: &[u8], key: NoisePublicKey, _h: &Arc<Handler>| {
                 if let Some(a) = weak_for_cb_pkt
                     .lock()
                     .expect("weak lock")
@@ -152,11 +155,10 @@ impl Adapter {
                 {
                     a.on_packet(data, key);
                 }
-            },
-        );
+            });
         // OnPeerConnected: wire up the per-peer device.
-        let on_connected: OnPeerConnectedFn = Arc::new(
-            move |key: NoisePublicKey, _h: &Arc<Handler>| {
+        let on_connected: OnPeerConnectedFn =
+            Arc::new(move |key: NoisePublicKey, _h: &Arc<Handler>| {
                 if let Some(a) = weak_for_cb_conn
                     .lock()
                     .expect("weak lock")
@@ -165,8 +167,7 @@ impl Adapter {
                 {
                     a.on_peer_connected(key);
                 }
-            },
-        );
+            });
 
         let server_cfg = if let Some(mh) = cfg.multi_handler.clone() {
             if let Some(cb) = cfg.on_unknown_peer.clone() {

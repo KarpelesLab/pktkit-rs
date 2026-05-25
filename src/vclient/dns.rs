@@ -189,7 +189,10 @@ impl Resolver {
     pub fn from_servers(servers: impl IntoIterator<Item = IpAddr>) -> Resolver {
         Resolver {
             cfg: ResolverConfig {
-                servers: servers.into_iter().map(|ip| SocketAddr::new(ip, 53)).collect(),
+                servers: servers
+                    .into_iter()
+                    .map(|ip| SocketAddr::new(ip, 53))
+                    .collect(),
                 timeout: Duration::from_secs(5),
             },
         }
@@ -243,7 +246,11 @@ impl Resolver {
         let query = wire::build_query(id, name, rtype)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "label too long"))?;
 
-        let bind = if server.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+        let bind = if server.is_ipv6() {
+            "[::]:0"
+        } else {
+            "0.0.0.0:0"
+        };
         let sock = UdpSocket::bind(bind)?;
         sock.set_read_timeout(Some(self.cfg.timeout))?;
         sock.send_to(&query, server)?;
@@ -284,7 +291,7 @@ mod tests {
         assert_eq!(&q[0..2], &[0x12, 0x34]);
         assert_eq!(q[2], 0x01); // RD
         assert_eq!(&q[4..6], &[0, 1]); // QDCOUNT
-        // ends with QTYPE=1, QCLASS=1
+                                       // ends with QTYPE=1, QCLASS=1
         assert_eq!(&q[q.len() - 4..], &[0, 1, 0, 1]);
     }
 
@@ -299,11 +306,11 @@ mod tests {
         r.extend_from_slice(&1u16.to_be_bytes()); // ANCOUNT
         r.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
         r.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
-        // Question
+                                                  // Question
         r.extend_from_slice(&wire::encode_name("a.com").unwrap());
         r.extend_from_slice(&1u16.to_be_bytes()); // QTYPE A
         r.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
-        // Answer: compressed name pointer to offset 12
+                                                  // Answer: compressed name pointer to offset 12
         r.extend_from_slice(&[0xC0, 0x0C]);
         r.extend_from_slice(&1u16.to_be_bytes()); // TYPE A
         r.extend_from_slice(&1u16.to_be_bytes()); // CLASS IN

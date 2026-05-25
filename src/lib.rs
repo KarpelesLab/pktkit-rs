@@ -63,8 +63,8 @@ pub use l2hub::{L2Hub, L2HubHandle};
 pub use l3hub::{L3Hub, L3HubHandle};
 pub use mac::{MacAddr, BROADCAST_MAC};
 pub use namespace::{
-    serve, serve_with_done, Cleanup, Done, DoneSignal, L2Acceptor, L2AcceptorWithDone,
-    L2Connector, L3Connector,
+    serve, serve_with_done, Cleanup, Done, DoneSignal, L2Acceptor, L2AcceptorWithDone, L2Connector,
+    L3Connector,
 };
 pub use packet::Packet;
 pub use pipe::{PipeL2, PipeL3};
