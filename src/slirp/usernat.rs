@@ -7,13 +7,15 @@
 //! Outbound flow:
 //!
 //! - IPv4 ICMP echo to our address → reply.
-//! - IPv4 TCP SYN → dial real `TcpStream`, mint SYN-ACK, bridge bytes.
+//! - IPv4 TCP SYN → dial real `TcpStream`, terminate the virtual side with a
+//!   server-side `vtcp::Conn` (`tcp_out::TcpOutConn`), and bridge bytes.
 //! - IPv4 TCP non-SYN to nothing → send RST per RFC 9293.
 //! - IPv4 UDP → dial real `UdpSocket`, ship payload through, return responses.
 //! - Symmetric handling for IPv6.
 //!
-//! Inbound to the virtual listener (when ports are claimed via [`Stack::listen`])
-//! is stubbed out — the full vtcp engine isn't ported yet.
+//! Inbound to a virtual listener (ports claimed via [`Stack::listen`]) is also
+//! served by the `vtcp` engine: an inbound SYN passive-opens a server-side
+//! `vtcp::Conn` and surfaces a [`TcpStream`](super::TcpStream) on ESTABLISHED.
 
 use crate::iface::{L3Device, L3Handler};
 use crate::namespace::{Cleanup, L3Connector};
@@ -23,11 +25,11 @@ use crate::slirp::icmpv6::build_icmpv6_echo_reply;
 use crate::slirp::ipv6::skip_extension_headers;
 use crate::slirp::listener::{resolve_v4, Listener, ListenerKey};
 use crate::slirp::listener6::{resolve_v6, Listener6, ListenerKey6};
-use crate::slirp::tcp_nat::{build_rst_for_stray, SendBack, TcpNatConn, FLAG_SYN};
+use crate::slirp::tcp_out::{build_refused_rst, build_rst_for_stray, TcpOutConn};
 use crate::slirp::tcp_stream::{is_closed as conn_is_closed, tick_conn, ConnState, Endpoints};
 use crate::slirp::udp::{SendFn as UdpSendFn, UdpConn};
 use crate::slirp::udp6::{SendFn as UdpSendFn6, UdpConn6};
-use crate::vtcp::segment::Segment;
+use crate::vtcp::segment::{flags as tcp_flags, Segment};
 use crate::vtcp::{Conn, ConnConfig, State as VtcpState};
 use crate::{connect_l3, IpPrefix, Result};
 
@@ -68,9 +70,10 @@ const UDP_IDLE: Duration = Duration::from_secs(60);
 struct Inner {
     addr: RwLock<IpPrefix>,
     handler: Mutex<Option<L3Handler>>,
-    // Per-protocol connection tables.
-    tcp: Mutex<HashMap<Key, Arc<TcpNatConn>>>,
-    tcp6: Mutex<HashMap<Key6, Arc<TcpNatConn>>>,
+    // Per-protocol connection tables. Outbound TCP terminates the virtual side
+    // with a server-side vtcp::Conn and bridges to a real socket (`TcpOutConn`).
+    tcp: Mutex<HashMap<Key, Arc<TcpOutConn>>>,
+    tcp6: Mutex<HashMap<Key6, Arc<TcpOutConn>>>,
     udp: Mutex<HashMap<Key, Arc<UdpConn>>>,
     udp6: Mutex<HashMap<Key6, Arc<UdpConn6>>>,
     // Inbound virtual TCP connections accepted by a Listener (vtcp-backed).
@@ -202,8 +205,9 @@ impl Stack {
         });
 
         // Tick thread: drive vtcp timers (RTO / keepalive / TIME-WAIT) for
-        // every accepted virtual TCP connection every 100ms, and reap any that
-        // have reached CLOSED.
+        // every vtcp-backed connection — both inbound accepts (`virt_tcp*`) and
+        // outbound NAT bridges (`tcp*`) — every 100ms, and reap any that have
+        // reached CLOSED.
         let weak_tick = Arc::downgrade(&inner);
         thread::spawn(move || loop {
             thread::sleep(Duration::from_millis(100));
@@ -249,6 +253,49 @@ impl Stack {
             if !dead6.is_empty() {
                 let mut t = inner.virt_tcp6.lock().expect("poisoned");
                 for k in dead6 {
+                    t.remove(&k);
+                }
+            }
+
+            // Outbound NAT bridges: tick the virtual-side engine; reap when the
+            // bridge has fully torn down.
+            let out: Vec<(Key, Arc<TcpOutConn>)> = inner
+                .tcp
+                .lock()
+                .expect("poisoned")
+                .iter()
+                .map(|(k, v)| (*k, v.clone()))
+                .collect();
+            let mut dead_out = Vec::new();
+            for (k, c) in out {
+                tick_conn(c.state());
+                if c.is_closed() {
+                    dead_out.push(k);
+                }
+            }
+            if !dead_out.is_empty() {
+                let mut t = inner.tcp.lock().expect("poisoned");
+                for k in dead_out {
+                    t.remove(&k);
+                }
+            }
+            let out6: Vec<(Key6, Arc<TcpOutConn>)> = inner
+                .tcp6
+                .lock()
+                .expect("poisoned")
+                .iter()
+                .map(|(k, v)| (*k, v.clone()))
+                .collect();
+            let mut dead_out6 = Vec::new();
+            for (k, c) in out6 {
+                tick_conn(c.state());
+                if c.is_closed() {
+                    dead_out6.push(k);
+                }
+            }
+            if !dead_out6.is_empty() {
+                let mut t = inner.tcp6.lock().expect("poisoned");
+                for k in dead_out6 {
                     t.remove(&k);
                 }
             }
@@ -459,7 +506,7 @@ impl Stack {
 
         // 2) SYN destined for a registered virtual listener? Passive-open a
         //    server-side vtcp::Conn and drive the handshake.
-        if (flags & FLAG_SYN) != 0 {
+        if (flags & tcp_flags::SYN) != 0 {
             let listener = Self::find_listener(inner, dst, dst_port);
             if let Some(listener) = listener {
                 return Self::accept_syn_v4(inner, ns, tcp, src, dst, src_port, dst_port, listener);
@@ -473,7 +520,7 @@ impl Stack {
         }
 
         // Non-SYN to unknown connection — RST per RFC 9293.
-        if (flags & FLAG_SYN) == 0 {
+        if (flags & tcp_flags::SYN) == 0 {
             if let Some(rst) = build_rst_for_stray(tcp, dst_port, src_port) {
                 let pkt = crate::slirp::packet::build_packet4(dst, src, &rst);
                 return Self::dispatch(inner, ns, &pkt);
@@ -481,35 +528,45 @@ impl Stack {
             return Ok(());
         }
 
-        // SYN → create outbound NAT connection.
-        let inner_for_send = inner.clone();
-        let send_fn: Arc<dyn Fn(&[u8]) -> Result<()> + Send + Sync> =
-            Arc::new(move |p: &[u8]| Self::dispatch(&inner_for_send, ns, p));
+        // SYN → dial the real destination and bridge it to a server-side
+        // vtcp::Conn terminating the virtual side.
+        if inner.tcp.lock().expect("poisoned").len() >= MAX_VIRT_TCP_CONNS {
+            return Ok(()); // silently drop; client will retransmit
+        }
+        let seg = match Segment::parse(tcp) {
+            Ok(s) => s,
+            Err(_) => return Ok(()),
+        };
 
         let remote = match TcpStream::connect(SocketAddrV4::new(dst, dst_port)) {
             Ok(s) => s,
             Err(_) => {
-                // Synthesize a RST+ACK so the client doesn't hang.
-                let mut rst = vec![0u8; 20];
-                rst[0..2].copy_from_slice(&dst_port.to_be_bytes());
-                rst[2..4].copy_from_slice(&src_port.to_be_bytes());
-                rst[8..12].copy_from_slice(&seq.wrapping_add(1).to_be_bytes());
-                rst[12] = 5 << 4;
-                rst[13] = crate::slirp::tcp_nat::FLAG_RST | crate::slirp::tcp_nat::FLAG_ACK;
-                rst[14..16].copy_from_slice(&32768u16.to_be_bytes());
+                // Refused/unreachable: RST+ACK so the client doesn't hang.
+                let rst = build_refused_rst(src_port, dst_port, seq);
                 let pkt = crate::slirp::packet::build_packet4(dst, src, &rst);
                 return Self::dispatch(inner, ns, &pkt);
             }
         };
 
-        let send_back = SendBack::V4 {
+        let inner_for_send = inner.clone();
+        let sink: Arc<dyn Fn(&[u8]) + Send + Sync> = Arc::new(move |p: &[u8]| {
+            let _ = Self::dispatch(&inner_for_send, ns, p);
+        });
+        let endpoints = Endpoints::V4 {
             local_ip: dst,
+            local_port: dst_port,
             remote_ip: src,
-            send: send_fn,
+            remote_port: src_port,
         };
-
-        let conn = TcpNatConn::accept_syn(src_port, dst_port, seq, remote, send_back)?;
-        inner.tcp.lock().expect("poisoned").insert(key, conn);
+        let conn = TcpOutConn::accept_syn(endpoints, &seg, remote, sink)?;
+        // Register before emitting the SYN-ACK so the client's ACK resolves to
+        // this connection rather than triggering a spurious RST.
+        inner
+            .tcp
+            .lock()
+            .expect("poisoned")
+            .insert(key, conn.clone());
+        conn.send_synack();
         Ok(())
     }
 
@@ -782,7 +839,7 @@ impl Stack {
 
         // 2) SYN destined for a registered virtual listener? Passive-open a
         //    server-side vtcp::Conn and drive the handshake.
-        if (flags & FLAG_SYN) != 0 {
+        if (flags & tcp_flags::SYN) != 0 {
             let listener = Self::find_listener6(inner, dst, dst_port);
             if let Some(listener) = listener {
                 return Self::accept_syn_v6(inner, ns, tcp, src, dst, src_port, dst_port, listener);
@@ -794,7 +851,7 @@ impl Stack {
             return c.handle_segment(tcp);
         }
 
-        if (flags & FLAG_SYN) == 0 {
+        if (flags & tcp_flags::SYN) == 0 {
             if let Some(rst) = build_rst_for_stray(tcp, dst_port, src_port) {
                 let pkt = crate::slirp::packet::build_packet6(dst, src, &rst);
                 return Self::dispatch(inner, ns, &pkt);
@@ -802,31 +859,41 @@ impl Stack {
             return Ok(());
         }
 
-        let inner_for_send = inner.clone();
-        let send_fn: Arc<dyn Fn(&[u8]) -> Result<()> + Send + Sync> =
-            Arc::new(move |p: &[u8]| Self::dispatch(&inner_for_send, ns, p));
+        if inner.tcp6.lock().expect("poisoned").len() >= MAX_VIRT_TCP_CONNS {
+            return Ok(()); // silently drop; client will retransmit
+        }
+        let seg = match Segment::parse(tcp) {
+            Ok(s) => s,
+            Err(_) => return Ok(()),
+        };
 
         let remote = match TcpStream::connect(SocketAddrV6::new(dst, dst_port, 0, 0)) {
             Ok(s) => s,
             Err(_) => {
-                let mut rst = vec![0u8; 20];
-                rst[0..2].copy_from_slice(&dst_port.to_be_bytes());
-                rst[2..4].copy_from_slice(&src_port.to_be_bytes());
-                rst[8..12].copy_from_slice(&seq.wrapping_add(1).to_be_bytes());
-                rst[12] = 5 << 4;
-                rst[13] = crate::slirp::tcp_nat::FLAG_RST | crate::slirp::tcp_nat::FLAG_ACK;
-                rst[14..16].copy_from_slice(&32768u16.to_be_bytes());
+                let rst = build_refused_rst(src_port, dst_port, seq);
                 let pkt = crate::slirp::packet::build_packet6(dst, src, &rst);
                 return Self::dispatch(inner, ns, &pkt);
             }
         };
-        let send_back = SendBack::V6 {
+
+        let inner_for_send = inner.clone();
+        let sink: Arc<dyn Fn(&[u8]) + Send + Sync> = Arc::new(move |p: &[u8]| {
+            let _ = Self::dispatch(&inner_for_send, ns, p);
+        });
+        let endpoints = Endpoints::V6 {
             local_ip: dst,
+            local_port: dst_port,
             remote_ip: src,
-            send: send_fn,
+            remote_port: src_port,
         };
-        let conn = TcpNatConn::accept_syn(src_port, dst_port, seq, remote, send_back)?;
-        inner.tcp6.lock().expect("poisoned").insert(key, conn);
+        let conn = TcpOutConn::accept_syn(endpoints, &seg, remote, sink)?;
+        // Register before emitting the SYN-ACK (see the v4 path).
+        inner
+            .tcp6
+            .lock()
+            .expect("poisoned")
+            .insert(key, conn.clone());
+        conn.send_synack();
         Ok(())
     }
 
@@ -1132,7 +1199,7 @@ impl L3Connector for Stack {
 mod tests {
     use super::*;
     use crate::slirp::checksum::{ipv4_header_checksum, udp_v4_checksum};
-    use crate::slirp::tcp_nat::FLAG_ACK;
+    use crate::vtcp::segment::flags as tcp_flags;
     use crate::Protocol;
     use std::net::{IpAddr, UdpSocket};
     use std::sync::atomic::AtomicUsize;
@@ -1318,7 +1385,7 @@ mod tests {
         p[ihl..ihl + 2].copy_from_slice(&12345u16.to_be_bytes());
         p[ihl + 2..ihl + 4].copy_from_slice(&80u16.to_be_bytes());
         p[ihl + 12] = 5 << 4;
-        p[ihl + 13] = FLAG_ACK;
+        p[ihl + 13] = tcp_flags::ACK;
         p[ihl + 8..ihl + 12].copy_from_slice(&1234u32.to_be_bytes()); // ACK
         L3Device::send(&*s, Packet::from_slice(&p)).unwrap();
 
@@ -1327,7 +1394,7 @@ mod tests {
         // Resulting packet is IPv4 TCP RST.
         assert_eq!(got[0][9], Protocol::TCP.as_u8());
         let rst_tcp = &got[0][20..];
-        assert!(rst_tcp[13] & crate::slirp::tcp_nat::FLAG_RST != 0);
+        assert!(rst_tcp[13] & tcp_flags::RST != 0);
     }
 
     #[test]
@@ -1431,16 +1498,7 @@ mod tests {
         let cport = 50000u16;
 
         // 1) Client → SYN
-        let syn = build_tcp_v4_packet(
-            client,
-            cport,
-            server,
-            port,
-            1000,
-            0,
-            crate::slirp::tcp_nat::FLAG_SYN,
-            &[],
-        );
+        let syn = build_tcp_v4_packet(client, cport, server, port, 1000, 0, tcp_flags::SYN, &[]);
         L3Device::send(&*stack, Packet::from_slice(&syn)).unwrap();
 
         // Wait for the SYN-ACK to land.
@@ -1453,8 +1511,7 @@ mod tests {
                     let pkt = &g[0];
                     let tcp = &pkt[20..];
                     assert!(
-                        tcp[13] & crate::slirp::tcp_nat::FLAG_SYN != 0
-                            && tcp[13] & crate::slirp::tcp_nat::FLAG_ACK != 0,
+                        tcp[13] & tcp_flags::SYN != 0 && tcp[13] & tcp_flags::ACK != 0,
                         "expected SYN+ACK, got flags {:02x}",
                         tcp[13]
                     );
@@ -1478,7 +1535,7 @@ mod tests {
             port,
             1001,
             server_iss.wrapping_add(1),
-            crate::slirp::tcp_nat::FLAG_ACK,
+            tcp_flags::ACK,
             &[],
         );
         L3Device::send(&*stack, Packet::from_slice(&ack)).unwrap();
@@ -1491,7 +1548,7 @@ mod tests {
             port,
             1001,
             server_iss.wrapping_add(1),
-            crate::slirp::tcp_nat::FLAG_ACK,
+            tcp_flags::ACK,
             b"ping",
         );
         L3Device::send(&*stack, Packet::from_slice(&data)).unwrap();
@@ -1523,5 +1580,180 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         assert!(got_pong, "did not see pong payload come back");
+    }
+
+    /// Drive a real `vtcp::Conn` as the virtual client through the outbound NAT
+    /// bridge and transfer a payload far larger than one MSS / one window in
+    /// both directions. This exercises the vtcp engine's segmentation, ACK
+    /// clocking, windowing, and reassembly on the virtual side — none of which
+    /// the old hand-rolled engine had.
+    #[test]
+    fn tcp_out_large_transfer_via_vtcp_client() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        // Real TCP echo server on loopback: echoes everything until EOF.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 16 * 1024];
+                loop {
+                    match s.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if s.write_all(&buf[..n]).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let stack = Stack::new();
+        stack
+            .set_addr(IpPrefix::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 24))
+            .unwrap();
+
+        let client = Ipv4Addr::new(10, 0, 0, 5);
+        let server = Ipv4Addr::new(127, 0, 0, 1);
+        let cport = 50001u16;
+
+        // The virtual client is a full vtcp::Conn. The stack's handler feeds
+        // packets it emits into the client; the client's replies are injected
+        // back into the stack.
+        let vclient = Arc::new(Mutex::new(Conn::new(ConnConfig {
+            local_port: cport,
+            remote_port: port,
+            mss: 1460,
+            ..Default::default()
+        })));
+
+        let stack_for_handler = stack.clone();
+        let client_for_handler = vclient.clone();
+        stack.set_handler(Arc::new(move |p: &Packet| {
+            let bytes = p.as_bytes();
+            if bytes.len() < 40 || bytes[9] != 6 {
+                return Ok(());
+            }
+            let seg = match Segment::parse(&bytes[20..]) {
+                Ok(s) => s,
+                Err(_) => return Ok(()),
+            };
+            let replies = {
+                let mut c = client_for_handler.lock().unwrap();
+                c.handle_segment(&seg)
+            };
+            for r in replies {
+                let ip = crate::slirp::packet::build_packet4(client, server, &r);
+                let _ = stack_for_handler.send(Packet::from_slice(&ip));
+            }
+            Ok(())
+        }));
+
+        let inject = |segs: Vec<Vec<u8>>| {
+            for s in segs {
+                let ip = crate::slirp::packet::build_packet4(client, server, &s);
+                stack.send(Packet::from_slice(&ip)).unwrap();
+            }
+        };
+
+        // Active open: client SYN → stack dials loopback, bridges with a
+        // server-side vtcp::Conn, replies SYN-ACK (handled in the handler).
+        // NB: never hold the vclient lock across `inject` — the handler re-locks
+        // it when the bridge emits segments, which would self-deadlock.
+        let syn = vclient.lock().unwrap().connect();
+        inject(syn);
+
+        // Wait for the client to reach ESTABLISHED.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if vclient.lock().unwrap().state() == VtcpState::Established {
+                break;
+            }
+            assert!(Instant::now() < deadline, "client never established");
+            // A tick may be needed to flush the client's handshake ACK.
+            let segs = vclient.lock().unwrap().tick();
+            inject(segs);
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        // Send a payload many MSS-segments long (well past the initial
+        // congestion window) so the transfer spans many segments and windows —
+        // exercising vtcp segmentation, ACK clocking, and the reassembly path
+        // that the old hand-rolled engine lacked.
+        let payload: Vec<u8> = (0..64_000u32).map(|i| (i % 251) as u8).collect();
+
+        // Writer thread: push the whole payload into the client conn, ticking
+        // to keep segments flowing as the window opens.
+        let writer_client = vclient.clone();
+        let stack_for_writer = stack.clone();
+        let payload_for_writer = payload.clone();
+        let writer = thread::spawn(move || {
+            let mut off = 0usize;
+            let total = payload_for_writer.len();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while off < total {
+                let (n, segs) = {
+                    let mut c = writer_client.lock().unwrap();
+                    c.write(&payload_for_writer[off..])
+                };
+                for s in segs {
+                    let ip = crate::slirp::packet::build_packet4(client, server, &s);
+                    let _ = stack_for_writer.send(Packet::from_slice(&ip));
+                }
+                off += n;
+                if n == 0 {
+                    // Window full: tick to drive retransmit / probe, let ACKs flow.
+                    let segs = writer_client.lock().unwrap().tick();
+                    for s in segs {
+                        let ip = crate::slirp::packet::build_packet4(client, server, &s);
+                        let _ = stack_for_writer.send(Packet::from_slice(&ip));
+                    }
+                    thread::sleep(Duration::from_millis(2));
+                }
+                assert!(Instant::now() < deadline, "writer stalled");
+            }
+            // Close the client → triggers FIN to the bridge → real socket EOF.
+            let segs = writer_client.lock().unwrap().close();
+            for s in segs {
+                let ip = crate::slirp::packet::build_packet4(client, server, &s);
+                let _ = stack_for_writer.send(Packet::from_slice(&ip));
+            }
+        });
+
+        // Reader: drain the echoed payload from the client conn, ticking to
+        // emit ACKs (which clock the bridge's send window open). A bare read
+        // does not ACK in vtcp; the periodic tick flushes the delayed ACK.
+        let mut received = Vec::with_capacity(payload.len());
+        let mut buf = [0u8; 16 * 1024];
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while received.len() < payload.len() {
+            let (n, segs) = {
+                let mut c = vclient.lock().unwrap();
+                let n = c.read(&mut buf);
+                let segs = c.tick();
+                (n, segs)
+            };
+            inject(segs);
+            if n > 0 {
+                received.extend_from_slice(&buf[..n]);
+            } else {
+                thread::sleep(Duration::from_millis(2));
+            }
+            assert!(
+                Instant::now() < deadline,
+                "only received {} of {} bytes",
+                received.len(),
+                payload.len()
+            );
+        }
+
+        writer.join().unwrap();
+        assert_eq!(received.len(), payload.len());
+        assert_eq!(received, payload, "echoed payload mismatch");
+
+        let _ = stack.shutdown();
     }
 }

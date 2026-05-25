@@ -17,10 +17,13 @@
 //!   and, on ESTABLISHED, surface a [`TcpStream`] to the application.
 //! - SYN-cookie defense (`vtcp::SynCookies`) for the accept-queue overflow
 //!   case is not yet wired in — see `TODO(slirp)` in `usernat`.
-//! - The *outbound* (virtual→real) NAT path still uses a hand-rolled subset
-//!   (see `tcp_nat`); it handles the SYN/SYN-ACK/ACK handshake, bulk data in
-//!   both directions, FIN-initiated graceful close, and RST. Out-of-order
-//!   reassembly, SACK, and congestion control are missing there.
+//! - The *outbound* (virtual→real) NAT path is also wired through the in-tree
+//!   `vtcp` engine (see `tcp_out`): a virtual client's SYN passively opens a
+//!   server-side [`vtcp::Conn`](crate::vtcp::Conn) terminating the virtual
+//!   side, while a real OS [`TcpStream`](std::net::TcpStream) is dialed to the
+//!   destination and bytes are pumped both ways. This inherits out-of-order
+//!   reassembly, SACK, window scaling, and congestion control on the virtual
+//!   side.
 
 mod checksum;
 mod icmpv4;
@@ -29,7 +32,7 @@ mod ipv6;
 mod listener;
 mod listener6;
 mod packet;
-mod tcp_nat;
+mod tcp_out;
 mod tcp_stream;
 mod udp;
 mod udp6;
