@@ -29,7 +29,7 @@ mod data;
 mod keys;
 mod opcode;
 mod options;
-mod packet_ctrl;
+pub(crate) mod packet_ctrl;
 mod peer;
 mod pkcs5;
 mod prf;

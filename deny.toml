@@ -1,0 +1,44 @@
+# cargo-deny configuration.
+#
+# The crate's dependency policy is part of what it offers: std, `libc` for OS
+# FFI, vetted RustCrypto primitives, and rustls for OpenVPN's control channel.
+# This file is where that policy is enforced instead of just documented.
+
+[graph]
+all-features = true
+
+[advisories]
+# Any unpatched advisory in the tree fails the build.
+yanked = "deny"
+
+[licenses]
+# Permissive licences only. Anything copyleft would change what a dependent
+# takes on by using this crate, so it needs a deliberate decision, not a
+# silent transitive addition.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Crypto backends that vendor C or assembly and run a build script. The `ovpn`
+# feature deliberately uses a pure-Rust rustls provider instead; if one of
+# these appears it means a default feature slipped back on somewhere.
+deny = [
+    { crate = "ring", reason = "vendors C and assembly; ovpn uses rustls-rustcrypto" },
+    { crate = "aws-lc-rs", reason = "vendors C; ovpn uses rustls-rustcrypto" },
+    { crate = "openssl-sys", reason = "pktkit links no native TLS" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

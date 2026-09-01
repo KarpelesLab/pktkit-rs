@@ -8,6 +8,95 @@ semantic versioning once it reaches 1.0.
 
 ### Added
 
+- **L4 wire types** (`l4` module, re-exported at the root): `TcpSegment`,
+  `UdpDatagram` and `IcmpMessage` as `#[repr(transparent)]` views, plus
+  `TcpFlags` and the `FiveTuple` that identifies a flow. Reachable straight
+  from a packet with `Packet::tcp()`, `udp()`, `icmp()` and `five_tuple()`.
+- **The rest of both IP headers on `Packet`**: identification, flags, fragment
+  offset, DSCP/ECN, options, traffic class, flow label, and setters for all of
+  them. `set_hop_limit` / `decrement_hop_limit` update the IPv4 header checksum
+  incrementally and report expiry instead of wrapping to 255.
+- **Checksums**: `verify_ipv4_checksum`, `recompute_ipv4_checksum`,
+  `verify_transport_checksum`, `recompute_transport_checksum`,
+  `recompute_checksums`, a standalone `transport_checksum`, and
+  `incremental_update` (RFC 1624) for cheap address and port rewrites.
+- **`build` module**: `build_ipv4`, `build_ipv6`, `build_ip`, `build_udp`,
+  `build_tcp`, `build_icmpv4`, `build_icmpv6` — every length and checksum
+  filled in — plus `push_vlan` / `pop_vlan`.
+- **`icmp` module**: `time_exceeded`, `packet_too_big`, `port_unreachable`,
+  `no_route`, `admin_prohibited` and the general `error`, each returning a
+  complete IP packet. `may_reply` implements the RFC 1812 / RFC 4443 rules on
+  when a reply is forbidden — never to another error, a later fragment, or
+  anything broadcast or multicast — which is what keeps an error storm from
+  starting.
+- **`fragment` module**: IPv4 egress fragmentation that honours the option copy
+  bit, preserves offsets when re-fragmenting a fragment, and reports
+  `DontFragment` / `NotFragmentable` so the caller knows to send an ICMP error
+  instead.
+- **`DeviceStats` and `HubStats`**: rx/tx/drop counters on devices, and
+  received/forwarded/flooded/dropped on hubs. Devices opt in through a
+  defaulted `L2Device::stats` / `L3Device::stats`, so existing implementors are
+  unaffected. Wired into pipes, hubs, TUN/TAP, AF_PACKET, taps and impaired
+  links.
+- **`pcap` feature**: `PcapWriter` plus `TapL2` / `TapL3`, which wrap any device
+  and mirror both directions into a file Wireshark or `tcpdump -r` opens. A
+  write failure counts an error rather than taking the link down. No
+  dependencies.
+- **`impair` feature**: `ImpairL2` / `ImpairL3` apply delay, jitter, loss,
+  duplication, corruption and a rate limit in both directions, released from a
+  delay queue in deadline order so jitter reorders traffic the way a real link
+  does. Seeding the RNG makes a run reproducible. No dependencies.
+- **`afpacket` feature**: an L2 device bound to an existing interface via an
+  `AF_PACKET` socket, with optional promiscuous mode and an inbound-only
+  filter. Needs no eBPF and creates no interface, which makes it the simplest
+  way to put a real NIC in a topology.
+- **Fuzzing**: `cargo-fuzz` targets in `fuzz/` covering the packet and L4
+  accessors, ICMP generation, fragmentation, DHCP, DNS, vTCP, OpenVPN control,
+  WireGuard, defrag and the NAT with every ALG registered. `tests/robustness.rs`
+  runs the same bodies on stable in ordinary CI, over mutated, random and
+  exhaustively-truncated input.
+- **Benchmarks**: `benches/hot_path.rs`, harness-free and dependency-free,
+  covering accessors, checksums, hub forwarding and the per-packet work a
+  forwarder does.
+- **CI**: `cargo-deny` (advisories, licences, and a ban on vendored C crypto
+  backends), an MSRV check, a Windows build, docs for individual feature
+  subsets, a benchmark run, and a rotating-seed robustness sweep.
+- Ergonomics: `Deref`, `AsRef<[u8]>`, `PartialEq`, `Eq` and `Hash` on `Frame`
+  and `Packet`; `to_vec()` on both; `vlan_pcp`, `vlan_dei` and `vlan_tci` on
+  `Frame`.
+
+### Fixed
+
+- **IPv6 extension headers are no longer mistaken for transport protocols.**
+  `Packet::ip_protocol()` returned the raw next-header field, so a hop-by-hop,
+  routing or fragment header reported itself as the upper-layer protocol, and
+  `payload()` started 40 bytes in regardless. Both now walk the chain. The walk
+  is bounded, so a crafted chain cannot spin, and it refuses to point at a
+  transport header that a later fragment does not carry.
+  `ipv6_next_header()` still returns the literal field.
+- **`full` builds on every platform.** It pulls in `xdp` and `afxdp`, which
+  were not gated on `target_os`, so enabling it anywhere but Linux failed to
+  compile. Those modules are now Linux-only, and `tuntap` gained an
+  `Unsupported` stub in place of its `compile_error!`.
+- Intra-doc links that resolved only under `--all-features` are fixed, so
+  `cargo doc` is clean for any feature subset.
+- A panic in `set_hop_limit` on a truncated IPv4 header, found by the new
+  randomized sweep on its first run.
+
+### Changed
+
+- `L2Hub` learns per (VLAN, MAC) rather than per MAC, so one address appearing
+  on two VLANs is no longer read as a station flapping between ports. Flooding
+  still reaches every port; ports carry no VLAN membership to filter on.
+- `PipeL2::inject` / `PipeL3::inject` count as received rather than
+  transmitted. Delivery is unchanged.
+- The `namespace` module is now `accept` — it is about accept loops and has
+  nothing to do with network namespaces. Private, so no API change.
+- `slirp`'s IPv6 extension-header walker delegates to the crate's canonical one
+  instead of keeping a second, less careful copy.
+
+### Added — XDP and AF_XDP
+
 - **`xdp` feature**: the in-kernel half of packet capture, split out of
   `afxdp`. eBPF instruction encoding with a label-patching assembler
   (`xdp::insn`), map create/lookup/update/delete with `LPM_TRIE` and `XSKMAP`

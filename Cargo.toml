@@ -12,6 +12,9 @@ documentation = "https://docs.rs/pktkit"
 readme = "README.md"
 keywords = ["networking", "packet", "tcp", "wireguard", "tun"]
 categories = ["network-programming", "virtualization"]
+# The fuzzing harness is a separate crate that depends on this one; it has no
+# business in the published package.
+exclude = ["fuzz", ".github"]
 
 [features]
 # By default we ship only the core: Frame, Packet, hubs, pipes, traits.
@@ -93,6 +96,11 @@ ovpn = [
     "dep:rustls-pemfile",
 ]
 
+# Exposes crate-internal parser entry points to the fuzz targets and the
+# randomized robustness test. Not part of `full`; never enable it as a
+# dependent -- it is not covered by semver.
+fuzzing = []
+
 # Convenience: enable everything (matches the Go upstream featureset).
 full = [
     "l2adapter",
@@ -146,6 +154,12 @@ rustls-pemfile      = { version = "2", optional = true }
 [lib]
 name = "pktkit"
 path = "src/lib.rs"
+
+# Hot-path microbenchmarks. No benchmark framework: the harness is a warmup and
+# a timed loop, which keeps the dev-dependency list empty.
+[[bench]]
+name = "hot_path"
+harness = false
 
 [package.metadata.docs.rs]
 all-features = true

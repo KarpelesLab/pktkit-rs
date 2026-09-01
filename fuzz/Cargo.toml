@@ -1,0 +1,92 @@
+[package]
+name = "pktkit-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.pktkit]
+path = ".."
+features = ["full", "fuzzing"]
+
+# Keep this crate out of the parent package's build; cargo-fuzz drives it.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "all"
+path = "fuzz_targets/all.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "packet"
+path = "fuzz_targets/packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "l4"
+path = "fuzz_targets/l4.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "icmp_fragment"
+path = "fuzz_targets/icmp_fragment.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "nat"
+path = "fuzz_targets/nat.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dhcp"
+path = "fuzz_targets/dhcp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dns"
+path = "fuzz_targets/dns.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vtcp"
+path = "fuzz_targets/vtcp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ovpn"
+path = "fuzz_targets/ovpn.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wg"
+path = "fuzz_targets/wg.rs"
+test = false
+doc = false
+bench = false

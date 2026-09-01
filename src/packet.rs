@@ -793,16 +793,23 @@ impl Packet {
     pub fn set_hop_limit(&mut self, value: u8) {
         match self.version() {
             4 => {
+                // Everything through the checksum field must be present: the
+                // TTL at 8, the protocol at 9 that shares its 16-bit word, and
+                // the checksum at 10..12 that the update writes back.
+                if self.0.len() < 12 {
+                    return;
+                }
                 let old = self.ipv4_ttl();
                 if old == value {
                     return;
                 }
+                let proto = self.0[9];
                 self.set_ipv4_ttl(value);
                 // The TTL is the high byte of the 16-bit word at offset 8.
                 let sum = crate::checksum::incremental_update(
                     self.ipv4_checksum(),
-                    &[old, self.0[9]],
-                    &[value, self.0[9]],
+                    &[old, proto],
+                    &[value, proto],
                 );
                 self.set_ipv4_checksum(sum);
             }

@@ -34,6 +34,25 @@ jobs:
       - name: Test (all features — lib, integration, and doc tests)
         run: cargo test --all-features --verbose
 
+  robustness:
+    name: Randomized robustness sweep
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The fixed-seed sweep already runs as part of `cargo test`. This runs
+      # the same bodies over fresh seeds, so CI explores new input over time
+      # rather than re-testing one corpus forever. A failure prints the seed
+      # and the exact bytes needed to reproduce it.
+      - name: Sweep with rotating seeds
+        run: |
+          for i in 1 2 3 4 5; do
+            seed=$(( ( $(date +%s) + i * 7919 ) % 4294967296 ))
+            echo "--- seed $seed ---"
+            PKTKIT_FUZZ_SEED=$seed cargo test --features "full fuzzing" --test robustness -- --nocapture
+          done
+
   fmt:
     name: Rustfmt
     runs-on: ubuntu-latest
@@ -65,18 +84,95 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo doc --all-features --no-deps
+      # Intra-doc links can resolve under --all-features and break for a user
+      # who enabled one feature, so check a few subsets too.
+      - name: Docs for feature subsets
+        run: |
+          for f in "" "pcap" "impair" "afpacket" "vtcp" "nat" "l2adapter dhcp"; do
+            echo "--- features: ${f:-default} ---"
+            cargo doc --no-deps ${f:+--features "$f"}
+          done
+
+  msrv:
+    name: Minimum supported Rust version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.75.0
+      - uses: Swatinem/rust-cache@v2
+      # The MSRV is a published promise; check it holds for the whole surface.
+      - run: cargo check --all-features --locked
 
   macos:
-    name: Build + test (macOS, no afxdp)
+    name: Build + test (macOS)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # afxdp is Linux-only (AF_XDP). tuntap builds on macOS (utun) but opening
-      # a device needs root, so it has no runtime tests. Everything else is
-      # pure-Rust + std and runs on the macOS runner.
-      - name: Build (all features except afxdp)
-        run: cargo build --features "l2adapter dhcp qemu tuntap vtcp slirp vclient nat wg ovpn"
-      - name: Test (socket + crypto features)
-        run: cargo test --features "l2adapter dhcp qemu vtcp slirp vclient nat wg ovpn"
+      # `full` includes xdp and afxdp, which compile only on Linux; the modules
+      # are gated on target_os, so --all-features must still build here. That
+      # is the whole point of the gate, so test it rather than working around
+      # it with a hand-listed feature set.
+      - run: cargo build --all-features
+      - run: cargo test --all-features
+
+  windows:
+    name: Build (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # tuntap and afpacket fall back to Unsupported stubs here; nothing may
+      # fail to compile.
+      - run: cargo build --all-features
+
+  bench:
+    name: Benchmarks build and run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Timings from a shared runner are not worth recording, but a benchmark
+      # that no longer compiles or panics is.
+      - run: cargo bench
+
+  fuzz:
+    name: Fuzz targets build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            fuzz
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Build every target
+        run: cargo fuzz build
+      # A short run on each target catches anything the stable sweep misses
+      # without turning CI into a fuzzing farm.
+      - name: Smoke-run each target
+        run: |
+          for t in $(cargo fuzz list); do
+            echo "--- $t ---"
+            cargo fuzz run "$t" -- -max_total_time=30 -print_final_stats=1
+          done
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+      # The minimal, audited dependency list is a selling point of this crate,
+      # so it gets checked rather than asserted: advisories, licences, and any
+      # dependency that sneaks in without being declared.
+      - run: cargo deny --all-features check

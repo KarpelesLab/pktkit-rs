@@ -99,6 +99,11 @@ pub type Result<T> = std::io::Result<T>;
 #[cfg(all(target_os = "linux", any(feature = "tuntap", feature = "afpacket")))]
 mod sys;
 
+// Parser entry points collected for fuzzing. Not an API; see `src/fuzz.rs`.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzz;
+
 // --- Feature modules --------------------------------------------------------
 
 #[cfg(feature = "l2adapter")]

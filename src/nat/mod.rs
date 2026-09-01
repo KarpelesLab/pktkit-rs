@@ -27,7 +27,7 @@ mod alg_irc;
 mod alg_pptp;
 mod alg_sip;
 mod alg_tftp;
-mod defrag;
+pub(crate) mod defrag;
 mod helper;
 mod nat;
 mod nat64;

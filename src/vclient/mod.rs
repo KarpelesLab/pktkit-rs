@@ -14,7 +14,7 @@
 //!   [`Client::http_get`]) — no third-party HTTP crate.
 
 mod client;
-mod dns;
+pub(crate) mod dns;
 mod http;
 mod tcp;
 mod udp;

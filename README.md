@@ -28,14 +28,20 @@ re-cast into idiomatic Rust:
 
 ### Core (always on)
 
-- **Zero-copy types**: `Frame`, `Packet`, `EtherType`, `Protocol`, `MacAddr`
+- **Zero-copy types**: `Frame` (L2), `Packet` (L3), and the `l4` views
+  `TcpSegment`, `UdpDatagram`, `IcmpMessage` — plus `TcpFlags`, `FiveTuple`,
+  `EtherType`, `Protocol`, `MacAddr`, `IpPrefix`
 - **Traits**: `L2Device`, `L3Device`, `L2Acceptor`, `L2Connector`, `L3Connector`
-- **L2Hub**: MAC-learning switch with 5-minute aging
+- **L2Hub**: MAC-learning switch, VLAN-aware, with 5-minute aging
 - **L3Hub**: prefix-routing hub with default-route fallback
 - **PipeL2 / PipeL3**: in-memory devices for testing
 - **connect_l2 / connect_l3**: point-to-point wiring
 - **serve**: accept loop, with auto-cleanup on `Done`
-- **checksum**: RFC 1071 + pseudo-header
+- **build**: constructors that fill in lengths and checksums, plus VLAN push/pop
+- **icmp**: error generation with the RFC rules on when a reply is forbidden
+- **fragment**: IPv4 fragmentation for the send path
+- **checksum**: RFC 1071, pseudo-header, and RFC 1624 incremental update
+- **DeviceStats / HubStats**: rx/tx/drop counters, for when a packet vanishes
 
 ### Opt-in cargo features
 
@@ -44,7 +50,10 @@ re-cast into idiomatic Rust:
 | `l2adapter`  | ARP, NDP, gateway routing, `L2Adapter` bridging an L3 device onto an L2 net   |
 | `dhcp`       | DHCP client codec + `DHCPServer` (DISCOVER/OFFER/REQUEST/ACK/…)               |
 | `qemu`       | QEMU userspace network socket protocol (listener + dialer)                    |
+| `pcap`       | Mirror a device's traffic to a `.pcap` file (`TapL2` / `TapL3`)              |
+| `impair`     | Delay, jitter, loss, duplication, corruption and rate limits on a link       |
 | `tuntap`     | TUN/TAP devices on Linux and macOS                                            |
+| `afpacket`   | Bind an L2 device to an existing interface (Linux `AF_PACKET`)               |
 | `xdp`        | Linux XDP: load/attach eBPF on a device's RX path, capture chosen IP prefixes |
 | `afxdp`      | Linux AF_XDP zero-copy sockets (builds on `xdp`)                             |
 | `vtcp`       | Pure-Rust TCP engine (congestion, SACK, timestamps, window scaling, SYN cookies) |
@@ -54,6 +63,11 @@ re-cast into idiomatic Rust:
 | `wg`         | WireGuard tunnel (Noise IK + transport)                                       |
 | `ovpn`       | OpenVPN server (TLS control + AES-CBC/GCM data)                               |
 | `full`       | All of the above                                                              |
+
+`full` builds on every platform. `xdp` and `afxdp` are Linux kernel interfaces
+with no analogue elsewhere, so those two modules are simply absent off Linux;
+`tuntap` and `afpacket` keep their types everywhere and report
+`ErrorKind::Unsupported` when opened on a platform that has no such device.
 
 ### Dependency policy
 
@@ -70,7 +84,10 @@ re-cast into idiomatic Rust:
   C/assembly, and no compile-time build script.
 
 Nothing else. No async runtime. No framework. No native code beyond `libc`.
-Everything cross-compiles. The default build pulls in zero dependencies.
+The default build pulls in zero dependencies, and so do the `pcap` and `impair`
+features. The policy is enforced in CI by `cargo-deny` rather than just stated:
+`ring`, `aws-lc-rs` and `openssl-sys` are banned outright, so a dependency
+cannot quietly pull a vendored C crypto backend back in.
 
 ## Usage
 
@@ -173,6 +190,88 @@ use pktkit::qemu;
 let listener = qemu::Listener::bind_unix("/tmp/qemu.sock")?;
 let hub = Arc::new(L2Hub::new());
 serve(&listener, &hub)?;  // accept loop: each VM joins the hub
+```
+
+### Reading and building packets
+
+Typed views go all the way to L4, and the builders fill in every length and
+checksum, so tests and protocol code never assemble headers by hand:
+
+```rust
+use pktkit::build::{build_ipv4, build_udp};
+use pktkit::{Packet, Protocol};
+use std::net::Ipv4Addr;
+
+let (src, dst) = (Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 2));
+let udp = build_udp(src.into(), dst.into(), 5000, 53, b"query");
+let buf = build_ipv4(src, dst, Protocol::UDP, 64, &udp);
+
+let pkt = Packet::from_slice(&buf);
+assert!(pkt.verify_ipv4_checksum());
+assert_eq!(pkt.udp().unwrap().dst_port(), 53);
+assert_eq!(pkt.five_tuple().unwrap().dst_port, 53);
+```
+
+IPv6 extension headers are walked for you: `ip_protocol()` and `payload()`
+report the real upper-layer protocol and where it starts, rather than whatever
+the next-header field happens to say. `ipv6_next_header()` still gives you the
+literal field when you want it.
+
+### Forwarding a packet correctly
+
+The pieces a forwarder owes its senders — expiry, MTU, and the ICMP that
+explains both — are in the box:
+
+```rust,ignore
+use pktkit::fragment::{fragment, Fragmentation};
+use pktkit::{icmp, Packet};
+
+fn forward(pkt: &mut Packet, mtu: usize, me: std::net::IpAddr) -> Vec<Vec<u8>> {
+    if !pkt.decrement_hop_limit() {
+        // TTL hit zero. Without this, traceroute sees only timeouts.
+        return icmp::time_exceeded(pkt, me).into_iter().collect();
+    }
+    match fragment(pkt, mtu) {
+        Fragmentation::Fits => vec![pkt.to_vec()],
+        Fragmentation::Fragments(parts) => parts,
+        // Too big and DF set, or IPv6: path MTU discovery runs on this reply.
+        _ => icmp::packet_too_big(pkt, me, mtu as u32).into_iter().collect(),
+    }
+}
+```
+
+### Seeing what happened
+
+Devices and hubs keep counters, and any device can be wrapped in a tap that
+writes a `.pcap` Wireshark opens:
+
+```rust,ignore
+// requires: --features "pcap"
+use pktkit::pcap::TapL2;
+
+let tap = TapL2::to_file(device, "/tmp/capture.pcap")?;
+// use `tap` in place of `device`; both directions are written as they pass
+
+let s = hub.stats();
+println!("received {} forwarded {} flooded {} dropped {}",
+         s.received, s.forwarded, s.flooded, s.dropped);
+```
+
+### Testing against a bad link
+
+```rust,ignore
+// requires: --features "impair"
+use pktkit::impair::{ImpairL2, Impairment};
+use std::time::Duration;
+
+let link = ImpairL2::new(device, Impairment {
+    delay: Duration::from_millis(50),
+    jitter: Duration::from_millis(10),
+    loss: 0.02,
+    rate_bps: 10_000_000,
+    seed: 0x5EED,          // same seed, same drops: a flake becomes a test case
+    ..Default::default()
+});
 ```
 
 ### Capturing specific addresses with XDP
