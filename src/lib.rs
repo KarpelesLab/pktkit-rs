@@ -104,6 +104,10 @@ pub mod qemu;
 #[cfg_attr(docsrs, doc(cfg(feature = "tuntap")))]
 pub mod tuntap;
 
+#[cfg(feature = "xdp")]
+#[cfg_attr(docsrs, doc(cfg(feature = "xdp")))]
+pub mod xdp;
+
 #[cfg(feature = "afxdp")]
 #[cfg_attr(docsrs, doc(cfg(feature = "afxdp")))]
 pub mod afxdp;

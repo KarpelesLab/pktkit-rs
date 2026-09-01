@@ -31,8 +31,12 @@ qemu = []
 # Linux/macOS TUN/TAP device support.
 tuntap = ["dep:libc"]
 
-# Linux AF_XDP zero-copy sockets.
-afxdp = ["dep:libc"]
+# Linux XDP: load/attach eBPF programs on a device's receive path, with an
+# IP-prefix capture program and the maps that drive it.
+xdp = ["dep:libc"]
+
+# Linux AF_XDP zero-copy sockets. Layers a userspace datapath on `xdp`.
+afxdp = ["xdp"]
 
 # Pure-Rust virtual TCP engine.
 vtcp = []
@@ -84,6 +88,7 @@ full = [
     "dhcp",
     "qemu",
     "tuntap",
+    "xdp",
     "afxdp",
     "vtcp",
     "slirp",

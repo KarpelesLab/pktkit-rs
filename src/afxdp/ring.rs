@@ -187,6 +187,13 @@ impl AddrRing {
             .store(cons.wrapping_add(n), Ordering::Release);
         n as usize
     }
+
+    /// See `Cursors::need_wakeup`. On the FILL ring this means the driver has
+    /// stopped pulling buffers and needs a `poll`/`recvmsg` to resume.
+    #[inline]
+    pub fn need_wakeup(&self) -> bool {
+        self.cur.need_wakeup()
+    }
 }
 
 /// An RX or TX ring of [`libc::xdp_desc`] descriptors.

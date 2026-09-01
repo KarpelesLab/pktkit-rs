@@ -1,11 +1,13 @@
 //! Linux AF_XDP zero-copy sockets.
 //!
-//! A port of the Go upstream's `afxdp` package (`xdp.go`, `ring.go`,
-//! `bpf.go`). It opens an `AF_XDP` socket, registers a UMEM region, sizes and
-//! `mmap`s the FILL/COMPLETION/RX/TX rings, loads a minimal `XDP_REDIRECT`
-//! eBPF program into an XSKMAP, binds to an interface/queue, and runs a poll
-//! loop that delivers received Ethernet frames to an [`L2Handler`](crate::L2Handler) while
-//! recycling UMEM frames back to the kernel.
+//! Opens an `AF_XDP` socket, registers a UMEM region, sizes and `mmap`s the
+//! FILL/COMPLETION/RX/TX rings, binds to an interface/queue, and runs a poll
+//! loop that delivers received Ethernet frames to an
+//! [`L2Handler`](crate::L2Handler) while recycling UMEM frames back to the
+//! kernel.
+//!
+//! The in-kernel half — the XDP program that decides which packets reach this
+//! socket, and the maps that steer it — lives in [`crate::xdp`].
 //!
 //! The device is presented as an [`L2Device`](crate::L2Device):
 //!
@@ -24,12 +26,10 @@
 //! # Module layout
 //!
 //! - [`ring`]: lock-free SPSC rings over the `mmap`'d shared memory.
-//! - [`bpf`]: eBPF program builder/loader and XSKMAP helpers.
 //! - `xdp` (private): socket setup and datapath; defines [`Config`]/[`Device`].
 
 mod xdp;
 
-pub mod bpf;
 pub mod ring;
 
 pub use xdp::{Config, Device};
