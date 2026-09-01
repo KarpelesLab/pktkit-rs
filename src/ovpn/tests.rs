@@ -10,9 +10,9 @@
 use std::io::{Read, Write};
 use std::sync::Arc;
 
+use rustls::ClientConnection;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
-use rustls::ClientConnection;
 
 use super::data;
 use super::keys::PeerKeys;
@@ -358,9 +358,9 @@ fn e2e_tls_handshake_and_key_exchange() {
 /// the client finally ACKs it, the retransmit stops.
 #[test]
 fn retransmit_fires_when_ack_withheld() {
+    use super::Opcode;
     use super::packet_ctrl::ControlPacket;
     use super::reliable::RETRANSMIT_INITIAL;
-    use super::Opcode;
     use std::time::{Duration, Instant};
 
     install_crypto_provider();

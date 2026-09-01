@@ -16,8 +16,8 @@
 
 use pktkit::build::{build_ipv4, build_ipv6, build_tcp, build_udp};
 use pktkit::{
-    build_frame, checksum, incremental_update, EtherType, Frame, L2Device, L2Hub, L3Device, L3Hub,
-    MacAddr, Packet, PipeL2, PipeL3, Protocol, TcpFlags,
+    EtherType, Frame, L2Device, L2Hub, L3Device, L3Hub, MacAddr, Packet, PipeL2, PipeL3, Protocol,
+    TcpFlags, build_frame, checksum, incremental_update,
 };
 use std::hint::black_box;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};

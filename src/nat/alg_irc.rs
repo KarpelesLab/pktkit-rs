@@ -4,9 +4,9 @@
 //! and `\x01DCC CHAT ...\x01` payloads and registers an expectation so the
 //! incoming DCC connection is forwarded to the inside client.
 
-use crate::nat::helper::{Expectation, Helper, NatMapping, PacketHelper, PROTO_TCP};
+use crate::nat::helper::{Expectation, Helper, NatMapping, PROTO_TCP, PacketHelper};
 use crate::nat::nat::Nat;
-use crate::{checksum, combine_checksums, pseudo_header_checksum, Protocol};
+use crate::{Protocol, checksum, combine_checksums, pseudo_header_checksum};
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::{Duration, Instant};

@@ -3,9 +3,9 @@
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
-use super::insn::{encode, Insn};
+use super::insn::{Insn, encode};
 use super::netlink;
-use super::sys::{self, bpf_cmd, ctx_err, LinkCreateAttr, ProgLoadAttr};
+use super::sys::{self, LinkCreateAttr, ProgLoadAttr, bpf_cmd, ctx_err};
 use crate::Result;
 
 /// The verdict an XDP program returns for a packet.
@@ -110,7 +110,7 @@ impl Program {
                 insns: bytes.as_ptr() as u64,
                 // GPL is required to call GPL-only helpers such as
                 // bpf_redirect_map.
-                license: b"GPL\0".as_ptr() as u64,
+                license: c"GPL".as_ptr() as u64,
                 log_level,
                 log_size,
                 log_buf,

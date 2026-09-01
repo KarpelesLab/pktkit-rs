@@ -12,14 +12,14 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+use crate::Result;
 use crate::wg::constants::{
-    NoisePresharedKey, NoisePrivateKey, NoisePublicKey, CHACHAPOLY_KEY_SIZE,
-    DEFAULT_LOAD_THRESHOLD, REJECT_AFTER_TIME, TAI64N_TIMESTAMP_SIZE,
+    CHACHAPOLY_KEY_SIZE, DEFAULT_LOAD_THRESHOLD, NoisePresharedKey, NoisePrivateKey,
+    NoisePublicKey, REJECT_AFTER_TIME, TAI64N_TIMESTAMP_SIZE,
 };
 use crate::wg::crypto::x25519_public;
 use crate::wg::replay::SlidingWindow;
 use crate::wg::transport::EncryptError;
-use crate::Result;
 
 /// Callback invoked when a handshake arrives from a peer not in the authorized
 /// list. The packet slice is only valid for the call; the callback must copy
@@ -270,10 +270,10 @@ impl Handler {
         let Some(p) = peers.get(peer_key) else {
             return false;
         };
-        if let Some(exp) = p.expires_at {
-            if Instant::now() > exp {
-                return false;
-            }
+        if let Some(exp) = p.expires_at
+            && Instant::now() > exp
+        {
+            return false;
         }
         true
     }
@@ -702,15 +702,15 @@ impl Handler {
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
                     "no peer for cookie reply",
-                ))
+                ));
             }
         };
-        let result = entry
+
+        entry
             .cookie_gen
             .lock()
             .expect("cookie_gen lock")
-            .consume_reply(nonce, ct);
-        result
+            .consume_reply(nonce, ct)
     }
 
     pub(crate) fn dec_active_handshakes(&self) {

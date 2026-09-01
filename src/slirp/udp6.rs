@@ -1,7 +1,7 @@
 //! IPv6 UDP NAT, mirroring [`udp`](super::udp) for IPv6.
 
-use crate::slirp::packet::build_udp_packet6;
 use crate::Result;
+use crate::slirp::packet::build_udp_packet6;
 use std::io::ErrorKind;
 use std::net::{Ipv6Addr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -64,7 +64,7 @@ impl UdpConn6 {
                     Err(e)
                         if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut =>
                     {
-                        continue
+                        continue;
                     }
                     Err(_) => return,
                 };

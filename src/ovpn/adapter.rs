@@ -198,10 +198,10 @@ impl Adapter {
     }
 
     fn on_disconnect(&self, key: PeerKey) {
-        if let Some(p) = self.peers.lock().unwrap().remove(&key) {
-            if let Some(c) = p.cleanup.lock().unwrap().take() {
-                let _ = c();
-            }
+        if let Some(p) = self.peers.lock().unwrap().remove(&key)
+            && let Some(c) = p.cleanup.lock().unwrap().take()
+        {
+            let _ = c();
         }
     }
 

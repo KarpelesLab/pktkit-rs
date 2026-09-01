@@ -9,8 +9,8 @@
 use crate::nat::helper::{PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP};
 use crate::nat::nat::{NAT_ICMP_TIMEOUT, NAT_TCP_FIN_GRACE, NAT_TCP_TIMEOUT, NAT_UDP_TIMEOUT};
 use crate::{
-    checksum, combine_checksums, pseudo_header_checksum, IpPrefix, L3Device, L3Handler, Packet,
-    Protocol, Result,
+    IpPrefix, L3Device, L3Handler, Packet, Protocol, Result, checksum, combine_checksums,
+    pseudo_header_checksum,
 };
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -219,11 +219,11 @@ impl Nat64 {
             let flags = transport[13];
             if flags & 0x05 != 0 {
                 let mut inner = self.inner.lock().unwrap();
-                if let Some(m) = inner.mappings.get_mut(&k) {
-                    if !m.fin_seen {
-                        m.fin_seen = true;
-                        m.fin_time = Some(Instant::now());
-                    }
+                if let Some(m) = inner.mappings.get_mut(&k)
+                    && !m.fin_seen
+                {
+                    m.fin_seen = true;
+                    m.fin_time = Some(Instant::now());
                 }
             }
         }
@@ -376,11 +376,11 @@ impl Nat64 {
             let flags = transport[13];
             if flags & 0x05 != 0 {
                 let mut inner = self.inner.lock().unwrap();
-                if let Some(m) = inner.mappings.get_mut(&mapping_key) {
-                    if !m.fin_seen {
-                        m.fin_seen = true;
-                        m.fin_time = Some(Instant::now());
-                    }
+                if let Some(m) = inner.mappings.get_mut(&mapping_key)
+                    && !m.fin_seen
+                {
+                    m.fin_seen = true;
+                    m.fin_time = Some(Instant::now());
                 }
             }
         }

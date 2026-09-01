@@ -89,6 +89,10 @@ features. The policy is enforced in CI by `cargo-deny` rather than just stated:
 `ring`, `aws-lc-rs` and `openssl-sys` are banned outright, so a dependency
 cannot quietly pull a vendored C crypto backend back in.
 
+## Requirements
+
+Rust 1.88 or newer, edition 2024.
+
 ## Usage
 
 ### Point-to-point L3

@@ -14,10 +14,10 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::Result;
+use crate::wg::NoisePublicKey;
 use crate::wg::handler::{Handler, PacketResult, PacketType};
 use crate::wg::multihandler::MultiHandler;
-use crate::wg::NoisePublicKey;
-use crate::Result;
 
 /// Callback fired when decrypted transport data arrives.
 pub type OnPacketFn = Arc<dyn Fn(&[u8], NoisePublicKey, &Arc<Handler>) + Send + Sync + 'static>;
@@ -92,13 +92,13 @@ impl Server {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "either handler or multi_handler must be set",
-                ))
+                ));
             }
             (true, true) => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "handler and multi_handler are mutually exclusive",
-                ))
+                ));
             }
             _ => {}
         }
@@ -218,10 +218,10 @@ impl Server {
         match result.ty {
             PacketType::HandshakeResponse | PacketType::CookieReply => {
                 let _ = conn.send_to(&result.response, addr);
-                if result.ty == PacketType::HandshakeResponse {
-                    if let Some(cb) = self.on_peer_connected.as_ref() {
-                        cb(result.peer_key, handler);
-                    }
+                if result.ty == PacketType::HandshakeResponse
+                    && let Some(cb) = self.on_peer_connected.as_ref()
+                {
+                    cb(result.peer_key, handler);
                 }
             }
             PacketType::TransportData => {

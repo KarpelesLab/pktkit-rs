@@ -52,7 +52,7 @@ fn seed() -> u64 {
 /// mutations past the first length check and into the interesting code.
 fn corpus() -> Vec<Vec<u8>> {
     use pktkit::build::{build_icmpv4, build_ipv4, build_ipv6, build_tcp, build_udp};
-    use pktkit::{build_frame, EtherType, MacAddr, Protocol, TcpFlags};
+    use pktkit::{EtherType, MacAddr, Protocol, TcpFlags, build_frame};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     let v4a = Ipv4Addr::new(10, 0, 0, 1);

@@ -141,11 +141,7 @@ impl Rng {
 
     /// A value in `[0, n)`; zero when `n` is zero.
     fn below(&mut self, n: u64) -> u64 {
-        if n == 0 {
-            0
-        } else {
-            self.next_u64() % n
-        }
+        if n == 0 { 0 } else { self.next_u64() % n }
     }
 }
 
@@ -564,7 +560,7 @@ impl L3Device for ImpairL3 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{build_frame, EtherType};
+    use crate::{EtherType, build_frame};
 
     /// Records what it is asked to send; delivers inbound frames on demand.
     #[derive(Default)]

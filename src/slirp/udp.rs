@@ -5,8 +5,8 @@
 //! responses and injects them back to the virtual client as IPv4+UDP
 //! packets.
 
-use crate::slirp::packet::build_udp_packet4;
 use crate::Result;
+use crate::slirp::packet::build_udp_packet4;
 use std::io::ErrorKind;
 use std::net::{Ipv4Addr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -71,7 +71,7 @@ impl UdpConn {
                     Err(e)
                         if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut =>
                     {
-                        continue
+                        continue;
                     }
                     Err(_) => return,
                 };

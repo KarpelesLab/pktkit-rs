@@ -27,6 +27,7 @@ use std::sync::Arc;
 
 use rustls::ServerConnection;
 
+use super::Opcode;
 use super::consts::{KEY_EXPANSION_ID, KEY_METHOD_MASK};
 use super::data;
 use super::keys::PeerKeys;
@@ -34,7 +35,6 @@ use super::options::Options;
 use super::prf::prf10;
 use super::reliable::Reliable;
 use super::window::Window;
-use super::Opcode;
 
 fn invalid(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())

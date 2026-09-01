@@ -1,6 +1,6 @@
+use crate::Protocol;
 use crate::checksum::{checksum, raw_transport_sum, transport_checksum};
 use crate::l4::{FiveTuple, IcmpMessage, TcpSegment, UdpDatagram};
-use crate::Protocol;
 use core::fmt;
 use core::ops::Deref;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -180,11 +180,7 @@ impl Packet {
     /// IP version (4 or 6). Returns 0 if the packet is empty.
     #[inline]
     pub fn version(&self) -> u8 {
-        if self.0.is_empty() {
-            0
-        } else {
-            self.0[0] >> 4
-        }
+        if self.0.is_empty() { 0 } else { self.0[0] >> 4 }
     }
 
     // --- IPv4 accessors ----------------------------------------------------
@@ -200,11 +196,7 @@ impl Packet {
 
     /// IPv4 DSCP — the upper six bits of the TOS byte (RFC 2474).
     pub fn ipv4_dscp(&self) -> u8 {
-        if self.0.len() < 2 {
-            0
-        } else {
-            self.0[1] >> 2
-        }
+        if self.0.len() < 2 { 0 } else { self.0[1] >> 2 }
     }
 
     /// IPv4 ECN — the low two bits of the TOS byte (RFC 3168).
@@ -236,11 +228,7 @@ impl Packet {
 
     /// IPv4 flags — the top three bits of byte 6 (reserved, DF, MF).
     pub fn ipv4_flags(&self) -> u8 {
-        if self.0.len() < 7 {
-            0
-        } else {
-            self.0[6] >> 5
-        }
+        if self.0.len() < 7 { 0 } else { self.0[6] >> 5 }
     }
 
     /// True if the Don't Fragment bit is set.
@@ -272,11 +260,7 @@ impl Packet {
 
     /// IPv4 TTL field.
     pub fn ipv4_ttl(&self) -> u8 {
-        if self.0.len() < 9 {
-            0
-        } else {
-            self.0[8]
-        }
+        if self.0.len() < 9 { 0 } else { self.0[8] }
     }
 
     /// IPv4 Protocol field.
@@ -487,11 +471,7 @@ impl Packet {
     }
 
     pub fn ipv6_hop_limit(&self) -> u8 {
-        if self.0.len() < 8 {
-            0
-        } else {
-            self.0[7]
-        }
+        if self.0.len() < 8 { 0 } else { self.0[7] }
     }
 
     pub fn ipv6_src_addr(&self) -> Option<Ipv6Addr> {

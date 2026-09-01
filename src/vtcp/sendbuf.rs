@@ -146,11 +146,7 @@ impl SendBuf {
             return &[];
         }
         let data = &self.buf[offset..unacked];
-        if data.len() > n {
-            &data[..n]
-        } else {
-            data
-        }
+        if data.len() > n { &data[..n] } else { data }
     }
 
     #[inline]

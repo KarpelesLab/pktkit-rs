@@ -9,7 +9,7 @@ use std::io;
 use std::net::IpAddr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
-use super::sys::{self, bpf_cmd, ctx_err, MapCreateAttr, MapElemAttr};
+use super::sys::{self, MapCreateAttr, MapElemAttr, bpf_cmd, ctx_err};
 use crate::{IpPrefix, Result};
 
 /// `bpf_map_type`. Open newtype: the kernel adds types faster than we care to

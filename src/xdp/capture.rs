@@ -56,10 +56,10 @@ use std::os::fd::AsRawFd;
 use std::sync::Mutex;
 
 use super::insn::{
-    host_be16, ld_map_fd, Asm, Insn, Jmp, Size, BPF_FUNC_MAP_LOOKUP_ELEM, BPF_FUNC_REDIRECT_MAP,
-    R0, R1, R10, R2, R3, R6, R7, R8,
+    Asm, BPF_FUNC_MAP_LOOKUP_ELEM, BPF_FUNC_REDIRECT_MAP, Insn, Jmp, R0, R1, R2, R3, R6, R7, R8,
+    R10, Size, host_be16, ld_map_fd,
 };
-use super::map::{lpm_key, Map, UpdateFlags};
+use super::map::{Map, UpdateFlags, lpm_key};
 use super::prog::{Action, Link, Mode, Program};
 use crate::{EtherType, IpPrefix, Result};
 
@@ -281,11 +281,7 @@ fn coverage(prefixes: &[IpPrefix], v4: bool) -> u128 {
 /// For IPv6 this saturates one short of 2^128, so the check triggers a single
 /// address early — in the safe direction.
 fn family_total(v4: bool) -> u128 {
-    if v4 {
-        1u128 << 32
-    } else {
-        u128::MAX
-    }
+    if v4 { 1u128 << 32 } else { u128::MAX }
 }
 
 /// Refuse a prefix that would let the set span an entire address family.
@@ -877,9 +873,11 @@ mod tests {
             min_prefix_v4: 0,
             ..Default::default()
         };
-        assert!(smuggled
-            .check_prefix(IpPrefix::new(Ipv4Addr::UNSPECIFIED.into(), 0))
-            .is_err());
+        assert!(
+            smuggled
+                .check_prefix(IpPrefix::new(Ipv4Addr::UNSPECIFIED.into(), 0))
+                .is_err()
+        );
     }
 
     #[test]
@@ -909,18 +907,22 @@ mod tests {
 
     #[test]
     fn a_floor_wider_than_the_family_is_rejected() {
-        assert!(CaptureConfig {
-            min_prefix_v4: 33,
-            ..Default::default()
-        }
-        .validate()
-        .is_err());
-        assert!(CaptureConfig {
-            min_prefix_v6: 129,
-            ..Default::default()
-        }
-        .validate()
-        .is_err());
+        assert!(
+            CaptureConfig {
+                min_prefix_v4: 33,
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            CaptureConfig {
+                min_prefix_v6: 129,
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
     }
 
     #[test]
@@ -996,12 +998,14 @@ mod tests {
         // REDIRECT with no preceding redirect call, or ABORTED, are not
         // sensible fall-throughs.
         for a in [Action::REDIRECT, Action::TX, Action::ABORTED] {
-            assert!(CaptureConfig {
-                default_action: a,
-                ..Default::default()
-            }
-            .validate()
-            .is_err());
+            assert!(
+                CaptureConfig {
+                    default_action: a,
+                    ..Default::default()
+                }
+                .validate()
+                .is_err()
+            );
         }
     }
 

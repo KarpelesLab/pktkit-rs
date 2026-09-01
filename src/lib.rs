@@ -71,21 +71,21 @@ mod rand;
 mod stats;
 
 pub use accept::{
-    serve, serve_with_done, Cleanup, Done, DoneSignal, L2Acceptor, L2AcceptorWithDone, L2Connector,
-    L3Connector,
+    Cleanup, Done, DoneSignal, L2Acceptor, L2AcceptorWithDone, L2Connector, L3Connector, serve,
+    serve_with_done,
 };
 pub use checksum::{
     checksum, combine_checksums, incremental_update, pseudo_header_checksum, transport_checksum,
 };
 pub use connect::{connect_l2, connect_l3};
 pub use ethertype::EtherType;
-pub use frame::{build_frame, Frame};
+pub use frame::{Frame, build_frame};
 pub use iface::{Handler, L2Device, L2Handler, L3Device, L3Handler};
 pub use ip::IpPrefix;
 pub use l2hub::{L2Hub, L2HubHandle};
 pub use l3hub::{L3Hub, L3HubHandle};
 pub use l4::{FiveTuple, IcmpMessage, TcpFlags, TcpSegment, UdpDatagram};
-pub use mac::{MacAddr, BROADCAST_MAC};
+pub use mac::{BROADCAST_MAC, MacAddr};
 pub use packet::Packet;
 pub use pipe::{PipeL2, PipeL3};
 pub use pool::{BufferPool, DEFAULT_MTU};

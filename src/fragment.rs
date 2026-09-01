@@ -186,8 +186,8 @@ fn copied_options_header(header: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::build::{build_ipv4, build_udp};
     use crate::Protocol;
+    use crate::build::{build_ipv4, build_udp};
     use std::net::Ipv4Addr;
 
     const A: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);

@@ -122,7 +122,7 @@ impl Parsed {
                 OPT_ROUTER if len >= 4 => {
                     p.router = Some(Ipv4Addr::new(data[0], data[1], data[2], data[3]));
                 }
-                OPT_DNS if len % 4 == 0 => {
+                OPT_DNS if len.is_multiple_of(4) => {
                     for chunk in data.chunks(4) {
                         p.dns
                             .push(Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]));

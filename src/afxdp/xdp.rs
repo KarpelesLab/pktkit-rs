@@ -691,7 +691,7 @@ impl Socket {
                         return Err(io::Error::new(
                             io::ErrorKind::WouldBlock,
                             "afxdp: no free TX buffers",
-                        ))
+                        ));
                     }
                 }
             }
@@ -810,20 +810,19 @@ fn poll_loop(sock: Arc<Socket>) {
             let addr = desc.addr;
             let len = desc.len as usize;
 
-            if len >= 14 {
-                if let Some(h) = &handler {
-                    // Handed to the handler in place. `L2Handler` takes `&Frame`
-                    // so the borrow cannot outlive the call, and the chunk is not
-                    // recycled into the FILL ring until after this loop — so the
-                    // kernel cannot be writing it while the handler reads.
-                    //
-                    // SAFETY: addr+len lies within the UMEM mapping (the kernel
-                    // wrote a valid RX descriptor).
-                    let slice = unsafe {
-                        std::slice::from_raw_parts(sock.umem.ptr().add(addr as usize), len)
-                    };
-                    let _ = h(Frame::from_slice(slice));
-                }
+            if len >= 14
+                && let Some(h) = &handler
+            {
+                // Handed to the handler in place. `L2Handler` takes `&Frame`
+                // so the borrow cannot outlive the call, and the chunk is not
+                // recycled into the FILL ring until after this loop — so the
+                // kernel cannot be writing it while the handler reads.
+                //
+                // SAFETY: addr+len lies within the UMEM mapping (the kernel
+                // wrote a valid RX descriptor).
+                let slice =
+                    unsafe { std::slice::from_raw_parts(sock.umem.ptr().add(addr as usize), len) };
+                let _ = h(Frame::from_slice(slice));
             }
 
             fill_batch[fill_count] = addr;
@@ -846,11 +845,7 @@ fn poll_loop(sock: Arc<Socket>) {
 fn page_size() -> usize {
     // SAFETY: sysconf with a valid name; -1 on failure, handled below.
     let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    if n <= 0 {
-        4096
-    } else {
-        n as usize
-    }
+    if n <= 0 { 4096 } else { n as usize }
 }
 
 /// `if_nametoindex`, mapping 0 (not found) to an error.
@@ -1108,10 +1103,8 @@ fn socket_is_zerocopy(fd: RawFd) -> bool {
 /// UMEM backing store. Huge pages cut TLB misses on the packet buffers, but
 /// they need pre-reserved hugetlb pages, so a failure falls back silently.
 fn mmap_umem(len: usize, huge_pages: bool) -> Result<Mapping> {
-    if huge_pages {
-        if let Ok(m) = mmap_anon(len, libc::MAP_HUGETLB) {
-            return Ok(m);
-        }
+    if huge_pages && let Ok(m) = mmap_anon(len, libc::MAP_HUGETLB) {
+        return Ok(m);
     }
     mmap_anon(len, 0)
 }
@@ -1288,33 +1281,41 @@ mod tests {
     #[test]
     fn frame_size_must_be_a_valid_umem_chunk() {
         // Below XDP_UMEM_MIN_CHUNK_SIZE.
-        assert!(Config {
-            frame_size: 1024,
-            ..Default::default()
-        }
-        .normalize()
-        .is_err());
+        assert!(
+            Config {
+                frame_size: 1024,
+                ..Default::default()
+            }
+            .normalize()
+            .is_err()
+        );
         // Not a power of two.
-        assert!(Config {
-            frame_size: 3000,
-            ..Default::default()
-        }
-        .normalize()
-        .is_err());
+        assert!(
+            Config {
+                frame_size: 3000,
+                ..Default::default()
+            }
+            .normalize()
+            .is_err()
+        );
         // Larger than a page: an aligned-mode chunk may not straddle one.
-        assert!(Config {
-            frame_size: (page_size() * 2) as u32,
-            ..Default::default()
-        }
-        .normalize()
-        .is_err());
+        assert!(
+            Config {
+                frame_size: (page_size() * 2) as u32,
+                ..Default::default()
+            }
+            .normalize()
+            .is_err()
+        );
         // 2048 is the smallest the kernel accepts.
-        assert!(Config {
-            frame_size: 2048,
-            ..Default::default()
-        }
-        .normalize()
-        .is_ok());
+        assert!(
+            Config {
+                frame_size: 2048,
+                ..Default::default()
+            }
+            .normalize()
+            .is_ok()
+        );
     }
 
     #[test]

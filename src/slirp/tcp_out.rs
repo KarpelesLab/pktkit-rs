@@ -24,10 +24,10 @@
 //! reassembly, SACK, window scaling, and congestion control on the virtual
 //! side.
 
+use crate::Result;
 use crate::slirp::tcp_stream::{ConnState, Endpoints};
 use crate::vtcp::segment::Segment;
 use crate::vtcp::{Conn, ConnConfig};
-use crate::Result;
 
 use std::io::{Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream};
@@ -180,10 +180,10 @@ impl TcpOutConn {
 
     /// Shut down the real socket (or a half of it). Tolerates a missing socket.
     fn shutdown_remote(&self, how: Shutdown) {
-        if let Ok(g) = self.remote.lock() {
-            if let Some(s) = g.as_ref() {
-                let _ = s.shutdown(how);
-            }
+        if let Ok(g) = self.remote.lock()
+            && let Some(s) = g.as_ref()
+        {
+            let _ = s.shutdown(how);
         }
     }
 
@@ -315,10 +315,10 @@ impl TcpOutConn {
 impl Drop for TcpOutConn {
     fn drop(&mut self) {
         self.closed.store(true, Ordering::Release);
-        if let Ok(g) = self.remote.lock() {
-            if let Some(s) = g.as_ref() {
-                let _ = s.shutdown(Shutdown::Both);
-            }
+        if let Ok(g) = self.remote.lock()
+            && let Some(s) = g.as_ref()
+        {
+            let _ = s.shutdown(Shutdown::Both);
         }
     }
 }

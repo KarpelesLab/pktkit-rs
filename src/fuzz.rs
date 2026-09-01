@@ -250,7 +250,7 @@ pub fn icmp_errors(data: &[u8]) {
 
 /// Fragmentation, whose output must reassemble to its input.
 pub fn fragmentation(data: &[u8]) {
-    use crate::fragment::{fragment, Fragmentation};
+    use crate::fragment::{Fragmentation, fragment};
     let p = Packet::from_slice(data);
     for mtu in [0usize, 28, 68, 576, 1500] {
         match fragment(p, mtu) {
@@ -321,8 +321,8 @@ pub fn defrag(data: &[u8]) {
 /// Drive a NAT with every ALG registered, in both directions.
 #[cfg(feature = "nat")]
 pub fn nat_forward(data: &[u8]) {
-    use crate::nat::{FtpHelper, H323Helper, IrcHelper, Nat, PptpHelper, SipHelper, TftpHelper};
     use crate::L3Device;
+    use crate::nat::{FtpHelper, H323Helper, IrcHelper, Nat, PptpHelper, SipHelper, TftpHelper};
     use std::sync::Arc;
 
     let nat = Nat::new(

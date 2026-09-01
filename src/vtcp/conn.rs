@@ -19,12 +19,12 @@ use crate::rand;
 
 use super::congestion::{CongestionController, HighSpeed, NewReno};
 use super::options::{
-    self, get_mss, get_sack_blocks, get_timestamp, get_wscale, has_sack_perm, mss_option,
-    sack_option, sack_perm_option, timestamp_option, wscale_option, TcpOption,
+    self, TcpOption, get_mss, get_sack_blocks, get_timestamp, get_wscale, has_sack_perm,
+    mss_option, sack_option, sack_perm_option, timestamp_option, wscale_option,
 };
 use super::recvbuf::RecvBuf;
-use super::rto::{RtoState, MAX_RTO};
-use super::segment::{flags, Segment};
+use super::rto::{MAX_RTO, RtoState};
+use super::segment::{Segment, flags};
 use super::sendbuf::SendBuf;
 use super::seqspace::{seq_after, seq_after_eq, seq_before_eq, seq_in_range};
 
@@ -445,11 +445,11 @@ impl Conn {
         if self.sack_enabled && has_sack_perm(remote_opts) {
             self.sack_ok = true;
         }
-        if self.ts_enabled {
-            if let Some((ts_val, _)) = get_timestamp(remote_opts) {
-                self.ts_recent = ts_val;
-                self.ts_ok = true;
-            }
+        if self.ts_enabled
+            && let Some((ts_val, _)) = get_timestamp(remote_opts)
+        {
+            self.ts_recent = ts_val;
+            self.ts_ok = true;
         }
     }
 
@@ -458,14 +458,13 @@ impl Conn {
             seg.options
                 .push(timestamp_option(self.ts_now(), self.ts_recent));
         }
-        if self.sack_ok {
-            if let Some(rb) = self.recv_buf.as_ref() {
-                if rb.has_ooo() {
-                    let blocks = rb.sack_blocks();
-                    if !blocks.is_empty() {
-                        seg.options.push(sack_option(&blocks));
-                    }
-                }
+        if self.sack_ok
+            && let Some(rb) = self.recv_buf.as_ref()
+            && rb.has_ooo()
+        {
+            let blocks = rb.sack_blocks();
+            if !blocks.is_empty() {
+                seg.options.push(sack_option(&blocks));
             }
         }
     }
@@ -1157,30 +1156,36 @@ impl Conn {
         let now = Instant::now();
 
         // RTO.
-        if let Some(d) = self.rto_deadline {
-            if now >= d && !self.closed && self.state != State::Closed {
-                self.on_rto_timeout();
-            }
+        if let Some(d) = self.rto_deadline
+            && now >= d
+            && !self.closed
+            && self.state != State::Closed
+        {
+            self.on_rto_timeout();
         }
         // Persist.
-        if let Some(d) = self.persist_deadline {
-            if now >= d && !self.closed && self.state != State::Closed {
-                self.on_persist_timeout();
-            }
+        if let Some(d) = self.persist_deadline
+            && now >= d
+            && !self.closed
+            && self.state != State::Closed
+        {
+            self.on_persist_timeout();
         }
         // TIME-WAIT.
-        if let Some(d) = self.time_wait_deadline {
-            if now >= d {
-                self.time_wait_deadline = None;
-                self.state = State::Closed;
-                self.closed = true;
-            }
+        if let Some(d) = self.time_wait_deadline
+            && now >= d
+        {
+            self.time_wait_deadline = None;
+            self.state = State::Closed;
+            self.closed = true;
         }
         // Keepalive.
-        if let Some(d) = self.keepalive_deadline {
-            if now >= d && !self.closed && self.state != State::Closed {
-                self.on_keepalive();
-            }
+        if let Some(d) = self.keepalive_deadline
+            && now >= d
+            && !self.closed
+            && self.state != State::Closed
+        {
+            self.on_keepalive();
         }
 
         self.take_outgoing()

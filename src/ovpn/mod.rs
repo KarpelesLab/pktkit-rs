@@ -41,10 +41,10 @@ mod window;
 
 pub use adapter::{Adapter, AdapterConfig, Connector};
 pub use addr::{PeerKey, Transport};
-pub use consts::{CipherBlockMethod, CipherCryptoAlg, AES, CBC, GCM};
+pub use consts::{AES, CBC, CipherBlockMethod, CipherCryptoAlg, GCM};
 pub use opcode::Opcode;
 pub use options::Options;
 pub use peer::{AuthInfo, OnAuth, Peer, PeerConfig, PeerOutput};
 pub use server::{
-    crypto_provider, install_crypto_provider, OnConnect, OnData, OnDisconnect, Server, ServerConfig,
+    OnConnect, OnData, OnDisconnect, Server, ServerConfig, crypto_provider, install_crypto_provider,
 };

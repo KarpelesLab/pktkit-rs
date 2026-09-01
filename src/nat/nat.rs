@@ -9,10 +9,10 @@
 
 use crate::nat::defrag::Defragger;
 use crate::nat::helper::{
-    Expectation, Helper, LocalHelper, NatMapping, PacketHelper, PortForward, PROTO_ICMP, PROTO_TCP,
-    PROTO_UDP,
+    Expectation, Helper, LocalHelper, NatMapping, PROTO_ICMP, PROTO_TCP, PROTO_UDP, PacketHelper,
+    PortForward,
 };
-use crate::{checksum, connect_l3, IpPrefix, L3Connector, L3Device, L3Handler, Packet, Result};
+use crate::{IpPrefix, L3Connector, L3Device, L3Handler, Packet, Result, checksum, connect_l3};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -238,13 +238,13 @@ impl Nat {
             port: pf.outside_port,
         };
         let mut inner = self.inner.lock().unwrap();
-        if let Some(existing) = inner.forwards.get(&rk) {
-            if existing.inside_ip != pf.inside_ip {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::AlreadyExists,
-                    "port already forwarded to another host",
-                ));
-            }
+        if let Some(existing) = inner.forwards.get(&rk)
+            && existing.inside_ip != pf.inside_ip
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "port already forwarded to another host",
+            ));
         }
         inner.forwards.insert(rk, pf);
         Ok(())
@@ -266,7 +266,7 @@ impl Nat {
         inner
             .forwards
             .values()
-            .filter(|pf| pf.expires.map_or(true, |e| e > now))
+            .filter(|pf| pf.expires.is_none_or(|e| e > now))
             .cloned()
             .collect()
     }
@@ -381,10 +381,10 @@ impl Nat {
             inner.helpers.clone()
         };
         for h in helpers {
-            if let Some(lh) = h.as_local() {
-                if lh.handle_local(self, pkt) {
-                    return true;
-                }
+            if let Some(lh) = h.as_local()
+                && lh.handle_local(self, pkt)
+            {
+                return true;
             }
         }
         false
@@ -400,10 +400,10 @@ impl Nat {
         };
         let mut out = pkt;
         for h in helpers {
-            if let Some(ph) = h.as_packet() {
-                if ph.match_outbound(proto, dst_port) {
-                    out = ph.process_outbound(self, out, m);
-                }
+            if let Some(ph) = h.as_packet()
+                && ph.match_outbound(proto, dst_port)
+            {
+                out = ph.process_outbound(self, out, m);
             }
         }
         out
@@ -419,10 +419,10 @@ impl Nat {
         };
         let mut out = pkt;
         for h in helpers {
-            if let Some(ph) = h.as_packet() {
-                if ph.match_outbound(proto, dst_port) {
-                    out = ph.process_inbound(self, out, m);
-                }
+            if let Some(ph) = h.as_packet()
+                && ph.match_outbound(proto, dst_port)
+            {
+                out = ph.process_inbound(self, out, m);
             }
         }
         out
@@ -765,11 +765,11 @@ impl Nat {
             let flags = pkt[ihl + 13];
             if flags & 0x05 != 0 {
                 let mut inner = self.inner.lock().unwrap();
-                if let Some(m) = inner.mappings.get_mut(&mapping_key) {
-                    if !m.fin_seen {
-                        m.fin_seen = true;
-                        m.fin_time = Some(Instant::now());
-                    }
+                if let Some(m) = inner.mappings.get_mut(&mapping_key)
+                    && !m.fin_seen
+                {
+                    m.fin_seen = true;
+                    m.fin_time = Some(Instant::now());
                 }
             }
         }

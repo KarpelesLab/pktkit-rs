@@ -6,17 +6,18 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Instant;
 
 use zeroize::Zeroize;
 
+use crate::Result;
 use crate::wg::constants::{
-    HandshakeState, NoisePrivateKey, NoisePublicKey, BLAKE2S_128_SIZE, BLAKE2S_256_SIZE,
-    CHACHAPOLY_KEY_SIZE, CHACHAPOLY_OVERHEAD, MAX_HANDSHAKES, MAX_SESSIONS,
-    MESSAGE_INITIATION_SIZE, MESSAGE_INITIATION_TYPE, MESSAGE_RESPONSE_SIZE, MESSAGE_RESPONSE_TYPE,
-    NOISE_PUBLIC_KEY_SIZE, TAI64N_TIMESTAMP_SIZE,
+    BLAKE2S_128_SIZE, BLAKE2S_256_SIZE, CHACHAPOLY_KEY_SIZE, CHACHAPOLY_OVERHEAD, HandshakeState,
+    MAX_HANDSHAKES, MAX_SESSIONS, MESSAGE_INITIATION_SIZE, MESSAGE_INITIATION_TYPE,
+    MESSAGE_RESPONSE_SIZE, MESSAGE_RESPONSE_TYPE, NOISE_PUBLIC_KEY_SIZE, NoisePrivateKey,
+    NoisePublicKey, TAI64N_TIMESTAMP_SIZE,
 };
 use crate::wg::crypto::{
     aead_open_zero, aead_seal_zero, blake2s_mac_128, calculate_mac1_key, ct_eq, fill_random,
@@ -26,7 +27,6 @@ use crate::wg::crypto::{
 use crate::wg::handler::{Handler, Keypair, PacketResult, PacketType};
 use crate::wg::replay::SlidingWindow;
 use crate::wg::time::tai64n_now;
-use crate::Result;
 
 /// In-flight Noise transcript state for one handshake (initiator side or
 /// responder mid-roundtrip).

@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use pktkit::afxdp::{Config, Device, ProgramSource, Zerocopy};
 use pktkit::xdp::{
-    build_program, Action, Capture, CaptureConfig, CaptureMaps, Map, MatchField, Mode, Program,
+    Action, Capture, CaptureConfig, CaptureMaps, Map, MatchField, Mode, Program, build_program,
 };
 use pktkit::{EtherType, Frame, IpPrefix, L2Device};
 
@@ -62,12 +62,9 @@ impl Veth {
             "ip netns add (iproute2 present?)"
         );
         assert!(
-            ip(
-                &[
-                    "link", "add", &v.host, "type", "veth", "peer", "name", &v.peer, "netns",
-                    &v.ns,
-                ]
-            ),
+            ip(&[
+                "link", "add", &v.host, "type", "veth", "peer", "name", &v.peer, "netns", &v.ns,
+            ]),
             "ip link add veth"
         );
         assert!(ip(&["addr", "add", "10.99.0.1/24", "dev", &v.host]));
@@ -196,9 +193,10 @@ fn lpm_trie_matches_by_longest_prefix() {
     assert_eq!(lookup([192, 0, 2, 1]), None);
 
     // Removing the /24 falls back to the /8 rather than to nothing.
-    assert!(map
-        .delete(pktkit::xdp::lpm_key(v4([10, 1, 2, 0], 24)).as_bytes())
-        .unwrap());
+    assert!(
+        map.delete(pktkit::xdp::lpm_key(v4([10, 1, 2, 0], 24)).as_bytes())
+            .unwrap()
+    );
     assert_eq!(lookup([10, 1, 2, 9]), Some(1));
 }
 
@@ -220,18 +218,20 @@ fn ipv6_prefixes_round_trip_through_the_trie() {
     let hit: Ipv6Addr = "2001:db8:1::dead".parse().unwrap();
     let miss: Ipv6Addr = "2001:db8:2::dead".parse().unwrap();
     let mut out = [0u8; 4];
-    assert!(map
-        .lookup(
+    assert!(
+        map.lookup(
             pktkit::xdp::lpm_key(IpPrefix::new(hit.into(), 128)).as_bytes(),
             &mut out
         )
-        .unwrap());
-    assert!(!map
-        .lookup(
+        .unwrap()
+    );
+    assert!(
+        !map.lookup(
             pktkit::xdp::lpm_key(IpPrefix::new(miss.into(), 128)).as_bytes(),
             &mut out
         )
-        .unwrap());
+        .unwrap()
+    );
 }
 
 // --- attach -----------------------------------------------------------------
@@ -251,23 +251,27 @@ fn capture_attaches_and_tracks_its_set() {
 
     let p = v4([10, 99, 0, 5], 32);
     cap.add(p).unwrap();
-    assert!(cap
-        .contains(IpAddr::V4(Ipv4Addr::new(10, 99, 0, 5)))
-        .unwrap());
-    assert!(!cap
-        .contains(IpAddr::V4(Ipv4Addr::new(10, 99, 0, 6)))
-        .unwrap());
+    assert!(
+        cap.contains(IpAddr::V4(Ipv4Addr::new(10, 99, 0, 5)))
+            .unwrap()
+    );
+    assert!(
+        !cap.contains(IpAddr::V4(Ipv4Addr::new(10, 99, 0, 6)))
+            .unwrap()
+    );
 
     // A /24 covers every address inside it.
     cap.add(v4([10, 50, 0, 0], 24)).unwrap();
-    assert!(cap
-        .contains(IpAddr::V4(Ipv4Addr::new(10, 50, 0, 200)))
-        .unwrap());
+    assert!(
+        cap.contains(IpAddr::V4(Ipv4Addr::new(10, 50, 0, 200)))
+            .unwrap()
+    );
 
     assert!(cap.remove(p).unwrap());
-    assert!(!cap
-        .contains(IpAddr::V4(Ipv4Addr::new(10, 99, 0, 5)))
-        .unwrap());
+    assert!(
+        !cap.contains(IpAddr::V4(Ipv4Addr::new(10, 99, 0, 5)))
+            .unwrap()
+    );
 }
 
 /// The interface-sharing invariant, against a live attachment: a refusal has to
@@ -284,9 +288,10 @@ fn a_live_capture_refuses_to_take_the_whole_interface() {
 
     // A default route in either family.
     assert!(cap.add(v4([0, 0, 0, 0], 0)).is_err());
-    assert!(cap
-        .add(IpPrefix::new("::".parse::<Ipv6Addr>().unwrap().into(), 0))
-        .is_err());
+    assert!(
+        cap.add(IpPrefix::new("::".parse::<Ipv6Addr>().unwrap().into(), 0))
+            .is_err()
+    );
 
     // Two halves that individually clear the floor.
     cap.add(v4([0, 0, 0, 0], 1)).unwrap();
@@ -294,13 +299,15 @@ fn a_live_capture_refuses_to_take_the_whole_interface() {
 
     // The refused half is genuinely absent from the trie, not just unrecorded:
     // an address inside it must still miss.
-    assert!(!cap
-        .contains(IpAddr::V4(Ipv4Addr::new(200, 0, 0, 1)))
-        .unwrap());
+    assert!(
+        !cap.contains(IpAddr::V4(Ipv4Addr::new(200, 0, 0, 1)))
+            .unwrap()
+    );
     // While the half that was accepted matches.
-    assert!(cap
-        .contains(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))
-        .unwrap());
+    assert!(
+        cap.contains(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))
+            .unwrap()
+    );
     assert_eq!(cap.prefixes(), vec![v4([0, 0, 0, 0], 1)]);
 }
 
@@ -320,13 +327,15 @@ fn a_configured_floor_is_enforced_on_a_live_capture() {
 
     cap.add(v4([10, 1, 2, 0], 24)).unwrap();
     assert!(cap.add(v4([10, 0, 0, 0], 8)).is_err());
-    assert!(cap
-        .contains(IpAddr::V4(Ipv4Addr::new(10, 1, 2, 9)))
-        .unwrap());
+    assert!(
+        cap.contains(IpAddr::V4(Ipv4Addr::new(10, 1, 2, 9)))
+            .unwrap()
+    );
     // Nothing from the refused /8 leaked in.
-    assert!(!cap
-        .contains(IpAddr::V4(Ipv4Addr::new(10, 9, 9, 9)))
-        .unwrap());
+    assert!(
+        !cap.contains(IpAddr::V4(Ipv4Addr::new(10, 9, 9, 9)))
+            .unwrap()
+    );
 }
 
 /// A `/128` has to bring its solicited-node multicast address with it, or

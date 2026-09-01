@@ -7,9 +7,9 @@
 //! this listener's bounded accept queue. [`Listener6::accept`] blocks on that
 //! queue.
 
+use crate::Result;
 use crate::slirp::listener::ACCEPT_QUEUE_CAP;
 use crate::slirp::tcp_stream::{ConnState, TcpStream};
-use crate::Result;
 use std::collections::VecDeque;
 use std::io;
 use std::net::{Ipv6Addr, SocketAddrV6};
@@ -116,10 +116,10 @@ pub(crate) fn resolve_v6(address: &str) -> Result<SocketAddrV6> {
     if let Ok(sa) = address.parse::<SocketAddrV6>() {
         return Ok(sa);
     }
-    if let Some(rest) = address.strip_prefix("[]:") {
-        if let Ok(port) = rest.parse::<u16>() {
-            return Ok(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0));
-        }
+    if let Some(rest) = address.strip_prefix("[]:")
+        && let Ok(port) = rest.parse::<u16>()
+    {
+        return Ok(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0));
     }
     Err(io::Error::new(
         io::ErrorKind::InvalidInput,

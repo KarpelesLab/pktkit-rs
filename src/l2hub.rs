@@ -313,7 +313,7 @@ impl Drop for L2HubHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{build_frame, EtherType, L2Handler, MacAddr};
+    use crate::{EtherType, L2Handler, MacAddr, build_frame};
     use std::sync::Mutex;
 
     #[derive(Default, Clone)]

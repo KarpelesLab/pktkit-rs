@@ -11,14 +11,14 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 
+use crate::Result;
+use crate::wg::NoisePublicKey;
 use crate::wg::constants::{
     MESSAGE_COOKIE_REPLY_TYPE, MESSAGE_INITIATION_TYPE, MESSAGE_RESPONSE_TYPE,
     MESSAGE_TRANSPORT_TYPE,
 };
 use crate::wg::handler::{Handler, PacketResult};
 use crate::wg::handshake::check_mac1;
-use crate::wg::NoisePublicKey;
-use crate::Result;
 
 /// A processed-packet result tagged with the handler that produced it.
 #[derive(Clone, Debug)]
@@ -209,10 +209,10 @@ impl MultiHandler {
         let g = self.handlers.read().expect("multihandler lock");
         let mut first: Option<io::Error> = None;
         for h in g.iter() {
-            if let Err(e) = h.close() {
-                if first.is_none() {
-                    first = Some(e);
-                }
+            if let Err(e) = h.close()
+                && first.is_none()
+            {
+                first = Some(e);
             }
         }
         match first {

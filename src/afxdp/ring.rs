@@ -65,17 +65,21 @@ impl Cursors {
     /// `mem` must point at a live ring mapping of at least
     /// `off.desc + size * elem_size` bytes, and `size` must be a power of two.
     unsafe fn new(mem: *mut u8, off: RingOffset, size: u32) -> Cursors {
-        let flags = if off.flags != 0 {
-            mem.add(off.flags as usize) as *const AtomicU32
-        } else {
-            std::ptr::null()
-        };
-        Cursors {
-            producer: mem.add(off.producer as usize) as *const AtomicU32,
-            consumer: mem.add(off.consumer as usize) as *const AtomicU32,
-            flags,
-            mask: size - 1,
-            size,
+        // SAFETY: the caller guarantees `mem` covers every offset in `off`,
+        // so each `add` stays inside the one mapping.
+        unsafe {
+            let flags = if off.flags != 0 {
+                mem.add(off.flags as usize) as *const AtomicU32
+            } else {
+                std::ptr::null()
+            };
+            Cursors {
+                producer: mem.add(off.producer as usize) as *const AtomicU32,
+                consumer: mem.add(off.consumer as usize) as *const AtomicU32,
+                flags,
+                mask: size - 1,
+                size,
+            }
         }
     }
 
@@ -128,9 +132,13 @@ impl AddrRing {
     /// See `Cursors::new`; additionally the element size at `off.desc` must
     /// be `u64`.
     pub unsafe fn new(mem: *mut u8, off: RingOffset, size: u32) -> AddrRing {
-        AddrRing {
-            cur: Cursors::new(mem, off, size),
-            addrs: mem.add(off.desc as usize) as *mut u64,
+        // SAFETY: the caller upholds `Cursors::new`'s contract, and `off.desc`
+        // is within the same mapping.
+        unsafe {
+            AddrRing {
+                cur: Cursors::new(mem, off, size),
+                addrs: mem.add(off.desc as usize) as *mut u64,
+            }
         }
     }
 
@@ -212,9 +220,12 @@ impl DescRing {
     /// See `Cursors::new`; additionally the element size at `off.desc` must
     /// be `xdp_desc`.
     pub unsafe fn new(mem: *mut u8, off: RingOffset, size: u32) -> DescRing {
-        DescRing {
-            cur: Cursors::new(mem, off, size),
-            descs: mem.add(off.desc as usize) as *mut libc::xdp_desc,
+        // SAFETY: as `AddrRing::new`, with `xdp_desc`-sized elements.
+        unsafe {
+            DescRing {
+                cur: Cursors::new(mem, off, size),
+                descs: mem.add(off.desc as usize) as *mut libc::xdp_desc,
+            }
         }
     }
 

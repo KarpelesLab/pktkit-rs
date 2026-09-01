@@ -4,7 +4,7 @@
 //! random ephemeral port. This helper registers a NAT expectation when it
 //! sees an outbound RRQ/WRQ so the response can flow back through.
 
-use crate::nat::helper::{Expectation, Helper, NatMapping, PacketHelper, PROTO_UDP};
+use crate::nat::helper::{Expectation, Helper, NatMapping, PROTO_UDP, PacketHelper};
 use crate::nat::nat::Nat;
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::{Duration, Instant};

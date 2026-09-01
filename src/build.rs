@@ -237,7 +237,7 @@ pub fn pop_vlan(frame: &Frame) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{build_frame, MacAddr, Packet};
+    use crate::{MacAddr, Packet, build_frame};
 
     const V4_A: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
     const V4_B: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);

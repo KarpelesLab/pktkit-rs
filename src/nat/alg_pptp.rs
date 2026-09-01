@@ -12,7 +12,7 @@
 //!
 //! Port of `alg_pptp.go`.
 
-use crate::nat::helper::{Expectation, Helper, NatMapping, PacketHelper, PROTO_TCP};
+use crate::nat::helper::{Expectation, Helper, NatMapping, PROTO_TCP, PacketHelper};
 use crate::nat::nat::Nat;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
@@ -260,7 +260,7 @@ fn pptp_parse_header(payload: &[u8]) -> Option<(u16, u16)> {
 mod tests {
     use super::*;
     use crate::nat::nat::Nat;
-    use crate::{checksum, combine_checksums, pseudo_header_checksum, IpPrefix, Protocol};
+    use crate::{IpPrefix, Protocol, checksum, combine_checksums, pseudo_header_checksum};
 
     fn pfx(s: &str) -> IpPrefix {
         s.parse().unwrap()

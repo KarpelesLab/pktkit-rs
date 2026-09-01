@@ -8,13 +8,13 @@ use std::io;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
+use crate::Result;
 use crate::wg::constants::{
     CHACHAPOLY_OVERHEAD, MESSAGE_TRANSPORT_HEADER_SIZE, MESSAGE_TRANSPORT_TYPE,
     REJECT_AFTER_MESSAGES, REJECT_AFTER_TIME, REKEY_AFTER_MESSAGES, REKEY_AFTER_TIME,
 };
 use crate::wg::crypto::{aead_open, aead_seal_in_place};
 use crate::wg::handler::{Handler, PacketResult, PacketType};
-use crate::Result;
 
 /// Total wire size of an encrypted WireGuard packet for the given plaintext
 /// length: 16-byte header + plaintext + 16-byte tag.

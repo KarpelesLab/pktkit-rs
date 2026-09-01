@@ -10,8 +10,8 @@
 use crate::arp::{self, Pending as ArpPending, Table as ArpTable};
 use crate::ndp::{self, Table as NdpTable};
 use crate::{
-    build_frame, EtherType, Frame, IpPrefix, L2Device, L2Handler, L3Device, L3Handler, MacAddr,
-    Packet, Protocol, Result,
+    EtherType, Frame, IpPrefix, L2Device, L2Handler, L3Device, L3Handler, MacAddr, Packet,
+    Protocol, Result, build_frame,
 };
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -179,11 +179,11 @@ impl L2Adapter {
                         let dport = u16::from_be_bytes([udp[2], udp[3]]);
                         if dport == 68 {
                             let dhcp = self.dhcp.lock().unwrap().clone();
-                            if let Some(c) = dhcp {
-                                if c.is_active() {
-                                    c.handle_packet(&udp[8..]);
-                                    return;
-                                }
+                            if let Some(c) = dhcp
+                                && c.is_active()
+                            {
+                                c.handle_packet(&udp[8..]);
+                                return;
                             }
                         }
                     }
@@ -335,11 +335,10 @@ impl L2Adapter {
                 let target = Ipv6Addr::from(t);
 
                 // Learn sender unless source is unspecified (DAD).
-                if !src.is_unspecified() {
-                    if let Some(src_mac) = ndp::parse_option(&icmp[24..], ndp::OPT_SOURCE_LINK_ADDR)
-                    {
-                        self.ndp.set(src, src_mac, ndp::DEFAULT_TTL);
-                    }
+                if !src.is_unspecified()
+                    && let Some(src_mac) = ndp::parse_option(&icmp[24..], ndp::OPT_SOURCE_LINK_ADDR)
+                {
+                    self.ndp.set(src, src_mac, ndp::DEFAULT_TTL);
                 }
 
                 let ll = ndp::link_local_from_mac(self.mac);

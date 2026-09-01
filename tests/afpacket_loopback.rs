@@ -12,7 +12,7 @@
 #![cfg(all(feature = "afpacket", target_os = "linux"))]
 
 use pktkit::afpacket::{Config, Socket};
-use pktkit::{build_frame, EtherType, Frame, L2Device, MacAddr};
+use pktkit::{EtherType, Frame, L2Device, MacAddr, build_frame};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};

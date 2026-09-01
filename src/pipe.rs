@@ -169,9 +169,9 @@ impl L3Device for PipeL3 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{build_frame, EtherType};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use crate::{EtherType, build_frame};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn pipe_l2_invokes_handler() {

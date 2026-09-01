@@ -301,7 +301,7 @@ fn decrypt_cbc<'a>(
     iv.copy_from_slice(&data[pos..pos + 16]);
     let ct_start = pos + 16;
     let ct_len = data.len() - ct_start;
-    if ct_len == 0 || ct_len % 16 != 0 {
+    if ct_len == 0 || !ct_len.is_multiple_of(16) {
         return Err(invalid("CBC ciphertext not block-aligned"));
     }
 

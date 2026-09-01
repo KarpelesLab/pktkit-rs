@@ -10,8 +10,8 @@
 //! `build_packet4` / `build_packet6` helpers (which fill IP + TCP checksums)
 //! and pushed into the virtual network through the stack's dispatch sink.
 
-use crate::vtcp::segment::Segment;
 use crate::vtcp::Conn;
+use crate::vtcp::segment::Segment;
 use std::io::{self};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Condvar, Mutex};

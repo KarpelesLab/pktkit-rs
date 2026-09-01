@@ -314,10 +314,8 @@ impl Server {
 
     fn remove_peer(&self, key: PeerKey) {
         let removed = self.peers.write().unwrap().remove(&key).is_some();
-        if removed {
-            if let Some(cb) = &self.cfg.on_disconnect {
-                cb(key);
-            }
+        if removed && let Some(cb) = &self.cfg.on_disconnect {
+            cb(key);
         }
     }
 
@@ -340,12 +338,12 @@ impl Server {
             let _ = self.send_raw(entry, dgram);
         }
 
-        if out.authenticated {
-            if let Some(cb) = &self.cfg.on_connect {
-                let peer = entry.peer.lock().unwrap();
-                if let Some(cfg) = peer.peer_config() {
-                    cb(key, cfg);
-                }
+        if out.authenticated
+            && let Some(cb) = &self.cfg.on_connect
+        {
+            let peer = entry.peer.lock().unwrap();
+            if let Some(cfg) = peer.peer_config() {
+                cb(key, cfg);
             }
         }
 

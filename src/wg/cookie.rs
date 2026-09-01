@@ -9,15 +9,15 @@
 //!   and decrypted, also writes MAC2 so subsequent initiations survive the
 //!   responder's under-load filter.
 
+use crate::Result;
 use crate::wg::constants::{
-    NoisePublicKey, BLAKE2S_128_SIZE, COOKIE_REFRESH_TIME, MESSAGE_COOKIE_REPLY_SIZE,
-    MESSAGE_COOKIE_REPLY_TYPE,
+    BLAKE2S_128_SIZE, COOKIE_REFRESH_TIME, MESSAGE_COOKIE_REPLY_SIZE, MESSAGE_COOKIE_REPLY_TYPE,
+    NoisePublicKey,
 };
 use crate::wg::crypto::{
     blake2s_mac_128, calculate_cookie_key, calculate_mac1_key, ct_eq, fill_random, xaead_open,
     xaead_seal,
 };
-use crate::Result;
 use std::time::Instant;
 
 /// Responder-side cookie validator + reply generator.
@@ -192,11 +192,11 @@ mod tests {
         // generator writes must validate at the checker.
         let responder = keypair();
         let checker = CookieChecker::new(&responder);
-        let mut gen = CookieGenerator::new(&responder);
+        let mut generator = CookieGenerator::new(&responder);
 
         // A fake 148-byte initiation: only the MAC fields matter here.
         let mut pkt = vec![7u8; 148];
-        gen.add_macs(&mut pkt);
+        generator.add_macs(&mut pkt);
         assert!(checker.check_mac1(&pkt));
 
         // Corrupting the body breaks MAC1.
@@ -208,13 +208,13 @@ mod tests {
     fn cookie_reply_roundtrip_enables_mac2() {
         let responder = keypair();
         let mut checker = CookieChecker::new(&responder);
-        let mut gen = CookieGenerator::new(&responder);
+        let mut generator = CookieGenerator::new(&responder);
 
         let src = [10u8, 0, 0, 9];
 
         // Initiator builds a first initiation (MAC1 only).
         let mut pkt = vec![3u8; 148];
-        gen.add_macs(&mut pkt);
+        generator.add_macs(&mut pkt);
         let init_mac1 = pkt[116..132].to_vec();
 
         // Responder mints a cookie reply for it.
@@ -229,10 +229,10 @@ mod tests {
         // that validates at the checker.
         let mut nonce = [0u8; 24];
         nonce.copy_from_slice(&reply[8..32]);
-        gen.consume_reply(&nonce, &reply[32..]).unwrap();
+        generator.consume_reply(&nonce, &reply[32..]).unwrap();
 
         let mut pkt2 = vec![5u8; 148];
-        gen.add_macs(&mut pkt2);
+        generator.add_macs(&mut pkt2);
         assert!(checker.check_mac1(&pkt2));
         assert!(checker.check_mac2(&pkt2, &src));
         // A different source address must NOT validate the MAC2.
@@ -242,8 +242,8 @@ mod tests {
     #[test]
     fn consume_reply_without_initiation_fails() {
         let responder = keypair();
-        let mut gen = CookieGenerator::new(&responder);
+        let mut generator = CookieGenerator::new(&responder);
         let nonce = [0u8; 24];
-        assert!(gen.consume_reply(&nonce, &[0u8; 32]).is_err());
+        assert!(generator.consume_reply(&nonce, &[0u8; 32]).is_err());
     }
 }

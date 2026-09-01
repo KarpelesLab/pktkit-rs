@@ -17,8 +17,8 @@
 
 use std::io;
 
-use super::consts::P_OPCODE_SHIFT;
 use super::Opcode;
+use super::consts::P_OPCODE_SHIFT;
 
 fn invalid(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.to_string())
@@ -222,7 +222,7 @@ mod tests {
         assert_eq!(head & 0x07, 0);
         assert_eq!(&data[1..9], &local);
         assert_eq!(data[9], 0); // ack count
-                                // No remote id when ack_count==0; pid at bytes 10..14.
+        // No remote id when ack_count==0; pid at bytes 10..14.
         assert_eq!(&data[10..14], &[0, 0, 0, 1]);
         assert_eq!(&data[14..], b"test payload");
     }
@@ -234,7 +234,7 @@ mod tests {
         pkt.set_pid(5);
         let data = pkt.to_bytes(&[1, 2, 3]);
         assert_eq!(data[9], 3); // ack count
-                                // After count: 3*4 ack bytes then remote id.
+        // After count: 3*4 ack bytes then remote id.
         assert_eq!(&data[10..14], &[0, 0, 0, 1]);
         assert_eq!(&data[22..30], &remote);
     }

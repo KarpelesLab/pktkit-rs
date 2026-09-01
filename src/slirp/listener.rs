@@ -6,8 +6,8 @@
 //! enqueues the resulting [`TcpStream`](super::TcpStream) onto this listener's
 //! bounded accept queue. [`Listener::accept`] blocks on that queue.
 
-use crate::slirp::tcp_stream::{ConnState, TcpStream};
 use crate::Result;
+use crate::slirp::tcp_stream::{ConnState, TcpStream};
 use std::collections::VecDeque;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4};
@@ -119,10 +119,10 @@ pub(crate) fn resolve_v4(address: &str) -> Result<SocketAddrV4> {
         return Ok(sa);
     }
     // Allow ":port" form (wildcard IPv4 address).
-    if let Some(rest) = address.strip_prefix(':') {
-        if let Ok(port) = rest.parse::<u16>() {
-            return Ok(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port));
-        }
+    if let Some(rest) = address.strip_prefix(':')
+        && let Ok(port) = rest.parse::<u16>()
+    {
+        return Ok(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port));
     }
     Err(io::Error::new(
         io::ErrorKind::InvalidInput,

@@ -23,15 +23,15 @@ use crate::packet::Packet;
 use crate::slirp::icmpv4::build_icmpv4_echo_reply;
 use crate::slirp::icmpv6::build_icmpv6_echo_reply;
 use crate::slirp::ipv6::skip_extension_headers;
-use crate::slirp::listener::{resolve_v4, Listener, ListenerKey};
-use crate::slirp::listener6::{resolve_v6, Listener6, ListenerKey6};
-use crate::slirp::tcp_out::{build_refused_rst, build_rst_for_stray, TcpOutConn};
-use crate::slirp::tcp_stream::{is_closed as conn_is_closed, tick_conn, ConnState, Endpoints};
+use crate::slirp::listener::{Listener, ListenerKey, resolve_v4};
+use crate::slirp::listener6::{Listener6, ListenerKey6, resolve_v6};
+use crate::slirp::tcp_out::{TcpOutConn, build_refused_rst, build_rst_for_stray};
+use crate::slirp::tcp_stream::{ConnState, Endpoints, is_closed as conn_is_closed, tick_conn};
 use crate::slirp::udp::{SendFn as UdpSendFn, UdpConn};
 use crate::slirp::udp6::{SendFn as UdpSendFn6, UdpConn6};
-use crate::vtcp::segment::{flags as tcp_flags, Segment};
+use crate::vtcp::segment::{Segment, flags as tcp_flags};
 use crate::vtcp::{Conn, ConnConfig, State as VtcpState};
-use crate::{connect_l3, IpPrefix, Result};
+use crate::{IpPrefix, Result, connect_l3};
 
 use std::collections::HashMap;
 use std::io;
@@ -171,37 +171,39 @@ impl Stack {
 
         // Maintenance thread: GC idle UDP flows and closed TCP connections.
         let weak = Arc::downgrade(&inner);
-        thread::spawn(move || loop {
-            thread::sleep(Duration::from_secs(30));
-            let inner = match weak.upgrade() {
-                Some(i) => i,
-                None => return,
-            };
-            if inner.closed.load(Ordering::Acquire) {
-                return;
+        thread::spawn(move || {
+            loop {
+                thread::sleep(Duration::from_secs(30));
+                let inner = match weak.upgrade() {
+                    Some(i) => i,
+                    None => return,
+                };
+                if inner.closed.load(Ordering::Acquire) {
+                    return;
+                }
+                let now = Instant::now();
+                // TCP: drop closed entries.
+                if let Ok(mut t) = inner.tcp.lock() {
+                    t.retain(|_, c| !c.is_closed());
+                }
+                if let Ok(mut t) = inner.tcp6.lock() {
+                    t.retain(|_, c| !c.is_closed());
+                }
+                // UDP: drop entries idle for more than UDP_IDLE.
+                if let Ok(mut u) = inner.udp.lock() {
+                    u.retain(|_, conn| {
+                        let last = conn.last_act.lock().map(|t| *t).unwrap_or(now);
+                        now.duration_since(last) < UDP_IDLE
+                    });
+                }
+                if let Ok(mut u) = inner.udp6.lock() {
+                    u.retain(|_, conn| {
+                        let last = conn.last_act.lock().map(|t| *t).unwrap_or(now);
+                        now.duration_since(last) < UDP_IDLE
+                    });
+                }
+                drop(inner);
             }
-            let now = Instant::now();
-            // TCP: drop closed entries.
-            if let Ok(mut t) = inner.tcp.lock() {
-                t.retain(|_, c| !c.is_closed());
-            }
-            if let Ok(mut t) = inner.tcp6.lock() {
-                t.retain(|_, c| !c.is_closed());
-            }
-            // UDP: drop entries idle for more than UDP_IDLE.
-            if let Ok(mut u) = inner.udp.lock() {
-                u.retain(|_, conn| {
-                    let last = conn.last_act.lock().map(|t| *t).unwrap_or(now);
-                    now.duration_since(last) < UDP_IDLE
-                });
-            }
-            if let Ok(mut u) = inner.udp6.lock() {
-                u.retain(|_, conn| {
-                    let last = conn.last_act.lock().map(|t| *t).unwrap_or(now);
-                    now.duration_since(last) < UDP_IDLE
-                });
-            }
-            drop(inner);
         });
 
         // Tick thread: drive vtcp timers (RTO / keepalive / TIME-WAIT) for
@@ -209,97 +211,99 @@ impl Stack {
         // outbound NAT bridges (`tcp*`) — every 100ms, and reap any that have
         // reached CLOSED.
         let weak_tick = Arc::downgrade(&inner);
-        thread::spawn(move || loop {
-            thread::sleep(Duration::from_millis(100));
-            let inner = match weak_tick.upgrade() {
-                Some(i) => i,
-                None => return,
-            };
-            if inner.closed.load(Ordering::Acquire) {
-                return;
-            }
-            let conns: Vec<(Key, Arc<ConnState>)> = inner
-                .virt_tcp
-                .lock()
-                .expect("poisoned")
-                .iter()
-                .map(|(k, v)| (*k, v.clone()))
-                .collect();
-            let mut dead = Vec::new();
-            for (k, cs) in conns {
-                if tick_conn(&cs) {
-                    dead.push(k);
+        thread::spawn(move || {
+            loop {
+                thread::sleep(Duration::from_millis(100));
+                let inner = match weak_tick.upgrade() {
+                    Some(i) => i,
+                    None => return,
+                };
+                if inner.closed.load(Ordering::Acquire) {
+                    return;
                 }
-            }
-            if !dead.is_empty() {
-                let mut t = inner.virt_tcp.lock().expect("poisoned");
-                for k in dead {
-                    t.remove(&k);
+                let conns: Vec<(Key, Arc<ConnState>)> = inner
+                    .virt_tcp
+                    .lock()
+                    .expect("poisoned")
+                    .iter()
+                    .map(|(k, v)| (*k, v.clone()))
+                    .collect();
+                let mut dead = Vec::new();
+                for (k, cs) in conns {
+                    if tick_conn(&cs) {
+                        dead.push(k);
+                    }
                 }
-            }
-            let conns6: Vec<(Key6, Arc<ConnState>)> = inner
-                .virt_tcp6
-                .lock()
-                .expect("poisoned")
-                .iter()
-                .map(|(k, v)| (*k, v.clone()))
-                .collect();
-            let mut dead6 = Vec::new();
-            for (k, cs) in conns6 {
-                if tick_conn(&cs) {
-                    dead6.push(k);
+                if !dead.is_empty() {
+                    let mut t = inner.virt_tcp.lock().expect("poisoned");
+                    for k in dead {
+                        t.remove(&k);
+                    }
                 }
-            }
-            if !dead6.is_empty() {
-                let mut t = inner.virt_tcp6.lock().expect("poisoned");
-                for k in dead6 {
-                    t.remove(&k);
+                let conns6: Vec<(Key6, Arc<ConnState>)> = inner
+                    .virt_tcp6
+                    .lock()
+                    .expect("poisoned")
+                    .iter()
+                    .map(|(k, v)| (*k, v.clone()))
+                    .collect();
+                let mut dead6 = Vec::new();
+                for (k, cs) in conns6 {
+                    if tick_conn(&cs) {
+                        dead6.push(k);
+                    }
                 }
-            }
+                if !dead6.is_empty() {
+                    let mut t = inner.virt_tcp6.lock().expect("poisoned");
+                    for k in dead6 {
+                        t.remove(&k);
+                    }
+                }
 
-            // Outbound NAT bridges: tick the virtual-side engine; reap when the
-            // bridge has fully torn down.
-            let out: Vec<(Key, Arc<TcpOutConn>)> = inner
-                .tcp
-                .lock()
-                .expect("poisoned")
-                .iter()
-                .map(|(k, v)| (*k, v.clone()))
-                .collect();
-            let mut dead_out = Vec::new();
-            for (k, c) in out {
-                tick_conn(c.state());
-                if c.is_closed() {
-                    dead_out.push(k);
+                // Outbound NAT bridges: tick the virtual-side engine; reap when the
+                // bridge has fully torn down.
+                let out: Vec<(Key, Arc<TcpOutConn>)> = inner
+                    .tcp
+                    .lock()
+                    .expect("poisoned")
+                    .iter()
+                    .map(|(k, v)| (*k, v.clone()))
+                    .collect();
+                let mut dead_out = Vec::new();
+                for (k, c) in out {
+                    tick_conn(c.state());
+                    if c.is_closed() {
+                        dead_out.push(k);
+                    }
                 }
-            }
-            if !dead_out.is_empty() {
-                let mut t = inner.tcp.lock().expect("poisoned");
-                for k in dead_out {
-                    t.remove(&k);
+                if !dead_out.is_empty() {
+                    let mut t = inner.tcp.lock().expect("poisoned");
+                    for k in dead_out {
+                        t.remove(&k);
+                    }
                 }
-            }
-            let out6: Vec<(Key6, Arc<TcpOutConn>)> = inner
-                .tcp6
-                .lock()
-                .expect("poisoned")
-                .iter()
-                .map(|(k, v)| (*k, v.clone()))
-                .collect();
-            let mut dead_out6 = Vec::new();
-            for (k, c) in out6 {
-                tick_conn(c.state());
-                if c.is_closed() {
-                    dead_out6.push(k);
+                let out6: Vec<(Key6, Arc<TcpOutConn>)> = inner
+                    .tcp6
+                    .lock()
+                    .expect("poisoned")
+                    .iter()
+                    .map(|(k, v)| (*k, v.clone()))
+                    .collect();
+                let mut dead_out6 = Vec::new();
+                for (k, c) in out6 {
+                    tick_conn(c.state());
+                    if c.is_closed() {
+                        dead_out6.push(k);
+                    }
                 }
-            }
-            if !dead_out6.is_empty() {
-                let mut t = inner.tcp6.lock().expect("poisoned");
-                for k in dead_out6 {
-                    t.remove(&k);
+                if !dead_out6.is_empty() {
+                    let mut t = inner.tcp6.lock().expect("poisoned");
+                    for k in dead_out6 {
+                        t.remove(&k);
+                    }
                 }
+                drop(inner);
             }
-            drop(inner);
         });
 
         Arc::new(Stack { inner })
@@ -1198,9 +1202,9 @@ impl L3Connector for Stack {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Protocol;
     use crate::slirp::checksum::{ipv4_header_checksum, udp_v4_checksum};
     use crate::vtcp::segment::flags as tcp_flags;
-    use crate::Protocol;
     use std::net::{IpAddr, UdpSocket};
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;

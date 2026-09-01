@@ -57,8 +57,8 @@ pub mod insn;
 pub mod map;
 
 pub use capture::{
-    build_program, solicited_node_multicast, Capture, CaptureConfig, CaptureMaps, MatchField,
+    Capture, CaptureConfig, CaptureMaps, MatchField, build_program, solicited_node_multicast,
 };
 pub use insn::{Asm, Insn, Label};
-pub use map::{lpm_key, set_socket_raw, LpmKey, Map, MapType, UpdateFlags};
-pub use prog::{detach, Action, Link, Mode, Program};
+pub use map::{LpmKey, Map, MapType, UpdateFlags, lpm_key, set_socket_raw};
+pub use prog::{Action, Link, Mode, Program, detach};

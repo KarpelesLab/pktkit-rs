@@ -173,16 +173,16 @@ fn try_parse_complete(raw: &[u8]) -> Option<Response> {
     let head = &raw[..header_end];
     let (status, reason, headers) = parse_head(head).ok()?;
 
-    if let Some(te) = headers.get("transfer-encoding") {
-        if te.eq_ignore_ascii_case("chunked") {
-            let body = decode_chunked(&raw[header_end..])?;
-            return Some(Response {
-                status,
-                reason,
-                headers,
-                body,
-            });
-        }
+    if let Some(te) = headers.get("transfer-encoding")
+        && te.eq_ignore_ascii_case("chunked")
+    {
+        let body = decode_chunked(&raw[header_end..])?;
+        return Some(Response {
+            status,
+            reason,
+            headers,
+            body,
+        });
     }
     if let Some(cl) = headers.get("content-length") {
         let len: usize = cl.trim().parse().ok()?;

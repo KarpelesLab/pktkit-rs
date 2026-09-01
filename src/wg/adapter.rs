@@ -391,10 +391,10 @@ impl Adapter {
 
     fn teardown_peer(&self, key: &NoisePublicKey) {
         let removed = self.peers.write().expect("peers lock").remove(key);
-        if let Some(p) = removed {
-            if let Some(cleanup) = p.cleanup.lock().expect("cleanup lock").take() {
-                let _ = cleanup();
-            }
+        if let Some(p) = removed
+            && let Some(cleanup) = p.cleanup.lock().expect("cleanup lock").take()
+        {
+            let _ = cleanup();
         }
     }
 }

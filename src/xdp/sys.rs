@@ -86,12 +86,16 @@ pub struct LinkCreateAttr {
 /// `attr` must point at a valid, initialized struct of at least `size` bytes
 /// matching `cmd`, and any pointers inside it must be valid for the call.
 pub unsafe fn bpf(cmd: i32, attr: *mut libc::c_void, size: usize) -> Result<i32> {
-    let r = libc::syscall(
-        libc::SYS_bpf,
-        cmd as libc::c_long,
-        attr,
-        size as libc::c_long,
-    );
+    // SAFETY: the caller guarantees `attr` points at a valid `size`-byte
+    // struct matching `cmd`.
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            cmd as libc::c_long,
+            attr,
+            size as libc::c_long,
+        )
+    };
     if r < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -103,11 +107,15 @@ pub unsafe fn bpf(cmd: i32, attr: *mut libc::c_void, size: usize) -> Result<i32>
 /// # Safety
 /// `attr` must be the struct `cmd` expects, with valid pointers inside it.
 pub unsafe fn bpf_cmd<T>(cmd: i32, attr: &mut T) -> Result<i32> {
-    bpf(
-        cmd,
-        attr as *mut T as *mut libc::c_void,
-        std::mem::size_of::<T>(),
-    )
+    // SAFETY: `attr` is a live `&mut T`, so the pointer and size are valid;
+    // the caller guarantees `T` is the struct `cmd` expects.
+    unsafe {
+        bpf(
+            cmd,
+            attr as *mut T as *mut libc::c_void,
+            std::mem::size_of::<T>(),
+        )
+    }
 }
 
 /// Wrap an errno with context, since a bare `EINVAL` from `bpf(2)` is close to

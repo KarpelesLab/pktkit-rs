@@ -1,8 +1,8 @@
 [package]
 name = "pktkit"
 version = "0.1.2"
-edition = "2021"
-rust-version = "1.75"
+edition = "2024"
+rust-version = "1.88"
 authors = ["Karpeles Lab Inc."]
 license = "MIT"
 description = "Zero-copy L2/L3 packet handling toolkit. Frames, packets, hubs, adapters, NAT, virtual TCP/IP, WireGuard, OpenVPN, QEMU networking, TUN/TAP, AF_XDP — all gated behind opt-in cargo features."

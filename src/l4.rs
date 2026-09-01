@@ -594,20 +594,12 @@ impl IcmpMessage {
 
     #[inline]
     pub fn message_type(&self) -> u8 {
-        if self.0.is_empty() {
-            0
-        } else {
-            self.0[0]
-        }
+        if self.0.is_empty() { 0 } else { self.0[0] }
     }
 
     #[inline]
     pub fn code(&self) -> u8 {
-        if self.0.len() < 2 {
-            0
-        } else {
-            self.0[1]
-        }
+        if self.0.len() < 2 { 0 } else { self.0[1] }
     }
 
     #[inline]

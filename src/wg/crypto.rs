@@ -9,7 +9,7 @@
 //!
 //! Wire constants live in [`super::constants`]; we don't redefine them here.
 
-use blake2::digest::{consts::U16, KeyInit as MacKeyInit, Mac, Update};
+use blake2::digest::{KeyInit as MacKeyInit, Mac, Update, consts::U16};
 use blake2::{Blake2s256, Blake2sMac, Digest};
 use chacha20poly1305::aead::{Aead, AeadInPlace, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, XChaCha20Poly1305, XNonce};
@@ -18,12 +18,12 @@ use hmac::SimpleHmac;
 use std::io;
 use zeroize::Zeroize;
 
-use crate::wg::constants::{NoisePresharedKey, NoisePrivateKey, NoisePublicKey};
+use crate::Result;
 use crate::wg::constants::{
     BLAKE2S_128_SIZE, BLAKE2S_256_SIZE, CHACHAPOLY_KEY_SIZE, NOISE_PUBLIC_KEY_SIZE, WG_IDENTIFIER,
     WG_LABEL_COOKIE, WG_LABEL_MAC1,
 };
-use crate::Result;
+use crate::wg::constants::{NoisePresharedKey, NoisePrivateKey, NoisePublicKey};
 
 // === Helpers ================================================================
 

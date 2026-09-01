@@ -3,9 +3,9 @@
 //! Rewrites `PORT`/`EPRT` commands outbound and `227`/`229` responses inbound
 //! so active and passive mode data connections work through the NAT.
 
-use crate::nat::helper::{Expectation, Helper, NatMapping, PacketHelper, PROTO_TCP};
+use crate::nat::helper::{Expectation, Helper, NatMapping, PROTO_TCP, PacketHelper};
 use crate::nat::nat::Nat;
-use crate::{checksum, combine_checksums, pseudo_header_checksum, Protocol};
+use crate::{Protocol, checksum, combine_checksums, pseudo_header_checksum};
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::{Duration, Instant};
 

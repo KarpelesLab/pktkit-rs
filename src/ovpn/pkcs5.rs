@@ -10,7 +10,7 @@ pub fn pad(data: &[u8], block_size: usize) -> Vec<u8> {
     let padding = block_size - (data.len() % block_size);
     let mut out = Vec::with_capacity(data.len() + padding);
     out.extend_from_slice(data);
-    out.extend(std::iter::repeat(padding as u8).take(padding));
+    out.extend(std::iter::repeat_n(padding as u8, padding));
     out
 }
 

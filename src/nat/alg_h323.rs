@@ -9,9 +9,9 @@
 //!
 //! Port of `alg_h323.go`.
 
-use crate::nat::helper::{Expectation, Helper, NatMapping, PacketHelper, PROTO_TCP, PROTO_UDP};
+use crate::nat::helper::{Expectation, Helper, NatMapping, PROTO_TCP, PROTO_UDP, PacketHelper};
 use crate::nat::nat::Nat;
-use crate::{checksum, combine_checksums, pseudo_header_checksum, Protocol};
+use crate::{Protocol, checksum, combine_checksums, pseudo_header_checksum};
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::{Duration, Instant};
 

@@ -28,7 +28,7 @@
 //! ```
 
 use crate::build::{build_icmpv4, build_icmpv6, build_ipv4, build_ipv6};
-use crate::l4::{icmpv4, icmpv6, IcmpMessage};
+use crate::l4::{IcmpMessage, icmpv4, icmpv6};
 use crate::{Packet, Protocol};
 use std::net::IpAddr;
 
@@ -82,10 +82,10 @@ pub fn may_reply(orig: &Packet) -> bool {
     if src.is_unspecified() || src.is_multicast() {
         return false;
     }
-    if let IpAddr::V4(v4) = src {
-        if v4.is_broadcast() {
-            return false;
-        }
+    if let IpAddr::V4(v4) = src
+        && v4.is_broadcast()
+    {
+        return false;
     }
     // Never answer an error with an error.
     let proto = orig.transport_protocol();

@@ -105,18 +105,20 @@ impl Pending {
 
         let inner_bg = inner.clone();
         let stop_bg = stop.clone();
-        std::thread::spawn(move || loop {
-            std::thread::sleep(Duration::from_secs(1));
-            if *stop_bg.lock().unwrap() {
-                return;
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+                if *stop_bg.lock().unwrap() {
+                    return;
+                }
+                let now = Instant::now();
+                let mut map = inner_bg.lock().unwrap();
+                map.retain(|_, e| {
+                    e.created
+                        .map(|c| now.duration_since(c) <= PENDING_TIMEOUT)
+                        .unwrap_or(true)
+                });
             }
-            let now = Instant::now();
-            let mut map = inner_bg.lock().unwrap();
-            map.retain(|_, e| {
-                e.created
-                    .map(|c| now.duration_since(c) <= PENDING_TIMEOUT)
-                    .unwrap_or(true)
-            });
         });
 
         Pending { inner, stop }

@@ -9,9 +9,9 @@
 //!
 //! Port of `alg_sip.go`.
 
-use crate::nat::helper::{Expectation, Helper, NatMapping, PacketHelper, PROTO_TCP, PROTO_UDP};
+use crate::nat::helper::{Expectation, Helper, NatMapping, PROTO_TCP, PROTO_UDP, PacketHelper};
 use crate::nat::nat::Nat;
-use crate::{checksum, combine_checksums, pseudo_header_checksum, Protocol};
+use crate::{Protocol, checksum, combine_checksums, pseudo_header_checksum};
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::{Duration, Instant};
 
@@ -156,16 +156,16 @@ fn rewrite_sdp_outbound(nat: &Nat, sdp: &[u8], outside_addr: &str, inside_ip: Ip
         if line.starts_with(b"c=IN IP4 ") {
             let rest = &line[b"c=IN IP4 ".len()..];
             let addr = String::from_utf8_lossy(rest).trim().to_string();
-            if addr != inside_addr {
-                if let Ok(a) = addr.parse::<Ipv4Addr>() {
-                    remote_ip = a;
-                }
+            if addr != inside_addr
+                && let Ok(a) = addr.parse::<Ipv4Addr>()
+            {
+                remote_ip = a;
             }
             line = format!("c=IN IP4 {}", outside_addr).into_bytes();
-        } else if line.starts_with(b"m=") {
-            if let Some(new_line) = sip_parse_media_line(&line, nat, remote_ip, inside_ip) {
-                line = new_line;
-            }
+        } else if line.starts_with(b"m=")
+            && let Some(new_line) = sip_parse_media_line(&line, nat, remote_ip, inside_ip)
+        {
+            line = new_line;
         }
         out.push(line);
     }
@@ -281,18 +281,17 @@ fn sip_update_content_length(headers: &mut Vec<u8>, sdp_body: &[u8]) -> Vec<u8> 
         }
     }
 
-    if let Some(cl) = cl_idx {
-        if let Some(line_end) = find_subslice(&headers[cl..], b"\r\n") {
-            if let Some(colon) = headers[cl..cl + line_end].iter().position(|&b| b == b':') {
-                let before = headers[..cl + colon + 1].to_vec();
-                let after = headers[cl + line_end..].to_vec();
-                let mut rebuilt = before;
-                rebuilt.push(b' ');
-                rebuilt.extend_from_slice(&new_cl);
-                rebuilt.extend_from_slice(&after);
-                *headers = rebuilt;
-            }
-        }
+    if let Some(cl) = cl_idx
+        && let Some(line_end) = find_subslice(&headers[cl..], b"\r\n")
+        && let Some(colon) = headers[cl..cl + line_end].iter().position(|&b| b == b':')
+    {
+        let before = headers[..cl + colon + 1].to_vec();
+        let after = headers[cl + line_end..].to_vec();
+        let mut rebuilt = before;
+        rebuilt.push(b' ');
+        rebuilt.extend_from_slice(&new_cl);
+        rebuilt.extend_from_slice(&after);
+        *headers = rebuilt;
     }
 
     let mut result = Vec::with_capacity(headers.len() + sdp_body.len());

@@ -25,11 +25,11 @@
 //! close. Outgoing segments are wrapped in IPv4 (with correct IP + TCP
 //! checksums) and injected onto the inside via [`Nat::send_inside`].
 
-use crate::nat::helper::{Helper, LocalHelper, PortForward, PROTO_TCP, PROTO_UDP};
+use crate::nat::helper::{Helper, LocalHelper, PROTO_TCP, PROTO_UDP, PortForward};
 use crate::nat::nat::Nat;
 use crate::vtcp::segment::Segment;
 use crate::vtcp::{Conn, ConnConfig};
-use crate::{checksum, combine_checksums, pseudo_header_checksum, Packet, Protocol};
+use crate::{Packet, Protocol, checksum, combine_checksums, pseudo_header_checksum};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Mutex;
@@ -277,22 +277,20 @@ EXT:\r\n\r\n",
                     cc.req.extend_from_slice(&buf[..n]);
                 }
 
-                if !remove {
-                    if let Some(req) = parse_http_request(&cc.req) {
-                        let res =
-                            self.handle_soap(nat, &req.soap_action, &req.body, Some(cc.client_ip));
-                        let resp = build_http_response(&res);
-                        let (_, segs) = cc.conn.write(&resp);
-                        outgoing.extend(segs);
-                        // Single request/response per connection: half-close.
-                        outgoing.extend(cc.conn.close());
-                        cc.responded = true;
-                    }
-                    // TODO(nat): pipelined / multi-request HTTP over a single
-                    // control connection is not handled — we serve exactly one
-                    // request then close, which matches the common UPnP control
-                    // flow (one AddPortMapping/DeletePortMapping/etc).
+                if !remove && let Some(req) = parse_http_request(&cc.req) {
+                    let res =
+                        self.handle_soap(nat, &req.soap_action, &req.body, Some(cc.client_ip));
+                    let resp = build_http_response(&res);
+                    let (_, segs) = cc.conn.write(&resp);
+                    outgoing.extend(segs);
+                    // Single request/response per connection: half-close.
+                    outgoing.extend(cc.conn.close());
+                    cc.responded = true;
                 }
+                // TODO(nat): pipelined / multi-request HTTP over a single
+                // control connection is not handled — we serve exactly one
+                // request then close, which matches the common UPnP control
+                // flow (one AddPortMapping/DeletePortMapping/etc).
             }
 
             // Reap fully-closed connections so the table does not grow.
@@ -416,10 +414,10 @@ EXT:\r\n\r\n",
                 None => return soap_fault(402, "Invalid internal client IP"),
             };
         // A client may only forward to itself.
-        if let Some(cip) = client_ip {
-            if cip != inside_ip {
-                return soap_fault(718, "Internal client must be the requesting host");
-            }
+        if let Some(cip) = client_ip
+            && cip != inside_ip
+        {
+            return soap_fault(718, "Internal client must be the requesting host");
         }
         if !self.is_port_allowed(ext_port) {
             return soap_fault(718, "External port not in allowed range");
@@ -789,10 +787,10 @@ fn parse_protocol(s: &str) -> Option<u8> {
 fn compute_expiry(lease_secs: u32, max: Option<Duration>) -> Option<Instant> {
     if lease_secs > 0 {
         let mut dur = Duration::from_secs(lease_secs as u64);
-        if let Some(m) = max {
-            if dur > m {
-                dur = m;
-            }
+        if let Some(m) = max
+            && dur > m
+        {
+            dur = m;
         }
         Some(Instant::now() + dur)
     } else {

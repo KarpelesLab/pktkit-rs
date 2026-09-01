@@ -144,11 +144,7 @@ impl Frame {
 
     /// Number of header bytes (14 normally, 18 with a VLAN tag).
     pub fn header_len(&self) -> usize {
-        if self.has_vlan() {
-            18
-        } else {
-            14
-        }
+        if self.has_vlan() { 18 } else { 14 }
     }
 
     /// Frame payload (everything after the Ethernet header). Empty if the

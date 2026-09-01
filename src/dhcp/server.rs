@@ -2,7 +2,7 @@
 
 use super::wire;
 use crate::{
-    build_frame, checksum, EtherType, Frame, L2Device, L2Handler, MacAddr, Protocol, Result,
+    EtherType, Frame, L2Device, L2Handler, MacAddr, Protocol, Result, build_frame, checksum,
 };
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -185,10 +185,10 @@ impl Server {
             if assigned.contains(&ip) {
                 continue;
             }
-            if let Some(exp) = declined.get(&ip) {
-                if *exp > now {
-                    continue;
-                }
+            if let Some(exp) = declined.get(&ip)
+                && *exp > now
+            {
+                continue;
             }
             leases.insert(
                 mac,
@@ -207,10 +207,10 @@ impl Server {
         let mut leases = self.leases.lock().unwrap();
 
         if let Some(static_ip) = self.cfg.static_leases.get(&mac).copied() {
-            if let Some(req) = requested {
-                if req != static_ip {
-                    return None;
-                }
+            if let Some(req) = requested
+                && req != static_ip
+            {
+                return None;
             }
             leases.insert(
                 mac,
@@ -223,10 +223,10 @@ impl Server {
         }
 
         if let Some(l) = leases.get_mut(&mac) {
-            if let Some(req) = requested {
-                if req != l.ip {
-                    return None;
-                }
+            if let Some(req) = requested
+                && req != l.ip
+            {
+                return None;
             }
             l.expiry = now + self.cfg.lease_time;
             return Some(l.ip);
@@ -251,10 +251,10 @@ impl Server {
                 return None;
             }
         }
-        if let Some(exp) = self.declined.lock().unwrap().get(&req) {
-            if *exp > now {
-                return None;
-            }
+        if let Some(exp) = self.declined.lock().unwrap().get(&req)
+            && *exp > now
+        {
+            return None;
         }
         if leases.len() >= MAX_LEASES {
             return None;

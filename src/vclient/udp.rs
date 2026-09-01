@@ -7,7 +7,7 @@
 //! `UdpConn` by 4-tuple. This is the building block the (tunnel-routed) DNS
 //! path uses and mirrors the Go `vclient` `udpConn`.
 
-use crate::{checksum, Packet, Protocol};
+use crate::{Packet, Protocol, checksum};
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -222,11 +222,7 @@ fn udp_checksum(src: IpAddr, dst: IpAddr, udp: &[u8]) -> u16 {
     let body = !checksum::checksum(udp);
     let cs = !checksum::combine_checksums(pseudo, body);
     // RFC 768: a 0 checksum is transmitted as 0xFFFF.
-    if cs == 0 {
-        0xFFFF
-    } else {
-        cs
-    }
+    if cs == 0 { 0xFFFF } else { cs }
 }
 
 fn wrap_udp_v4(src: Ipv4Addr, sp: u16, dst: Ipv4Addr, dp: u16, payload: &[u8]) -> Vec<u8> {

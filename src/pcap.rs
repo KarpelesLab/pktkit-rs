@@ -318,7 +318,7 @@ impl L3Device for TapL3 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{build_frame, EtherType};
+    use crate::{EtherType, build_frame};
     use std::time::Duration;
 
     /// A `Write` whose bytes stay inspectable after the writer takes ownership.

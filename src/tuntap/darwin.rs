@@ -99,7 +99,7 @@ impl L3Device for Tun {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "unknown IP version",
-                ))
+                ));
             }
         };
         let mut framed = Vec::with_capacity(4 + bytes.len());

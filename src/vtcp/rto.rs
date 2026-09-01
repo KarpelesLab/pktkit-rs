@@ -54,11 +54,7 @@ impl RtoState {
             self.measured = true;
         } else {
             // RTTVAR must be updated before SRTT (RFC 6298 §2.3).
-            let diff = if self.srtt > rtt {
-                self.srtt - rtt
-            } else {
-                rtt - self.srtt
-            };
+            let diff = self.srtt.abs_diff(rtt);
             self.rttvar = (self.rttvar * 3 + diff) / 4;
             self.srtt = (self.srtt * 7 + rtt) / 8;
         }

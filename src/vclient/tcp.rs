@@ -9,8 +9,8 @@
 //! timers for every connection.
 
 use crate::vtcp::segment::flags;
-use crate::vtcp::{segment::Segment, Conn, ConnConfig, State};
-use crate::{checksum, IpPrefix, Packet, Protocol};
+use crate::vtcp::{Conn, ConnConfig, State, segment::Segment};
+use crate::{IpPrefix, Packet, Protocol, checksum};
 use std::collections::{HashMap, VecDeque};
 use std::io::{self};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -270,13 +270,15 @@ impl TcpStack {
         // Tick thread: drive timers for all connections every 100ms.
         let weak = Arc::downgrade(&stack);
         let stop = stack.stop.clone();
-        std::thread::spawn(move || loop {
-            std::thread::sleep(Duration::from_millis(100));
-            if *stop.lock().unwrap() {
-                return;
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_millis(100));
+                if *stop.lock().unwrap() {
+                    return;
+                }
+                let Some(stack) = weak.upgrade() else { return };
+                stack.tick_all();
             }
-            let Some(stack) = weak.upgrade() else { return };
-            stack.tick_all();
         });
         stack
     }

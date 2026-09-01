@@ -9,7 +9,7 @@
 //! same network. Renewal is driven by an internal timer thread.
 
 use super::wire;
-use crate::{checksum, EtherType, Frame, IpPrefix, MacAddr, Protocol};
+use crate::{EtherType, Frame, IpPrefix, MacAddr, Protocol, checksum};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

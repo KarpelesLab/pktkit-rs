@@ -43,8 +43,8 @@ where
 mod tests {
     use super::*;
     use crate::{
-        build_frame, EtherType, Frame, IpPrefix, L2Handler, L3Handler, MacAddr, Packet, PipeL2,
-        PipeL3, Result,
+        EtherType, Frame, IpPrefix, L2Handler, L3Handler, MacAddr, Packet, PipeL2, PipeL3, Result,
+        build_frame,
     };
     use std::sync::{Arc, Mutex};
 

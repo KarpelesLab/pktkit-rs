@@ -260,7 +260,7 @@ impl crate::L2Acceptor for Listener {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{build_frame, EtherType};
+    use crate::{EtherType, build_frame};
     use std::time::Duration;
 
     #[test]

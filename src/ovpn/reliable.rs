@@ -16,9 +16,9 @@ use std::collections::HashMap;
 use std::io;
 use std::time::{Duration, Instant};
 
+use super::Opcode;
 use super::consts::{CONTROL_CHANNEL_MTU, TLS_RELIABLE_N_REC_BUFFERS};
 use super::packet_ctrl::ControlPacket;
-use super::Opcode;
 
 /// Initial retransmit timeout for an unacked control packet. OpenVPN's
 /// reliable layer starts at ~1s and backs off exponentially.
