@@ -8,11 +8,20 @@ name: release-plz
 #                        changed), publishes to crates.io and creates the git
 #                        tag + GitHub release.
 #
-# Requirements (configure once in the repo settings):
-#   * Secret `CARGO_REGISTRY_TOKEN` — a crates.io API token with publish scope.
-#   * Settings → Actions → General → Workflow permissions:
-#       - "Read and write permissions"
-#       - "Allow GitHub Actions to create and approve pull requests"
+# Both jobs authenticate with the organisation's `RELEASE_PLZ_TOKEN` PAT rather
+# than the default `GITHUB_TOKEN`. GitHub deliberately does not trigger
+# workflows from events created by `GITHUB_TOKEN` — it is how recursive runs are
+# prevented — so a release PR opened with it leaves CI stuck at
+# `action_required` until somebody approves each run by hand, and a tag pushed
+# with it fires no tag-triggered workflow at all. The PAT is also what makes the
+# release PR come from the org account instead of `github-actions[bot]`.
+#
+# Requirements (both are organisation-level secrets, inherited by this repo):
+#   * `CARGO_REGISTRY_TOKEN` — a crates.io API token with publish scope.
+#   * `RELEASE_PLZ_TOKEN`    — a PAT with `contents: write` + `pull-requests: write`.
+# Plus, once, in Settings → Actions → General → Workflow permissions:
+#   * "Read and write permissions"
+#   * "Allow GitHub Actions to create and approve pull requests"
 
 on:
   push:
@@ -21,6 +30,12 @@ on:
 permissions:
   contents: write
   pull-requests: write
+
+# Never run two release-plz jobs against the same ref at once: they both push
+# to the release branch.
+concurrency:
+  group: release-plz-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   # Publish to crates.io + tag/release when the release PR lands.
@@ -31,31 +46,33 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          # release-plz pushes the version-bump commit and tag over git, so the
+          # PAT has to be persisted on the checkout, not just handed to the
+          # action's API calls.
+          token: ${{ secrets.RELEASE_PLZ_TOKEN }}
       - uses: dtolnay/rust-toolchain@stable
       - name: Run release-plz
         uses: release-plz/action@v0.5
         with:
           command: release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
   # Open / update the release PR (version bump + changelog).
   release-plz-pr:
     name: Release-plz PR
     runs-on: ubuntu-latest
-    concurrency:
-      group: release-plz-${{ github.ref }}
-      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          token: ${{ secrets.RELEASE_PLZ_TOKEN }}
       - uses: dtolnay/rust-toolchain@stable
       - name: Run release-plz
         uses: release-plz/action@v0.5
         with:
           command: release-pr
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
