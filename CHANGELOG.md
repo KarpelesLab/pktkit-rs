@@ -6,6 +6,29 @@ semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+## [0.1.3](https://github.com/KarpelesLab/pktkit-rs/compare/v0.1.2...v0.1.3) - 2026-09-01
+
+### Other
+
+- release-plz authenticates with the org PAT, like every other crate
+- VLAN access and trunk ports
+- O(1) unicast forwarding, per-port limits, loop bounding
+- fix the L2Hub benchmark, which measured nothing
+- fix two toolchain-drift lint failures; cover the TLS version range
+- move all crypto to purecrypto, dropping rustls
+- move all crypto to purecrypto
+- edition 2024, MSRV 1.88
+- fix the four failing jobs, drop two unused dependencies
+- fuzzing, benchmarks, and a dependency audit
+- AF_PACKET, cross-platform builds, and the rest of the counters
+- observability, capture, and link impairment
+- complete the wire type layer through L4
+- a capture can never widen into the whole interface
+- keep an explicitly captured solicited-node group
+- document the xdp feature and the afxdp breaking changes
+- kernel-side integration tests behind --ignored
+- address-scoped capture, zero-copy, and a per-queue datapath
+
 ### Added — L2Hub
 
 - **VLAN port modes.** `PortMode::Access { vlan }` is an edge port belonging to
