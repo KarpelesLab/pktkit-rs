@@ -52,6 +52,12 @@ impl Frame {
         &mut self.0
     }
 
+    /// Copy the frame into an owned buffer.
+    #[inline]
+    pub fn to_vec(&self) -> Vec<u8> {
+        self.0.to_vec()
+    }
+
     /// Total frame length in bytes (header + payload).
     #[inline]
     pub fn len(&self) -> usize {
@@ -101,6 +107,27 @@ impl Frame {
             return 0;
         }
         u16::from_be_bytes([self.0[14], self.0[15]]) & 0x0FFF
+    }
+
+    /// VLAN priority code point (3 bits). Returns 0 when the frame is untagged.
+    pub fn vlan_pcp(&self) -> u8 {
+        if !self.has_vlan() {
+            return 0;
+        }
+        self.0[14] >> 5
+    }
+
+    /// VLAN drop-eligible indicator. False when the frame is untagged.
+    pub fn vlan_dei(&self) -> bool {
+        self.has_vlan() && self.0[14] & 0x10 != 0
+    }
+
+    /// The full 16-bit tag control information field, or `None` when untagged.
+    pub fn vlan_tci(&self) -> Option<u16> {
+        if !self.has_vlan() {
+            return None;
+        }
+        Some(u16::from_be_bytes([self.0[14], self.0[15]]))
     }
 
     /// Protocol type of the payload, transparently handling a VLAN tag.
@@ -175,6 +202,37 @@ fn raw_ether_type(b: &[u8]) -> u16 {
     u16::from_be_bytes([b[12], b[13]])
 }
 
+impl core::ops::Deref for Frame {
+    type Target = [u8];
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl AsRef<[u8]> for Frame {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl PartialEq for Frame {
+    #[inline]
+    fn eq(&self, other: &Frame) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for Frame {}
+
+impl core::hash::Hash for Frame {
+    #[inline]
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state)
+    }
+}
+
 impl fmt::Debug for Frame {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Frame")
@@ -215,6 +273,7 @@ mod tests {
         assert_eq!(f.src_mac(), Some(src));
         assert_eq!(f.ether_type(), EtherType::IPV4);
         assert!(!f.has_vlan());
+        assert_eq!(f.vlan_tci(), None);
         assert_eq!(f.header_len(), 14);
         assert_eq!(f.payload(), &payload);
         assert!(!f.is_broadcast());
@@ -236,6 +295,9 @@ mod tests {
         assert!(f.is_valid());
         assert!(f.has_vlan());
         assert_eq!(f.vlan_id(), 1);
+        assert_eq!(f.vlan_pcp(), 0);
+        assert!(!f.vlan_dei());
+        assert_eq!(f.vlan_tci(), Some(1));
         assert_eq!(f.ether_type(), EtherType::IPV4);
         assert_eq!(f.header_len(), 18);
         assert_eq!(f.payload(), &[0xaa, 0xbb]);

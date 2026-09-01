@@ -23,6 +23,18 @@
 //! - [`connect_l2`] and [`connect_l3`] wire two devices point-to-point.
 //! - [`serve`] runs an accept loop, joining each incoming L2 device into a
 //!   connector.
+//!
+//! # Reading and writing wire formats
+//!
+//! [`Frame`] covers L2 and [`Packet`] covers L3; the [`l4`] module adds the
+//! transport layer ([`TcpSegment`], [`UdpDatagram`], [`IcmpMessage`]) and the
+//! [`FiveTuple`] that identifies a flow. Get an L4 view straight from a packet
+//! with [`Packet::tcp`], [`Packet::udp`] or [`Packet::icmp`].
+//!
+//! Going the other way, [`build`] constructs well-formed packets with lengths
+//! and checksums filled in, [`icmp`] generates the error messages a forwarder
+//! owes to senders, and [`fragment`] splits a datagram that is too large for
+//! the next hop.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![warn(missing_debug_implementations)]
@@ -37,14 +49,18 @@
 
 // --- Core (always compiled) -------------------------------------------------
 
+pub mod build;
 mod checksum;
 mod connect;
 mod ethertype;
+pub mod fragment;
 mod frame;
+pub mod icmp;
 mod iface;
 mod ip;
 mod l2hub;
 mod l3hub;
+pub mod l4;
 mod mac;
 mod namespace;
 mod packet;
@@ -52,8 +68,11 @@ mod pipe;
 mod pool;
 mod protocol;
 mod rand;
+mod stats;
 
-pub use checksum::{checksum, combine_checksums, pseudo_header_checksum};
+pub use checksum::{
+    checksum, combine_checksums, incremental_update, pseudo_header_checksum, transport_checksum,
+};
 pub use connect::{connect_l2, connect_l3};
 pub use ethertype::EtherType;
 pub use frame::{build_frame, Frame};
@@ -61,6 +80,7 @@ pub use iface::{Handler, L2Device, L2Handler, L3Device, L3Handler};
 pub use ip::IpPrefix;
 pub use l2hub::{L2Hub, L2HubHandle};
 pub use l3hub::{L3Hub, L3HubHandle};
+pub use l4::{FiveTuple, IcmpMessage, TcpFlags, TcpSegment, UdpDatagram};
 pub use mac::{MacAddr, BROADCAST_MAC};
 pub use namespace::{
     serve, serve_with_done, Cleanup, Done, DoneSignal, L2Acceptor, L2AcceptorWithDone, L2Connector,
@@ -70,6 +90,7 @@ pub use packet::Packet;
 pub use pipe::{PipeL2, PipeL3};
 pub use pool::{BufferPool, DEFAULT_MTU};
 pub use protocol::Protocol;
+pub use stats::{DeviceStats, Stats};
 
 /// Crate-wide `Result` alias.
 pub type Result<T> = std::io::Result<T>;

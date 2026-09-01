@@ -1,4 +1,4 @@
-use crate::{Frame, IpPrefix, MacAddr, Packet, Result};
+use crate::{DeviceStats, Frame, IpPrefix, MacAddr, Packet, Result};
 use std::sync::Arc;
 
 /// A frame handler: invoked synchronously by an [`L2Device`] when a frame is
@@ -35,6 +35,16 @@ pub trait L2Device: Send + Sync {
 
     /// Release any resources held by the device.
     fn close(&self) -> Result<()>;
+
+    /// Traffic counters, if the device keeps any.
+    ///
+    /// Defaults to `None` so existing implementors are unaffected; a device
+    /// opts in by holding a [`DeviceStats`] and returning a reference to it.
+    /// This is the first thing to reach for when a packet goes missing inside a
+    /// topology.
+    fn stats(&self) -> Option<&DeviceStats> {
+        None
+    }
 }
 
 /// A Layer 3 (IP) network device.
@@ -49,6 +59,11 @@ pub trait L3Device: Send + Sync {
     fn set_addr(&self, prefix: IpPrefix) -> Result<()>;
 
     fn close(&self) -> Result<()>;
+
+    /// Traffic counters, if the device keeps any. See [`L2Device::stats`].
+    fn stats(&self) -> Option<&DeviceStats> {
+        None
+    }
 }
 
 // Blanket impls so callers can store devices as `Arc<dyn L2Device>` or
@@ -70,6 +85,10 @@ impl<T: L2Device + ?Sized> L2Device for Arc<T> {
     #[inline]
     fn close(&self) -> Result<()> {
         (**self).close()
+    }
+    #[inline]
+    fn stats(&self) -> Option<&DeviceStats> {
+        (**self).stats()
     }
 }
 
@@ -93,5 +112,9 @@ impl<T: L3Device + ?Sized> L3Device for Arc<T> {
     #[inline]
     fn close(&self) -> Result<()> {
         (**self).close()
+    }
+    #[inline]
+    fn stats(&self) -> Option<&DeviceStats> {
+        (**self).stats()
     }
 }

@@ -1,4 +1,6 @@
-use crate::{Frame, IpPrefix, L2Device, L2Handler, L3Device, L3Handler, MacAddr, Packet, Result};
+use crate::{
+    DeviceStats, Frame, IpPrefix, L2Device, L2Handler, L3Device, L3Handler, MacAddr, Packet, Result,
+};
 use std::sync::Mutex;
 
 /// A simple in-memory [`L2Device`] useful for tests and for wiring subpackages.
@@ -9,6 +11,7 @@ use std::sync::Mutex;
 pub struct PipeL2 {
     handler: Mutex<Option<L2Handler>>,
     mac: MacAddr,
+    stats: DeviceStats,
 }
 
 impl PipeL2 {
@@ -17,14 +20,32 @@ impl PipeL2 {
         PipeL2 {
             handler: Mutex::new(None),
             mac,
+            stats: DeviceStats::new(),
         }
     }
 
     /// Push a frame through the handler as if it had been received from the
-    /// network. Equivalent to [`send`](L2Device::send) — provided to make
-    /// test direction explicit.
+    /// network. Delivery is identical to [`send`](L2Device::send); the two
+    /// differ only in which counters they move, so a test can tell the
+    /// directions apart.
     pub fn inject(&self, f: &Frame) -> Result<()> {
-        self.send(f)
+        self.stats.record_rx(f.len());
+        match self.take_handler() {
+            Some(h) => h(f),
+            None => {
+                self.stats.record_rx_drop();
+                Ok(())
+            }
+        }
+    }
+
+    /// Clone the handler out from under the lock. Invoking it while holding
+    /// the lock would deadlock if it called back into this pipe.
+    fn take_handler(&self) -> Option<L2Handler> {
+        self.handler
+            .lock()
+            .expect("PipeL2 handler poisoned")
+            .clone()
     }
 }
 
@@ -40,16 +61,15 @@ impl L2Device for PipeL2 {
     }
 
     fn send(&self, f: &Frame) -> Result<()> {
+        self.stats.record_tx(f.len());
         // Clone the Arc out, drop the lock, then invoke. This lets the handler
         // call back into another pipe without re-entering the same mutex.
-        let h = self
-            .handler
-            .lock()
-            .expect("PipeL2 handler poisoned")
-            .clone();
-        match h {
+        match self.take_handler() {
             Some(h) => h(f),
-            None => Ok(()),
+            None => {
+                self.stats.record_tx_drop();
+                Ok(())
+            }
         }
     }
 
@@ -60,12 +80,17 @@ impl L2Device for PipeL2 {
     fn close(&self) -> Result<()> {
         Ok(())
     }
+
+    fn stats(&self) -> Option<&DeviceStats> {
+        Some(&self.stats)
+    }
 }
 
 /// A simple in-memory [`L3Device`] useful for tests.
 pub struct PipeL3 {
     handler: Mutex<Option<L3Handler>>,
     addr: Mutex<IpPrefix>,
+    stats: DeviceStats,
 }
 
 impl PipeL3 {
@@ -74,13 +99,28 @@ impl PipeL3 {
         PipeL3 {
             handler: Mutex::new(None),
             addr: Mutex::new(addr),
+            stats: DeviceStats::new(),
         }
     }
 
     /// Push a packet through the handler as if it had been received from the
     /// network.
     pub fn inject(&self, p: &Packet) -> Result<()> {
-        self.send(p)
+        self.stats.record_rx(p.len());
+        match self.take_handler() {
+            Some(h) => h(p),
+            None => {
+                self.stats.record_rx_drop();
+                Ok(())
+            }
+        }
+    }
+
+    fn take_handler(&self) -> Option<L3Handler> {
+        self.handler
+            .lock()
+            .expect("PipeL3 handler poisoned")
+            .clone()
     }
 }
 
@@ -98,14 +138,13 @@ impl L3Device for PipeL3 {
     }
 
     fn send(&self, p: &Packet) -> Result<()> {
-        let h = self
-            .handler
-            .lock()
-            .expect("PipeL3 handler poisoned")
-            .clone();
-        match h {
+        self.stats.record_tx(p.len());
+        match self.take_handler() {
             Some(h) => h(p),
-            None => Ok(()),
+            None => {
+                self.stats.record_tx_drop();
+                Ok(())
+            }
         }
     }
 
@@ -120,6 +159,10 @@ impl L3Device for PipeL3 {
 
     fn close(&self) -> Result<()> {
         Ok(())
+    }
+
+    fn stats(&self) -> Option<&DeviceStats> {
+        Some(&self.stats)
     }
 }
 
@@ -153,6 +196,27 @@ mod tests {
         let buf = build_frame(MacAddr::zero(), MacAddr::zero(), EtherType::IPV4, &[]);
         let f = Frame::from_slice(&buf);
         p.send(f).unwrap();
+    }
+
+    #[test]
+    fn pipe_counts_both_directions() {
+        let p = PipeL2::new(MacAddr::zero());
+        let buf = build_frame(MacAddr::zero(), MacAddr::zero(), EtherType::IPV4, &[0; 10]);
+        let f = Frame::from_slice(&buf);
+
+        // No handler yet: both directions count as dropped.
+        p.send(f).unwrap();
+        p.inject(f).unwrap();
+        let s = p.stats().unwrap().snapshot();
+        assert_eq!((s.tx_packets, s.tx_dropped), (1, 1));
+        assert_eq!((s.rx_packets, s.rx_dropped), (1, 1));
+        assert_eq!(s.rx_bytes, buf.len() as u64);
+
+        p.set_handler(Arc::new(|_f: &Frame| Ok(())));
+        p.inject(f).unwrap();
+        let s = p.stats().unwrap().snapshot();
+        assert_eq!(s.rx_packets, 2);
+        assert_eq!(s.rx_dropped, 1, "the delivered frame was not dropped");
     }
 
     #[test]
