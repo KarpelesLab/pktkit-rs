@@ -49,6 +49,7 @@
 
 // --- Core (always compiled) -------------------------------------------------
 
+mod accept;
 pub mod build;
 mod checksum;
 mod connect;
@@ -62,7 +63,6 @@ mod l2hub;
 mod l3hub;
 pub mod l4;
 mod mac;
-mod namespace;
 mod packet;
 mod pipe;
 mod pool;
@@ -70,6 +70,10 @@ mod protocol;
 mod rand;
 mod stats;
 
+pub use accept::{
+    serve, serve_with_done, Cleanup, Done, DoneSignal, L2Acceptor, L2AcceptorWithDone, L2Connector,
+    L3Connector,
+};
 pub use checksum::{
     checksum, combine_checksums, incremental_update, pseudo_header_checksum, transport_checksum,
 };
@@ -82,10 +86,6 @@ pub use l2hub::{L2Hub, L2HubHandle};
 pub use l3hub::{L3Hub, L3HubHandle};
 pub use l4::{FiveTuple, IcmpMessage, TcpFlags, TcpSegment, UdpDatagram};
 pub use mac::{MacAddr, BROADCAST_MAC};
-pub use namespace::{
-    serve, serve_with_done, Cleanup, Done, DoneSignal, L2Acceptor, L2AcceptorWithDone, L2Connector,
-    L3Connector,
-};
 pub use packet::Packet;
 pub use pipe::{PipeL2, PipeL3};
 pub use pool::{BufferPool, DEFAULT_MTU};
@@ -94,6 +94,10 @@ pub use stats::{DeviceStats, HubCounters, HubStats, Stats};
 
 /// Crate-wide `Result` alias.
 pub type Result<T> = std::io::Result<T>;
+
+// Linux syscall helpers, compiled only for the features that issue them.
+#[cfg(all(target_os = "linux", any(feature = "tuntap", feature = "afpacket")))]
+mod sys;
 
 // --- Feature modules --------------------------------------------------------
 
@@ -117,6 +121,10 @@ pub use l2adapter::{L2Adapter, L2AdapterConfig};
 #[cfg_attr(docsrs, doc(cfg(feature = "dhcp")))]
 pub mod dhcp;
 
+#[cfg(feature = "afpacket")]
+#[cfg_attr(docsrs, doc(cfg(feature = "afpacket")))]
+pub mod afpacket;
+
 #[cfg(feature = "impair")]
 #[cfg_attr(docsrs, doc(cfg(feature = "impair")))]
 pub mod impair;
@@ -133,11 +141,16 @@ pub mod qemu;
 #[cfg_attr(docsrs, doc(cfg(feature = "tuntap")))]
 pub mod tuntap;
 
-#[cfg(feature = "xdp")]
+// XDP and AF_XDP are Linux kernel interfaces with no analogue elsewhere, and
+// unlike `tuntap` or `afpacket` there is no meaningful stub to offer: the API
+// is built around eBPF programs, maps and UMEM rings. The modules are simply
+// absent off Linux, so that enabling `full` -- which includes them -- still
+// builds everywhere.
+#[cfg(all(feature = "xdp", target_os = "linux"))]
 #[cfg_attr(docsrs, doc(cfg(feature = "xdp")))]
 pub mod xdp;
 
-#[cfg(feature = "afxdp")]
+#[cfg(all(feature = "afxdp", target_os = "linux"))]
 #[cfg_attr(docsrs, doc(cfg(feature = "afxdp")))]
 pub mod afxdp;
 

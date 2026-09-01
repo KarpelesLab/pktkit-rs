@@ -1,3 +1,14 @@
+//! Joining devices to a topology as they arrive.
+//!
+//! Where [`connect_l2`](crate::connect_l2) wires two known devices together,
+//! this is the other shape: something produces devices over time -- a listening
+//! socket accepting VM connections, say -- and each one should be attached to a
+//! hub as it appears and detached when it goes away.
+//!
+//! [`L2Acceptor`] is the source of devices, [`L2Connector`] is what they are
+//! joined to (any `Arc<L2Hub>` is one), and [`serve`] runs the loop that
+//! marries the two.
+
 use crate::{L2Device, L3Device, Result};
 use std::sync::Arc;
 
@@ -11,7 +22,7 @@ pub type Cleanup = Box<dyn FnOnce() -> Result<()> + Send>;
 
 /// Produces [`L2Device`]s, typically by accepting incoming network connections.
 ///
-/// Implemented by [`qemu::Listener`](crate::qemu) and similar.
+/// Implemented by the `qemu` feature's `Listener` and similar.
 pub trait L2Acceptor {
     /// Block until the next device is available.
     fn accept_l2(&self) -> Result<Arc<dyn L2Device>>;

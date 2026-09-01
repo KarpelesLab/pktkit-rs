@@ -22,7 +22,7 @@
 //!
 //! The classic pcap format is used (microsecond timestamps, little-endian), so
 //! the files are readable by everything. Records are written as they arrive; a
-//! [`PcapWriter`] wrapping a [`BufWriter`](std::io::BufWriter) will hold data
+//! [`PcapWriter`] wrapping a [`BufWriter`] will hold data
 //! until it is flushed or dropped.
 
 use crate::{DeviceStats, Frame, IpPrefix, L2Device, L2Handler, L3Device, L3Handler, MacAddr};

@@ -20,8 +20,8 @@ use std::sync::{Arc, Mutex, Weak};
 use super::addr::PeerKey;
 use super::peer::{OnAuth, PeerConfig};
 use super::server::{Server, ServerConfig};
+use crate::accept::{Cleanup, L2Connector, L3Connector};
 use crate::iface::{L2Device, L2Handler, L3Device, L3Handler};
-use crate::namespace::{Cleanup, L2Connector, L3Connector};
 use crate::{IpPrefix, MacAddr, Result};
 
 /// Connector target: exactly one of these is configured.

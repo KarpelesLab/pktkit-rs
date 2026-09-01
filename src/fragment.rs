@@ -1,8 +1,8 @@
 //! IPv4 fragmentation on the send path.
 //!
-//! [`crate::nat::defrag`] puts fragments back together; this splits a datagram
-//! that is too large for the next hop. A forwarder needs both: reassemble to
-//! inspect, re-fragment to send on.
+//! The `nat` feature's defragmenter puts fragments back together; this splits
+//! a datagram that is too large for the next hop. A forwarder needs both:
+//! reassemble to inspect, re-fragment to send on.
 //!
 //! IPv6 is deliberately not fragmented here. RFC 8200 moved that
 //! responsibility to the source host, so a forwarder's only correct response to

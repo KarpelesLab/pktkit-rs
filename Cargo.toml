@@ -39,6 +39,9 @@ qemu = []
 # Linux/macOS TUN/TAP device support.
 tuntap = ["dep:libc"]
 
+# Bind an L2 device to an existing interface with an AF_PACKET socket (Linux).
+afpacket = ["dep:libc"]
+
 # Linux XDP: load/attach eBPF programs on a device's receive path, with an
 # IP-prefix capture program and the maps that drive it.
 xdp = ["dep:libc"]
@@ -98,6 +101,7 @@ full = [
     "pcap",
     "qemu",
     "tuntap",
+    "afpacket",
     "xdp",
     "afxdp",
     "vtcp",

@@ -12,8 +12,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::thread;
 
+use crate::accept::{Cleanup, L3Connector};
 use crate::iface::{L3Device, L3Handler};
-use crate::namespace::{Cleanup, L3Connector};
 use crate::wg::handler::{Config as HandlerConfig, Handler};
 use crate::wg::multihandler::MultiHandler;
 use crate::wg::server::{OnPacketFn, OnPeerConnectedFn, Server, ServerConfig};

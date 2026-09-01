@@ -10,7 +10,7 @@
 //! The unit tests cover encoding and layout; these cover the two things only a
 //! kernel can answer — whether the generated program passes the verifier, and
 //! whether the trie keys we build actually match the way we expect.
-#![cfg(feature = "afxdp")]
+#![cfg(all(feature = "afxdp", target_os = "linux"))]
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::process::Command;

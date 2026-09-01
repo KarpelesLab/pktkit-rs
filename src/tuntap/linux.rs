@@ -4,7 +4,10 @@
 //! handed to the handler is the read scratch and is only valid for the
 //! duration of the call (mirroring the rest of the crate).
 
-use crate::{Frame, IpPrefix, L2Device, L2Handler, L3Device, L3Handler, MacAddr, Packet, Result};
+use crate::sys::{if_hw_addr, write_all};
+use crate::{
+    DeviceStats, Frame, IpPrefix, L2Device, L2Handler, L3Device, L3Handler, MacAddr, Packet, Result,
+};
 use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -24,6 +27,7 @@ pub struct Tun {
     inner: Arc<DevInner>,
     handler: Arc<Mutex<Option<L3Handler>>>,
     addr: Mutex<IpPrefix>,
+    stats: Arc<DeviceStats>,
 }
 
 /// Linux TAP device — full Ethernet frames including header.
@@ -31,6 +35,7 @@ pub struct Tap {
     inner: Arc<DevInner>,
     handler: Arc<Mutex<Option<L2Handler>>>,
     mac: MacAddr,
+    stats: Arc<DeviceStats>,
 }
 
 struct DevInner {
@@ -72,15 +77,18 @@ impl Tun {
             closed: AtomicBool::new(false),
         });
         let handler: Arc<Mutex<Option<L3Handler>>> = Arc::new(Mutex::new(None));
+        let stats = Arc::new(DeviceStats::new());
 
         let inner_t = inner.clone();
         let handler_t = handler.clone();
-        std::thread::spawn(move || read_loop_l3(inner_t, handler_t));
+        let stats_t = stats.clone();
+        std::thread::spawn(move || read_loop_l3(inner_t, handler_t, stats_t));
 
         Ok(Tun {
             inner,
             handler,
             addr: Mutex::new(IpPrefix::default()),
+            stats,
         })
     }
 
@@ -94,22 +102,25 @@ impl Tap {
     /// Open a TAP (L2) device. Requires `CAP_NET_ADMIN` or root.
     pub fn open(cfg: TuntapConfig) -> Result<Tap> {
         let (fd, name) = open_tuntap(&cfg.name, libc::IFF_TAP | libc::IFF_NO_PI)?;
-        let mac = read_hw_addr(&name).unwrap_or_else(|_| MacAddr::random_local_unicast());
+        let mac = if_hw_addr(&name).unwrap_or_else(|_| MacAddr::random_local_unicast());
         let inner = Arc::new(DevInner {
             fd,
             name,
             closed: AtomicBool::new(false),
         });
         let handler: Arc<Mutex<Option<L2Handler>>> = Arc::new(Mutex::new(None));
+        let stats = Arc::new(DeviceStats::new());
 
         let inner_t = inner.clone();
         let handler_t = handler.clone();
-        std::thread::spawn(move || read_loop_l2(inner_t, handler_t));
+        let stats_t = stats.clone();
+        std::thread::spawn(move || read_loop_l2(inner_t, handler_t, stats_t));
 
         Ok(Tap {
             inner,
             handler,
             mac,
+            stats,
         })
     }
 
@@ -125,7 +136,17 @@ impl L3Device for Tun {
         *self.handler.lock().unwrap() = Some(h);
     }
     fn send(&self, pkt: &Packet) -> Result<()> {
-        write_all(self.inner.raw(), pkt.as_bytes())
+        match write_all(self.inner.raw(), pkt.as_bytes()) {
+            Ok(()) => {
+                self.stats.record_tx(pkt.len());
+                Ok(())
+            }
+            Err(e) => {
+                self.stats.record_error();
+                self.stats.record_tx_drop();
+                Err(e)
+            }
+        }
     }
     fn addr(&self) -> IpPrefix {
         *self.addr.lock().unwrap()
@@ -143,6 +164,9 @@ impl L3Device for Tun {
         // Tun and let GC do its thing.
         Ok(())
     }
+    fn stats(&self) -> Option<&DeviceStats> {
+        Some(&self.stats)
+    }
 }
 
 // --- L2Device for Tap -----------------------------------------------------
@@ -152,7 +176,17 @@ impl L2Device for Tap {
         *self.handler.lock().unwrap() = Some(h);
     }
     fn send(&self, f: &Frame) -> Result<()> {
-        write_all(self.inner.raw(), f.as_bytes())
+        match write_all(self.inner.raw(), f.as_bytes()) {
+            Ok(()) => {
+                self.stats.record_tx(f.len());
+                Ok(())
+            }
+            Err(e) => {
+                self.stats.record_error();
+                self.stats.record_tx_drop();
+                Err(e)
+            }
+        }
     }
     fn hw_addr(&self) -> MacAddr {
         self.mac
@@ -160,6 +194,9 @@ impl L2Device for Tap {
     fn close(&self) -> Result<()> {
         self.inner.closed.store(true, Ordering::Release);
         Ok(())
+    }
+    fn stats(&self) -> Option<&DeviceStats> {
+        Some(&self.stats)
     }
 }
 
@@ -196,52 +233,11 @@ fn open_tuntap(name: &str, flags: i32) -> Result<(OwnedFd, String)> {
     Ok((owned, assigned))
 }
 
-fn read_hw_addr(name: &str) -> Result<MacAddr> {
-    // socket(AF_INET, SOCK_DGRAM, 0); ioctl(SIOCGIFHWADDR).
-    let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
-    if sock < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let _close = OwnedSock(sock);
-
-    let mut ifr = [0u8; 40];
-    let bytes = name.as_bytes();
-    let n = bytes.len().min(15);
-    ifr[..n].copy_from_slice(&bytes[..n]);
-
-    let r = unsafe { libc::ioctl(sock, libc::SIOCGIFHWADDR, &mut ifr) };
-    if r < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // Skip 2-byte sa_family at offset 16, then 6 bytes of MAC.
-    let mut o = [0u8; 6];
-    o.copy_from_slice(&ifr[18..24]);
-    Ok(MacAddr(o))
-}
-
-fn write_all(fd: i32, buf: &[u8]) -> Result<()> {
-    let mut written = 0;
-    while written < buf.len() {
-        let n = unsafe {
-            libc::write(
-                fd,
-                buf[written..].as_ptr() as *const libc::c_void,
-                buf.len() - written,
-            )
-        };
-        if n < 0 {
-            let e = io::Error::last_os_error();
-            if e.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(e);
-        }
-        written += n as usize;
-    }
-    Ok(())
-}
-
-fn read_loop_l3(inner: Arc<DevInner>, handler: Arc<Mutex<Option<L3Handler>>>) {
+fn read_loop_l3(
+    inner: Arc<DevInner>,
+    handler: Arc<Mutex<Option<L3Handler>>>,
+    stats: Arc<DeviceStats>,
+) {
     let mut buf = vec![0u8; 65536];
     while !inner.closed.load(Ordering::Acquire) {
         let n = unsafe {
@@ -254,14 +250,22 @@ fn read_loop_l3(inner: Arc<DevInner>, handler: Arc<Mutex<Option<L3Handler>>>) {
         if n <= 0 {
             return;
         }
+        stats.record_rx(n as usize);
         let h = handler.lock().unwrap().clone();
-        if let Some(h) = h {
-            let _ = h(Packet::from_slice(&buf[..n as usize]));
+        match h {
+            Some(h) => {
+                let _ = h(Packet::from_slice(&buf[..n as usize]));
+            }
+            None => stats.record_rx_drop(),
         }
     }
 }
 
-fn read_loop_l2(inner: Arc<DevInner>, handler: Arc<Mutex<Option<L2Handler>>>) {
+fn read_loop_l2(
+    inner: Arc<DevInner>,
+    handler: Arc<Mutex<Option<L2Handler>>>,
+    stats: Arc<DeviceStats>,
+) {
     let mut buf = vec![0u8; 65536];
     while !inner.closed.load(Ordering::Acquire) {
         let n = unsafe {
@@ -276,20 +280,16 @@ fn read_loop_l2(inner: Arc<DevInner>, handler: Arc<Mutex<Option<L2Handler>>>) {
         }
         let n = n as usize;
         if n < 14 {
+            stats.record_rx_drop();
             continue;
         }
+        stats.record_rx(n);
         let h = handler.lock().unwrap().clone();
-        if let Some(h) = h {
-            let _ = h(Frame::from_slice(&buf[..n]));
-        }
-    }
-}
-
-struct OwnedSock(i32);
-impl Drop for OwnedSock {
-    fn drop(&mut self) {
-        unsafe {
-            libc::close(self.0);
+        match h {
+            Some(h) => {
+                let _ = h(Frame::from_slice(&buf[..n]));
+            }
+            None => stats.record_rx_drop(),
         }
     }
 }

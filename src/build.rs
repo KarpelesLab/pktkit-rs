@@ -1,6 +1,6 @@
 //! Constructors for well-formed packets.
 //!
-//! The accessor types ([`Frame`](crate::Frame), [`Packet`](crate::Packet), the
+//! The accessor types ([`Frame`], [`Packet`](crate::Packet), the
 //! [`l4`](crate::l4) views) read and mutate buffers that already exist. These
 //! functions produce the buffers in the first place, with lengths and checksums
 //! filled in, so tests and protocol code do not have to assemble headers by

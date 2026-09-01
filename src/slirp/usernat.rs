@@ -17,8 +17,8 @@
 //! served by the `vtcp` engine: an inbound SYN passive-opens a server-side
 //! `vtcp::Conn` and surfaces a [`TcpStream`](super::TcpStream) on ESTABLISHED.
 
+use crate::accept::{Cleanup, L3Connector};
 use crate::iface::{L3Device, L3Handler};
-use crate::namespace::{Cleanup, L3Connector};
 use crate::packet::Packet;
 use crate::slirp::icmpv4::build_icmpv4_echo_reply;
 use crate::slirp::icmpv6::build_icmpv6_echo_reply;
