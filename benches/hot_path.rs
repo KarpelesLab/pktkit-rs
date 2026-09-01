@@ -16,12 +16,13 @@
 
 use pktkit::build::{build_ipv4, build_ipv6, build_tcp, build_udp};
 use pktkit::{
-    EtherType, Frame, L2Device, L2Hub, L3Device, L3Hub, MacAddr, Packet, PipeL2, PipeL3, Protocol,
-    TcpFlags, build_frame, checksum, incremental_update,
+    EtherType, Frame, L2Device, L2Hub, L2HubHandle, L3Device, L3Hub, MacAddr, Packet, PipeL3,
+    Protocol, TcpFlags, build_frame, checksum, incremental_update,
 };
 use std::hint::black_box;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 fn main() {
@@ -218,34 +219,114 @@ fn build_benches() {
     });
 }
 
-fn hub_benches() {
-    // Two ports, one learned MAC: the ordinary forwarding case.
+/// A port that does not loop.
+///
+/// `PipeL2` is unusable here: its `send` feeds the frame straight back into
+/// its own handler, which the hub has set to its forwarding entry point, so a
+/// hub delivery would recurse forever. Silencing that by calling
+/// `set_handler` after `connect` — the obvious fix — instead *replaces* the
+/// hub's handler, and then the benchmark measures an empty closure rather
+/// than the hub. This device separates the two directions: `deliver` injects
+/// inbound (into the hub), `send` is a sink.
+struct BenchPort {
+    handler: Mutex<Option<pktkit::L2Handler>>,
+    mac: MacAddr,
+    sent: AtomicU64,
+}
+
+impl BenchPort {
+    fn new(mac: MacAddr) -> Arc<BenchPort> {
+        Arc::new(BenchPort {
+            handler: Mutex::new(None),
+            mac,
+            sent: AtomicU64::new(0),
+        })
+    }
+
+    /// Hand a frame to whatever the hub installed, i.e. receive from the wire.
+    fn deliver(&self, f: &Frame) {
+        let h = self.handler.lock().unwrap().clone();
+        if let Some(h) = h {
+            let _ = h(f);
+        }
+    }
+}
+
+impl std::fmt::Debug for BenchPort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BenchPort").field("mac", &self.mac).finish()
+    }
+}
+
+impl L2Device for BenchPort {
+    fn set_handler(&self, h: pktkit::L2Handler) {
+        *self.handler.lock().unwrap() = Some(h);
+    }
+    fn send(&self, _f: &Frame) -> Result<(), std::io::Error> {
+        self.sent.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+    fn hw_addr(&self) -> MacAddr {
+        self.mac
+    }
+    fn close(&self) -> Result<(), std::io::Error> {
+        Ok(())
+    }
+}
+
+fn bench_mac(n: u16) -> MacAddr {
+    let b = n.to_be_bytes();
+    MacAddr::new([0x02, 0, 0, 0, b[0], b[1]])
+}
+
+/// Build a hub with `n` ports, every station already learned.
+fn learned_hub(n: usize, payload: &[u8]) -> (Arc<L2Hub>, Vec<Arc<BenchPort>>, Vec<L2HubHandle>) {
     let hub = Arc::new(L2Hub::new());
-    let a_mac: MacAddr = "02:00:00:00:00:01".parse().unwrap();
-    let b_mac: MacAddr = "02:00:00:00:00:02".parse().unwrap();
-    let a = Arc::new(PipeL2::new(a_mac));
-    let b = Arc::new(PipeL2::new(b_mac));
-    let _ha = hub.connect_arc(a.clone());
-    let _hb = hub.connect_arc(b.clone());
-    // Nothing on the far side, so we measure the hub rather than the handler.
-    b.set_handler(Arc::new(|_f: &Frame| Ok(())));
-    a.set_handler(Arc::new(|_f: &Frame| Ok(())));
+    let mut ports = Vec::with_capacity(n);
+    let mut handles = Vec::with_capacity(n);
+    for i in 0..n {
+        let p = BenchPort::new(bench_mac(i as u16));
+        handles.push(hub.connect_arc(p.clone()));
+        ports.push(p);
+    }
+    for (i, p) in ports.iter().enumerate() {
+        let to = bench_mac(((i + 1) % n) as u16);
+        let f = build_frame(to, bench_mac(i as u16), EtherType::IPV4, payload);
+        p.deliver(Frame::from_slice(&f));
+    }
+    (hub, ports, handles)
+}
 
+fn hub_benches() {
     let payload = v4_udp();
-    let to_b = build_frame(b_mac, a_mac, EtherType::IPV4, &payload);
-    let to_a = build_frame(a_mac, b_mac, EtherType::IPV4, &payload);
-    // Teach the hub where both stations live.
-    a.inject(Frame::from_slice(&to_b)).unwrap();
-    b.inject(Frame::from_slice(&to_a)).unwrap();
 
-    bench("l2hub/forward_known_unicast", 1_000_000, || {
-        a.inject(Frame::from_slice(black_box(&to_b))).unwrap();
-    });
+    // Known unicast at a few port counts: the forwarding path snapshots the
+    // port list per frame, so the cost of a single delivery should be read
+    // against how many ports the hub has.
+    for n in [2usize, 8, 32, 128] {
+        let (_hub, ports, _handles) = learned_hub(n, &payload);
+        let f = build_frame(bench_mac(1), bench_mac(0), EtherType::IPV4, &payload);
+        bench(
+            &format!("l2hub/forward_known_unicast/{n}_ports"),
+            500_000,
+            || {
+                ports[0].deliver(Frame::from_slice(black_box(&f)));
+            },
+        );
+    }
 
-    let bcast = build_frame(MacAddr::broadcast(), a_mac, EtherType::IPV4, &payload);
-    bench("l2hub/flood_broadcast", 1_000_000, || {
-        a.inject(Frame::from_slice(black_box(&bcast))).unwrap();
-    });
+    for n in [2usize, 32] {
+        let (_hub, ports, _handles) = learned_hub(n, &payload);
+        let bcast = build_frame(
+            MacAddr::broadcast(),
+            bench_mac(0),
+            EtherType::IPV4,
+            &payload,
+        );
+        bench(&format!("l2hub/flood_broadcast/{n}_ports"), 200_000, || {
+            ports[0].deliver(Frame::from_slice(black_box(&bcast)));
+        });
+    }
 
     let l3 = Arc::new(L3Hub::new());
     let x = Arc::new(PipeL3::new("10.0.0.1/24".parse().unwrap()));
