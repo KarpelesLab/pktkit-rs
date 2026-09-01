@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Instant;
 
-use zeroize::Zeroize;
+use crate::zeroize::zeroize;
 
 use crate::Result;
 use crate::wg::constants::{
@@ -46,9 +46,9 @@ pub(crate) struct Handshake {
 
 impl Drop for Handshake {
     fn drop(&mut self) {
-        self.hash.zeroize();
-        self.chain_key.zeroize();
-        self.precomputed_static_static.zeroize();
+        zeroize(&mut self.hash);
+        zeroize(&mut self.chain_key);
+        zeroize(&mut self.precomputed_static_static);
     }
 }
 
@@ -114,7 +114,7 @@ pub(crate) fn initiate_handshake(h: &Handler, peer_key: &NoisePublicKey) -> Resu
     let temp_ss = x25519_dh(&client_priv, peer_key);
     hs.precomputed_static_static.copy_from_slice(&temp_ss);
     let mut temp_ss = temp_ss; // shadow so we can zeroize
-    temp_ss.zeroize();
+    zeroize(&mut temp_ss);
 
     // h = MixHash(h, responder's static pk).
     let h_save = hs.hash;
@@ -136,7 +136,7 @@ pub(crate) fn initiate_handshake(h: &Handler, peer_key: &NoisePublicKey) -> Resu
     let mut ck_next = [0u8; BLAKE2S_256_SIZE];
     crate::wg::crypto::kdf2(&mut ck_next, key_blake(&mut key), &hs.chain_key, &temp_ss);
     hs.chain_key = ck_next;
-    temp_ss.zeroize();
+    zeroize(&mut temp_ss);
 
     // Encrypt our static public key under k with AD=h.
     let enc_static = aead_seal_zero(&key, &client_pub.0, &hs.hash);
@@ -192,7 +192,7 @@ pub(crate) fn initiate_handshake(h: &Handler, peer_key: &NoisePublicKey) -> Resu
     // writes the trailing 32 bytes of the packet.
     h.cookie_add_macs(peer_key, &mut pkt);
 
-    key.zeroize();
+    zeroize(&mut key);
     Ok(pkt)
 }
 
@@ -253,13 +253,13 @@ pub(crate) fn process_handshake_response(h: &Handler, data: &[u8]) -> Result<Pac
     let mut temp = x25519_dh(&hs.local_ephemeral, &server_eph_pub);
     let ck_save = hs.chain_key;
     mix_key(&mut hs.chain_key, &ck_save, &temp);
-    temp.zeroize();
+    zeroize(&mut temp);
 
     // se: client_static * server_eph
     let mut temp = x25519_dh(h.private_key(), &server_eph_pub);
     let ck_save = hs.chain_key;
     mix_key(&mut hs.chain_key, &ck_save, &temp);
-    temp.zeroize();
+    zeroize(&mut temp);
 
     // PSK mix.
     let psk = h.preshared_key(&hs.remote_static);
@@ -295,9 +295,9 @@ pub(crate) fn process_handshake_response(h: &Handler, data: &[u8]) -> Result<Pac
     crate::wg::crypto::kdf2(&mut t0, &mut t1, &hs.chain_key, &[]);
     send_key.copy_from_slice(&t0[..CHACHAPOLY_KEY_SIZE]);
     recv_key.copy_from_slice(&t1[..CHACHAPOLY_KEY_SIZE]);
-    t0.zeroize();
-    t1.zeroize();
-    k.zeroize();
+    zeroize(&mut t0);
+    zeroize(&mut t1);
+    zeroize(&mut k);
 
     let peer_key = hs.remote_static;
     let local_idx = hs.local_index;
@@ -437,8 +437,8 @@ pub(crate) fn process_handshake_initiation(
     crate::wg::crypto::kdf2(&mut t0, &mut t1, &hs.chain_key, &temp_ss);
     hs.chain_key = t0;
     k.copy_from_slice(&t1[..CHACHAPOLY_KEY_SIZE]);
-    temp_ss.zeroize();
-    t1.zeroize();
+    zeroize(&mut temp_ss);
+    zeroize(&mut t1);
 
     let enc_static = &data[INIT_OFF_STATIC..INIT_OFF_STATIC_END];
     let client_static = aead_open_zero(&k, enc_static, &hs.hash)
@@ -462,8 +462,8 @@ pub(crate) fn process_handshake_initiation(
     crate::wg::crypto::kdf2(&mut t0, &mut t1, &hs.chain_key, &temp_ss);
     hs.chain_key = t0;
     k.copy_from_slice(&t1[..CHACHAPOLY_KEY_SIZE]);
-    temp_ss.zeroize();
-    t1.zeroize();
+    zeroize(&mut temp_ss);
+    zeroize(&mut t1);
 
     // Decrypt timestamp; we don't enforce monotonicity yet (TODO).
     let enc_timestamp = &data[INIT_OFF_TIMESTAMP..INIT_OFF_TIMESTAMP_END];
@@ -506,13 +506,13 @@ pub(crate) fn process_handshake_initiation(
     let mut temp = x25519_dh(&hs.local_ephemeral, &hs.remote_ephemeral);
     let ck_save = hs.chain_key;
     mix_key(&mut hs.chain_key, &ck_save, &temp);
-    temp.zeroize();
+    zeroize(&mut temp);
 
     // se: local_eph * remote_static
     let mut temp = x25519_dh(&hs.local_ephemeral, &hs.remote_static);
     let ck_save = hs.chain_key;
     mix_key(&mut hs.chain_key, &ck_save, &temp);
-    temp.zeroize();
+    zeroize(&mut temp);
 
     // PSK.
     let psk = h.preshared_key(&hs.remote_static);
@@ -552,9 +552,9 @@ pub(crate) fn process_handshake_initiation(
     let mut send_key = [0u8; CHACHAPOLY_KEY_SIZE];
     recv_key.copy_from_slice(&t0[..CHACHAPOLY_KEY_SIZE]);
     send_key.copy_from_slice(&t1[..CHACHAPOLY_KEY_SIZE]);
-    t0.zeroize();
-    t1.zeroize();
-    k.zeroize();
+    zeroize(&mut t0);
+    zeroize(&mut t1);
+    zeroize(&mut k);
 
     hs.local_index = sender_idx_local;
     hs.state = HandshakeState::ResponseCreated;

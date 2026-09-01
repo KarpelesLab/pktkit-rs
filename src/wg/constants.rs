@@ -167,8 +167,7 @@ impl fmt::Debug for NoisePrivateKey {
 
 impl Drop for NoisePrivateKey {
     fn drop(&mut self) {
-        use zeroize::Zeroize;
-        self.0.zeroize();
+        crate::zeroize::zeroize(&mut self.0);
     }
 }
 
@@ -207,8 +206,7 @@ impl fmt::Debug for NoisePresharedKey {
 
 impl Drop for NoisePresharedKey {
     fn drop(&mut self) {
-        use zeroize::Zeroize;
-        self.0.zeroize();
+        crate::zeroize::zeroize(&mut self.0);
     }
 }
 

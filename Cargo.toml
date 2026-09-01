@@ -67,31 +67,24 @@ nat = ["vtcp"]
 
 # WireGuard tunnel (Noise IK handshake + transport).
 wg = [
-    "dep:curve25519-dalek",
-    "dep:chacha20poly1305",
-    "dep:blake2",
-    "dep:hmac",
-    "dep:zeroize",
-    "dep:rand_core",
-    "dep:getrandom",
+    "dep:purecrypto",
+    "purecrypto/hash",
+    "purecrypto/cipher",
+    "purecrypto/ec",
+    "purecrypto/rng",
 ]
 
 # OpenVPN server (TLS control channel + AES-CBC/GCM data channel).
 ovpn = [
-    "dep:aes",
-    "dep:aes-gcm",
-    "dep:cbc",
-    "dep:hmac",
-    "dep:sha1",
-    "dep:sha2",
-    "dep:rand_core",
-    "dep:getrandom",
-    # TLS for the OpenVPN control channel. The data channel still uses the
-    # RustCrypto primitives above (AES-CBC/GCM keyed via PRF 1.2). rustls is
-    # accepted here as an opt-in exception to the "minimal third-party" rule
-    # because hand-rolling TLS 1.2 + X.509 is not worth the risk.
-    "dep:rustls",
-    "dep:rustls-rustcrypto",
+    "dep:purecrypto",
+    "purecrypto/hash",
+    "purecrypto/cipher",
+    "purecrypto/kdf",
+    "purecrypto/rng",
+    # The control channel is TLS 1.2 run inside OpenVPN's own reliable
+    # transport, so it needs the sans-I/O TLS core plus X.509.
+    "purecrypto/tls",
+    "purecrypto/x509",
 ]
 
 # Exposes crate-internal parser entry points to the fuzz targets and the
@@ -122,27 +115,11 @@ full = [
 # libc is the only OS-FFI shim we use, gated behind features that need it.
 libc = { version = "0.2", optional = true }
 
-# Vetted RustCrypto crates, only pulled in by the crypto-using features.
-# We do not write our own primitives.
-curve25519-dalek    = { version = "4", optional = true, default-features = false, features = ["alloc", "zeroize"] }
-chacha20poly1305    = { version = "0.10", optional = true, default-features = false, features = ["alloc"] }
-aes                 = { version = "0.8", optional = true }
-aes-gcm             = { version = "0.10", optional = true, default-features = false, features = ["alloc", "aes"] }
-cbc                 = { version = "0.1", optional = true, features = ["alloc"] }
-blake2              = { version = "0.10", optional = true }
-sha1                = { version = "0.10", optional = true }
-sha2                = { version = "0.10", optional = true }
-hmac                = { version = "0.12", optional = true }
-zeroize             = { version = "1", optional = true, default-features = false, features = ["zeroize_derive"] }
-rand_core           = { version = "0.6", optional = true }
-getrandom           = { version = "0.2", optional = true }
-# TLS for OpenVPN's control channel only (ovpn feature). We deliberately
-# disable rustls's built-in crypto backends (no `ring`, no `aws-lc-rs` — both
-# vendor C/assembly and run a build script) and supply a pure-Rust provider
-# from rustls-rustcrypto, which is backed by the same RustCrypto primitives the
-# data channel already uses. TLS 1.2 is required (OpenVPN negotiates it).
-rustls              = { version = "0.23", optional = true, default-features = false, features = ["std", "tls12"] }
-rustls-rustcrypto   = { version = "=0.0.2-alpha", optional = true }
+# All cryptography comes from purecrypto: primitives, X.509 and TLS in one
+# pure-Rust tree with no foreign code and no build script. `default-features`
+# is off so a build pulls only the modules the enabled pktkit features name --
+# `wg` does not compile the TLS stack, and `ovpn` does not compile ML-DSA.
+purecrypto = { version = "0.7", optional = true, default-features = false, features = ["std", "linux-getrandom"] }
 
 [dev-dependencies]
 # Tests may exercise OS sockets; nothing extra needed beyond std.

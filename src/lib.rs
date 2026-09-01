@@ -69,6 +69,8 @@ mod pool;
 mod protocol;
 mod rand;
 mod stats;
+#[cfg(any(feature = "wg", feature = "ovpn"))]
+mod zeroize;
 
 pub use accept::{
     Cleanup, Done, DoneSignal, L2Acceptor, L2AcceptorWithDone, L2Connector, L3Connector, serve,
