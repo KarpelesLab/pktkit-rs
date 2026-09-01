@@ -16,13 +16,8 @@
 
 use std::io;
 
-use aes::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
-use aes_gcm::aead::AeadInPlace;
-use aes_gcm::{Aes128Gcm, Aes256Gcm, KeyInit};
-use cbc::{Decryptor, Encryptor};
-use hmac::{Mac, SimpleHmac};
-use sha1::Sha1;
-use sha2::{Sha224, Sha256};
+use purecrypto::cipher::{Aes128, Aes128Gcm, Aes256, Aes256Gcm, Cbc};
+use purecrypto::hash::{Hmac, Mac, Sha1, Sha224, Sha256};
 
 use super::consts::OPENVPN_PING;
 use super::keys::PeerKeys;
@@ -165,22 +160,16 @@ fn gcm_seal_in_place(
     ad: &[u8],
     buf: &mut [u8],
 ) -> io::Result<[u8; GCM_TAG]> {
-    let nonce = aes_gcm::Nonce::from_slice(nonce);
-    let tag = match key.len() {
-        16 => {
-            let c = Aes128Gcm::new_from_slice(key).map_err(|_| invalid("bad gcm key"))?;
-            c.encrypt_in_place_detached(nonce, ad, buf)
-        }
-        32 => {
-            let c = Aes256Gcm::new_from_slice(key).map_err(|_| invalid("bad gcm key"))?;
-            c.encrypt_in_place_detached(nonce, ad, buf)
-        }
+    Ok(match key.len() {
+        16 => Aes128Gcm::new(Aes128::new(&fixed::<16>(key)?)).encrypt(nonce, ad, buf),
+        32 => Aes256Gcm::new(Aes256::new(&fixed::<32>(key)?)).encrypt(nonce, ad, buf),
         _ => return Err(invalid("unsupported AES-GCM key size")),
-    }
-    .map_err(|_| invalid("gcm seal failed"))?;
-    let mut out = [0u8; GCM_TAG];
-    out.copy_from_slice(&tag);
-    Ok(out)
+    })
+}
+
+/// Copy a key slice into a fixed-size array, or report a bad length.
+fn fixed<const N: usize>(key: &[u8]) -> io::Result<[u8; N]> {
+    key.try_into().map_err(|_| invalid("bad key length"))
 }
 
 /// Open `ct` in place against `tag`; on success `ct[..return]` is the plaintext.
@@ -191,18 +180,10 @@ fn gcm_open_in_place(
     tag: &[u8; GCM_TAG],
     ct: &mut [u8],
 ) -> io::Result<usize> {
-    let nonce = aes_gcm::Nonce::from_slice(nonce);
-    let tag = aes_gcm::Tag::from_slice(tag);
     let len = ct.len();
     match key.len() {
-        16 => {
-            let c = Aes128Gcm::new_from_slice(key).map_err(|_| invalid("bad gcm key"))?;
-            c.decrypt_in_place_detached(nonce, ad, ct, tag)
-        }
-        32 => {
-            let c = Aes256Gcm::new_from_slice(key).map_err(|_| invalid("bad gcm key"))?;
-            c.decrypt_in_place_detached(nonce, ad, ct, tag)
-        }
+        16 => Aes128Gcm::new(Aes128::new(&fixed::<16>(key)?)).decrypt(nonce, ad, ct, tag),
+        32 => Aes256Gcm::new(Aes256::new(&fixed::<32>(key)?)).decrypt(nonce, ad, ct, tag),
         _ => return Err(invalid("unsupported AES-GCM key size")),
     }
     .map_err(|_| invalid("gcm auth failure"))?;
@@ -210,11 +191,6 @@ fn gcm_open_in_place(
 }
 
 // --- CBC + HMAC -------------------------------------------------------------
-
-type Aes128CbcEnc = Encryptor<aes::Aes128>;
-type Aes128CbcDec = Decryptor<aes::Aes128>;
-type Aes256CbcEnc = Encryptor<aes::Aes256>;
-type Aes256CbcDec = Decryptor<aes::Aes256>;
 
 fn encrypt_cbc(
     opts: &Options,
@@ -320,65 +296,39 @@ fn decrypt_cbc<'a>(
 
 fn cbc_encrypt(key: &[u8], iv: &[u8; 16], buf: &mut [u8]) -> io::Result<()> {
     match key.len() {
-        16 => {
-            Aes128CbcEnc::new_from_slices(key, iv)
-                .map_err(|_| invalid("bad cbc key/iv"))?
-                .encrypt_blocks_mut(as_blocks_mut(buf));
-        }
-        32 => {
-            Aes256CbcEnc::new_from_slices(key, iv)
-                .map_err(|_| invalid("bad cbc key/iv"))?
-                .encrypt_blocks_mut(as_blocks_mut(buf));
-        }
+        16 => Cbc::new(Aes128::new(&fixed::<16>(key)?), iv).encrypt(buf),
+        32 => Cbc::new(Aes256::new(&fixed::<32>(key)?), iv).encrypt(buf),
         _ => return Err(invalid("unsupported AES-CBC key size")),
     }
-    Ok(())
+    .map_err(|_| invalid("CBC input is not a whole number of blocks"))
 }
 
 fn cbc_decrypt(key: &[u8], iv: &[u8; 16], buf: &mut [u8]) -> io::Result<()> {
     match key.len() {
-        16 => {
-            Aes128CbcDec::new_from_slices(key, iv)
-                .map_err(|_| invalid("bad cbc key/iv"))?
-                .decrypt_blocks_mut(as_blocks_mut(buf));
-        }
-        32 => {
-            Aes256CbcDec::new_from_slices(key, iv)
-                .map_err(|_| invalid("bad cbc key/iv"))?
-                .decrypt_blocks_mut(as_blocks_mut(buf));
-        }
+        16 => Cbc::new(Aes128::new(&fixed::<16>(key)?), iv).decrypt(buf),
+        32 => Cbc::new(Aes256::new(&fixed::<32>(key)?), iv).decrypt(buf),
         _ => return Err(invalid("unsupported AES-CBC key size")),
     }
-    Ok(())
-}
-
-fn as_blocks_mut(
-    buf: &mut [u8],
-) -> &mut [aes::cipher::generic_array::GenericArray<u8, aes::cipher::consts::U16>] {
-    use aes::cipher::generic_array::GenericArray;
-    let n = buf.len() / 16;
-    // SAFETY: GenericArray<u8, U16> is repr(transparent) over [u8; 16]; buf is
-    // a multiple of 16 (checked by callers).
-    unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut GenericArray<u8, _>, n) }
+    .map_err(|_| invalid("CBC input is not a whole number of blocks"))
 }
 
 fn hmac_compute(auth: AuthHash, key: &[u8], data: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
     match auth {
         AuthHash::Sha1 => {
-            let mut m = <SimpleHmac<Sha1> as Mac>::new_from_slice(key).expect("hmac key");
+            let mut m = Hmac::<Sha1>::new(key);
             m.update(data);
-            out[..20].copy_from_slice(&m.finalize().into_bytes());
+            m.finalize_into(&mut out[..20]);
         }
         AuthHash::Sha224 => {
-            let mut m = <SimpleHmac<Sha224> as Mac>::new_from_slice(key).expect("hmac key");
+            let mut m = Hmac::<Sha224>::new(key);
             m.update(data);
-            out[..28].copy_from_slice(&m.finalize().into_bytes());
+            m.finalize_into(&mut out[..28]);
         }
         AuthHash::Sha256 => {
-            let mut m = <SimpleHmac<Sha256> as Mac>::new_from_slice(key).expect("hmac key");
+            let mut m = Hmac::<Sha256>::new(key);
             m.update(data);
-            out[..32].copy_from_slice(&m.finalize().into_bytes());
+            m.finalize_into(&mut out[..32]);
         }
         AuthHash::None => {}
     }

@@ -1,8 +1,9 @@
 # cargo-deny configuration.
 #
 # The crate's dependency policy is part of what it offers: std, `libc` for OS
-# FFI, vetted RustCrypto primitives, and rustls for OpenVPN's control channel.
-# This file is where that policy is enforced instead of just documented.
+# FFI, and `purecrypto` for every piece of cryptography. That is the whole
+# tree -- two direct dependencies, no transitive ones. This file is where the
+# policy is enforced instead of just documented.
 
 [graph]
 all-features = true
@@ -22,28 +23,22 @@ yanked = "deny"
 # Permissive licences only. Anything copyleft would change what a dependent
 # takes on by using this crate, so it needs a deliberate decision, not a
 # silent transitive addition.
-allow = [
-    "MIT",
-    "Apache-2.0",
-    "Apache-2.0 WITH LLVM-exception",
-    "BSD-2-Clause",
-    "BSD-3-Clause",
-    "ISC",
-    "Unicode-3.0",
-    "Zlib",
-]
+# Only what the tree actually uses, so that a new licence has to be added
+# here deliberately rather than slipping in under a broad allowance.
+allow = ["MIT", "Apache-2.0"]
 confidence-threshold = 0.9
 
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
-# Crypto backends that vendor C or assembly and run a build script. The `ovpn`
-# feature deliberately uses a pure-Rust rustls provider instead; if one of
-# these appears it means a default feature slipped back on somewhere.
+# Crypto that vendors C or assembly, or runs a build script. All cryptography
+# comes from purecrypto; if one of these appears, something pulled in a second
+# implementation behind our back.
 deny = [
-    { crate = "ring", reason = "vendors C and assembly; ovpn uses rustls-rustcrypto" },
-    { crate = "aws-lc-rs", reason = "vendors C; ovpn uses rustls-rustcrypto" },
+    { crate = "ring", reason = "vendors C and assembly; pktkit uses purecrypto" },
+    { crate = "aws-lc-rs", reason = "vendors C; pktkit uses purecrypto" },
     { crate = "openssl-sys", reason = "pktkit links no native TLS" },
+    { crate = "rustls", reason = "the OpenVPN control channel uses purecrypto's TLS" },
 ]
 
 [sources]

@@ -10,8 +10,10 @@ its idioms into Rust idioms without bloating the dependency footprint.
   separate crate. The default build pulls in zero dependencies.
 - Each feature module lives at `src/<feature>.rs` (single file) or
   `src/<feature>/mod.rs` + submodules.
-- Feature is declared in `Cargo.toml`. Crypto features pull in vetted
-  RustCrypto crates; nothing else is acceptable except `libc` (for OS FFI).
+- Feature is declared in `Cargo.toml`. All cryptography comes from
+  `purecrypto`; nothing else is acceptable except `libc` (for OS FFI). The
+  whole dependency tree is those two crates, with no transitive dependencies,
+  and `cargo-deny` enforces it.
 - Pub re-exports for the feature go in `src/lib.rs` under the `#[cfg(feature = "...")]` block.
 
 ## Type conventions
@@ -75,7 +77,7 @@ its idioms into Rust idioms without bloating the dependency footprint.
 | `chan struct{}`                   | `Arc<(Mutex<bool>, Condvar)>` or `AtomicBool`       |
 | `time.Duration`                   | `std::time::Duration`                               |
 | `time.Now()`                      | `std::time::Instant::now()`                         |
-| `crypto/rand.Read`                | `getrandom` or `rand_core::OsRng` (gated features)  |
+| `crypto/rand.Read`                | `purecrypto::rng::OsRng` (gated features)            |
 | `math/rand.Uint32`                | `crate::rand::u32()` (non-crypto)                   |
 | `net.IP`                          | `std::net::IpAddr`                                  |
 | `netip.Prefix`                    | `crate::IpPrefix`                                   |
@@ -105,8 +107,11 @@ its idioms into Rust idioms without bloating the dependency footprint.
   with a hand-rolled HTTP/1.1 parser.
 - **nat**: connection-tracking table keyed by 5-tuple. ALGs are independent
   stateless transforms applied at packet boundaries.
-- **wg**: Noise IK handshake — use `x25519-dalek`, `chacha20poly1305`,
-  `blake2`, `hmac`, `sha2`. Don't roll your own primitives.
-- **ovpn**: hardest. Has a full TLS 1.2 handshake. If you have to choose
-  between completeness and a working subset, ship the subset and document
-  what isn't there.
+- **wg**: Noise IK handshake — X25519, ChaCha20-Poly1305, BLAKE2s and HMAC
+  all come from `purecrypto`. Don't roll your own primitives. Changes here
+  must keep the RFC 7748 / RFC 7693 known-answer tests passing: a
+  self-consistent round-trip proves nothing about interoperability.
+- **ovpn**: hardest. Has a full TLS 1.2 handshake, run over OpenVPN's own
+  reliable transport via `purecrypto::tls::Connection` (sans-I/O: `feed` /
+  `pop` / `send` / `recv`). The TLS config is supplied by the caller and needs
+  both an identity and an explicit `.rng(...)` entropy source.

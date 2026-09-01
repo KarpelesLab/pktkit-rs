@@ -1,18 +1,15 @@
 //! End-to-end control-channel test.
 //!
-//! Drives a `rustls::ClientConnection` against our [`Peer`] (server) entirely
+//! Drives a purecrypto TLS client against our [`Peer`] (server) entirely
 //! through the OpenVPN reliable layer — there is no socket; datagrams are
 //! passed between the two sides in-memory. This exercises the full happy path:
 //! client hard reset → TLS 1.2 handshake (over P_CONTROL packets) → key-method
 //! 2 exchange → data-channel key derivation → an AES-256-GCM data roundtrip in
 //! both directions.
 
-use std::io::{Read, Write};
 use std::sync::Arc;
 
-use rustls::ClientConnection;
-use rustls::pki_types::pem::PemObject;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use purecrypto::tls::{Config as TlsConfig, Connection as TlsConnection, ProtocolVersion};
 
 use super::data;
 use super::keys::PeerKeys;
@@ -20,7 +17,6 @@ use super::options::Options;
 use super::peer::{AuthInfo, OnAuth, Peer, PeerConfig};
 use super::prf::prf10;
 use super::reliable::Reliable;
-use super::server::install_crypto_provider;
 use super::{CipherBlockMethod, CipherCryptoAlg};
 
 const TEST_CERT: &str = "-----BEGIN CERTIFICATE-----
@@ -74,88 +70,51 @@ hTUd0ADAoahUGAiz1Wal4L0=
 -----END PRIVATE KEY-----
 ";
 
-fn server_config() -> Arc<rustls::ServerConfig> {
-    let cert = CertificateDer::from_pem_slice(TEST_CERT.as_bytes()).unwrap();
-    let key = PrivateKeyDer::from_pem_slice(TEST_KEY.as_bytes()).unwrap();
+/// Decode a PEM block into DER.
+fn der(pem: &str, label: &str) -> Vec<u8> {
+    purecrypto::der::pem_decode(pem, label).expect("PEM decodes")
+}
+
+fn server_config() -> Arc<TlsConfig> {
+    let chain = vec![der(TEST_CERT, "CERTIFICATE")];
+    let key = purecrypto::rsa::BoxedRsaPrivateKey::from_pkcs8_der(&der(TEST_KEY, "PRIVATE KEY"))
+        .expect("test key parses");
     Arc::new(
-        rustls::ServerConfig::builder_with_provider(super::server::crypto_provider())
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .with_no_client_auth()
-            .with_single_cert(vec![cert], key)
-            .unwrap(),
+        TlsConfig::builder()
+            // OpenVPN's control channel is TLS 1.2; pin it so the test drives
+            // the same engine the protocol actually uses.
+            .versions(ProtocolVersion::TLSv1_2, ProtocolVersion::TLSv1_2)
+            .rng(Arc::new(purecrypto::rng::OsRng))
+            .identity(chain, purecrypto::tls::SigningKey::Rsa(key))
+            .build(),
     )
 }
 
-// A client that accepts any server certificate (OpenVPN's verify is out of
-// scope for this control-channel test).
-#[derive(Debug)]
-struct NoVerify;
-impl rustls::client::danger::ServerCertVerifier for NoVerify {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        use rustls::SignatureScheme::*;
-        vec![
-            RSA_PKCS1_SHA256,
-            RSA_PKCS1_SHA384,
-            RSA_PKCS1_SHA512,
-            RSA_PSS_SHA256,
-            RSA_PSS_SHA384,
-            RSA_PSS_SHA512,
-            ECDSA_NISTP256_SHA256,
-            ECDSA_NISTP384_SHA384,
-        ]
-    }
-}
-
-fn client_config() -> Arc<rustls::ClientConfig> {
-    let cfg = rustls::ClientConfig::builder_with_provider(super::server::crypto_provider())
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoVerify))
-        .with_no_client_auth();
-    Arc::new(cfg)
+fn client_config() -> Arc<TlsConfig> {
+    Arc::new(
+        TlsConfig::builder()
+            .versions(ProtocolVersion::TLSv1_2, ProtocolVersion::TLSv1_2)
+            .rng(Arc::new(purecrypto::rng::OsRng))
+            .server_name("ovpn-test")
+            // The test certificate is self-signed and there is no trust anchor
+            // to check it against; this test is about the OpenVPN plumbing, not
+            // about X.509 validation.
+            .verify_certificates(false)
+            .build(),
+    )
 }
 
 /// A minimal OpenVPN client that mirrors the server's reliable+TLS plumbing,
 /// used only to drive the e2e test.
 struct TestClient {
-    tls: ClientConnection,
+    tls: TlsConnection,
     reliable: Reliable,
     ctrl_buf: Vec<u8>,
 }
 
 impl TestClient {
     fn new(local_id: [u8; 8]) -> TestClient {
-        let tls =
-            ClientConnection::new(client_config(), ServerName::try_from("ovpn-test").unwrap())
-                .unwrap();
+        let tls = TlsConnection::client(&client_config()).unwrap();
         TestClient {
             tls,
             reliable: Reliable::new(local_id),
@@ -179,17 +138,21 @@ impl TestClient {
         }
 
         if !recv.tls_bytes.is_empty() {
-            let mut cursor = std::io::Cursor::new(&recv.tls_bytes);
-            while (cursor.position() as usize) < recv.tls_bytes.len() {
-                let n = self.tls.read_tls(&mut cursor).unwrap();
+            let mut fed = 0usize;
+            while fed < recv.tls_bytes.len() {
+                let n = self.tls.feed(&recv.tls_bytes[fed..]).unwrap();
                 if n == 0 {
                     break;
                 }
-                self.tls.process_new_packets().unwrap();
+                fed += n;
             }
-            let mut plain = Vec::new();
-            let _ = self.tls.reader().read_to_end(&mut plain);
-            self.ctrl_buf.extend_from_slice(&plain);
+            loop {
+                match self.tls.recv() {
+                    Ok(plain) if plain.is_empty() => break,
+                    Ok(plain) => self.ctrl_buf.extend_from_slice(&plain),
+                    Err(_) => break,
+                }
+            }
         }
 
         self.pump_tls(&mut send);
@@ -198,10 +161,11 @@ impl TestClient {
 
     fn pump_tls(&mut self, send: &mut Vec<Vec<u8>>) {
         let mut tls_out = Vec::new();
-        while self.tls.wants_write() {
-            let n = self.tls.write_tls(&mut tls_out).unwrap();
-            if n == 0 {
-                break;
+        loop {
+            match self.tls.pop() {
+                Ok(chunk) if chunk.is_empty() => break,
+                Ok(chunk) => tls_out.extend_from_slice(&chunk),
+                Err(e) => panic!("client tls pop: {e:?}"),
             }
         }
         if !tls_out.is_empty() {
@@ -223,14 +187,12 @@ impl TestClient {
     }
 
     fn handshake_done(&self) -> bool {
-        !self.tls.is_handshaking()
+        self.tls.is_handshake_complete()
     }
 }
 
 #[test]
 fn e2e_tls_handshake_and_key_exchange() {
-    install_crypto_provider();
-
     let mut server = Peer::new(server_config(), *b"SERVERID", auth_hook()).unwrap();
     let mut client = TestClient::new(*b"CLIENTID");
 
@@ -363,8 +325,6 @@ fn retransmit_fires_when_ack_withheld() {
     use super::reliable::RETRANSMIT_INITIAL;
     use std::time::{Duration, Instant};
 
-    install_crypto_provider();
-
     let mut server = Peer::new(server_config(), *b"SERVERID", auth_hook()).unwrap();
     let mut client = TestClient::new(*b"CLIENTID");
 
@@ -473,7 +433,7 @@ fn send_client_key_material(client: &mut TestClient) -> ([u8; 48], [u8; 32], [u8
     write_ctrl_string(&mut blob, ""); // password
     write_ctrl_string(&mut blob, "IV_VER=2.6\n"); // peer info
 
-    client.tls.writer().write_all(&blob).unwrap();
+    client.tls.send(&blob).unwrap();
     (pre_master, random1, random2)
 }
 

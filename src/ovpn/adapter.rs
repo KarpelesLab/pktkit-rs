@@ -43,8 +43,8 @@ impl std::fmt::Debug for Connector {
 
 /// Configuration for an [`Adapter`].
 pub struct AdapterConfig {
-    /// rustls server config (cert + key).
-    pub tls_config: Arc<rustls::ServerConfig>,
+    /// TLS config for the control channel (identity: cert chain + key).
+    pub tls_config: Arc<purecrypto::tls::Config>,
     /// Listen address (UDP + TCP).
     pub listen_addr: SocketAddr,
     /// Connector wiring per-peer devices to the network.

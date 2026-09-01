@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Once, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 
 use super::addr::{PeerKey, Transport};
@@ -35,8 +35,23 @@ pub type OnDisconnect = Arc<dyn Fn(PeerKey) + Send + Sync>;
 /// Server configuration.
 #[derive(Clone)]
 pub struct ServerConfig {
-    /// rustls server configuration (must carry a certificate + key).
-    pub tls_config: Arc<rustls::ServerConfig>,
+    /// TLS configuration for the control channel.
+    ///
+    /// Must carry an identity (certificate chain + signing key) and an entropy
+    /// source, since this is the server side and the TLS core is sans-I/O:
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use purecrypto::tls::{Config, ProtocolVersion, SigningKey};
+    /// # fn build(chain: Vec<Vec<u8>>, key: SigningKey) -> Config {
+    /// Config::builder()
+    ///     .versions(ProtocolVersion::TLSv1_2, ProtocolVersion::TLSv1_2)
+    ///     .rng(Arc::new(purecrypto::rng::OsRng))
+    ///     .identity(chain, key)
+    ///     .build()
+    /// # }
+    /// ```
+    pub tls_config: Arc<purecrypto::tls::Config>,
     /// Address to listen on (both UDP and TCP), e.g. `0.0.0.0:1194`.
     pub listen_addr: SocketAddr,
     /// Authentication hook.
@@ -55,26 +70,6 @@ impl std::fmt::Debug for ServerConfig {
             .field("listen_addr", &self.listen_addr)
             .finish()
     }
-}
-
-static PROVIDER_INIT: Once = Once::new();
-
-/// Install the pure-Rust RustCrypto crypto provider for rustls as the
-/// process-wide default, exactly once. Safe to call from anywhere; subsequent
-/// calls (and a provider already installed elsewhere) are no-ops.
-pub fn install_crypto_provider() {
-    PROVIDER_INIT.call_once(|| {
-        // Ignore the error: if a provider is already installed, that's fine.
-        let _ = rustls_rustcrypto::provider().install_default();
-    });
-}
-
-/// The pure-Rust RustCrypto [`CryptoProvider`](rustls::crypto::CryptoProvider)
-/// used for the OpenVPN control channel. Pass it to
-/// `rustls::ServerConfig::builder_with_provider` so config construction does
-/// not depend on the process-wide default being installed first.
-pub fn crypto_provider() -> std::sync::Arc<rustls::crypto::CryptoProvider> {
-    std::sync::Arc::new(rustls_rustcrypto::provider())
 }
 
 struct PeerEntry {
@@ -106,8 +101,6 @@ impl std::fmt::Debug for Server {
 impl Server {
     /// Bind the UDP and TCP listeners and start the accept/read loops.
     pub fn new(cfg: ServerConfig) -> io::Result<Arc<Server>> {
-        install_crypto_provider();
-
         let udp = Arc::new(UdpSocket::bind(cfg.listen_addr)?);
         let tcp = TcpListener::bind(cfg.listen_addr)?;
 

@@ -74,20 +74,19 @@ with no analogue elsewhere, so those two modules are simply absent off Linux;
 `pktkit` depends on:
 
 - the Rust standard library
-- `libc` (only when `tuntap`, `xdp` or `afxdp` is enabled)
-- RustCrypto primitive crates (`chacha20poly1305`, `aes-gcm`, `curve25519-dalek`,
-  `sha2`, `hmac`, `blake2`, `rsa`, …) — only when the relevant tunnel feature is
-  enabled. We do not roll our own crypto.
-- `rustls` for OpenVPN's control-channel TLS (only when `ovpn` is enabled),
-  configured with a **pure-Rust** crypto provider (`rustls-rustcrypto`, backed
-  by the same RustCrypto crates) — no `ring`, no `aws-lc-rs`, no vendored
-  C/assembly, and no compile-time build script.
+- `libc` (only when `tuntap`, `afpacket`, `xdp` or `afxdp` is enabled)
+- [`purecrypto`](https://crates.io/crates/purecrypto) for every piece of
+  cryptography — primitives, X.509 and the TLS 1.2 control channel — only when
+  `wg` or `ovpn` is enabled. We do not roll our own crypto.
 
-Nothing else. No async runtime. No framework. No native code beyond `libc`.
-The default build pulls in zero dependencies, and so do the `pcap` and `impair`
-features. The policy is enforced in CI by `cargo-deny` rather than just stated:
-`ring`, `aws-lc-rs` and `openssl-sys` are banned outright, so a dependency
-cannot quietly pull a vendored C crypto backend back in.
+That is the entire tree. Two direct dependencies, **no transitive ones**, no
+vendored C or assembly, and no build scripts.
+
+No async runtime. No framework. No native code beyond `libc`. The default
+build pulls in zero dependencies, and so do the `pcap` and `impair` features.
+The policy is enforced in CI by `cargo-deny` rather than just stated: `ring`,
+`aws-lc-rs`, `openssl-sys` and `rustls` are banned outright, so a second crypto
+implementation cannot slip back in behind a default feature.
 
 ## Requirements
 

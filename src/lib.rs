@@ -69,7 +69,7 @@ mod pool;
 mod protocol;
 mod rand;
 mod stats;
-#[cfg(any(feature = "wg", feature = "ovpn"))]
+#[cfg(feature = "wg")]
 mod zeroize;
 
 pub use accept::{

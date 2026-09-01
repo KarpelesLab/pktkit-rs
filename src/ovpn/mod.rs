@@ -45,6 +45,4 @@ pub use consts::{AES, CBC, CipherBlockMethod, CipherCryptoAlg, GCM};
 pub use opcode::Opcode;
 pub use options::Options;
 pub use peer::{AuthInfo, OnAuth, Peer, PeerConfig, PeerOutput};
-pub use server::{
-    OnConnect, OnData, OnDisconnect, Server, ServerConfig, crypto_provider, install_crypto_provider,
-};
+pub use server::{OnConnect, OnData, OnDisconnect, Server, ServerConfig};

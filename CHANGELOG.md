@@ -6,7 +6,55 @@ semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+### Changed (breaking)
+
+- **All cryptography now comes from [`purecrypto`](https://crates.io/crates/purecrypto).**
+  `curve25519-dalek`, `chacha20poly1305`, `blake2`, `aes`, `aes-gcm`, `cbc`,
+  `sha1`, `sha2`, `hmac`, `zeroize`, `rand_core`, `getrandom`, `rustls`,
+  `rustls-rustcrypto`, `rsa` and `rustls-pemfile` are all gone. The crate's
+  entire dependency tree is now `libc` and `purecrypto`, with **no transitive
+  dependencies at all** — down from around forty packages.
+- `ovpn::ServerConfig::tls_config` and `ovpn::AdapterConfig::tls_config` are
+  now `Arc<purecrypto::tls::Config>` instead of `Arc<rustls::ServerConfig>`.
+  The config must carry an identity *and* an explicit `.rng(...)` entropy
+  source: purecrypto's TLS core is sans-I/O, so it takes entropy as an input
+  rather than reaching for a global.
+- `ovpn::install_crypto_provider` and `ovpn::crypto_provider` are removed.
+  They existed only to manage rustls's process-wide provider, which
+  purecrypto has no equivalent of.
+- **Edition 2024, MSRV 1.88**, which is what purecrypto requires.
+
 ### Added
+
+- Known-answer tests for the WireGuard primitives: X25519 against RFC 7748
+  §5.2 and §6.1, BLAKE2s-256 against RFC 7693, MixHash against `h || data`,
+  the MAC1/cookie keys against `Blake2s256(label || Spub)`, and the
+  data-channel nonce layout. Every previous test here was a self-consistency
+  round-trip, which passes just as happily against a subtly wrong primitive
+  and only fails when talking to a real peer.
+
+### Removed
+
+- The hand-rolled MD5 and HMAC in `ovpn/prf.rs` — about 250 lines of
+  hand-written crypto — now that `purecrypto` supplies both. MD5 was only
+  hand-written because none of the RustCrypto crates the `ovpn` feature
+  pulled in happened to provide it.
+- The `unsafe` block-slice transmute in `ovpn/data.rs`: purecrypto's CBC
+  takes `&mut [u8]`, so there is nothing to reinterpret.
+
+### Fixed
+
+- All six `cargo-deny` advisories, by removing the dependencies that carried
+  them rather than by annotating around them: four in an outdated
+  `rustls-webpki` (RUSTSEC-2026-0049/0098/0099/0104), the `rsa` Marvin timing
+  sidechannel (RUSTSEC-2023-0071), and unmaintained `paste`
+  (RUSTSEC-2024-0436). `rustls-pemfile` (RUSTSEC-2025-0134) went earlier, as
+  a declared-but-unused dependency.
+- `aead_seal_in_place` no longer allocates. purecrypto's AEAD uses a detached
+  tag, so the plaintext is encrypted directly in the caller's buffer instead
+  of via a temporary `Vec`.
+
+### Added — packet toolkit
 
 - **L4 wire types** (`l4` module, re-exported at the root): `TcpSegment`,
   `UdpDatagram` and `IcmpMessage` as `#[repr(transparent)]` views, plus

@@ -4,7 +4,7 @@
 //!
 //! 1. **Hard reset** — the client's `P_CONTROL_HARD_RESET_CLIENT_V2` sets the
 //!    peer session id; we reply with our own server hard reset.
-//! 2. **TLS handshake** — a `rustls::ServerConnection` runs *inside* the
+//! 2. **TLS handshake** — a purecrypto TLS server connection runs *inside* the
 //!    reliable control channel. We feed it the TLS bytes carried by
 //!    `P_CONTROL_V1` packets (`read_tls` + `process_new_packets`) and pump its
 //!    output back out as more `P_CONTROL_V1` packets (`write_tls`). There is no
@@ -22,10 +22,10 @@
 //! Rust port is single-threaded and event-driven — each inbound datagram is
 //! processed synchronously and any work that can make progress does so.
 
-use std::io::{self, Read, Write};
+use std::io;
 use std::sync::Arc;
 
-use rustls::ServerConnection;
+use purecrypto::tls::Connection as TlsConnection;
 
 use super::Opcode;
 use super::consts::{KEY_EXPANSION_ID, KEY_METHOD_MASK};
@@ -93,7 +93,7 @@ enum Phase {
 
 /// One OpenVPN peer.
 pub struct Peer {
-    tls: ServerConnection,
+    tls: TlsConnection,
     reliable: Reliable,
     phase: Phase,
 
@@ -130,16 +130,16 @@ impl std::fmt::Debug for Peer {
 }
 
 impl Peer {
-    /// Create a peer with the given rustls config, local session id, and auth
+    /// Create a peer with the given TLS config, local session id, and auth
     /// hook. The local session id is typically random; the server uses it to
     /// identify reliable-layer packets.
     pub fn new(
-        config: Arc<rustls::ServerConfig>,
+        config: Arc<purecrypto::tls::Config>,
         local_id: [u8; 8],
         on_auth: OnAuth,
     ) -> io::Result<Peer> {
-        let tls = ServerConnection::new(config)
-            .map_err(|e| invalid(format!("rustls server connection: {e}")))?;
+        let tls = TlsConnection::server(&config)
+            .map_err(|e| invalid(format!("TLS server connection: {e:?}")))?;
         Ok(Peer {
             tls,
             reliable: Reliable::new(local_id),
@@ -219,27 +219,29 @@ impl Peer {
             return Ok(out);
         }
 
-        // Feed any newly-ordered TLS bytes into rustls.
+        // Feed any newly-ordered TLS bytes into the TLS engine.
         if !recv.tls_bytes.is_empty() {
-            let mut cursor = io::Cursor::new(&recv.tls_bytes);
-            while (cursor.position() as usize) < recv.tls_bytes.len() {
+            let mut fed = 0usize;
+            while fed < recv.tls_bytes.len() {
                 let n = self
                     .tls
-                    .read_tls(&mut cursor)
-                    .map_err(|e| invalid(format!("read_tls: {e}")))?;
+                    .feed(&recv.tls_bytes[fed..])
+                    .map_err(|e| invalid(format!("tls feed: {e:?}")))?;
                 if n == 0 {
                     break;
                 }
-                self.tls
-                    .process_new_packets()
-                    .map_err(|e| invalid(format!("tls process: {e}")))?;
+                fed += n;
             }
 
-            // Drain decrypted plaintext into the control buffer.
-            let mut plain = Vec::new();
-            let _ = self.tls.reader().read_to_end(&mut plain);
-            if !plain.is_empty() {
-                self.ctrl_buf.extend_from_slice(&plain);
+            // Drain decrypted plaintext into the control buffer. `recv` yields
+            // one record's worth at a time and reports an empty vec when there
+            // is nothing more to hand over.
+            loop {
+                match self.tls.recv() {
+                    Ok(plain) if plain.is_empty() => break,
+                    Ok(plain) => self.ctrl_buf.extend_from_slice(&plain),
+                    Err(_) => break,
+                }
             }
 
             // Try to advance the key-method-2 exchange / push handling.
@@ -260,13 +262,11 @@ impl Peer {
     /// ACK if we owe acknowledgements but produced no control packet to ride on.
     fn pump_tls(&mut self, out: &mut PeerOutput) -> io::Result<()> {
         let mut tls_out = Vec::new();
-        while self.tls.wants_write() {
-            let n = self
-                .tls
-                .write_tls(&mut tls_out)
-                .map_err(|e| invalid(format!("write_tls: {e}")))?;
-            if n == 0 {
-                break;
+        loop {
+            match self.tls.pop() {
+                Ok(chunk) if chunk.is_empty() => break,
+                Ok(chunk) => tls_out.extend_from_slice(&chunk),
+                Err(e) => return Err(invalid(format!("tls pop: {e:?}"))),
             }
         }
 
@@ -315,9 +315,8 @@ impl Peer {
         // Build the server reply onto the TLS stream.
         let reply = self.build_kx_reply(&parsed)?;
         self.tls
-            .writer()
-            .write_all(&reply)
-            .map_err(|e| invalid(format!("tls write reply: {e}")))?;
+            .send(&reply)
+            .map_err(|e| invalid(format!("tls write reply: {e:?}")))?;
 
         // Derive the data-channel keys.
         self.derive_keys(&parsed)?;
@@ -370,9 +369,8 @@ impl Peer {
             if verb == "PUSH_REQUEST" {
                 let reply = self.build_push_reply();
                 self.tls
-                    .writer()
-                    .write_all(reply.as_bytes())
-                    .map_err(|e| invalid(format!("tls push reply: {e}")))?;
+                    .send(reply.as_bytes())
+                    .map_err(|e| invalid(format!("tls push reply: {e:?}")))?;
             }
         }
         Ok(())
@@ -619,7 +617,8 @@ fn parse_peer_info(raw: &str) -> io::Result<std::collections::HashMap<String, St
 
 /// Cryptographic randomness for IVs and session material.
 pub(crate) fn fill_random(buf: &mut [u8]) -> io::Result<()> {
-    getrandom::getrandom(buf).map_err(|e| io::Error::other(format!("getrandom: {e}")))
+    purecrypto::rng::RngCore::fill_bytes(&mut purecrypto::rng::OsRng, buf);
+    Ok(())
 }
 
 #[cfg(test)]
