@@ -45,7 +45,8 @@ re-cast into idiomatic Rust:
 | `dhcp`       | DHCP client codec + `DHCPServer` (DISCOVER/OFFER/REQUEST/ACK/…)               |
 | `qemu`       | QEMU userspace network socket protocol (listener + dialer)                    |
 | `tuntap`     | TUN/TAP devices on Linux and macOS                                            |
-| `afxdp`      | Linux AF_XDP zero-copy sockets                                                |
+| `xdp`        | Linux XDP: load/attach eBPF on a device's RX path, capture chosen IP prefixes |
+| `afxdp`      | Linux AF_XDP zero-copy sockets (builds on `xdp`)                             |
 | `vtcp`       | Pure-Rust TCP engine (congestion, SACK, timestamps, window scaling, SYN cookies) |
 | `slirp`      | Userspace NAT stack routing virtual traffic to real sockets                    |
 | `vclient`    | High-level virtual client: `dial`, `listen`, DNS, minimal HTTP                |
@@ -59,7 +60,7 @@ re-cast into idiomatic Rust:
 `pktkit` depends on:
 
 - the Rust standard library
-- `libc` (only when `tuntap` or `afxdp` is enabled)
+- `libc` (only when `tuntap`, `xdp` or `afxdp` is enabled)
 - RustCrypto primitive crates (`chacha20poly1305`, `aes-gcm`, `curve25519-dalek`,
   `sha2`, `hmac`, `blake2`, `rsa`, …) — only when the relevant tunnel feature is
   enabled. We do not roll our own crypto.
@@ -174,6 +175,42 @@ let hub = Arc::new(L2Hub::new());
 serve(&listener, &hub)?;  // accept loop: each VM joins the hub
 ```
 
+### Capturing specific addresses with XDP
+
+`xdp` attaches an eBPF program that redirects only the traffic belonging to a
+set of IP prefixes and returns `XDP_PASS` for everything else, so a capture
+device shares a live NIC with the host stack instead of black-holing it.
+
+```rust
+use pktkit::afxdp::{Config, Device};
+use pktkit::{Frame, IpPrefix, L2Device};
+use std::net::Ipv4Addr;
+use std::sync::Arc;
+
+// One AF_XDP socket per RX queue, native-mode attach, zero-copy if the
+// driver supports it.
+let dev = Device::open(Config {
+    interface: "eth0".into(),
+    ..Default::default()
+})?;
+
+dev.set_handler(Arc::new(|frame: &Frame| {
+    println!("{} bytes", frame.as_bytes().len());
+    Ok(())
+}));
+
+// Nothing is diverted until an address is named. Takes effect immediately:
+// the prefix goes into a map the running program reads.
+dev.capture_add(IpPrefix::new(Ipv4Addr::new(10, 0, 0, 7).into(), 32))?;
+
+println!("zero-copy: {}, queues: {:?}", dev.zerocopy(), dev.queue_ids());
+```
+
+Matching is longest-prefix, so a `/24` captures a whole subnet. ARP for a
+captured IPv4 address is captured too (otherwise nothing could resolve it), and
+adding an IPv6 `/128` also captures its solicited-node multicast address so
+neighbour discovery arrives.
+
 ## Status
 
 Active development; the API is not yet stable. Most features are functionally
@@ -181,8 +218,12 @@ complete and tested; a few have documented `// TODO(<feature>)` gaps:
 
 - **ovpn**: tls-crypt/tls-auth, control-packet retransmit timers, and fuller
   PUSH_REPLY negotiation are not yet implemented.
-- **afxdp**: the datapath needs root + a real NIC; pure logic is unit-tested,
-  hardware paths are marked as needing verification.
+- **xdp / afxdp**: program codegen, map key layout and ring math are
+  unit-tested, and `tests/xdp_kernel.rs` covers verifier acceptance and the
+  veth datapath — but those are `#[ignore]`d because they need root, so the
+  kernel-facing paths stay marked `// TODO(afxdp)` until CI runs them.
+  Zero-copy additionally needs a driver that supports it; `Device::zerocopy()`
+  reports what was actually negotiated.
 - **tuntap**: macOS `utun` is type-checked against the Apple target but not yet
   exercised on a macOS host.
 - **slirp**: inbound virtual TCP accept is IPv4-only (IPv6 accept is a TODO).

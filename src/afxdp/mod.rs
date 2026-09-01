@@ -9,6 +9,33 @@
 //! The in-kernel half — the XDP program that decides which packets reach this
 //! socket, and the maps that steer it — lives in [`crate::xdp`].
 //!
+//! ```no_run
+//! use pktkit::afxdp::{Config, Device};
+//! use pktkit::{Frame, IpPrefix, L2Device};
+//! use std::net::Ipv4Addr;
+//! use std::sync::Arc;
+//!
+//! # fn main() -> std::io::Result<()> {
+//! // One socket per RX queue, native-mode attach, zero-copy where the driver
+//! // supports it.
+//! let dev = Device::open(Config {
+//!     interface: "eth0".into(),
+//!     ..Default::default()
+//! })?;
+//!
+//! dev.set_handler(Arc::new(|frame: &Frame| {
+//!     println!("{} bytes", frame.as_bytes().len());
+//!     Ok(())
+//! }));
+//!
+//! // Nothing is diverted until an address is named.
+//! dev.capture_add(IpPrefix::new(Ipv4Addr::new(10, 0, 0, 7).into(), 32))?;
+//!
+//! println!("zero-copy: {}, queues: {:?}", dev.zerocopy(), dev.queue_ids());
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! The device is presented as an [`L2Device`](crate::L2Device):
 //!
 //! - [`Device::open`] performs the full setup.
