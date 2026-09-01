@@ -7,10 +7,16 @@
 //! incoming sockets and yields [`Conn`]s via
 //! [`L2Acceptor`](crate::L2Acceptor) so it plugs straight into
 //! [`serve`](crate::serve).
+//!
+//! Both transports QEMU offers are here. The TCP one works everywhere; the
+//! Unix-domain one needs a platform with `std::os::unix::net`, and
+//! [`dial_unix`] / [`Listener::bind_unix`] report `ErrorKind::Unsupported`
+//! where there is none.
 
 use crate::{Frame, L2Device, L2Handler, MacAddr, Result};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+#[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -154,15 +160,39 @@ pub fn dial_tcp(addr: impl ToSocketAddrs) -> Result<Arc<Conn>> {
 }
 
 /// Dial a QEMU socket netdev over a Unix domain socket.
+///
+/// Reports `ErrorKind::Unsupported` on platforms without Unix-domain sockets;
+/// use [`dial_tcp`] there.
+#[cfg(unix)]
 pub fn dial_unix(path: impl AsRef<Path>) -> Result<Arc<Conn>> {
     let s = UnixStream::connect(path)?;
     let s2 = s.try_clone()?;
     Ok(Conn::from_split(Box::new(s), Box::new(s2)))
 }
 
+/// Dial a QEMU socket netdev over a Unix domain socket.
+///
+/// This platform has none, so the call always fails; use [`dial_tcp`].
+#[cfg(not(unix))]
+pub fn dial_unix(path: impl AsRef<Path>) -> Result<Arc<Conn>> {
+    let _ = path.as_ref();
+    Err(no_unix_sockets())
+}
+
+/// The error returned by the Unix-domain entry points off Unix.
+#[cfg(not(unix))]
+fn no_unix_sockets() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "Unix-domain sockets are not available on this platform; use TCP",
+    )
+}
+
 /// Listens for QEMU peers over TCP or Unix sockets.
 pub enum Listener {
     Tcp(TcpListener),
+    /// Only present on platforms with Unix-domain sockets.
+    #[cfg(unix)]
     Unix(UnixListener),
 }
 
@@ -170,6 +200,7 @@ impl core::fmt::Debug for Listener {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Listener::Tcp(_) => f.write_str("qemu::Listener::Tcp"),
+            #[cfg(unix)]
             Listener::Unix(_) => f.write_str("qemu::Listener::Unix"),
         }
     }
@@ -183,9 +214,23 @@ impl Listener {
 
     /// Bind a Unix-domain listener. Any stale socket file at `path` is
     /// removed first.
+    ///
+    /// Reports `ErrorKind::Unsupported` on platforms without Unix-domain
+    /// sockets; use [`bind_tcp`](Self::bind_tcp) there.
+    #[cfg(unix)]
     pub fn bind_unix(path: impl AsRef<Path>) -> Result<Listener> {
         let _ = std::fs::remove_file(path.as_ref());
         Ok(Listener::Unix(UnixListener::bind(path)?))
+    }
+
+    /// Bind a Unix-domain listener.
+    ///
+    /// This platform has none, so the call always fails; use
+    /// [`bind_tcp`](Self::bind_tcp).
+    #[cfg(not(unix))]
+    pub fn bind_unix(path: impl AsRef<Path>) -> Result<Listener> {
+        let _ = path.as_ref();
+        Err(no_unix_sockets())
     }
 
     /// Block until a peer arrives, then wrap it as a [`Conn`].
@@ -196,6 +241,7 @@ impl Listener {
                 let s2 = s.try_clone()?;
                 Ok(Conn::from_split(Box::new(s), Box::new(s2)))
             }
+            #[cfg(unix)]
             Listener::Unix(l) => {
                 let (s, _) = l.accept()?;
                 let s2 = s.try_clone()?;
@@ -254,6 +300,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn unix_roundtrip() {
         let tmp = std::env::temp_dir().join(format!("pktkit-qemu-{}.sock", std::process::id()));
         let ln = Listener::bind_unix(&tmp).unwrap();

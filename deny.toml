@@ -11,6 +11,13 @@ all-features = true
 # Any unpatched advisory in the tree fails the build.
 yanked = "deny"
 
+# No advisory exceptions. The five findings currently open all arrive through
+# `rustls-rustcrypto =0.0.2-alpha` (an outdated `rustls-webpki`, the `rsa`
+# Marvin timing sidechannel, and unmaintained `paste`), and the fix is to drop
+# that dependency rather than to annotate around it. This job stays red until
+# then, on purpose.
+
+
 [licenses]
 # Permissive licences only. Anything copyleft would change what a dependent
 # takes on by using this crate, so it needs a deliberate decision, not a

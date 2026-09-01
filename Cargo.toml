@@ -84,7 +84,6 @@ ovpn = [
     "dep:hmac",
     "dep:sha1",
     "dep:sha2",
-    "dep:rsa",
     "dep:rand_core",
     "dep:getrandom",
     # TLS for the OpenVPN control channel. The data channel still uses the
@@ -93,7 +92,6 @@ ovpn = [
     # because hand-rolling TLS 1.2 + X.509 is not worth the risk.
     "dep:rustls",
     "dep:rustls-rustcrypto",
-    "dep:rustls-pemfile",
 ]
 
 # Exposes crate-internal parser entry points to the fuzz targets and the
@@ -135,7 +133,6 @@ blake2              = { version = "0.10", optional = true }
 sha1                = { version = "0.10", optional = true }
 sha2                = { version = "0.10", optional = true }
 hmac                = { version = "0.12", optional = true }
-rsa                 = { version = "0.9", optional = true, default-features = false }
 zeroize             = { version = "1", optional = true, default-features = false, features = ["zeroize_derive"] }
 rand_core           = { version = "0.6", optional = true }
 getrandom           = { version = "0.2", optional = true }
@@ -146,7 +143,6 @@ getrandom           = { version = "0.2", optional = true }
 # data channel already uses. TLS 1.2 is required (OpenVPN negotiates it).
 rustls              = { version = "0.23", optional = true, default-features = false, features = ["std", "tls12"] }
 rustls-rustcrypto   = { version = "=0.0.2-alpha", optional = true }
-rustls-pemfile      = { version = "2", optional = true }
 
 [dev-dependencies]
 # Tests may exercise OS sockets; nothing extra needed beyond std.
