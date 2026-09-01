@@ -32,7 +32,8 @@ re-cast into idiomatic Rust:
   `TcpSegment`, `UdpDatagram`, `IcmpMessage` — plus `TcpFlags`, `FiveTuple`,
   `EtherType`, `Protocol`, `MacAddr`, `IpPrefix`
 - **Traits**: `L2Device`, `L3Device`, `L2Acceptor`, `L2Connector`, `L3Connector`
-- **L2Hub**: MAC-learning switch, VLAN-aware, with 5-minute aging
+- **L2Hub**: MAC-learning switch with VLAN access/trunk ports, per-port
+  learning limits, and bounded forwarding for looped topologies
 - **L3Hub**: prefix-routing hub with default-route fallback
 - **PipeL2 / PipeL3**: in-memory devices for testing
 - **connect_l2 / connect_l3**: point-to-point wiring

@@ -84,7 +84,7 @@ pub use ethertype::EtherType;
 pub use frame::{Frame, build_frame};
 pub use iface::{Handler, L2Device, L2Handler, L3Device, L3Handler};
 pub use ip::IpPrefix;
-pub use l2hub::{L2Hub, L2HubHandle};
+pub use l2hub::{L2Hub, L2HubHandle, PortMode, VlanSet};
 pub use l3hub::{L3Hub, L3HubHandle};
 pub use l4::{FiveTuple, IcmpMessage, TcpFlags, TcpSegment, UdpDatagram};
 pub use mac::{BROADCAST_MAC, MacAddr};

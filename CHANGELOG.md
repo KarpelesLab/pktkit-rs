@@ -6,6 +6,21 @@ semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+### Added — L2Hub
+
+- **VLAN port modes.** `PortMode::Access { vlan }` is an edge port belonging to
+  one VLAN that never sees a tag; `PortMode::Trunk { allowed, native }` carries
+  several, tagged, with the native VLAN untagged. Flooding reaches only ports
+  carrying the frame's VLAN, and a learned address is a hit only on the VLAN it
+  was learned on. Set with `set_port_mode`; ports start
+  `PortMode::transparent()`, which passes every VLAN through with tags
+  untouched, so an unconfigured switch behaves exactly as before.
+- `VlanSet`, a 4096-bit set of VLAN ids. The bitmap is boxed so "every VLAN" —
+  much the commonest setting — costs a discriminant rather than 512 bytes.
+- `set_port_mac_limit` to lift the learning cap on uplinks, `loop_drops()` and
+  `set_max_forward_depth` for looped topologies, `port_mode` to read a port's
+  configuration back.
+
 ### Changed (breaking)
 
 - **All cryptography now comes from [`purecrypto`](https://crates.io/crates/purecrypto).**
