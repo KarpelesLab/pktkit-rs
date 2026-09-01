@@ -32,4 +32,4 @@ mod xdp;
 
 pub mod ring;
 
-pub use xdp::{Config, Device};
+pub use xdp::{BusyPoll, Config, Device, ProgramSource, Zerocopy};
