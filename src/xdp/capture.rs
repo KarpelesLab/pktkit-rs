@@ -427,8 +427,11 @@ impl Capture {
 
         if let Some(sn) = self.solicited_node(prefix) {
             // Two addresses can share a solicited-node group (it is derived
-            // from the low 24 bits), so only drop it once nothing needs it.
-            let still_needed = held.iter().any(|p| self.solicited_node(*p) == Some(sn));
+            // from the low 24 bits), so only drop it once nothing needs it —
+            // including a caller who added that group address in its own right.
+            let still_needed = held
+                .iter()
+                .any(|p| *p == sn || self.solicited_node(*p) == Some(sn));
             if !still_needed {
                 self.map_for(sn).delete(lpm_key(sn).as_bytes())?;
             }
