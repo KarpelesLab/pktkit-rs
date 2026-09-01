@@ -211,6 +211,14 @@ captured IPv4 address is captured too (otherwise nothing could resolve it), and
 adding an IPv6 `/128` also captures its solicited-node multicast address so
 neighbour discovery arrives.
 
+**A capture can never widen into the whole interface.** `capture_add` refuses a
+`/0` outright, refuses anything shorter than the configured per-family floor
+(`min_prefix_v4` / `min_prefix_v6`), and refuses any addition that would leave
+the set covering an entire address family — two `/1`s clear the floor
+individually but not together. Both checks run before anything reaches the
+kernel, so a refused call leaves the set unchanged. Traffic that matches nothing
+returns `XDP_PASS` and goes to the host stack as usual.
+
 ## Status
 
 Active development; the API is not yet stable. Most features are functionally

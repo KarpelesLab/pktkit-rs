@@ -270,6 +270,65 @@ fn capture_attaches_and_tracks_its_set() {
         .unwrap());
 }
 
+/// The interface-sharing invariant, against a live attachment: a refusal has to
+/// leave the kernel-side set untouched, not merely return an error.
+#[test]
+#[ignore = "needs CAP_BPF + CAP_NET_ADMIN"]
+fn a_live_capture_refuses_to_take_the_whole_interface() {
+    if !root() {
+        return;
+    }
+    let veth = Veth::new("whole");
+    let cap =
+        Capture::attach(ifindex(&veth.host), CaptureConfig::default(), Mode::AUTO).expect("attach");
+
+    // A default route in either family.
+    assert!(cap.add(v4([0, 0, 0, 0], 0)).is_err());
+    assert!(cap
+        .add(IpPrefix::new("::".parse::<Ipv6Addr>().unwrap().into(), 0))
+        .is_err());
+
+    // Two halves that individually clear the floor.
+    cap.add(v4([0, 0, 0, 0], 1)).unwrap();
+    assert!(cap.add(v4([128, 0, 0, 0], 1)).is_err());
+
+    // The refused half is genuinely absent from the trie, not just unrecorded:
+    // an address inside it must still miss.
+    assert!(!cap
+        .contains(IpAddr::V4(Ipv4Addr::new(200, 0, 0, 1)))
+        .unwrap());
+    // While the half that was accepted matches.
+    assert!(cap
+        .contains(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))
+        .unwrap());
+    assert_eq!(cap.prefixes(), vec![v4([0, 0, 0, 0], 1)]);
+}
+
+/// A tighter floor has to be enforced against the kernel-side set too.
+#[test]
+#[ignore = "needs CAP_BPF + CAP_NET_ADMIN"]
+fn a_configured_floor_is_enforced_on_a_live_capture() {
+    if !root() {
+        return;
+    }
+    let veth = Veth::new("floor");
+    let cfg = CaptureConfig {
+        min_prefix_v4: 24,
+        ..Default::default()
+    };
+    let cap = Capture::attach(ifindex(&veth.host), cfg, Mode::AUTO).expect("attach");
+
+    cap.add(v4([10, 1, 2, 0], 24)).unwrap();
+    assert!(cap.add(v4([10, 0, 0, 0], 8)).is_err());
+    assert!(cap
+        .contains(IpAddr::V4(Ipv4Addr::new(10, 1, 2, 9)))
+        .unwrap());
+    // Nothing from the refused /8 leaked in.
+    assert!(!cap
+        .contains(IpAddr::V4(Ipv4Addr::new(10, 9, 9, 9)))
+        .unwrap());
+}
+
 /// A `/128` has to bring its solicited-node multicast address with it, or
 /// nothing on the network can resolve it.
 #[test]

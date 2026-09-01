@@ -30,9 +30,19 @@ semantic versioning once it reaches 1.0.
   cannot reorder its own frames.
 - Optional kernel-side busy polling (`SO_PREFER_BUSY_POLL`, `SO_BUSY_POLL`,
   `SO_BUSY_POLL_BUDGET`) and optional huge-page UMEM.
+- **A capture can never widen into the whole interface.** `Capture::add`
+  refuses a `/0` in either family, refuses anything shorter than
+  `CaptureConfig::min_prefix_v4` / `min_prefix_v6` (both default to 1, i.e.
+  reject only the catch-all), and refuses any addition that would leave the set
+  covering an entire address family — a per-prefix floor alone does not catch
+  two `/1`s. Both checks run before anything is written to a map, so a refused
+  call leaves the capture set unchanged. `CaptureConfig::validate` additionally
+  rejects a zero or over-wide floor and a `default_action` that is not `PASS` or
+  `DROP`.
 - `tests/xdp_kernel.rs`: `#[ignore]`d tests covering verifier acceptance for
-  every program configuration, LPM trie semantics against the real kernel, and
-  the veth datapath.
+  every program configuration, LPM trie semantics against the real kernel, the
+  veth datapath, and that a refused over-broad prefix leaves the kernel-side
+  trie untouched.
 
 ### Fixed
 

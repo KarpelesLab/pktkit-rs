@@ -3,7 +3,7 @@
 //! This is the kernel-side half of packet capture. It loads a program, attaches
 //! it to an interface, and manages the maps the program reads. The userspace
 //! half — an `AF_XDP` socket that receives the redirected frames — lives in
-//! [`afxdp`](crate::afxdp), which builds on this module.
+//! the `afxdp` module (feature `afxdp`), which builds on this one.
 //!
 //! # Capturing specific addresses
 //!
@@ -28,6 +28,11 @@
 //! reloading the program, and matching is longest-prefix — a `/24` captures the
 //! whole subnet.
 //!
+//! A capture can never widen into the whole interface: `add` refuses a `/0`
+//! outright, refuses anything under [`CaptureConfig::min_prefix_v4`] /
+//! [`CaptureConfig::min_prefix_v6`], and refuses any addition that would leave
+//! the set covering an entire address family. See the [`capture`] module docs.
+//!
 //! # Attach modes
 //!
 //! [`Mode::DRIVER`] runs the program in the NIC driver's NAPI poll, before an
@@ -43,7 +48,7 @@
 //! codegen, map key layout, netlink message layout — are unit-tested; paths
 //! that require the kernel are marked `TODO(xdp)`.
 
-mod capture;
+pub mod capture;
 mod netlink;
 mod prog;
 mod sys;

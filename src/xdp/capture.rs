@@ -28,7 +28,29 @@
 //! Anything that matches nothing returns [`CaptureConfig::default_action`],
 //! normally [`Action::PASS`]. A capture device therefore coexists with the
 //! host stack on the same NIC instead of black-holing it.
+//!
+//! # Never the whole interface
+//!
+//! Sharing the NIC only holds if the capture set stays a strict subset of the
+//! traffic on it, so [`Capture::add`] enforces that on two levels:
+//!
+//! - **Per prefix.** A `/0` matches every packet and is refused unconditionally.
+//!   [`CaptureConfig::min_prefix_v4`] and [`CaptureConfig::min_prefix_v6`] raise
+//!   the floor further for callers who want to allow no more than, say, a
+//!   subnet at a time.
+//! - **Per set.** A floor alone is not enough — two `/1`s clear it individually
+//!   and cover all of IPv4 between them. Any addition that would leave the set
+//!   spanning an entire address family is refused as well.
+//!
+//! Both checks run before anything reaches the kernel, so a refused call leaves
+//! the capture set exactly as it was.
+//!
+//! The guarantee is a property of [`Capture`]. Assembling [`CaptureMaps`] and
+//! [`build_program`] by hand, or supplying your own program through
+//! `afxdp::ProgramSource::External`, opts out of it — those are the deliberate
+//! low-level paths, and policing them is the caller's job.
 
+use std::io;
 use std::net::{IpAddr, Ipv6Addr};
 use std::os::fd::AsRawFd;
 use std::sync::Mutex;
@@ -136,7 +158,21 @@ pub struct CaptureConfig {
     /// so IPv6 neighbor discovery reaches userspace.
     pub neighbor_discovery: bool,
     /// Verdict for traffic that matches nothing.
+    ///
+    /// [`Action::PASS`] (the default) leaves it to the host stack, which is
+    /// what lets a capture device share a live NIC. [`Action::DROP`] takes the
+    /// interface away from the host entirely — only meaningful on a NIC
+    /// dedicated to this process.
     pub default_action: Action,
+    /// Shortest IPv4 prefix [`Capture::add`] will accept, 1-32.
+    ///
+    /// The floor exists so a capture can never widen into the whole interface.
+    /// `/0` matches every packet and is refused at any setting; raise this to
+    /// hold callers to something tighter (e.g. 24 to allow no more than a
+    /// subnet at a time).
+    pub min_prefix_v4: u8,
+    /// Shortest IPv6 prefix [`Capture::add`] will accept, 1-128.
+    pub min_prefix_v6: u8,
     /// Capacity of each address-family trie.
     pub max_prefixes: u32,
     /// XSKMAP slots, i.e. the highest NIC queue index that can be bound.
@@ -152,10 +188,125 @@ impl Default for CaptureConfig {
             // Never steal traffic we were not asked for: anything unmatched
             // belongs to the host stack.
             default_action: Action::PASS,
+            // Reject only the outright catch-all by default; anything narrower
+            // is a judgement call that belongs to the caller.
+            min_prefix_v4: 1,
+            min_prefix_v6: 1,
             max_prefixes: 1024,
             max_queues: 64,
         }
     }
+}
+
+impl CaptureConfig {
+    /// Reject a configuration that could not uphold the sharing invariant.
+    pub fn validate(&self) -> Result<()> {
+        if self.min_prefix_v4 == 0 || self.min_prefix_v6 == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "xdp: min_prefix_v4/min_prefix_v6 must be at least 1; a /0                  matches every packet on the interface",
+            ));
+        }
+        if self.min_prefix_v4 > 32 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("xdp: min_prefix_v4 is /{}, max is /32", self.min_prefix_v4),
+            ));
+        }
+        if self.min_prefix_v6 > 128 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("xdp: min_prefix_v6 is /{}, max is /128", self.min_prefix_v6),
+            ));
+        }
+        if self.default_action != Action::PASS && self.default_action != Action::DROP {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "xdp: default_action must be PASS or DROP, got {:?}",
+                    self.default_action
+                ),
+            ));
+        }
+        if self.max_prefixes == 0 || self.max_queues == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "xdp: max_prefixes and max_queues must be non-zero",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Reject a prefix broader than this configuration allows.
+    pub fn check_prefix(&self, prefix: IpPrefix) -> Result<()> {
+        let (min, family) = if prefix.is_v4() {
+            (self.min_prefix_v4.max(1), "IPv4")
+        } else {
+            (self.min_prefix_v6.max(1), "IPv6")
+        };
+        if prefix.bits() >= min {
+            return Ok(());
+        }
+        let why = if prefix.bits() == 0 {
+            " — a /0 matches every packet on the interface".to_string()
+        } else {
+            format!(" — the {family} floor is /{min}")
+        };
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("xdp: refusing to capture {prefix}{why}"),
+        ))
+    }
+}
+
+/// Addresses covered by the `v4`/`v6` half of `prefixes`, saturating.
+///
+/// Overlapping prefixes are counted twice, which can only overstate coverage —
+/// the check built on this errs towards refusing.
+fn coverage(prefixes: &[IpPrefix], v4: bool) -> u128 {
+    let width: u32 = if v4 { 32 } else { 128 };
+    prefixes
+        .iter()
+        .filter(|p| p.is_v4() == v4)
+        .fold(0u128, |acc, p| {
+            let host_bits = width - u32::from(p.bits()).min(width);
+            // `add` refuses a /0, so host_bits <= 127 and the shift is defined.
+            let n = 1u128.checked_shl(host_bits).unwrap_or(u128::MAX);
+            acc.saturating_add(n)
+        })
+}
+
+/// Every address in a family, as `coverage` counts them.
+///
+/// For IPv6 this saturates one short of 2^128, so the check triggers a single
+/// address early — in the safe direction.
+fn family_total(v4: bool) -> u128 {
+    if v4 {
+        1u128 << 32
+    } else {
+        u128::MAX
+    }
+}
+
+/// Refuse a prefix that would let the set span an entire address family.
+///
+/// The per-prefix floor alone does not close this: two `/1`s cover all of IPv4
+/// between them. This is what makes "never captures a whole interface" a
+/// property of the set rather than of each addition.
+fn check_coverage(held: &[IpPrefix], new: IpPrefix) -> Result<()> {
+    let v4 = new.is_v4();
+    let mut combined = held.to_vec();
+    combined.push(new);
+    if coverage(&combined, v4) >= family_total(v4) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "xdp: refusing to capture {new}: it would leave the capture set                  covering every {} address on the interface",
+                if v4 { "IPv4" } else { "IPv6" }
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// The maps a capture program reads.
@@ -374,6 +525,7 @@ impl Capture {
     /// The capture set starts empty, so nothing is diverted from the host
     /// stack until [`Capture::add`] is called.
     pub fn attach(ifindex: u32, cfg: CaptureConfig, mode: Mode) -> Result<Capture> {
+        cfg.validate()?;
         let maps = CaptureMaps::create(&cfg)?;
         let insns = build_program(&cfg, &maps)?;
         let prog = Program::load(&insns, "pktkit_cap")?;
@@ -400,16 +552,27 @@ impl Capture {
     }
 
     /// Start capturing `prefix`. Idempotent.
+    ///
+    /// Refuses anything broader than [`CaptureConfig::min_prefix_v4`] /
+    /// [`CaptureConfig::min_prefix_v6`], and refuses any prefix that would
+    /// leave the set covering a whole address family. Nothing reaches the
+    /// kernel until both checks pass, so a rejected call changes nothing.
     pub fn add(&self, prefix: IpPrefix) -> Result<()> {
         let prefix = prefix.masked();
+        self.cfg.check_prefix(prefix)?;
+
+        let mut held = self.prefixes.lock().unwrap();
+        if held.contains(&prefix) {
+            return Ok(());
+        }
+        check_coverage(&held, prefix)?;
+
         self.insert(prefix)?;
         if let Some(sn) = self.solicited_node(prefix) {
+            // Derived entries are always /128, so they cannot move coverage.
             self.insert(sn)?;
         }
-        let mut held = self.prefixes.lock().unwrap();
-        if !held.contains(&prefix) {
-            held.push(prefix);
-        }
+        held.push(prefix);
         Ok(())
     }
 
@@ -502,6 +665,10 @@ mod tests {
     use super::*;
     use crate::xdp::insn::{BPF_ADD, BPF_ALU64, BPF_JMP, BPF_K, BPF_STX};
     use std::net::Ipv4Addr;
+
+    fn v4(a: [u8; 4], bits: u8) -> IpPrefix {
+        IpPrefix::new(Ipv4Addr::from(a).into(), bits)
+    }
 
     /// Codegen tests use placeholder fds: creating real maps needs CAP_BPF,
     /// which is exactly what these tests avoid.
@@ -670,6 +837,177 @@ mod tests {
                 assert!(written.contains(&slot), "lookup key at {slot} never staged");
             }
         }
+    }
+
+    // --- the interface-sharing invariant ---
+
+    #[test]
+    fn a_default_route_is_never_capturable() {
+        let cfg = CaptureConfig::default();
+        for p in [
+            IpPrefix::new(Ipv4Addr::UNSPECIFIED.into(), 0),
+            IpPrefix::new(Ipv6Addr::UNSPECIFIED.into(), 0),
+        ] {
+            let e = cfg.check_prefix(p).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+            assert!(
+                e.to_string().contains("every packet"),
+                "error should say why: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_zero_floor_cannot_be_configured() {
+        // Otherwise `min_prefix = 0` would re-admit the catch-all.
+        for cfg in [
+            CaptureConfig {
+                min_prefix_v4: 0,
+                ..Default::default()
+            },
+            CaptureConfig {
+                min_prefix_v6: 0,
+                ..Default::default()
+            },
+        ] {
+            assert!(cfg.validate().is_err());
+        }
+        // And even if one were smuggled in, check_prefix floors it at 1.
+        let smuggled = CaptureConfig {
+            min_prefix_v4: 0,
+            ..Default::default()
+        };
+        assert!(smuggled
+            .check_prefix(IpPrefix::new(Ipv4Addr::UNSPECIFIED.into(), 0))
+            .is_err());
+    }
+
+    #[test]
+    fn ordinary_prefixes_are_accepted() {
+        let cfg = CaptureConfig::default();
+        cfg.check_prefix(v4([10, 0, 0, 7], 32)).unwrap();
+        cfg.check_prefix(v4([10, 0, 0, 0], 24)).unwrap();
+        cfg.check_prefix(v4([10, 0, 0, 0], 8)).unwrap();
+        cfg.check_prefix(v4([0, 0, 0, 0], 1)).unwrap();
+    }
+
+    #[test]
+    fn a_tighter_floor_is_enforced_per_family() {
+        let cfg = CaptureConfig {
+            min_prefix_v4: 24,
+            min_prefix_v6: 64,
+            ..Default::default()
+        };
+        cfg.validate().unwrap();
+        cfg.check_prefix(v4([10, 0, 0, 0], 24)).unwrap();
+        assert!(cfg.check_prefix(v4([10, 0, 0, 0], 16)).is_err());
+        // The v4 floor must not leak into the v6 decision.
+        let net: Ipv6Addr = "2001:db8::".parse().unwrap();
+        cfg.check_prefix(IpPrefix::new(net.into(), 64)).unwrap();
+        assert!(cfg.check_prefix(IpPrefix::new(net.into(), 48)).is_err());
+    }
+
+    #[test]
+    fn a_floor_wider_than_the_family_is_rejected() {
+        assert!(CaptureConfig {
+            min_prefix_v4: 33,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+        assert!(CaptureConfig {
+            min_prefix_v6: 129,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
+    fn two_halves_cannot_add_up_to_the_whole_interface() {
+        // Each /1 clears the per-prefix floor; together they are a /0.
+        let low = v4([0, 0, 0, 0], 1);
+        let high = v4([128, 0, 0, 0], 1);
+        check_coverage(&[], low).unwrap();
+        let e = check_coverage(&[low], high).unwrap_err();
+        assert!(e.to_string().contains("every IPv4 address"), "{e}");
+    }
+
+    #[test]
+    fn four_quarters_cannot_either() {
+        let quarters: Vec<IpPrefix> = [0u8, 64, 128, 192]
+            .iter()
+            .map(|&a| v4([a, 0, 0, 0], 2))
+            .collect();
+        for i in 0..3 {
+            check_coverage(&quarters[..i], quarters[i]).unwrap();
+        }
+        assert!(check_coverage(&quarters[..3], quarters[3]).is_err());
+    }
+
+    #[test]
+    fn ipv6_halves_are_caught_without_overflowing() {
+        let low = IpPrefix::new("::".parse::<Ipv6Addr>().unwrap().into(), 1);
+        let high = IpPrefix::new("8000::".parse::<Ipv6Addr>().unwrap().into(), 1);
+        check_coverage(&[], low).unwrap();
+        assert!(check_coverage(&[low], high).is_err());
+    }
+
+    #[test]
+    fn coverage_is_counted_per_family() {
+        // A full IPv6 set must not block an IPv4 addition, or vice versa.
+        let v6_low = IpPrefix::new("::".parse::<Ipv6Addr>().unwrap().into(), 1);
+        let v6_high = IpPrefix::new("8000::".parse::<Ipv6Addr>().unwrap().into(), 1);
+        check_coverage(&[v6_low, v6_high], v4([10, 0, 0, 1], 32)).unwrap();
+    }
+
+    #[test]
+    fn realistic_sets_stay_far_from_the_limit() {
+        // A thousand hosts plus a couple of subnets must not trip the guard.
+        let mut held: Vec<IpPrefix> = (0..1000)
+            .map(|i| v4([10, (i / 256) as u8, (i % 256) as u8, 1], 32))
+            .collect();
+        held.push(v4([192, 168, 0, 0], 16));
+        held.push(v4([172, 16, 0, 0], 12));
+        check_coverage(&held, v4([10, 0, 0, 0], 8)).unwrap();
+    }
+
+    #[test]
+    fn coverage_totals_are_exact_at_the_boundary() {
+        assert_eq!(coverage(&[v4([10, 0, 0, 1], 32)], true), 1);
+        assert_eq!(coverage(&[v4([10, 0, 0, 0], 24)], true), 256);
+        assert_eq!(coverage(&[v4([0, 0, 0, 0], 1)], true), 1 << 31);
+        assert_eq!(family_total(true), 1u128 << 32);
+        // Only /0 could reach the v6 total on its own, and that is refused
+        // before coverage is ever consulted.
+        assert_eq!(coverage(&[], false), 0);
+    }
+
+    #[test]
+    fn default_action_must_be_a_terminal_verdict() {
+        for a in [Action::PASS, Action::DROP] {
+            CaptureConfig {
+                default_action: a,
+                ..Default::default()
+            }
+            .validate()
+            .unwrap();
+        }
+        // REDIRECT with no preceding redirect call, or ABORTED, are not
+        // sensible fall-throughs.
+        for a in [Action::REDIRECT, Action::TX, Action::ABORTED] {
+            assert!(CaptureConfig {
+                default_action: a,
+                ..Default::default()
+            }
+            .validate()
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn the_default_configuration_validates() {
+        CaptureConfig::default().validate().unwrap();
     }
 
     #[test]
