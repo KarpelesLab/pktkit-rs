@@ -10,9 +10,12 @@
 use crate::arp::{self, Pending as ArpPending, Table as ArpTable};
 use crate::ndp::{self, Table as NdpTable};
 use crate::{
-    EtherType, Frame, IpPrefix, L2Device, L2Handler, L3Device, L3Handler, MacAddr, Packet,
-    Protocol, Result, build_frame,
+    EtherType, Frame, L2Device, L2Handler, L3Device, L3Handler, MacAddr, Packet, Protocol, Result,
+    build_frame,
 };
+// Only the DHCP client callback names this type.
+#[cfg(feature = "dhcp")]
+use crate::IpPrefix;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, Mutex, Weak};
