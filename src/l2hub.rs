@@ -1,4 +1,4 @@
-use crate::{Frame, L2Device, Result};
+use crate::{Frame, HubCounters, HubStats, L2Device, Result};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -25,6 +25,11 @@ struct MacEntry {
     expires: Instant,
 }
 
+/// MAC table key. The VLAN identifier is part of it so the same address seen
+/// on two VLANs is learned as two separate stations rather than one that keeps
+/// moving ports. Untagged frames use VLAN 0.
+type MacKey = (u16, [u8; 6]);
+
 /// A learning Ethernet switch.
 ///
 /// `L2Hub` forwards Ethernet frames between connected devices: it learns
@@ -33,7 +38,13 @@ struct MacEntry {
 /// every port except the source.
 ///
 /// The MAC table ages entries out after five minutes and is capped to 8192
-/// entries to bound memory.
+/// entries to bound memory. Learning is VLAN-aware: entries are keyed on
+/// (VLAN id, MAC), so one address appearing on two VLANs does not look like a
+/// station flapping between ports. Flooding still reaches every port — ports
+/// have no VLAN membership to filter on, so the hub does not pretend to
+/// segregate traffic.
+///
+/// [`stats`](Self::stats) reports what the hub did with each frame.
 ///
 /// ```
 /// # use std::sync::Arc;
@@ -46,7 +57,8 @@ pub struct L2Hub {
     // RwLock<Vec<Arc<Port>>> is read-heavy on the forwarding path; writers
     // (connect / disconnect) are rare.
     ports: RwLock<Vec<Arc<Port>>>,
-    mac_table: Mutex<HashMap<[u8; 6], MacEntry>>,
+    mac_table: Mutex<HashMap<MacKey, MacEntry>>,
+    stats: HubStats,
 }
 
 impl Default for L2Hub {
@@ -68,7 +80,20 @@ impl L2Hub {
         L2Hub {
             ports: RwLock::new(Vec::new()),
             mac_table: Mutex::new(HashMap::new()),
+            stats: HubStats::new(),
         }
+    }
+
+    /// Forwarding counters — received, forwarded, flooded and dropped.
+    pub fn stats(&self) -> HubCounters {
+        self.stats.snapshot()
+    }
+
+    /// Number of live entries in the MAC table. Useful as a gauge next to
+    /// [`stats`](Self::stats); expired entries are counted until they are
+    /// looked up and evicted.
+    pub fn mac_table_len(&self) -> usize {
+        self.mac_table.lock().unwrap().len()
     }
 
     /// Attach a device to the switch. The device's handler is installed to
@@ -128,13 +153,18 @@ impl L2Hub {
 
     fn forward(&self, f: &Frame, source_id: u64) {
         let bytes = f.as_bytes();
+        self.stats.record_received();
         if bytes.len() < 14 {
+            self.stats.record_dropped();
             return;
         }
 
+        let vlan = f.vlan_id();
+
         // Learn source MAC → port mapping.
-        let mut src = [0u8; 6];
-        src.copy_from_slice(&bytes[6..12]);
+        let mut mac = [0u8; 6];
+        mac.copy_from_slice(&bytes[6..12]);
+        let src: MacKey = (vlan, mac);
         {
             let mut table = self.mac_table.lock().unwrap();
             match table.get(&src) {
@@ -168,17 +198,14 @@ impl L2Hub {
 
         // Broadcast / multicast → flood to all ports except source.
         if bytes[0] & 1 != 0 {
-            for p in &ports {
-                if p.id != source_id {
-                    let _ = p.dev.send(f);
-                }
-            }
+            self.flood(f, source_id, &ports);
             return;
         }
 
         // Unicast: look up the destination MAC.
-        let mut dst = [0u8; 6];
-        dst.copy_from_slice(&bytes[0..6]);
+        let mut dst_mac = [0u8; 6];
+        dst_mac.copy_from_slice(&bytes[0..6]);
+        let dst: MacKey = (vlan, dst_mac);
         let target = {
             let mut table = self.mac_table.lock().unwrap();
             match table.get(&dst).copied() {
@@ -195,6 +222,7 @@ impl L2Hub {
             for p in &ports {
                 if p.id == pid && p.id != source_id {
                     let _ = p.dev.send(f);
+                    self.stats.record_forwarded(1);
                     return;
                 }
             }
@@ -202,10 +230,24 @@ impl L2Hub {
         }
 
         // Unknown unicast → flood.
-        for p in &ports {
+        self.flood(f, source_id, &ports);
+    }
+
+    /// Send `f` out every port but the source, counting the frame as flooded.
+    /// A flood with nowhere to go is a drop: it means the hub is holding the
+    /// only copy.
+    fn flood(&self, f: &Frame, source_id: u64, ports: &[Arc<Port>]) {
+        let mut sent = 0u64;
+        for p in ports {
             if p.id != source_id {
                 let _ = p.dev.send(f);
+                sent += 1;
             }
+        }
+        if sent == 0 {
+            self.stats.record_dropped();
+        } else {
+            self.stats.record_flooded();
         }
     }
 
@@ -409,5 +451,83 @@ mod tests {
         let bf = build_frame(MacAddr::broadcast(), MacAddr::zero(), EtherType::IPV4, &[]);
         a.inject(Frame::from_slice(&bf)).unwrap();
         assert_eq!(b.inner.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn stats_track_flood_forward_and_drop() {
+        let hub = Arc::new(L2Hub::new());
+        let a_mac: MacAddr = "02:00:00:00:00:01".parse().unwrap();
+        let b_mac: MacAddr = "02:00:00:00:00:02".parse().unwrap();
+        let a = Sink {
+            mac: a_mac,
+            ..Default::default()
+        };
+        let b = Sink {
+            mac: b_mac,
+            ..Default::default()
+        };
+        let ha = hub.connect(a.clone());
+        let hb = hub.connect(b.clone());
+
+        // A broadcast from A floods to B.
+        let bcast = build_frame(MacAddr::broadcast(), a_mac, EtherType::IPV4, &[0; 20]);
+        hub.forward(Frame::from_slice(&bcast), ha.id);
+        let s = hub.stats();
+        assert_eq!((s.received, s.flooded, s.forwarded), (1, 1, 0));
+
+        // B answers A. A's MAC was learned from the broadcast, so this is a
+        // targeted forward rather than a flood.
+        let unicast = build_frame(a_mac, b_mac, EtherType::IPV4, &[0; 20]);
+        hub.forward(Frame::from_slice(&unicast), hb.id);
+        let s = hub.stats();
+        assert_eq!((s.received, s.flooded, s.forwarded), (2, 1, 1));
+
+        // A runt is dropped outright.
+        hub.forward(Frame::from_slice(&[0u8; 4]), ha.id);
+        assert_eq!(hub.stats().dropped, 1);
+    }
+
+    #[test]
+    fn learning_is_vlan_aware() {
+        let hub = Arc::new(L2Hub::new());
+        let station: MacAddr = "02:00:00:00:00:aa".parse().unwrap();
+        let other: MacAddr = "02:00:00:00:00:bb".parse().unwrap();
+        let a = Sink {
+            mac: "02:00:00:00:00:01".parse().unwrap(),
+            ..Default::default()
+        };
+        let b = Sink {
+            mac: "02:00:00:00:00:02".parse().unwrap(),
+            ..Default::default()
+        };
+        let ha = hub.connect(a.clone());
+        let hb = hub.connect(b.clone());
+        let (a_id, b_id) = (ha.id, hb.id);
+
+        // The station is untagged on port A...
+        let untagged = build_frame(other, station, EtherType::IPV4, &[0; 20]);
+        hub.forward(Frame::from_slice(&untagged), a_id);
+
+        // ...and the same MAC appears on VLAN 5 on port B. Without VLAN-aware
+        // keys this would look like the station moving ports.
+        let tagged = crate::build::push_vlan(Frame::from_slice(&untagged), 5, 0);
+        hub.forward(Frame::from_slice(&tagged), b_id);
+
+        assert_eq!(hub.mac_table_len(), 2, "two VLANs, two entries");
+
+        // An untagged frame for the station must still go to port A only.
+        a.inner.lock().unwrap().clear();
+        b.inner.lock().unwrap().clear();
+        let reply = build_frame(station, other, EtherType::IPV4, &[0; 20]);
+        hub.forward(Frame::from_slice(&reply), b_id);
+        assert_eq!(a.inner.lock().unwrap().len(), 1);
+        assert_eq!(b.inner.lock().unwrap().len(), 0);
+
+        // A tagged frame for the station goes to port B only.
+        let tagged_reply = crate::build::push_vlan(Frame::from_slice(&reply), 5, 0);
+        a.inner.lock().unwrap().clear();
+        hub.forward(Frame::from_slice(&tagged_reply), a_id);
+        assert_eq!(a.inner.lock().unwrap().len(), 0);
+        assert_eq!(b.inner.lock().unwrap().len(), 1);
     }
 }

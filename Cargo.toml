@@ -25,6 +25,14 @@ l2adapter = []
 # when StartDHCP() is called.
 dhcp = []
 
+# Link impairment: delay, jitter, loss, duplication, corruption, rate limits.
+# Pure std -- no dependencies.
+impair = []
+
+# Write traffic crossing a device to a .pcap file for Wireshark / tcpdump.
+# Pure std -- no dependencies.
+pcap = []
+
 # QEMU userspace network socket protocol (client + listener).
 qemu = []
 
@@ -86,6 +94,8 @@ ovpn = [
 full = [
     "l2adapter",
     "dhcp",
+    "impair",
+    "pcap",
     "qemu",
     "tuntap",
     "xdp",

@@ -125,6 +125,83 @@ impl DeviceStats {
     }
 }
 
+/// A snapshot of a hub's counters. See [`HubStats`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct HubCounters {
+    /// Messages that arrived at the hub from a connected port.
+    pub received: u64,
+    /// Copies delivered to a specific port because the hub knew where the
+    /// destination lived.
+    pub forwarded: u64,
+    /// Messages flooded to every port but the source — broadcast, multicast,
+    /// or a destination the hub has not learned. Counted once per message, not
+    /// once per copy.
+    pub flooded: u64,
+    /// Messages the hub had nowhere to send, or refused as malformed. A
+    /// climbing count here is where "my packet disappeared" usually ends.
+    pub dropped: u64,
+}
+
+/// Traffic counters for a hub.
+///
+/// A hub sees every message twice over — once arriving, once or many times
+/// leaving — so its counters answer a different question than a device's:
+/// not "how much traffic", but "did the hub know where to send it".
+#[derive(Debug, Default)]
+pub struct HubStats {
+    received: AtomicU64,
+    forwarded: AtomicU64,
+    flooded: AtomicU64,
+    dropped: AtomicU64,
+}
+
+impl HubStats {
+    pub fn new() -> HubStats {
+        HubStats::default()
+    }
+
+    #[inline]
+    pub fn record_received(&self) {
+        bump(&self.received, 1);
+    }
+
+    /// Record `n` copies delivered to known ports.
+    #[inline]
+    pub fn record_forwarded(&self, n: u64) {
+        bump(&self.forwarded, n);
+    }
+
+    #[inline]
+    pub fn record_flooded(&self) {
+        bump(&self.flooded, 1);
+    }
+
+    #[inline]
+    pub fn record_dropped(&self) {
+        bump(&self.dropped, 1);
+    }
+
+    pub fn snapshot(&self) -> HubCounters {
+        HubCounters {
+            received: self.received.load(Ordering::Relaxed),
+            forwarded: self.forwarded.load(Ordering::Relaxed),
+            flooded: self.flooded.load(Ordering::Relaxed),
+            dropped: self.dropped.load(Ordering::Relaxed),
+        }
+    }
+
+    pub fn reset(&self) {
+        for c in [
+            &self.received,
+            &self.forwarded,
+            &self.flooded,
+            &self.dropped,
+        ] {
+            c.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Add to a counter, saturating instead of wrapping.
 #[inline]
 fn bump(counter: &AtomicU64, by: u64) {

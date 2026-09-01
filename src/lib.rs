@@ -90,7 +90,7 @@ pub use packet::Packet;
 pub use pipe::{PipeL2, PipeL3};
 pub use pool::{BufferPool, DEFAULT_MTU};
 pub use protocol::Protocol;
-pub use stats::{DeviceStats, Stats};
+pub use stats::{DeviceStats, HubCounters, HubStats, Stats};
 
 /// Crate-wide `Result` alias.
 pub type Result<T> = std::io::Result<T>;
@@ -116,6 +116,14 @@ pub use l2adapter::{L2Adapter, L2AdapterConfig};
 #[cfg(feature = "dhcp")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dhcp")))]
 pub mod dhcp;
+
+#[cfg(feature = "impair")]
+#[cfg_attr(docsrs, doc(cfg(feature = "impair")))]
+pub mod impair;
+
+#[cfg(feature = "pcap")]
+#[cfg_attr(docsrs, doc(cfg(feature = "pcap")))]
+pub mod pcap;
 
 #[cfg(feature = "qemu")]
 #[cfg_attr(docsrs, doc(cfg(feature = "qemu")))]

@@ -1,4 +1,4 @@
-use crate::{Cleanup, L3Device, L3Handler, Packet, Result};
+use crate::{Cleanup, HubCounters, HubStats, L3Device, L3Handler, Packet, Result};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -21,9 +21,13 @@ fn next_port_id() -> u64 {
 /// device only. Broadcast and multicast are flooded to every port except the
 /// source. A default route may be configured to absorb packets that don't
 /// match any connected prefix.
+///
+/// A packet that matches no prefix and has no default route is dropped, and
+/// [`stats`](Self::stats) is where that shows up.
 pub struct L3Hub {
     ports: RwLock<Vec<Arc<Port>>>,
     default_route: Mutex<Option<u64>>,
+    stats: HubStats,
 }
 
 impl Default for L3Hub {
@@ -45,7 +49,13 @@ impl L3Hub {
         L3Hub {
             ports: RwLock::new(Vec::new()),
             default_route: Mutex::new(None),
+            stats: HubStats::new(),
         }
+    }
+
+    /// Routing counters — received, forwarded, flooded and dropped.
+    pub fn stats(&self) -> HubCounters {
+        self.stats.snapshot()
     }
 
     /// Attach a device, installing its handler to route via the hub.
@@ -95,21 +105,33 @@ impl L3Hub {
     }
 
     fn route(&self, pkt: &Packet, source_id: u64) {
+        self.stats.record_received();
         if !pkt.is_valid() {
+            self.stats.record_dropped();
             return;
         }
         let dst = match pkt.dst_addr() {
             Some(d) => d,
-            None => return,
+            None => {
+                self.stats.record_dropped();
+                return;
+            }
         };
 
         let ports: Vec<Arc<Port>> = self.ports.read().unwrap().clone();
 
         if pkt.is_broadcast() || pkt.is_multicast() {
+            let mut sent = 0u64;
             for p in &ports {
                 if p.id != source_id {
                     let _ = p.dev.send(pkt);
+                    sent += 1;
                 }
+            }
+            if sent == 0 {
+                self.stats.record_dropped();
+            } else {
+                self.stats.record_flooded();
             }
             return;
         }
@@ -117,6 +139,7 @@ impl L3Hub {
         for p in &ports {
             if p.id != source_id && p.dev.addr().contains(dst) {
                 let _ = p.dev.send(pkt);
+                self.stats.record_forwarded(1);
                 return;
             }
         }
@@ -125,10 +148,14 @@ impl L3Hub {
             for p in &ports {
                 if p.id == default_id && p.id != source_id {
                     let _ = p.dev.send(pkt);
+                    self.stats.record_forwarded(1);
                     return;
                 }
             }
         }
+
+        // Nowhere to send it: no matching prefix and no usable default route.
+        self.stats.record_dropped();
     }
 
     fn disconnect(&self, id: u64) {
@@ -286,5 +313,55 @@ mod tests {
         let buf = v4([10, 0, 0, 1], [10, 0, 1, 5]);
         a.inject(Packet::from_slice(&buf)).unwrap();
         assert_eq!(b.inner.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn stats_count_an_unroutable_packet_as_dropped() {
+        let hub = Arc::new(L3Hub::new());
+        let a = Sink::default();
+        a.set_addr("10.0.0.1/24".parse().unwrap()).unwrap();
+        let ha = hub.connect(a.clone());
+
+        // Nothing owns 192.0.2.1 and no default route is set.
+        let pkt = crate::build::build_ipv4(
+            std::net::Ipv4Addr::new(10, 0, 0, 1),
+            std::net::Ipv4Addr::new(192, 0, 2, 1),
+            crate::Protocol::UDP,
+            64,
+            &[0; 8],
+        );
+        hub.route(Packet::from_slice(&pkt), ha.id);
+
+        let s = hub.stats();
+        assert_eq!(s.received, 1);
+        assert_eq!(s.forwarded, 0);
+        assert_eq!(s.dropped, 1, "no route and no default route");
+    }
+
+    #[test]
+    fn stats_count_a_routed_packet_as_forwarded() {
+        // A `Sink` rather than a `PipeL3`: a pipe loops whatever the hub sends
+        // it straight back into the hub's own handler, which would count the
+        // packet twice.
+        let hub = Arc::new(L3Hub::new());
+        let a = Sink::default();
+        a.set_addr("10.0.0.1/24".parse().unwrap()).unwrap();
+        let b = Sink::default();
+        b.set_addr("192.0.2.1/24".parse().unwrap()).unwrap();
+        let ha = hub.connect(a.clone());
+        let _hb = hub.connect(b.clone());
+
+        let pkt = crate::build::build_ipv4(
+            std::net::Ipv4Addr::new(10, 0, 0, 1),
+            std::net::Ipv4Addr::new(192, 0, 2, 9),
+            crate::Protocol::UDP,
+            64,
+            &[0; 8],
+        );
+        hub.route(Packet::from_slice(&pkt), ha.id);
+
+        let s = hub.stats();
+        assert_eq!((s.received, s.forwarded, s.dropped), (1, 1, 0));
+        assert_eq!(b.inner.lock().unwrap().len(), 1);
     }
 }
