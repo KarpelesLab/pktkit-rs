@@ -233,16 +233,13 @@ impl Peer {
                 fed += n;
             }
 
-            // Drain decrypted plaintext into the control buffer. `recv` yields
-            // one record's worth at a time and reports an empty vec when there
-            // is nothing more to hand over.
-            loop {
-                match self.tls.recv() {
-                    Ok(plain) if plain.is_empty() => break,
-                    Ok(plain) => self.ctrl_buf.extend_from_slice(&plain),
-                    Err(_) => break,
-                }
-            }
+            // Drain decrypted plaintext into the control buffer. `recv`
+            // hands back everything buffered in one call.
+            let plain = self
+                .tls
+                .recv()
+                .map_err(|e| invalid(format!("tls recv: {e:?}")))?;
+            self.ctrl_buf.extend_from_slice(&plain);
 
             // Try to advance the key-method-2 exchange / push handling.
             self.advance_control()?;
@@ -261,14 +258,11 @@ impl Peer {
     /// Emit any pending TLS output as P_CONTROL_V1 packets, plus a standalone
     /// ACK if we owe acknowledgements but produced no control packet to ride on.
     fn pump_tls(&mut self, out: &mut PeerOutput) -> io::Result<()> {
-        let mut tls_out = Vec::new();
-        loop {
-            match self.tls.pop() {
-                Ok(chunk) if chunk.is_empty() => break,
-                Ok(chunk) => tls_out.extend_from_slice(&chunk),
-                Err(e) => return Err(invalid(format!("tls pop: {e:?}"))),
-            }
-        }
+        // `pop` returns the whole pending wire stream in one call.
+        let tls_out = self
+            .tls
+            .pop()
+            .map_err(|e| invalid(format!("tls pop: {e:?}")))?;
 
         if !tls_out.is_empty() {
             let chunks = self.reliable.chunk_tls_stream(&tls_out);

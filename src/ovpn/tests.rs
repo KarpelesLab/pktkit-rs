@@ -75,25 +75,35 @@ fn der(pem: &str, label: &str) -> Vec<u8> {
     purecrypto::der::pem_decode(pem, label).expect("PEM decodes")
 }
 
-fn server_config() -> Arc<TlsConfig> {
+/// OpenVPN's control channel is classically TLS 1.2, but a server built with
+/// the default version range accepts 1.3 as well and picks the engine from the
+/// ClientHello. Both paths are exercised.
+const TLS12_ONLY: (ProtocolVersion, ProtocolVersion) =
+    (ProtocolVersion::TLSv1_2, ProtocolVersion::TLSv1_2);
+const TLS12_TO_13: (ProtocolVersion, ProtocolVersion) =
+    (ProtocolVersion::TLSv1_2, ProtocolVersion::TLSv1_3);
+
+fn server_config_versions(versions: (ProtocolVersion, ProtocolVersion)) -> Arc<TlsConfig> {
     let chain = vec![der(TEST_CERT, "CERTIFICATE")];
     let key = purecrypto::rsa::BoxedRsaPrivateKey::from_pkcs8_der(&der(TEST_KEY, "PRIVATE KEY"))
         .expect("test key parses");
     Arc::new(
         TlsConfig::builder()
-            // OpenVPN's control channel is TLS 1.2; pin it so the test drives
-            // the same engine the protocol actually uses.
-            .versions(ProtocolVersion::TLSv1_2, ProtocolVersion::TLSv1_2)
+            .versions(versions.0, versions.1)
             .rng(Arc::new(purecrypto::rng::OsRng))
             .identity(chain, purecrypto::tls::SigningKey::Rsa(key))
             .build(),
     )
 }
 
-fn client_config() -> Arc<TlsConfig> {
+fn server_config() -> Arc<TlsConfig> {
+    server_config_versions(TLS12_ONLY)
+}
+
+fn client_config_versions(versions: (ProtocolVersion, ProtocolVersion)) -> Arc<TlsConfig> {
     Arc::new(
         TlsConfig::builder()
-            .versions(ProtocolVersion::TLSv1_2, ProtocolVersion::TLSv1_2)
+            .versions(versions.0, versions.1)
             .rng(Arc::new(purecrypto::rng::OsRng))
             .server_name("ovpn-test")
             // The test certificate is self-signed and there is no trust anchor
@@ -102,6 +112,10 @@ fn client_config() -> Arc<TlsConfig> {
             .verify_certificates(false)
             .build(),
     )
+}
+
+fn client_config() -> Arc<TlsConfig> {
+    client_config_versions(TLS12_ONLY)
 }
 
 /// A minimal OpenVPN client that mirrors the server's reliable+TLS plumbing,
@@ -114,7 +128,11 @@ struct TestClient {
 
 impl TestClient {
     fn new(local_id: [u8; 8]) -> TestClient {
-        let tls = TlsConnection::client(&client_config()).unwrap();
+        Self::with_config(local_id, client_config())
+    }
+
+    fn with_config(local_id: [u8; 8], config: Arc<TlsConfig>) -> TestClient {
+        let tls = TlsConnection::client(&config).unwrap();
         TestClient {
             tls,
             reliable: Reliable::new(local_id),
@@ -146,13 +164,8 @@ impl TestClient {
                 }
                 fed += n;
             }
-            loop {
-                match self.tls.recv() {
-                    Ok(plain) if plain.is_empty() => break,
-                    Ok(plain) => self.ctrl_buf.extend_from_slice(&plain),
-                    Err(_) => break,
-                }
-            }
+            let plain = self.tls.recv().unwrap();
+            self.ctrl_buf.extend_from_slice(&plain);
         }
 
         self.pump_tls(&mut send);
@@ -160,14 +173,7 @@ impl TestClient {
     }
 
     fn pump_tls(&mut self, send: &mut Vec<Vec<u8>>) {
-        let mut tls_out = Vec::new();
-        loop {
-            match self.tls.pop() {
-                Ok(chunk) if chunk.is_empty() => break,
-                Ok(chunk) => tls_out.extend_from_slice(&chunk),
-                Err(e) => panic!("client tls pop: {e:?}"),
-            }
-        }
+        let tls_out = self.tls.pop().expect("client tls pop");
         if !tls_out.is_empty() {
             let chunks = self.reliable.chunk_tls_stream(&tls_out);
             for (i, pkt) in chunks.iter().enumerate() {
@@ -188,6 +194,57 @@ impl TestClient {
 
     fn handshake_done(&self) -> bool {
         self.tls.is_handshake_complete()
+    }
+}
+
+/// Run the reliable-layer pump until the TLS handshake completes on both
+/// sides, or give up. Returns whether it completed.
+fn drive_handshake(server: &mut Peer, client: &mut TestClient) -> bool {
+    let mut server_inbox: Vec<Vec<u8>> = vec![client.hard_reset()];
+    let mut client_inbox: Vec<Vec<u8>> = Vec::new();
+
+    for _round in 0..50 {
+        for dg in server_inbox.drain(..) {
+            let out = server.handle_packet(&dg).expect("server handle");
+            client_inbox.extend(out.send);
+        }
+        let mut extra = Vec::new();
+        client.pump_tls(&mut extra);
+        server_inbox.extend(extra);
+
+        for dg in client_inbox.drain(..) {
+            server_inbox.extend(client.handle(&dg));
+        }
+        if client.handshake_done() {
+            return true;
+        }
+    }
+    client.handshake_done()
+}
+
+/// A server built with the default 1.2–1.3 range picks its engine from the
+/// ClientHello rather than from config, which is a different code path than
+/// the version-pinned one the main e2e test drives. Real deployments leave the
+/// range at its default, so both ends of it need to work.
+#[test]
+fn tls_handshake_completes_across_the_version_range() {
+    for (name, client_versions) in [
+        ("1.2 client", TLS12_ONLY),
+        ("1.3-capable client", TLS12_TO_13),
+    ] {
+        let mut server = Peer::new(
+            server_config_versions(TLS12_TO_13),
+            *b"SERVERID",
+            auth_hook(),
+        )
+        .unwrap();
+        let mut client =
+            TestClient::with_config(*b"CLIENTID", client_config_versions(client_versions));
+
+        assert!(
+            drive_handshake(&mut server, &mut client),
+            "{name}: handshake did not complete against a 1.2-1.3 server"
+        );
     }
 }
 

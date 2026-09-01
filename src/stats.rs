@@ -203,13 +203,25 @@ impl HubStats {
 }
 
 /// Add to a counter, saturating instead of wrapping.
+///
+/// A hand-rolled compare-exchange loop rather than `fetch_update`, which is
+/// deprecated on newer toolchains in favour of a `try_update` that does not
+/// exist at this crate's MSRV. Relaxed ordering is right here: counters are
+/// read for reporting, never to establish ordering with the data plane.
 #[inline]
 fn bump(counter: &AtomicU64, by: u64) {
-    // Relaxed is right here: counters are read for reporting, never to
-    // establish ordering with the data plane.
-    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-        Some(v.saturating_add(by))
-    });
+    let mut cur = counter.load(Ordering::Relaxed);
+    loop {
+        let next = cur.saturating_add(by);
+        if next == cur {
+            // Already saturated; nothing to store.
+            return;
+        }
+        match counter.compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(actual) => cur = actual,
+        }
+    }
 }
 
 #[cfg(test)]
