@@ -314,6 +314,29 @@ captured IPv4 address is captured too (otherwise nothing could resolve it), and
 adding an IPv6 `/128` also captures its solicited-node multicast address so
 neighbour discovery arrives.
 
+`capture_add` takes the whole address. To share one with the host stack, name
+a protocol or a TCP/UDP port on it instead:
+
+```rust
+use pktkit::xdp::Rule;
+use pktkit::Protocol;
+
+let host = IpPrefix::new(Ipv4Addr::new(10, 0, 0, 1).into(), 32);
+// WireGuard on the host's own address. ICMP, SSH, ARP and everything else on
+// 10.0.0.1 keep going to the kernel.
+dev.capture_add_rule(host, Rule::Port(Protocol::UDP, 51820))?;
+// Or a whole protocol.
+dev.capture_add_rule(host, Rule::Proto(Protocol::GRE))?;
+```
+
+A prefix holds up to `max_rules_per_prefix` rules (default 8) and is captured
+when any one of them matches. The port compared is the captured endpoint's —
+the destination port when the destination address matched, the source port
+when the source did. ARP and neighbour discovery are diverted only for a prefix
+with a `Rule::Any`; a narrower rule means the host stack still owns the address
+and keeps answering for it. A non-first IPv4 fragment carries no port and
+matches only protocol rules; IPv6 extension headers are not walked.
+
 **A capture can never widen into the whole interface.** `capture_add` refuses a
 `/0` outright, refuses anything shorter than the configured per-family floor
 (`min_prefix_v4` / `min_prefix_v6`), and refuses any addition that would leave

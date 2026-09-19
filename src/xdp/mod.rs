@@ -28,6 +28,25 @@
 //! reloading the program, and matching is longest-prefix — a `/24` captures the
 //! whole subnet.
 //!
+//! `add` takes the whole address. To share one with the host stack, capture
+//! only a protocol or a TCP/UDP port on it instead:
+//!
+//! ```no_run
+//! use pktkit::xdp::{Capture, CaptureConfig, Mode, Rule};
+//! use pktkit::{IpPrefix, Protocol};
+//! use std::net::Ipv4Addr;
+//!
+//! # fn main() -> std::io::Result<()> {
+//! let cap = Capture::attach(2, CaptureConfig::default(), Mode::AUTO)?;
+//! let host = IpPrefix::new(Ipv4Addr::new(10, 0, 0, 1).into(), 32);
+//! // WireGuard on the host's own address; everything else on it stays with
+//! // the kernel, including ARP.
+//! cap.add_rule(host, Rule::Port(Protocol::UDP, 51820))?;
+//! cap.add_rule(host, Rule::Proto(Protocol::GRE))?;
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! A capture can never widen into the whole interface: `add` refuses a `/0`
 //! outright, refuses anything under [`CaptureConfig::min_prefix_v4`] /
 //! [`CaptureConfig::min_prefix_v6`], and refuses any addition that would leave
@@ -57,7 +76,8 @@ pub mod insn;
 pub mod map;
 
 pub use capture::{
-    Capture, CaptureConfig, CaptureMaps, MatchField, build_program, solicited_node_multicast,
+    Capture, CaptureConfig, CaptureMaps, MAX_RULES_PER_PREFIX, MatchField, Rule, build_program,
+    solicited_node_multicast,
 };
 pub use insn::{Asm, Insn, Label};
 pub use map::{LpmKey, Map, MapType, UpdateFlags, lpm_key, set_socket_raw};

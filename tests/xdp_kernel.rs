@@ -20,9 +20,10 @@ use std::time::{Duration, Instant};
 
 use pktkit::afxdp::{Config, Device, ProgramSource, Zerocopy};
 use pktkit::xdp::{
-    Action, Capture, CaptureConfig, CaptureMaps, Map, MatchField, Mode, Program, build_program,
+    Action, Capture, CaptureConfig, CaptureMaps, MAX_RULES_PER_PREFIX, Map, MatchField, Mode,
+    Program, Rule, build_program,
 };
-use pktkit::{EtherType, Frame, IpPrefix, L2Device};
+use pktkit::{EtherType, Frame, IpPrefix, L2Device, Protocol};
 
 /// True when this process can actually exercise the kernel paths.
 ///
@@ -136,16 +137,26 @@ fn every_capture_configuration_passes_the_verifier() {
     for match_field in [MatchField::Dst, MatchField::Src, MatchField::Either] {
         for arp in [true, false] {
             for default_action in [Action::PASS, Action::DROP] {
-                let cfg = CaptureConfig {
-                    match_field,
-                    arp,
-                    default_action,
-                    ..Default::default()
-                };
-                let maps = CaptureMaps::create(&cfg).expect("create maps");
-                let insns = build_program(&cfg, &maps).expect("codegen");
-                Program::load(&insns, "pktkit_test")
-                    .unwrap_or_else(|e| panic!("verifier rejected {match_field:?} arp={arp}: {e}"));
+                // The rule walk is unrolled per slot, so the widest list is
+                // the one most likely to trip an instruction or complexity
+                // limit; the narrowest exercises the degenerate loop.
+                for max_rules_per_prefix in [1, 8, MAX_RULES_PER_PREFIX] {
+                    let cfg = CaptureConfig {
+                        match_field,
+                        arp,
+                        default_action,
+                        max_rules_per_prefix,
+                        ..Default::default()
+                    };
+                    let maps = CaptureMaps::create(&cfg).expect("create maps");
+                    let insns = build_program(&cfg, &maps).expect("codegen");
+                    Program::load(&insns, "pktkit_test").unwrap_or_else(|e| {
+                        panic!(
+                            "verifier rejected {match_field:?} arp={arp} \
+                             rules={max_rules_per_prefix}: {e}"
+                        )
+                    });
+                }
             }
         }
     }
@@ -338,6 +349,84 @@ fn a_configured_floor_is_enforced_on_a_live_capture() {
     );
 }
 
+/// Rules accumulate per prefix in the kernel-side value, and go away one at a
+/// time or all at once.
+#[test]
+#[ignore = "needs CAP_BPF + CAP_NET_ADMIN"]
+fn rules_are_tracked_per_prefix() {
+    if !root() {
+        return;
+    }
+    let veth = Veth::new("rules");
+    let cap =
+        Capture::attach(ifindex(&veth.host), CaptureConfig::default(), Mode::AUTO).expect("attach");
+
+    let p = v4([10, 99, 0, 5], 32);
+    let addr = IpAddr::V4(Ipv4Addr::new(10, 99, 0, 5));
+    let wg = Rule::Port(Protocol::UDP, 51820);
+    let gre = Rule::Proto(Protocol::GRE);
+
+    cap.add_rule(p, wg).unwrap();
+    cap.add_rule(p, gre).unwrap();
+    // Idempotent per rule.
+    cap.add_rule(p, gre).unwrap();
+    assert_eq!(cap.rules(p), vec![wg, gre]);
+    // What the kernel holds is what we recorded.
+    assert_eq!(cap.rules_for(addr).unwrap(), vec![wg, gre]);
+    assert_eq!(cap.prefixes(), vec![p]);
+
+    // A port rule on anything but TCP/UDP never reaches the map.
+    assert!(cap.add_rule(p, Rule::Port(Protocol::GRE, 1)).is_err());
+    assert_eq!(cap.rules_for(addr).unwrap().len(), 2);
+
+    assert!(cap.remove_rule(p, wg).unwrap());
+    assert!(!cap.remove_rule(p, wg).unwrap());
+    assert_eq!(cap.rules_for(addr).unwrap(), vec![gre]);
+
+    // The last rule takes the prefix with it.
+    assert!(cap.remove_rule(p, gre).unwrap());
+    assert!(!cap.contains(addr).unwrap());
+    assert!(cap.prefixes().is_empty());
+
+    // The per-prefix cap is enforced before the map is touched.
+    let cfg = CaptureConfig {
+        max_rules_per_prefix: 2,
+        ..Default::default()
+    };
+    drop(cap);
+    let cap = Capture::attach(ifindex(&veth.host), cfg, Mode::AUTO).expect("attach");
+    cap.add_rule(p, Rule::Port(Protocol::TCP, 1)).unwrap();
+    cap.add_rule(p, Rule::Port(Protocol::TCP, 2)).unwrap();
+    assert!(cap.add_rule(p, Rule::Port(Protocol::TCP, 3)).is_err());
+    assert_eq!(cap.rules_for(addr).unwrap().len(), 2);
+}
+
+/// Neighbor discovery is only diverted for an address that is wholly ours.
+#[test]
+#[ignore = "needs CAP_BPF + CAP_NET_ADMIN"]
+fn a_narrow_v6_rule_leaves_the_solicited_node_group_alone() {
+    if !root() {
+        return;
+    }
+    let veth = Veth::new("nd2");
+    let cap =
+        Capture::attach(ifindex(&veth.host), CaptureConfig::default(), Mode::AUTO).expect("attach");
+
+    let addr: Ipv6Addr = "2001:db8::dead:beef".parse().unwrap();
+    let p = IpPrefix::new(addr.into(), 128);
+    let sn = IpAddr::V6(pktkit::xdp::solicited_node_multicast(addr));
+
+    cap.add_rule(p, Rule::Port(Protocol::UDP, 53)).unwrap();
+    assert!(!cap.contains(sn).unwrap());
+    // Widening to the whole address brings the group in...
+    cap.add_rule(p, Rule::Any).unwrap();
+    assert!(cap.contains(sn).unwrap());
+    // ...and narrowing again takes it back out, leaving the port rule.
+    assert!(cap.remove_rule(p, Rule::Any).unwrap());
+    assert!(!cap.contains(sn).unwrap());
+    assert!(cap.contains(IpAddr::V6(addr)).unwrap());
+}
+
 /// A `/128` has to bring its solicited-node multicast address with it, or
 /// nothing on the network can resolve it.
 #[test]
@@ -469,6 +558,77 @@ fn uncaptured_traffic_still_reaches_the_host_stack() {
     dev.close().unwrap();
 }
 
+/// The point of a port rule: one service on the host's own address is
+/// captured, and everything else on that address — ARP included — stays with
+/// the host stack.
+#[test]
+#[ignore = "needs CAP_BPF + CAP_NET_ADMIN"]
+fn a_port_rule_shares_the_address_with_the_host_stack() {
+    if !root() {
+        return;
+    }
+    let veth = Veth::new("port");
+
+    let dev = Device::open(Config {
+        interface: veth.host.clone(),
+        zerocopy: Zerocopy::Off,
+        ..Default::default()
+    })
+    .expect("open AF_XDP on veth");
+
+    let seen: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+    let n = Arc::new(AtomicUsize::new(0));
+    {
+        let seen = seen.clone();
+        let n = n.clone();
+        dev.set_handler(Arc::new(move |f: &Frame| {
+            seen.lock().unwrap().push(f.as_bytes().to_vec());
+            n.fetch_add(1, Ordering::Release);
+            Ok(())
+        }));
+    }
+
+    // 10.99.0.1 is the host's address on this link. Take only UDP 5555 on it.
+    dev.capture_add_rule(v4([10, 99, 0, 1], 32), Rule::Port(Protocol::UDP, 5555))
+        .unwrap();
+
+    // The host still answers ARP and ICMP for the address.
+    assert!(
+        veth.exec(&["ping", "-c", "2", "-W", "2", "10.99.0.1"]),
+        "a port rule took the whole address away from the host"
+    );
+    assert!(
+        !seen.lock().unwrap().iter().any(|f| ipv4_dst(f).is_some()),
+        "ICMP to a port-captured address was diverted"
+    );
+
+    // The captured port arrives. bash's /dev/udp is the least that can send
+    // a datagram from inside the namespace.
+    veth.exec(&["bash", "-c", "echo hi >/dev/udp/10.99.0.1/5555"]);
+    wait_for(&n, 1, Duration::from_secs(3));
+    assert!(
+        seen.lock()
+            .unwrap()
+            .iter()
+            .any(|f| udp_dst_port(f) == Some(5555)),
+        "the captured port was not delivered"
+    );
+
+    // A neighbouring port does not.
+    let before = seen.lock().unwrap().len();
+    veth.exec(&["bash", "-c", "echo hi >/dev/udp/10.99.0.1/5556"]);
+    std::thread::sleep(Duration::from_millis(500));
+    let after = seen.lock().unwrap().clone();
+    assert!(
+        !after[before..]
+            .iter()
+            .any(|f| udp_dst_port(f) == Some(5556)),
+        "a port that was never captured was delivered"
+    );
+
+    dev.close().unwrap();
+}
+
 fn wait_for(n: &AtomicUsize, target: usize, timeout: Duration) {
     let start = Instant::now();
     while n.load(Ordering::Acquire) < target && start.elapsed() < timeout {
@@ -486,6 +646,18 @@ fn ipv4_dst(frame: &[u8]) -> Option<[u8; 4]> {
         return None;
     }
     Some([frame[30], frame[31], frame[32], frame[33]])
+}
+
+/// Destination port of an IPv4 UDP frame, if it is one.
+fn udp_dst_port(frame: &[u8]) -> Option<u16> {
+    ipv4_dst(frame)?;
+    if frame[23] != Protocol::UDP.as_u8() {
+        return None;
+    }
+    let l4 = 14 + usize::from(frame[14] & 0x0f) * 4;
+    frame
+        .get(l4 + 2..l4 + 4)
+        .map(|b| u16::from_be_bytes([b[0], b[1]]))
 }
 
 fn ifindex(name: &str) -> u32 {

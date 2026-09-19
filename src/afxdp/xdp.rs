@@ -33,7 +33,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::afxdp::ring::{AddrRing, DescRing};
-use crate::xdp::{self, Capture, CaptureConfig, Mode};
+use crate::xdp::{self, Capture, CaptureConfig, Mode, Rule};
 use crate::{Frame, IpPrefix, L2Handler, MacAddr, Result};
 
 // --- AF_XDP / setsockopt constants (mirror <linux/if_xdp.h>) ---------------
@@ -478,7 +478,7 @@ impl Device {
         self.inner.capture.as_ref()
     }
 
-    /// Start delivering traffic for `prefix` to this device.
+    /// Start delivering all traffic for `prefix` to this device.
     ///
     /// Takes effect immediately: the prefix goes into a map the running program
     /// reads, so nothing is reloaded or reattached.
@@ -486,9 +486,23 @@ impl Device {
         self.require_capture()?.add(prefix)
     }
 
-    /// Stop capturing `prefix`. Returns `false` if it was not in the set.
+    /// Start delivering the traffic `rule` selects for `prefix` — one
+    /// protocol, or one TCP/UDP port — leaving the rest of the address to the
+    /// host stack. See [`Rule`].
+    pub fn capture_add_rule(&self, prefix: IpPrefix, rule: Rule) -> Result<()> {
+        self.require_capture()?.add_rule(prefix, rule)
+    }
+
+    /// Stop capturing `prefix` under every rule. Returns `false` if it was
+    /// not in the set.
     pub fn capture_remove(&self, prefix: IpPrefix) -> Result<bool> {
         self.require_capture()?.remove(prefix)
+    }
+
+    /// Stop capturing what `rule` selects for `prefix`. Returns `false` if the
+    /// prefix did not hold that rule.
+    pub fn capture_remove_rule(&self, prefix: IpPrefix, rule: Rule) -> Result<bool> {
+        self.require_capture()?.remove_rule(prefix, rule)
     }
 
     fn require_capture(&self) -> Result<&Capture> {

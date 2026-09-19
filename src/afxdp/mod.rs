@@ -11,7 +11,8 @@
 //!
 //! ```no_run
 //! use pktkit::afxdp::{Config, Device};
-//! use pktkit::{Frame, IpPrefix, L2Device};
+//! use pktkit::xdp::Rule;
+//! use pktkit::{Frame, IpPrefix, L2Device, Protocol};
 //! use std::net::Ipv4Addr;
 //! use std::sync::Arc;
 //!
@@ -30,6 +31,11 @@
 //!
 //! // Nothing is diverted until an address is named.
 //! dev.capture_add(IpPrefix::new(Ipv4Addr::new(10, 0, 0, 7).into(), 32))?;
+//! // Or one port of an address the host stack keeps using.
+//! dev.capture_add_rule(
+//!     IpPrefix::new(Ipv4Addr::new(10, 0, 0, 1).into(), 32),
+//!     Rule::Port(Protocol::UDP, 51820),
+//! )?;
 //!
 //! println!("zero-copy: {}, queues: {:?}", dev.zerocopy(), dev.queue_ids());
 //! # Ok(())

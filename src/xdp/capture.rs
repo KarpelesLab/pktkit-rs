@@ -18,6 +18,20 @@
 //!   protocol address, so an `ARP who-has <captured ip>` reaches userspace.
 //!   Without this a captured address is unreachable — nobody can resolve it.
 //!
+//! An address hit is not yet a capture: each prefix carries a short list of
+//! [`Rule`]s, and the packet has to satisfy one of them. [`Rule::Any`] takes
+//! the whole address; [`Rule::Proto`] one IP protocol on it; [`Rule::Port`]
+//! one TCP or UDP port. The port compared is the one at the captured endpoint
+//! — the destination port when the destination address matched, the source
+//! port when the source address did — so `Port(UDP, 53)` on a captured address
+//! means "the DNS service *at* that address", whichever way the packet is
+//! travelling.
+//!
+//! ARP and neighbor discovery follow the rules too. Only a prefix with an
+//! [`Rule::Any`] entry has its ARP captured, and only a `/128` with one gets a
+//! solicited-node multicast entry: a narrower rule means the address is shared
+//! with the host stack, which then has to keep answering for it.
+//!
 //! IPv6 neighbor discovery needs the equivalent treatment, but a neighbor
 //! solicitation is addressed to a *solicited-node multicast* address rather
 //! than to the target, so no amount of destination matching finds it. Instead
@@ -28,6 +42,20 @@
 //! Anything that matches nothing returns [`CaptureConfig::default_action`],
 //! normally [`Action::PASS`]. A capture device therefore coexists with the
 //! host stack on the same NIC instead of black-holing it.
+//!
+//! # Where the transport header is not
+//!
+//! A port rule can only be judged on a packet that carries a transport header
+//! at a place the program can find:
+//!
+//! - An IPv4 packet with a fragment offset other than zero has no transport
+//!   header. It does not match a port rule, and goes wherever the address's
+//!   other rules (or the default action) send it. The first fragment carries
+//!   the ports and matches normally.
+//! - IPv6 extension headers are not walked. A [`Rule::Proto`] is compared
+//!   against the Next Header field of the fixed header, and a [`Rule::Port`]
+//!   requires TCP or UDP to follow the fixed header directly. A packet with,
+//!   say, a Fragment header in between matches neither.
 //!
 //! # Never the whole interface
 //!
@@ -41,6 +69,9 @@
 //! - **Per set.** A floor alone is not enough — two `/1`s clear it individually
 //!   and cover all of IPv4 between them. Any addition that would leave the set
 //!   spanning an entire address family is refused as well.
+//!
+//! The rules on a prefix do not relax either check: a port rule on every
+//! address is still a program that inspects every packet on the interface.
 //!
 //! Both checks run before anything reaches the kernel, so a refused call leaves
 //! the capture set exactly as it was.
@@ -56,23 +87,29 @@ use std::os::fd::AsRawFd;
 use std::sync::Mutex;
 
 use super::insn::{
-    Asm, BPF_FUNC_MAP_LOOKUP_ELEM, BPF_FUNC_REDIRECT_MAP, Insn, Jmp, R0, R1, R2, R3, R6, R7, R8,
-    R10, Size, host_be16, ld_map_fd,
+    Asm, BPF_FUNC_MAP_LOOKUP_ELEM, BPF_FUNC_REDIRECT_MAP, Insn, Jmp, Label, R0, R1, R2, R3, R4, R6,
+    R7, R8, R10, Size, host_be16, ld_map_fd,
 };
 use super::map::{Map, UpdateFlags, lpm_key};
 use super::prog::{Action, Link, Mode, Program};
-use crate::{EtherType, IpPrefix, Result};
+use crate::{EtherType, IpPrefix, Protocol, Result};
 
 // --- packet offsets --------------------------------------------------------
 
 const ETH_HLEN: i32 = 14;
 const ETH_TYPE: i16 = 12;
 
+/// `ip.frag_off` — the flags and fragment offset word.
+const IPV4_FRAG: i16 = ETH_HLEN as i16 + 6;
+const IPV4_PROTO: i16 = ETH_HLEN as i16 + 9;
 const IPV4_SRC: i16 = ETH_HLEN as i16 + 12;
 const IPV4_DST: i16 = ETH_HLEN as i16 + 16;
 /// Ethernet header plus a minimum-length IPv4 header.
 const IPV4_MIN: i32 = ETH_HLEN + 20;
+/// The 13-bit fragment offset within `ip.frag_off`, in wire order.
+const IPV4_FRAG_OFF_MASK: u16 = 0x1fff;
 
+const IPV6_NEXT: i16 = ETH_HLEN as i16 + 6;
 const IPV6_SRC: i16 = ETH_HLEN as i16 + 8;
 const IPV6_DST: i16 = ETH_HLEN as i16 + 24;
 /// Ethernet header plus the fixed IPv6 header.
@@ -106,20 +143,131 @@ const V4_SRC_KEY: i16 = -16;
 const V6_DST_KEY: i16 = -40;
 const V6_SRC_KEY: i16 = -64;
 
+/// The transport fields the rule check needs, read from the packet before any
+/// lookup and compared afterwards. Each is a `u32` so the same `ldx W` reads
+/// it back whatever its width in the packet.
+const L4_DPORT: i16 = -80;
+const L4_SPORT: i16 = -76;
+const L4_PROTO: i16 = -72;
+
+/// Staged as the port when the packet has no readable transport header. A
+/// rule's port is 16 bits, so nothing can ever equal it.
+const NO_PORT: i32 = 0x1_0000;
+
 // The verifier enforces alignment strictly for PTR_TO_STACK, the keys must not
 // overlap, and the whole lot has to fit the 512-byte BPF stack. Cheaper to
 // prove here than to debug as an EACCES from the verifier.
 const _: () = {
     assert!(V4_DST_KEY % 4 == 0 && V4_SRC_KEY % 4 == 0);
     assert!(V6_DST_KEY % 4 == 0 && V6_SRC_KEY % 4 == 0);
+    assert!(L4_DPORT % 4 == 0 && L4_SPORT % 4 == 0 && L4_PROTO % 4 == 0);
     assert!(V4_SRC_KEY + 8 <= V4_DST_KEY, "v4 keys overlap");
     assert!(
         V6_DST_KEY + 20 <= V4_SRC_KEY,
         "v6 dst key overlaps a v4 key"
     );
     assert!(V6_SRC_KEY + 20 <= V6_DST_KEY, "v6 keys overlap");
-    assert!(V6_SRC_KEY > -512, "keys exceed the BPF stack");
+    assert!(L4_PROTO + 4 <= V6_SRC_KEY, "transport slots overlap a key");
+    assert!(L4_DPORT + 4 <= L4_SPORT && L4_SPORT + 4 <= L4_PROTO);
+    assert!(L4_DPORT > -512, "slots exceed the BPF stack");
 };
+
+// --- rules -----------------------------------------------------------------
+
+/// What, beyond the address, a packet has to carry to be captured.
+///
+/// Every prefix in the set holds a list of these; a packet is captured if its
+/// address matches the prefix *and* any one rule accepts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Rule {
+    /// Every protocol: the whole address belongs to the capture. This is what
+    /// [`Capture::add`] installs, and the only rule under which ARP and
+    /// neighbor discovery for the address are captured too.
+    Any,
+    /// One IP protocol, e.g. `Protocol::ICMP` or `Protocol::GRE`, on any port.
+    Proto(Protocol),
+    /// One TCP or UDP port at the captured endpoint. Any other protocol is
+    /// refused: the program reads ports at the offsets those two share.
+    Port(Protocol, u16),
+}
+
+/// Byte tags in the map value. `KIND_END` marks the end of a prefix's list,
+/// which is why the list is kept packed.
+const KIND_END: u8 = 0;
+const KIND_ANY: u8 = 1;
+const KIND_PROTO: u8 = 2;
+const KIND_PORT: u8 = 3;
+
+/// `{ u8 kind; u8 proto; u8 port[2] (wire order); }`
+const RULE_SIZE: usize = 4;
+
+/// Hard cap on [`CaptureConfig::max_rules_per_prefix`]. The rule check is
+/// unrolled once per slot at up to four lookup sites, and 64 keeps even the
+/// widest configuration comfortably inside the old 4096-instruction limit.
+pub const MAX_RULES_PER_PREFIX: u8 = 64;
+
+impl Rule {
+    /// Reject a rule the program could not evaluate.
+    pub fn validate(&self) -> Result<()> {
+        match self {
+            Rule::Port(proto, _) if *proto != Protocol::TCP && *proto != Protocol::UDP => {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "xdp: a port rule needs TCP or UDP, got protocol {}",
+                        proto.as_u8()
+                    ),
+                ))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn encode(self) -> [u8; RULE_SIZE] {
+        match self {
+            Rule::Any => [KIND_ANY, 0, 0, 0],
+            Rule::Proto(p) => [KIND_PROTO, p.as_u8(), 0, 0],
+            Rule::Port(p, port) => {
+                // Wire order, so the program compares it against the packet's
+                // port with the same `ldx H` and no byte swap on either side.
+                let b = port.to_be_bytes();
+                [KIND_PORT, p.as_u8(), b[0], b[1]]
+            }
+        }
+    }
+
+    fn decode(b: &[u8; RULE_SIZE]) -> Option<Rule> {
+        match b[0] {
+            KIND_ANY => Some(Rule::Any),
+            KIND_PROTO => Some(Rule::Proto(Protocol(b[1]))),
+            KIND_PORT => Some(Rule::Port(Protocol(b[1]), u16::from_be_bytes([b[2], b[3]]))),
+            _ => None,
+        }
+    }
+}
+
+/// The trie value for a prefix: its rules, packed, padded with `KIND_END`.
+fn encode_rules(rules: &[Rule], max_rules: u8) -> Vec<u8> {
+    let mut v = vec![KIND_END; value_size(max_rules) as usize];
+    for (slot, rule) in rules.iter().take(max_rules as usize).enumerate() {
+        v[slot * RULE_SIZE..(slot + 1) * RULE_SIZE].copy_from_slice(&rule.encode());
+    }
+    v
+}
+
+fn decode_rules(value: &[u8]) -> Vec<Rule> {
+    value
+        .as_chunks::<RULE_SIZE>()
+        .0
+        .iter()
+        .map_while(Rule::decode)
+        .collect()
+}
+
+#[inline]
+fn value_size(max_rules: u8) -> u32 {
+    u32::from(max_rules) * RULE_SIZE as u32
+}
 
 /// Which address in the packet is matched against the capture set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -151,11 +299,13 @@ impl MatchField {
 pub struct CaptureConfig {
     /// Which address to match. See [`MatchField`].
     pub match_field: MatchField,
-    /// Also capture ARP whose protocol address is in the v4 set. Required for
-    /// a captured IPv4 address to be reachable at all.
+    /// Also capture ARP whose protocol address is in the v4 set with a
+    /// [`Rule::Any`]. Required for a captured IPv4 address to be reachable at
+    /// all.
     pub arp: bool,
-    /// When adding a `/128`, also capture its solicited-node multicast address
-    /// so IPv6 neighbor discovery reaches userspace.
+    /// When adding a `/128` with a [`Rule::Any`], also capture its
+    /// solicited-node multicast address so IPv6 neighbor discovery reaches
+    /// userspace.
     pub neighbor_discovery: bool,
     /// Verdict for traffic that matches nothing.
     ///
@@ -175,6 +325,10 @@ pub struct CaptureConfig {
     pub min_prefix_v6: u8,
     /// Capacity of each address-family trie.
     pub max_prefixes: u32,
+    /// How many [`Rule`]s one prefix can hold, 1 to
+    /// [`MAX_RULES_PER_PREFIX`]. Sets the trie value size and how far the
+    /// in-program rule check is unrolled, so it cannot change after attach.
+    pub max_rules_per_prefix: u8,
     /// XSKMAP slots, i.e. the highest NIC queue index that can be bound.
     pub max_queues: u32,
 }
@@ -193,6 +347,7 @@ impl Default for CaptureConfig {
             min_prefix_v4: 1,
             min_prefix_v6: 1,
             max_prefixes: 1024,
+            max_rules_per_prefix: 8,
             max_queues: 64,
         }
     }
@@ -204,7 +359,8 @@ impl CaptureConfig {
         if self.min_prefix_v4 == 0 || self.min_prefix_v6 == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "xdp: min_prefix_v4/min_prefix_v6 must be at least 1; a /0                  matches every packet on the interface",
+                "xdp: min_prefix_v4/min_prefix_v6 must be at least 1; a /0 \
+                 matches every packet on the interface",
             ));
         }
         if self.min_prefix_v4 > 32 {
@@ -232,6 +388,15 @@ impl CaptureConfig {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "xdp: max_prefixes and max_queues must be non-zero",
+            ));
+        }
+        if self.max_rules_per_prefix == 0 || self.max_rules_per_prefix > MAX_RULES_PER_PREFIX {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "xdp: max_rules_per_prefix is {}, must be 1-{MAX_RULES_PER_PREFIX}",
+                    self.max_rules_per_prefix
+                ),
             ));
         }
         Ok(())
@@ -297,7 +462,8 @@ fn check_coverage(held: &[IpPrefix], new: IpPrefix) -> Result<()> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "xdp: refusing to capture {new}: it would leave the capture set                  covering every {} address on the interface",
+                "xdp: refusing to capture {new}: it would leave the capture set \
+                 covering every {} address on the interface",
                 if v4 { "IPv4" } else { "IPv6" }
             ),
         ));
@@ -310,19 +476,20 @@ fn check_coverage(held: &[IpPrefix], new: IpPrefix) -> Result<()> {
 pub struct CaptureMaps {
     /// Queue index -> AF_XDP socket.
     pub xskmap: Map,
-    /// IPv4 prefixes to capture.
+    /// IPv4 prefixes to capture. The value is the prefix's packed rule list.
     pub v4: Map,
-    /// IPv6 prefixes to capture.
+    /// IPv6 prefixes to capture, likewise.
     pub v6: Map,
 }
 
 impl CaptureMaps {
     /// Create the three maps a capture program needs.
     pub fn create(cfg: &CaptureConfig) -> Result<CaptureMaps> {
+        let value = value_size(cfg.max_rules_per_prefix);
         Ok(CaptureMaps {
             xskmap: Map::xskmap(cfg.max_queues)?,
-            v4: Map::lpm_trie(4, 4, cfg.max_prefixes)?,
-            v6: Map::lpm_trie(16, 4, cfg.max_prefixes)?,
+            v4: Map::lpm_trie(4, value, cfg.max_prefixes)?,
+            v6: Map::lpm_trie(16, value, cfg.max_prefixes)?,
         })
     }
 }
@@ -348,18 +515,130 @@ fn stage_v6(asm: &mut Asm, slot: i16, pkt_off: i16) {
     }
 }
 
-/// `if (bpf_map_lookup_elem(map, stack + slot)) goto hit`.
-fn lookup(asm: &mut Asm, map_fd: i32, slot: i16, hit: super::insn::Label) {
+/// Mark both port slots "unreadable". The transport staging below overwrites
+/// them only once it has proven a transport header is there.
+fn stage_no_ports(asm: &mut Asm) {
+    asm.emit(Insn::st_imm(Size::W, R10, L4_DPORT, NO_PORT));
+    asm.emit(Insn::st_imm(Size::W, R10, L4_SPORT, NO_PORT));
+}
+
+/// Copy the two ports at `l4` (a register holding a packet pointer whose
+/// first 4 bytes are verified in bounds) into their slots.
+fn stage_ports(asm: &mut Asm, l4: u8) {
+    asm.emit(Insn::ldx(Size::H, R3, l4, 0));
+    asm.emit(Insn::stx(Size::W, R10, L4_SPORT, R3));
+    asm.emit(Insn::ldx(Size::H, R3, l4, 2));
+    asm.emit(Insn::stx(Size::W, R10, L4_DPORT, R3));
+}
+
+/// Stage protocol and ports from an IPv4 packet whose minimum header is
+/// already in bounds.
+///
+/// The transport header sits at `ihl * 4`, a variable offset the verifier
+/// accepts because `ihl` is masked to four bits before it is added to the
+/// packet pointer. A non-first fragment carries no transport header, and
+/// neither does a packet whose `ihl` is short of the fixed header, so both
+/// keep the `NO_PORT` markers.
+fn stage_v4_l4(asm: &mut Asm) {
+    let l_done = asm.label();
+    stage_no_ports(asm);
+    asm.emit(Insn::ldx(Size::B, R1, R7, IPV4_PROTO));
+    asm.emit(Insn::stx(Size::W, R10, L4_PROTO, R1));
+
+    asm.emit(Insn::ldx(Size::H, R1, R7, IPV4_FRAG));
+    asm.jump(
+        Insn::jmp_imm(Jmp::JSET, R1, host_be16(IPV4_FRAG_OFF_MASK), 0),
+        l_done,
+    );
+
+    asm.emit(Insn::ldx(Size::B, R2, R7, ETH_HLEN as i16));
+    asm.emit(Insn::and64_imm(R2, 0x0f));
+    asm.emit(Insn::lsh64_imm(R2, 2));
+    asm.jump(Insn::jmp_imm(Jmp::JLT, R2, IPV4_MIN - ETH_HLEN, 0), l_done);
+    // r1 = data + 14 + ihl*4; verify 4 bytes there before reading them.
+    asm.emit(Insn::mov64_reg(R1, R7));
+    asm.emit(Insn::add64_imm(R1, ETH_HLEN));
+    asm.emit(Insn::add64_reg(R1, R2));
+    asm.emit(Insn::mov64_reg(R3, R1));
+    asm.emit(Insn::add64_imm(R3, 4));
+    asm.jump(Insn::jmp_reg(Jmp::JGT, R3, R8, 0), l_done);
+    stage_ports(asm, R1);
+    asm.place(l_done);
+}
+
+/// Stage protocol and ports from an IPv6 packet whose fixed header is already
+/// in bounds. Extension headers are not walked (see the module docs), so the
+/// ports are wherever a directly-following TCP/UDP header would put them.
+fn stage_v6_l4(asm: &mut Asm) {
+    let l_done = asm.label();
+    stage_no_ports(asm);
+    asm.emit(Insn::ldx(Size::B, R1, R7, IPV6_NEXT));
+    asm.emit(Insn::stx(Size::W, R10, L4_PROTO, R1));
+    need_bytes(asm, IPV6_MIN + 4, l_done);
+    asm.emit(Insn::mov64_reg(R1, R7));
+    asm.emit(Insn::add64_imm(R1, IPV6_MIN));
+    stage_ports(asm, R1);
+    asm.place(l_done);
+}
+
+/// `if (!bpf_map_lookup_elem(map, stack + slot)) goto miss`, leaving the
+/// value pointer in `r0`.
+fn lookup(asm: &mut Asm, map_fd: i32, slot: i16, miss: Label) {
     asm.emit_all(&ld_map_fd(R1, map_fd));
     asm.emit(Insn::mov64_reg(R2, R10));
     asm.emit(Insn::add64_imm(R2, slot as i32));
     asm.emit(Insn::call(BPF_FUNC_MAP_LOOKUP_ELEM));
-    asm.jump(Insn::jmp_imm(Jmp::JNE, R0, 0, 0), hit);
+    asm.jump(Insn::jmp_imm(Jmp::JEQ, R0, 0, 0), miss);
+}
+
+/// Walk the rule list `r0` points at: `goto hit` on the first rule the packet
+/// satisfies, `goto miss` once none does.
+///
+/// `port_slot` names the port the packet is judged on — [`L4_DPORT`] after a
+/// destination-address hit, [`L4_SPORT`] after a source one. `None` is the ARP
+/// branch, where only a [`Rule::Any`] can match: there is no transport header
+/// to judge anything else on, and a narrower rule leaves ARP to the host.
+fn match_rules(asm: &mut Asm, max_rules: u8, port_slot: Option<i16>, hit: Label, miss: Label) {
+    if let Some(slot) = port_slot {
+        asm.emit(Insn::ldx(Size::W, R3, R10, L4_PROTO));
+        asm.emit(Insn::ldx(Size::W, R4, R10, slot));
+    }
+    for i in 0..max_rules as i16 {
+        let next = asm.label();
+        let off = i * RULE_SIZE as i16;
+        asm.emit(Insn::ldx(Size::B, R1, R0, off));
+        asm.jump(Insn::jmp_imm(Jmp::JEQ, R1, KIND_END as i32, 0), miss);
+        asm.jump(Insn::jmp_imm(Jmp::JEQ, R1, KIND_ANY as i32, 0), hit);
+        if port_slot.is_some() {
+            asm.emit(Insn::ldx(Size::B, R2, R0, off + 1));
+            asm.jump(Insn::jmp_reg(Jmp::JNE, R2, R3, 0), next);
+            asm.jump(Insn::jmp_imm(Jmp::JEQ, R1, KIND_PROTO as i32, 0), hit);
+            asm.emit(Insn::ldx(Size::H, R2, R0, off + 2));
+            asm.jump(Insn::jmp_reg(Jmp::JEQ, R2, R4, 0), hit);
+        }
+        asm.place(next);
+    }
+    asm.jump(Insn::ja(0), miss);
+}
+
+/// One trie lookup followed by its rule check: falls through on a miss.
+fn lookup_and_match(
+    asm: &mut Asm,
+    cfg: &CaptureConfig,
+    map_fd: i32,
+    slot: i16,
+    port_slot: Option<i16>,
+    hit: Label,
+) {
+    let miss = asm.label();
+    lookup(asm, map_fd, slot, miss);
+    match_rules(asm, cfg.max_rules_per_prefix, port_slot, hit, miss);
+    asm.place(miss);
 }
 
 /// `if (data + n > data_end) goto miss` — the bounds check the verifier
 /// requires before every packet read.
-fn need_bytes(asm: &mut Asm, n: i32, miss: super::insn::Label) {
+fn need_bytes(asm: &mut Asm, n: i32, miss: Label) {
     asm.emit(Insn::mov64_reg(R1, R7));
     asm.emit(Insn::add64_imm(R1, n));
     asm.jump(Insn::jmp_reg(Jmp::JGT, R1, R8, 0), miss);
@@ -421,9 +700,13 @@ fn build_program_with_fds(
     }
     asm.jump(Insn::ja(0), l_default);
 
+    // Every packet read in a branch happens before its first lookup: the
+    // transport fields and both keys are staged, then the lookups run.
+
     // --- IPv4 ---
     asm.place(l_v4);
     need_bytes(&mut asm, IPV4_MIN, l_default);
+    stage_v4_l4(&mut asm);
     if cfg.match_field.wants_dst() {
         stage_v4(&mut asm, V4_DST_KEY, IPV4_DST);
     }
@@ -431,16 +714,17 @@ fn build_program_with_fds(
         stage_v4(&mut asm, V4_SRC_KEY, IPV4_SRC);
     }
     if cfg.match_field.wants_dst() {
-        lookup(&mut asm, v4_fd, V4_DST_KEY, l_redirect);
+        lookup_and_match(&mut asm, cfg, v4_fd, V4_DST_KEY, Some(L4_DPORT), l_redirect);
     }
     if cfg.match_field.wants_src() {
-        lookup(&mut asm, v4_fd, V4_SRC_KEY, l_redirect);
+        lookup_and_match(&mut asm, cfg, v4_fd, V4_SRC_KEY, Some(L4_SPORT), l_redirect);
     }
     asm.jump(Insn::ja(0), l_default);
 
     // --- IPv6 ---
     asm.place(l_v6);
     need_bytes(&mut asm, IPV6_MIN, l_default);
+    stage_v6_l4(&mut asm);
     if cfg.match_field.wants_dst() {
         stage_v6(&mut asm, V6_DST_KEY, IPV6_DST);
     }
@@ -448,10 +732,10 @@ fn build_program_with_fds(
         stage_v6(&mut asm, V6_SRC_KEY, IPV6_SRC);
     }
     if cfg.match_field.wants_dst() {
-        lookup(&mut asm, v6_fd, V6_DST_KEY, l_redirect);
+        lookup_and_match(&mut asm, cfg, v6_fd, V6_DST_KEY, Some(L4_DPORT), l_redirect);
     }
     if cfg.match_field.wants_src() {
-        lookup(&mut asm, v6_fd, V6_SRC_KEY, l_redirect);
+        lookup_and_match(&mut asm, cfg, v6_fd, V6_SRC_KEY, Some(L4_SPORT), l_redirect);
     }
     asm.jump(Insn::ja(0), l_default);
 
@@ -474,10 +758,10 @@ fn build_program_with_fds(
             stage_v4(&mut asm, V4_SRC_KEY, ARP_SPA);
         }
         if cfg.match_field.wants_dst() {
-            lookup(&mut asm, v4_fd, V4_DST_KEY, l_redirect);
+            lookup_and_match(&mut asm, cfg, v4_fd, V4_DST_KEY, None, l_redirect);
         }
         if cfg.match_field.wants_src() {
-            lookup(&mut asm, v4_fd, V4_SRC_KEY, l_redirect);
+            lookup_and_match(&mut asm, cfg, v4_fd, V4_SRC_KEY, None, l_redirect);
         }
         asm.jump(Insn::ja(0), l_default);
     }
@@ -501,6 +785,13 @@ fn build_program_with_fds(
     asm.build()
 }
 
+/// One prefix in the set and the rules the caller gave it.
+#[derive(Debug, Clone)]
+struct Entry {
+    prefix: IpPrefix,
+    rules: Vec<Rule>,
+}
+
 /// A loaded, attached capture program together with the maps that drive it.
 ///
 /// Dropping this detaches the program and frees the maps.
@@ -510,9 +801,10 @@ pub struct Capture {
     _prog: Program,
     link: Link,
     cfg: CaptureConfig,
-    /// Prefixes the caller added, kept so a removal can tell whether a derived
-    /// entry (a solicited-node multicast address) is still needed.
-    prefixes: Mutex<Vec<IpPrefix>>,
+    /// What the caller added, kept so a removal can tell whether a derived
+    /// entry (a solicited-node multicast address) is still needed, and so a
+    /// rule can be added to a prefix without reading the trie back.
+    entries: Mutex<Vec<Entry>>,
 }
 
 impl Capture {
@@ -531,7 +823,7 @@ impl Capture {
             _prog: prog,
             link,
             cfg,
-            prefixes: Mutex::new(Vec::new()),
+            entries: Mutex::new(Vec::new()),
         })
     }
 
@@ -547,77 +839,156 @@ impl Capture {
         &self.maps.xskmap
     }
 
-    /// Start capturing `prefix`. Idempotent.
+    /// Start capturing everything for `prefix`: [`Capture::add_rule`] with
+    /// [`Rule::Any`]. Idempotent.
     ///
     /// Refuses anything broader than [`CaptureConfig::min_prefix_v4`] /
     /// [`CaptureConfig::min_prefix_v6`], and refuses any prefix that would
     /// leave the set covering a whole address family. Nothing reaches the
     /// kernel until both checks pass, so a rejected call changes nothing.
     pub fn add(&self, prefix: IpPrefix) -> Result<()> {
+        self.add_rule(prefix, Rule::Any)
+    }
+
+    /// Start capturing the traffic `rule` selects for `prefix`. Idempotent
+    /// per rule; a prefix accumulates rules up to
+    /// [`CaptureConfig::max_rules_per_prefix`].
+    ///
+    /// The prefix checks of [`Capture::add`] apply whatever the rule.
+    pub fn add_rule(&self, prefix: IpPrefix, rule: Rule) -> Result<()> {
         let prefix = prefix.masked();
         self.cfg.check_prefix(prefix)?;
+        rule.validate()?;
 
-        let mut held = self.prefixes.lock().unwrap();
-        if held.contains(&prefix) {
-            return Ok(());
+        let mut held = self.entries.lock().unwrap();
+        match held.iter().position(|e| e.prefix == prefix) {
+            Some(i) => {
+                if held[i].rules.contains(&rule) {
+                    return Ok(());
+                }
+                if held[i].rules.len() >= usize::from(self.cfg.max_rules_per_prefix) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "xdp: {prefix} already holds {} rules, the configured maximum",
+                            held[i].rules.len()
+                        ),
+                    ));
+                }
+                let mut rules = held[i].rules.clone();
+                rules.push(rule);
+                self.write(prefix, &rules)?;
+                held[i].rules = rules;
+            }
+            None => {
+                let prefixes: Vec<IpPrefix> = held.iter().map(|e| e.prefix).collect();
+                check_coverage(&prefixes, prefix)?;
+                self.write(prefix, &[rule])?;
+                held.push(Entry {
+                    prefix,
+                    rules: vec![rule],
+                });
+            }
         }
-        check_coverage(&held, prefix)?;
-
-        self.insert(prefix)?;
-        if let Some(sn) = self.solicited_node(prefix) {
-            // Derived entries are always /128, so they cannot move coverage.
-            self.insert(sn)?;
+        if rule == Rule::Any
+            && let Some(sn) = self.solicited_node(prefix)
+        {
+            self.sync_solicited_node(&held, sn)?;
         }
-        held.push(prefix);
         Ok(())
     }
 
-    /// Stop capturing `prefix`. Returns `false` if it was not in the set.
+    /// Stop capturing `prefix` under every rule. Returns `false` if it was not
+    /// in the set.
     pub fn remove(&self, prefix: IpPrefix) -> Result<bool> {
         let prefix = prefix.masked();
-        let mut held = self.prefixes.lock().unwrap();
-        let had = match held.iter().position(|p| *p == prefix) {
+        let mut held = self.entries.lock().unwrap();
+        let had = match held.iter().position(|e| e.prefix == prefix) {
             Some(i) => {
                 held.remove(i);
                 true
             }
             None => false,
         };
-
-        if let Some(sn) = self.solicited_node(prefix) {
-            // Two addresses can share a solicited-node group (it is derived
-            // from the low 24 bits), so only drop it once nothing needs it —
-            // including a caller who added that group address in its own right.
-            let still_needed = held
-                .iter()
-                .any(|p| *p == sn || self.solicited_node(*p) == Some(sn));
-            if !still_needed {
-                self.map_for(sn).delete(lpm_key(sn).as_bytes())?;
-            }
-        }
-        drop(held);
-
         let removed = self.map_for(prefix).delete(lpm_key(prefix).as_bytes())?;
+        self.after_removal(&held, prefix)?;
         Ok(had || removed)
     }
 
-    /// True if `addr` is matched by the capture set.
+    /// Stop capturing what `rule` selects for `prefix`, leaving its other
+    /// rules in place. Returns `false` if the prefix did not hold that rule.
+    pub fn remove_rule(&self, prefix: IpPrefix, rule: Rule) -> Result<bool> {
+        let prefix = prefix.masked();
+        let mut held = self.entries.lock().unwrap();
+        let Some(i) = held.iter().position(|e| e.prefix == prefix) else {
+            return Ok(false);
+        };
+        let Some(r) = held[i].rules.iter().position(|r| *r == rule) else {
+            return Ok(false);
+        };
+        let mut rules = held[i].rules.clone();
+        rules.remove(r);
+        if rules.is_empty() {
+            self.map_for(prefix).delete(lpm_key(prefix).as_bytes())?;
+            held.remove(i);
+        } else {
+            self.write(prefix, &rules)?;
+            held[i].rules = rules;
+        }
+        if rule == Rule::Any {
+            self.after_removal(&held, prefix)?;
+        }
+        Ok(true)
+    }
+
+    /// True if `addr` is matched by the capture set under any rule.
     pub fn contains(&self, addr: IpAddr) -> Result<bool> {
+        Ok(!self.rules_for(addr)?.is_empty())
+    }
+
+    /// The rules the kernel-side set applies to `addr`: those of the longest
+    /// prefix containing it, or none if nothing does.
+    pub fn rules_for(&self, addr: IpAddr) -> Result<Vec<Rule>> {
         let full = IpPrefix::new(addr, if addr.is_ipv4() { 32 } else { 128 });
-        let mut out = [0u8; 4];
-        self.map_for(full)
-            .lookup(lpm_key(full).as_bytes(), &mut out)
+        let mut out = vec![0u8; value_size(self.cfg.max_rules_per_prefix) as usize];
+        if self
+            .map_for(full)
+            .lookup(lpm_key(full).as_bytes(), &mut out)?
+        {
+            Ok(decode_rules(&out))
+        } else {
+            Ok(Vec::new())
+        }
     }
 
-    /// The prefixes added through [`Capture::add`], excluding derived entries.
+    /// The prefixes added through [`Capture::add`] / [`Capture::add_rule`],
+    /// excluding derived entries.
     pub fn prefixes(&self) -> Vec<IpPrefix> {
-        self.prefixes.lock().unwrap().clone()
+        self.entries
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| e.prefix)
+            .collect()
     }
 
-    fn insert(&self, prefix: IpPrefix) -> Result<()> {
+    /// The rules added for `prefix`, in insertion order; empty if it is not
+    /// in the set.
+    pub fn rules(&self, prefix: IpPrefix) -> Vec<Rule> {
+        let prefix = prefix.masked();
+        self.entries
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|e| e.prefix == prefix)
+            .map(|e| e.rules.clone())
+            .unwrap_or_default()
+    }
+
+    fn write(&self, prefix: IpPrefix, rules: &[Rule]) -> Result<()> {
         self.map_for(prefix).update(
             lpm_key(prefix).as_bytes(),
-            &1u32.to_ne_bytes(),
+            &encode_rules(rules, self.cfg.max_rules_per_prefix),
             UpdateFlags::ANY,
         )
     }
@@ -628,6 +999,41 @@ impl Capture {
             &self.maps.v4
         } else {
             &self.maps.v6
+        }
+    }
+
+    /// Bring the derived entries `prefix` could have touched back in line: the
+    /// group it derives, and — if `prefix` is itself a solicited-node group
+    /// the caller had claimed — the group another `/128` may still need.
+    fn after_removal(&self, held: &[Entry], prefix: IpPrefix) -> Result<()> {
+        if let Some(sn) = self.solicited_node(prefix) {
+            self.sync_solicited_node(held, sn)?;
+        }
+        if is_solicited_node_group(prefix) {
+            self.sync_solicited_node(held, prefix)?;
+        }
+        Ok(())
+    }
+
+    /// Insert or delete the derived entry for the solicited-node group `sn`
+    /// according to whether any `/128` with a [`Rule::Any`] still derives it.
+    ///
+    /// A caller who added the group address in its own right owns it: its
+    /// rules stand, and it is neither overwritten nor deleted here.
+    fn sync_solicited_node(&self, held: &[Entry], sn: IpPrefix) -> Result<()> {
+        if held.iter().any(|e| e.prefix == sn) {
+            return Ok(());
+        }
+        // Two addresses can share a group (it is derived from the low 24
+        // bits), so it stays as long as any of them needs it.
+        let needed = held
+            .iter()
+            .any(|e| e.rules.contains(&Rule::Any) && self.solicited_node(e.prefix) == Some(sn));
+        if needed {
+            // Derived entries are always /128, so they cannot move coverage.
+            self.write(sn, &[Rule::Any])
+        } else {
+            self.map_for(sn).delete(lpm_key(sn).as_bytes()).map(|_| ())
         }
     }
 
@@ -656,11 +1062,25 @@ pub fn solicited_node_multicast(addr: Ipv6Addr) -> Ipv6Addr {
     Ipv6Addr::from(sn)
 }
 
+/// True if `prefix` is a single address inside `ff02::1:ff00:0/104`.
+fn is_solicited_node_group(prefix: IpPrefix) -> bool {
+    match prefix.addr() {
+        IpAddr::V6(a) if prefix.bits() == 128 => {
+            let o = a.octets();
+            o[..13] == [0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0xff]
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::xdp::insn::{BPF_ADD, BPF_ALU64, BPF_JMP, BPF_K, BPF_STX};
     use std::net::Ipv4Addr;
+
+    const UDP: Protocol = Protocol::UDP;
+    const TCP: Protocol = Protocol::TCP;
 
     fn v4(a: [u8; 4], bits: u8) -> IpPrefix {
         IpPrefix::new(Ipv4Addr::from(a).into(), bits)
@@ -691,6 +1111,15 @@ mod tests {
             CaptureConfig {
                 arp: false,
                 match_field: MatchField::Src,
+                ..Default::default()
+            },
+            CaptureConfig {
+                max_rules_per_prefix: 1,
+                ..Default::default()
+            },
+            CaptureConfig {
+                max_rules_per_prefix: MAX_RULES_PER_PREFIX,
+                match_field: MatchField::Either,
                 ..Default::default()
             },
         ] {
@@ -1045,5 +1474,955 @@ mod tests {
     fn v4_prefix_round_trips_through_a_key() {
         let p = IpPrefix::new(Ipv4Addr::new(198, 51, 100, 7).into(), 32);
         assert_eq!(lpm_key(p).as_bytes()[4..], [198, 51, 100, 7]);
+    }
+
+    // --- rules ---
+
+    #[test]
+    fn a_port_rule_needs_tcp_or_udp() {
+        Rule::Port(TCP, 443).validate().unwrap();
+        Rule::Port(UDP, 53).validate().unwrap();
+        Rule::Proto(Protocol::ICMP).validate().unwrap();
+        Rule::Any.validate().unwrap();
+        for p in [Protocol::ICMP, Protocol::GRE, Protocol(132)] {
+            let e = Rule::Port(p, 80).validate().unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[test]
+    fn rules_round_trip_through_the_value() {
+        let rules = [Rule::Any, Rule::Proto(Protocol::GRE), Rule::Port(TCP, 443)];
+        let v = encode_rules(&rules, 8);
+        assert_eq!(v.len(), 32);
+        assert_eq!(decode_rules(&v), rules);
+        // The list is packed and END-terminated: the fourth slot stops the walk.
+        assert_eq!(v[12], KIND_END);
+    }
+
+    #[test]
+    fn a_port_is_stored_in_wire_order() {
+        // So `ldx H` sees the same bits from the value as from the packet.
+        assert_eq!(
+            Rule::Port(UDP, 0x1234).encode(),
+            [KIND_PORT, 17, 0x12, 0x34]
+        );
+    }
+
+    #[test]
+    fn an_empty_list_decodes_to_nothing() {
+        assert!(decode_rules(&encode_rules(&[], 4)).is_empty());
+    }
+
+    #[test]
+    fn value_size_follows_the_rule_cap() {
+        assert_eq!(value_size(1), 4);
+        assert_eq!(value_size(8), 32);
+        assert_eq!(value_size(MAX_RULES_PER_PREFIX), 256);
+    }
+
+    #[test]
+    fn the_rule_cap_is_bounded() {
+        for n in [0, MAX_RULES_PER_PREFIX + 1] {
+            assert!(
+                CaptureConfig {
+                    max_rules_per_prefix: n,
+                    ..Default::default()
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        CaptureConfig {
+            max_rules_per_prefix: MAX_RULES_PER_PREFIX,
+            ..Default::default()
+        }
+        .validate()
+        .unwrap();
+    }
+
+    #[test]
+    fn solicited_node_groups_are_recognised() {
+        let sn: Ipv6Addr = "ff02::1:ffad:beef".parse().unwrap();
+        assert!(is_solicited_node_group(IpPrefix::new(sn.into(), 128)));
+        assert!(!is_solicited_node_group(IpPrefix::new(sn.into(), 104)));
+        let other: Ipv6Addr = "ff02::16".parse().unwrap();
+        assert!(!is_solicited_node_group(IpPrefix::new(other.into(), 128)));
+        assert!(!is_solicited_node_group(v4([224, 0, 0, 1], 32)));
+    }
+
+    #[test]
+    fn rule_reads_stay_inside_the_value() {
+        // Every load off r0 (the map value) must be within value_size, or the
+        // verifier rejects the program.
+        for n in [1u8, 3, 8, MAX_RULES_PER_PREFIX] {
+            let cfg = CaptureConfig {
+                max_rules_per_prefix: n,
+                match_field: MatchField::Either,
+                ..Default::default()
+            };
+            let size = value_size(n) as i16;
+            for i in program(&cfg) {
+                if i.code & 0x07 == 0x01 && (i.regs >> 4) == R0 {
+                    let width = match Size(i.code & 0x18) {
+                        Size::B => 1,
+                        Size::H => 2,
+                        Size::W => 4,
+                        _ => 8,
+                    };
+                    assert!(
+                        i.off >= 0 && i.off + width <= size,
+                        "read at {} past {size}",
+                        i.off
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_arp_branch_never_compares_a_protocol() {
+        // ARP has no transport header: its rule walk may only look at kinds.
+        let p = program(&CaptureConfig {
+            match_field: MatchField::Dst,
+            ..Default::default()
+        });
+        let arp = p
+            .iter()
+            .position(|i| *i == Insn::ldx(Size::H, R2, R7, ARP_PTYPE))
+            .expect("arp branch present");
+        let redirect = p
+            .iter()
+            .position(|i| *i == Insn::call(BPF_FUNC_REDIRECT_MAP))
+            .unwrap();
+        for i in &p[arp..redirect] {
+            assert_ne!(*i, Insn::ldx(Size::W, R3, R10, L4_PROTO));
+            assert_ne!(*i, Insn::ldx(Size::B, R2, R0, 1));
+        }
+    }
+
+    #[test]
+    fn transport_slots_are_staged_before_the_first_lookup() {
+        let p = program(&CaptureConfig::default());
+        let first_call = p
+            .iter()
+            .position(|i| *i == Insn::call(BPF_FUNC_MAP_LOOKUP_ELEM))
+            .unwrap();
+        let head = &p[..first_call];
+        for slot in [L4_DPORT, L4_SPORT] {
+            assert!(head.contains(&Insn::st_imm(Size::W, R10, slot, NO_PORT)));
+        }
+        assert!(head.contains(&Insn::stx(Size::W, R10, L4_PROTO, R1)));
+    }
+
+    // --- executing the program ---
+    //
+    // The verifier can only be consulted as root (see tests/xdp_kernel.rs).
+    // What can be checked here is that the instruction stream *means* what the
+    // codegen intends: a small interpreter runs it against synthetic frames and
+    // simulated maps, and the verdicts have to come out right.
+
+    mod vm {
+        use super::*;
+
+        const PKT: u64 = 0x1000_0000;
+        const STACK_TOP: u64 = 0x2000_0200;
+        const VALUE: u64 = 0x3000_0000;
+        const CTX: u64 = 0x4000_0000;
+        const MAP: u64 = 0x5000_0000;
+
+        pub const XSK_FD: i32 = 10;
+        pub const V4_FD: i32 = 11;
+        pub const V6_FD: i32 = 12;
+
+        pub struct Trie {
+            pub addr_len: usize,
+            /// `(prefixlen, address, value)`
+            pub entries: Vec<(u32, Vec<u8>, Vec<u8>)>,
+        }
+
+        impl Trie {
+            fn lookup(&self, key: &[u8]) -> Option<&[u8]> {
+                assert_eq!(key.len(), 4 + self.addr_len, "key does not fit this trie");
+                let bits = u32::from_ne_bytes(key[..4].try_into().unwrap());
+                let addr = &key[4..];
+                self.entries
+                    .iter()
+                    .filter(|(plen, paddr, _)| *plen <= bits && prefix_eq(paddr, addr, *plen))
+                    .max_by_key(|(plen, _, _)| *plen)
+                    .map(|(_, _, v)| v.as_slice())
+            }
+        }
+
+        fn prefix_eq(a: &[u8], b: &[u8], bits: u32) -> bool {
+            let full = (bits / 8) as usize;
+            if a[..full] != b[..full] {
+                return false;
+            }
+            let rem = bits % 8;
+            rem == 0 || {
+                let mask = 0xffu8 << (8 - rem);
+                a[full] & mask == b[full] & mask
+            }
+        }
+
+        pub struct Vm<'a> {
+            pub v4: Trie,
+            pub v6: Trie,
+            pub xsk_queues: Vec<u32>,
+            pub rx_queue: u32,
+            pkt: &'a [u8],
+            stack: [u8; 512],
+            value: Vec<u8>,
+            ctx: [u8; 20],
+            regs: [u64; 11],
+        }
+
+        impl<'a> Vm<'a> {
+            pub fn new(pkt: &'a [u8], v4: Trie, v6: Trie) -> Vm<'a> {
+                Vm {
+                    v4,
+                    v6,
+                    xsk_queues: vec![0],
+                    rx_queue: 0,
+                    pkt,
+                    stack: [0; 512],
+                    value: Vec::new(),
+                    ctx: [0; 20],
+                    regs: [0; 11],
+                }
+            }
+
+            fn mem(&mut self, addr: u64, len: usize) -> &mut [u8] {
+                // Packet memory is read-only to the program and is served by
+                // `load`; a write there is a codegen bug.
+                let (base, buf): (u64, &mut [u8]) = if (STACK_TOP - 512..STACK_TOP).contains(&addr)
+                {
+                    (STACK_TOP - 512, &mut self.stack[..])
+                } else if (VALUE..VALUE + self.value.len() as u64).contains(&addr) {
+                    (VALUE, &mut self.value[..])
+                } else if (CTX..CTX + 20).contains(&addr) {
+                    (CTX, &mut self.ctx[..])
+                } else {
+                    panic!("access to unmapped address {addr:#x}")
+                };
+                let off = (addr - base) as usize;
+                assert!(off + len <= buf.len(), "access past the end of a region");
+                &mut buf[off..off + len]
+            }
+
+            fn load(&mut self, addr: u64, len: usize) -> u64 {
+                let mut b = [0u8; 8];
+                if (PKT..PKT + self.pkt.len() as u64).contains(&addr) {
+                    let off = (addr - PKT) as usize;
+                    assert!(
+                        off + len <= self.pkt.len(),
+                        "packet read at {off}+{len} past data_end — the verifier would reject this"
+                    );
+                    b[..len].copy_from_slice(&self.pkt[off..off + len]);
+                } else {
+                    b[..len].copy_from_slice(self.mem(addr, len));
+                }
+                u64::from_ne_bytes(b)
+            }
+
+            fn store(&mut self, addr: u64, len: usize, v: u64) {
+                let b = v.to_ne_bytes();
+                self.mem(addr, len).copy_from_slice(&b[..len]);
+            }
+
+            fn call(&mut self, func: i32) {
+                match func {
+                    BPF_FUNC_MAP_LOOKUP_ELEM => {
+                        let fd = (self.regs[1] - MAP) as i32;
+                        let addr_len = match fd {
+                            V4_FD => 4,
+                            V6_FD => 16,
+                            _ => panic!("lookup on non-trie fd {fd}"),
+                        };
+                        let key = self.load_bytes(self.regs[2], 4 + addr_len);
+                        let trie = if fd == V4_FD { &self.v4 } else { &self.v6 };
+                        match trie.lookup(&key).map(<[u8]>::to_vec) {
+                            Some(v) => {
+                                self.value = v;
+                                self.regs[0] = VALUE;
+                            }
+                            None => self.regs[0] = 0,
+                        }
+                    }
+                    BPF_FUNC_REDIRECT_MAP => {
+                        assert_eq!(self.regs[1], MAP + XSK_FD as u64);
+                        let q = self.regs[2] as u32;
+                        self.regs[0] = if self.xsk_queues.contains(&q) {
+                            Action::REDIRECT.0 as u64
+                        } else {
+                            self.regs[3] & 0xf
+                        };
+                    }
+                    _ => panic!("unknown helper {func}"),
+                }
+                // r1-r5 are clobbered by a call.
+                for r in 1..=5 {
+                    self.regs[r] = 0xdead_beef_dead_beef;
+                }
+            }
+
+            fn load_bytes(&mut self, addr: u64, len: usize) -> Vec<u8> {
+                (0..len)
+                    .map(|i| self.load(addr + i as u64, 1) as u8)
+                    .collect()
+            }
+
+            /// Run `prog` to `exit` and return the verdict in r0.
+            pub fn run(&mut self, prog: &[Insn]) -> u32 {
+                let end = PKT + self.pkt.len() as u64;
+                self.ctx[..4].copy_from_slice(&(PKT as u32).to_ne_bytes());
+                self.ctx[4..8].copy_from_slice(&(end as u32).to_ne_bytes());
+                self.ctx[16..20].copy_from_slice(&self.rx_queue.to_ne_bytes());
+                self.regs[1] = CTX;
+                self.regs[10] = STACK_TOP;
+
+                let mut pc = 0usize;
+                let mut steps = 0;
+                loop {
+                    steps += 1;
+                    assert!(steps < 10_000, "program does not terminate");
+                    let i = prog[pc];
+                    let dst = (i.regs & 0x0f) as usize;
+                    let src = (i.regs >> 4) as usize;
+                    let class = i.code & 0x07;
+                    pc += 1;
+                    match class {
+                        0x00 => {
+                            // ld_map_fd, two slots.
+                            assert_eq!(i.code, 0x18);
+                            self.regs[dst] = MAP + i.imm as u64;
+                            pc += 1;
+                        }
+                        0x01 => {
+                            let len = width(i.code);
+                            let addr = self.regs[src].wrapping_add(i.off as i64 as u64);
+                            self.regs[dst] = self.load(addr, len);
+                        }
+                        0x02 | 0x03 => {
+                            let len = width(i.code);
+                            let addr = self.regs[dst].wrapping_add(i.off as i64 as u64);
+                            let v = if class == 0x02 {
+                                i.imm as u64
+                            } else {
+                                self.regs[src]
+                            };
+                            self.store(addr, len, v);
+                        }
+                        0x07 => {
+                            let operand = if i.code & 0x08 != 0 {
+                                self.regs[src]
+                            } else {
+                                i.imm as i64 as u64
+                            };
+                            match i.code & 0xf0 {
+                                0xb0 => self.regs[dst] = operand,
+                                0x00 => self.regs[dst] = self.regs[dst].wrapping_add(operand),
+                                0x50 => self.regs[dst] &= operand,
+                                0x60 => self.regs[dst] <<= operand,
+                                op => panic!("unsupported alu op {op:#x}"),
+                            }
+                        }
+                        0x05 => {
+                            let op = i.code & 0xf0;
+                            if op == 0x80 {
+                                self.call(i.imm);
+                                continue;
+                            }
+                            if op == 0x90 {
+                                return self.regs[0] as u32;
+                            }
+                            let a = self.regs[dst];
+                            let b = if i.code & 0x08 != 0 {
+                                self.regs[src]
+                            } else {
+                                i.imm as i64 as u64
+                            };
+                            let taken = match op {
+                                0x00 => true,
+                                0x10 => a == b,
+                                0x20 => a > b,
+                                0x30 => a >= b,
+                                0x40 => a & b != 0,
+                                0x50 => a != b,
+                                0xa0 => a < b,
+                                op => panic!("unsupported jump op {op:#x}"),
+                            };
+                            if taken {
+                                pc = (pc as isize + i.off as isize) as usize;
+                            }
+                        }
+                        c => panic!("unsupported class {c:#x}"),
+                    }
+                }
+            }
+        }
+
+        fn width(code: u8) -> usize {
+            match Size(code & 0x18) {
+                Size::B => 1,
+                Size::H => 2,
+                Size::W => 4,
+                _ => 8,
+            }
+        }
+    }
+
+    use vm::{Trie, Vm};
+
+    /// A trie populated from `(prefix, rules)` pairs exactly the way `Capture`
+    /// would populate the kernel's.
+    fn tries(cfg: &CaptureConfig, set: &[(IpPrefix, &[Rule])]) -> (Trie, Trie) {
+        let mut v4 = Trie {
+            addr_len: 4,
+            entries: Vec::new(),
+        };
+        let mut v6 = Trie {
+            addr_len: 16,
+            entries: Vec::new(),
+        };
+        for (prefix, rules) in set {
+            let key = lpm_key(*prefix);
+            let entry = (
+                u32::from(prefix.bits()),
+                key.as_bytes()[4..].to_vec(),
+                encode_rules(rules, cfg.max_rules_per_prefix),
+            );
+            if prefix.is_v4() {
+                v4.entries.push(entry);
+            } else {
+                v6.entries.push(entry);
+            }
+        }
+        (v4, v6)
+    }
+
+    fn verdict(cfg: &CaptureConfig, set: &[(IpPrefix, &[Rule])], pkt: &[u8]) -> u32 {
+        let prog = build_program_with_fds(cfg, vm::XSK_FD, vm::V4_FD, vm::V6_FD).unwrap();
+        let (v4, v6) = tries(cfg, set);
+        Vm::new(pkt, v4, v6).run(&prog)
+    }
+
+    const REDIRECT: u32 = Action::REDIRECT.0;
+    const PASS: u32 = Action::PASS.0;
+
+    fn eth(ethertype: u16, payload: &[u8]) -> Vec<u8> {
+        let mut f = vec![0x02, 0, 0, 0, 0, 1, 0x02, 0, 0, 0, 0, 2];
+        f.extend_from_slice(&ethertype.to_be_bytes());
+        f.extend_from_slice(payload);
+        f
+    }
+
+    /// An IPv4 header with `ihl` words (options zero-filled) and the given
+    /// flags/fragment-offset word, followed by `l4`.
+    fn ipv4_with(
+        proto: Protocol,
+        src: [u8; 4],
+        dst: [u8; 4],
+        ihl: u8,
+        frag: u16,
+        l4: &[u8],
+    ) -> Vec<u8> {
+        let mut h = vec![0u8; usize::from(ihl) * 4];
+        h[0] = 0x40 | ihl;
+        let total = (h.len() + l4.len()) as u16;
+        h[2..4].copy_from_slice(&total.to_be_bytes());
+        h[6..8].copy_from_slice(&frag.to_be_bytes());
+        h[8] = 64;
+        h[9] = proto.as_u8();
+        h[12..16].copy_from_slice(&src);
+        h[16..20].copy_from_slice(&dst);
+        h.extend_from_slice(l4);
+        eth(EtherType::IPV4.0, &h)
+    }
+
+    fn ipv4(proto: Protocol, src: [u8; 4], dst: [u8; 4], l4: &[u8]) -> Vec<u8> {
+        ipv4_with(proto, src, dst, 5, 0, l4)
+    }
+
+    fn ipv6(next: Protocol, src: &str, dst: &str, l4: &[u8]) -> Vec<u8> {
+        let mut h = vec![0u8; 40];
+        h[0] = 0x60;
+        h[4..6].copy_from_slice(&(l4.len() as u16).to_be_bytes());
+        h[6] = next.as_u8();
+        h[7] = 64;
+        h[8..24].copy_from_slice(&src.parse::<Ipv6Addr>().unwrap().octets());
+        h[24..40].copy_from_slice(&dst.parse::<Ipv6Addr>().unwrap().octets());
+        h.extend_from_slice(l4);
+        eth(EtherType::IPV6.0, &h)
+    }
+
+    /// The first four bytes of a TCP or UDP header, plus a little payload.
+    fn ports(sport: u16, dport: u16) -> Vec<u8> {
+        let mut l4 = Vec::new();
+        l4.extend_from_slice(&sport.to_be_bytes());
+        l4.extend_from_slice(&dport.to_be_bytes());
+        l4.extend_from_slice(&[0u8; 16]);
+        l4
+    }
+
+    fn arp(spa: [u8; 4], tpa: [u8; 4]) -> Vec<u8> {
+        let mut a = vec![0u8; 28];
+        a[..2].copy_from_slice(&1u16.to_be_bytes());
+        a[2..4].copy_from_slice(&EtherType::IPV4.0.to_be_bytes());
+        a[4] = 6;
+        a[5] = 4;
+        a[6..8].copy_from_slice(&1u16.to_be_bytes());
+        a[14..18].copy_from_slice(&spa);
+        a[24..28].copy_from_slice(&tpa);
+        eth(EtherType::ARP.0, &a)
+    }
+
+    const HOST: [u8; 4] = [10, 0, 0, 7];
+    const PEER: [u8; 4] = [10, 0, 0, 9];
+
+    #[test]
+    fn any_rule_takes_every_protocol_on_the_address() {
+        let cfg = CaptureConfig::default();
+        let set: &[(IpPrefix, &[Rule])] = &[(v4(HOST, 32), &[Rule::Any])];
+        assert_eq!(
+            verdict(&cfg, set, &ipv4(UDP, PEER, HOST, &ports(1, 2))),
+            REDIRECT
+        );
+        assert_eq!(
+            verdict(&cfg, set, &ipv4(TCP, PEER, HOST, &ports(1, 2))),
+            REDIRECT
+        );
+        assert_eq!(
+            verdict(&cfg, set, &ipv4(Protocol::ICMP, PEER, HOST, &[8, 0, 0, 0])),
+            REDIRECT
+        );
+        // Another address on the same wire is left alone.
+        assert_eq!(
+            verdict(&cfg, set, &ipv4(UDP, HOST, PEER, &ports(1, 2))),
+            PASS
+        );
+    }
+
+    #[test]
+    fn proto_rule_takes_one_protocol_only() {
+        let cfg = CaptureConfig::default();
+        let set: &[(IpPrefix, &[Rule])] = &[(v4(HOST, 32), &[Rule::Proto(UDP)])];
+        assert_eq!(
+            verdict(&cfg, set, &ipv4(UDP, PEER, HOST, &ports(1000, 53))),
+            REDIRECT
+        );
+        assert_eq!(
+            verdict(&cfg, set, &ipv4(TCP, PEER, HOST, &ports(1000, 53))),
+            PASS
+        );
+        assert_eq!(
+            verdict(&cfg, set, &ipv4(Protocol::ICMP, PEER, HOST, &[8, 0, 0, 0])),
+            PASS
+        );
+    }
+
+    #[test]
+    fn port_rule_takes_one_port_of_one_protocol() {
+        let cfg = CaptureConfig::default();
+        let set: &[(IpPrefix, &[Rule])] = &[(v4(HOST, 32), &[Rule::Port(UDP, 51820)])];
+        assert_eq!(
+            verdict(&cfg, set, &ipv4(UDP, PEER, HOST, &ports(4000, 51820))),
+            REDIRECT
+        );
+        // Right port, wrong protocol.
+        assert_eq!(
+            verdict(&cfg, set, &ipv4(TCP, PEER, HOST, &ports(4000, 51820))),
+            PASS
+        );
+        // Right protocol, wrong port.
+        assert_eq!(
+            verdict(&cfg, set, &ipv4(UDP, PEER, HOST, &ports(4000, 53))),
+            PASS
+        );
+        // The rule is about the captured endpoint's port, not the peer's.
+        assert_eq!(
+            verdict(&cfg, set, &ipv4(UDP, PEER, HOST, &ports(51820, 4000))),
+            PASS
+        );
+    }
+
+    #[test]
+    fn port_is_found_behind_ipv4_options() {
+        let cfg = CaptureConfig::default();
+        let set: &[(IpPrefix, &[Rule])] = &[(v4(HOST, 32), &[Rule::Port(TCP, 443)])];
+        for ihl in [5u8, 6, 8, 15] {
+            let f = ipv4_with(TCP, PEER, HOST, ihl, 0, &ports(4000, 443));
+            assert_eq!(verdict(&cfg, set, &f), REDIRECT, "ihl={ihl}");
+            let f = ipv4_with(TCP, PEER, HOST, ihl, 0, &ports(4000, 80));
+            assert_eq!(verdict(&cfg, set, &f), PASS, "ihl={ihl}");
+        }
+    }
+
+    #[test]
+    fn a_bogus_ihl_cannot_match_a_port() {
+        // ihl < 5 would put the "transport header" inside the IP header.
+        let cfg = CaptureConfig::default();
+        let set: &[(IpPrefix, &[Rule])] = &[(v4(HOST, 32), &[Rule::Port(TCP, 0x0a00)])];
+        // With ihl=4 the bytes at 14+16 would be the destination address —
+        // 10.0.0.7 — whose first two bytes spell port 0x0a00.
+        let mut f = ipv4_with(TCP, PEER, HOST, 5, 0, &ports(1, 2));
+        f[14] = 0x44;
+        assert_eq!(verdict(&cfg, set, &f), PASS);
+    }
+
+    #[test]
+    fn only_the_first_fragment_carries_a_port() {
+        let cfg = CaptureConfig::default();
+        let set: &[(IpPrefix, &[Rule])] = &[(v4(HOST, 32), &[Rule::Port(UDP, 53)])];
+        // First fragment: MF set, offset 0. Ports are there.
+        let f = ipv4_with(UDP, PEER, HOST, 5, 0x2000, &ports(4000, 53));
+        assert_eq!(verdict(&cfg, set, &f), REDIRECT);
+        // Later fragments: whatever the bytes at the transport offset are,
+        // they are payload, not a port.
+        let f = ipv4_with(UDP, PEER, HOST, 5, 0x2000 | 185, &ports(4000, 53));
+        assert_eq!(verdict(&cfg, set, &f), PASS);
+        let f = ipv4_with(UDP, PEER, HOST, 5, 185, &ports(4000, 53));
+        assert_eq!(verdict(&cfg, set, &f), PASS);
+        // A protocol rule on the same address still takes them.
+        let set: &[(IpPrefix, &[Rule])] = &[(v4(HOST, 32), &[Rule::Proto(UDP)])];
+        assert_eq!(verdict(&cfg, set, &f), REDIRECT);
+    }
+
+    #[test]
+    fn a_truncated_transport_header_cannot_match_a_port() {
+        let cfg = CaptureConfig::default();
+        let set: &[(IpPrefix, &[Rule])] =
+            &[(v4(HOST, 32), &[Rule::Port(UDP, 53), Rule::Proto(TCP)])];
+        // IP header complete, transport header missing entirely.
+        assert_eq!(verdict(&cfg, set, &ipv4(UDP, PEER, HOST, &[])), PASS);
+        // Or short by a byte.
+        assert_eq!(
+            verdict(&cfg, set, &ipv4(UDP, PEER, HOST, &[0x00, 0x35, 0x00])),
+            PASS
+        );
+        // The protocol rule does not need the transport header.
+        assert_eq!(verdict(&cfg, set, &ipv4(TCP, PEER, HOST, &[])), REDIRECT);
+    }
+
+    #[test]
+    fn the_rule_list_is_walked_in_full() {
+        let cfg = CaptureConfig::default();
+        let rules: &[Rule] = &[
+            Rule::Proto(Protocol::ICMP),
+            Rule::Port(TCP, 443),
+            Rule::Port(UDP, 53),
+            Rule::Port(TCP, 22),
+        ];
+        let set: &[(IpPrefix, &[Rule])] = &[(v4(HOST, 32), rules)];
+        assert_eq!(
+            verdict(&cfg, set, &ipv4(Protocol::ICMP, PEER, HOST, &[8, 0, 0, 0])),
+            REDIRECT
+        );
+        assert_eq!(
+            verdict(&cfg, set, &ipv4(TCP, PEER, HOST, &ports(1, 443))),
+            REDIRECT
+        );
+        assert_eq!(
+            verdict(&cfg, set, &ipv4(UDP, PEER, HOST, &ports(1, 53))),
+            REDIRECT
+        );
+        assert_eq!(
+            verdict(&cfg, set, &ipv4(TCP, PEER, HOST, &ports(1, 22))),
+            REDIRECT
+        );
+        assert_eq!(
+            verdict(&cfg, set, &ipv4(TCP, PEER, HOST, &ports(1, 80))),
+            PASS
+        );
+        assert_eq!(
+            verdict(&cfg, set, &ipv4(UDP, PEER, HOST, &ports(1, 443))),
+            PASS
+        );
+        assert_eq!(
+            verdict(&cfg, set, &ipv4(Protocol::GRE, PEER, HOST, &[0; 4])),
+            PASS
+        );
+    }
+
+    #[test]
+    fn a_full_rule_list_has_no_terminator_and_still_stops() {
+        let cfg = CaptureConfig {
+            max_rules_per_prefix: 2,
+            ..Default::default()
+        };
+        let rules: &[Rule] = &[Rule::Port(TCP, 1), Rule::Port(TCP, 2)];
+        let set: &[(IpPrefix, &[Rule])] = &[(v4(HOST, 32), rules)];
+        assert_eq!(
+            verdict(&cfg, set, &ipv4(TCP, PEER, HOST, &ports(9, 2))),
+            REDIRECT
+        );
+        assert_eq!(
+            verdict(&cfg, set, &ipv4(TCP, PEER, HOST, &ports(9, 3))),
+            PASS
+        );
+    }
+
+    #[test]
+    fn any_anywhere_in_the_list_wins() {
+        let cfg = CaptureConfig::default();
+        let rules: &[Rule] = &[Rule::Port(TCP, 1), Rule::Any];
+        let set: &[(IpPrefix, &[Rule])] = &[(v4(HOST, 32), rules)];
+        assert_eq!(
+            verdict(&cfg, set, &ipv4(Protocol::GRE, PEER, HOST, &[0; 4])),
+            REDIRECT
+        );
+    }
+
+    #[test]
+    fn src_match_judges_the_source_port() {
+        let cfg = CaptureConfig {
+            match_field: MatchField::Src,
+            ..Default::default()
+        };
+        let set: &[(IpPrefix, &[Rule])] = &[(v4(HOST, 32), &[Rule::Port(UDP, 51820)])];
+        // Replies from the captured service.
+        assert_eq!(
+            verdict(&cfg, set, &ipv4(UDP, HOST, PEER, &ports(51820, 4000))),
+            REDIRECT
+        );
+        // The captured host talking *to* someone's 51820 is not its service.
+        assert_eq!(
+            verdict(&cfg, set, &ipv4(UDP, HOST, PEER, &ports(4000, 51820))),
+            PASS
+        );
+        // And traffic addressed to it is not matched at all under Src.
+        assert_eq!(
+            verdict(&cfg, set, &ipv4(UDP, PEER, HOST, &ports(4000, 51820))),
+            PASS
+        );
+    }
+
+    #[test]
+    fn either_falls_through_to_the_source_lookup_after_a_port_mismatch() {
+        let cfg = CaptureConfig {
+            match_field: MatchField::Either,
+            ..Default::default()
+        };
+        let set: &[(IpPrefix, &[Rule])] = &[
+            (v4(HOST, 32), &[Rule::Port(UDP, 51820)]),
+            (v4(PEER, 32), &[Rule::Port(UDP, 4000)]),
+        ];
+        // dst=HOST hits but port 53 != 51820; src=PEER:4000 then matches.
+        assert_eq!(
+            verdict(&cfg, set, &ipv4(UDP, PEER, HOST, &ports(4000, 53))),
+            REDIRECT
+        );
+        // Neither endpoint's port is its captured one.
+        assert_eq!(
+            verdict(&cfg, set, &ipv4(UDP, PEER, HOST, &ports(5000, 53))),
+            PASS
+        );
+        // Both directions of the captured flow.
+        assert_eq!(
+            verdict(&cfg, set, &ipv4(UDP, PEER, HOST, &ports(9, 51820))),
+            REDIRECT
+        );
+        assert_eq!(
+            verdict(&cfg, set, &ipv4(UDP, HOST, PEER, &ports(51820, 9))),
+            REDIRECT
+        );
+    }
+
+    #[test]
+    fn a_subnet_rule_applies_to_every_address_in_it() {
+        let cfg = CaptureConfig::default();
+        let set: &[(IpPrefix, &[Rule])] = &[(v4([10, 0, 0, 0], 24), &[Rule::Port(TCP, 80)])];
+        assert_eq!(
+            verdict(&cfg, set, &ipv4(TCP, PEER, [10, 0, 0, 200], &ports(1, 80))),
+            REDIRECT
+        );
+        assert_eq!(
+            verdict(&cfg, set, &ipv4(TCP, PEER, [10, 0, 1, 200], &ports(1, 80))),
+            PASS
+        );
+        // A longer prefix inside carries its own rules, not the subnet's.
+        let set: &[(IpPrefix, &[Rule])] = &[
+            (v4([10, 0, 0, 0], 24), &[Rule::Port(TCP, 80)]),
+            (v4(HOST, 32), &[Rule::Port(TCP, 22)]),
+        ];
+        assert_eq!(
+            verdict(&cfg, set, &ipv4(TCP, PEER, HOST, &ports(1, 22))),
+            REDIRECT
+        );
+        assert_eq!(
+            verdict(&cfg, set, &ipv4(TCP, PEER, HOST, &ports(1, 80))),
+            PASS
+        );
+    }
+
+    #[test]
+    fn arp_is_captured_only_under_any() {
+        let cfg = CaptureConfig::default();
+        let who_has = arp(PEER, HOST);
+        let set: &[(IpPrefix, &[Rule])] = &[(v4(HOST, 32), &[Rule::Any])];
+        assert_eq!(verdict(&cfg, set, &who_has), REDIRECT);
+        // A shared address: the host stack keeps answering ARP for it.
+        let set: &[(IpPrefix, &[Rule])] = &[(v4(HOST, 32), &[Rule::Port(UDP, 51820)])];
+        assert_eq!(verdict(&cfg, set, &who_has), PASS);
+        let set: &[(IpPrefix, &[Rule])] = &[(v4(HOST, 32), &[Rule::Proto(UDP)])];
+        assert_eq!(verdict(&cfg, set, &who_has), PASS);
+        // Any later in the list still counts.
+        let set: &[(IpPrefix, &[Rule])] = &[(v4(HOST, 32), &[Rule::Proto(UDP), Rule::Any])];
+        assert_eq!(verdict(&cfg, set, &who_has), REDIRECT);
+        // ARP for someone else is never ours.
+        assert_eq!(verdict(&cfg, set, &arp(HOST, PEER)), PASS);
+    }
+
+    #[test]
+    fn arp_follows_the_sender_under_src() {
+        let cfg = CaptureConfig {
+            match_field: MatchField::Src,
+            ..Default::default()
+        };
+        let set: &[(IpPrefix, &[Rule])] = &[(v4(HOST, 32), &[Rule::Any])];
+        assert_eq!(verdict(&cfg, set, &arp(HOST, PEER)), REDIRECT);
+        assert_eq!(verdict(&cfg, set, &arp(PEER, HOST)), PASS);
+    }
+
+    #[test]
+    fn arp_is_off_when_disabled() {
+        let cfg = CaptureConfig {
+            arp: false,
+            ..Default::default()
+        };
+        let set: &[(IpPrefix, &[Rule])] = &[(v4(HOST, 32), &[Rule::Any])];
+        assert_eq!(verdict(&cfg, set, &arp(PEER, HOST)), PASS);
+    }
+
+    const HOST6: &str = "2001:db8::7";
+    const PEER6: &str = "2001:db8::9";
+
+    fn v6(addr: &str, bits: u8) -> IpPrefix {
+        IpPrefix::new(addr.parse::<Ipv6Addr>().unwrap().into(), bits)
+    }
+
+    #[test]
+    fn ipv6_rules_behave_like_ipv4_ones() {
+        let cfg = CaptureConfig::default();
+        let set: &[(IpPrefix, &[Rule])] = &[(v6(HOST6, 128), &[Rule::Port(UDP, 51820)])];
+        assert_eq!(
+            verdict(&cfg, set, &ipv6(UDP, PEER6, HOST6, &ports(4000, 51820))),
+            REDIRECT
+        );
+        assert_eq!(
+            verdict(&cfg, set, &ipv6(UDP, PEER6, HOST6, &ports(4000, 53))),
+            PASS
+        );
+        assert_eq!(
+            verdict(&cfg, set, &ipv6(TCP, PEER6, HOST6, &ports(4000, 51820))),
+            PASS
+        );
+        assert_eq!(
+            verdict(&cfg, set, &ipv6(UDP, HOST6, PEER6, &ports(51820, 4000))),
+            PASS
+        );
+
+        let set: &[(IpPrefix, &[Rule])] =
+            &[(v6("2001:db8::", 64), &[Rule::Proto(Protocol::ICMPV6)])];
+        assert_eq!(
+            verdict(
+                &cfg,
+                set,
+                &ipv6(Protocol::ICMPV6, PEER6, HOST6, &[128, 0, 0, 0])
+            ),
+            REDIRECT
+        );
+        assert_eq!(
+            verdict(&cfg, set, &ipv6(UDP, PEER6, HOST6, &ports(1, 2))),
+            PASS
+        );
+
+        let set: &[(IpPrefix, &[Rule])] = &[(v6(HOST6, 128), &[Rule::Any])];
+        assert_eq!(
+            verdict(&cfg, set, &ipv6(Protocol::GRE, PEER6, HOST6, &[0; 4])),
+            REDIRECT
+        );
+    }
+
+    #[test]
+    fn ipv6_extension_headers_are_not_walked() {
+        let cfg = CaptureConfig::default();
+        let set: &[(IpPrefix, &[Rule])] = &[(v6(HOST6, 128), &[Rule::Port(UDP, 53)])];
+        // A Fragment header (44) between the fixed header and UDP. Its first
+        // bytes are `next=17, reserved`; a naive read would see garbage ports.
+        let mut ext = vec![UDP.as_u8(), 0, 0, 53, 0, 0, 0, 1];
+        ext.extend_from_slice(&ports(4000, 53));
+        assert_eq!(
+            verdict(&cfg, set, &ipv6(Protocol(44), PEER6, HOST6, &ext)),
+            PASS
+        );
+        // Even one whose payload happens to spell the port where UDP's would be.
+        let mut ext = vec![UDP.as_u8(), 0];
+        ext.extend_from_slice(&53u16.to_be_bytes());
+        ext.extend_from_slice(&[0; 20]);
+        assert_eq!(
+            verdict(&cfg, set, &ipv6(Protocol(44), PEER6, HOST6, &ext)),
+            PASS
+        );
+        // A protocol rule for the extension header itself does match, since
+        // that is what the Next Header field says.
+        let set: &[(IpPrefix, &[Rule])] = &[(v6(HOST6, 128), &[Rule::Proto(Protocol(44))])];
+        assert_eq!(
+            verdict(&cfg, set, &ipv6(Protocol(44), PEER6, HOST6, &ext)),
+            REDIRECT
+        );
+    }
+
+    #[test]
+    fn frames_too_short_for_their_header_take_the_default() {
+        let cfg = CaptureConfig::default();
+        let set: &[(IpPrefix, &[Rule])] =
+            &[(v4(HOST, 32), &[Rule::Any]), (v6(HOST6, 128), &[Rule::Any])];
+        let f = ipv4(UDP, PEER, HOST, &ports(1, 2));
+        assert_eq!(verdict(&cfg, set, &f[..30]), PASS);
+        let f = ipv6(UDP, PEER6, HOST6, &ports(1, 2));
+        assert_eq!(verdict(&cfg, set, &f[..50]), PASS);
+        assert_eq!(verdict(&cfg, set, &f[..10]), PASS);
+        let f = arp(PEER, HOST);
+        assert_eq!(verdict(&cfg, set, &f[..40]), PASS);
+        // Exactly the fixed headers is enough for an address match.
+        let f = ipv4(UDP, PEER, HOST, &[]);
+        assert_eq!(verdict(&cfg, set, &f), REDIRECT);
+        let f = ipv6(UDP, PEER6, HOST6, &[]);
+        assert_eq!(verdict(&cfg, set, &f), REDIRECT);
+    }
+
+    #[test]
+    fn unmatched_traffic_takes_the_configured_default() {
+        let set: &[(IpPrefix, &[Rule])] = &[(v4(HOST, 32), &[Rule::Any])];
+        let f = ipv4(UDP, HOST, PEER, &ports(1, 2));
+        let drop = CaptureConfig {
+            default_action: Action::DROP,
+            ..Default::default()
+        };
+        assert_eq!(verdict(&drop, set, &f), Action::DROP.0);
+        assert_eq!(
+            verdict(&drop, set, &ipv4(UDP, PEER, HOST, &ports(1, 2))),
+            REDIRECT
+        );
+        assert_eq!(verdict(&CaptureConfig::default(), set, &f), PASS);
+        // Something that is neither IP nor ARP.
+        assert_eq!(verdict(&drop, set, &eth(0x88cc, &[0; 40])), Action::DROP.0);
+    }
+
+    #[test]
+    fn a_queue_with_no_socket_passes_to_the_host() {
+        let cfg = CaptureConfig::default();
+        let prog = build_program_with_fds(&cfg, vm::XSK_FD, vm::V4_FD, vm::V6_FD).unwrap();
+        let set: &[(IpPrefix, &[Rule])] = &[(v4(HOST, 32), &[Rule::Any])];
+        let (v4t, v6t) = tries(&cfg, set);
+        let f = ipv4(UDP, PEER, HOST, &ports(1, 2));
+        let mut vm = Vm::new(&f, v4t, v6t);
+        vm.xsk_queues = vec![0, 1];
+        vm.rx_queue = 3;
+        assert_eq!(vm.run(&prog), PASS);
+        vm.rx_queue = 1;
+        assert_eq!(vm.run(&prog), REDIRECT);
     }
 }

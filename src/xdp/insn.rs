@@ -44,6 +44,8 @@ pub const BPF_X: u8 = 0x08; // register operand
 // --- ALU / jump operations -------------------------------------------------
 
 pub const BPF_ADD: u8 = 0x00;
+pub const BPF_AND: u8 = 0x50;
+pub const BPF_LSH: u8 = 0x60;
 pub const BPF_MOV: u8 = 0xb0;
 
 /// Jump condition, encoded in the high nibble of `code`.
@@ -56,7 +58,10 @@ impl Jmp {
     pub const JEQ: Jmp = Jmp(0x10);
     pub const JGT: Jmp = Jmp(0x20);
     pub const JGE: Jmp = Jmp(0x30);
+    /// `if dst & imm`
+    pub const JSET: Jmp = Jmp(0x40);
     pub const JNE: Jmp = Jmp(0x50);
+    pub const JLT: Jmp = Jmp(0xa0);
 }
 
 pub const BPF_CALL: u8 = 0x80;
@@ -125,6 +130,36 @@ impl Insn {
     pub fn add64_imm(dst: u8, imm: i32) -> Insn {
         Insn {
             code: BPF_ALU64 | BPF_K | BPF_ADD,
+            regs: reg(dst, 0),
+            off: 0,
+            imm,
+        }
+    }
+
+    /// `dst += src`
+    pub fn add64_reg(dst: u8, src: u8) -> Insn {
+        Insn {
+            code: BPF_ALU64 | BPF_X | BPF_ADD,
+            regs: reg(dst, src),
+            off: 0,
+            imm: 0,
+        }
+    }
+
+    /// `dst &= imm`
+    pub fn and64_imm(dst: u8, imm: i32) -> Insn {
+        Insn {
+            code: BPF_ALU64 | BPF_K | BPF_AND,
+            regs: reg(dst, 0),
+            off: 0,
+            imm,
+        }
+    }
+
+    /// `dst <<= imm`
+    pub fn lsh64_imm(dst: u8, imm: i32) -> Insn {
+        Insn {
+            code: BPF_ALU64 | BPF_K | BPF_LSH,
             regs: reg(dst, 0),
             off: 0,
             imm,
@@ -357,6 +392,21 @@ mod tests {
             Insn::mov64_imm(R0, 2).to_bytes(),
             [0xb7, 0x00, 0, 0, 2, 0, 0, 0]
         );
+    }
+
+    #[test]
+    fn alu_encodings_match_the_uapi() {
+        // r2 &= 0x0f
+        assert_eq!(Insn::and64_imm(R2, 0x0f).code, 0x57);
+        // r2 <<= 2
+        assert_eq!(Insn::lsh64_imm(R2, 2).code, 0x67);
+        // r1 += r2
+        let i = Insn::add64_reg(R1, R2);
+        assert_eq!(i.code, 0x0f);
+        assert_eq!(i.regs, 0x21);
+        // if r1 & imm goto / if r2 < imm goto
+        assert_eq!(Insn::jmp_imm(Jmp::JSET, R1, 1, 0).code, 0x45);
+        assert_eq!(Insn::jmp_imm(Jmp::JLT, R2, 20, 0).code, 0xa5);
     }
 
     #[test]

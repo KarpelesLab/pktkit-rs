@@ -6,6 +6,36 @@ semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+### Added — XDP capture
+
+- **Per-prefix rules: protocol and port capture.** `xdp::Rule` selects, on a
+  captured prefix, everything (`Any`), one IP protocol (`Proto`), or one TCP
+  or UDP port (`Port`). `Capture::add_rule` / `remove_rule` /
+  `rules` / `rules_for` and the `Device::capture_add_rule` /
+  `capture_remove_rule` wrappers manage them; `Capture::add` is now
+  `add_rule(prefix, Rule::Any)`. The rule list lives in the trie value, so
+  the program checks it after an address hit without another lookup. The port
+  compared is the captured endpoint's: destination on a destination hit,
+  source on a source hit. A prefix with only narrow rules is assumed to be
+  shared with the host stack, which keeps its ARP and neighbor discovery.
+- `CaptureConfig::max_rules_per_prefix` (default 8, at most
+  `MAX_RULES_PER_PREFIX`) sizes the trie value and the unrolled rule walk.
+- IPv4 ports are read behind options (`ihl` is honoured) and never from a
+  non-first fragment. IPv6 extension headers are not walked: a port rule needs
+  TCP/UDP directly after the fixed header.
+- An eBPF interpreter in the unit tests executes the generated program
+  against synthetic IPv4, IPv6 and ARP frames and simulated maps, so the
+  codegen's verdicts are checked without root. The kernel tests in
+  `tests/xdp_kernel.rs` load every rule-cap variant through the verifier and
+  exercise a port rule on the host's own address end to end.
+
+### Changed — XDP capture
+
+- The `LPM_TRIE` value is now `max_rules_per_prefix * 4` bytes of packed
+  rules rather than a `u32` flag. Anything reading `CaptureMaps` directly, or
+  passing its own maps to `build_program`, has to match. The
+  `afxdp::ProgramSource::External` path is unaffected.
+
 ## [0.1.3](https://github.com/KarpelesLab/pktkit-rs/compare/v0.1.2...v0.1.3) - 2026-09-01
 
 ### Other
