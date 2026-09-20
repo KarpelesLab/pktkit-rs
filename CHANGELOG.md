@@ -6,6 +6,12 @@ semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+### Changed (breaking)
+
+- **purecrypto 0.9, MSRV 1.89.** purecrypto 0.9 needs Rust 1.89, so the
+  crate's minimum moves with it; a dependency-free build is held to the same
+  floor so there is one number to remember.
+
 ### Added — XDP capture
 
 - **Per-prefix rules: protocol and port capture.** `xdp::Rule` selects, on a

@@ -91,7 +91,7 @@ implementation cannot slip back in behind a default feature.
 
 ## Requirements
 
-Rust 1.88 or newer, edition 2024.
+Rust 1.89 or newer, edition 2024.
 
 ## Usage
 
