@@ -6,6 +6,11 @@ semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+## [0.1.4](https://github.com/KarpelesLab/pktkit-rs/compare/v0.1.3...v0.1.4) - 2026-09-19
+
+### Other
+
+- per-prefix capture rules for a protocol or a TCP/UDP port
 ### Changed (breaking)
 
 - **purecrypto 0.9, MSRV 1.89.** purecrypto 0.9 needs Rust 1.89, so the
