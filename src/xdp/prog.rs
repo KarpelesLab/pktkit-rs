@@ -5,7 +5,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use super::insn::{Insn, encode};
 use super::netlink;
-use super::sys::{self, LinkCreateAttr, ProgLoadAttr, bpf_cmd, ctx_err};
+use super::sys::{self, LinkCreateAttr, ProgLoadAttr, ProgTestRunAttr, bpf_cmd, ctx_err};
 use crate::Result;
 
 /// The verdict an XDP program returns for a packet.
@@ -214,7 +214,41 @@ impl Program {
     }
 }
 
+/// What [`Program::test_run`] observed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TestRun {
+    /// The verdict the program returned for the frame.
+    pub action: Action,
+    /// Mean wall time of one run, in nanoseconds, as the kernel measured it.
+    pub duration_ns: u32,
+}
+
 impl Program {
+    /// Run the program in the kernel against `frame`, `repeat` times, without
+    /// any traffic having to arrive (`BPF_PROG_TEST_RUN`).
+    ///
+    /// This is the JITed program and the real maps, so it answers both "what
+    /// would the kernel do with this frame" and, with a large `repeat`, "what
+    /// does the program cost per packet". The frame is seen as arriving on RX
+    /// queue 0. A redirect is only reported, never carried out.
+    pub fn test_run(&self, frame: &[u8], repeat: u32) -> Result<TestRun> {
+        let mut attr = ProgTestRunAttr {
+            prog_fd: self.fd.as_raw_fd() as u32,
+            data_size_in: frame.len() as u32,
+            data_in: frame.as_ptr() as u64,
+            repeat: repeat.max(1),
+            ..Default::default()
+        };
+        // SAFETY: attr matches BPF_PROG_TEST_RUN; `frame` outlives the call
+        // and no output buffer is supplied.
+        unsafe { bpf_cmd(sys::BPF_PROG_TEST_RUN, &mut attr) }
+            .map_err(|e| ctx_err("prog test run", e))?;
+        Ok(TestRun {
+            action: Action(attr.retval),
+            duration_ns: attr.duration,
+        })
+    }
+
     /// Give up ownership of the program's file descriptor.
     ///
     /// The program stays loaded for as long as the fd is open (or something

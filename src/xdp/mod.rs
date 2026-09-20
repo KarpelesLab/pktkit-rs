@@ -81,4 +81,4 @@ pub use capture::{
 };
 pub use insn::{Asm, Insn, Label};
 pub use map::{LpmKey, Map, MapType, UpdateFlags, lpm_key, set_socket_raw};
-pub use prog::{Action, Link, Mode, Program, detach};
+pub use prog::{Action, Link, Mode, Program, TestRun, detach};

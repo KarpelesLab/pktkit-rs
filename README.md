@@ -91,7 +91,7 @@ implementation cannot slip back in behind a default feature.
 
 ## Requirements
 
-Rust 1.88 or newer, edition 2024.
+Rust 1.89 or newer, edition 2024.
 
 ## Usage
 
@@ -344,6 +344,28 @@ the set covering an entire address family — two `/1`s clear the floor
 individually but not together. Both checks run before anything reaches the
 kernel, so a refused call leaves the set unchanged. Traffic that matches nothing
 returns `XDP_PASS` and goes to the host stack as usual.
+
+That uncaptured traffic is what the program is tuned for: a miss costs the
+bounds checks, one key and one lookup, and the transport header is parsed only
+after an address hit on a prefix with a narrow rule. `Capture::test_run` runs
+the loaded program against a frame you supply and reports the verdict and the
+mean nanoseconds per run, so the cost can be measured without traffic.
+
+On the userspace side, three things are worth setting under load:
+
+```rust
+// One ring update and at most one wakeup syscall for the whole burst.
+let sent = dev.send_batch(&frames)?;
+
+let cfg = Config {
+    interface: "eth0".into(),
+    // Re-check an empty RX ring this many times before blocking in poll().
+    rx_spin: 2000,
+    // RX thread i, serving the i'th bound queue, runs on rx_cpus[i].
+    rx_cpus: vec![2, 3],
+    ..Default::default()
+};
+```
 
 ## Status
 

@@ -2,7 +2,7 @@
 name = "pktkit"
 version = "0.1.4"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 authors = ["Karpeles Lab Inc."]
 license = "MIT"
 description = "Zero-copy L2/L3 packet handling toolkit. Frames, packets, hubs, adapters, NAT, virtual TCP/IP, WireGuard, OpenVPN, QEMU networking, TUN/TAP, AF_XDP — all gated behind opt-in cargo features."
@@ -119,7 +119,7 @@ libc = { version = "0.2", optional = true }
 # pure-Rust tree with no foreign code and no build script. `default-features`
 # is off so a build pulls only the modules the enabled pktkit features name --
 # `wg` does not compile the TLS stack, and `ovpn` does not compile ML-DSA.
-purecrypto = { version = "0.7", optional = true, default-features = false, features = ["std", "linux-getrandom"] }
+purecrypto = { version = "0.9", optional = true, default-features = false, features = ["std", "linux-getrandom"] }
 
 [dev-dependencies]
 # Tests may exercise OS sockets; nothing extra needed beyond std.

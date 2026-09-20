@@ -11,6 +11,11 @@ semantic versioning once it reaches 1.0.
 ### Other
 
 - per-prefix capture rules for a protocol or a TCP/UDP port
+### Changed (breaking)
+
+- **purecrypto 0.9, MSRV 1.89.** purecrypto 0.9 needs Rust 1.89, so the
+  crate's minimum moves with it; a dependency-free build is held to the same
+  floor so there is one number to remember.
 
 ### Added — XDP capture
 
@@ -34,8 +39,42 @@ semantic versioning once it reaches 1.0.
   codegen's verdicts are checked without root. The kernel tests in
   `tests/xdp_kernel.rs` load every rule-cap variant through the verifier and
   exercise a port rule on the host's own address end to end.
+- `Program::test_run` / `Capture::test_run` run the loaded program in the
+  kernel against a supplied frame (`BPF_PROG_TEST_RUN`) and return the verdict
+  and the mean cost per run. The kernel tests use it to check the JITed
+  program's verdicts against the interpreter's, and
+  `what_the_capture_program_costs_per_packet` prints nanoseconds per packet
+  for a far miss, a near miss and both kinds of hit as the set grows from 1 to
+  2048 hosts.
+
+### Added — AF_XDP
+
+- `Device::send_batch` transmits a burst with one TX ring update and at most
+  one wakeup syscall, where `send` pays for both per frame. It returns how
+  many frames were taken, so a caller can offer the rest again once the kernel
+  has completed some.
+- `Config::rx_spin` makes an RX thread re-check an empty ring a number of
+  times before blocking in `poll()`. Off by default.
+- `Config::rx_cpus` pins RX thread `i` to `rx_cpus[i]`. A CPU that does not
+  exist fails `Device::open`. Off by default.
+
+### Fixed — AF_XDP
+
+- **`Device::open` failed with `EINVAL` on every interface.** All four ring
+  mappings were sized for 16-byte descriptors, but the FILL and COMPLETION
+  rings hold 8-byte addresses, and the kernel refuses a mapping longer than
+  the ring it allocated. Each ring is now mapped at its own element size, and
+  every setup step names itself in its error instead of surfacing a bare
+  errno.
 
 ### Changed — XDP capture
+
+- The capture program no longer parses the transport header on a miss. The
+  protocol and port are read after an address hit, into registers rather
+  than stack slots, and not at all when the prefix holds a `Rule::Any`, which
+  is now always encoded first. An IPv4 packet that matches nothing executes 23
+  instructions where it executed 43. `Capture::rules_for` reports rules in
+  that walked order; `Capture::rules` still reports insertion order.
 
 - The `LPM_TRIE` value is now `max_rules_per_prefix * 4` bytes of packed
   rules rather than a `u32` flag. Anything reading `CaptureMaps` directly, or

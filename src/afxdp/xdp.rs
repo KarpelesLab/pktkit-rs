@@ -159,6 +159,20 @@ pub struct Config {
     /// Kernel-side busy polling; off by default because it trades CPU for
     /// latency.
     pub busy_poll: Option<BusyPoll>,
+    /// How many times an RX thread re-checks an empty ring before it blocks in
+    /// `poll()`. 0, the default, blocks at once. A few thousand keeps a thread
+    /// that is receiving a steady stream out of the kernel between batches —
+    /// the wakeup from `poll()` costs far more than a batch does — at the
+    /// price of a core that stays busy for that long after traffic stops.
+    pub rx_spin: u32,
+    /// CPUs to pin the RX threads to: thread `i`, serving the `i`th bound
+    /// queue, goes on `rx_cpus[i]`. Queues past the end of the list are left
+    /// to the scheduler; empty, the default, pins nothing.
+    ///
+    /// The core to name is the one that takes the queue's interrupt, or a
+    /// neighbour sharing its cache. With [`Config::busy_poll`] it should be
+    /// the same core, since the NAPI loop then runs on the calling thread.
+    pub rx_cpus: Vec<usize>,
     /// Back the UMEM with huge pages when possible, falling back silently.
     /// Cuts TLB pressure on the packet buffers at the cost of holding a scarce
     /// system resource.
@@ -179,6 +193,8 @@ impl Default for Config {
             mode: Mode::AUTO,
             program: ProgramSource::default(),
             busy_poll: None,
+            rx_spin: 0,
+            rx_cpus: Vec::new(),
             huge_pages: false,
             flags: 0,
         }
@@ -232,6 +248,19 @@ impl Config {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("afxdp: num_frames must be at least 2, got {}", c.num_frames),
+            ));
+        }
+        if let Some(&cpu) = c
+            .rx_cpus
+            .iter()
+            .find(|&&cpu| cpu >= libc::CPU_SETSIZE as usize)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "afxdp: rx_cpus names CPU {cpu}, past the {} a cpu_set_t holds",
+                    libc::CPU_SETSIZE
+                ),
             ));
         }
         Ok(c)
@@ -290,6 +319,8 @@ struct Socket {
 
     handler: Arc<Mutex<Option<L2Handler>>>,
     closed: Arc<AtomicBool>,
+    /// [`Config::rx_spin`].
+    rx_spin: u32,
 }
 
 impl std::fmt::Debug for Socket {
@@ -442,9 +473,15 @@ impl Device {
             tx_cursor: AtomicUsize::new(0),
         });
 
-        for sock in &inner.sockets {
+        for (i, sock) in inner.sockets.iter().enumerate() {
             let s = sock.clone();
-            std::thread::spawn(move || poll_loop(s));
+            let thread = std::thread::spawn(move || poll_loop(s));
+            // Pinned from here rather than from inside the thread so a CPU
+            // that does not exist fails the open instead of being lost. On
+            // error `inner` drops, which is what stops the threads.
+            if let Some(&cpu) = cfg.rx_cpus.get(i) {
+                pin_thread(&thread, cpu)?;
+            }
         }
 
         Ok(Device { inner })
@@ -536,6 +573,21 @@ impl Device {
         Ok(total)
     }
 
+    /// Send several frames at once: one ring update and at most one wakeup
+    /// syscall for the lot, where [`L2Device::send`](crate::L2Device::send)
+    /// pays for both per frame. In copy mode, where the kernel wants a wakeup
+    /// for nearly every transmission, that is the difference between one
+    /// `sendto` per packet and one per burst.
+    ///
+    /// Returns how many frames, from the front of `frames`, were taken; fewer
+    /// than `frames.len()` means the TX buffers or the ring ran out, and the
+    /// rest can be offered again. Runt frames are taken and dropped, as `send`
+    /// does. A frame too large for a UMEM chunk fails the call before anything
+    /// is queued.
+    pub fn send_batch(&self, frames: &[&Frame]) -> Result<usize> {
+        self.tx_socket().send_batch(frames)
+    }
+
     /// The socket a given caller transmits on. Each thread sticks to one queue
     /// so that a single sender cannot reorder its own frames.
     fn tx_socket(&self) -> &Arc<Socket> {
@@ -589,14 +641,14 @@ impl Socket {
 
         let fd = unsafe { libc::socket(libc::AF_XDP, libc::SOCK_RAW, 0) };
         if fd < 0 {
-            return Err(io::Error::last_os_error());
+            return Err(step("socket(AF_XDP)", io::Error::last_os_error()));
         }
         // SAFETY: fresh fd, owned now.
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
         let raw = fd.as_raw_fd();
 
         let umem_size = num_frames as usize * frame_size as usize;
-        let umem = mmap_umem(umem_size, cfg.huge_pages)?;
+        let umem = mmap_umem(umem_size, cfg.huge_pages).map_err(|e| step("mmap UMEM", e))?;
 
         // The libc `xdp_umem_reg` calls the frame size `chunk_size`. Headroom
         // stays 0: the kernel reserves XDP_PACKET_HEADROOM inside the chunk on
@@ -609,7 +661,7 @@ impl Socket {
             flags: 0,
             tx_metadata_len: 0,
         };
-        setsockopt_umem_reg(raw, &reg)?;
+        setsockopt_umem_reg(raw, &reg).map_err(|e| step("XDP_UMEM_REG", e))?;
 
         for opt in [
             XDP_UMEM_FILL_RING,
@@ -617,15 +669,30 @@ impl Socket {
             XDP_RX_RING,
             XDP_TX_RING,
         ] {
-            setsockopt_u32(raw, opt, ring_size)?;
+            setsockopt_u32(raw, opt, ring_size).map_err(|e| step("set ring size", e))?;
         }
 
-        let offs = getsockopt_mmap_offsets(raw)?;
+        let offs = getsockopt_mmap_offsets(raw).map_err(|e| step("XDP_MMAP_OFFSETS", e))?;
 
-        let fill_map = mmap_ring(raw, XDP_UMEM_PGOFF_FILL_RING, &offs.fr, ring_size)?;
-        let comp_map = mmap_ring(raw, XDP_UMEM_PGOFF_COMPLETION_RING, &offs.cr, ring_size)?;
-        let rx_map = mmap_ring(raw, XDP_PGOFF_RX_RING, &offs.rx, ring_size)?;
-        let tx_map = mmap_ring(raw, XDP_PGOFF_TX_RING, &offs.tx, ring_size)?;
+        // FILL and COMPLETION carry bare u64 addresses, RX and TX full
+        // descriptors. The kernel refuses a mapping longer than the ring it
+        // allocated, so each has to be asked for at its own element size.
+        let addr = std::mem::size_of::<u64>();
+        let desc = std::mem::size_of::<libc::xdp_desc>();
+        let fill_map = mmap_ring(raw, XDP_UMEM_PGOFF_FILL_RING, &offs.fr, ring_size, addr)
+            .map_err(|e| step("mmap FILL ring", e))?;
+        let comp_map = mmap_ring(
+            raw,
+            XDP_UMEM_PGOFF_COMPLETION_RING,
+            &offs.cr,
+            ring_size,
+            addr,
+        )
+        .map_err(|e| step("mmap COMPLETION ring", e))?;
+        let rx_map = mmap_ring(raw, XDP_PGOFF_RX_RING, &offs.rx, ring_size, desc)
+            .map_err(|e| step("mmap RX ring", e))?;
+        let tx_map = mmap_ring(raw, XDP_PGOFF_TX_RING, &offs.tx, ring_size, desc)
+            .map_err(|e| step("mmap TX ring", e))?;
 
         // SAFETY: each mapping is sized for its ring (see `mmap_ring`), the
         // offsets came from the kernel, and ring_size is a power of two.
@@ -645,16 +712,18 @@ impl Socket {
             .map(|i| ((rx_frames + i) as u64) * frame_size as u64)
             .collect();
 
-        let zerocopy = bind_xdp(raw, ifindex, queue_id, cfg, want_zerocopy)?;
+        let zerocopy = bind_xdp(raw, ifindex, queue_id, cfg, want_zerocopy)
+            .map_err(|e| step(&format!("bind queue {queue_id}"), e))?;
 
         if let Some(bp) = cfg.busy_poll {
-            set_busy_poll(raw, bp)?;
+            set_busy_poll(raw, bp).map_err(|e| step("SO_BUSY_POLL", e))?;
         }
 
         Ok(Socket {
             fd,
             queue_id,
             frame_size: frame_size as usize,
+            rx_spin: cfg.rx_spin,
             zerocopy,
             umem,
             _fill_map: fill_map,
@@ -740,6 +809,83 @@ impl Socket {
         Ok(())
     }
 
+    /// As [`Socket::send`] for a burst. See [`Device::send_batch`].
+    fn send_batch(&self, frames: &[&Frame]) -> Result<usize> {
+        if let Some(f) = frames.iter().find(|f| f.as_bytes().len() > self.frame_size) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "afxdp: frame of {} bytes exceeds the {}-byte UMEM chunk",
+                    f.as_bytes().len(),
+                    self.frame_size
+                ),
+            ));
+        }
+        if self.closed.load(Ordering::Acquire) {
+            return Err(io::Error::new(io::ErrorKind::NotConnected, "afxdp: closed"));
+        }
+
+        let mut free = self.tx_free.lock().unwrap();
+        let mut taken = 0;
+        let mut queued = false;
+        let mut descs = [libc::xdp_desc {
+            addr: 0,
+            len: 0,
+            options: 0,
+        }; BATCH];
+
+        while taken < frames.len() {
+            // We are the ring's only producer and hold the lock, so the room
+            // seen here cannot shrink before the produce below.
+            let room = self.tx_ring.free().min(BATCH);
+            let mut n = 0;
+            let mut upto = taken;
+            while n < room && upto < frames.len() {
+                let bytes = frames[upto].as_bytes();
+                if bytes.len() < 14 {
+                    upto += 1;
+                    continue;
+                }
+                if free.is_empty() {
+                    self.reclaim_tx(&mut free);
+                }
+                let Some(addr) = free.pop() else { break };
+                // SAFETY: addr is a frame-aligned offset from the TX pool and
+                // the length was checked against frame_size above.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        bytes.as_ptr(),
+                        self.umem.ptr().add(addr as usize),
+                        bytes.len(),
+                    );
+                }
+                descs[n] = libc::xdp_desc {
+                    addr,
+                    len: bytes.len() as u32,
+                    options: 0,
+                };
+                n += 1;
+                upto += 1;
+            }
+            if n > 0 {
+                let produced = self.tx_ring.produce(&descs[..n]);
+                debug_assert_eq!(produced, n, "TX ring shrank under its only producer");
+                queued = true;
+            }
+            if upto == taken {
+                // Neither a buffer nor a ring slot to be had.
+                break;
+            }
+            taken = upto;
+        }
+        drop(free);
+
+        if queued && self.tx_ring.need_wakeup() {
+            self.kick_tx();
+        }
+        Ok(taken)
+    }
+
     /// Drain the completion ring, returning finished TX addresses to the pool.
     /// Caller holds the `tx_free` lock.
     fn reclaim_tx(&self, free: &mut Vec<u64>) {
@@ -803,8 +949,17 @@ fn poll_loop(sock: Arc<Socket>) {
     }; BATCH];
     let mut fill_batch = [0u64; BATCH];
 
+    let mut idle = 0u32;
+
     while !sock.closed.load(Ordering::Acquire) {
         let got = sock.rx_ring.consume(&mut rx_batch);
+        if got == 0 && idle < sock.rx_spin {
+            // Traffic was here a moment ago; look again before paying for a
+            // trip through poll().
+            idle += 1;
+            std::hint::spin_loop();
+            continue;
+        }
         if got == 0 {
             // Idle: give TX completions back to the pool for whichever thread
             // sends next, then sleep until the kernel has something for us.
@@ -815,6 +970,7 @@ fn poll_loop(sock: Arc<Socket>) {
             sock.wait(POLL_TIMEOUT_MS);
             continue;
         }
+        idle = 0;
 
         // One clone per batch rather than per frame.
         let handler = sock.handler.lock().unwrap().clone();
@@ -855,6 +1011,37 @@ fn poll_loop(sock: Arc<Socket>) {
 }
 
 // --- syscall helpers -------------------------------------------------------
+
+/// Name the setup step an errno came from. `Device::open` makes a dozen
+/// syscalls that can all answer a bare `EINVAL`.
+fn step(what: &str, e: io::Error) -> io::Error {
+    io::Error::new(e.kind(), format!("afxdp: {what}: {e}"))
+}
+
+/// Restrict `thread` to `cpu`.
+fn pin_thread<T>(thread: &std::thread::JoinHandle<T>, cpu: usize) -> Result<()> {
+    use std::os::unix::thread::JoinHandleExt;
+    // SAFETY: an all-zero cpu_set_t is the empty set; `cpu` was checked against
+    // CPU_SETSIZE in `Config::normalize`, which is CPU_SET's precondition.
+    let rc = unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_SET(cpu, &mut set);
+        libc::pthread_setaffinity_np(
+            thread.as_pthread_t(),
+            std::mem::size_of::<libc::cpu_set_t>(),
+            &set,
+        )
+    };
+    if rc != 0 {
+        // pthread functions return the error rather than setting errno.
+        let e = io::Error::from_raw_os_error(rc);
+        return Err(io::Error::new(
+            e.kind(),
+            format!("afxdp: pin RX thread to CPU {cpu}: {e}"),
+        ));
+    }
+    Ok(())
+}
 
 fn page_size() -> usize {
     // SAFETY: sysconf with a valid name; -1 on failure, handled below.
@@ -1155,8 +1342,9 @@ fn mmap_ring(
     pgoff: libc::off_t,
     off: &libc::xdp_ring_offset,
     size: u32,
+    elem: usize,
 ) -> Result<Mapping> {
-    let total = ring_map_len(off.desc, size);
+    let total = ring_map_len(off.desc, size, elem);
     let ptr = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
@@ -1176,8 +1364,10 @@ fn mmap_ring(
     })
 }
 
-fn ring_map_len(desc_off: u64, size: u32) -> usize {
-    desc_off as usize + size as usize * std::mem::size_of::<libc::xdp_desc>()
+/// Bytes from the start of a ring mapping to the end of its `size` elements
+/// of `elem` bytes each.
+fn ring_map_len(desc_off: u64, size: u32, elem: usize) -> usize {
+    desc_off as usize + size as usize * elem
 }
 
 /// The bind flag sequence to try, most preferred first.
@@ -1355,8 +1545,14 @@ mod tests {
 
     #[test]
     fn ring_mmap_size_covers_descs() {
-        // A ring mapping must reach past the cursors to the end of the array.
-        assert_eq!(ring_map_len(64, 8), 64 + 8 * 16);
+        // A ring mapping must reach past the cursors to the end of the array
+        // and no further: the kernel answers EINVAL to a mapping longer than
+        // the ring, which is what sizing an address ring by descriptors does.
+        assert_eq!(ring_map_len(64, 8, std::mem::size_of::<u64>()), 64 + 8 * 8);
+        assert_eq!(
+            ring_map_len(64, 8, std::mem::size_of::<libc::xdp_desc>()),
+            64 + 8 * 16
+        );
     }
 
     #[test]
@@ -1404,6 +1600,68 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn spinning_and_pinning_are_off_by_default() {
+        let c = Config::default();
+        assert_eq!(c.rx_spin, 0);
+        assert!(c.rx_cpus.is_empty());
+    }
+
+    #[test]
+    fn a_cpu_past_the_set_size_is_refused_before_open() {
+        let e = Config {
+            interface: "lo".into(),
+            rx_cpus: vec![0, libc::CPU_SETSIZE as usize],
+            ..Default::default()
+        }
+        .normalize()
+        .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn a_thread_can_be_pinned_to_a_cpu_we_are_allowed_on() {
+        // Pick from our own mask: a container may not own CPU 0.
+        // SAFETY: zeroed cpu_set_t is valid; pid 0 is the calling thread.
+        let allowed = unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            assert_eq!(
+                libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set),
+                0
+            );
+            (0..libc::CPU_SETSIZE as usize)
+                .find(|&c| libc::CPU_ISSET(c, &set))
+                .expect("running on some CPU")
+        };
+
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let t = std::thread::spawn(move || {
+            rx.recv().ok();
+            // SAFETY: as above.
+            unsafe {
+                let mut set: libc::cpu_set_t = std::mem::zeroed();
+                libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set);
+                (0..libc::CPU_SETSIZE as usize)
+                    .filter(|&c| libc::CPU_ISSET(c, &set))
+                    .collect::<Vec<_>>()
+            }
+        });
+        pin_thread(&t, allowed).unwrap();
+        tx.send(()).unwrap();
+        assert_eq!(t.join().unwrap(), vec![allowed]);
+    }
+
+    #[test]
+    fn pinning_to_a_cpu_that_does_not_exist_is_an_error() {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let t = std::thread::spawn(move || rx.recv().ok());
+        // Inside cpu_set_t, but no machine running this has 1024 cores online.
+        let e = pin_thread(&t, libc::CPU_SETSIZE as usize - 1).unwrap_err();
+        assert!(e.to_string().contains("pin RX thread"), "{e}");
+        tx.send(()).unwrap();
+        t.join().unwrap();
     }
 
     #[test]

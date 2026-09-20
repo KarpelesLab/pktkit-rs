@@ -15,7 +15,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use pktkit::afxdp::{Config, Device, ProgramSource, Zerocopy};
@@ -39,11 +39,25 @@ fn root() -> bool {
     false
 }
 
+/// Every veth pair puts 10.99.0.1/24 on its host end, and the host ends all
+/// live in the root namespace. Two pairs alive at once give the host two
+/// routes to the same subnet, and a reply then leaves through whichever veth
+/// the route lookup finds first — so anything that expects an answer fails at
+/// random. Holding this for the life of a [`Veth`] runs those tests one at a
+/// time, whatever `--test-threads` says.
+static ADDRESS_PLAN: Mutex<()> = Mutex::new(());
+
+/// Locally administered, unicast. See [`Veth::new`] for why they are fixed.
+const HOST_MAC: &str = "02:70:6b:00:00:01";
+const PEER_MAC: &str = "02:70:6b:00:00:02";
+
 /// veth pair + netns, torn down on drop.
 struct Veth {
     ns: String,
     host: String,
     peer: String,
+    /// Released after `Drop::drop` has torn the pair down.
+    _plan: MutexGuard<'static, ()>,
 }
 
 impl Veth {
@@ -51,6 +65,9 @@ impl Veth {
     /// are root, so a failure here is iproute2 missing or a real bug.
     fn new(tag: &str) -> Veth {
         let v = Veth {
+            // A test that panicked poisons the lock without leaving anything
+            // behind that the teardown below does not clear.
+            _plan: ADDRESS_PLAN.lock().unwrap_or_else(|e| e.into_inner()),
             ns: format!("pk-{tag}"),
             host: format!("pkh-{tag}"),
             peer: format!("pkp-{tag}"),
@@ -62,9 +79,17 @@ impl Veth {
             ip(&["netns", "add", &v.ns]),
             "ip netns add (iproute2 present?)"
         );
+        // Both ends get an address we chose. Left to the kernel they get a
+        // random one, and udev then swaps in its "persistent" address a moment
+        // after the link appears — asynchronously, so sometimes after the
+        // peer has already resolved the old one. From then on the peer sends
+        // to a MAC the host end no longer has, and the host drops every frame
+        // as addressed to someone else. An address set explicitly is left
+        // alone.
         assert!(
             ip(&[
-                "link", "add", &v.host, "type", "veth", "peer", "name", &v.peer, "netns", &v.ns,
+                "link", "add", &v.host, "address", HOST_MAC, "type", "veth", "peer", "name",
+                &v.peer, "address", PEER_MAC, "netns", &v.ns,
             ]),
             "ip link add veth"
         );
@@ -95,6 +120,34 @@ impl Veth {
         let mut v = vec!["netns", "exec", self.ns.as_str()];
         v.extend_from_slice(args);
         ip(&v)
+    }
+
+    /// Ping the host end from inside the namespace.
+    fn ping_host(&self) -> bool {
+        self.exec(&["ping", "-c", "2", "-W", "2", "10.99.0.1"])
+    }
+
+    /// Establish that the host answers at all before XDP is involved, so a
+    /// later failure can be laid at the program's door and not at a firewall's.
+    fn assert_baseline(&self) {
+        assert!(
+            self.ping_host(),
+            "the host does not answer ping on a plain veth, with no XDP program \
+             attached: this environment (firewall? rp_filter?) cannot run the test"
+        );
+    }
+
+    /// Frames the peer end has received, from its own interface counters.
+    fn peer_rx_packets(&self) -> u64 {
+        let path = format!("/sys/class/net/{}/statistics/rx_packets", self.peer);
+        let out = Command::new("ip")
+            .args(["netns", "exec", &self.ns, "cat", &path])
+            .output()
+            .expect("read peer counters");
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .expect("rx_packets is a number")
     }
 
     fn teardown(&self) {
@@ -538,6 +591,7 @@ fn uncaptured_traffic_still_reaches_the_host_stack() {
         return;
     }
     let veth = Veth::new("pass");
+    veth.assert_baseline();
 
     let dev = Device::open(Config {
         interface: veth.host.clone(),
@@ -550,10 +604,12 @@ fn uncaptured_traffic_still_reaches_the_host_stack() {
 
     // 10.99.0.1 is the host's own address on this link and was never captured,
     // so the kernel must still answer it.
-    assert!(
-        veth.exec(&["ping", "-c", "2", "-W", "2", "10.99.0.1"]),
-        "attaching the capture program broke the host stack"
-    );
+    if !veth.ping_host() {
+        panic!(
+            "attaching the capture program broke the host stack: {}",
+            why_no_answer(&veth, dev)
+        );
+    }
 
     dev.close().unwrap();
 }
@@ -568,6 +624,7 @@ fn a_port_rule_shares_the_address_with_the_host_stack() {
         return;
     }
     let veth = Veth::new("port");
+    veth.assert_baseline();
 
     let dev = Device::open(Config {
         interface: veth.host.clone(),
@@ -593,10 +650,12 @@ fn a_port_rule_shares_the_address_with_the_host_stack() {
         .unwrap();
 
     // The host still answers ARP and ICMP for the address.
-    assert!(
-        veth.exec(&["ping", "-c", "2", "-W", "2", "10.99.0.1"]),
-        "a port rule took the whole address away from the host"
-    );
+    if !veth.ping_host() {
+        panic!(
+            "a port rule took the whole address away from the host: {}",
+            why_no_answer(&veth, dev)
+        );
+    }
     assert!(
         !seen.lock().unwrap().iter().any(|f| ipv4_dst(f).is_some()),
         "ICMP to a port-captured address was diverted"
@@ -625,6 +684,430 @@ fn a_port_rule_shares_the_address_with_the_host_stack() {
             .any(|f| udp_dst_port(f) == Some(5556)),
         "a port that was never captured was delivered"
     );
+
+    dev.close().unwrap();
+}
+
+/// An Ethernet + IPv4 frame with `ihl` header words and the given
+/// flags/fragment word, carrying `sport`/`dport` where TCP and UDP keep them.
+fn l4_frame(proto: Protocol, dst: [u8; 4], ihl: u8, frag: u16, sport: u16, dport: u16) -> Vec<u8> {
+    let mut f = vec![0x02, 0, 0, 0, 0, 1, 0x02, 0, 0, 0, 0, 2, 0x08, 0x00];
+    let mut h = vec![0u8; usize::from(ihl) * 4];
+    h[0] = 0x40 | ihl;
+    let total = (h.len() + 20) as u16;
+    h[2..4].copy_from_slice(&total.to_be_bytes());
+    h[6..8].copy_from_slice(&frag.to_be_bytes());
+    h[8] = 64;
+    h[9] = proto.as_u8();
+    h[12..16].copy_from_slice(&[10, 99, 0, 2]);
+    h[16..20].copy_from_slice(&dst);
+    f.extend_from_slice(&h);
+    f.extend_from_slice(&sport.to_be_bytes());
+    f.extend_from_slice(&dport.to_be_bytes());
+    f.extend_from_slice(&[0u8; 16]);
+    f
+}
+
+/// Output of a command, or why there is none, on one line.
+fn output_of(cmd: &str, args: &[&str]) -> String {
+    match Command::new(cmd).args(args).output() {
+        Ok(o) => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .map(str::trim)
+            .collect::<Vec<_>>()
+            .join(" | "),
+        Err(e) => format!("({cmd}: {e})"),
+    }
+}
+
+/// `InEchos` and `OutEchoReps` from the root namespace's ICMP counters: did
+/// the stack see an echo request, and did it answer.
+fn icmp_echo_counters() -> (u64, u64) {
+    let snmp = std::fs::read_to_string("/proc/net/snmp").unwrap_or_default();
+    let mut lines = snmp.lines().filter(|l| l.starts_with("Icmp:"));
+    let (Some(names), Some(values)) = (lines.next(), lines.next()) else {
+        return (0, 0);
+    };
+    let field = |want: &str| {
+        names
+            .split_whitespace()
+            .zip(values.split_whitespace())
+            .find(|(n, _)| *n == want)
+            .and_then(|(_, v)| v.parse().ok())
+            .unwrap_or(0)
+    };
+    (field("InEchos"), field("OutEchoReps"))
+}
+
+/// Everything that tells "the program dropped it" from "the stack lost it",
+/// for the message of a ping that went unanswered after the baseline passed.
+///
+/// Takes the device because the last two probes need it gone: whether the
+/// host answers again once the program is detached, and whether it answers
+/// behind a generic-mode attachment where it did not behind a native one.
+fn why_no_answer(veth: &Veth, dev: Device) -> String {
+    let verdict = |frame: &[u8]| {
+        dev.capture()
+            .map(|c| c.test_run(frame, 1).map(|r| r.action))
+    };
+    let mut echo = l4_frame(Protocol::ICMP, [10, 99, 0, 1], 5, 0, 0x0800, 0);
+    echo.truncate(14 + 20 + 8);
+    // who-has 10.99.0.1 tell 10.99.0.2
+    let mut arp = vec![0xffu8; 6];
+    arp.extend_from_slice(&[0x02, 0, 0, 0, 0, 2, 0x08, 0x06]);
+    arp.extend_from_slice(&[0, 1, 0x08, 0x00, 6, 4, 0, 1]);
+    arp.extend_from_slice(&[0x02, 0, 0, 0, 0, 2, 10, 99, 0, 2]);
+    arp.extend_from_slice(&[0, 0, 0, 0, 0, 0, 10, 99, 0, 1]);
+    let verdicts = format!("echo={:?} arp={:?}", verdict(&echo), verdict(&arp));
+
+    let host_stat = |name: &str| -> u64 {
+        std::fs::read_to_string(format!("/sys/class/net/{}/statistics/{name}", veth.host))
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0)
+    };
+
+    // One more ping, a second later, with the counters read either side of
+    // it: requests arriving (rx), the stack seeing them (InEchos), the stack
+    // answering (OutEchoReps), the answers leaving by this veth (tx).
+    std::thread::sleep(Duration::from_secs(1));
+    let (rx0, tx0) = (host_stat("rx_packets"), host_stat("tx_packets"));
+    let (in0, out0) = icmp_echo_counters();
+    let retry = veth.ping_host();
+    let (in1, out1) = icmp_echo_counters();
+    let during = format!(
+        "answered={retry} veth rx+{} tx+{} rx_dropped={} stack InEchos+{} OutEchoReps+{}",
+        host_stat("rx_packets") - rx0,
+        host_stat("tx_packets") - tx0,
+        host_stat("rx_dropped"),
+        in1 - in0,
+        out1 - out0,
+    );
+
+    // If these disagree with what the peer has cached below, the host end
+    // changed its address under the test.
+    let host_mac = veth.host_mac();
+    let neigh_host = output_of("ip", &["neigh", "show", "dev", &veth.host]);
+    let neigh_peer = output_of("ip", &["-n", &veth.ns, "neigh", "show"]);
+    let routes = output_of("ip", &["route", "show", "10.99.0.0/24"]);
+    let queue_stats = output_of("ethtool", &["-S", &veth.host]);
+    let mode = dev.mode();
+    let xsk = dev
+        .statistics()
+        .map(|s| (s.rx_dropped, s.rx_invalid_descs, s.rx_ring_full));
+
+    // Detached: does the host come back by itself?
+    let _ = dev.close();
+    drop(dev);
+    std::thread::sleep(Duration::from_millis(1500));
+    let detached = veth.ping_host();
+
+    // And behind the generic hook, which shares nothing with veth's own
+    // NAPI receive path?
+    let generic = match Device::open(Config {
+        interface: veth.host.clone(),
+        zerocopy: Zerocopy::Off,
+        mode: Mode::GENERIC,
+        ..Default::default()
+    }) {
+        Ok(d) => {
+            let answered = veth.ping_host();
+            let _ = d.close();
+            format!("{answered}")
+        }
+        Err(e) => format!("(open: {e})"),
+    };
+
+    format!(
+        "\n  mode={mode:?} verdicts: {verdicts}\n  second ping: {during}\n  \
+         xsk stats={xsk:?}\n  host mac now: {host_mac} (created as {HOST_MAC})\n  \
+         host neigh: {neigh_host}\n  peer neigh: {neigh_peer}\n  \
+         routes: {routes}\n  ethtool -S: {queue_stats}\n  \
+         answers once detached={detached}\n  answers behind generic mode={generic}"
+    )
+}
+
+/// The unit tests execute the generated program in an interpreter. This runs
+/// the same kind of frames through the JITed program in the kernel, against
+/// real maps, so the two cannot quietly disagree.
+///
+/// No socket is bound, so a hit falls back to the verdict in the redirect
+/// flags, `XDP_PASS`; the default action is set to `XDP_DROP` to keep a miss
+/// distinguishable from it.
+#[test]
+#[ignore = "needs CAP_BPF + CAP_NET_ADMIN"]
+fn the_kernel_gives_the_verdicts_the_interpreter_does() {
+    if !root() {
+        return;
+    }
+    const HIT: Action = Action::PASS;
+    const MISS: Action = Action::DROP;
+    let veth = Veth::new("verdict");
+    let cap = Capture::attach(
+        ifindex(&veth.host),
+        CaptureConfig {
+            default_action: MISS,
+            ..Default::default()
+        },
+        Mode::AUTO,
+    )
+    .expect("attach");
+
+    let shared = [10, 99, 0, 1];
+    let owned = [10, 99, 0, 5];
+    cap.add_rule(v4(shared, 32), Rule::Port(Protocol::UDP, 5555))
+        .unwrap();
+    cap.add_rule(v4(owned, 32), Rule::Port(Protocol::TCP, 1))
+        .unwrap();
+    // Added second, walked first.
+    cap.add(v4(owned, 32)).unwrap();
+
+    let udp = Protocol::UDP;
+    let tcp = Protocol::TCP;
+    let mut truncated = l4_frame(udp, shared, 5, 0, 9, 5555);
+    truncated.truncate(14 + 20 + 3);
+    let cases: Vec<(&str, Vec<u8>, Action)> = vec![
+        ("captured port", l4_frame(udp, shared, 5, 0, 9, 5555), HIT),
+        (
+            "neighbouring port",
+            l4_frame(udp, shared, 5, 0, 9, 5556),
+            MISS,
+        ),
+        (
+            "the peer's port, not ours",
+            l4_frame(udp, shared, 5, 0, 5555, 9),
+            MISS,
+        ),
+        (
+            "right port, wrong protocol",
+            l4_frame(tcp, shared, 5, 0, 9, 5555),
+            MISS,
+        ),
+        (
+            "behind ip options",
+            l4_frame(udp, shared, 7, 0, 9, 5555),
+            HIT,
+        ),
+        (
+            "behind the longest header",
+            l4_frame(udp, shared, 15, 0, 9, 5555),
+            HIT,
+        ),
+        (
+            "first fragment",
+            l4_frame(udp, shared, 5, 0x2000, 9, 5555),
+            HIT,
+        ),
+        (
+            "later fragment",
+            l4_frame(udp, shared, 5, 185, 9, 5555),
+            MISS,
+        ),
+        ("truncated transport header", truncated, MISS),
+        ("whole address, udp", l4_frame(udp, owned, 5, 0, 9, 9), HIT),
+        (
+            "whole address, later fragment",
+            l4_frame(tcp, owned, 5, 185, 9, 9),
+            HIT,
+        ),
+        (
+            "someone else",
+            l4_frame(udp, [10, 99, 0, 9], 5, 0, 9, 5555),
+            MISS,
+        ),
+    ];
+    // Every case is run before anything is asserted, so one report shows the
+    // whole picture instead of the first disagreement.
+    let wrong: Vec<String> = cases
+        .iter()
+        .filter_map(|(what, frame, want)| match cap.test_run(frame, 1) {
+            Ok(got) if got.action == *want => None,
+            Ok(got) => Some(format!("{what}: {:?}, wanted {want:?}", got.action)),
+            Err(e) => Some(format!("{what} ({} bytes): {e}", frame.len())),
+        })
+        .collect();
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// With a socket bound to the queue, a hit is `XDP_REDIRECT` rather than the
+/// fallback verdict.
+#[test]
+#[ignore = "needs CAP_BPF + CAP_NET_ADMIN"]
+fn a_bound_socket_turns_a_hit_into_a_redirect() {
+    if !root() {
+        return;
+    }
+    let veth = Veth::new("redir");
+    let dev = Device::open(Config {
+        interface: veth.host.clone(),
+        zerocopy: Zerocopy::Off,
+        ..Default::default()
+    })
+    .expect("open AF_XDP on veth");
+    let cap = dev.capture().expect("capture program");
+    cap.add(v4([10, 99, 0, 5], 32)).unwrap();
+
+    let miss = l4_frame(Protocol::UDP, [10, 99, 0, 9], 5, 0, 9, 9);
+    let hit = l4_frame(Protocol::UDP, [10, 99, 0, 5], 5, 0, 9, 9);
+    // The miss goes first: it never reaches the redirect helper, so if only
+    // the hit fails, the helper or the populated XSKMAP is what the test run
+    // objects to, and not the bound socket as such.
+    let miss = cap.test_run(&miss, 1);
+    let hit = cap.test_run(&hit, 1);
+    assert_eq!(
+        (
+            miss.as_ref().map(|r| r.action).map_err(|e| e.to_string()),
+            hit.as_ref().map(|r| r.action).map_err(|e| e.to_string()),
+        ),
+        (Ok(Action::PASS), Ok(Action::REDIRECT)),
+        "queues={:?} mode={:?}",
+        dev.queue_ids(),
+        dev.mode()
+    );
+
+    dev.close().unwrap();
+}
+
+/// Not a pass/fail test: prints what the program costs per packet, which is
+/// the number every optimisation of the codegen has to move. Run with
+/// `--ignored --nocapture cost`.
+///
+/// The miss columns matter most — that is the host's own traffic — and how the
+/// near miss grows with the size of the set is what says whether the LPM trie
+/// is worth fronting with a hash for host entries. Measured on Linux 6.18,
+/// x86-64, native-mode veth, it is not: from 1 to 2048 captured hosts a miss
+/// stayed at 6 ns and a near miss at 7-8 ns (8 and 9-10 ns under `Either`).
+/// Only a whole-address hit deepens with the set, 9 ns to 46 ns, and that
+/// packet goes on to an AF_XDP delivery costing many times as much.
+#[test]
+#[ignore = "needs CAP_BPF + CAP_NET_ADMIN"]
+fn what_the_capture_program_costs_per_packet() {
+    if !root() {
+        return;
+    }
+    const REPEAT: u32 = 2_000_000;
+    let veth = Veth::new("cost");
+    let miss = l4_frame(Protocol::UDP, [10, 99, 0, 9], 5, 0, 9, 53);
+    // A neighbour of the captured hosts, which is what the host's own traffic
+    // usually is. It shares most of its bits with the set, so the trie walks
+    // about as deep for it as for a hit — unlike the far miss above, which
+    // falls out at the first node whatever the set holds.
+    let near_miss = l4_frame(Protocol::UDP, [10, 200, 255, 255], 5, 0, 9, 53);
+    let any_hit = l4_frame(Protocol::UDP, [10, 200, 0, 0], 5, 0, 9, 53);
+    let port_hit = l4_frame(Protocol::UDP, [10, 201, 0, 0], 5, 0, 9, 53);
+
+    for match_field in [MatchField::Dst, MatchField::Either] {
+        let cap = Capture::attach(
+            ifindex(&veth.host),
+            CaptureConfig {
+                match_field,
+                max_prefixes: 4096,
+                ..Default::default()
+            },
+            Mode::AUTO,
+        )
+        .expect("attach");
+        cap.add_rule(v4([10, 201, 0, 0], 32), Rule::Port(Protocol::UDP, 53))
+            .unwrap();
+
+        let mut held = 0u32;
+        for target in [1u32, 16, 256, 2048] {
+            while held < target {
+                let [_, _, c, d] = held.to_be_bytes();
+                cap.add(v4([10, 200, c, d], 32)).unwrap();
+                held += 1;
+            }
+            let m = cap.test_run(&miss, REPEAT).expect("test run");
+            let n = cap.test_run(&near_miss, REPEAT).expect("test run");
+            assert_eq!(n.action, Action::PASS);
+            let a = cap.test_run(&any_hit, REPEAT).expect("test run");
+            let p = cap.test_run(&port_hit, REPEAT).expect("test run");
+            assert_eq!(m.action, Action::PASS);
+            eprintln!(
+                "{match_field:?} {held:>5} hosts: miss {:>3} ns  near-miss {:>3} ns  \
+                 any-hit {:>3} ns  port-hit {:>3} ns",
+                m.duration_ns, n.duration_ns, a.duration_ns, p.duration_ns
+            );
+        }
+    }
+}
+
+/// A burst goes out whole through `send_batch`, which takes what it has
+/// buffers for and says so.
+#[test]
+#[ignore = "needs CAP_BPF + CAP_NET_ADMIN"]
+fn a_batch_is_transmitted_in_full() {
+    if !root() {
+        return;
+    }
+    const FRAMES: usize = 5000;
+    // Half of these are the TX pool. Keeping it far below the kernel's input
+    // backlog (`netdev_max_backlog`, 1000 by default) makes the burst pace
+    // itself: a buffer only comes back once the peer has consumed the frame,
+    // so the veth can never be handed more than it can queue. A full-sized
+    // pool loses a third of a 5000-frame burst there, which says nothing
+    // about `send_batch`.
+    const POOL: u32 = 128;
+    let veth = Veth::new("batch");
+    let dev = Device::open(Config {
+        interface: veth.host.clone(),
+        zerocopy: Zerocopy::Off,
+        num_frames: POOL,
+        ..Default::default()
+    })
+    .expect("open AF_XDP on veth");
+
+    // Broadcast, in an EtherType reserved for local experiments, so nothing
+    // on either side answers it.
+    let mut frame = vec![0xffu8; 6];
+    frame.extend_from_slice(&[0x02, 0, 0, 0, 0, 1, 0x88, 0xb5]);
+    frame.extend_from_slice(&[0u8; 50]);
+    let one = Frame::from_slice(&frame);
+    let burst: Vec<&Frame> = vec![one; FRAMES];
+
+    // An oversized frame fails the call before anything is queued.
+    let huge = vec![0u8; 8192];
+    assert!(dev.send_batch(&[one, Frame::from_slice(&huge)]).is_err());
+
+    let before = veth.peer_rx_packets();
+    // A runt is taken and dropped without stalling what follows it.
+    let runt = Frame::from_slice(&frame[..10]);
+    assert_eq!(dev.send_batch(&[runt, one]).unwrap(), 2);
+
+    // More than the pool holds: part of it is taken, and the count is honest.
+    let first = dev.send_batch(&burst).expect("send_batch");
+    assert!(
+        first > 0 && first <= (POOL / 2) as usize,
+        "{first} frames taken from a pool of {}",
+        POOL / 2
+    );
+
+    let mut sent = first;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while sent < FRAMES && Instant::now() < deadline {
+        let n = dev.send_batch(&burst[sent..]).expect("send_batch");
+        sent += n;
+        if n == 0 {
+            // Out of buffers until the kernel completes some.
+            std::thread::sleep(Duration::from_micros(200));
+        }
+    }
+    assert_eq!(sent, FRAMES, "the device stopped taking frames");
+
+    // The runt never went out; the frame offered alongside it did.
+    let want = FRAMES as u64 + 1;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while veth.peer_rx_packets() - before < want && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let arrived = veth.peer_rx_packets() - before;
+    let stats = dev.statistics().expect("statistics");
+    assert!(
+        arrived >= want,
+        "{arrived} of {want} batched frames reached the peer (tx_invalid_descs={})",
+        stats.tx_invalid_descs
+    );
+    assert_eq!(stats.tx_invalid_descs, 0);
 
     dev.close().unwrap();
 }

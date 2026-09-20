@@ -1,12 +1,22 @@
-# Design rules for the pktkit-rs port
+# Design rules for pktkit-rs
 
-Read this before touching any feature module. The Go upstream
-(`../pktkit/`) is the source of truth for behaviour. Your job is to map
-its idioms into Rust idioms without bloating the dependency footprint.
+Read this before touching any feature module.
+
+pktkit-rs began as a port of the Go `pktkit` (`../pktkit/`), which is being
+discontinued. This crate is the implementation going forward, and the source
+of truth for behaviour is whatever the thing being implemented says: the
+kernel ABI, the RFCs, the wire format of the peer on the other end. The Go
+code is a historical reference — read it for what a feature was meant to do,
+not as a specification, and do not fix things there. A faithful port carries
+bugs over as faithfully as features: `Device::open` failed on every interface
+until it stopped sizing the FILL and COMPLETION rings the way the Go code did.
+Diverging from Go is not a defect; being wrong is.
+
+Whatever you add, do not bloat the dependency footprint.
 
 ## Crate shape
 
-- One crate, `pktkit`. Every subpackage from Go is a Cargo *feature*, not a
+- One crate, `pktkit`. What was a subpackage in Go is a Cargo *feature*, not a
   separate crate. The default build pulls in zero dependencies.
 - Each feature module lives at `src/<feature>.rs` (single file) or
   `src/<feature>/mod.rs` + submodules.
@@ -68,6 +78,8 @@ its idioms into Rust idioms without bloating the dependency footprint.
 
 ## Translating Go idioms
 
+For reading the old code, and for the parts of it still worth bringing over.
+
 | Go                                | Rust                                                |
 | --------------------------------- | --------------------------------------------------- |
 | `[]byte`                          | `&[u8]` or `Vec<u8>`; `&Foo` for typed wrappers     |
@@ -88,7 +100,7 @@ its idioms into Rust idioms without bloating the dependency footprint.
 | `interface{}`                     | `&dyn Any` or a trait + `dyn Trait`                 |
 | `sync.Pool`                       | `crate::BufferPool`                                 |
 
-## What NOT to port literally
+## What NOT to carry over from Go
 
 - Go's per-CPU pools — `BufferPool` is enough.
 - Go's `sync.Pool` finalizers — Rust's Drop handles cleanup deterministically.

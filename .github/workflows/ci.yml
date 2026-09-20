@@ -98,9 +98,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@1.89.0
       - uses: Swatinem/rust-cache@v2
-      # The whole surface, crypto included: purecrypto's own MSRV is 1.88,
+      # The whole surface, crypto included: purecrypto's own MSRV is 1.89,
       # exactly ours, so there is no dependency here that can drift past it
       # and fail this job for reasons no change in this repo could fix.
       - run: cargo check --all-features

@@ -74,5 +74,6 @@ jobs:
         with:
           command: release-pr
         env:
+          # No CARGO_REGISTRY_TOKEN here: opening the PR publishes nothing, so
+          # this job has no business holding the publish token.
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

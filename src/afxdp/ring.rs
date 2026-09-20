@@ -235,6 +235,15 @@ impl DescRing {
         unsafe { self.descs.add((idx & self.cur.mask) as usize) }
     }
 
+    /// Slots a producer could fill right now. The consumer only ever frees
+    /// more, so for the single producer this is a floor, not a guess.
+    #[inline]
+    pub fn free(&self) -> usize {
+        let prod = self.cur.producer().load(Ordering::Relaxed);
+        let cons = self.cur.consumer().load(Ordering::Acquire);
+        (self.cur.size - prod.wrapping_sub(cons)) as usize
+    }
+
     /// Enqueue TX descriptors (app asks the kernel to transmit). Returns how
     /// many were enqueued.
     pub fn produce(&self, descs: &[libc::xdp_desc]) -> usize {
@@ -400,7 +409,9 @@ mod tests {
                 options: 0,
             },
         ];
+        assert_eq!(ring.free(), 8);
         assert_eq!(ring.produce(&descs), 2);
+        assert_eq!(ring.free(), 6);
 
         let mut out = [libc::xdp_desc {
             addr: 0,
@@ -412,6 +423,7 @@ mod tests {
         assert_eq!(out[0].len, 60);
         assert_eq!(out[1].addr, 4096);
         assert_eq!(out[1].len, 1514);
+        assert_eq!(ring.free(), 8);
     }
 
     #[test]
