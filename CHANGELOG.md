@@ -12,6 +12,15 @@ semantic versioning once it reaches 1.0.
   crate's minimum moves with it; a dependency-free build is held to the same
   floor so there is one number to remember.
 
+### Fixed — AF_XDP
+
+- **`Device::open` failed with `EINVAL` on every interface.** All four ring
+  mappings were sized for 16-byte descriptors, but the FILL and COMPLETION
+  rings hold 8-byte addresses, and the kernel refuses a mapping longer than
+  the ring it allocated. Each ring is now mapped at its own element size, and
+  every setup step names itself in its error instead of surfacing a bare
+  errno.
+
 ### Added — XDP capture
 
 - **Per-prefix rules: protocol and port capture.** `xdp::Rule` selects, on a

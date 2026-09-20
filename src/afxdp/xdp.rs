@@ -589,14 +589,14 @@ impl Socket {
 
         let fd = unsafe { libc::socket(libc::AF_XDP, libc::SOCK_RAW, 0) };
         if fd < 0 {
-            return Err(io::Error::last_os_error());
+            return Err(step("socket(AF_XDP)", io::Error::last_os_error()));
         }
         // SAFETY: fresh fd, owned now.
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
         let raw = fd.as_raw_fd();
 
         let umem_size = num_frames as usize * frame_size as usize;
-        let umem = mmap_umem(umem_size, cfg.huge_pages)?;
+        let umem = mmap_umem(umem_size, cfg.huge_pages).map_err(|e| step("mmap UMEM", e))?;
 
         // The libc `xdp_umem_reg` calls the frame size `chunk_size`. Headroom
         // stays 0: the kernel reserves XDP_PACKET_HEADROOM inside the chunk on
@@ -609,7 +609,7 @@ impl Socket {
             flags: 0,
             tx_metadata_len: 0,
         };
-        setsockopt_umem_reg(raw, &reg)?;
+        setsockopt_umem_reg(raw, &reg).map_err(|e| step("XDP_UMEM_REG", e))?;
 
         for opt in [
             XDP_UMEM_FILL_RING,
@@ -617,15 +617,30 @@ impl Socket {
             XDP_RX_RING,
             XDP_TX_RING,
         ] {
-            setsockopt_u32(raw, opt, ring_size)?;
+            setsockopt_u32(raw, opt, ring_size).map_err(|e| step("set ring size", e))?;
         }
 
-        let offs = getsockopt_mmap_offsets(raw)?;
+        let offs = getsockopt_mmap_offsets(raw).map_err(|e| step("XDP_MMAP_OFFSETS", e))?;
 
-        let fill_map = mmap_ring(raw, XDP_UMEM_PGOFF_FILL_RING, &offs.fr, ring_size)?;
-        let comp_map = mmap_ring(raw, XDP_UMEM_PGOFF_COMPLETION_RING, &offs.cr, ring_size)?;
-        let rx_map = mmap_ring(raw, XDP_PGOFF_RX_RING, &offs.rx, ring_size)?;
-        let tx_map = mmap_ring(raw, XDP_PGOFF_TX_RING, &offs.tx, ring_size)?;
+        // FILL and COMPLETION carry bare u64 addresses, RX and TX full
+        // descriptors. The kernel refuses a mapping longer than the ring it
+        // allocated, so each has to be asked for at its own element size.
+        let addr = std::mem::size_of::<u64>();
+        let desc = std::mem::size_of::<libc::xdp_desc>();
+        let fill_map = mmap_ring(raw, XDP_UMEM_PGOFF_FILL_RING, &offs.fr, ring_size, addr)
+            .map_err(|e| step("mmap FILL ring", e))?;
+        let comp_map = mmap_ring(
+            raw,
+            XDP_UMEM_PGOFF_COMPLETION_RING,
+            &offs.cr,
+            ring_size,
+            addr,
+        )
+        .map_err(|e| step("mmap COMPLETION ring", e))?;
+        let rx_map = mmap_ring(raw, XDP_PGOFF_RX_RING, &offs.rx, ring_size, desc)
+            .map_err(|e| step("mmap RX ring", e))?;
+        let tx_map = mmap_ring(raw, XDP_PGOFF_TX_RING, &offs.tx, ring_size, desc)
+            .map_err(|e| step("mmap TX ring", e))?;
 
         // SAFETY: each mapping is sized for its ring (see `mmap_ring`), the
         // offsets came from the kernel, and ring_size is a power of two.
@@ -645,10 +660,11 @@ impl Socket {
             .map(|i| ((rx_frames + i) as u64) * frame_size as u64)
             .collect();
 
-        let zerocopy = bind_xdp(raw, ifindex, queue_id, cfg, want_zerocopy)?;
+        let zerocopy = bind_xdp(raw, ifindex, queue_id, cfg, want_zerocopy)
+            .map_err(|e| step(&format!("bind queue {queue_id}"), e))?;
 
         if let Some(bp) = cfg.busy_poll {
-            set_busy_poll(raw, bp)?;
+            set_busy_poll(raw, bp).map_err(|e| step("SO_BUSY_POLL", e))?;
         }
 
         Ok(Socket {
@@ -855,6 +871,12 @@ fn poll_loop(sock: Arc<Socket>) {
 }
 
 // --- syscall helpers -------------------------------------------------------
+
+/// Name the setup step an errno came from. `Device::open` makes a dozen
+/// syscalls that can all answer a bare `EINVAL`.
+fn step(what: &str, e: io::Error) -> io::Error {
+    io::Error::new(e.kind(), format!("afxdp: {what}: {e}"))
+}
 
 fn page_size() -> usize {
     // SAFETY: sysconf with a valid name; -1 on failure, handled below.
@@ -1155,8 +1177,9 @@ fn mmap_ring(
     pgoff: libc::off_t,
     off: &libc::xdp_ring_offset,
     size: u32,
+    elem: usize,
 ) -> Result<Mapping> {
-    let total = ring_map_len(off.desc, size);
+    let total = ring_map_len(off.desc, size, elem);
     let ptr = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
@@ -1176,8 +1199,10 @@ fn mmap_ring(
     })
 }
 
-fn ring_map_len(desc_off: u64, size: u32) -> usize {
-    desc_off as usize + size as usize * std::mem::size_of::<libc::xdp_desc>()
+/// Bytes from the start of a ring mapping to the end of its `size` elements
+/// of `elem` bytes each.
+fn ring_map_len(desc_off: u64, size: u32, elem: usize) -> usize {
+    desc_off as usize + size as usize * elem
 }
 
 /// The bind flag sequence to try, most preferred first.
@@ -1355,8 +1380,14 @@ mod tests {
 
     #[test]
     fn ring_mmap_size_covers_descs() {
-        // A ring mapping must reach past the cursors to the end of the array.
-        assert_eq!(ring_map_len(64, 8), 64 + 8 * 16);
+        // A ring mapping must reach past the cursors to the end of the array
+        // and no further: the kernel answers EINVAL to a mapping longer than
+        // the ring, which is what sizing an address ring by descriptors does.
+        assert_eq!(ring_map_len(64, 8, std::mem::size_of::<u64>()), 64 + 8 * 8);
+        assert_eq!(
+            ring_map_len(64, 8, std::mem::size_of::<libc::xdp_desc>()),
+            64 + 8 * 16
+        );
     }
 
     #[test]
