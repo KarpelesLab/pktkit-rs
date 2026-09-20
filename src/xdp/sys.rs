@@ -20,6 +20,7 @@ pub const BPF_MAP_LOOKUP_ELEM: i32 = 1;
 pub const BPF_MAP_UPDATE_ELEM: i32 = 2;
 pub const BPF_MAP_DELETE_ELEM: i32 = 3;
 pub const BPF_PROG_LOAD: i32 = 5;
+pub const BPF_PROG_TEST_RUN: i32 = 10;
 pub const BPF_LINK_CREATE: i32 = 28;
 
 // --- program / attach types ------------------------------------------------
@@ -69,6 +70,42 @@ pub struct ProgLoadAttr {
     pub prog_ifindex: u32,
     pub expected_attach_type: u32,
 }
+
+/// `bpf_attr` for `BPF_PROG_TEST_RUN`. `data_in` is a userspace pointer the
+/// kernel reads; `retval` and `duration` are written back.
+#[repr(C)]
+#[derive(Default)]
+pub struct ProgTestRunAttr {
+    pub prog_fd: u32,
+    pub retval: u32,
+    pub data_size_in: u32,
+    pub data_size_out: u32,
+    pub data_in: u64,
+    pub data_out: u64,
+    pub repeat: u32,
+    pub duration: u32,
+    pub ctx_size_in: u32,
+    pub ctx_size_out: u32,
+    pub ctx_in: u64,
+    pub ctx_out: u64,
+    pub flags: u32,
+    pub cpu: u32,
+    pub batch_size: u32,
+    /// Spelled out so it is zeroed: see the size assertions below.
+    pub _pad: u32,
+}
+
+// The kernel rejects a command with `EINVAL` unless every byte past the last
+// field it knows is zero. Padding the compiler adds is never initialized, so
+// a struct with any would pass or fail on whatever the stack last held. Each
+// size below is the sum of its fields: no padding anywhere.
+const _: () = {
+    assert!(std::mem::size_of::<MapCreateAttr>() == 5 * 4);
+    assert!(std::mem::size_of::<MapElemAttr>() == 2 * 4 + 3 * 8);
+    assert!(std::mem::size_of::<ProgLoadAttr>() == 8 * 4 + 3 * 8 + 16);
+    assert!(std::mem::size_of::<ProgTestRunAttr>() == 12 * 4 + 4 * 8);
+    assert!(std::mem::size_of::<LinkCreateAttr>() == 4 * 4);
+};
 
 /// `bpf_attr` for `BPF_LINK_CREATE` against an XDP target.
 #[repr(C)]

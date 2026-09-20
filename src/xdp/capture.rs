@@ -87,11 +87,11 @@ use std::os::fd::AsRawFd;
 use std::sync::Mutex;
 
 use super::insn::{
-    Asm, BPF_FUNC_MAP_LOOKUP_ELEM, BPF_FUNC_REDIRECT_MAP, Insn, Jmp, Label, R0, R1, R2, R3, R4, R6,
-    R7, R8, R10, Size, host_be16, ld_map_fd,
+    Asm, BPF_FUNC_MAP_LOOKUP_ELEM, BPF_FUNC_REDIRECT_MAP, Insn, Jmp, Label, R0, R1, R2, R3, R4, R5,
+    R6, R7, R8, R10, Size, host_be16, ld_map_fd,
 };
 use super::map::{Map, UpdateFlags, lpm_key};
-use super::prog::{Action, Link, Mode, Program};
+use super::prog::{Action, Link, Mode, Program, TestRun};
 use crate::{EtherType, IpPrefix, Protocol, Result};
 
 // --- packet offsets --------------------------------------------------------
@@ -143,14 +143,17 @@ const V4_SRC_KEY: i16 = -16;
 const V6_DST_KEY: i16 = -40;
 const V6_SRC_KEY: i16 = -64;
 
-/// The transport fields the rule check needs, read from the packet before any
-/// lookup and compared afterwards. Each is a `u32` so the same `ldx W` reads
-/// it back whatever its width in the packet.
-const L4_DPORT: i16 = -80;
-const L4_SPORT: i16 = -76;
-const L4_PROTO: i16 = -72;
+/// Where a TCP or UDP header keeps its two ports.
+const L4_SPORT: i16 = 0;
+const L4_DPORT: i16 = 2;
 
-/// Staged as the port when the packet has no readable transport header. A
+/// The packet's protocol and the port at the captured endpoint, as the rule
+/// walk compares them. Registers rather than stack slots: they are filled in
+/// after the lookup and nothing is called before the walk is over.
+const RULE_PROTO: u8 = R3;
+const RULE_PORT: u8 = R4;
+
+/// Loaded as the port when the packet has no readable transport header. A
 /// rule's port is 16 bits, so nothing can ever equal it.
 const NO_PORT: i32 = 0x1_0000;
 
@@ -160,16 +163,13 @@ const NO_PORT: i32 = 0x1_0000;
 const _: () = {
     assert!(V4_DST_KEY % 4 == 0 && V4_SRC_KEY % 4 == 0);
     assert!(V6_DST_KEY % 4 == 0 && V6_SRC_KEY % 4 == 0);
-    assert!(L4_DPORT % 4 == 0 && L4_SPORT % 4 == 0 && L4_PROTO % 4 == 0);
     assert!(V4_SRC_KEY + 8 <= V4_DST_KEY, "v4 keys overlap");
     assert!(
         V6_DST_KEY + 20 <= V4_SRC_KEY,
         "v6 dst key overlaps a v4 key"
     );
     assert!(V6_SRC_KEY + 20 <= V6_DST_KEY, "v6 keys overlap");
-    assert!(L4_PROTO + 4 <= V6_SRC_KEY, "transport slots overlap a key");
-    assert!(L4_DPORT + 4 <= L4_SPORT && L4_SPORT + 4 <= L4_PROTO);
-    assert!(L4_DPORT > -512, "slots exceed the BPF stack");
+    assert!(V6_SRC_KEY > -512, "keys exceed the BPF stack");
 };
 
 // --- rules -----------------------------------------------------------------
@@ -247,9 +247,15 @@ impl Rule {
 }
 
 /// The trie value for a prefix: its rules, packed, padded with `KIND_END`.
+///
+/// A [`Rule::Any`] goes first whatever order the caller added things in: it
+/// decides the packet by itself, and in the first slot the program finds it
+/// before parsing a transport header it would not need.
 fn encode_rules(rules: &[Rule], max_rules: u8) -> Vec<u8> {
     let mut v = vec![KIND_END; value_size(max_rules) as usize];
-    for (slot, rule) in rules.iter().take(max_rules as usize).enumerate() {
+    let any = rules.iter().filter(|r| **r == Rule::Any);
+    let rest = rules.iter().filter(|r| **r != Rule::Any);
+    for (slot, rule) in any.chain(rest).take(max_rules as usize).enumerate() {
         v[slot * RULE_SIZE..(slot + 1) * RULE_SIZE].copy_from_slice(&rule.encode());
     }
     v
@@ -515,69 +521,58 @@ fn stage_v6(asm: &mut Asm, slot: i16, pkt_off: i16) {
     }
 }
 
-/// Mark both port slots "unreadable". The transport staging below overwrites
-/// them only once it has proven a transport header is there.
-fn stage_no_ports(asm: &mut Asm) {
-    asm.emit(Insn::st_imm(Size::W, R10, L4_DPORT, NO_PORT));
-    asm.emit(Insn::st_imm(Size::W, R10, L4_SPORT, NO_PORT));
+/// Which packet the transport fields are read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Family {
+    V4,
+    V6,
 }
 
-/// Copy the two ports at `l4` (a register holding a packet pointer whose
-/// first 4 bytes are verified in bounds) into their slots.
-fn stage_ports(asm: &mut Asm, l4: u8) {
-    asm.emit(Insn::ldx(Size::H, R3, l4, 0));
-    asm.emit(Insn::stx(Size::W, R10, L4_SPORT, R3));
-    asm.emit(Insn::ldx(Size::H, R3, l4, 2));
-    asm.emit(Insn::stx(Size::W, R10, L4_DPORT, R3));
-}
-
-/// Stage protocol and ports from an IPv4 packet whose minimum header is
-/// already in bounds.
+/// Load [`RULE_PROTO`] and [`RULE_PORT`] from the packet, the port being the
+/// one at `port_off` in the transport header.
 ///
-/// The transport header sits at `ihl * 4`, a variable offset the verifier
-/// accepts because `ihl` is masked to four bits before it is added to the
-/// packet pointer. A non-first fragment carries no transport header, and
-/// neither does a packet whose `ihl` is short of the fixed header, so both
-/// keep the `NO_PORT` markers.
-fn stage_v4_l4(asm: &mut Asm) {
+/// This runs after a lookup has hit, never before: most packets on the
+/// interface miss, and they should not pay for a transport parse nobody will
+/// look at. `r7`/`r8` are callee-saved and `bpf_map_lookup_elem` does not move
+/// packet data, so they are still good packet pointers here. `r0` — the rule
+/// list — is left alone; `r1`, `r2` and `r5` are scratch.
+fn load_l4(asm: &mut Asm, family: Family, port_off: i16) {
     let l_done = asm.label();
-    stage_no_ports(asm);
-    asm.emit(Insn::ldx(Size::B, R1, R7, IPV4_PROTO));
-    asm.emit(Insn::stx(Size::W, R10, L4_PROTO, R1));
-
-    asm.emit(Insn::ldx(Size::H, R1, R7, IPV4_FRAG));
-    asm.jump(
-        Insn::jmp_imm(Jmp::JSET, R1, host_be16(IPV4_FRAG_OFF_MASK), 0),
-        l_done,
-    );
-
-    asm.emit(Insn::ldx(Size::B, R2, R7, ETH_HLEN as i16));
-    asm.emit(Insn::and64_imm(R2, 0x0f));
-    asm.emit(Insn::lsh64_imm(R2, 2));
-    asm.jump(Insn::jmp_imm(Jmp::JLT, R2, IPV4_MIN - ETH_HLEN, 0), l_done);
-    // r1 = data + 14 + ihl*4; verify 4 bytes there before reading them.
-    asm.emit(Insn::mov64_reg(R1, R7));
-    asm.emit(Insn::add64_imm(R1, ETH_HLEN));
-    asm.emit(Insn::add64_reg(R1, R2));
-    asm.emit(Insn::mov64_reg(R3, R1));
-    asm.emit(Insn::add64_imm(R3, 4));
-    asm.jump(Insn::jmp_reg(Jmp::JGT, R3, R8, 0), l_done);
-    stage_ports(asm, R1);
-    asm.place(l_done);
-}
-
-/// Stage protocol and ports from an IPv6 packet whose fixed header is already
-/// in bounds. Extension headers are not walked (see the module docs), so the
-/// ports are wherever a directly-following TCP/UDP header would put them.
-fn stage_v6_l4(asm: &mut Asm) {
-    let l_done = asm.label();
-    stage_no_ports(asm);
-    asm.emit(Insn::ldx(Size::B, R1, R7, IPV6_NEXT));
-    asm.emit(Insn::stx(Size::W, R10, L4_PROTO, R1));
-    need_bytes(asm, IPV6_MIN + 4, l_done);
-    asm.emit(Insn::mov64_reg(R1, R7));
-    asm.emit(Insn::add64_imm(R1, IPV6_MIN));
-    stage_ports(asm, R1);
+    asm.emit(Insn::mov64_imm(RULE_PORT, NO_PORT));
+    match family {
+        // The transport header sits at `ihl * 4`, a variable offset the
+        // verifier accepts because `ihl` is masked to four bits before it is
+        // added to the packet pointer. A non-first fragment carries no
+        // transport header, and neither does a packet whose `ihl` is short of
+        // the fixed header, so both keep `NO_PORT`.
+        Family::V4 => {
+            asm.emit(Insn::ldx(Size::B, RULE_PROTO, R7, IPV4_PROTO));
+            asm.emit(Insn::ldx(Size::H, R1, R7, IPV4_FRAG));
+            asm.jump(
+                Insn::jmp_imm(Jmp::JSET, R1, host_be16(IPV4_FRAG_OFF_MASK), 0),
+                l_done,
+            );
+            asm.emit(Insn::ldx(Size::B, R2, R7, ETH_HLEN as i16));
+            asm.emit(Insn::and64_imm(R2, 0x0f));
+            asm.emit(Insn::lsh64_imm(R2, 2));
+            asm.jump(Insn::jmp_imm(Jmp::JLT, R2, IPV4_MIN - ETH_HLEN, 0), l_done);
+            asm.emit(Insn::mov64_reg(R1, R7));
+            asm.emit(Insn::add64_imm(R1, ETH_HLEN));
+            asm.emit(Insn::add64_reg(R1, R2));
+        }
+        // Extension headers are not walked (see the module docs), so the
+        // ports are wherever a directly-following TCP/UDP header puts them.
+        Family::V6 => {
+            asm.emit(Insn::ldx(Size::B, RULE_PROTO, R7, IPV6_NEXT));
+            asm.emit(Insn::mov64_reg(R1, R7));
+            asm.emit(Insn::add64_imm(R1, IPV6_MIN));
+        }
+    }
+    // r1 = transport header; both ports have to be in bounds to read either.
+    asm.emit(Insn::mov64_reg(R5, R1));
+    asm.emit(Insn::add64_imm(R5, 4));
+    asm.jump(Insn::jmp_reg(Jmp::JGT, R5, R8, 0), l_done);
+    asm.emit(Insn::ldx(Size::H, RULE_PORT, R1, port_off));
     asm.place(l_done);
 }
 
@@ -594,27 +589,34 @@ fn lookup(asm: &mut Asm, map_fd: i32, slot: i16, miss: Label) {
 /// Walk the rule list `r0` points at: `goto hit` on the first rule the packet
 /// satisfies, `goto miss` once none does.
 ///
-/// `port_slot` names the port the packet is judged on — [`L4_DPORT`] after a
-/// destination-address hit, [`L4_SPORT`] after a source one. `None` is the ARP
-/// branch, where only a [`Rule::Any`] can match: there is no transport header
-/// to judge anything else on, and a narrower rule leaves ARP to the host.
-fn match_rules(asm: &mut Asm, max_rules: u8, port_slot: Option<i16>, hit: Label, miss: Label) {
-    if let Some(slot) = port_slot {
-        asm.emit(Insn::ldx(Size::W, R3, R10, L4_PROTO));
-        asm.emit(Insn::ldx(Size::W, R4, R10, slot));
-    }
+/// `l4` names the packet family and the port the packet is judged on —
+/// [`L4_DPORT`] after a destination-address hit, [`L4_SPORT`] after a source
+/// one. `None` is the ARP branch, where only a [`Rule::Any`] can match: there
+/// is no transport header to judge anything else on, and a narrower rule
+/// leaves ARP to the host.
+///
+/// The transport fields are loaded only once the first slot has turned out to
+/// be neither the end of the list nor a [`Rule::Any`], which [`encode_rules`]
+/// always puts first. A whole-address capture is therefore decided on one byte
+/// of the value.
+fn match_rules(asm: &mut Asm, max_rules: u8, l4: Option<(Family, i16)>, hit: Label, miss: Label) {
     for i in 0..max_rules as i16 {
         let next = asm.label();
         let off = i * RULE_SIZE as i16;
         asm.emit(Insn::ldx(Size::B, R1, R0, off));
         asm.jump(Insn::jmp_imm(Jmp::JEQ, R1, KIND_END as i32, 0), miss);
         asm.jump(Insn::jmp_imm(Jmp::JEQ, R1, KIND_ANY as i32, 0), hit);
-        if port_slot.is_some() {
+        if let Some((family, port_off)) = l4 {
+            if i == 0 {
+                load_l4(asm, family, port_off);
+                // The parse used r1.
+                asm.emit(Insn::ldx(Size::B, R1, R0, off));
+            }
             asm.emit(Insn::ldx(Size::B, R2, R0, off + 1));
-            asm.jump(Insn::jmp_reg(Jmp::JNE, R2, R3, 0), next);
+            asm.jump(Insn::jmp_reg(Jmp::JNE, R2, RULE_PROTO, 0), next);
             asm.jump(Insn::jmp_imm(Jmp::JEQ, R1, KIND_PROTO as i32, 0), hit);
             asm.emit(Insn::ldx(Size::H, R2, R0, off + 2));
-            asm.jump(Insn::jmp_reg(Jmp::JEQ, R2, R4, 0), hit);
+            asm.jump(Insn::jmp_reg(Jmp::JEQ, R2, RULE_PORT, 0), hit);
         }
         asm.place(next);
     }
@@ -627,12 +629,12 @@ fn lookup_and_match(
     cfg: &CaptureConfig,
     map_fd: i32,
     slot: i16,
-    port_slot: Option<i16>,
+    l4: Option<(Family, i16)>,
     hit: Label,
 ) {
     let miss = asm.label();
     lookup(asm, map_fd, slot, miss);
-    match_rules(asm, cfg.max_rules_per_prefix, port_slot, hit, miss);
+    match_rules(asm, cfg.max_rules_per_prefix, l4, hit, miss);
     asm.place(miss);
 }
 
@@ -700,13 +702,12 @@ fn build_program_with_fds(
     }
     asm.jump(Insn::ja(0), l_default);
 
-    // Every packet read in a branch happens before its first lookup: the
-    // transport fields and both keys are staged, then the lookups run.
+    // Both keys are staged before the first lookup. The transport header is
+    // not: it is parsed after an address hit, inside the rule walk.
 
     // --- IPv4 ---
     asm.place(l_v4);
     need_bytes(&mut asm, IPV4_MIN, l_default);
-    stage_v4_l4(&mut asm);
     if cfg.match_field.wants_dst() {
         stage_v4(&mut asm, V4_DST_KEY, IPV4_DST);
     }
@@ -714,17 +715,18 @@ fn build_program_with_fds(
         stage_v4(&mut asm, V4_SRC_KEY, IPV4_SRC);
     }
     if cfg.match_field.wants_dst() {
-        lookup_and_match(&mut asm, cfg, v4_fd, V4_DST_KEY, Some(L4_DPORT), l_redirect);
+        let l4 = Some((Family::V4, L4_DPORT));
+        lookup_and_match(&mut asm, cfg, v4_fd, V4_DST_KEY, l4, l_redirect);
     }
     if cfg.match_field.wants_src() {
-        lookup_and_match(&mut asm, cfg, v4_fd, V4_SRC_KEY, Some(L4_SPORT), l_redirect);
+        let l4 = Some((Family::V4, L4_SPORT));
+        lookup_and_match(&mut asm, cfg, v4_fd, V4_SRC_KEY, l4, l_redirect);
     }
     asm.jump(Insn::ja(0), l_default);
 
     // --- IPv6 ---
     asm.place(l_v6);
     need_bytes(&mut asm, IPV6_MIN, l_default);
-    stage_v6_l4(&mut asm);
     if cfg.match_field.wants_dst() {
         stage_v6(&mut asm, V6_DST_KEY, IPV6_DST);
     }
@@ -732,10 +734,12 @@ fn build_program_with_fds(
         stage_v6(&mut asm, V6_SRC_KEY, IPV6_SRC);
     }
     if cfg.match_field.wants_dst() {
-        lookup_and_match(&mut asm, cfg, v6_fd, V6_DST_KEY, Some(L4_DPORT), l_redirect);
+        let l4 = Some((Family::V6, L4_DPORT));
+        lookup_and_match(&mut asm, cfg, v6_fd, V6_DST_KEY, l4, l_redirect);
     }
     if cfg.match_field.wants_src() {
-        lookup_and_match(&mut asm, cfg, v6_fd, V6_SRC_KEY, Some(L4_SPORT), l_redirect);
+        let l4 = Some((Family::V6, L4_SPORT));
+        lookup_and_match(&mut asm, cfg, v6_fd, V6_SRC_KEY, l4, l_redirect);
     }
     asm.jump(Insn::ja(0), l_default);
 
@@ -798,7 +802,7 @@ struct Entry {
 #[derive(Debug)]
 pub struct Capture {
     maps: CaptureMaps,
-    _prog: Program,
+    prog: Program,
     link: Link,
     cfg: CaptureConfig,
     /// What the caller added, kept so a removal can tell whether a derived
@@ -820,7 +824,7 @@ impl Capture {
         let link = prog.attach(ifindex, mode)?;
         Ok(Capture {
             maps,
-            _prog: prog,
+            prog,
             link,
             cfg,
             entries: Mutex::new(Vec::new()),
@@ -837,6 +841,13 @@ impl Capture {
     #[inline]
     pub fn xskmap(&self) -> &Map {
         &self.maps.xskmap
+    }
+
+    /// Run the attached program against `frame` in the kernel, `repeat` times:
+    /// the verdict it gives with the capture set as it stands, and its mean
+    /// cost per packet. See [`Program::test_run`].
+    pub fn test_run(&self, frame: &[u8], repeat: u32) -> Result<TestRun> {
+        self.prog.test_run(frame, repeat)
     }
 
     /// Start capturing everything for `prefix`: [`Capture::add_rule`] with
@@ -947,7 +958,8 @@ impl Capture {
     }
 
     /// The rules the kernel-side set applies to `addr`: those of the longest
-    /// prefix containing it, or none if nothing does.
+    /// prefix containing it, or none if nothing does. They come back in the
+    /// order the program walks them, which has any [`Rule::Any`] first.
     pub fn rules_for(&self, addr: IpAddr) -> Result<Vec<Rule>> {
         let full = IpPrefix::new(addr, if addr.is_ipv4() { 32 } else { 128 });
         let mut out = vec![0u8; value_size(self.cfg.max_rules_per_prefix) as usize];
@@ -1596,23 +1608,38 @@ mod tests {
             .position(|i| *i == Insn::call(BPF_FUNC_REDIRECT_MAP))
             .unwrap();
         for i in &p[arp..redirect] {
-            assert_ne!(*i, Insn::ldx(Size::W, R3, R10, L4_PROTO));
+            assert_ne!(*i, Insn::mov64_imm(RULE_PORT, NO_PORT));
             assert_ne!(*i, Insn::ldx(Size::B, R2, R0, 1));
         }
     }
 
     #[test]
-    fn transport_slots_are_staged_before_the_first_lookup() {
+    fn the_transport_header_is_not_parsed_before_a_lookup() {
+        // A miss is the common case on a shared NIC and must stay cheap: no
+        // branch may start its transport parse ahead of its first lookup.
         let p = program(&CaptureConfig::default());
         let first_call = p
             .iter()
             .position(|i| *i == Insn::call(BPF_FUNC_MAP_LOOKUP_ELEM))
             .unwrap();
         let head = &p[..first_call];
-        for slot in [L4_DPORT, L4_SPORT] {
-            assert!(head.contains(&Insn::st_imm(Size::W, R10, slot, NO_PORT)));
-        }
-        assert!(head.contains(&Insn::stx(Size::W, R10, L4_PROTO, R1)));
+        assert!(!head.contains(&Insn::mov64_imm(RULE_PORT, NO_PORT)));
+        assert!(!head.contains(&Insn::ldx(Size::B, RULE_PROTO, R7, IPV4_PROTO)));
+        // And it is there afterwards, once per lookup site.
+        let parses = p
+            .iter()
+            .filter(|i| **i == Insn::mov64_imm(RULE_PORT, NO_PORT))
+            .count();
+        assert_eq!(parses, 2, "one v4 site and one v6 site under Dst");
+    }
+
+    #[test]
+    fn any_is_encoded_first() {
+        let rules = [Rule::Port(TCP, 443), Rule::Any, Rule::Proto(Protocol::GRE)];
+        assert_eq!(
+            decode_rules(&encode_rules(&rules, 8)),
+            [Rule::Any, Rule::Port(TCP, 443), Rule::Proto(Protocol::GRE)]
+        );
     }
 
     // --- executing the program ---
@@ -1671,6 +1698,8 @@ mod tests {
             pub v6: Trie,
             pub xsk_queues: Vec<u32>,
             pub rx_queue: u32,
+            /// Instructions the last [`Vm::run`] executed.
+            pub steps: usize,
             pkt: &'a [u8],
             stack: [u8; 512],
             value: Vec<u8>,
@@ -1685,6 +1714,7 @@ mod tests {
                     v6,
                     xsk_queues: vec![0],
                     rx_queue: 0,
+                    steps: 0,
                     pkt,
                     stack: [0; 512],
                     value: Vec::new(),
@@ -1783,10 +1813,10 @@ mod tests {
                 self.regs[10] = STACK_TOP;
 
                 let mut pc = 0usize;
-                let mut steps = 0;
+                self.steps = 0;
                 loop {
-                    steps += 1;
-                    assert!(steps < 10_000, "program does not terminate");
+                    self.steps += 1;
+                    assert!(self.steps < 10_000, "program does not terminate");
                     let i = prog[pc];
                     let dst = (i.regs & 0x0f) as usize;
                     let src = (i.regs >> 4) as usize;
@@ -1906,6 +1936,16 @@ mod tests {
         let prog = build_program_with_fds(cfg, vm::XSK_FD, vm::V4_FD, vm::V6_FD).unwrap();
         let (v4, v6) = tries(cfg, set);
         Vm::new(pkt, v4, v6).run(&prog)
+    }
+
+    /// Instructions executed for `pkt`, the measure of what a packet costs
+    /// before the JIT: helper calls count as one.
+    fn steps(cfg: &CaptureConfig, set: &[(IpPrefix, &[Rule])], pkt: &[u8]) -> usize {
+        let prog = build_program_with_fds(cfg, vm::XSK_FD, vm::V4_FD, vm::V6_FD).unwrap();
+        let (v4, v6) = tries(cfg, set);
+        let mut vm = Vm::new(pkt, v4, v6);
+        vm.run(&prog);
+        vm.steps
     }
 
     const REDIRECT: u32 = Action::REDIRECT.0;
@@ -2172,6 +2212,39 @@ mod tests {
             verdict(&cfg, set, &ipv4(Protocol::GRE, PEER, HOST, &[0; 4])),
             REDIRECT
         );
+    }
+
+    #[test]
+    fn any_is_honoured_wherever_it_sits_in_the_value() {
+        // `encode_rules` puts Any first, but the maps are public: a value
+        // written by someone else must still mean what it says.
+        let cfg = CaptureConfig::default();
+        let mut value = encode_rules(&[Rule::Port(TCP, 1)], cfg.max_rules_per_prefix);
+        value[RULE_SIZE..2 * RULE_SIZE].copy_from_slice(&Rule::Any.encode());
+        let (mut v4t, v6t) = tries(&cfg, &[]);
+        v4t.entries.push((32, HOST.to_vec(), value));
+        let prog = build_program_with_fds(&cfg, vm::XSK_FD, vm::V4_FD, vm::V6_FD).unwrap();
+        let f = ipv4(Protocol::GRE, PEER, HOST, &[0; 4]);
+        assert_eq!(Vm::new(&f, v4t, v6t).run(&prog), REDIRECT);
+    }
+
+    #[test]
+    fn a_miss_is_the_cheapest_path_through_the_program() {
+        let cfg = CaptureConfig::default();
+        let any: &[(IpPrefix, &[Rule])] = &[(v4(HOST, 32), &[Rule::Any])];
+        let port: &[(IpPrefix, &[Rule])] = &[(v4(HOST, 32), &[Rule::Port(UDP, 53)])];
+        let hit = ipv4(UDP, PEER, HOST, &ports(1, 53));
+        let miss = ipv4(UDP, HOST, PEER, &ports(1, 53));
+
+        // Host traffic that is none of our business: bounds checks, one key,
+        // one lookup, the default verdict. The exact count is pinned so that
+        // anything added to this path has to be added on purpose.
+        assert_eq!(steps(&cfg, port, &miss), 23);
+        assert_eq!(steps(&cfg, any, &miss), steps(&cfg, port, &miss));
+        // A whole-address capture is decided without a transport parse...
+        assert!(steps(&cfg, any, &hit) < steps(&cfg, port, &hit));
+        // ...and only a narrow rule pays for one.
+        assert!(steps(&cfg, port, &hit) > steps(&cfg, port, &miss));
     }
 
     #[test]
