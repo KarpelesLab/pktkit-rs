@@ -47,6 +47,10 @@ fn root() -> bool {
 /// time, whatever `--test-threads` says.
 static ADDRESS_PLAN: Mutex<()> = Mutex::new(());
 
+/// Locally administered, unicast. See [`Veth::new`] for why they are fixed.
+const HOST_MAC: &str = "02:70:6b:00:00:01";
+const PEER_MAC: &str = "02:70:6b:00:00:02";
+
 /// veth pair + netns, torn down on drop.
 struct Veth {
     ns: String,
@@ -75,9 +79,17 @@ impl Veth {
             ip(&["netns", "add", &v.ns]),
             "ip netns add (iproute2 present?)"
         );
+        // Both ends get an address we chose. Left to the kernel they get a
+        // random one, and udev then swaps in its "persistent" address a moment
+        // after the link appears — asynchronously, so sometimes after the
+        // peer has already resolved the old one. From then on the peer sends
+        // to a MAC the host end no longer has, and the host drops every frame
+        // as addressed to someone else. An address set explicitly is left
+        // alone.
         assert!(
             ip(&[
-                "link", "add", &v.host, "type", "veth", "peer", "name", &v.peer, "netns", &v.ns,
+                "link", "add", &v.host, "address", HOST_MAC, "type", "veth", "peer", "name",
+                &v.peer, "address", PEER_MAC, "netns", &v.ns,
             ]),
             "ip link add veth"
         );
@@ -592,11 +604,12 @@ fn uncaptured_traffic_still_reaches_the_host_stack() {
 
     // 10.99.0.1 is the host's own address on this link and was never captured,
     // so the kernel must still answer it.
-    assert!(
-        veth.ping_host(),
-        "attaching the capture program broke the host stack: {}",
-        why_no_answer(&veth, &dev)
-    );
+    if !veth.ping_host() {
+        panic!(
+            "attaching the capture program broke the host stack: {}",
+            why_no_answer(&veth, dev)
+        );
+    }
 
     dev.close().unwrap();
 }
@@ -637,11 +650,12 @@ fn a_port_rule_shares_the_address_with_the_host_stack() {
         .unwrap();
 
     // The host still answers ARP and ICMP for the address.
-    assert!(
-        veth.ping_host(),
-        "a port rule took the whole address away from the host: {}",
-        why_no_answer(&veth, &dev)
-    );
+    if !veth.ping_host() {
+        panic!(
+            "a port rule took the whole address away from the host: {}",
+            why_no_answer(&veth, dev)
+        );
+    }
     assert!(
         !seen.lock().unwrap().iter().any(|f| ipv4_dst(f).is_some()),
         "ICMP to a port-captured address was diverted"
@@ -694,9 +708,44 @@ fn l4_frame(proto: Protocol, dst: [u8; 4], ihl: u8, frag: u16, sport: u16, dport
     f
 }
 
+/// Output of a command, or why there is none, on one line.
+fn output_of(cmd: &str, args: &[&str]) -> String {
+    match Command::new(cmd).args(args).output() {
+        Ok(o) => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .map(str::trim)
+            .collect::<Vec<_>>()
+            .join(" | "),
+        Err(e) => format!("({cmd}: {e})"),
+    }
+}
+
+/// `InEchos` and `OutEchoReps` from the root namespace's ICMP counters: did
+/// the stack see an echo request, and did it answer.
+fn icmp_echo_counters() -> (u64, u64) {
+    let snmp = std::fs::read_to_string("/proc/net/snmp").unwrap_or_default();
+    let mut lines = snmp.lines().filter(|l| l.starts_with("Icmp:"));
+    let (Some(names), Some(values)) = (lines.next(), lines.next()) else {
+        return (0, 0);
+    };
+    let field = |want: &str| {
+        names
+            .split_whitespace()
+            .zip(values.split_whitespace())
+            .find(|(n, _)| *n == want)
+            .and_then(|(_, v)| v.parse().ok())
+            .unwrap_or(0)
+    };
+    (field("InEchos"), field("OutEchoReps"))
+}
+
 /// Everything that tells "the program dropped it" from "the stack lost it",
 /// for the message of a ping that went unanswered after the baseline passed.
-fn why_no_answer(veth: &Veth, dev: &Device) -> String {
+///
+/// Takes the device because the last two probes need it gone: whether the
+/// host answers again once the program is detached, and whether it answers
+/// behind a generic-mode attachment where it did not behind a native one.
+fn why_no_answer(veth: &Veth, dev: Device) -> String {
     let verdict = |frame: &[u8]| {
         dev.capture()
             .map(|c| c.test_run(frame, 1).map(|r| r.action))
@@ -709,29 +758,72 @@ fn why_no_answer(veth: &Veth, dev: &Device) -> String {
     arp.extend_from_slice(&[0, 1, 0x08, 0x00, 6, 4, 0, 1]);
     arp.extend_from_slice(&[0x02, 0, 0, 0, 0, 2, 10, 99, 0, 2]);
     arp.extend_from_slice(&[0, 0, 0, 0, 0, 0, 10, 99, 0, 1]);
+    let verdicts = format!("echo={:?} arp={:?}", verdict(&echo), verdict(&arp));
 
-    let host_stat = |name: &str| {
+    let host_stat = |name: &str| -> u64 {
         std::fs::read_to_string(format!("/sys/class/net/{}/statistics/{name}", veth.host))
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|e| e.to_string())
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0)
     };
-    // A transient outage while the program settles in and a lasting one are
-    // different bugs.
+
+    // One more ping, a second later, with the counters read either side of
+    // it: requests arriving (rx), the stack seeing them (InEchos), the stack
+    // answering (OutEchoReps), the answers leaving by this veth (tx).
     std::thread::sleep(Duration::from_secs(1));
+    let (rx0, tx0) = (host_stat("rx_packets"), host_stat("tx_packets"));
+    let (in0, out0) = icmp_echo_counters();
     let retry = veth.ping_host();
+    let (in1, out1) = icmp_echo_counters();
+    let during = format!(
+        "answered={retry} veth rx+{} tx+{} rx_dropped={} stack InEchos+{} OutEchoReps+{}",
+        host_stat("rx_packets") - rx0,
+        host_stat("tx_packets") - tx0,
+        host_stat("rx_dropped"),
+        in1 - in0,
+        out1 - out0,
+    );
+
+    // If these disagree with what the peer has cached below, the host end
+    // changed its address under the test.
+    let host_mac = veth.host_mac();
+    let neigh_host = output_of("ip", &["neigh", "show", "dev", &veth.host]);
+    let neigh_peer = output_of("ip", &["-n", &veth.ns, "neigh", "show"]);
+    let routes = output_of("ip", &["route", "show", "10.99.0.0/24"]);
+    let queue_stats = output_of("ethtool", &["-S", &veth.host]);
+    let mode = dev.mode();
+    let xsk = dev
+        .statistics()
+        .map(|s| (s.rx_dropped, s.rx_invalid_descs, s.rx_ring_full));
+
+    // Detached: does the host come back by itself?
+    let _ = dev.close();
+    drop(dev);
+    std::thread::sleep(Duration::from_millis(1500));
+    let detached = veth.ping_host();
+
+    // And behind the generic hook, which shares nothing with veth's own
+    // NAPI receive path?
+    let generic = match Device::open(Config {
+        interface: veth.host.clone(),
+        zerocopy: Zerocopy::Off,
+        mode: Mode::GENERIC,
+        ..Default::default()
+    }) {
+        Ok(d) => {
+            let answered = veth.ping_host();
+            let _ = d.close();
+            format!("{answered}")
+        }
+        Err(e) => format!("(open: {e})"),
+    };
 
     format!(
-        "mode={:?} zerocopy={} verdict(echo)={:?} verdict(arp)={:?} \
-         answers a second ping a second later={retry} host rx_packets={} rx_dropped={} \
-         xsk stats={:?}",
-        dev.mode(),
-        dev.zerocopy(),
-        verdict(&echo),
-        verdict(&arp),
-        host_stat("rx_packets"),
-        host_stat("rx_dropped"),
-        dev.statistics()
-            .map(|s| (s.rx_dropped, s.rx_invalid_descs, s.rx_ring_full)),
+        "\n  mode={mode:?} verdicts: {verdicts}\n  second ping: {during}\n  \
+         xsk stats={xsk:?}\n  host mac now: {host_mac} (created as {HOST_MAC})\n  \
+         host neigh: {neigh_host}\n  peer neigh: {neigh_peer}\n  \
+         routes: {routes}\n  ethtool -S: {queue_stats}\n  \
+         answers once detached={detached}\n  answers behind generic mode={generic}"
     )
 }
 
