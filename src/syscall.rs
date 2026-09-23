@@ -477,7 +477,15 @@ impl IfReq {
 /// Resolve an interface name to its index, as libc's `if_nametoindex` does:
 /// `SIOCGIFINDEX` on a throwaway socket.
 pub(crate) fn if_nametoindex(name: &str) -> Result<u32> {
-    let mut req = IfReq::new(name)?;
+    let not_found = || {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("interface {name:?} not found"),
+        )
+    };
+    // No interface can have a name that does not fit an ifreq, so like libc,
+    // report that as not found rather than as a bad argument.
+    let mut req = IfReq::new(name).map_err(|_| not_found())?;
     let sock = socket(AF_INET, SOCK_DGRAM, 0)?;
     // SAFETY: SIOCGIFINDEX reads the name and writes an int into the union,
     // both inside `req`.
@@ -494,10 +502,7 @@ pub(crate) fn if_nametoindex(name: &str) -> Result<u32> {
             req.data[2],
             req.data[3],
         ])),
-        Err(e) if e.raw_os_error() == Some(ENODEV) => Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("interface {name:?} not found"),
-        )),
+        Err(e) if e.raw_os_error() == Some(ENODEV) => Err(not_found()),
         Err(e) => Err(e),
     }
 }
@@ -530,6 +535,14 @@ mod tests {
     #[test]
     fn loopback_resolves() {
         assert_eq!(if_nametoindex("lo").unwrap(), 1);
+    }
+
+    #[test]
+    fn missing_interfaces_are_not_found() {
+        for name in ["pktkit-nope", "pktkit-no-such-if", "nul\0inside"] {
+            let e = if_nametoindex(name).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::NotFound, "{name:?}: {e}");
+        }
     }
 
     #[test]
