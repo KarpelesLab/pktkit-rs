@@ -261,7 +261,45 @@ impl crate::L2Acceptor for Listener {
 mod tests {
     use super::*;
     use crate::{EtherType, build_frame};
+    use std::sync::mpsc;
     use std::time::Duration;
+
+    /// How long to wait for the echo. Only reached when the test is failing:
+    /// a passing run returns as soon as the frame is back.
+    const ECHO_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// Accept one peer on `ln` and echo every frame back to it, holding the
+    /// connection until the returned sender fires (or is dropped).
+    fn echo_server(ln: Listener) -> (std::thread::JoinHandle<()>, mpsc::Sender<()>) {
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let t = std::thread::spawn(move || {
+            let conn = ln.accept().unwrap();
+            let conn_for_handler = conn.clone();
+            conn.set_handler(Arc::new(move |f: &Frame| conn_for_handler.send(f)));
+            let _ = done_rx.recv();
+            drop(conn);
+        });
+        (t, done_tx)
+    }
+
+    /// Send `payload` through `client` and wait for the echo. Channels rather
+    /// than sleeps, so a slow runner makes the test slower, not flaky.
+    fn assert_echoes(client: &Arc<Conn>, payload: &[u8]) {
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        client.set_handler(Arc::new(move |f: &Frame| {
+            let _ = tx.send(f.as_bytes().to_vec());
+            Ok(())
+        }));
+
+        let m = MacAddr([2, 0, 0, 0, 0, 1]);
+        let frame = build_frame(m, m, EtherType::IPV4, payload);
+        client.send(Frame::from_slice(&frame)).unwrap();
+
+        let echoed = rx.recv_timeout(ECHO_TIMEOUT).expect("no echo");
+        assert_eq!(echoed, frame);
+        // Exactly one copy: nothing else may already be queued behind it.
+        assert!(rx.try_recv().is_err(), "frame echoed more than once");
+    }
 
     #[test]
     fn tcp_roundtrip() {
@@ -271,33 +309,14 @@ mod tests {
             #[cfg(unix)]
             _ => unreachable!(),
         };
-
-        let server_thread = std::thread::spawn(move || {
-            let conn = ln.accept().unwrap();
-            let conn_for_handler = conn.clone();
-            conn.set_handler(Arc::new(move |f: &Frame| conn_for_handler.send(f)));
-            std::thread::sleep(Duration::from_millis(200));
-            drop(conn);
-        });
+        let (server, done) = echo_server(ln);
 
         let client = dial_tcp(addr).unwrap();
-        let received = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
-        let rc = received.clone();
-        client.set_handler(Arc::new(move |f: &Frame| {
-            rc.lock().unwrap().push(f.as_bytes().to_vec());
-            Ok(())
-        }));
+        assert_echoes(&client, b"hello world");
 
-        let m = MacAddr([2, 0, 0, 0, 0, 1]);
-        let frame = build_frame(m, m, EtherType::IPV4, b"hello world");
-        client.send(Frame::from_slice(&frame)).unwrap();
-
-        std::thread::sleep(Duration::from_millis(100));
-        let r = received.lock().unwrap();
-        assert_eq!(r.len(), 1);
-        assert_eq!(r[0], frame);
         drop(client);
-        server_thread.join().unwrap();
+        let _ = done.send(());
+        server.join().unwrap();
     }
 
     #[test]
@@ -305,32 +324,14 @@ mod tests {
     fn unix_roundtrip() {
         let tmp = std::env::temp_dir().join(format!("pktkit-qemu-{}.sock", std::process::id()));
         let ln = Listener::bind_unix(&tmp).unwrap();
-        let path = tmp.clone();
+        let (server, done) = echo_server(ln);
 
-        let server_thread = std::thread::spawn(move || {
-            let conn = ln.accept().unwrap();
-            let conn_for_handler = conn.clone();
-            conn.set_handler(Arc::new(move |f: &Frame| conn_for_handler.send(f)));
-            std::thread::sleep(Duration::from_millis(200));
-            drop(conn);
-        });
+        let client = dial_unix(&tmp).unwrap();
+        assert_echoes(&client, b"hi");
 
-        let client = dial_unix(&path).unwrap();
-        let received = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
-        let rc = received.clone();
-        client.set_handler(Arc::new(move |f: &Frame| {
-            rc.lock().unwrap().push(f.as_bytes().to_vec());
-            Ok(())
-        }));
-
-        let m = MacAddr([2, 0, 0, 0, 0, 1]);
-        let frame = build_frame(m, m, EtherType::IPV4, b"hi");
-        client.send(Frame::from_slice(&frame)).unwrap();
-
-        std::thread::sleep(Duration::from_millis(100));
-        assert_eq!(received.lock().unwrap().len(), 1);
         drop(client);
-        server_thread.join().unwrap();
+        let _ = done.send(());
+        server.join().unwrap();
         let _ = std::fs::remove_file(&tmp);
     }
 }
