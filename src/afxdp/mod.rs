@@ -65,4 +65,4 @@ mod xdp;
 
 pub mod ring;
 
-pub use xdp::{BusyPoll, Config, Device, ProgramSource, Zerocopy};
+pub use xdp::{BusyPoll, Config, Device, ProgramSource, Statistics, Zerocopy};

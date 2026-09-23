@@ -186,7 +186,7 @@ impl Map {
         // SAFETY: as for `update`; `out` is writable for value_size bytes.
         match unsafe { bpf_cmd(sys::BPF_MAP_LOOKUP_ELEM, &mut attr) } {
             Ok(_) => Ok(true),
-            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(false),
+            Err(e) if e.raw_os_error() == Some(crate::syscall::ENOENT) => Ok(false),
             Err(e) => Err(ctx_err("map lookup", e)),
         }
     }
@@ -204,7 +204,7 @@ impl Map {
         // SAFETY: as for `update`; delete reads only the key.
         match unsafe { bpf_cmd(sys::BPF_MAP_DELETE_ELEM, &mut attr) } {
             Ok(_) => Ok(true),
-            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(false),
+            Err(e) if e.raw_os_error() == Some(crate::syscall::ENOENT) => Ok(false),
             Err(e) => Err(ctx_err("map delete", e)),
         }
     }

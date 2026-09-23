@@ -2,9 +2,9 @@
 //! program, still the only way to detach one that outlived its process.
 
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::AsRawFd;
 
-use crate::Result;
+use crate::{Result, syscall};
 
 const NETLINK_ROUTE: i32 = 0;
 const RTM_SETLINK: u16 = 19;
@@ -38,7 +38,7 @@ fn build_setlink_xdp(ifindex: u32, prog_fd: i32, flags: u32, seq: u32) -> Vec<u8
 
     // struct ifinfomsg: family(1) pad(1) type(2) index(4) flags(4) change(4).
     let mut ifinfo = [0u8; 16];
-    ifinfo[0] = libc::AF_UNSPEC as u8;
+    ifinfo[0] = syscall::AF_UNSPEC as u8;
     ifinfo[4..8].copy_from_slice(&ifindex.to_ne_bytes());
 
     let mut payload = Vec::with_capacity(16 + nested.len());
@@ -62,41 +62,20 @@ fn build_setlink_xdp(ifindex: u32, prog_fd: i32, flags: u32, seq: u32) -> Vec<u8
 // TODO(xdp): needs a real interface + CAP_NET_ADMIN to verify. The message
 // encoding is unit-tested; the socket round-trip is not.
 pub fn set_xdp(ifindex: u32, prog_fd: i32, flags: u32) -> Result<()> {
-    let sock = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW, NETLINK_ROUTE) };
-    if sock < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: fresh fd; OwnedFd closes it on drop.
-    let sock = unsafe { OwnedFd::from_raw_fd(sock) };
+    let sock = syscall::socket(syscall::AF_NETLINK, syscall::SOCK_RAW, NETLINK_ROUTE)?;
     let raw = sock.as_raw_fd();
 
     let msg = build_setlink_xdp(ifindex, prog_fd, flags, 1);
 
     // struct sockaddr_nl { family:u16, pad:u16, pid:u32, groups:u32 }.
     let mut sa = [0u8; 12];
-    sa[0..2].copy_from_slice(&(libc::AF_NETLINK as u16).to_ne_bytes());
-
-    let sent = unsafe {
-        libc::sendto(
-            raw,
-            msg.as_ptr() as *const libc::c_void,
-            msg.len(),
-            0,
-            sa.as_ptr() as *const libc::sockaddr,
-            sa.len() as libc::socklen_t,
-        )
-    };
-    if sent < 0 {
-        return Err(io::Error::last_os_error());
-    }
+    sa[0..2].copy_from_slice(&(syscall::AF_NETLINK as u16).to_ne_bytes());
+    syscall::sendto(raw, &msg, 0, Some(&sa))?;
 
     // The ACK is an nlmsgerr whose `error` is 0 on success.
     let mut buf = [0u8; 4096];
-    let n = unsafe { libc::recv(raw, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
-    if n < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if n as usize >= 20 {
+    let n = syscall::recv(raw, &mut buf, 0)?;
+    if n >= 20 {
         let err_code = i32::from_ne_bytes([buf[16], buf[17], buf[18], buf[19]]);
         if err_code != 0 {
             return Err(io::Error::from_raw_os_error(-err_code));

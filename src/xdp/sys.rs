@@ -1,6 +1,6 @@
 //! Raw `bpf(2)` plumbing.
 //!
-//! We call `syscall(SYS_bpf, cmd, &attr, sizeof attr)` directly rather than
+//! We call `bpf(cmd, &attr, sizeof attr)` directly rather than
 //! depend on libbpf: the programs in this module are hand-encoded, so an ELF
 //! loader would be the only thing libbpf brought to the table.
 //!
@@ -117,28 +117,6 @@ pub struct LinkCreateAttr {
     pub flags: u32,
 }
 
-/// Invoke `bpf(2)`.
-///
-/// # Safety
-/// `attr` must point at a valid, initialized struct of at least `size` bytes
-/// matching `cmd`, and any pointers inside it must be valid for the call.
-pub unsafe fn bpf(cmd: i32, attr: *mut libc::c_void, size: usize) -> Result<i32> {
-    // SAFETY: the caller guarantees `attr` points at a valid `size`-byte
-    // struct matching `cmd`.
-    let r = unsafe {
-        libc::syscall(
-            libc::SYS_bpf,
-            cmd as libc::c_long,
-            attr,
-            size as libc::c_long,
-        )
-    };
-    if r < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(r as i32)
-}
-
 /// `bpf(2)` with a `#[repr(C)]` attr struct, sized automatically.
 ///
 /// # Safety
@@ -146,13 +124,7 @@ pub unsafe fn bpf(cmd: i32, attr: *mut libc::c_void, size: usize) -> Result<i32>
 pub unsafe fn bpf_cmd<T>(cmd: i32, attr: &mut T) -> Result<i32> {
     // SAFETY: `attr` is a live `&mut T`, so the pointer and size are valid;
     // the caller guarantees `T` is the struct `cmd` expects.
-    unsafe {
-        bpf(
-            cmd,
-            attr as *mut T as *mut libc::c_void,
-            std::mem::size_of::<T>(),
-        )
-    }
+    unsafe { crate::syscall::bpf(cmd, attr as *mut T as *mut u8, std::mem::size_of::<T>()) }
 }
 
 /// Wrap an errno with context, since a bare `EINVAL` from `bpf(2)` is close to

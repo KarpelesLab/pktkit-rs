@@ -134,6 +134,11 @@ path = "src/lib.rs"
 name = "hot_path"
 harness = false
 
+[lints.rust]
+# `fullrust` (github.com/KarpelesLab/fullrust) is a libc-free Linux target whose
+# `target_os` stock rustc does not know; without this every cfg naming it warns.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("fullrust"))'] }
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]

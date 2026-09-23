@@ -119,6 +119,13 @@ For reading the old code, and for the parts of it still worth bringing over.
   with a hand-rolled HTTP/1.1 parser.
 - **nat**: connection-tracking table keyed by 5-tuple. ALGs are independent
   stateless transforms applied at packet boundaries.
+- **xdp / afxdp**: must also build for fullrust
+  (`x86_64-unknown-linux-fullrust`): Linux kernel, no libc, `target_os =
+  "fullrust"`, not `cfg(unix)`. Every syscall goes through `crate::syscall`,
+  which uses libc's `syscall()` on Linux and the `syscall` instruction on
+  fullrust. Don't call `libc::` directly in these modules, and don't use
+  `std::os::unix` (`std::os::fd` is fine). Kernel structs are pktkit's own
+  `#[repr(C)]` types with size asserts, not `libc::` ones.
 - **wg**: Noise IK handshake — X25519, ChaCha20-Poly1305, BLAKE2s and HMAC
   all come from `purecrypto`. Don't roll your own primitives. Changes here
   must keep the RFC 7748 / RFC 7693 known-answer tests passing: a

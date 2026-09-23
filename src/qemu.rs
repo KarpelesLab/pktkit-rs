@@ -268,6 +268,7 @@ mod tests {
         let ln = Listener::bind_tcp("127.0.0.1:0").unwrap();
         let addr = match &ln {
             Listener::Tcp(l) => l.local_addr().unwrap(),
+            #[cfg(unix)]
             _ => unreachable!(),
         };
 

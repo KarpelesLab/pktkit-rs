@@ -28,35 +28,36 @@
 
 use std::cell::Cell;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::afxdp::ring::{AddrRing, DescRing};
+use crate::afxdp::ring::{AddrRing, DescRing, RingOffset, XdpDesc};
+use crate::syscall::{self, CPU_SETSIZE, CpuSet, IfReq};
 use crate::xdp::{self, Capture, CaptureConfig, Mode, Rule};
 use crate::{Frame, IpPrefix, L2Handler, MacAddr, Result};
 
 // --- AF_XDP / setsockopt constants (mirror <linux/if_xdp.h>) ---------------
 
-const SOL_XDP: libc::c_int = 283;
-const XDP_MMAP_OFFSETS: libc::c_int = 1;
-const XDP_RX_RING: libc::c_int = 2;
-const XDP_TX_RING: libc::c_int = 3;
-const XDP_UMEM_REG: libc::c_int = 4;
-const XDP_UMEM_FILL_RING: libc::c_int = 5;
-const XDP_UMEM_COMPLETION_RING: libc::c_int = 6;
-const XDP_STATISTICS: libc::c_int = 7;
-const XDP_OPTIONS: libc::c_int = 8;
+const SOL_XDP: i32 = 283;
+const XDP_MMAP_OFFSETS: i32 = 1;
+const XDP_RX_RING: i32 = 2;
+const XDP_TX_RING: i32 = 3;
+const XDP_UMEM_REG: i32 = 4;
+const XDP_UMEM_FILL_RING: i32 = 5;
+const XDP_UMEM_COMPLETION_RING: i32 = 6;
+const XDP_STATISTICS: i32 = 7;
+const XDP_OPTIONS: i32 = 8;
 
 /// `XDP_OPTIONS_ZEROCOPY`: set once the kernel has actually put the socket on
 /// a driver's zero-copy path. The authoritative answer, as opposed to guessing
 /// from which bind flags were accepted.
 const XDP_OPTIONS_ZEROCOPY: u32 = 1 << 0;
 
-const XDP_PGOFF_RX_RING: libc::off_t = 0;
-const XDP_PGOFF_TX_RING: libc::off_t = 0x8000_0000;
-const XDP_UMEM_PGOFF_FILL_RING: libc::off_t = 0x1_0000_0000;
-const XDP_UMEM_PGOFF_COMPLETION_RING: libc::off_t = 0x1_8000_0000;
+const XDP_PGOFF_RX_RING: i64 = 0;
+const XDP_PGOFF_TX_RING: i64 = 0x8000_0000;
+const XDP_UMEM_PGOFF_FILL_RING: i64 = 0x1_0000_0000;
+const XDP_UMEM_PGOFF_COMPLETION_RING: i64 = 0x1_8000_0000;
 
 // Bind flags.
 const XDP_COPY: u16 = 1 << 1;
@@ -65,10 +66,69 @@ const XDP_ZEROCOPY: u16 = 1 << 2;
 /// a syscall to make progress. Without it every batch pays for a `sendto`.
 const XDP_USE_NEED_WAKEUP: u16 = 1 << 3;
 
-// Busy-poll socket options (SOL_SOCKET). Not in the libc crate.
-const SO_BUSY_POLL: libc::c_int = 46;
-const SO_PREFER_BUSY_POLL: libc::c_int = 69;
-const SO_BUSY_POLL_BUDGET: libc::c_int = 70;
+// Busy-poll socket options (SOL_SOCKET).
+const SO_BUSY_POLL: i32 = 46;
+const SO_PREFER_BUSY_POLL: i32 = 69;
+const SO_BUSY_POLL_BUDGET: i32 = 70;
+
+/// `struct xdp_umem_reg`.
+#[repr(C)]
+struct UmemReg {
+    addr: u64,
+    len: u64,
+    /// The UMEM frame size.
+    chunk_size: u32,
+    headroom: u32,
+    flags: u32,
+    tx_metadata_len: u32,
+}
+
+/// `struct xdp_mmap_offsets`.
+#[repr(C)]
+#[derive(Default)]
+struct MmapOffsets {
+    rx: RingOffset,
+    tx: RingOffset,
+    fr: RingOffset,
+    cr: RingOffset,
+}
+
+/// `struct sockaddr_xdp`.
+#[repr(C)]
+struct SockaddrXdp {
+    family: u16,
+    flags: u16,
+    ifindex: u32,
+    queue_id: u32,
+    shared_umem_fd: u32,
+}
+
+/// Kernel counters for an AF_XDP socket (`struct xdp_statistics`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct Statistics {
+    /// Dropped for reasons other than invalid descriptors.
+    pub rx_dropped: u64,
+    /// Dropped because of invalid descriptors.
+    pub rx_invalid_descs: u64,
+    /// Dropped because of invalid descriptors.
+    pub tx_invalid_descs: u64,
+    /// Dropped because the RX ring was full.
+    pub rx_ring_full: u64,
+    /// Times the FILL ring was found empty.
+    pub rx_fill_ring_empty_descs: u64,
+    /// Times the TX ring was found empty.
+    pub tx_ring_empty_descs: u64,
+}
+
+// The kernel ABI. `UmemReg` is the size a 6.8+ kernel knows; older ones accept
+// it as long as the fields they do not know are zero.
+const _: () = {
+    assert!(std::mem::size_of::<UmemReg>() == 32);
+    assert!(std::mem::size_of::<MmapOffsets>() == 128);
+    assert!(std::mem::size_of::<SockaddrXdp>() == 16);
+    assert!(std::mem::size_of::<Statistics>() == 48);
+};
 
 /// Smallest UMEM chunk the kernel accepts (`XDP_UMEM_MIN_CHUNK_SIZE`).
 const MIN_FRAME_SIZE: u32 = 2048;
@@ -79,7 +139,7 @@ const MIN_FRAME_SIZE: u32 = 2048;
 const BATCH: usize = 64;
 
 /// How long the poll loop blocks before re-checking whether it should exit.
-const POLL_TIMEOUT_MS: libc::c_int = 1000;
+const POLL_TIMEOUT_MS: i32 = 1000;
 
 /// Whether to insist on a zero-copy bind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -232,7 +292,7 @@ impl Config {
             ));
         }
         // Aligned-mode UMEM: a chunk may not straddle a page.
-        let page = page_size();
+        let page = syscall::page_size();
         if c.frame_size as usize > page {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -250,17 +310,10 @@ impl Config {
                 format!("afxdp: num_frames must be at least 2, got {}", c.num_frames),
             ));
         }
-        if let Some(&cpu) = c
-            .rx_cpus
-            .iter()
-            .find(|&&cpu| cpu >= libc::CPU_SETSIZE as usize)
-        {
+        if let Some(&cpu) = c.rx_cpus.iter().find(|&&cpu| cpu >= CPU_SETSIZE) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!(
-                    "afxdp: rx_cpus names CPU {cpu}, past the {} a cpu_set_t holds",
-                    libc::CPU_SETSIZE
-                ),
+                format!("afxdp: rx_cpus names CPU {cpu}, past the {CPU_SETSIZE} a cpu_set_t holds"),
             ));
         }
         Ok(c)
@@ -284,7 +337,7 @@ impl Mapping {
 impl Drop for Mapping {
     fn drop(&mut self) {
         // SAFETY: ptr/len came from a successful mmap and are unmapped once.
-        unsafe { libc::munmap(self.ptr as *mut libc::c_void, self.len) };
+        let _ = unsafe { syscall::munmap(self.ptr, self.len) };
     }
 }
 
@@ -475,13 +528,28 @@ impl Device {
 
         for (i, sock) in inner.sockets.iter().enumerate() {
             let s = sock.clone();
-            let thread = std::thread::spawn(move || poll_loop(s));
-            // Pinned from here rather than from inside the thread so a CPU
-            // that does not exist fails the open instead of being lost. On
-            // error `inner` drops, which is what stops the threads.
-            if let Some(&cpu) = cfg.rx_cpus.get(i) {
-                pin_thread(&thread, cpu)?;
-            }
+            let Some(&cpu) = cfg.rx_cpus.get(i) else {
+                std::thread::spawn(move || poll_loop(s));
+                continue;
+            };
+            // The thread pins itself before it touches a ring, and reports
+            // back so that a CPU that does not exist fails the open instead
+            // of being lost. On error `inner` drops, which is what stops the
+            // threads already running.
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let pinned = pin_current_thread(cpu);
+                let ok = pinned.is_ok();
+                let _ = tx.send(pinned);
+                if ok {
+                    poll_loop(s);
+                }
+            });
+            rx.recv().map_err(|_| {
+                io::Error::other(format!(
+                    "afxdp: RX thread for CPU {cpu} died before pinning"
+                ))
+            })??;
         }
 
         Ok(Device { inner })
@@ -552,15 +620,8 @@ impl Device {
     }
 
     /// Kernel counters, summed across every bound queue.
-    pub fn statistics(&self) -> Result<libc::xdp_statistics> {
-        let mut total = libc::xdp_statistics {
-            rx_dropped: 0,
-            rx_invalid_descs: 0,
-            tx_invalid_descs: 0,
-            rx_ring_full: 0,
-            rx_fill_ring_empty_descs: 0,
-            tx_ring_empty_descs: 0,
-        };
+    pub fn statistics(&self) -> Result<Statistics> {
+        let mut total = Statistics::default();
         for s in &self.inner.sockets {
             let st = getsockopt_statistics(s.raw())?;
             total.rx_dropped += st.rx_dropped;
@@ -639,21 +700,16 @@ impl Socket {
         let frame_size = cfg.frame_size;
         let num_frames = cfg.num_frames;
 
-        let fd = unsafe { libc::socket(libc::AF_XDP, libc::SOCK_RAW, 0) };
-        if fd < 0 {
-            return Err(step("socket(AF_XDP)", io::Error::last_os_error()));
-        }
-        // SAFETY: fresh fd, owned now.
-        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let fd = syscall::socket(syscall::AF_XDP, syscall::SOCK_RAW, 0)
+            .map_err(|e| step("socket(AF_XDP)", e))?;
         let raw = fd.as_raw_fd();
 
         let umem_size = num_frames as usize * frame_size as usize;
         let umem = mmap_umem(umem_size, cfg.huge_pages).map_err(|e| step("mmap UMEM", e))?;
 
-        // The libc `xdp_umem_reg` calls the frame size `chunk_size`. Headroom
-        // stays 0: the kernel reserves XDP_PACKET_HEADROOM inside the chunk on
-        // its own, and asking for more only shrinks the usable frame.
-        let reg = libc::xdp_umem_reg {
+        // Headroom stays 0: the kernel reserves XDP_PACKET_HEADROOM inside the
+        // chunk on its own, and asking for more only shrinks the usable frame.
+        let reg = UmemReg {
             addr: umem.ptr() as u64,
             len: umem_size as u64,
             chunk_size: frame_size,
@@ -661,7 +717,8 @@ impl Socket {
             flags: 0,
             tx_metadata_len: 0,
         };
-        setsockopt_umem_reg(raw, &reg).map_err(|e| step("XDP_UMEM_REG", e))?;
+        syscall::setsockopt(raw, SOL_XDP, XDP_UMEM_REG, &reg)
+            .map_err(|e| step("XDP_UMEM_REG", e))?;
 
         for opt in [
             XDP_UMEM_FILL_RING,
@@ -678,7 +735,7 @@ impl Socket {
         // descriptors. The kernel refuses a mapping longer than the ring it
         // allocated, so each has to be asked for at its own element size.
         let addr = std::mem::size_of::<u64>();
-        let desc = std::mem::size_of::<libc::xdp_desc>();
+        let desc = std::mem::size_of::<XdpDesc>();
         let fill_map = mmap_ring(raw, XDP_UMEM_PGOFF_FILL_RING, &offs.fr, ring_size, addr)
             .map_err(|e| step("mmap FILL ring", e))?;
         let comp_map = mmap_ring(
@@ -696,10 +753,10 @@ impl Socket {
 
         // SAFETY: each mapping is sized for its ring (see `mmap_ring`), the
         // offsets came from the kernel, and ring_size is a power of two.
-        let fill_ring = unsafe { AddrRing::new(fill_map.ptr(), (&offs.fr).into(), ring_size) };
-        let comp_ring = unsafe { AddrRing::new(comp_map.ptr(), (&offs.cr).into(), ring_size) };
-        let rx_ring = unsafe { DescRing::new(rx_map.ptr(), (&offs.rx).into(), ring_size) };
-        let tx_ring = unsafe { DescRing::new(tx_map.ptr(), (&offs.tx).into(), ring_size) };
+        let fill_ring = unsafe { AddrRing::new(fill_map.ptr(), offs.fr, ring_size) };
+        let comp_ring = unsafe { AddrRing::new(comp_map.ptr(), offs.cr, ring_size) };
+        let rx_ring = unsafe { DescRing::new(rx_map.ptr(), offs.rx, ring_size) };
+        let tx_ring = unsafe { DescRing::new(tx_map.ptr(), offs.tx, ring_size) };
 
         // Split the UMEM: first half RX (handed to the kernel up front), second
         // half a TX pool we allocate from.
@@ -787,7 +844,7 @@ impl Socket {
             std::ptr::copy_nonoverlapping(frame.as_ptr(), self.umem.ptr().add(addr as usize), len);
         }
 
-        let desc = [libc::xdp_desc {
+        let desc = [XdpDesc {
             addr,
             len: len as u32,
             options: 0,
@@ -828,7 +885,7 @@ impl Socket {
         let mut free = self.tx_free.lock().unwrap();
         let mut taken = 0;
         let mut queued = false;
-        let mut descs = [libc::xdp_desc {
+        let mut descs = [XdpDesc {
             addr: 0,
             len: 0,
             options: 0,
@@ -859,7 +916,7 @@ impl Socket {
                         bytes.len(),
                     );
                 }
-                descs[n] = libc::xdp_desc {
+                descs[n] = XdpDesc {
                     addr,
                     len: bytes.len() as u32,
                     options: 0,
@@ -901,17 +958,9 @@ impl Socket {
 
     /// Ask the kernel to pick up queued TX descriptors.
     fn kick_tx(&self) {
-        // SAFETY: valid fd; a null buffer is allowed with MSG_DONTWAIT.
-        unsafe {
-            libc::sendto(
-                self.raw(),
-                std::ptr::null(),
-                0,
-                libc::MSG_DONTWAIT,
-                std::ptr::null(),
-                0,
-            );
-        }
+        // Failure is not ours to act on: EAGAIN/EBUSY mean the kernel is
+        // already busy with the ring, and the next kick retries anyway.
+        let _ = syscall::sendto(self.raw(), &[], syscall::MSG_DONTWAIT, None);
     }
 
     /// Block until there is RX work or `timeout_ms` elapses.
@@ -920,14 +969,8 @@ impl Socket {
     /// `XDP_RING_NEED_WAKEUP` the kernel has stopped pulling buffers from it and
     /// this is what restarts it. With busy polling configured, the same call
     /// runs the driver's NAPI loop inline.
-    fn wait(&self, timeout_ms: libc::c_int) {
-        let mut pfd = libc::pollfd {
-            fd: self.raw(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: single valid pollfd, kernel writes only revents.
-        unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+    fn wait(&self, timeout_ms: i32) {
+        let _ = syscall::poll(self.raw(), syscall::POLLIN, timeout_ms);
     }
 }
 
@@ -942,7 +985,7 @@ fn umem_split(num_frames: u32) -> (u32, u32) {
 //
 // TODO(afxdp): needs hardware to verify — no packets arrive in a sandbox.
 fn poll_loop(sock: Arc<Socket>) {
-    let mut rx_batch = [libc::xdp_desc {
+    let mut rx_batch = [XdpDesc {
         addr: 0,
         len: 0,
         options: 0,
@@ -1018,109 +1061,33 @@ fn step(what: &str, e: io::Error) -> io::Error {
     io::Error::new(e.kind(), format!("afxdp: {what}: {e}"))
 }
 
-/// Restrict `thread` to `cpu`.
-fn pin_thread<T>(thread: &std::thread::JoinHandle<T>, cpu: usize) -> Result<()> {
-    use std::os::unix::thread::JoinHandleExt;
-    // SAFETY: an all-zero cpu_set_t is the empty set; `cpu` was checked against
-    // CPU_SETSIZE in `Config::normalize`, which is CPU_SET's precondition.
-    let rc = unsafe {
-        let mut set: libc::cpu_set_t = std::mem::zeroed();
-        libc::CPU_SET(cpu, &mut set);
-        libc::pthread_setaffinity_np(
-            thread.as_pthread_t(),
-            std::mem::size_of::<libc::cpu_set_t>(),
-            &set,
-        )
-    };
-    if rc != 0 {
-        // pthread functions return the error rather than setting errno.
-        let e = io::Error::from_raw_os_error(rc);
-        return Err(io::Error::new(
-            e.kind(),
-            format!("afxdp: pin RX thread to CPU {cpu}: {e}"),
-        ));
-    }
-    Ok(())
+/// Restrict the calling thread to `cpu`, which `Config::normalize` has checked
+/// is below `CPU_SETSIZE`.
+fn pin_current_thread(cpu: usize) -> Result<()> {
+    let mut set = CpuSet::new();
+    set.set(cpu);
+    syscall::sched_setaffinity(&set)
+        .map_err(|e| io::Error::new(e.kind(), format!("afxdp: pin RX thread to CPU {cpu}: {e}")))
 }
 
-fn page_size() -> usize {
-    // SAFETY: sysconf with a valid name; -1 on failure, handled below.
-    let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    if n <= 0 { 4096 } else { n as usize }
-}
-
-/// `if_nametoindex`, mapping 0 (not found) to an error.
+/// `if_nametoindex`, with the interface named in the error.
 fn if_nametoindex(name: &str) -> Result<u32> {
-    let c = std::ffi::CString::new(name).map_err(|_| {
-        io::Error::new(io::ErrorKind::InvalidInput, "afxdp: interface name has NUL")
-    })?;
-    // SAFETY: NUL-terminated string from CString.
-    let idx = unsafe { libc::if_nametoindex(c.as_ptr()) };
-    if idx == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("afxdp: interface {name:?} not found"),
-        ));
-    }
-    Ok(idx)
+    syscall::if_nametoindex(name).map_err(|e| step(&format!("interface {name:?}"), e))
 }
 
 /// Read an interface's MAC through `SIOCGIFHWADDR`.
 fn read_hw_addr(name: &str) -> Result<MacAddr> {
-    let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
-    if sock < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: fresh fd; OwnedFd closes it.
-    let sock = unsafe { OwnedFd::from_raw_fd(sock) };
-
+    let sock = syscall::socket(syscall::AF_INET, syscall::SOCK_DGRAM, 0)?;
     let mut req = IfReq::new(name)?;
     // SAFETY: SIOCGIFHWADDR writes sa_data inside the ifreq we own.
-    let r = unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCGIFHWADDR, &mut req) };
-    if r < 0 {
-        return Err(io::Error::last_os_error());
-    }
+    unsafe { syscall::ioctl(sock.as_raw_fd(), syscall::SIOCGIFHWADDR, &mut req)? };
     // struct sockaddr { sa_family: u16, sa_data: [c_char; 14] } — the address
     // starts 2 bytes into the union.
-    let b = req.union_bytes();
+    let b = &req.data;
     Ok(MacAddr::new([b[2], b[3], b[4], b[5], b[6], b[7]]))
 }
 
-/// `struct ifreq`: a 16-byte name followed by a 24-byte union.
-#[repr(C)]
-struct IfReq {
-    name: [u8; 16],
-    union_: [u8; 24],
-}
-
-impl IfReq {
-    fn new(name: &str) -> Result<IfReq> {
-        let b = name.as_bytes();
-        if b.len() >= 16 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("afxdp: interface name {name:?} too long"),
-            ));
-        }
-        let mut req = IfReq {
-            name: [0; 16],
-            union_: [0; 24],
-        };
-        req.name[..b.len()].copy_from_slice(b);
-        Ok(req)
-    }
-
-    fn set_data_ptr(&mut self, p: *mut libc::c_void) {
-        self.union_[..8].copy_from_slice(&(p as usize as u64).to_ne_bytes());
-    }
-
-    fn union_bytes(&self) -> &[u8; 24] {
-        &self.union_
-    }
-}
-
 // ethtool commands used to count receive queues.
-const SIOCETHTOOL: libc::c_ulong = 0x8946;
 const ETHTOOL_GRXRINGS: u32 = 0x0000_002f;
 const ETHTOOL_GCHANNELS: u32 = 0x0000_003c;
 
@@ -1157,12 +1124,7 @@ struct EthtoolRxnfc {
 //
 // TODO(afxdp): needs a real NIC to verify; virtual devices answer EOPNOTSUPP.
 fn rx_queue_count(name: &str) -> Result<u32> {
-    let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
-    if sock < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: fresh fd; OwnedFd closes it.
-    let sock = unsafe { OwnedFd::from_raw_fd(sock) };
+    let sock: OwnedFd = syscall::socket(syscall::AF_INET, syscall::SOCK_DGRAM, 0)?;
     let raw = sock.as_raw_fd();
 
     let mut ch = EthtoolChannels {
@@ -1170,10 +1132,10 @@ fn rx_queue_count(name: &str) -> Result<u32> {
         ..Default::default()
     };
     let mut req = IfReq::new(name)?;
-    req.set_data_ptr(&mut ch as *mut _ as *mut libc::c_void);
+    req.set_data_ptr(&mut ch);
     // SAFETY: req.name is NUL-padded and the data pointer refers to `ch`, which
     // outlives the call.
-    if unsafe { libc::ioctl(raw, SIOCETHTOOL, &mut req) } >= 0 {
+    if unsafe { syscall::ioctl(raw, syscall::SIOCETHTOOL, &mut req) }.is_ok() {
         // A driver reports its queues as `combined` (shared RX/TX) or as
         // dedicated `rx`; either can be zero.
         let n = ch.combined_count + ch.rx_count;
@@ -1187,51 +1149,17 @@ fn rx_queue_count(name: &str) -> Result<u32> {
         ..Default::default()
     };
     let mut req = IfReq::new(name)?;
-    req.set_data_ptr(&mut nfc as *mut _ as *mut libc::c_void);
+    req.set_data_ptr(&mut nfc);
     // SAFETY: as above, for `nfc`.
-    if unsafe { libc::ioctl(raw, SIOCETHTOOL, &mut req) } >= 0 && nfc.data > 0 {
+    if unsafe { syscall::ioctl(raw, syscall::SIOCETHTOOL, &mut req) }.is_ok() && nfc.data > 0 {
         return Ok(nfc.data as u32);
     }
 
     Ok(1)
 }
 
-fn setsockopt_umem_reg(fd: RawFd, reg: &libc::xdp_umem_reg) -> Result<()> {
-    // SAFETY: valid fd and a correctly sized option value.
-    let r = unsafe {
-        libc::setsockopt(
-            fd,
-            SOL_XDP,
-            XDP_UMEM_REG,
-            reg as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::xdp_umem_reg>() as libc::socklen_t,
-        )
-    };
-    if r < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-fn setsockopt_u32(fd: RawFd, opt: libc::c_int, val: u32) -> Result<()> {
-    setsockopt_u32_level(fd, SOL_XDP, opt, val)
-}
-
-fn setsockopt_u32_level(fd: RawFd, level: libc::c_int, opt: libc::c_int, val: u32) -> Result<()> {
-    // SAFETY: valid fd and a correctly sized option value.
-    let r = unsafe {
-        libc::setsockopt(
-            fd,
-            level,
-            opt,
-            &val as *const u32 as *const libc::c_void,
-            std::mem::size_of::<u32>() as libc::socklen_t,
-        )
-    };
-    if r < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+fn setsockopt_u32(fd: RawFd, opt: i32, val: u32) -> Result<()> {
+    syscall::setsockopt(fd, SOL_XDP, opt, &val)
 }
 
 /// Turn on kernel-side busy polling.
@@ -1240,96 +1168,58 @@ fn setsockopt_u32_level(fd: RawFd, level: libc::c_int, opt: libc::c_int, val: u3
 /// that does not know them leaves plain `SO_BUSY_POLL` doing the useful part,
 /// so those two are best-effort.
 fn set_busy_poll(fd: RawFd, bp: BusyPoll) -> Result<()> {
-    let _ = setsockopt_u32_level(fd, libc::SOL_SOCKET, SO_PREFER_BUSY_POLL, 1);
-    setsockopt_u32_level(fd, libc::SOL_SOCKET, SO_BUSY_POLL, bp.timeout_us)?;
-    let _ = setsockopt_u32_level(fd, libc::SOL_SOCKET, SO_BUSY_POLL_BUDGET, bp.budget);
+    let _ = syscall::setsockopt(fd, syscall::SOL_SOCKET, SO_PREFER_BUSY_POLL, &1u32);
+    syscall::setsockopt(fd, syscall::SOL_SOCKET, SO_BUSY_POLL, &bp.timeout_us)?;
+    let _ = syscall::setsockopt(fd, syscall::SOL_SOCKET, SO_BUSY_POLL_BUDGET, &bp.budget);
     Ok(())
 }
 
-fn getsockopt_mmap_offsets(fd: RawFd) -> Result<libc::xdp_mmap_offsets> {
-    let mut offs: libc::xdp_mmap_offsets = unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of::<libc::xdp_mmap_offsets>() as libc::socklen_t;
-    // SAFETY: valid fd; the kernel writes at most `len` bytes into `offs`.
-    let r = unsafe {
-        libc::getsockopt(
-            fd,
-            SOL_XDP,
-            XDP_MMAP_OFFSETS,
-            &mut offs as *mut _ as *mut libc::c_void,
-            &mut len,
-        )
-    };
-    if r < 0 {
-        return Err(io::Error::last_os_error());
-    }
+fn getsockopt_mmap_offsets(fd: RawFd) -> Result<MmapOffsets> {
+    let mut offs = MmapOffsets::default();
+    // SAFETY: plain integers; any bytes are a valid MmapOffsets.
+    unsafe { syscall::getsockopt(fd, SOL_XDP, XDP_MMAP_OFFSETS, &mut offs)? };
     Ok(offs)
 }
 
-fn getsockopt_statistics(fd: RawFd) -> Result<libc::xdp_statistics> {
-    let mut stats: libc::xdp_statistics = unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of::<libc::xdp_statistics>() as libc::socklen_t;
-    // SAFETY: valid fd; the kernel writes at most `len` bytes into `stats`.
-    let r = unsafe {
-        libc::getsockopt(
-            fd,
-            SOL_XDP,
-            XDP_STATISTICS,
-            &mut stats as *mut _ as *mut libc::c_void,
-            &mut len,
-        )
-    };
-    if r < 0 {
-        return Err(io::Error::last_os_error());
-    }
+fn getsockopt_statistics(fd: RawFd) -> Result<Statistics> {
+    let mut stats = Statistics::default();
+    // SAFETY: plain integers; any bytes are a valid Statistics.
+    unsafe { syscall::getsockopt(fd, SOL_XDP, XDP_STATISTICS, &mut stats)? };
     Ok(stats)
 }
 
 /// Ask the kernel whether this socket ended up on a zero-copy path.
 fn socket_is_zerocopy(fd: RawFd) -> bool {
-    let mut opts: libc::xdp_options = unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of::<libc::xdp_options>() as libc::socklen_t;
-    // SAFETY: valid fd; the kernel writes at most `len` bytes into `opts`.
-    let r = unsafe {
-        libc::getsockopt(
-            fd,
-            SOL_XDP,
-            XDP_OPTIONS,
-            &mut opts as *mut _ as *mut libc::c_void,
-            &mut len,
-        )
-    };
-    r >= 0 && opts.flags & XDP_OPTIONS_ZEROCOPY != 0
+    // `struct xdp_options` is a single u32 of flags.
+    let mut flags = 0u32;
+    // SAFETY: any bytes are a valid u32.
+    let r = unsafe { syscall::getsockopt(fd, SOL_XDP, XDP_OPTIONS, &mut flags) };
+    r.is_ok() && flags & XDP_OPTIONS_ZEROCOPY != 0
 }
 
 /// UMEM backing store. Huge pages cut TLB misses on the packet buffers, but
 /// they need pre-reserved hugetlb pages, so a failure falls back silently.
 fn mmap_umem(len: usize, huge_pages: bool) -> Result<Mapping> {
-    if huge_pages && let Ok(m) = mmap_anon(len, libc::MAP_HUGETLB) {
+    if huge_pages && let Ok(m) = mmap_anon(len, syscall::MAP_HUGETLB) {
         return Ok(m);
     }
     mmap_anon(len, 0)
 }
 
-fn mmap_anon(len: usize, extra_flags: libc::c_int) -> Result<Mapping> {
+fn mmap_anon(len: usize, extra_flags: i32) -> Result<Mapping> {
     // MAP_POPULATE faults the whole region in now rather than taking the page
     // faults on the receive path.
+    // SAFETY: a fresh private anonymous mapping aliases nothing.
     let ptr = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
+        syscall::mmap(
             len,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_POPULATE | extra_flags,
+            syscall::PROT_READ | syscall::PROT_WRITE,
+            syscall::MAP_PRIVATE | syscall::MAP_ANONYMOUS | syscall::MAP_POPULATE | extra_flags,
             -1,
             0,
-        )
+        )?
     };
-    if ptr == libc::MAP_FAILED {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(Mapping {
-        ptr: ptr as *mut u8,
-        len,
-    })
+    Ok(Mapping { ptr, len })
 }
 
 /// Map one ring at the given page offset. The mapping spans the descriptor
@@ -1337,31 +1227,20 @@ fn mmap_anon(len: usize, extra_flags: libc::c_int) -> Result<Mapping> {
 /// cursors, and the element size is 8 bytes for the FILL/COMPLETION rings or
 /// 16 bytes (`xdp_desc`) for RX/TX. We always reserve the larger 16-byte
 /// stride, which is a harmless over-map for the address rings.
-fn mmap_ring(
-    fd: RawFd,
-    pgoff: libc::off_t,
-    off: &libc::xdp_ring_offset,
-    size: u32,
-    elem: usize,
-) -> Result<Mapping> {
+fn mmap_ring(fd: RawFd, pgoff: i64, off: &RingOffset, size: u32, elem: usize) -> Result<Mapping> {
     let total = ring_map_len(off.desc, size, elem);
+    // SAFETY: the ring is shared with the kernel, not with any Rust object;
+    // the rings only touch it through atomics and the SPSC discipline.
     let ptr = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
+        syscall::mmap(
             total,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_SHARED | libc::MAP_POPULATE,
+            syscall::PROT_READ | syscall::PROT_WRITE,
+            syscall::MAP_SHARED | syscall::MAP_POPULATE,
             fd,
             pgoff,
-        )
+        )?
     };
-    if ptr == libc::MAP_FAILED {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(Mapping {
-        ptr: ptr as *mut u8,
-        len: total,
-    })
+    Ok(Mapping { ptr, len: total })
 }
 
 /// Bytes from the start of a ring mapping to the end of its `size` elements
@@ -1396,14 +1275,14 @@ fn bind_xdp(
 ) -> Result<bool> {
     let mut last = None;
     for flags in bind_flag_candidates(cfg.flags, want_zerocopy) {
-        let sa = libc::sockaddr_xdp {
-            sxdp_family: libc::AF_XDP as u16,
-            sxdp_flags: flags,
-            sxdp_ifindex: ifindex,
-            sxdp_queue_id: queue_id,
-            sxdp_shared_umem_fd: 0,
+        let sa = SockaddrXdp {
+            family: syscall::AF_XDP as u16,
+            flags,
+            ifindex,
+            queue_id,
+            shared_umem_fd: 0,
         };
-        match bind_once(fd, &sa) {
+        match syscall::bind(fd, &sa) {
             Ok(()) => return Ok(socket_is_zerocopy(fd)),
             Err(e) => last = Some(e),
         }
@@ -1411,20 +1290,6 @@ fn bind_xdp(
     Err(last.unwrap_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "afxdp: no bind flags to try")
     }))
-}
-
-fn bind_once(fd: RawFd, sa: &libc::sockaddr_xdp) -> Result<()> {
-    let r = unsafe {
-        libc::bind(
-            fd,
-            sa as *const _ as *const libc::sockaddr,
-            std::mem::size_of::<libc::sockaddr_xdp>() as libc::socklen_t,
-        )
-    };
-    if r < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1505,7 +1370,7 @@ mod tests {
         // Larger than a page: an aligned-mode chunk may not straddle one.
         assert!(
             Config {
-                frame_size: (page_size() * 2) as u32,
+                frame_size: (syscall::page_size() * 2) as u32,
                 ..Default::default()
             }
             .normalize()
@@ -1550,7 +1415,7 @@ mod tests {
         // the ring, which is what sizing an address ring by descriptors does.
         assert_eq!(ring_map_len(64, 8, std::mem::size_of::<u64>()), 64 + 8 * 8);
         assert_eq!(
-            ring_map_len(64, 8, std::mem::size_of::<libc::xdp_desc>()),
+            ring_map_len(64, 8, std::mem::size_of::<XdpDesc>()),
             64 + 8 * 16
         );
     }
@@ -1576,14 +1441,6 @@ mod tests {
         for f in bind_flag_candidates(extra, true) {
             assert_eq!(f & extra, extra);
         }
-    }
-
-    #[test]
-    fn ifreq_layout_matches_the_kernel_struct() {
-        assert_eq!(std::mem::size_of::<IfReq>(), 40);
-        let req = IfReq::new("eth0").unwrap();
-        assert_eq!(&req.name[..5], b"eth0\0");
-        assert!(IfReq::new("an-interface-name-that-is-far-too-long").is_err());
     }
 
     #[test]
@@ -1613,7 +1470,7 @@ mod tests {
     fn a_cpu_past_the_set_size_is_refused_before_open() {
         let e = Config {
             interface: "lo".into(),
-            rx_cpus: vec![0, libc::CPU_SETSIZE as usize],
+            rx_cpus: vec![0, CPU_SETSIZE],
             ..Default::default()
         }
         .normalize()
@@ -1624,44 +1481,31 @@ mod tests {
     #[test]
     fn a_thread_can_be_pinned_to_a_cpu_we_are_allowed_on() {
         // Pick from our own mask: a container may not own CPU 0.
-        // SAFETY: zeroed cpu_set_t is valid; pid 0 is the calling thread.
-        let allowed = unsafe {
-            let mut set: libc::cpu_set_t = std::mem::zeroed();
-            assert_eq!(
-                libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set),
-                0
-            );
-            (0..libc::CPU_SETSIZE as usize)
-                .find(|&c| libc::CPU_ISSET(c, &set))
-                .expect("running on some CPU")
-        };
-
-        let (tx, rx) = std::sync::mpsc::channel::<()>();
-        let t = std::thread::spawn(move || {
-            rx.recv().ok();
-            // SAFETY: as above.
-            unsafe {
-                let mut set: libc::cpu_set_t = std::mem::zeroed();
-                libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set);
-                (0..libc::CPU_SETSIZE as usize)
-                    .filter(|&c| libc::CPU_ISSET(c, &set))
-                    .collect::<Vec<_>>()
-            }
-        });
-        pin_thread(&t, allowed).unwrap();
-        tx.send(()).unwrap();
-        assert_eq!(t.join().unwrap(), vec![allowed]);
+        let allowed = syscall::sched_getaffinity()
+            .unwrap()
+            .iter()
+            .next()
+            .expect("running on some CPU");
+        let got = std::thread::spawn(move || {
+            pin_current_thread(allowed).unwrap();
+            syscall::sched_getaffinity()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>()
+        })
+        .join()
+        .unwrap();
+        assert_eq!(got, vec![allowed]);
     }
 
     #[test]
     fn pinning_to_a_cpu_that_does_not_exist_is_an_error() {
-        let (tx, rx) = std::sync::mpsc::channel::<()>();
-        let t = std::thread::spawn(move || rx.recv().ok());
         // Inside cpu_set_t, but no machine running this has 1024 cores online.
-        let e = pin_thread(&t, libc::CPU_SETSIZE as usize - 1).unwrap_err();
+        let e = std::thread::spawn(|| pin_current_thread(CPU_SETSIZE - 1))
+            .join()
+            .unwrap()
+            .unwrap_err();
         assert!(e.to_string().contains("pin RX thread"), "{e}");
-        tx.send(()).unwrap();
-        t.join().unwrap();
     }
 
     #[test]

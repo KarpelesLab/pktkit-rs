@@ -10,7 +10,7 @@
 //!
 //! There are two element types: the FILL and COMPLETION rings carry bare
 //! `u64` UMEM addresses ([`AddrRing`]); the RX and TX rings carry
-//! [`libc::xdp_desc`] descriptors ([`DescRing`]).
+//! [`XdpDesc`] descriptors ([`DescRing`]).
 //!
 //! # Safety
 //!
@@ -24,7 +24,11 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Offsets of the producer/consumer/flags cursors and the descriptor array
 /// within a ring's `mmap` region, as reported by `XDP_MMAP_OFFSETS`.
-#[derive(Debug, Clone, Copy)]
+///
+/// Laid out as the kernel's `struct xdp_ring_offset`, so the kernel fills it
+/// in directly.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[repr(C)]
 pub struct RingOffset {
     pub producer: u64,
     pub consumer: u64,
@@ -32,16 +36,24 @@ pub struct RingOffset {
     pub flags: u64,
 }
 
-impl From<&libc::xdp_ring_offset> for RingOffset {
-    fn from(o: &libc::xdp_ring_offset) -> RingOffset {
-        RingOffset {
-            producer: o.producer,
-            consumer: o.consumer,
-            desc: o.desc,
-            flags: o.flags,
-        }
-    }
+/// One RX or TX descriptor: the kernel's `struct xdp_desc`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct XdpDesc {
+    /// Offset of the frame within the UMEM.
+    pub addr: u64,
+    /// Frame length in bytes.
+    pub len: u32,
+    /// `XDP_PKT_CONTD` and friends; 0 for a single-buffer frame.
+    pub options: u32,
 }
+
+// The kernel ABI, checked here so a layout slip fails the build instead of the
+// ring.
+const _: () = {
+    assert!(std::mem::size_of::<RingOffset>() == 32);
+    assert!(std::mem::size_of::<XdpDesc>() == 16);
+};
 
 /// Common cursor plumbing shared by both ring flavours.
 ///
@@ -204,11 +216,11 @@ impl AddrRing {
     }
 }
 
-/// An RX or TX ring of [`libc::xdp_desc`] descriptors.
+/// An RX or TX ring of [`XdpDesc`] descriptors.
 #[derive(Debug)]
 pub struct DescRing {
     cur: Cursors,
-    descs: *mut libc::xdp_desc,
+    descs: *mut XdpDesc,
 }
 
 // SAFETY: same argument as `AddrRing`.
@@ -224,13 +236,13 @@ impl DescRing {
         unsafe {
             DescRing {
                 cur: Cursors::new(mem, off, size),
-                descs: mem.add(off.desc as usize) as *mut libc::xdp_desc,
+                descs: mem.add(off.desc as usize) as *mut XdpDesc,
             }
         }
     }
 
     #[inline]
-    fn slot(&self, idx: u32) -> *mut libc::xdp_desc {
+    fn slot(&self, idx: u32) -> *mut XdpDesc {
         // SAFETY: idx masked into [0, size).
         unsafe { self.descs.add((idx & self.cur.mask) as usize) }
     }
@@ -246,7 +258,7 @@ impl DescRing {
 
     /// Enqueue TX descriptors (app asks the kernel to transmit). Returns how
     /// many were enqueued.
-    pub fn produce(&self, descs: &[libc::xdp_desc]) -> usize {
+    pub fn produce(&self, descs: &[XdpDesc]) -> usize {
         let prod = self.cur.producer().load(Ordering::Relaxed);
         let cons = self.cur.consumer().load(Ordering::Acquire);
 
@@ -259,7 +271,7 @@ impl DescRing {
             let d = &descs[i as usize];
             // SAFETY: slot in-bounds; producer-owned until publish.
             unsafe {
-                *self.slot(prod.wrapping_add(i)) = libc::xdp_desc {
+                *self.slot(prod.wrapping_add(i)) = XdpDesc {
                     addr: d.addr,
                     len: d.len,
                     options: d.options,
@@ -274,7 +286,7 @@ impl DescRing {
 
     /// Dequeue RX descriptors (kernel delivered received packets) into `out`.
     /// Returns how many were dequeued.
-    pub fn consume(&self, out: &mut [libc::xdp_desc]) -> usize {
+    pub fn consume(&self, out: &mut [XdpDesc]) -> usize {
         let cons = self.cur.consumer().load(Ordering::Relaxed);
         let prod = self.cur.producer().load(Ordering::Acquire);
 
@@ -286,7 +298,7 @@ impl DescRing {
         for i in 0..n {
             // SAFETY: slot in-bounds and published by the producer.
             let d = unsafe { &*self.slot(cons.wrapping_add(i)) };
-            out[i as usize] = libc::xdp_desc {
+            out[i as usize] = XdpDesc {
                 addr: d.addr,
                 len: d.len,
                 options: d.options,
@@ -394,16 +406,16 @@ mod tests {
     #[test]
     fn desc_ring_produce_consume_roundtrip() {
         let size = 8u32;
-        let mut mem = backing(size, std::mem::size_of::<libc::xdp_desc>());
+        let mut mem = backing(size, std::mem::size_of::<XdpDesc>());
         let ring = unsafe { DescRing::new(mem.as_mut_ptr(), offsets(), size) };
 
         let descs = [
-            libc::xdp_desc {
+            XdpDesc {
                 addr: 0,
                 len: 60,
                 options: 0,
             },
-            libc::xdp_desc {
+            XdpDesc {
                 addr: 4096,
                 len: 1514,
                 options: 0,
@@ -413,7 +425,7 @@ mod tests {
         assert_eq!(ring.produce(&descs), 2);
         assert_eq!(ring.free(), 6);
 
-        let mut out = [libc::xdp_desc {
+        let mut out = [XdpDesc {
             addr: 0,
             len: 0,
             options: 0,
@@ -438,7 +450,7 @@ mod tests {
     #[test]
     fn need_wakeup_reads_flags_word() {
         let size = 4u32;
-        let mut mem = backing(size, std::mem::size_of::<libc::xdp_desc>());
+        let mut mem = backing(size, std::mem::size_of::<XdpDesc>());
         let ring = unsafe { DescRing::new(mem.as_mut_ptr(), offsets(), size) };
 
         // Flags word starts at 0 -> no wakeup needed.
@@ -455,7 +467,7 @@ mod tests {
     #[test]
     fn need_wakeup_true_without_flags() {
         let size = 4u32;
-        let mut mem = backing(size, std::mem::size_of::<libc::xdp_desc>());
+        let mut mem = backing(size, std::mem::size_of::<XdpDesc>());
         let off = RingOffset {
             flags: 0,
             ..offsets()

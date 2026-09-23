@@ -101,6 +101,11 @@ pub type Result<T> = std::io::Result<T>;
 #[cfg(all(target_os = "linux", any(feature = "tuntap", feature = "afpacket")))]
 mod sys;
 
+// The syscalls XDP and AF_XDP make, on both targets with a Linux kernel
+// underneath: `linux`, and the libc-free `fullrust`.
+#[cfg(all(feature = "xdp", any(target_os = "linux", target_os = "fullrust")))]
+mod syscall;
+
 // Parser entry points collected for fuzzing. Not an API; see `src/fuzz.rs`.
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
@@ -151,13 +156,14 @@ pub mod tuntap;
 // XDP and AF_XDP are Linux kernel interfaces with no analogue elsewhere, and
 // unlike `tuntap` or `afpacket` there is no meaningful stub to offer: the API
 // is built around eBPF programs, maps and UMEM rings. The modules are simply
-// absent off Linux, so that enabling `full` -- which includes them -- still
-// builds everywhere.
-#[cfg(all(feature = "xdp", target_os = "linux"))]
+// absent without a Linux kernel, so that enabling `full` -- which includes
+// them -- still builds everywhere. `fullrust` is a Linux kernel without libc
+// (and outside the `unix` family), which is all these modules need.
+#[cfg(all(feature = "xdp", any(target_os = "linux", target_os = "fullrust")))]
 #[cfg_attr(docsrs, doc(cfg(feature = "xdp")))]
 pub mod xdp;
 
-#[cfg(all(feature = "afxdp", target_os = "linux"))]
+#[cfg(all(feature = "afxdp", any(target_os = "linux", target_os = "fullrust")))]
 #[cfg_attr(docsrs, doc(cfg(feature = "afxdp")))]
 pub mod afxdp;
 

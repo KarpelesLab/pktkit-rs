@@ -70,6 +70,11 @@ with no analogue elsewhere, so those two modules are simply absent off Linux;
 `tuntap` and `afpacket` keep their types everywhere and report
 `ErrorKind::Unsupported` when opened on a platform that has no such device.
 
+That includes [fullrust](https://github.com/KarpelesLab/fullrust)'s
+`x86_64-unknown-linux-fullrust`, a Linux target with no libc. `xdp` and
+`afxdp` work there too, making their syscalls directly; `tuntap` and
+`afpacket` are the unsupported stubs.
+
 ### Dependency policy
 
 `pktkit` depends on:

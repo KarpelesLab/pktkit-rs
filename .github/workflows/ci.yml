@@ -105,6 +105,26 @@ jobs:
       # and fail this job for reasons no change in this repo could fix.
       - run: cargo check --all-features
 
+  fullrust:
+    name: Build + test (fullrust, libc-free Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      # A Linux target without libc, outside the `unix` family: xdp and afxdp
+      # make their syscalls themselves there. Build everything, then run the
+      # xdp/afxdp unit tests, which exercise those syscalls on loopback.
+      - name: Build (all features)
+        uses: KarpelesLab/fullrust@master
+        with:
+          image: ghcr.io/karpeleslab/fullrust:latest
+          args: --all-features --all-targets
+      - name: Test (xdp, afxdp)
+        uses: KarpelesLab/fullrust@master
+        with:
+          image: ghcr.io/karpeleslab/fullrust:latest
+          command: test
+          args: --features afxdp --lib -- xdp syscall
+
   macos:
     name: Build + test (macOS)
     runs-on: macos-latest
