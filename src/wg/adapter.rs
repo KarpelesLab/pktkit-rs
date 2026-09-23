@@ -22,6 +22,7 @@ use crate::{IpPrefix, Packet, Result};
 
 /// Configuration for a [`WireGuard Adapter`](Adapter).
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct AdapterConfig {
     /// Local WireGuard identity. Ignored if `multi_handler` is set.
     pub private_key: NoisePrivateKey,
@@ -34,6 +35,31 @@ pub struct AdapterConfig {
     pub addr: IpPrefix,
     /// Optional callback for unauthorized peers.
     pub on_unknown_peer: Option<crate::wg::handler::UnknownPeerFn>,
+}
+
+setters! {
+    AdapterConfig {
+        some multi_handler: Arc<MultiHandler>;
+        some on_unknown_peer: crate::wg::handler::UnknownPeerFn;
+    }
+}
+
+impl AdapterConfig {
+    /// An adapter with identity `private_key`, joining each peer's device to
+    /// `connector` with address `addr`.
+    pub fn new(
+        private_key: NoisePrivateKey,
+        connector: Arc<dyn L3Connector + Send + Sync>,
+        addr: IpPrefix,
+    ) -> AdapterConfig {
+        AdapterConfig {
+            private_key,
+            multi_handler: None,
+            connector,
+            addr,
+            on_unknown_peer: None,
+        }
+    }
 }
 
 impl std::fmt::Debug for AdapterConfig {

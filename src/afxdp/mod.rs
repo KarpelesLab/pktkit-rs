@@ -19,10 +19,7 @@
 //! # fn main() -> std::io::Result<()> {
 //! // One socket per RX queue, native-mode attach, zero-copy where the driver
 //! // supports it.
-//! let dev = Device::open(Config {
-//!     interface: "eth0".into(),
-//!     ..Default::default()
-//! })?;
+//! let dev = Device::open(Config::new("eth0"))?;
 //!
 //! dev.set_handler(Arc::new(|frame: &Frame| {
 //!     println!("{} bytes", frame.as_bytes().len());

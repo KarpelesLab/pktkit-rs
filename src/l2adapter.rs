@@ -22,12 +22,21 @@ use std::sync::{Arc, Mutex, Weak};
 
 /// Configure an [`L2Adapter`].
 #[derive(Default, Debug, Clone)]
+#[non_exhaustive]
 pub struct L2AdapterConfig {
     /// Override the MAC. Defaults to a random locally-administered unicast.
     pub mac: Option<MacAddr>,
     /// Initial gateway. Updated automatically once DHCP binds.
     pub gateway_v4: Option<Ipv4Addr>,
     pub gateway_v6: Option<Ipv6Addr>,
+}
+
+setters! {
+    L2AdapterConfig {
+        some mac: MacAddr;
+        some gateway_v4: Ipv4Addr;
+        some gateway_v6: Ipv6Addr;
+    }
 }
 
 /// Bridges an L3 device onto an L2 network.

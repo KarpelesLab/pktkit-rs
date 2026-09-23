@@ -194,13 +194,11 @@ fn every_capture_configuration_passes_the_verifier() {
                 // the one most likely to trip an instruction or complexity
                 // limit; the narrowest exercises the degenerate loop.
                 for max_rules_per_prefix in [1, 8, MAX_RULES_PER_PREFIX] {
-                    let cfg = CaptureConfig {
-                        match_field,
-                        arp,
-                        default_action,
-                        max_rules_per_prefix,
-                        ..Default::default()
-                    };
+                    let cfg = CaptureConfig::default()
+                        .match_field(match_field)
+                        .arp(arp)
+                        .default_action(default_action)
+                        .max_rules_per_prefix(max_rules_per_prefix);
                     let maps = CaptureMaps::create(&cfg).expect("create maps");
                     let insns = build_program(&cfg, &maps).expect("codegen");
                     Program::load(&insns, "pktkit_test").unwrap_or_else(|e| {
@@ -383,10 +381,7 @@ fn a_configured_floor_is_enforced_on_a_live_capture() {
         return;
     }
     let veth = Veth::new("floor");
-    let cfg = CaptureConfig {
-        min_prefix_v4: 24,
-        ..Default::default()
-    };
+    let cfg = CaptureConfig::default().min_prefix_v4(24);
     let cap = Capture::attach(ifindex(&veth.host), cfg, Mode::AUTO).expect("attach");
 
     cap.add(v4([10, 1, 2, 0], 24)).unwrap();
@@ -442,10 +437,7 @@ fn rules_are_tracked_per_prefix() {
     assert!(cap.prefixes().is_empty());
 
     // The per-prefix cap is enforced before the map is touched.
-    let cfg = CaptureConfig {
-        max_rules_per_prefix: 2,
-        ..Default::default()
-    };
+    let cfg = CaptureConfig::default().max_rules_per_prefix(2);
     drop(cap);
     let cap = Capture::attach(ifindex(&veth.host), cfg, Mode::AUTO).expect("attach");
     cap.add_rule(p, Rule::Port(Protocol::TCP, 1)).unwrap();
@@ -532,13 +524,12 @@ fn only_captured_addresses_reach_the_device() {
         ]));
     }
 
-    let dev = Device::open(Config {
-        interface: veth.host.clone(),
-        // veth cannot do zero-copy; this test is about the filtering.
-        zerocopy: Zerocopy::Off,
-        program: ProgramSource::Capture(CaptureConfig::default()),
-        ..Default::default()
-    })
+    let dev = Device::open(
+        Config::new(veth.host.clone())
+            // veth cannot do zero-copy; this test is about the filtering.
+            .zerocopy(Zerocopy::Off)
+            .program(ProgramSource::Capture(CaptureConfig::default())),
+    )
     .expect("open AF_XDP on veth");
     eprintln!("mode={:?} queues={:?}", dev.mode(), dev.queue_ids());
 
@@ -593,12 +584,8 @@ fn uncaptured_traffic_still_reaches_the_host_stack() {
     let veth = Veth::new("pass");
     veth.assert_baseline();
 
-    let dev = Device::open(Config {
-        interface: veth.host.clone(),
-        zerocopy: Zerocopy::Off,
-        ..Default::default()
-    })
-    .expect("open AF_XDP on veth");
+    let dev = Device::open(Config::new(veth.host.clone()).zerocopy(Zerocopy::Off))
+        .expect("open AF_XDP on veth");
     // Capture something unrelated, so the program is doing real work.
     dev.capture_add(v4([10, 99, 0, 5], 32)).unwrap();
 
@@ -626,12 +613,8 @@ fn a_port_rule_shares_the_address_with_the_host_stack() {
     let veth = Veth::new("port");
     veth.assert_baseline();
 
-    let dev = Device::open(Config {
-        interface: veth.host.clone(),
-        zerocopy: Zerocopy::Off,
-        ..Default::default()
-    })
-    .expect("open AF_XDP on veth");
+    let dev = Device::open(Config::new(veth.host.clone()).zerocopy(Zerocopy::Off))
+        .expect("open AF_XDP on veth");
 
     let seen: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
     let n = Arc::new(AtomicUsize::new(0));
@@ -804,12 +787,11 @@ fn why_no_answer(veth: &Veth, dev: Device) -> String {
 
     // And behind the generic hook, which shares nothing with veth's own
     // NAPI receive path?
-    let generic = match Device::open(Config {
-        interface: veth.host.clone(),
-        zerocopy: Zerocopy::Off,
-        mode: Mode::GENERIC,
-        ..Default::default()
-    }) {
+    let generic = match Device::open(
+        Config::new(veth.host.clone())
+            .zerocopy(Zerocopy::Off)
+            .mode(Mode::GENERIC),
+    ) {
         Ok(d) => {
             let answered = veth.ping_host();
             let _ = d.close();
@@ -845,10 +827,7 @@ fn the_kernel_gives_the_verdicts_the_interpreter_does() {
     let veth = Veth::new("verdict");
     let cap = Capture::attach(
         ifindex(&veth.host),
-        CaptureConfig {
-            default_action: MISS,
-            ..Default::default()
-        },
+        CaptureConfig::default().default_action(MISS),
         Mode::AUTO,
     )
     .expect("attach");
@@ -938,12 +917,8 @@ fn a_bound_socket_turns_a_hit_into_a_redirect() {
         return;
     }
     let veth = Veth::new("redir");
-    let dev = Device::open(Config {
-        interface: veth.host.clone(),
-        zerocopy: Zerocopy::Off,
-        ..Default::default()
-    })
-    .expect("open AF_XDP on veth");
+    let dev = Device::open(Config::new(veth.host.clone()).zerocopy(Zerocopy::Off))
+        .expect("open AF_XDP on veth");
     let cap = dev.capture().expect("capture program");
     cap.add(v4([10, 99, 0, 5], 32)).unwrap();
 
@@ -999,11 +974,9 @@ fn what_the_capture_program_costs_per_packet() {
     for match_field in [MatchField::Dst, MatchField::Either] {
         let cap = Capture::attach(
             ifindex(&veth.host),
-            CaptureConfig {
-                match_field,
-                max_prefixes: 4096,
-                ..Default::default()
-            },
+            CaptureConfig::default()
+                .match_field(match_field)
+                .max_prefixes(4096),
             Mode::AUTO,
         )
         .expect("attach");
@@ -1049,12 +1022,11 @@ fn a_batch_is_transmitted_in_full() {
     // about `send_batch`.
     const POOL: u32 = 128;
     let veth = Veth::new("batch");
-    let dev = Device::open(Config {
-        interface: veth.host.clone(),
-        zerocopy: Zerocopy::Off,
-        num_frames: POOL,
-        ..Default::default()
-    })
+    let dev = Device::open(
+        Config::new(veth.host.clone())
+            .zerocopy(Zerocopy::Off)
+            .num_frames(POOL),
+    )
     .expect("open AF_XDP on veth");
 
     // Broadcast, in an EtherType reserved for local experiments, so nothing

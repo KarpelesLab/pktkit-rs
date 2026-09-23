@@ -44,6 +44,7 @@ const MAX_REQUEST_BYTES: usize = 64 * 1024;
 
 /// Configuration knobs for the UPnP IGD helper.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct UPnPConfig {
     /// TCP port for the SOAP control server (default 5000).
     pub control_port: u16,
@@ -55,6 +56,16 @@ pub struct UPnPConfig {
     pub max_per_client: usize,
     /// Maximum lease duration (`None` = permanent allowed).
     pub lease_duration: Option<Duration>,
+}
+
+setters! {
+    UPnPConfig {
+        set control_port: u16;
+        set allowed_ports: Vec<(u16, u16)>;
+        set max_mappings: usize;
+        set max_per_client: usize;
+        some lease_duration: Duration;
+    }
 }
 
 impl Default for UPnPConfig {

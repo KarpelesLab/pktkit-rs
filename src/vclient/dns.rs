@@ -157,11 +157,19 @@ pub mod wire {
 
 /// Configure a [`Resolver`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ResolverConfig {
     /// DNS servers to query, in priority order. Defaults to UDP/53.
     pub servers: Vec<SocketAddr>,
     /// Per-server query timeout.
     pub timeout: Duration,
+}
+
+setters! {
+    ResolverConfig {
+        set servers: Vec<SocketAddr>;
+        set timeout: Duration;
+    }
 }
 
 impl Default for ResolverConfig {

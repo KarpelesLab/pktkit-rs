@@ -16,11 +16,19 @@ use std::time::Duration;
 
 /// Knobs for [`Client`].
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct ClientConfig {
     /// IPv4/IPv6 prefix assigned to the client.
     pub prefix: Option<IpPrefix>,
     /// DNS servers to use (overrides anything learned via DHCP).
     pub dns: Vec<IpAddr>,
+}
+
+setters! {
+    ClientConfig {
+        some prefix: IpPrefix;
+        set dns: Vec<IpAddr>;
+    }
 }
 
 /// A virtual network client. Implements [`L3Device`].

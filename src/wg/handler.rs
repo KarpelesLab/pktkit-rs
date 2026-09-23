@@ -28,6 +28,7 @@ pub type UnknownPeerFn = Arc<dyn Fn(NoisePublicKey, SocketAddr, &[u8]) + Send + 
 
 /// Per-handler configuration.
 #[derive(Clone, Default)]
+#[non_exhaustive]
 pub struct Config {
     /// Local static private key. If zero, a fresh key is generated.
     pub private_key: NoisePrivateKey,
@@ -40,6 +41,14 @@ pub struct Config {
     /// exactly, so `Some(0)` makes every initiation under-load (useful in
     /// tests to force the cookie path).
     pub load_threshold: Option<usize>,
+}
+
+setters! {
+    Config {
+        set private_key: NoisePrivateKey;
+        some on_unknown_peer: UnknownPeerFn;
+        some load_threshold: usize;
+    }
 }
 
 impl std::fmt::Debug for Config {

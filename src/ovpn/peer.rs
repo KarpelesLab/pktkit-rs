@@ -51,6 +51,7 @@ pub struct AuthInfo {
 
 /// IP configuration the server pushes back to an authenticated client.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PeerConfig {
     /// Tunnel address assigned to the client.
     pub ip: std::net::IpAddr,
@@ -60,6 +61,23 @@ pub struct PeerConfig {
     pub mask: std::net::IpAddr,
     /// Prefix length for the per-peer device address.
     pub prefix_len: u8,
+}
+
+impl PeerConfig {
+    /// Every field is required; see each for what it does.
+    pub fn new(
+        ip: std::net::IpAddr,
+        gateway: std::net::IpAddr,
+        mask: std::net::IpAddr,
+        prefix_len: u8,
+    ) -> PeerConfig {
+        PeerConfig {
+            ip,
+            gateway,
+            mask,
+            prefix_len,
+        }
+    }
 }
 
 /// Authentication callback: given the credentials, return the IP config to push

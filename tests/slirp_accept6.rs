@@ -48,12 +48,12 @@ fn inbound_accept_handshake_and_bidirectional_data_v6() {
         .unwrap();
 
     // The virtual client (the host connecting *to* our listener).
-    let client = Arc::new(Mutex::new(Conn::new(ConnConfig {
-        local_port: CLIENT_PORT,
-        remote_port: SERVER_PORT,
-        mss: 1440,
-        ..Default::default()
-    })));
+    let client = Arc::new(Mutex::new(Conn::new(
+        ConnConfig::default()
+            .local_port(CLIENT_PORT)
+            .remote_port(SERVER_PORT)
+            .mss(1440),
+    )));
 
     // The stack pushes packets it wants to send out via its L3 handler. Those
     // packets are destined for the client: parse the TCP segment and feed it

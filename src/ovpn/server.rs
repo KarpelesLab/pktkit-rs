@@ -34,6 +34,7 @@ pub type OnDisconnect = Arc<dyn Fn(PeerKey) + Send + Sync>;
 
 /// Server configuration.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct ServerConfig {
     /// TLS configuration for the control channel.
     ///
@@ -62,6 +63,32 @@ pub struct ServerConfig {
     pub on_connect: Option<OnConnect>,
     /// Optional disconnect notification.
     pub on_disconnect: Option<OnDisconnect>,
+}
+
+setters! {
+    ServerConfig {
+        some on_connect: OnConnect;
+        some on_disconnect: OnDisconnect;
+    }
+}
+
+impl ServerConfig {
+    /// A server with no connect/disconnect hooks.
+    pub fn new(
+        tls_config: Arc<purecrypto::tls::Config>,
+        listen_addr: SocketAddr,
+        on_auth: OnAuth,
+        on_data: OnData,
+    ) -> ServerConfig {
+        ServerConfig {
+            tls_config,
+            listen_addr,
+            on_auth,
+            on_data,
+            on_connect: None,
+            on_disconnect: None,
+        }
+    }
 }
 
 impl std::fmt::Debug for ServerConfig {

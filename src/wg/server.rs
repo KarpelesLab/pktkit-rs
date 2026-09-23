@@ -27,6 +27,7 @@ pub type OnPeerConnectedFn = Arc<dyn Fn(NoisePublicKey, &Arc<Handler>) + Send + 
 
 /// Server configuration.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct ServerConfig {
     pub handler: Option<Arc<Handler>>,
     pub multi_handler: Option<Arc<MultiHandler>>,
@@ -34,6 +35,17 @@ pub struct ServerConfig {
     pub on_peer_connected: Option<OnPeerConnectedFn>,
     pub maintenance_interval: Option<Duration>,
     pub read_buffer_size: usize,
+}
+
+setters! {
+    ServerConfig {
+        some handler: Arc<Handler>;
+        some multi_handler: Arc<MultiHandler>;
+        set on_packet: OnPacketFn;
+        some on_peer_connected: OnPeerConnectedFn;
+        some maintenance_interval: Duration;
+        set read_buffer_size: usize;
+    }
 }
 
 impl std::fmt::Debug for ServerConfig {

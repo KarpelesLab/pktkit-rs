@@ -15,11 +15,7 @@
 //! use std::sync::Arc;
 //!
 //! # fn main() -> std::io::Result<()> {
-//! let dev = Socket::open(Config {
-//!     interface: "eth0".into(),
-//!     promiscuous: true,
-//!     ..Default::default()
-//! })?;
+//! let dev = Socket::open(Config::new("eth0").promiscuous(true))?;
 //!
 //! dev.set_handler(Arc::new(|f: &Frame| {
 //!     println!("{:?} -> {:?}", f.src_mac(), f.dst_mac());
@@ -62,6 +58,7 @@ use std::time::Duration;
 
 /// How to open an [`Socket`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Config {
     /// Interface to bind to, e.g. `eth0`. Required.
     pub interface: String,
@@ -78,6 +75,23 @@ pub struct Config {
     /// been closed. Lower is a more responsive [`close`](L2Device::close),
     /// higher is fewer wakeups on an idle link.
     pub poll_interval: Duration,
+}
+
+setters! {
+    Config {
+        into interface: String;
+        set promiscuous: bool;
+        set inbound_only: bool;
+        set recv_buffer: usize;
+        set poll_interval: Duration;
+    }
+}
+
+impl Config {
+    /// Defaults for everything but the interface, e.g. `"eth0"`.
+    pub fn new(interface: impl Into<String>) -> Config {
+        Config::default().interface(interface)
+    }
 }
 
 impl Default for Config {

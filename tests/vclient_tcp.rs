@@ -36,18 +36,16 @@ fn wrap(src: Ipv4Addr, dst: Ipv4Addr, seg: &[u8]) -> Vec<u8> {
 #[test]
 fn dial_handshake_and_bidirectional_data() {
     // Server-side vtcp connection in LISTEN-ish posture (Closed → accept_syn).
-    let server = Arc::new(Mutex::new(Conn::new(ConnConfig {
-        local_port: SERVER_PORT,
-        remote_port: 0, // learned from the SYN
-        ..Default::default()
-    })));
+    // The remote port is learned from the SYN.
+    let server = Arc::new(Mutex::new(Conn::new(
+        ConnConfig::default().local_port(SERVER_PORT),
+    )));
 
     // The client: when it emits a packet, feed it to the server engine. The
     // server's response segments are wrapped and pushed back into the client.
-    let client = pktkit::vclient::Client::new(pktkit::vclient::ClientConfig {
-        prefix: Some(IpPrefix::new(IpAddr::V4(CLIENT_IP), 24)),
-        dns: vec![],
-    });
+    let client = pktkit::vclient::Client::new(
+        pktkit::vclient::ClientConfig::default().prefix(IpPrefix::new(IpAddr::V4(CLIENT_IP), 24)),
+    );
 
     // Stash a weak ref so the handler can push packets back into the client.
     let client_for_handler = client.clone();
@@ -63,11 +61,11 @@ fn dial_handshake_and_bidirectional_data() {
             && !seg.has_flag(pktkit::vtcp::segment::flags::ACK)
         {
             // Re-create the server conn now that we know the client's port.
-            *srv = Conn::new(ConnConfig {
-                local_port: SERVER_PORT,
-                remote_port: seg.src_port,
-                ..Default::default()
-            });
+            *srv = Conn::new(
+                ConnConfig::default()
+                    .local_port(SERVER_PORT)
+                    .remote_port(seg.src_port),
+            );
             srv.accept_syn(&seg)
         } else {
             srv.handle_segment(&seg)
@@ -128,19 +126,18 @@ const LISTEN_PORT: u16 = 8080;
 fn listen_accept_and_bidirectional_data() {
     // The vclient `Client` is the *server*: it listens. A remote `vtcp::Conn`
     // acts as the connecting client ("peer").
-    let client = pktkit::vclient::Client::new(pktkit::vclient::ClientConfig {
-        prefix: Some(IpPrefix::new(IpAddr::V4(CLIENT_IP), 24)),
-        dns: vec![],
-    });
+    let client = pktkit::vclient::Client::new(
+        pktkit::vclient::ClientConfig::default().prefix(IpPrefix::new(IpAddr::V4(CLIENT_IP), 24)),
+    );
 
-    let peer = Arc::new(Mutex::new(Conn::new(ConnConfig {
-        local_port: PEER_PORT,
-        remote_port: LISTEN_PORT,
-        local_addr: Some(SocketAddr::new(IpAddr::V4(PEER_IP), PEER_PORT)),
-        remote_addr: Some(SocketAddr::new(IpAddr::V4(CLIENT_IP), LISTEN_PORT)),
-        mss: 1460,
-        ..Default::default()
-    })));
+    let peer = Arc::new(Mutex::new(Conn::new(
+        ConnConfig::default()
+            .local_port(PEER_PORT)
+            .remote_port(LISTEN_PORT)
+            .local_addr(SocketAddr::new(IpAddr::V4(PEER_IP), PEER_PORT))
+            .remote_addr(SocketAddr::new(IpAddr::V4(CLIENT_IP), LISTEN_PORT))
+            .mss(1460),
+    )));
 
     // Client's outbound packets (server side) are delivered to the peer, and
     // the peer's responses wrapped back into the client.

@@ -23,11 +23,7 @@ const TEST_ETHERTYPE: u16 = 0x88B5; // IEEE 802.1 local experimental
 const MAGIC: &[u8] = b"pktkit-afpacket-loopback";
 
 fn open_lo(inbound_only: bool) -> Socket_ {
-    match Socket::open(Config {
-        interface: "lo".into(),
-        inbound_only,
-        ..Default::default()
-    }) {
+    match Socket::open(Config::new("lo").inbound_only(inbound_only)) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
             panic!("needs CAP_NET_RAW: run under sudo")

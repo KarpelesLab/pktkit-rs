@@ -8,6 +8,7 @@ use std::io;
 
 /// Knobs for opening a TUN or TAP device.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct TuntapConfig {
     /// Requested interface name; ignored on this platform.
     pub name: String,

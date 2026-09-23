@@ -302,6 +302,7 @@ impl MatchField {
 
 /// How the capture program is built.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct CaptureConfig {
     /// Which address to match. See [`MatchField`].
     pub match_field: MatchField,
@@ -337,6 +338,20 @@ pub struct CaptureConfig {
     pub max_rules_per_prefix: u8,
     /// XSKMAP slots, i.e. the highest NIC queue index that can be bound.
     pub max_queues: u32,
+}
+
+setters! {
+    CaptureConfig {
+        set match_field: MatchField;
+        set arp: bool;
+        set neighbor_discovery: bool;
+        set default_action: Action;
+        set min_prefix_v4: u8;
+        set min_prefix_v6: u8;
+        set max_prefixes: u32;
+        set max_rules_per_prefix: u8;
+        set max_queues: u32;
+    }
 }
 
 impl Default for CaptureConfig {

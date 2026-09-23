@@ -33,3 +33,16 @@ pub use darwin::{Tap, Tun, TuntapConfig};
 mod unsupported;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub use unsupported::{Tap, Tun, TuntapConfig};
+
+setters! {
+    TuntapConfig {
+        into name: String;
+    }
+}
+
+impl TuntapConfig {
+    /// Ask for the device `name`. Empty lets the kernel pick one.
+    pub fn new(name: impl Into<String>) -> TuntapConfig {
+        TuntapConfig::default().name(name)
+    }
+}

@@ -14,6 +14,7 @@ const DEFAULT_LEASE: Duration = Duration::from_secs(3600);
 
 /// Configure a [`Server`].
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct ServerConfig {
     pub server_ip: Ipv4Addr,
     pub subnet_mask: Ipv4Addr,
@@ -26,6 +27,20 @@ pub struct ServerConfig {
     /// Reserved IPs handed out to specific clients, never recycled to anyone
     /// else.
     pub static_leases: HashMap<MacAddr, Ipv4Addr>,
+}
+
+setters! {
+    ServerConfig {
+        set server_ip: Ipv4Addr;
+        set subnet_mask: Ipv4Addr;
+        set range_start: Ipv4Addr;
+        set range_end: Ipv4Addr;
+        some router: Ipv4Addr;
+        set dns: Vec<Ipv4Addr>;
+        set lease_time: Duration;
+        set mac: MacAddr;
+        set static_leases: HashMap<MacAddr, Ipv4Addr>;
+    }
 }
 
 impl core::fmt::Debug for ServerConfig {

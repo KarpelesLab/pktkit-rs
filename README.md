@@ -152,10 +152,11 @@ use std::net::Ipv4Addr;
 use pktkit::IpPrefix;
 use pktkit::vclient::{Client, ClientConfig};
 
-let client = Client::new(ClientConfig {
-    prefix: Some(IpPrefix::new(Ipv4Addr::new(10, 0, 0, 2).into(), 24)),
-    dns: vec![Ipv4Addr::new(1, 1, 1, 1).into()],
-});
+let client = Client::new(
+    ClientConfig::default()
+        .prefix(IpPrefix::new(Ipv4Addr::new(10, 0, 0, 2).into(), 24))
+        .dns(vec![Ipv4Addr::new(1, 1, 1, 1).into()]),
+);
 // Wire `client` into an L3 network (slirp, wg, hub) via its L3Device impl,
 // then:
 let resp = client.http_get("http://example.com/")?;
@@ -175,13 +176,11 @@ use pktkit::slirp::Stack;
 let stack = Stack::new();
 stack.set_addr(IpPrefix::new(Ipv4Addr::new(10, 0, 0, 1).into(), 24)).unwrap();
 
-let adapter = Adapter::new(AdapterConfig {
+let adapter = Adapter::new(AdapterConfig::new(
     private_key,                      // your server's WireGuard private key
-    multi_handler: None,
-    connector: stack,                 // each peer gets isolated NAT via L3Connector
-    addr: IpPrefix::new(Ipv4Addr::new(10, 0, 0, 1).into(), 24),
-    on_unknown_peer: None,
-})?;
+    stack,                            // each peer gets isolated NAT via L3Connector
+    IpPrefix::new(Ipv4Addr::new(10, 0, 0, 1).into(), 24),
+))?;
 adapter.add_peer(client_public_key);
 
 let udp = UdpSocket::bind("0.0.0.0:51820")?;
@@ -273,14 +272,15 @@ println!("received {} forwarded {} flooded {} dropped {}",
 use pktkit::impair::{ImpairL2, Impairment};
 use std::time::Duration;
 
-let link = ImpairL2::new(device, Impairment {
-    delay: Duration::from_millis(50),
-    jitter: Duration::from_millis(10),
-    loss: 0.02,
-    rate_bps: 10_000_000,
-    seed: 0x5EED,          // same seed, same drops: a flake becomes a test case
-    ..Default::default()
-});
+let link = ImpairL2::new(
+    device,
+    Impairment::default()
+        .delay(Duration::from_millis(50))
+        .jitter(Duration::from_millis(10))
+        .loss(0.02)
+        .rate_bps(10_000_000)
+        .seed(0x5EED), // same seed, same drops: a flake becomes a test case
+);
 ```
 
 ### Capturing specific addresses with XDP
@@ -297,10 +297,7 @@ use std::sync::Arc;
 
 // One AF_XDP socket per RX queue, native-mode attach, zero-copy if the
 // driver supports it.
-let dev = Device::open(Config {
-    interface: "eth0".into(),
-    ..Default::default()
-})?;
+let dev = Device::open(Config::new("eth0"))?;
 
 dev.set_handler(Arc::new(|frame: &Frame| {
     println!("{} bytes", frame.as_bytes().len());
@@ -362,14 +359,11 @@ On the userspace side, three things are worth setting under load:
 // One ring update and at most one wakeup syscall for the whole burst.
 let sent = dev.send_batch(&frames)?;
 
-let cfg = Config {
-    interface: "eth0".into(),
+let cfg = Config::new("eth0")
     // Re-check an empty RX ring this many times before blocking in poll().
-    rx_spin: 2000,
+    .rx_spin(2000)
     // RX thread i, serving the i'th bound queue, runs on rx_cpus[i].
-    rx_cpus: vec![2, 3],
-    ..Default::default()
-};
+    .rx_cpus(vec![2, 3]);
 ```
 
 ## Status

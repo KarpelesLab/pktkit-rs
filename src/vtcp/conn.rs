@@ -99,6 +99,7 @@ fn make_cc(kind: CongestionKind, mss: u32) -> Box<dyn CongestionController> {
 
 /// Connection configuration.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ConnConfig {
     pub local_addr: std::option::Option<SocketAddr>,
     pub remote_addr: std::option::Option<SocketAddr>,
@@ -115,6 +116,26 @@ pub struct ConnConfig {
     pub keepalive_count: u32,
     pub send_buf_size: usize,
     pub recv_buf_size: usize,
+}
+
+setters! {
+    ConnConfig {
+        some local_addr: SocketAddr;
+        some remote_addr: SocketAddr;
+        set local_port: u16;
+        set remote_port: u16;
+        set mss: u16;
+        set no_window_scaling: bool;
+        set enable_timestamps: bool;
+        set enable_sack: bool;
+        set congestion: CongestionKind;
+        set keepalive: bool;
+        set keepalive_idle: Duration;
+        set keepalive_interval: Duration;
+        set keepalive_count: u32;
+        set send_buf_size: usize;
+        set recv_buf_size: usize;
+    }
 }
 
 impl Default for ConnConfig {

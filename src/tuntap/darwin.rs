@@ -23,6 +23,7 @@ const UTUN_OPT_IFNAME: libc::c_int = 2;
 /// Knobs for opening a utun device. `name` is ignored on macOS (the kernel
 /// assigns `utunN`); present for API parity with the Linux backend.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct TuntapConfig {
     pub name: String,
 }

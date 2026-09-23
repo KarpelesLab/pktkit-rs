@@ -16,10 +16,17 @@ use std::time::Duration;
 
 /// User-controllable knobs.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct ClientConfig {
     /// Override the client MAC. Defaults to whatever [`ClientTransport::mac`]
     /// returns at start time.
     pub mac: Option<MacAddr>,
+}
+
+setters! {
+    ClientConfig {
+        some mac: MacAddr;
+    }
 }
 
 /// What the client needs from its surroundings: a way to send Ethernet

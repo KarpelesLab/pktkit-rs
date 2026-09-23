@@ -42,6 +42,7 @@ impl std::fmt::Debug for Connector {
 }
 
 /// Configuration for an [`Adapter`].
+#[non_exhaustive]
 pub struct AdapterConfig {
     /// TLS config for the control channel (identity: cert chain + key).
     pub tls_config: Arc<purecrypto::tls::Config>,
@@ -51,6 +52,23 @@ pub struct AdapterConfig {
     pub connector: Connector,
     /// Auth hook returning the per-peer IP config.
     pub on_auth: OnAuth,
+}
+
+impl AdapterConfig {
+    /// Every field is required; see each for what it does.
+    pub fn new(
+        tls_config: Arc<purecrypto::tls::Config>,
+        listen_addr: SocketAddr,
+        connector: Connector,
+        on_auth: OnAuth,
+    ) -> AdapterConfig {
+        AdapterConfig {
+            tls_config,
+            listen_addr,
+            connector,
+            on_auth,
+        }
+    }
 }
 
 impl std::fmt::Debug for AdapterConfig {

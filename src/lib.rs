@@ -49,6 +49,9 @@
 
 // --- Core (always compiled) -------------------------------------------------
 
+#[macro_use]
+mod macros;
+
 mod accept;
 pub mod build;
 mod checksum;

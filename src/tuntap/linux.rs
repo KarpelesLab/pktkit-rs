@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 
 /// Knobs for opening a TUN or TAP device.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct TuntapConfig {
     /// Requested interface name; empty asks the kernel to pick one
     /// (`tun0`, `tap0`, …).

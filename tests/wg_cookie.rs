@@ -12,11 +12,7 @@ fn under_load_cookie_reply_then_accepted_retry() {
     // Responder with load_threshold = 0 → always "under load", so MAC2 is
     // mandatory and the first (MAC2-less) initiation must be answered with a
     // cookie reply.
-    let responder = Handler::new(Config {
-        load_threshold: Some(0),
-        ..Default::default()
-    })
-    .unwrap();
+    let responder = Handler::new(Config::default().load_threshold(0)).unwrap();
     let initiator = Handler::new(Config::default()).unwrap();
 
     responder.add_peer(initiator.public_key());
@@ -60,11 +56,7 @@ fn under_load_cookie_reply_then_accepted_retry() {
 fn cookie_mac2_is_source_bound() {
     // A cookie minted for one source address must not authorize an initiation
     // arriving from a different address.
-    let responder = Handler::new(Config {
-        load_threshold: Some(0),
-        ..Default::default()
-    })
-    .unwrap();
+    let responder = Handler::new(Config::default().load_threshold(0)).unwrap();
     let initiator = Handler::new(Config::default()).unwrap();
     responder.add_peer(initiator.public_key());
     initiator.add_peer(responder.public_key());

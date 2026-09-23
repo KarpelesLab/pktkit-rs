@@ -14,13 +14,11 @@
 //! let inner: Arc<dyn L2Device> = Arc::new(PipeL2::new(MacAddr::zero()));
 //! let link = ImpairL2::new(
 //!     inner,
-//!     Impairment {
-//!         delay: Duration::from_millis(50),
-//!         jitter: Duration::from_millis(10),
-//!         loss: 0.01,
-//!         rate_bps: 10_000_000,
-//!         ..Default::default()
-//!     },
+//!     Impairment::default()
+//!         .delay(Duration::from_millis(50))
+//!         .jitter(Duration::from_millis(10))
+//!         .loss(0.01)
+//!         .rate_bps(10_000_000),
 //! );
 //! # let _ = link.hw_addr();
 //! ```
@@ -50,6 +48,7 @@ use std::time::{Duration, Instant};
 /// The default is a perfect link: no delay, no loss, unlimited rate. Every
 /// probability is in `0.0..=1.0` and is drawn per message, per direction.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct Impairment {
     /// Base one-way latency added to every message.
     pub delay: Duration,
@@ -72,6 +71,19 @@ pub struct Impairment {
     /// Seed for the impairment RNG. Zero picks an arbitrary seed; any other
     /// value makes the run reproducible.
     pub seed: u64,
+}
+
+setters! {
+    Impairment {
+        set delay: Duration;
+        set jitter: Duration;
+        set loss: f64;
+        set duplicate: f64;
+        set corrupt: f64;
+        set rate_bps: u64;
+        set queue_limit: usize;
+        set seed: u64;
+    }
 }
 
 impl Default for Impairment {

@@ -34,6 +34,13 @@ Whatever you add, do not bloat the dependency footprint.
 - Owned buffers are `Vec<u8>`. Borrow as `&Foo` to use accessors.
 - IP types come from `std::net` (`Ipv4Addr`, `Ipv6Addr`, `IpAddr`). Use
   `crate::IpPrefix` for CIDR. MAC is `crate::MacAddr` (6-byte newtype).
+- Config structs (anything callers fill in: `*Config`, `Impairment`,
+  `BusyPoll`, …) are `#[non_exhaustive]`, so adding a field is not a breaking
+  change. Other crates then cannot use struct literals, so give each one
+  chainable setters with the crate-internal `setters!` macro
+  (`src/macros.rs`), plus a `new(...)` taking the required fields when
+  `Default` cannot fill them in. Examples, README and `tests/` build them
+  with setters: `Config::new("eth0").rx_spin(2000)`.
 - Wrap raw u8/u16 enums as `#[repr(transparent)] pub struct Foo(pub u16)`
   with `pub const VARIANT: Foo = Foo(0x1234)` — extensible without
   exhaustiveness pain. See `EtherType` / `Protocol`.

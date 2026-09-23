@@ -106,6 +106,7 @@ struct SockaddrXdp {
 /// Kernel counters for an AF_XDP socket (`struct xdp_statistics`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[repr(C)]
+#[non_exhaustive]
 pub struct Statistics {
     /// Dropped for reasons other than invalid descriptors.
     pub rx_dropped: u64,
@@ -160,12 +161,20 @@ pub enum Zerocopy {
 /// waiting for an interrupt, which removes the interrupt and the context switch
 /// from the receive path. Needs Linux 5.11+.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct BusyPoll {
     /// `SO_BUSY_POLL`, in microseconds.
     pub timeout_us: u32,
     /// `SO_BUSY_POLL_BUDGET`: packets per NAPI poll. The kernel's AF_XDP
     /// documentation suggests matching it to the RX batch size.
     pub budget: u32,
+}
+
+setters! {
+    BusyPoll {
+        set timeout_us: u32;
+        set budget: u32;
+    }
 }
 
 impl Default for BusyPoll {
@@ -196,6 +205,7 @@ impl Default for ProgramSource {
 
 /// Configuration for an AF_XDP device.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Config {
     /// Interface to bind, e.g. `"eth0"`.
     pub interface: String,
@@ -239,6 +249,31 @@ pub struct Config {
     pub huge_pages: bool,
     /// Extra bind flags OR'd in.
     pub flags: u16,
+}
+
+setters! {
+    Config {
+        into interface: String;
+        set queue_ids: Vec<u32>;
+        set ring_size: u32;
+        set frame_size: u32;
+        set num_frames: u32;
+        set zerocopy: Zerocopy;
+        set mode: Mode;
+        set program: ProgramSource;
+        some busy_poll: BusyPoll;
+        set rx_spin: u32;
+        set rx_cpus: Vec<usize>;
+        set huge_pages: bool;
+        set flags: u16;
+    }
+}
+
+impl Config {
+    /// Defaults for everything but the interface, e.g. `"eth0"`.
+    pub fn new(interface: impl Into<String>) -> Config {
+        Config::default().interface(interface)
+    }
 }
 
 impl Default for Config {
