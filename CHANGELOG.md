@@ -6,6 +6,15 @@ semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+## [0.1.5](https://github.com/KarpelesLab/pktkit-rs/compare/v0.1.4...v0.1.5) - 2026-09-23
+
+### Other
+
+- wait for the echo on a channel instead of sleeping
+- Make config structs #[non_exhaustive], with chainable setters
+- report an over-long interface name as not found
+- xdp, afxdp: build for fullrust, the libc-free Linux target
+
 ## [0.1.4](https://github.com/KarpelesLab/pktkit-rs/compare/v0.1.3...v0.1.4) - 2026-09-19
 
 ### Other
