@@ -330,6 +330,20 @@ impl Stack {
     /// registered (IP, port) are passive-opened against the in-tree vtcp
     /// engine; [`Listener::accept`] yields a [`TcpStream`](super::TcpStream)
     /// once the handshake completes.
+    ///
+    /// `network` must be `"tcp"` or `"tcp4"` (else `Unsupported`), and
+    /// `address` is `"ip:port"`, or `":port"` for every address; for IPv6
+    /// use [`listen6`](Self::listen6).
+    ///
+    /// A listener holds at most 128 connections in the middle of their
+    /// handshake, as a listen backlog does, and at most 10 completed ones
+    /// waiting for `accept`. A SYN that finds the handshakes at their cap, or
+    /// the accept queue full or one short of it, is dropped for the peer to
+    /// retransmit.
+    ///
+    /// Fails with `AddrInUse` if a live listener already has the address,
+    /// and with `NotConnected` once the stack has been
+    /// [`shutdown`](Self::shutdown).
     pub fn listen(&self, network: &str, address: &str) -> Result<Arc<Listener>> {
         match network {
             "tcp" | "tcp4" => {
@@ -375,7 +389,19 @@ impl Stack {
         }
     }
 
-    /// Open a virtual IPv6 listener on the stack.
+    /// Open a virtual IPv6 TCP listener on the stack, the IPv6 counterpart
+    /// of [`listen`](Self::listen); `address` is `"[ip]:port"`, or
+    /// `"[]:port"` for every address.
+    ///
+    /// A listener holds at most 128 connections in the middle of their
+    /// handshake, as a listen backlog does, and at most 10 completed ones
+    /// waiting for `accept`. A SYN that finds the handshakes at their cap, or
+    /// the accept queue full or one short of it, is dropped for the peer to
+    /// retransmit.
+    ///
+    /// Fails with `AddrInUse` if a live listener already has the address,
+    /// and with `NotConnected` once the stack has been
+    /// [`shutdown`](Self::shutdown).
     pub fn listen6(&self, address: &str) -> Result<Arc<Listener6>> {
         let addr = resolve_v6(address)?;
         let listener = Arc::new(Listener6::new(addr));
@@ -426,7 +452,11 @@ impl Stack {
     /// like [`Ipv4Addr::is_loopback`] or [`Ipv4Addr::is_link_local`] catch
     /// it. Unspecified destinations (`0.0.0.0`, `::`), which the host would
     /// treat as its own loopback, are refused before the filter runs, as are
-    /// TCP connections to broadcast or multicast addresses.
+    /// TCP connections to a multicast address or to the limited broadcast
+    /// address `255.255.255.255`. A subnet's directed broadcast (such as
+    /// `192.168.1.255`) is an ordinary address to the stack, which cannot
+    /// know the host's subnets: a filter that should refuse one must do so
+    /// itself.
     ///
     /// The filter runs on the packet path, so it should be quick, and must
     /// not call back into the stack. `None` allows everything again.
@@ -444,8 +474,8 @@ impl Stack {
     /// IPv6 clothing. An unspecified destination (`0.0.0.0`, `::`) is never
     /// relayed: the host's stack treats a connect or send to it as one to
     /// its own loopback, which is not somewhere a guest asked to go. Nor is
-    /// a TCP connection to a broadcast or multicast address, which no peer
-    /// can answer.
+    /// a TCP connection to a multicast address or to `255.255.255.255`,
+    /// which no peer can answer.
     fn dial_target(inner: &Inner, dest: SocketAddr, proto: Protocol) -> Option<SocketAddr> {
         let ip = dest.ip().to_canonical();
         if ip.is_unspecified() {

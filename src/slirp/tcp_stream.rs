@@ -229,6 +229,14 @@ impl ConnState {
 /// [`std::io::Read`] + [`std::io::Write`]. Dropping it closes the
 /// connection gracefully, unless received data was left unread: then, as a
 /// host stack does (RFC 2525 §2.17), the peer gets a reset.
+///
+/// After the drop nobody is left to read, so the peer is reset if it sends
+/// more data, or if it ACKs our FIN but then goes quiet without sending its
+/// own for vtcp's FIN-WAIT-2 timeout
+/// ([`DEFAULT_FIN_WAIT2_TIMEOUT`](crate::vtcp::conn::DEFAULT_FIN_WAIT2_TIMEOUT)),
+/// as Linux does for an orphaned socket. [`close`](Self::close) alone is a
+/// half-close: the handle can still read, and the peer may take as long as
+/// it likes.
 pub struct TcpStream {
     state: Arc<ConnState>,
     read_timeout: Mutex<Option<Duration>>,
