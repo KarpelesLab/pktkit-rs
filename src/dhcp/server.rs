@@ -122,7 +122,18 @@ impl Server {
 
     /// Decode a UDP/DHCP payload and react. Public so callers that already
     /// stripped the IP and UDP headers can drive the server directly.
+    ///
+    /// Without the Ethernet frame the server does not know a relay agent's
+    /// MAC, so replies to a relay go to the broadcast MAC (still addressed
+    /// to the relay's IP). Frames given to [`send`](L2Device::send) do not
+    /// have that problem.
     pub fn handle_dhcp(&self, msg: &[u8]) {
+        self.handle(msg, None);
+    }
+
+    /// `from` is the Ethernet source of the request: for a relayed one, the
+    /// relay agent (or the router toward it), which is where the answer goes.
+    fn handle(&self, msg: &[u8], from: Option<MacAddr>) {
         let p = match wire::Parsed::from_bytes(msg) {
             Some(p) => p,
             None => return,
@@ -130,15 +141,21 @@ impl Server {
         if p.op != 1 {
             return; // not a BOOTREQUEST
         }
+        // RFC 2131 §4.3.1: a relayed request is for the subnet the relay
+        // sits on. This server has one pool; for a relay on any other
+        // subnet it has nothing that would work there, so it stays out.
+        if !p.giaddr.is_unspecified() && !self.on_our_subnet(p.giaddr) {
+            return;
+        }
         match p.msg_type {
             wire::MSG_DISCOVER => {
                 if let Some(ip) = self.allocate(p.chaddr) {
-                    self.send_reply(wire::MSG_OFFER, p.xid, p.chaddr, Some(ip));
+                    self.send_reply(&p, from, wire::MSG_OFFER, Some(ip));
                 }
             }
             wire::MSG_REQUEST => match self.request(&p) {
-                Answer::Ack(ip) => self.send_reply(wire::MSG_ACK, p.xid, p.chaddr, Some(ip)),
-                Answer::Nak => self.send_nak(p.xid, p.chaddr),
+                Answer::Ack(ip) => self.send_reply(&p, from, wire::MSG_ACK, Some(ip)),
+                Answer::Nak => self.send_nak(&p, from),
                 Answer::Silent => {}
             },
             wire::MSG_RELEASE => {
@@ -146,7 +163,7 @@ impl Server {
             }
             wire::MSG_DECLINE => self.decline(&p),
             wire::MSG_INFORM => {
-                self.send_reply(wire::MSG_ACK, p.xid, p.chaddr, None);
+                self.send_reply(&p, from, wire::MSG_ACK, None);
             }
             _ => {}
         }
@@ -304,8 +321,7 @@ impl Server {
             expiry: self.lease_end(now),
             bound: true,
         };
-        let mask = u32::from(self.cfg.subnet_mask);
-        if u32::from(ip) & mask != u32::from(self.cfg.server_ip) & mask {
+        if !self.on_our_subnet(ip) {
             return Answer::Nak; // the client moved here from another network
         }
         if let Some(static_ip) = self.cfg.static_leases.get(&mac).copied() {
@@ -394,15 +410,32 @@ impl Server {
     /// DHCPNAK carries no address or configuration, only who refused
     /// (RFC 2131 Table 3), and is broadcast since the client may have no
     /// usable address.
-    fn send_nak(&self, xid: u32, chaddr: MacAddr) {
-        let mut b = wire::Builder::new(2, xid, chaddr);
-        b.message_type(wire::MSG_NAK)
+    fn send_nak(&self, p: &wire::Parsed, from: Option<MacAddr>) {
+        let mut b = wire::Builder::new(2, p.xid, p.chaddr);
+        // Through a relay, the BROADCAST bit tells it to broadcast the NAK
+        // on the client's subnet (RFC 2131 §4.1).
+        let mut flags = p.flags;
+        if !p.giaddr.is_unspecified() {
+            flags |= wire::FLAG_BROADCAST;
+        }
+        b.flags(flags)
+            .giaddr(p.giaddr)
+            .message_type(wire::MSG_NAK)
             .ipv4_option(wire::OPT_SERVER_ID, self.cfg.server_ip);
-        self.send_message(chaddr, &b.finish());
+        let (mac, ip, port) = self.destination(p, from, None, true);
+        self.send_message(mac, ip, port, &b.finish());
     }
 
-    fn send_reply(&self, msg_type: u8, xid: u32, chaddr: MacAddr, yiaddr: Option<Ipv4Addr>) {
-        let mut b = wire::Builder::new(2, xid, chaddr);
+    fn send_reply(
+        &self,
+        p: &wire::Parsed,
+        from: Option<MacAddr>,
+        msg_type: u8,
+        yiaddr: Option<Ipv4Addr>,
+    ) {
+        let mut b = wire::Builder::new(2, p.xid, p.chaddr);
+        // Table 3: flags and giaddr are the client's, echoed back.
+        b.flags(p.flags).giaddr(p.giaddr);
         if let Some(ip) = yiaddr {
             b.yiaddr(ip);
         }
@@ -418,20 +451,57 @@ impl Server {
             b.u32_option(wire::OPT_LEASE_TIME, self.lease_secs());
             b.ipv4_option(wire::OPT_SERVER_ID, self.cfg.server_ip);
         }
-        self.send_message(chaddr, &b.finish());
+        let (mac, ip, port) = self.destination(p, from, yiaddr, false);
+        self.send_message(mac, ip, port, &b.finish());
     }
 
-    fn send_message(&self, chaddr: MacAddr, dhcp: &[u8]) {
-        // UDP 67→68
+    /// Where a reply to `p` goes, as RFC 2131 §4.1 lays out: (Ethernet
+    /// destination, IP destination, UDP port).
+    fn destination(
+        &self,
+        p: &wire::Parsed,
+        from: Option<MacAddr>,
+        yiaddr: Option<Ipv4Addr>,
+        nak: bool,
+    ) -> (MacAddr, Ipv4Addr, u16) {
+        let everyone = (MacAddr::broadcast(), Ipv4Addr::BROADCAST, 68);
+        if !p.giaddr.is_unspecified() {
+            // Back to the relay, on the server port.
+            return (from.unwrap_or(MacAddr::broadcast()), p.giaddr, 67);
+        }
+        if nak {
+            return everyone;
+        }
+        if !p.ciaddr.is_unspecified() {
+            // The client has an address and answers ARP for it.
+            return (p.chaddr, p.ciaddr, 68);
+        }
+        if p.flags & wire::FLAG_BROADCAST != 0 {
+            return everyone;
+        }
+        match yiaddr {
+            // Unicast to the new address, at the client's own MAC, since it
+            // cannot answer ARP for an address it does not have yet.
+            Some(ip) => (p.chaddr, ip, 68),
+            None => everyone,
+        }
+    }
+
+    /// Whether `ip` is on the subnet this server hands addresses out on.
+    fn on_our_subnet(&self, ip: Ipv4Addr) -> bool {
+        let mask = u32::from(self.cfg.subnet_mask);
+        u32::from(ip) & mask == u32::from(self.cfg.server_ip) & mask
+    }
+
+    fn send_message(&self, dst_mac: MacAddr, dst_ip: Ipv4Addr, dst_port: u16, dhcp: &[u8]) {
         let udp_len = 8 + dhcp.len();
         let mut udp = Vec::with_capacity(udp_len);
         udp.extend_from_slice(&67u16.to_be_bytes());
-        udp.extend_from_slice(&68u16.to_be_bytes());
+        udp.extend_from_slice(&dst_port.to_be_bytes());
         udp.extend_from_slice(&(udp_len as u16).to_be_bytes());
         udp.extend_from_slice(&[0, 0]); // checksum = 0
         udp.extend_from_slice(dhcp);
 
-        // IPv4 server_ip → 255.255.255.255
         let ip_len = 20 + udp_len;
         let mut ip = vec![0u8; ip_len];
         ip[0] = 0x45;
@@ -439,12 +509,12 @@ impl Server {
         ip[8] = 64;
         ip[9] = Protocol::UDP.as_u8();
         ip[12..16].copy_from_slice(&self.cfg.server_ip.octets());
-        ip[16..20].copy_from_slice(&[0xff; 4]);
+        ip[16..20].copy_from_slice(&dst_ip.octets());
         let cs = checksum(&ip[..20]);
         ip[10..12].copy_from_slice(&cs.to_be_bytes());
         ip[20..].copy_from_slice(&udp);
 
-        let frame = build_frame(chaddr, self.cfg.mac, EtherType::IPV4, &ip);
+        let frame = build_frame(dst_mac, self.cfg.mac, EtherType::IPV4, &ip);
         let h = self.handler.lock().unwrap().clone();
         if let Some(h) = h {
             let _ = h(Frame::from_slice(&frame));
@@ -481,7 +551,7 @@ impl L2Device for Server {
             return Ok(());
         }
         let dhcp = &udp[8..udp_len];
-        self.handle_dhcp(dhcp);
+        self.handle(dhcp, f.src_mac());
         Ok(())
     }
     fn hw_addr(&self) -> MacAddr {
@@ -870,6 +940,115 @@ mod tests {
             s.handle_dhcp(&decline(mac, Some(Ipv4Addr::from(0x0a00_0000 + i)), us));
         }
         assert!(s.declined.lock().unwrap().len() <= MAX_LEASES);
+    }
+
+    /// Where each reply sent so far went: (Ethernet dst, IP dst, UDP dst
+    /// port, message); and forget them.
+    fn addressed(r: &Sent) -> Vec<(MacAddr, Ipv4Addr, u16, wire::Parsed)> {
+        r.lock()
+            .unwrap()
+            .drain(..)
+            .map(|f| {
+                let f = Frame::from_slice(&f);
+                let ip = crate::Packet::from_slice(f.payload());
+                let udp = ip.ipv4_payload();
+                (
+                    f.dst_mac().unwrap(),
+                    ip.ipv4_dst_addr().unwrap(),
+                    u16::from_be_bytes([udp[2], udp[3]]),
+                    wire::Parsed::from_bytes(&udp[8..]).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn replies_are_addressed_per_rfc_2131_section_4_1() {
+        let (s, r) = recording(ServerConfig::new(
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(10, 0, 0, 10),
+            Ipv4Addr::new(10, 0, 0, 20),
+        ));
+        let mac = MacAddr([2, 0, 0, 0, 0, 1]);
+
+        // No flag: unicast to the offered address at chaddr.
+        s.handle_dhcp(&build_discover(1, mac));
+        let (emac, ip, port, p) = addressed(&r).remove(0);
+        assert_eq!((emac, ip, port), (mac, p.yiaddr, 68));
+
+        // Broadcast flag: the client cannot take unicast yet.
+        let mut b = wire::Builder::new(1, 2, mac);
+        b.flags(0x8000).message_type(wire::MSG_DISCOVER);
+        s.handle_dhcp(&b.finish());
+        let (emac, ip, _, p) = addressed(&r).remove(0);
+        assert_eq!((emac, ip), (MacAddr::broadcast(), Ipv4Addr::BROADCAST));
+        assert_eq!(p.flags & 0x8000, 0x8000, "flags echoed");
+
+        // A renewal is answered at its ciaddr.
+        let leased = p.yiaddr;
+        s.handle_dhcp(&request(3, mac, leased, Ipv4Addr::new(10, 0, 0, 1)));
+        addressed(&r);
+        let mut b = wire::Builder::new(1, 4, mac);
+        b.message_type(wire::MSG_REQUEST).ciaddr(leased);
+        s.handle_dhcp(&b.finish());
+        let (emac, ip, _, p) = addressed(&r).remove(0);
+        assert_eq!(p.msg_type, wire::MSG_ACK);
+        assert_eq!((emac, ip), (mac, leased));
+
+        // A NAK with no relay is always broadcast.
+        let mut b = wire::Builder::new(1, 5, mac);
+        b.message_type(wire::MSG_REQUEST)
+            .ipv4_option(wire::OPT_REQUESTED_IP, Ipv4Addr::new(192, 168, 9, 9));
+        s.handle_dhcp(&b.finish());
+        let (emac, ip, _, p) = addressed(&r).remove(0);
+        assert_eq!(p.msg_type, wire::MSG_NAK);
+        assert_eq!((emac, ip), (MacAddr::broadcast(), Ipv4Addr::BROADCAST));
+    }
+
+    #[test]
+    fn relayed_requests_are_answered_to_the_relay_and_only_for_our_subnet() {
+        let (s, r) = recording(one_address_pool());
+        let relay_mac = MacAddr([2, 0, 0, 0, 0, 0xee]);
+        let client = MacAddr([2, 0, 0, 0, 0, 1]);
+        let relayed = |giaddr: Ipv4Addr| {
+            let mut b = wire::Builder::new(1, 1, client);
+            b.giaddr(giaddr).message_type(wire::MSG_DISCOVER);
+            let dhcp = b.finish();
+            let udp = crate::build::build_udp(
+                std::net::IpAddr::V4(giaddr),
+                std::net::IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+                67,
+                67,
+                &dhcp,
+            );
+            let ip = crate::build::build_ipv4(
+                giaddr,
+                Ipv4Addr::new(10, 0, 0, 1),
+                Protocol::UDP,
+                64,
+                &udp,
+            );
+            build_frame(s.cfg.mac, relay_mac, EtherType::IPV4, &ip)
+        };
+
+        // A relay on a subnet this server has no pool for.
+        s.send(Frame::from_slice(&relayed(Ipv4Addr::new(192, 168, 5, 1))))
+            .unwrap();
+        assert!(
+            addressed(&r).is_empty(),
+            "offered 10.0.0.x to 192.168.5.0/24"
+        );
+
+        // A relay on ours: the answer goes back through it, to port 67.
+        s.send(Frame::from_slice(&relayed(Ipv4Addr::new(10, 0, 0, 254))))
+            .unwrap();
+        let (emac, ip, port, p) = addressed(&r).remove(0);
+        assert_eq!(p.msg_type, wire::MSG_OFFER);
+        assert_eq!(
+            (emac, ip, port),
+            (relay_mac, Ipv4Addr::new(10, 0, 0, 254), 67)
+        );
+        assert_eq!(p.giaddr, Ipv4Addr::new(10, 0, 0, 254));
     }
 
     #[test]

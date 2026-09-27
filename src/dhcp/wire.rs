@@ -18,6 +18,9 @@ pub const MSG_NAK: u8 = 6;
 pub const MSG_RELEASE: u8 = 7;
 pub const MSG_INFORM: u8 = 8;
 
+/// The BROADCAST bit of `flags` (RFC 2131 §2).
+pub const FLAG_BROADCAST: u16 = 0x8000;
+
 // --- Option codes ----------------------------------------------------------
 
 pub const OPT_PAD: u8 = 0;
@@ -45,10 +48,16 @@ pub const MAGIC_COOKIE: [u8; 4] = [99, 130, 83, 99];
 pub struct Parsed {
     pub op: u8,
     pub xid: u32,
+    /// `flags`; the top bit is BROADCAST (RFC 2131 §2), set by a client
+    /// that cannot receive unicast before it has an address.
+    pub flags: u16,
     /// Client's current address, set only when it is renewing or rebinding a
     /// lease it holds (RFC 2131 §4.3.2).
     pub ciaddr: Ipv4Addr,
     pub yiaddr: Ipv4Addr,
+    /// Relay agent address: non-zero when a BOOTP relay forwarded the
+    /// message from another subnet.
+    pub giaddr: Ipv4Addr,
     pub chaddr: MacAddr,
     pub msg_type: u8,
     pub subnet_mask: Option<Ipv4Addr>,
@@ -70,8 +79,10 @@ impl Default for Parsed {
         Parsed {
             op: 0,
             xid: 0,
+            flags: 0,
             ciaddr: Ipv4Addr::UNSPECIFIED,
             yiaddr: Ipv4Addr::UNSPECIFIED,
+            giaddr: Ipv4Addr::UNSPECIFIED,
             chaddr: MacAddr::zero(),
             msg_type: 0,
             subnet_mask: None,
@@ -100,8 +111,10 @@ impl Parsed {
         let mut p = Parsed {
             op: b[0],
             xid: u32::from_be_bytes([b[4], b[5], b[6], b[7]]),
+            flags: u16::from_be_bytes([b[10], b[11]]),
             ciaddr: Ipv4Addr::new(b[12], b[13], b[14], b[15]),
             yiaddr: Ipv4Addr::new(b[16], b[17], b[18], b[19]),
+            giaddr: Ipv4Addr::new(b[24], b[25], b[26], b[27]),
             chaddr: {
                 let mut o = [0u8; 6];
                 o.copy_from_slice(&b[28..34]);
@@ -221,6 +234,18 @@ impl Builder {
     /// Set the `siaddr` ("server IP") field.
     pub fn siaddr(&mut self, ip: Ipv4Addr) -> &mut Self {
         self.buf[20..24].copy_from_slice(&ip.octets());
+        self
+    }
+
+    /// Set the `flags` field (the top bit is BROADCAST).
+    pub fn flags(&mut self, flags: u16) -> &mut Self {
+        self.buf[10..12].copy_from_slice(&flags.to_be_bytes());
+        self
+    }
+
+    /// Set the `giaddr` (relay agent) field.
+    pub fn giaddr(&mut self, ip: Ipv4Addr) -> &mut Self {
+        self.buf[24..28].copy_from_slice(&ip.octets());
         self
     }
 
