@@ -47,6 +47,12 @@ const MAX_REQUEST_BYTES: usize = 64 * 1024;
 /// request buffer, and a SYN is all it takes to create one.
 const MAX_CTRL_CONNS: usize = 64;
 
+/// Cap on concurrent control connections from one client, so that one host
+/// opening connections and leaving them idle cannot take the whole table
+/// and lock every other host out of UPnP. A control point makes one
+/// request at a time.
+const MAX_CTRL_CONNS_PER_CLIENT: usize = 8;
+
 /// A control connection with no traffic for this long is dropped: a SOAP
 /// exchange takes milliseconds, and nothing else drives the engine's timers.
 const CTRL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -379,6 +385,11 @@ EXT:\r\n\r\n",
                 && !seg.has_flag(crate::vtcp::flags::ACK)
                 && !table.contains_key(&key)
                 && table.len() < MAX_CTRL_CONNS
+                && table
+                    .keys()
+                    .filter(|k| k.ns == ns && k.client_ip == client_ip)
+                    .count()
+                    < MAX_CTRL_CONNS_PER_CLIENT
             {
                 let cfg = ConnConfig {
                     local_addr: Some(SocketAddr::new(
@@ -1416,9 +1427,10 @@ Content-Length: {len}\r\n\r\n",
     fn control_connection_table_is_bounded_and_reaped() {
         let nat = Nat::new(pfx("10.0.0.1/24"), pfx("203.0.113.1/24"));
         let h = UPnPHelper::new(UPnPConfig::default());
-        let client_ip = Ipv4Addr::new(10, 0, 0, 42);
         let inside_ip = Ipv4Addr::new(10, 0, 0, 1);
+        // From many hosts, so that the per-client cap is not what binds.
         let syn = |port: u16| {
+            let client_ip = Ipv4Addr::new(10, 0, 0, 2 + (port % 200) as u8);
             let mut c = crate::vtcp::Conn::new(crate::vtcp::ConnConfig {
                 local_addr: Some(SocketAddr::new(IpAddr::V4(client_ip), port)),
                 remote_addr: Some(SocketAddr::new(IpAddr::V4(inside_ip), 5000)),
@@ -1432,7 +1444,7 @@ Content-Length: {len}\r\n\r\n",
         for port in 0..(MAX_CTRL_CONNS as u16 + 50) {
             h.handle_local(&nat, crate::Packet::from_slice(&syn(40000 + port)));
         }
-        assert!(h.ctrl.lock().unwrap().len() <= MAX_CTRL_CONNS);
+        assert_eq!(h.ctrl.lock().unwrap().len(), MAX_CTRL_CONNS);
 
         let long_ago = Instant::now() - CTRL_IDLE_TIMEOUT - Duration::from_secs(1);
         h.ctrl
@@ -1698,5 +1710,32 @@ MAN: \"ssdp:discover\"\r\nST: upnp:rootdevice\r\n\r\n";
         assert_eq!(add(20004, "10.0.0.44"), 500);
         nat.remove_port_forward(PROTO_TCP, 20003);
         assert_eq!(add(20004, "10.0.0.44"), 200);
+    }
+
+    #[test]
+    fn one_client_cannot_take_every_control_connection() {
+        let nat = Nat::new(pfx("10.0.0.1/24"), pfx("203.0.113.1/24"));
+        let h = UPnPHelper::new(UPnPConfig::default());
+        let inside_ip = Ipv4Addr::new(10, 0, 0, 1);
+        let syn = |client_ip: Ipv4Addr, port: u16| {
+            let mut c = crate::vtcp::Conn::new(crate::vtcp::ConnConfig {
+                local_addr: Some(SocketAddr::new(IpAddr::V4(client_ip), port)),
+                remote_addr: Some(SocketAddr::new(IpAddr::V4(inside_ip), 5000)),
+                local_port: port,
+                remote_port: 5000,
+                ..Default::default()
+            });
+            wrap_tcp_v4(client_ip, inside_ip, &c.connect()[0])
+        };
+        let greedy = Ipv4Addr::new(10, 0, 0, 66);
+        for port in 0..MAX_CTRL_CONNS as u16 {
+            h.handle_local(&nat, crate::Packet::from_slice(&syn(greedy, 40000 + port)));
+        }
+        let held = h.ctrl.lock().unwrap().len();
+        assert!(held < MAX_CTRL_CONNS, "one client holds all {held}");
+
+        let polite = Ipv4Addr::new(10, 0, 0, 42);
+        h.handle_local(&nat, crate::Packet::from_slice(&syn(polite, 50000)));
+        assert!(h.ctrl.lock().unwrap().keys().any(|k| k.client_ip == polite));
     }
 }
