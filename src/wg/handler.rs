@@ -687,15 +687,27 @@ impl Handler {
 
     /// Install the keypair from a handshake we initiated. The response
     /// proved the peer holds it, so it becomes current at once.
+    ///
+    /// An unconfirmed next keypair means both ends initiated at once and we
+    /// answered the peer's too. The peer, once our response reaches it,
+    /// sends with that one, so it is kept as previous (in place of current,
+    /// which it supersedes), as the reference's add_new_keypair does.
+    /// Dropping it cut traffic from the peer until the next rekey.
     pub(crate) fn install_initiator_keypair(
         &self,
         peer_key: NoisePublicKey,
         kp: Arc<Keypair>,
     ) -> Result<()> {
         self.install(peer_key, kp, |s, kp| {
-            let mut gone: Vec<_> = s.keypair_next.take().into_iter().collect();
-            gone.extend(s.keypair_prev.take());
-            s.keypair_prev = s.keypair_current.replace(kp);
+            let mut gone: Vec<_> = s.keypair_prev.take().into_iter().collect();
+            s.keypair_prev = match s.keypair_next.take() {
+                Some(next) => {
+                    gone.extend(s.keypair_current.take());
+                    Some(next)
+                }
+                None => s.keypair_current.take(),
+            };
+            s.keypair_current = Some(kp);
             gone
         })
     }
@@ -1252,6 +1264,35 @@ mod tests {
         assert!(a.has_session(&b.public_key()));
         rewind(&a, &b.public_key(), Duration::from_secs(6));
         assert!(timer_actions(&a).is_empty(), "still retrying");
+    }
+
+    /// Both ends initiate at once and both handshakes complete. Each side
+    /// then sends with the keypair from its own initiation, which the other
+    /// holds as the one it answered: that one must still decrypt.
+    #[test]
+    fn crossing_handshakes_leave_traffic_flowing_both_ways() {
+        let (a, b) = pair();
+        let addr = loopback();
+        let init_a = a.initiate_handshake(&b.public_key()).unwrap();
+        let init_b = b.initiate_handshake(&a.public_key()).unwrap();
+        let resp_a = a.process_packet(&init_b, &addr).unwrap();
+        let resp_b = b.process_packet(&init_a, &addr).unwrap();
+        let ka_a = a.process_packet(&resp_b.response, &addr).unwrap();
+        let ka_b = b.process_packet(&resp_a.response, &addr).unwrap();
+        assert_eq!(
+            b.process_packet(&ka_a.response, &addr).unwrap().ty,
+            PacketType::Keepalive
+        );
+        assert_eq!(
+            a.process_packet(&ka_b.response, &addr).unwrap().ty,
+            PacketType::Keepalive
+        );
+        for _ in 0..3 {
+            let pkt = a.encrypt(b"a to b", &b.public_key()).unwrap();
+            assert_eq!(b.process_packet(&pkt, &addr).unwrap().data, b"a to b");
+            let pkt = b.encrypt(b"b to a", &a.public_key()).unwrap();
+            assert_eq!(a.process_packet(&pkt, &addr).unwrap().data, b"b to a");
+        }
     }
 
     /// A response to an initiation made before the peer was removed must not
