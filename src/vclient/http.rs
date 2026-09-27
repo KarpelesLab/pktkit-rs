@@ -107,7 +107,7 @@ impl Request {
         self
     }
 
-    /// Add a request header.
+    /// Add a request header. A `Host` header replaces the one the URL gives.
     pub fn header(mut self, name: &str, value: &str) -> Request {
         self.headers.push((name.to_string(), value.to_string()));
         self
@@ -130,7 +130,15 @@ impl Request {
         }
         let mut out = Vec::new();
         let _ = write!(out, "{} {} HTTP/1.1\r\n", self.method, self.path);
-        let _ = write!(out, "Host: {}\r\n", host_header(&self.host, self.port));
+        // A caller's own Host replaces ours: a request with two is one a
+        // server must reject (RFC 9112 §3.2).
+        if !self
+            .headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("host"))
+        {
+            let _ = write!(out, "Host: {}\r\n", host_header(&self.host, self.port));
+        }
         let mut have_len = false;
         let mut have_conn = false;
         for (k, v) in &self.headers {
@@ -829,6 +837,19 @@ mod tests {
         assert_eq!(host("http://h:8080/"), "h:8080");
         assert_eq!(host("http://[::1]/"), "[::1]");
         assert_eq!(host("http://[::1]:8080/"), "[::1]:8080");
+    }
+
+    #[test]
+    fn callers_host_header_replaces_the_default() {
+        let req = Request::get("http://10.0.0.1:8080/")
+            .unwrap()
+            .header("hOsT", "example.test");
+        let s = String::from_utf8(req.serialize().unwrap()).unwrap();
+        let hosts: Vec<&str> = s
+            .lines()
+            .filter(|l| l.to_ascii_lowercase().starts_with("host:"))
+            .collect();
+        assert_eq!(hosts, ["hOsT: example.test"]);
     }
 
     #[test]
