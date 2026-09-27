@@ -6,6 +6,12 @@ semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+## [0.1.7](https://github.com/KarpelesLab/pktkit-rs/compare/v0.1.6...v0.1.7) - 2026-09-27
+
+### Added
+
+- run on wasm32-unknown-unknown and wasm32-wasip1
+
 ## [0.1.6](https://github.com/KarpelesLab/pktkit-rs/compare/v0.1.5...v0.1.6) - 2026-09-27
 
 ### Fixed
