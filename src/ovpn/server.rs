@@ -147,10 +147,33 @@ struct PeerEntry {
     // For TCP peers, the connection's outbound queue. For UDP, None (the
     // server writes via the shared UDP socket).
     tcp: Option<TcpOut>,
-    /// Whether on_connect was fired for the peer and not yet matched by an
-    /// on_disconnect: the callbacks pair, so only such a peer is reported
-    /// gone.
-    connected: AtomicBool,
+    /// What on_connect / on_disconnect have said of the peer. One lock for
+    /// removal and the connect transition, so a verdict landing as the
+    /// peer is removed either reports it connected before the removal
+    /// sees it, or not at all.
+    link: Mutex<Link>,
+}
+
+#[derive(Default)]
+struct Link {
+    /// Out of the peer table: never reported connected again.
+    removed: bool,
+    /// on_connect was fired and not yet matched by an on_disconnect: the
+    /// callbacks pair, so only such a peer is reported gone.
+    connected: bool,
+    /// on_connect is running. A removal meanwhile leaves the matching
+    /// on_disconnect to the thread running it, so the two come in order.
+    announcing: bool,
+}
+
+impl PeerEntry {
+    /// Mark the entry removed; whether on_disconnect is to be fired for it
+    /// now.
+    fn mark_removed(&self) -> bool {
+        let mut l = self.link.lock().unwrap();
+        l.removed = true;
+        !l.announcing && std::mem::take(&mut l.connected)
+    }
 }
 
 /// Most frames queued for one TCP connection; past it, frames are dropped
@@ -370,7 +393,7 @@ impl Server {
             .write()
             .unwrap()
             .drain()
-            .filter(|(_, e)| e.connected.swap(false, Ordering::SeqCst))
+            .filter(|(_, e)| e.mark_removed())
             .map(|(k, _)| k)
             .collect();
         if let Some(cb) = &self.cfg.on_disconnect {
@@ -523,7 +546,7 @@ impl Server {
             transport,
             addr,
             tcp,
-            connected: AtomicBool::new(false),
+            link: Mutex::default(),
         });
         peers.insert(key, entry.clone());
         Some(entry)
@@ -545,7 +568,7 @@ impl Server {
         if let Some(w) = &entry.tcp {
             let _ = w.stream.shutdown(std::net::Shutdown::Both);
         }
-        if entry.connected.swap(false, Ordering::SeqCst)
+        if entry.mark_removed()
             && let Some(cb) = &self.cfg.on_disconnect
         {
             cb(key);
@@ -607,18 +630,7 @@ impl Server {
         // Callbacks run without the peer's lock held: they may well call
         // back into the server for this peer (send_to_peer, say).
         if let Some(cfg) = &out.connected {
-            // A new session taking over from one that was reported
-            // connected ends that connection first. The flag, not
-            // `out.replaced`, decides: the old session may have failed on
-            // its own before this one authenticated.
-            if entry.connected.swap(true, Ordering::SeqCst)
-                && let Some(cb) = &self.cfg.on_disconnect
-            {
-                cb(key);
-            }
-            if let Some(cb) = &self.cfg.on_connect {
-                cb(key, cfg);
-            }
+            self.announce(entry, key, cfg);
         }
 
         if let Some(payload) = out.deliver {
@@ -630,6 +642,38 @@ impl Server {
             self.remove_entry(entry);
         } else if let Some(req) = out.auth.take() {
             self.start_auth(entry, req);
+        }
+    }
+
+    /// Report a session that has just authenticated: on_connect, unless the
+    /// peer was removed meanwhile.
+    fn announce(&self, entry: &PeerEntry, key: PeerKey, cfg: &PeerConfig) {
+        // A new session taking over from one that was reported connected
+        // ends that connection first. The flag, not `out.replaced`,
+        // decides: the old session may have failed on its own before this
+        // one authenticated.
+        let replaced = {
+            let mut l = entry.link.lock().unwrap();
+            if l.removed {
+                return;
+            }
+            l.announcing = true;
+            std::mem::replace(&mut l.connected, true)
+        };
+        if replaced && let Some(cb) = &self.cfg.on_disconnect {
+            cb(key);
+        }
+        if let Some(cb) = &self.cfg.on_connect {
+            cb(key, cfg);
+        }
+        // A removal while the callbacks ran left its on_disconnect to us.
+        let gone = {
+            let mut l = entry.link.lock().unwrap();
+            l.announcing = false;
+            l.removed && std::mem::take(&mut l.connected)
+        };
+        if gone && let Some(cb) = &self.cfg.on_disconnect {
+            cb(key);
         }
     }
 
@@ -1227,7 +1271,7 @@ mod tests {
             transport: Transport::Tcp,
             addr,
             tcp: Some(TcpOut::spawn(s, None).unwrap()),
-            connected: AtomicBool::new(false),
+            link: Mutex::default(),
         });
         assert!(server.send_raw(&entry, &vec![0u8; 70_000]).is_err());
         server.send_raw(&entry, b"ok").unwrap();
@@ -1289,7 +1333,7 @@ mod tests {
             transport: Transport::Tcp,
             addr,
             tcp: Some(old),
-            connected: AtomicBool::new(false),
+            link: Mutex::default(),
         });
         server
             .peers
@@ -1641,6 +1685,88 @@ mod tests {
 
         server.close();
         assert_eq!(disconnects.load(Ordering::SeqCst), 1);
+    }
+
+    type Events = Arc<Mutex<Vec<&'static str>>>;
+
+    /// A server recording its on_connect / on_disconnect calls; `during`
+    /// runs inside on_connect.
+    fn recording_server(
+        events: &Events,
+        during: impl Fn(PeerKey) + Send + Sync + 'static,
+    ) -> Arc<Server> {
+        let on_data: OnData = Arc::new(|_, _, _| {});
+        let (c, d) = (events.clone(), events.clone());
+        let cfg = ServerConfig::new(
+            crate::ovpn::tests::server_config(),
+            "127.0.0.1:0".parse().unwrap(),
+            auth_ok(),
+            on_data,
+        )
+        .on_connect(Arc::new(move |key, _| {
+            c.lock().unwrap().push("connect");
+            during(key);
+        }))
+        .on_disconnect(Arc::new(move |_| d.lock().unwrap().push("disconnect")));
+        Server::new(cfg).unwrap()
+    }
+
+    fn connected_output() -> PeerOutput {
+        PeerOutput {
+            connected: Some(PeerConfig::new(
+                "10.8.0.2".parse().unwrap(),
+                "10.8.0.1".parse().unwrap(),
+                "255.255.255.0".parse().unwrap(),
+                24,
+            )),
+            ..PeerOutput::default()
+        }
+    }
+
+    /// A verdict can arrive for a peer removed meanwhile (its handshake
+    /// window ran out, close() ran): it must not be reported connected,
+    /// as nothing would ever report it gone.
+    #[test]
+    fn a_removed_peer_is_not_reported_connected() {
+        let events = Events::default();
+        let server = recording_server(&events, |_| {});
+        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let key = PeerKey::new(addr, Transport::Udp);
+        let entry = server
+            .create_peer(key, Transport::Udp, addr, None, None)
+            .unwrap();
+        server.remove_entry(&entry);
+        server.apply(&entry, connected_output());
+        server.close();
+        assert_eq!(*events.lock().unwrap(), Vec::<&str>::new());
+    }
+
+    /// A peer removed while its on_connect runs is reported gone once
+    /// that returns, not before: the callbacks pair, in order.
+    #[test]
+    fn a_peer_removed_during_on_connect_is_reported_after_it() {
+        let events = Events::default();
+        let slot: Arc<Mutex<std::sync::Weak<Server>>> = Arc::default();
+        let s2 = slot.clone();
+        let e2 = events.clone();
+        let server = recording_server(&events, move |key| {
+            let s = s2.lock().unwrap().upgrade().unwrap();
+            let entry = s.get_peer(&key).unwrap();
+            s.remove_entry(&entry);
+            e2.lock().unwrap().push("removed");
+        });
+        *slot.lock().unwrap() = Arc::downgrade(&server);
+        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let key = PeerKey::new(addr, Transport::Udp);
+        let entry = server
+            .create_peer(key, Transport::Udp, addr, None, None)
+            .unwrap();
+        server.apply(&entry, connected_output());
+        server.close();
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec!["connect", "removed", "disconnect"]
+        );
     }
 
     fn auth_ok() -> OnAuth {
