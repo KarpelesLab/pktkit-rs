@@ -132,10 +132,13 @@ pub struct ConnConfig {
     pub send_buf_size: usize,
     pub recv_buf_size: usize,
     /// How long FIN-WAIT-2 may go without hearing from the peer before the
-    /// connection is reset. RFC 9293 §3.10.7.4 allows a timeout here; a
-    /// peer that never sends its FIN would otherwise hold the connection
-    /// forever. Measured from the last segment received, so a peer still
-    /// sending after our half-close keeps it open. `None` waits forever.
+    /// connection is reset, once it has been [released](Conn::release).
+    /// RFC 9293 §3.10.7.4 allows a timeout here; a peer that never sends
+    /// its FIN would otherwise hold an abandoned connection forever. Like
+    /// Linux's `tcp_fin_timeout`, it spares a mere half-close
+    /// ([`Conn::close`]): the application is still reading, and the peer
+    /// may send for as long as it likes. Measured from the last segment
+    /// received. `None` waits forever.
     pub fin_wait2_timeout: Option<Duration>,
     /// How long TIME-WAIT lasts ([`TIME_WAIT_DURATION`] by default).
     pub time_wait: Duration,
@@ -275,6 +278,8 @@ pub struct Conn {
     // number right after the last data byte.
     fin_queued: bool,
     fin_sent: bool,
+    /// The owner has let go of the connection (see [`Conn::release`]).
+    released: bool,
 
     // Persist (zero-window probing).
     persist_deadline: std::option::Option<Instant>,
@@ -371,6 +376,7 @@ impl Conn {
             pending_fin_seq: 0,
             fin_queued: false,
             fin_sent: false,
+            released: false,
             persist_deadline: None,
             persist_backoff: Duration::ZERO,
             time_wait_deadline: None,
@@ -1718,8 +1724,10 @@ impl Conn {
             self.state = State::Closed;
             self.closed = true;
         }
-        // FIN-WAIT-2: the peer has gone quiet without closing.
+        // FIN-WAIT-2: the peer has gone quiet without closing, and nothing
+        // on our side is waiting for what it might still send.
         if self.state == State::FinWait2
+            && self.released
             && let Some(t) = self.cfg.fin_wait2_timeout
             && self.last_recv.elapsed() >= t
         {
@@ -2003,6 +2011,25 @@ impl Conn {
             }
         }
         self.take_outgoing()
+    }
+
+    /// The application is done with the connection: it will neither write
+    /// nor read any more. Sends our FIN if [`close`](Self::close) has not
+    /// already, and returns any segments produced.
+    ///
+    /// The connection itself carries on until the close handshake
+    /// finishes, so keep driving it ([`handle_segment`](Self::handle_segment),
+    /// [`tick`](Self::tick)) until [`is_closed`](Self::is_closed). What
+    /// changes is that nobody is left to hear from the peer, so a peer that
+    /// ACKs our FIN but never sends its own has the connection reset after
+    /// [`ConnConfig::fin_wait2_timeout`], as Linux does for an orphaned
+    /// socket. A half-close with `close` alone never times out that way.
+    ///
+    /// Call it where a socket API would drop or fully close its socket:
+    /// when the last handle goes away, or on an explicit full close.
+    pub fn release(&mut self) -> Vec<Vec<u8>> {
+        self.released = true;
+        self.close()
     }
 
     /// Immediate teardown: send RST and mark closed.
@@ -3564,7 +3591,7 @@ mod tests {
     #[test]
     fn fin_wait_2_times_out_once_the_peer_goes_quiet() {
         let (mut client, mut server) = established(40320);
-        let fin = client.close();
+        let fin = client.release();
         let ack = deliver(&mut server, &fin);
         deliver(&mut client, &ack);
         assert_eq!(client.state(), State::FinWait2);
@@ -3583,12 +3610,32 @@ mod tests {
         assert!(parse(&rst[0]).has_flag(flags::RST));
     }
 
+    // A half-close (shutdown(SHUT_WR)) leaves the application reading, so
+    // however long the peer takes, the timeout is not for it: Linux applies
+    // tcp_fin_timeout to orphaned sockets only.
+    #[test]
+    fn fin_wait_2_timeout_spares_a_half_close() {
+        let (mut client, mut server) = established(40322);
+        let fin = client.close();
+        let ack = deliver(&mut server, &fin);
+        deliver(&mut client, &ack);
+        assert_eq!(client.state(), State::FinWait2);
+        client.last_recv = Instant::now() - client.cfg.fin_wait2_timeout.unwrap();
+        assert!(client.tick().is_empty());
+        assert_eq!(client.state(), State::FinWait2);
+
+        // Once the application lets go, the timeout applies.
+        assert!(client.release().is_empty(), "the FIN is already out");
+        assert!(parse(&client.tick()[0]).has_flag(flags::RST));
+        assert!(client.is_closed());
+    }
+
     #[test]
     fn fin_wait_2_timeout_can_be_disabled() {
         let mut client = Conn::new(cfg(40321, 80).fin_wait2_timeout(None));
         let mut server = Conn::new(cfg(80, 40321));
         drive_handshake(&mut client, &mut server);
-        let fin = client.close();
+        let fin = client.release();
         let ack = deliver(&mut server, &fin);
         deliver(&mut client, &ack);
         client.last_recv = Instant::now() - Duration::from_secs(3600);
