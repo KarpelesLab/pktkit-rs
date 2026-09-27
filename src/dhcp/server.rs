@@ -78,6 +78,12 @@ impl ServerConfig {
     }
 }
 
+enum Answer {
+    Ack(Ipv4Addr),
+    Nak,
+    Silent,
+}
+
 #[derive(Copy, Clone)]
 struct Lease {
     ip: Ipv4Addr,
@@ -130,14 +136,11 @@ impl Server {
                     self.send_reply(wire::MSG_OFFER, p.xid, p.chaddr, Some(ip));
                 }
             }
-            wire::MSG_REQUEST => {
-                if let Some(ip) = self.confirm(p.chaddr, p.requested_ip) {
-                    self.send_reply(wire::MSG_ACK, p.xid, p.chaddr, Some(ip));
-                }
-                // No NAK on confirmation failure — Go upstream is silent in
-                // that case too. Adding NAK would simplify renewal across
-                // server restarts; left as future work.
-            }
+            wire::MSG_REQUEST => match self.request(&p) {
+                Answer::Ack(ip) => self.send_reply(wire::MSG_ACK, p.xid, p.chaddr, Some(ip)),
+                Answer::Nak => self.send_nak(p.xid, p.chaddr),
+                Answer::Silent => {}
+            },
             wire::MSG_RELEASE => {
                 self.leases.lock().unwrap().remove(&p.chaddr);
             }
@@ -231,61 +234,113 @@ impl Server {
         Some(ip)
     }
 
-    fn confirm(&self, mac: MacAddr, requested: Option<Ipv4Addr>) -> Option<Ipv4Addr> {
+    /// Answer a DHCPREQUEST, telling apart the client states of RFC 2131
+    /// §4.3.2 by which of server identifier, requested address and ciaddr
+    /// it carries.
+    fn request(&self, p: &wire::Parsed) -> Answer {
         let now = Instant::now();
+        let mac = p.chaddr;
         let mut leases = self.live_leases(now);
+        let ip = match (p.server_id, p.requested_ip) {
+            // SELECTING, but the client took another server's offer: ours is
+            // free again.
+            (Some(sid), _) if sid != self.cfg.server_ip => {
+                if leases.get(&mac).is_some_and(|l| !l.bound) {
+                    leases.remove(&mac);
+                }
+                return Answer::Silent;
+            }
+            // SELECTING our offer, which must be for the address it names.
+            (Some(_), Some(ip)) => {
+                if leases.get(&mac).is_some_and(|l| !l.bound && l.ip != ip) {
+                    leases.remove(&mac);
+                    return Answer::Nak;
+                }
+                ip
+            }
+            // INIT-REBOOT: the client asks to keep an address it remembers.
+            (None, Some(ip)) => ip,
+            // RENEWING or REBINDING: the address is in ciaddr.
+            (None, None) if !p.ciaddr.is_unspecified() => p.ciaddr,
+            _ => return Answer::Silent,
+        };
+        self.commit(&mut leases, mac, ip, now)
+    }
 
+    /// Bind `ip` to `mac` if the server agrees that is the client's address.
+    fn commit(
+        &self,
+        leases: &mut HashMap<MacAddr, Lease>,
+        mac: MacAddr,
+        ip: Ipv4Addr,
+        now: Instant,
+    ) -> Answer {
+        let lease = Lease {
+            ip,
+            expiry: now + self.cfg.lease_time,
+            bound: true,
+        };
+        let mask = u32::from(self.cfg.subnet_mask);
+        if u32::from(ip) & mask != u32::from(self.cfg.server_ip) & mask {
+            return Answer::Nak; // the client moved here from another network
+        }
         if let Some(static_ip) = self.cfg.static_leases.get(&mac).copied() {
-            if let Some(req) = requested
-                && req != static_ip
-            {
-                return None;
+            if ip != static_ip {
+                return Answer::Nak;
             }
-            leases.insert(
-                mac,
-                Lease {
-                    ip: static_ip,
-                    expiry: now + self.cfg.lease_time,
-                    bound: true,
-                },
-            );
-            return Some(static_ip);
+            leases.insert(mac, lease);
+            return Answer::Ack(ip);
         }
 
-        let held = self.held_by_others(&leases, mac);
-        if let Some(l) = leases.get_mut(&mac) {
-            if requested.is_some_and(|req| req != l.ip) || held.contains(&l.ip) {
-                return None;
+        let held = self.held_by_others(leases, mac);
+        match leases.get(&mac) {
+            Some(l) if l.ip == ip && !held.contains(&ip) => {
+                leases.insert(mac, lease);
+                return Answer::Ack(ip);
             }
-            l.expiry = now + self.cfg.lease_time;
-            l.bound = true;
-            return Some(l.ip);
+            Some(l) if l.bound => return Answer::Nak,
+            // An outstanding offer the client chose not to take: forget it,
+            // and treat the request like one from a client we have no record
+            // of.
+            Some(_) => {
+                leases.remove(&mac);
+            }
+            None => {}
         }
 
-        // No existing lease — try to grant the requested IP if it's in range.
-        let req = requested?;
-        if req == self.cfg.server_ip {
-            return None;
+        // No record, as after a server restart. RFC 2131 wants silence here
+        // so servers sharing a segment do not fight; an address from our
+        // own pool is ours to judge, though, and granting it when it is free
+        // lets clients keep their address across a restart.
+        if !self.in_pool(ip) {
+            return Answer::Silent;
         }
-        let raw = u32::from(req);
-        if raw < u32::from(self.cfg.range_start) || raw > u32::from(self.cfg.range_end) {
-            return None;
-        }
-        if held.contains(&req) || self.declined.lock().unwrap().contains_key(&req) {
-            return None;
+        if held.contains(&ip) || self.declined.lock().unwrap().contains_key(&ip) {
+            return Answer::Nak;
         }
         if leases.len() >= MAX_LEASES {
-            return None;
+            return Answer::Silent;
         }
-        leases.insert(
-            mac,
-            Lease {
-                ip: req,
-                expiry: now + self.cfg.lease_time,
-                bound: true,
-            },
-        );
-        Some(req)
+        leases.insert(mac, lease);
+        Answer::Ack(ip)
+    }
+
+    /// Whether `ip` is one of the addresses this server hands out.
+    fn in_pool(&self, ip: Ipv4Addr) -> bool {
+        let raw = u32::from(ip);
+        raw >= u32::from(self.cfg.range_start)
+            && raw <= u32::from(self.cfg.range_end)
+            && ip != self.cfg.server_ip
+    }
+
+    /// DHCPNAK carries no address or configuration, only who refused
+    /// (RFC 2131 Table 3), and is broadcast since the client may have no
+    /// usable address.
+    fn send_nak(&self, xid: u32, chaddr: MacAddr) {
+        let mut b = wire::Builder::new(2, xid, chaddr);
+        b.message_type(wire::MSG_NAK)
+            .ipv4_option(wire::OPT_SERVER_ID, self.cfg.server_ip);
+        self.send_message(chaddr, &b.finish());
     }
 
     fn send_reply(&self, msg_type: u8, xid: u32, chaddr: MacAddr, yiaddr: Option<Ipv4Addr>) {
@@ -305,8 +360,10 @@ impl Server {
             b.u32_option(wire::OPT_LEASE_TIME, self.cfg.lease_time.as_secs() as u32);
             b.ipv4_option(wire::OPT_SERVER_ID, self.cfg.server_ip);
         }
-        let dhcp = b.finish();
+        self.send_message(chaddr, &b.finish());
+    }
 
+    fn send_message(&self, chaddr: MacAddr, dhcp: &[u8]) {
         // UDP 67→68
         let udp_len = 8 + dhcp.len();
         let mut udp = Vec::with_capacity(udp_len);
@@ -314,7 +371,7 @@ impl Server {
         udp.extend_from_slice(&68u16.to_be_bytes());
         udp.extend_from_slice(&(udp_len as u16).to_be_bytes());
         udp.extend_from_slice(&[0, 0]); // checksum = 0
-        udp.extend_from_slice(&dhcp);
+        udp.extend_from_slice(dhcp);
 
         // IPv4 server_ip → 255.255.255.255
         let ip_len = 20 + udp_len;
@@ -570,5 +627,101 @@ mod tests {
         let got = replies(&r);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].msg_type, wire::MSG_OFFER);
+    }
+
+    fn bound_lease(s: &Server, r: &Sent, mac: MacAddr) -> Ipv4Addr {
+        s.handle_dhcp(&build_discover(1, mac));
+        let ip = replies(r)[0].yiaddr;
+        s.handle_dhcp(&request(1, mac, ip, Ipv4Addr::new(10, 0, 0, 1)));
+        assert_eq!(replies(r)[0].msg_type, wire::MSG_ACK);
+        ip
+    }
+
+    #[test]
+    fn request_for_another_server_is_ignored_and_releases_our_offer() {
+        let (s, r) = recording(one_address_pool());
+        let mac = MacAddr([2, 0, 0, 0, 0, 1]);
+        s.handle_dhcp(&build_discover(1, mac));
+        let offered = replies(&r)[0].yiaddr;
+
+        s.handle_dhcp(&request(1, mac, offered, Ipv4Addr::new(10, 0, 0, 2)));
+        assert!(replies(&r).is_empty(), "the client chose another server");
+        assert!(s.leases.lock().unwrap().is_empty(), "offer withdrawn");
+    }
+
+    #[test]
+    fn selecting_a_different_address_than_offered_is_naked() {
+        let cfg = ServerConfig::new(
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(10, 0, 0, 10),
+            Ipv4Addr::new(10, 0, 0, 20),
+        );
+        let (s, r) = recording(cfg);
+        let mac = MacAddr([2, 0, 0, 0, 0, 1]);
+        s.handle_dhcp(&build_discover(1, mac));
+        let offered = replies(&r)[0].yiaddr;
+        let other = Ipv4Addr::from(u32::from(offered) + 1);
+        s.handle_dhcp(&request(1, mac, other, Ipv4Addr::new(10, 0, 0, 1)));
+        let got = replies(&r);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].msg_type, wire::MSG_NAK);
+        assert_eq!(got[0].server_id, Some(Ipv4Addr::new(10, 0, 0, 1)));
+        assert_eq!(got[0].yiaddr, Ipv4Addr::UNSPECIFIED);
+    }
+
+    #[test]
+    fn init_reboot_is_naked_when_the_address_is_wrong() {
+        let (s, r) = recording(one_address_pool());
+        let a = MacAddr([2, 0, 0, 0, 0, 0xa]);
+        let b = MacAddr([2, 0, 0, 0, 0, 0xb]);
+        let ip = bound_lease(&s, &r, a);
+
+        let init_reboot = |mac: MacAddr, ip: Ipv4Addr| {
+            let mut m = wire::Builder::new(1, 9, mac);
+            m.message_type(wire::MSG_REQUEST)
+                .ipv4_option(wire::OPT_REQUESTED_IP, ip);
+            m.finish()
+        };
+
+        // B reboots believing it owns A's address.
+        s.handle_dhcp(&init_reboot(b, ip));
+        assert_eq!(replies(&r)[0].msg_type, wire::MSG_NAK);
+
+        // A client moved over from another network.
+        s.handle_dhcp(&init_reboot(b, Ipv4Addr::new(192, 168, 7, 7)));
+        assert_eq!(replies(&r)[0].msg_type, wire::MSG_NAK);
+
+        // A reboots and asks for what it has.
+        s.handle_dhcp(&init_reboot(a, ip));
+        let got = replies(&r);
+        assert_eq!(got[0].msg_type, wire::MSG_ACK);
+        assert_eq!(got[0].yiaddr, ip);
+    }
+
+    #[test]
+    fn renewal_by_ciaddr_is_acked() {
+        let (s, r) = recording(one_address_pool());
+        let mac = MacAddr([2, 0, 0, 0, 0, 1]);
+        let ip = bound_lease(&s, &r, mac);
+        s.leases.lock().unwrap().get_mut(&mac).unwrap().expiry =
+            Instant::now() + Duration::from_secs(5);
+
+        let mut m = wire::Builder::new(1, 7, mac);
+        m.message_type(wire::MSG_REQUEST).ciaddr(ip);
+        s.handle_dhcp(&m.finish());
+        let got = replies(&r);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].msg_type, wire::MSG_ACK);
+        assert_eq!(got[0].yiaddr, ip);
+        assert!(
+            s.leases.lock().unwrap()[&mac].expiry > Instant::now() + Duration::from_secs(60),
+            "renewal extends the lease"
+        );
+
+        // Renewing an address the server never gave this client.
+        let mut m = wire::Builder::new(1, 8, MacAddr([2, 0, 0, 0, 0, 2]));
+        m.message_type(wire::MSG_REQUEST).ciaddr(ip);
+        s.handle_dhcp(&m.finish());
+        assert_eq!(replies(&r)[0].msg_type, wire::MSG_NAK);
     }
 }

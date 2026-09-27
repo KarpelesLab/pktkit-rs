@@ -42,6 +42,9 @@ pub const MAGIC_COOKIE: [u8; 4] = [99, 130, 83, 99];
 pub struct Parsed {
     pub op: u8,
     pub xid: u32,
+    /// Client's current address, set only when it is renewing or rebinding a
+    /// lease it holds (RFC 2131 §4.3.2).
+    pub ciaddr: Ipv4Addr,
     pub yiaddr: Ipv4Addr,
     pub chaddr: MacAddr,
     pub msg_type: u8,
@@ -58,6 +61,7 @@ impl Default for Parsed {
         Parsed {
             op: 0,
             xid: 0,
+            ciaddr: Ipv4Addr::UNSPECIFIED,
             yiaddr: Ipv4Addr::UNSPECIFIED,
             chaddr: MacAddr::zero(),
             msg_type: 0,
@@ -85,6 +89,7 @@ impl Parsed {
         let mut p = Parsed {
             op: b[0],
             xid: u32::from_be_bytes([b[4], b[5], b[6], b[7]]),
+            ciaddr: Ipv4Addr::new(b[12], b[13], b[14], b[15]),
             yiaddr: Ipv4Addr::new(b[16], b[17], b[18], b[19]),
             chaddr: {
                 let mut o = [0u8; 6];
@@ -243,6 +248,7 @@ mod tests {
         let mac = MacAddr([0x02, 0, 0, 0, 0, 1]);
         let mut b = Builder::new(2, 0xCAFEBABE, mac);
         b.yiaddr(Ipv4Addr::new(10, 0, 0, 5))
+            .ciaddr(Ipv4Addr::new(10, 0, 0, 7))
             .siaddr(Ipv4Addr::new(10, 0, 0, 1))
             .message_type(MSG_OFFER)
             .ipv4_option(OPT_SUBNET_MASK, Ipv4Addr::new(255, 255, 255, 0))
@@ -260,6 +266,7 @@ mod tests {
         assert_eq!(p.xid, 0xCAFEBABE);
         assert_eq!(p.chaddr, mac);
         assert_eq!(p.yiaddr, Ipv4Addr::new(10, 0, 0, 5));
+        assert_eq!(p.ciaddr, Ipv4Addr::new(10, 0, 0, 7));
         assert_eq!(p.msg_type, MSG_OFFER);
         assert_eq!(p.subnet_mask, Some(Ipv4Addr::new(255, 255, 255, 0)));
         assert_eq!(p.router, Some(Ipv4Addr::new(10, 0, 0, 1)));
