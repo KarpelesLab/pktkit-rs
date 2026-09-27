@@ -51,6 +51,14 @@ struct Mapping {
     outside_port: u16,
     last_active: Instant,
     peers: Peers,
+    /// Set for mappings made to receive connections (port forwards,
+    /// expectations, ALG-opened media ports): any remote's traffic keeps
+    /// them alive and is tracked. A plain outbound mapping is kept alive
+    /// only by remotes its inside host has talked to (RFC 4787 REQ-6 lets
+    /// inbound refresh be off); otherwise anyone could hold every mapping,
+    /// and with them the whole port pool, open forever by spraying packets
+    /// at it.
+    open: bool,
 }
 
 impl Mapping {
@@ -60,7 +68,18 @@ impl Mapping {
             outside_port,
             last_active: now,
             peers: Peers::default(),
+            open: false,
         }
+    }
+
+    /// Account for an inbound packet from `peer`. Returns whether the
+    /// remote is tracked.
+    fn note_inbound(&mut self, peer: SocketAddrV4, tcp_flags: Option<u8>, now: Instant) -> bool {
+        if self.open || self.peers.contains(&peer) {
+            self.last_active = now;
+            self.peers.note(peer, false, tcp_flags, now);
+        }
+        self.peers.contains(&peer)
     }
 }
 
@@ -426,7 +445,11 @@ impl Nat {
             port: inside_port,
         };
         let mut inner = self.inner.lock().unwrap();
-        Some(Self::get_or_create_mapping_locked(&mut inner, k)?.outside_port)
+        let m = Self::get_or_create_mapping_locked(&mut inner, k)?;
+        // Made for a remote to connect to, which may not have been
+        // contacted from here.
+        m.open = true;
+        Some(m.outside_port)
     }
 
     /// Map two endpoints of one inside host to consecutive outside ports,
@@ -456,7 +479,9 @@ impl Nat {
             {
                 let p = a.outside_port;
                 for k in [k1, k2] {
-                    inner.mappings.get_mut(&k).unwrap().last_active = now;
+                    let m = inner.mappings.get_mut(&k).unwrap();
+                    m.last_active = now;
+                    m.open = true;
                 }
                 return Some(p);
             }
@@ -466,7 +491,9 @@ impl Nat {
         let p = Self::alloc_pair_locked(&mut inner)?;
         for (k, port) in [(k1, p), (k2, p + 1)] {
             inner.reverse.insert(NatRevKey { proto, port }, k);
-            inner.mappings.insert(k, Mapping::new(k, port, now));
+            let mut m = Mapping::new(k, port, now);
+            m.open = true;
+            inner.mappings.insert(k, m);
         }
         Some(p)
     }
@@ -520,9 +547,9 @@ impl Nat {
             };
             inner.reverse.remove(&old_rk);
         }
-        inner
-            .mappings
-            .insert(k, Mapping::new(k, rk.port, Instant::now()));
+        let mut m = Mapping::new(k, rk.port, Instant::now());
+        m.open = true;
+        inner.mappings.insert(k, m);
         inner.reverse.insert(rk, k);
         true
     }
@@ -1287,11 +1314,10 @@ impl Nat {
                 k
             };
             let peer = SocketAddrV4::new(src_ip, src_port);
-            let tracked = inner.mappings.get_mut(&k).is_some_and(|m| {
-                m.last_active = now;
-                m.peers.note(peer, false, tcp_flags(pkt, ihl, proto), now);
-                m.peers.contains(&peer)
-            });
+            let tracked = inner
+                .mappings
+                .get_mut(&k)
+                .is_some_and(|m| m.note_inbound(peer, tcp_flags(pkt, ihl, proto), now));
             (k, dst_port, tracked)
         };
 
@@ -1380,10 +1406,9 @@ impl Nat {
                     let mut inner = self.inner.lock().unwrap();
                     let k = inner.reverse.get(&rk).copied()?;
                     if let Some(m) = inner.mappings.get_mut(&k) {
-                        m.last_active = Instant::now();
                         let peer =
                             SocketAddrV4::new(Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]), 0);
-                        m.peers.note(peer, false, None, m.last_active);
+                        m.note_inbound(peer, None, Instant::now());
                     }
                     k
                 };
@@ -2664,6 +2689,59 @@ mod tests {
         nat.inside().send(Packet::from_slice(&p)).unwrap();
         nat.sweep_at(Instant::now() + Duration::from_secs(4 * 60));
         assert_eq!(mapped(&nat), 1);
+    }
+
+    /// Backdate every mapping's activity by `by`, returning the new time.
+    fn age_mappings(nat: &Nat, by: Duration) -> Instant {
+        let then = Instant::now() - by;
+        for m in nat.inner.lock().unwrap().mappings.values_mut() {
+            m.last_active = then;
+        }
+        then
+    }
+
+    #[test]
+    fn unsolicited_inbound_does_not_keep_a_mapping_alive() {
+        let (nat, i, o) = setup();
+        let p = build_udp(INSIDE, 5000, REMOTE, 53, b"q");
+        nat.inside().send(Packet::from_slice(&p)).unwrap();
+        let port = src_port(&o.lock().unwrap()[0]);
+        let then = age_mappings(&nat, Duration::from_secs(100));
+        let stranger = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 66), 4444);
+        let r = build_udp(*stranger.ip(), stranger.port(), PUBLIC, port, b"x");
+        nat.outside().send(Packet::from_slice(&r)).unwrap();
+        // Still let through (endpoint-independent filtering) ...
+        assert_eq!(i.lock().unwrap().len(), 1);
+        {
+            let inner = nat.inner.lock().unwrap();
+            let m = inner.mappings.values().next().unwrap();
+            // ... but neither refreshing the mapping nor taking a peer slot.
+            assert_eq!(m.last_active, then);
+            assert!(!m.peers.contains(&stranger));
+        }
+        // The remote the host talked to does refresh it.
+        let r = build_udp(REMOTE, 53, PUBLIC, port, b"a");
+        nat.outside().send(Packet::from_slice(&r)).unwrap();
+        let inner = nat.inner.lock().unwrap();
+        assert!(inner.mappings.values().next().unwrap().last_active > then);
+    }
+
+    #[test]
+    fn any_remote_keeps_a_forward_alive() {
+        let (nat, i, _o) = setup();
+        nat.add_port_forward(PortForward::new(PROTO_UDP, 8080, INSIDE, 80))
+            .unwrap();
+        let first = build_udp(REMOTE, 1000, PUBLIC, 8080, b"x");
+        nat.outside().send(Packet::from_slice(&first)).unwrap();
+        let then = age_mappings(&nat, Duration::from_secs(100));
+        let other = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 66), 4444);
+        let r = build_udp(*other.ip(), other.port(), PUBLIC, 8080, b"y");
+        nat.outside().send(Packet::from_slice(&r)).unwrap();
+        assert_eq!(i.lock().unwrap().len(), 2);
+        let inner = nat.inner.lock().unwrap();
+        let m = inner.mappings.values().next().unwrap();
+        assert!(m.last_active > then);
+        assert!(m.peers.contains(&other));
     }
 
     #[test]

@@ -48,6 +48,20 @@ struct Mapping {
     peers: Peers,
 }
 
+impl Mapping {
+    /// Account for an inbound packet from `peer`. Every mapping here is
+    /// made by outbound traffic, so only remotes the inside host has talked
+    /// to keep it alive (RFC 6146 §3.5.1.1 and §3.5.2.2 refresh a session
+    /// only for packets that belong to it). Anyone else could otherwise
+    /// hold every mapping, and the port pool with them, open forever.
+    fn note_inbound(&mut self, peer: SocketAddrV4, tcp_flags: Option<u8>) {
+        if self.peers.contains(&peer) {
+            self.last_active = Instant::now();
+            self.peers.note(peer, false, tcp_flags, self.last_active);
+        }
+    }
+}
+
 /// NAT64 between an inside IPv6 network and an outside IPv4 network.
 pub struct Nat64 {
     inside: Arc<Nat64Side>,
@@ -711,11 +725,9 @@ impl Nat64 {
             let mut inner = self.inner.lock().unwrap();
             let k = inner.reverse.get(&rk).copied()?;
             if let Some(m) = inner.mappings.get_mut(&k) {
-                m.last_active = Instant::now();
                 let src_port = u16::from_be_bytes([transport[0], transport[1]]);
                 let peer = SocketAddrV4::new(src_v4, src_port);
-                m.peers
-                    .note(peer, false, tcp_flags(transport, proto), m.last_active);
+                m.note_inbound(peer, tcp_flags(transport, proto));
             }
             k
         };
@@ -820,9 +832,7 @@ impl Nat64 {
                 None => return,
             };
             if let Some(m) = inner.mappings.get_mut(&k) {
-                m.last_active = Instant::now();
-                let peer = SocketAddrV4::new(src_v4, 0);
-                m.peers.note(peer, false, None, m.last_active);
+                m.note_inbound(SocketAddrV4::new(src_v4, 0), None);
             }
             k
         };
@@ -1825,6 +1835,36 @@ mod tests {
         r[28..32].copy_from_slice(b"resp");
         crate::nat::l4::fill_v4_l4_checksum(&mut r, 20);
         r
+    }
+
+    #[test]
+    fn unsolicited_inbound_does_not_keep_a_mapping_alive() {
+        let (nat, inside, outside) = wired();
+        let port = u16::from_be_bytes({
+            let p = send_udp(&nat, &outside);
+            [p[20], p[21]]
+        });
+        let then = Instant::now() - std::time::Duration::from_secs(100);
+        let last = |nat: &Nat64| {
+            let inner = nat.inner.lock().unwrap();
+            let m = inner.mappings.values().next().unwrap();
+            (
+                m.last_active,
+                m.peers.contains(&SocketAddrV4::new(ROUTER, 53)),
+            )
+        };
+        for m in nat.inner.lock().unwrap().mappings.values_mut() {
+            m.last_active = then;
+        }
+        nat.outside()
+            .send(Packet::from_slice(&v4_reply(ROUTER, port)))
+            .unwrap();
+        assert_eq!(inside.lock().unwrap().len(), 1, "still let through");
+        assert_eq!(last(&nat), (then, false));
+        nat.outside()
+            .send(Packet::from_slice(&v4_reply(SERVER, port)))
+            .unwrap();
+        assert!(last(&nat).0 > then);
     }
 
     /// An ICMPv6 error from the client to `to` quoting `quoted`.
