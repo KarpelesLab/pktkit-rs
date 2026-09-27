@@ -99,6 +99,22 @@ pub struct ServerConfig {
     /// Most peers (UDP and TCP together) held at once; a client beyond it is
     /// not served. Default 1024.
     pub max_peers: usize,
+    /// Most peers held at once that have no authenticated session: clients
+    /// still in their handshake, or anyone at all who got as far as a
+    /// session id. Past it, a new client is not served until one of those
+    /// authenticates or gives up, but clients that have authenticated keep
+    /// their places. `None`, the default: half of
+    /// [`max_peers`](Self::max_peers), rounded up.
+    pub max_unauthenticated_peers: Option<usize>,
+    /// Most such peers from one source: an IPv4 address, or an IPv6 /64
+    /// (what one host is typically given). Keeps one source from taking
+    /// every place the whole server has for clients handshaking. Default 16.
+    pub max_unauthenticated_peers_per_source: usize,
+    /// At most this many new peers per period, UDP and TCP together
+    /// (OpenVPN's `connect-freq`). Default 100 per 10 s. Unlike
+    /// [`connect_freq_initial`](Self::connect_freq_initial), it counts the
+    /// clients that complete the three-way handshake: each gets a peer.
+    pub connect_freq: (u32, Duration),
     /// Most TCP connections served at once; each has two threads, a reader
     /// and a writer. Default 256.
     pub max_tcp_connections: usize,
@@ -120,6 +136,10 @@ pub struct ServerConfig {
 
 /// Default [`ServerConfig::max_peers`].
 pub(super) const DEFAULT_MAX_PEERS: usize = 1024;
+/// Default [`ServerConfig::max_unauthenticated_peers_per_source`].
+pub(super) const DEFAULT_MAX_UNAUTHENTICATED_PER_SOURCE: usize = 16;
+/// Default [`ServerConfig::connect_freq`].
+pub(super) const DEFAULT_CONNECT_FREQ: (u32, Duration) = (100, Duration::from_secs(10));
 /// Default [`ServerConfig::max_tcp_connections`].
 pub(super) const DEFAULT_MAX_TCP_CONNECTIONS: usize = 256;
 /// Default [`ServerConfig::connect_freq_initial`].
@@ -132,6 +152,9 @@ setters! {
         some on_connect: OnConnect;
         some on_disconnect: OnDisconnect;
         set max_peers: usize;
+        some max_unauthenticated_peers: usize;
+        set max_unauthenticated_peers_per_source: usize;
+        set connect_freq: (u32, Duration);
         set max_tcp_connections: usize;
         set timers: PeerTimers;
         set connect_freq_initial: (u32, Duration);
@@ -155,6 +178,9 @@ impl ServerConfig {
             on_connect: None,
             on_disconnect: None,
             max_peers: DEFAULT_MAX_PEERS,
+            max_unauthenticated_peers: None,
+            max_unauthenticated_peers_per_source: DEFAULT_MAX_UNAUTHENTICATED_PER_SOURCE,
+            connect_freq: DEFAULT_CONNECT_FREQ,
             max_tcp_connections: DEFAULT_MAX_TCP_CONNECTIONS,
             timers: PeerTimers::default(),
             connect_freq_initial: DEFAULT_CONNECT_FREQ_INITIAL,
@@ -186,6 +212,9 @@ struct PeerEntry {
     link: Mutex<Link>,
     /// Authentications waiting for an on_auth call.
     auth: Mutex<PeerAuth>,
+    /// The peer's last output said it has an authenticated session: it
+    /// does not count against the limits on unauthenticated peers.
+    authenticated: AtomicBool,
 }
 
 /// A peer's authentications. They run one at a time -- a client restarting
@@ -216,6 +245,7 @@ impl PeerEntry {
             tcp,
             link: Mutex::default(),
             auth: Mutex::default(),
+            authenticated: AtomicBool::new(false),
         }
     }
 
@@ -390,6 +420,8 @@ pub struct Server {
     cookies: Cookies,
     /// Bounds those answers (`connect_freq_initial`).
     initial_limit: Mutex<RateLimit>,
+    /// Bounds new peers (`connect_freq`).
+    connect_limit: Mutex<RateLimit>,
     /// Peers with authentications to run, and the workers running them.
     auth: Mutex<AuthPool>,
     /// on_connect / on_disconnect calls owed, by key. A key is here only
@@ -486,10 +518,13 @@ impl Server {
         let cookies = Cookies::new(cfg.timers.handshake_window);
         let (max, period) = cfg.connect_freq_initial;
         let initial_limit = Mutex::new(RateLimit::new(max, period));
+        let (max, period) = cfg.connect_freq;
+        let connect_limit = Mutex::new(RateLimit::new(max, period));
         let server = Arc::new_cyclic(|me| Server {
             me: me.clone(),
             cookies,
             initial_limit,
+            connect_limit,
             cfg,
             udp: RwLock::new(Some(Arc::new(udp))),
             tcp_addr,
@@ -704,6 +739,9 @@ impl Server {
                 self.remove_entry(&entry);
                 continue;
             };
+            entry
+                .authenticated
+                .store(out.authenticated, Ordering::Relaxed);
             for dgram in &out.send {
                 let _ = self.send_raw(&entry, dgram);
             }
@@ -718,7 +756,9 @@ impl Server {
     }
 
     /// Add a peer for `key`, or return the one already there. `None` when
-    /// the peer table is full.
+    /// the peer table is full -- or has no room for another peer that has
+    /// not authenticated, from this source or at all -- or when new peers
+    /// are coming faster than `connect_freq` allows.
     ///
     /// `stateless` is for a UDP client whose hard reset was answered
     /// statelessly: our session id from that answer and the client's.
@@ -730,13 +770,43 @@ impl Server {
         tcp: Option<TcpOut>,
         stateless: Option<([u8; 8], [u8; 8])>,
     ) -> Option<Arc<PeerEntry>> {
-        let admit = |peers: &HashMap<PeerKey, Arc<PeerEntry>>| match peers.get(&key) {
-            Some(e) => Err(Some(e.clone())),
-            None if peers.len() >= self.cfg.max_peers => Err(None),
-            None => Ok(()),
+        let max_unauthenticated = self
+            .cfg
+            .max_unauthenticated_peers
+            .unwrap_or(self.cfg.max_peers.div_ceil(2));
+        let source = source_of(addr.ip());
+        let admit = |peers: &HashMap<PeerKey, Arc<PeerEntry>>| {
+            if let Some(e) = peers.get(&key) {
+                return Err(Some(e.clone()));
+            }
+            if peers.len() >= self.cfg.max_peers {
+                return Err(None);
+            }
+            // A walk of the table, at most max_peers long, only for a
+            // client that proved its address to get this far: a few
+            // microseconds, about what checking the proof took.
+            let (mut all, mut here) = (0, 0);
+            for e in peers.values() {
+                if !e.authenticated.load(Ordering::Relaxed) {
+                    all += 1;
+                    here += usize::from(source_of(e.addr.ip()) == source);
+                }
+            }
+            if all >= max_unauthenticated || here >= self.cfg.max_unauthenticated_peers_per_source {
+                return Err(None);
+            }
+            Ok(())
         };
         if let Err(found) = admit(&self.peers.read().unwrap()) {
             return found;
+        }
+        if !self
+            .connect_limit
+            .lock()
+            .unwrap()
+            .allow(crate::time::Instant::now())
+        {
+            return None;
         }
         // Built with no lock held: a panic under the table's write lock
         // would poison it for every client. A panic costs this client only.
@@ -960,6 +1030,9 @@ impl Server {
     /// Act on what the peer produced: send, report, deliver, close.
     fn apply(&self, entry: &Arc<PeerEntry>, mut out: PeerOutput) {
         let key = entry.key();
+        entry
+            .authenticated
+            .store(out.authenticated, Ordering::Relaxed);
         for dgram in &out.send {
             let _ = self.send_raw(entry, dgram);
         }
@@ -1057,6 +1130,19 @@ impl Server {
                 }
             }
         }
+    }
+}
+
+/// The source a client counts against for
+/// [`max_unauthenticated_peers_per_source`](ServerConfig::max_unauthenticated_peers_per_source):
+/// its IPv4 address, or its IPv6 /64, which one host typically has all of.
+fn source_of(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip.to_canonical() {
+        std::net::IpAddr::V6(v6) => {
+            let bits = u128::from(v6) & !(u128::from(u64::MAX));
+            std::net::IpAddr::V6(bits.into())
+        }
+        v4 => v4,
     }
 }
 
@@ -2690,7 +2776,8 @@ mod tests {
             on_auth,
             on_data,
         )
-        .max_peers(2);
+        .max_peers(2)
+        .max_unauthenticated_peers(2);
         let server = Server::new(cfg).unwrap();
         let clients: Vec<UdpSocket> = (0..3).map(|_| udp_client(&server)).collect();
         for (i, c) in clients.iter().take(2).enumerate() {
@@ -2702,6 +2789,111 @@ mod tests {
         );
         assert_eq!(server.peers.read().unwrap().len(), 2);
         server.close();
+    }
+
+    /// A server whose peers need no authentication to be refused, with
+    /// `cfg` applied to its config.
+    fn server_configured(
+        on_auth: OnAuth,
+        cfg: impl FnOnce(ServerConfig) -> ServerConfig,
+    ) -> Arc<Server> {
+        let on_data: OnData = Arc::new(|_, _, _| {});
+        let base = ServerConfig::new(
+            crate::ovpn::tests::server_config(),
+            "127.0.0.1:0".parse().unwrap(),
+            on_auth,
+            on_data,
+        );
+        Server::new(cfg(base)).unwrap()
+    }
+
+    /// Peers that have not authenticated are capped per source address --
+    /// one source must not take every place the table has -- and in all,
+    /// so clients that did authenticate keep theirs. A client that has
+    /// authenticated no longer counts.
+    #[test]
+    fn unauthenticated_peers_are_capped_per_source_and_in_all() {
+        let server = server_configured(auth_ok(), |c| c.max_unauthenticated_peers_per_source(2));
+        // All kept open for the whole test, so no port is reused.
+        let clients: Vec<UdpSocket> = (0..4).map(|_| udp_client(&server)).collect();
+        let mut authed = TestClient::new(*b"AUTHED!!");
+        connect_udp(&clients[0], &mut authed);
+        assert!(wait_for(|| {
+            server
+                .peers
+                .read()
+                .unwrap()
+                .values()
+                .all(|e| e.authenticated.load(Ordering::Relaxed))
+        }));
+        assert!(open_udp(&clients[1], *b"PENDING1").1);
+        assert!(open_udp(&clients[2], *b"PENDING2").1);
+        assert!(
+            !open_udp(&clients[3], *b"PENDING3").1,
+            "over the per-source cap"
+        );
+        assert_eq!(server.peers.read().unwrap().len(), 3);
+        server.close();
+
+        let server = server_configured(auth_ok(), |c| c.max_peers(10).max_unauthenticated_peers(2));
+        let clients: Vec<UdpSocket> = (0..3).map(|_| udp_client(&server)).collect();
+        assert!(open_udp(&clients[0], *b"PENDING1").1);
+        assert!(open_udp(&clients[1], *b"PENDING2").1);
+        assert!(!open_udp(&clients[2], *b"PENDING3").1, "over the total cap");
+        server.close();
+    }
+
+    /// With a default config, one source cannot fill the table: half of it
+    /// is for clients that have not authenticated, and one source gets 16
+    /// places of those.
+    #[test]
+    fn one_source_cannot_fill_the_peer_table() {
+        let server = server_configured(auth_ok(), |c| c.max_peers(64));
+        let clients: Vec<UdpSocket> = (0..20).map(|_| udp_client(&server)).collect();
+        let served = clients
+            .iter()
+            .enumerate()
+            .filter(|(i, c)| {
+                open_udp(
+                    c,
+                    [
+                        b'P',
+                        b'E',
+                        b'E',
+                        b'R',
+                        b'-',
+                        b'0',
+                        b'0' + *i as u8 / 10,
+                        b'0' + *i as u8 % 10,
+                    ],
+                )
+                .1
+            })
+            .count();
+        assert_eq!(served, 16);
+        server.close();
+    }
+
+    /// New peers are rate-limited (connect-freq): a client that echoes our
+    /// stateless answer gets its answer refunded, so that limit alone does
+    /// not bound how fast peers are made.
+    #[test]
+    fn new_peers_are_rate_limited() {
+        let server =
+            server_configured(auth_ok(), |c| c.connect_freq((2, Duration::from_secs(600))));
+        let clients: Vec<UdpSocket> = (0..3).map(|_| udp_client(&server)).collect();
+        assert!(open_udp(&clients[0], *b"CLIENT-1").1);
+        assert!(open_udp(&clients[1], *b"CLIENT-2").1);
+        assert!(!open_udp(&clients[2], *b"CLIENT-3").1, "over the limit");
+        server.close();
+    }
+
+    #[test]
+    fn sources_are_addresses_or_ipv6_64s() {
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        assert_eq!(source_of(ip("192.0.2.7")), ip("192.0.2.7"));
+        assert_eq!(source_of(ip("::ffff:192.0.2.7")), ip("192.0.2.7"));
+        assert_eq!(source_of(ip("2001:db8:1:2:3:4:5:6")), ip("2001:db8:1:2::"));
     }
 
     /// While every auth worker is busy -- a slow on_auth -- peers that come

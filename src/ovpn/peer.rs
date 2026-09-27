@@ -328,6 +328,9 @@ pub struct Peer {
     /// Sessions beyond the first started this period, and when it began
     /// (see [`NEW_SESSIONS`]).
     new_sessions: (Instant, u32),
+    /// Since when the peer has had no authenticated session; `None` while
+    /// it has one.
+    unauthenticated_since: Option<Instant>,
 }
 
 impl std::fmt::Debug for Peer {
@@ -388,6 +391,7 @@ impl Peer {
             last_recv: now,
             last_sent: now,
             new_sessions: (now, 0),
+            unauthenticated_since: Some(now),
         }
     }
 
@@ -507,7 +511,8 @@ impl Peer {
     ///
     /// The same tick runs the peer's other timers: a session that has not
     /// completed its key exchange within the handshake window is abandoned,
-    /// an idle established peer is sent a keepalive ping, and one not heard
+    /// as is a peer that has gone that long without an authenticated
+    /// session, however many sessions it started meanwhile; an idle established peer is sent a keepalive ping, and one not heard
     /// from for the ping-restart timeout is closed.
     pub fn tick(&mut self, now: Instant) -> io::Result<PeerOutput> {
         let mut out = PeerOutput::default();
@@ -559,6 +564,33 @@ impl Peer {
         {
             let reset = s.soft_reset(&timers, now);
             out.send.push(reset.to_bytes(&[]));
+        }
+
+        // Each session has the handshake window to authenticate in, but a
+        // new hard reset brings a new session, with a window of its own:
+        // someone sending one now and then would keep a peer that never
+        // authenticates, holding its place in the server's table, for as
+        // long as they liked. So the peer itself has the window too,
+        // counted from when it was created or lost its authenticated
+        // session, whatever new sessions come meanwhile.
+        match self.unauthenticated_since {
+            _ if self.active.is_some() => self.unauthenticated_since = None,
+            None => self.unauthenticated_since = Some(now),
+            Some(since) => {
+                if since
+                    .checked_add(self.timers.handshake_window)
+                    .is_some_and(|t| now >= t)
+                {
+                    self.initial = None;
+                    self.untrusted = None;
+                    out.close = true;
+                    out.error = Some(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "no session authenticated within the handshake window",
+                    ));
+                    return Ok(self.report(out));
+                }
+            }
         }
 
         if self.active.is_some() {

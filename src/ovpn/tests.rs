@@ -1046,6 +1046,35 @@ fn handshake_window_expires_a_stalled_session() {
     assert!(out.close, "handshake window should have expired");
 }
 
+/// Each new hard reset brings a session with a handshake window of its own,
+/// but not the peer: one that never authenticates is closed once the window
+/// is up, however many resets keep coming -- else a trickle of them would
+/// hold its place in the server's table for good.
+#[test]
+fn resets_do_not_extend_a_peers_handshake_window() {
+    let window = Duration::from_millis(300);
+    let mut server = Peer::new(server_config(), *b"SERVERID", auth_hook())
+        .unwrap()
+        .with_timers(quiet_timers().handshake_window(window));
+    let start = Instant::now();
+    server
+        .handle_packet(&TestClient::new(*b"CLIENT-0").hard_reset())
+        .unwrap();
+    let mut closed_at = None;
+    for i in 1..=10u8 {
+        std::thread::sleep(Duration::from_millis(100));
+        let _ = server.handle_packet(
+            &TestClient::new([b'C', b'L', b'I', b'E', b'N', b'T', b'-', i]).hard_reset(),
+        );
+        if server.tick(Instant::now()).unwrap().close {
+            closed_at = Some(start.elapsed());
+            break;
+        }
+    }
+    let closed_at = closed_at.expect("the peer outlived its handshake window");
+    assert!(closed_at >= window);
+}
+
 /// An established peer that goes quiet is pinged every keepalive interval,
 /// and dropped once nothing has been heard for twice the keepalive timeout
 /// (OpenVPN's `--keepalive 10 60` on a server).

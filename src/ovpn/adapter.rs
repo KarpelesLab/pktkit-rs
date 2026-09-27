@@ -62,6 +62,14 @@ pub struct AdapterConfig {
     pub on_auth: OnAuth,
     /// Most peers held at once; see [`ServerConfig::max_peers`].
     pub max_peers: usize,
+    /// Most peers held at once that have not authenticated; see
+    /// [`ServerConfig::max_unauthenticated_peers`].
+    pub max_unauthenticated_peers: Option<usize>,
+    /// Most of those from one source; see
+    /// [`ServerConfig::max_unauthenticated_peers_per_source`].
+    pub max_unauthenticated_peers_per_source: usize,
+    /// New peers per period; see [`ServerConfig::connect_freq`].
+    pub connect_freq: (u32, Duration),
     /// Most TCP connections served at once; see
     /// [`ServerConfig::max_tcp_connections`].
     pub max_tcp_connections: usize,
@@ -78,6 +86,9 @@ pub struct AdapterConfig {
 setters! {
     AdapterConfig {
         set max_peers: usize;
+        some max_unauthenticated_peers: usize;
+        set max_unauthenticated_peers_per_source: usize;
+        set connect_freq: (u32, Duration);
         set max_tcp_connections: usize;
         set timers: PeerTimers;
         set connect_freq_initial: (u32, Duration);
@@ -100,6 +111,10 @@ impl AdapterConfig {
             connector,
             on_auth,
             max_peers: super::server::DEFAULT_MAX_PEERS,
+            max_unauthenticated_peers: None,
+            max_unauthenticated_peers_per_source:
+                super::server::DEFAULT_MAX_UNAUTHENTICATED_PER_SOURCE,
+            connect_freq: super::server::DEFAULT_CONNECT_FREQ,
             max_tcp_connections: super::server::DEFAULT_MAX_TCP_CONNECTIONS,
             timers: PeerTimers::default(),
             connect_freq_initial: super::server::DEFAULT_CONNECT_FREQ_INITIAL,
@@ -114,6 +129,12 @@ impl std::fmt::Debug for AdapterConfig {
             .field("listen_addr", &self.listen_addr)
             .field("connector", &self.connector)
             .field("max_peers", &self.max_peers)
+            .field("max_unauthenticated_peers", &self.max_unauthenticated_peers)
+            .field(
+                "max_unauthenticated_peers_per_source",
+                &self.max_unauthenticated_peers_per_source,
+            )
+            .field("connect_freq", &self.connect_freq)
             .field("max_tcp_connections", &self.max_tcp_connections)
             .field("timers", &self.timers)
             .field("connect_freq_initial", &self.connect_freq_initial)
@@ -177,28 +198,32 @@ impl Adapter {
                 }
             })
         };
-        let server_cfg = ServerConfig::new(cfg.tls_config, cfg.listen_addr, cfg.on_auth, on_data)
-            .max_peers(cfg.max_peers)
-            .max_tcp_connections(cfg.max_tcp_connections)
-            .timers(cfg.timers)
-            .connect_freq_initial(cfg.connect_freq_initial)
-            .max_auth_threads(cfg.max_auth_threads)
-            .on_connect({
-                let a = adapter.me.clone();
-                Arc::new(move |key, cfg| {
-                    if let Some(a) = a.upgrade() {
-                        a.on_connect(key, cfg);
-                    }
+        let mut server_cfg =
+            ServerConfig::new(cfg.tls_config, cfg.listen_addr, cfg.on_auth, on_data)
+                .max_peers(cfg.max_peers)
+                .max_unauthenticated_peers_per_source(cfg.max_unauthenticated_peers_per_source)
+                .connect_freq(cfg.connect_freq)
+                .max_tcp_connections(cfg.max_tcp_connections)
+                .timers(cfg.timers)
+                .connect_freq_initial(cfg.connect_freq_initial)
+                .max_auth_threads(cfg.max_auth_threads)
+                .on_connect({
+                    let a = adapter.me.clone();
+                    Arc::new(move |key, cfg| {
+                        if let Some(a) = a.upgrade() {
+                            a.on_connect(key, cfg);
+                        }
+                    })
                 })
-            })
-            .on_disconnect({
-                let a = adapter.me.clone();
-                Arc::new(move |key| {
-                    if let Some(a) = a.upgrade() {
-                        a.on_disconnect(key);
-                    }
-                })
-            });
+                .on_disconnect({
+                    let a = adapter.me.clone();
+                    Arc::new(move |key| {
+                        if let Some(a) = a.upgrade() {
+                            a.on_disconnect(key);
+                        }
+                    })
+                });
+        server_cfg.max_unauthenticated_peers = cfg.max_unauthenticated_peers;
 
         let server = Server::new(server_cfg)?;
         *adapter.server.lock().unwrap() = Some(server);
