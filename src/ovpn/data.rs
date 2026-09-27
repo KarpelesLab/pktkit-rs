@@ -6,9 +6,10 @@
 //!   The nonce is `pid(4) || implicit_iv(8)` where the implicit IV is taken
 //!   from the per-direction HMAC key. The 4-byte packet ID is the AAD. This is
 //!   the modern happy path and is fully implemented.
-//! - **AES-CBC + HMAC** (encrypt-then-... actually OpenVPN HMACs the opcode-less
-//!   ciphertext). Wire format with auth: `[opcode:1][hmac:N][iv:16][ct..]` where
-//!   the ciphertext encrypts `[pid:4][compression:1][payload..]` PKCS#7-padded.
+//! - **AES-CBC + HMAC** (encrypt-then-MAC: the HMAC covers IV and ciphertext).
+//!   Wire format: `[opcode:1][hmac:N][iv:16][ct..]` where the ciphertext
+//!   encrypts `[pid:4][compression:1][payload..]` PKCS#7-padded -- OpenVPN
+//!   frames for compression first and then prepends the packet id.
 //!
 //! Decryption returns the inner payload with the leading compression byte
 //! consumed (only the `0xfa` "no compression" marker is accepted; LZO/LZ4 are
@@ -207,13 +208,13 @@ fn encrypt_cbc(
     let mut iv = [0u8; 16];
     rng(&mut iv)?;
 
-    // Plaintext = [compression?:1][pid:4][payload..], PKCS#7 padded to 16.
+    // Plaintext = [pid:4][compression?:1][payload..], PKCS#7 padded to 16.
     let has_comp = opts.compression != "none" && !opts.compression.is_empty();
     let mut pt = Vec::with_capacity(5 + payload.len() + 16);
+    pt.extend_from_slice(&pid.to_be_bytes());
     if has_comp {
         pt.push(COMP_NONE);
     }
-    pt.extend_from_slice(&pid.to_be_bytes());
     pt.extend_from_slice(payload);
     let mut padded = pkcs5::pad(&pt, 16);
 
@@ -286,12 +287,12 @@ fn decrypt_cbc<'a>(
     let unpadded_len = pkcs5::trim(ct).len();
     let plain = &data[ct_start..ct_start + unpadded_len];
 
-    // plain = [compression?:1][pid:4][payload..]. The compression byte is read
-    // by finish_plaintext after the pid; but in CBC the pid is *inside* the
-    // encrypted region, preceding compression is also inside. OpenVPN orders it
-    // as [compression][pid][payload] when compression is present, matching the
-    // encrypt path above.
-    finish_plaintext_cbc(plain)
+    // plain = [pid:4][compression:1][payload..].
+    if plain.len() < 4 {
+        return Ok(None);
+    }
+    let pid = u32::from_be_bytes([plain[0], plain[1], plain[2], plain[3]]);
+    finish_plaintext(pid, &plain[4..])
 }
 
 fn cbc_encrypt(key: &[u8], iv: &[u8; 16], buf: &mut [u8]) -> io::Result<()> {
@@ -348,8 +349,9 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 
 // --- shared plaintext post-processing --------------------------------------
 
-/// For GCM: plaintext is `[compression:1][payload..]`; pid was already parsed
-/// from the wire header. Strip the compression byte and detect a ping.
+/// Plaintext after the packet id is `[compression:1][payload..]` (the pid is
+/// in the clear header for GCM, inside the ciphertext for CBC). Strip the
+/// compression byte and detect a ping.
 fn finish_plaintext(pid: u32, plaintext: &[u8]) -> io::Result<Option<Decrypted<'_>>> {
     if plaintext.is_empty() {
         return Ok(None);
@@ -360,30 +362,6 @@ fn finish_plaintext(pid: u32, plaintext: &[u8]) -> io::Result<Option<Decrypted<'
         COMP_LZ4 => return Err(invalid("lz4 compression not supported")),
         _ => return Err(invalid("unsupported compression format")),
     };
-    let is_ping = payload.len() == OPENVPN_PING.len() && payload == OPENVPN_PING;
-    Ok(Some(Decrypted {
-        pid,
-        payload,
-        is_ping,
-    }))
-}
-
-/// For CBC: plaintext is `[compression:1][pid:4][payload..]`.
-fn finish_plaintext_cbc(plaintext: &[u8]) -> io::Result<Option<Decrypted<'_>>> {
-    if plaintext.is_empty() {
-        return Ok(None);
-    }
-    let rest = match plaintext[0] {
-        COMP_NONE => &plaintext[1..],
-        COMP_LZO => return Err(invalid("lzo compression not supported")),
-        COMP_LZ4 => return Err(invalid("lz4 compression not supported")),
-        _ => return Err(invalid("unsupported compression format")),
-    };
-    if rest.len() < 4 {
-        return Ok(None);
-    }
-    let pid = u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]);
-    let payload = &rest[4..];
     let is_ping = payload.len() == OPENVPN_PING.len() && payload == OPENVPN_PING;
     Ok(Some(Decrypted {
         pid,
@@ -547,6 +525,38 @@ mod tests {
         })
         .unwrap();
         assert_ne!(p1, p2);
+    }
+
+    /// OpenVPN compresses (frames) first and then prepends the packet id, so
+    /// the CBC plaintext is `[pid][compression byte][payload]` plus PKCS#7
+    /// padding (crypto.c openvpn_encrypt_v1 / openvpn_decrypt_v1).
+    #[test]
+    fn cbc_plaintext_layout_matches_openvpn() {
+        let (sk, rk) = key_pair();
+        let opts = cbc_opts(128);
+        let pkt = encrypt(&opts, &sk, 0x0102_0304, b"xyz", rng_zero).unwrap();
+        // [opcode:1][hmac:32][iv:16][ct..]
+        let iv: [u8; 16] = pkt[33..49].try_into().unwrap();
+        let mut ct = pkt[49..].to_vec();
+        cbc_decrypt(&rk.cipher_decrypt[..16], &iv, &mut ct).unwrap();
+        assert_eq!(&ct[..8], &[1, 2, 3, 4, COMP_NONE, b'x', b'y', b'z']);
+        assert_eq!(&ct[8..], &[8u8; 8]);
+
+        // And a packet laid out that way decrypts.
+        let mut plain = vec![0, 0, 0, 9, COMP_NONE];
+        plain.extend_from_slice(b"from openvpn");
+        let mut padded = pkcs5::pad(&plain, 16);
+        let iv = [0x42u8; 16];
+        cbc_encrypt(&sk.cipher_encrypt[..16], &iv, &mut padded).unwrap();
+        let mut body = iv.to_vec();
+        body.extend_from_slice(&padded);
+        let mac = hmac_compute(AuthHash::Sha256, &sk.hmac_encrypt[..32], &body);
+        let mut wire = vec![Opcode::DATA_V1.to_byte(0)];
+        wire.extend_from_slice(&mac);
+        wire.extend_from_slice(&body);
+        let d = decrypt(&opts, &rk, &mut wire).unwrap().unwrap();
+        assert_eq!(d.pid, 9);
+        assert_eq!(d.payload, b"from openvpn");
     }
 
     #[test]
