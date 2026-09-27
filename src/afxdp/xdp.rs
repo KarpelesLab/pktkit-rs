@@ -527,7 +527,11 @@ impl Device {
         // The program goes on before any socket binds, so no frame can be
         // redirected at a map slot we have not filled in yet.
         let capture = match &cfg.program {
-            ProgramSource::Capture(ccfg) => Some(Capture::attach(ifindex, ccfg.clone(), cfg.mode)?),
+            ProgramSource::Capture(ccfg) => Some(Capture::attach(
+                ifindex,
+                capture_config_for(ccfg, &queue_ids),
+                cfg.mode,
+            )?),
             ProgramSource::External { .. } => None,
         };
         let xskmap_fd = match (&capture, &cfg.program) {
@@ -1031,6 +1035,17 @@ impl Socket {
     }
 }
 
+/// The capture configuration to attach for `queue_ids`: the XSKMAP is indexed
+/// by queue, so it needs a slot past the highest queue bound, whatever
+/// [`CaptureConfig::max_queues`] says. A NIC with more channels than the
+/// default 64 would otherwise fail to open with `E2BIG` from the map.
+fn capture_config_for(ccfg: &CaptureConfig, queue_ids: &[u32]) -> CaptureConfig {
+    let need = queue_ids.iter().max().map_or(0, |&q| q.saturating_add(1));
+    let mut c = ccfg.clone();
+    c.max_queues = c.max_queues.max(need);
+    c
+}
+
 /// Split a UMEM into RX and TX halves, guaranteeing at least one frame each.
 fn umem_split(num_frames: u32) -> (u32, u32) {
     let rx = (num_frames / 2).max(1);
@@ -1472,6 +1487,21 @@ mod tests {
             .normalize()
             .is_ok()
         );
+    }
+
+    #[test]
+    fn the_xskmap_has_a_slot_for_every_bound_queue() {
+        let base = CaptureConfig::default();
+        assert_eq!(base.max_queues, 64);
+        // More channels than the default map holds.
+        let queues: Vec<u32> = (0..96).collect();
+        assert_eq!(capture_config_for(&base, &queues).max_queues, 96);
+        // An explicit queue past the default, alone.
+        assert_eq!(capture_config_for(&base, &[200]).max_queues, 201);
+        // Never shrunk below what the caller asked for.
+        assert_eq!(capture_config_for(&base, &[0, 1]).max_queues, 64);
+        let big = base.clone().max_queues(512);
+        assert_eq!(capture_config_for(&big, &queues).max_queues, 512);
     }
 
     #[test]

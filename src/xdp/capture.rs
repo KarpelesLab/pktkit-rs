@@ -351,7 +351,8 @@ pub struct CaptureConfig {
     /// [`MAX_RULES_PER_PREFIX`]. Sets the trie value size and how far the
     /// in-program rule check is unrolled, so it cannot change after attach.
     pub max_rules_per_prefix: u8,
-    /// XSKMAP slots, i.e. the highest NIC queue index that can be bound.
+    /// XSKMAP slots: one past the highest NIC queue index that can be bound.
+    /// `afxdp::Device::open` raises it to cover every queue it binds.
     pub max_queues: u32,
 }
 

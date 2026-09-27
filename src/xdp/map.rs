@@ -293,6 +293,15 @@ pub fn set_socket_raw(map_fd: RawFd, queue_id: u32, socket_fd: RawFd) -> Result<
             ),
         ));
     }
+    if queue_id >= info.max_entries {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "xdp: queue {queue_id} is past the {} slots of the XSKMAP at fd {map_fd}",
+                info.max_entries
+            ),
+        ));
+    }
     let key = queue_id.to_ne_bytes();
     let value = (socket_fd as u32).to_ne_bytes();
     let mut attr = MapElemAttr {
