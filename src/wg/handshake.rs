@@ -19,7 +19,7 @@ use crate::wg::constants::{
     NOISE_PUBLIC_KEY_SIZE, NoisePrivateKey, NoisePublicKey, TAI64N_TIMESTAMP_SIZE,
 };
 use crate::wg::crypto::{
-    aead_open_zero, aead_seal_zero, blake2s_mac_128, calculate_mac1_key, ct_eq, fill_random,
+    aead_open_zero, aead_seal_zero, blake2s_mac_128, calculate_mac1_key, ct_eq,
     generate_private_key, initial_chain_key, initial_hash, is_zero, mix_hash, mix_key, mix_psk,
     x25519_dh, x25519_public,
 };
@@ -164,13 +164,7 @@ pub(crate) fn initiate_handshake(h: &Handler, peer_key: &NoisePublicKey) -> Resu
     let h_save = hs.hash;
     mix_hash(&mut hs.hash, &h_save, &enc_timestamp);
 
-    // Allocate a non-zero sender index.
-    let mut sender_idx: u32 = 0;
-    while sender_idx == 0 {
-        let mut buf = [0u8; 4];
-        fill_random(&mut buf)?;
-        sender_idx = u32::from_le_bytes(buf);
-    }
+    let sender_idx = h.allocate_index()?;
     hs.local_index = sender_idx;
     hs.state = HandshakeState::InitiationCreated;
     hs.created = Instant::now();
@@ -510,12 +504,7 @@ pub(crate) fn process_handshake_initiation(
     }
 
     // === Build response ===
-    let mut sender_idx_local: u32 = 0;
-    while sender_idx_local == 0 {
-        let mut buf = [0u8; 4];
-        fill_random(&mut buf)?;
-        sender_idx_local = u32::from_le_bytes(buf);
-    }
+    let sender_idx_local = h.allocate_index()?;
 
     hs.local_ephemeral = generate_private_key()?;
     let eph_pub = x25519_public(&hs.local_ephemeral);

@@ -580,6 +580,29 @@ impl Handler {
 
     // --- Handshake-table accessors used by handshake.rs ------------------
 
+    /// Draw a fresh, non-zero local index that no pending handshake or
+    /// keypair uses, as the reference's index hashtable does. A random u32
+    /// alone could repeat one in use and replace another peer's entry.
+    pub(crate) fn allocate_index(&self) -> Result<u32> {
+        self.allocate_index_with(|| {
+            let mut buf = [0u8; 4];
+            crate::wg::crypto::fill_random(&mut buf)?;
+            Ok(u32::from_le_bytes(buf))
+        })
+    }
+
+    fn allocate_index_with(&self, mut draw: impl FnMut() -> Result<u32>) -> Result<u32> {
+        // Both tables are bounded far below 2^32, so this ends quickly.
+        let hs = self.handshakes.lock().expect("handshakes lock");
+        let kps = self.keypairs.read().expect("keypairs lock");
+        loop {
+            let idx = draw()?;
+            if idx != 0 && !hs.contains_key(&idx) && !kps.contains_key(&idx) {
+                return Ok(idx);
+            }
+        }
+    }
+
     pub(crate) fn insert_handshake(
         &self,
         idx: u32,
@@ -590,7 +613,15 @@ impl Handler {
         // supersedes the last, and a response to the old one is refused.
         // Keeping them would stack up an entry per retry.
         g.retain(|_, old| old.remote_static != hs.remote_static);
-        if g.len() >= crate::wg::constants::MAX_HANDSHAKES && !g.contains_key(&idx) {
+        // allocate_index handed out a free index, but another handshake may
+        // have drawn the same one since: refuse rather than replace it.
+        if g.contains_key(&idx) || self.has_keypair_index(idx) {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "local index in use",
+            ));
+        }
+        if g.len() >= crate::wg::constants::MAX_HANDSHAKES {
             return Err(io::Error::other("handshake table full"));
         }
         g.insert(idx, hs);
@@ -669,6 +700,14 @@ impl Handler {
         }
         if kps.len() >= MAX_HANDSHAKES {
             return Err(io::Error::other("keypair table full"));
+        }
+        // The index was free when allocated; one drawn again meanwhile must
+        // not take over another keypair's entry.
+        if kps.contains_key(&kp.local_index) {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "local index in use",
+            ));
         }
         kps.insert(kp.local_index, kp.clone());
         let s = sess.entry(peer_key).or_insert_with(|| Session {
@@ -1264,6 +1303,54 @@ mod tests {
         assert!(a.has_session(&b.public_key()));
         rewind(&a, &b.public_key(), Duration::from_secs(6));
         assert!(timer_actions(&a).is_empty(), "still retrying");
+    }
+
+    /// A local index names one handshake or keypair: one drawn again must
+    /// not replace another peer's entry, which would hand that peer's
+    /// traffic to the wrong keypair and cut off the peer it belonged to.
+    #[test]
+    fn a_local_index_in_use_is_not_taken_over() {
+        let (a, b) = pair();
+        let (_, c) = pair();
+        a.add_peer(c.public_key());
+        handshake(&a, &b);
+        let kp_idx = *a.keypairs.read().unwrap().keys().next().unwrap();
+        a.initiate_handshake(&c.public_key()).unwrap();
+        let hs_idx = *a.handshakes.lock().unwrap().keys().next().unwrap();
+
+        // Allocation skips both tables (and zero).
+        let mut draws = [0, kp_idx, hs_idx, 7].into_iter();
+        let got = a.allocate_index_with(|| Ok(draws.next().unwrap())).unwrap();
+        assert_eq!(got, 7);
+
+        // And an index that is taken anyway, by a race, is refused.
+        let hs = |idx| {
+            let mut h = a.handshakes.lock().unwrap()[&hs_idx].clone();
+            h.remote_static = b.public_key();
+            h.local_index = idx;
+            h
+        };
+        assert!(a.insert_handshake(kp_idx, hs(kp_idx)).is_err());
+        assert!(a.insert_handshake(hs_idx, hs(hs_idx)).is_err());
+        assert_eq!(
+            a.handshakes.lock().unwrap()[&hs_idx].remote_static,
+            c.public_key()
+        );
+        let old = a.keypairs.read().unwrap()[&kp_idx].clone();
+        let kp = Arc::new(Keypair {
+            send_key: [0; CHACHAPOLY_KEY_SIZE],
+            receive_key: [0; CHACHAPOLY_KEY_SIZE],
+            send_counter: AtomicU64::new(0),
+            created: Instant::now(),
+            local_index: kp_idx,
+            remote_index: 1,
+            peer_key: c.public_key(),
+            is_initiator: true,
+            replay_filter: SlidingWindow::new(),
+        });
+        assert!(a.install_initiator_keypair(c.public_key(), kp).is_err());
+        assert!(Arc::ptr_eq(&a.keypairs.read().unwrap()[&kp_idx], &old));
+        assert!(!a.sessions.read().unwrap().contains_key(&c.public_key()));
     }
 
     /// Both ends initiate at once and both handshakes complete. Each side
