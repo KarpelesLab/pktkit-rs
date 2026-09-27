@@ -709,6 +709,21 @@ impl Nat {
             .collect()
     }
 
+    /// The live forward at position `idx` among those
+    /// [`list_port_forwards`](Self::list_port_forwards) would list, in the
+    /// same order while the table is unchanged, without copying out the
+    /// rest.
+    pub(crate) fn port_forward_at(&self, idx: usize) -> Option<PortForward> {
+        let now = Instant::now();
+        let inner = self.inner.lock().unwrap();
+        inner
+            .forwards
+            .values()
+            .filter(|pf| pf.expires.is_none_or(|e| e > now))
+            .nth(idx)
+            .cloned()
+    }
+
     /// The live forward on `(proto, outside_port)`, if any: what
     /// [`list_port_forwards`](Self::list_port_forwards) would find there,
     /// without copying out the whole table.

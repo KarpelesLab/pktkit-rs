@@ -46,6 +46,12 @@ const SSDP_MCAST: Ipv4Addr = Ipv4Addr::new(239, 255, 255, 250);
 /// hostile client. A UPnP SOAP control request is a few hundred bytes.
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 
+/// Cap on the description kept for a mapping. It is only a label, and the
+/// forward holds it for the whole lease: a client could otherwise park a
+/// request's worth of text in each of its mappings. miniupnpd keeps 64 bytes
+/// too.
+const MAX_DESCRIPTION_BYTES: usize = 64;
+
 /// Cap on concurrent control connections. Each holds a TCP engine and a
 /// request buffer, and a SYN is all it takes to create one.
 const MAX_CTRL_CONNS: usize = 64;
@@ -691,7 +697,10 @@ EXT:\r\n\r\n",
             .unwrap_or(0);
         let expires = compute_expiry(lease_secs, self.cfg.lease_duration);
 
-        let desc = xml_field(&xml, "NewPortMappingDescription").unwrap_or_default();
+        let desc = truncate_utf8(
+            xml_field(&xml, "NewPortMappingDescription").unwrap_or_default(),
+            MAX_DESCRIPTION_BYTES,
+        );
         let mut pf = PortForward::new(proto, ext_port, inside_ip, int_port)
             .description(desc)
             .namespace(ns);
@@ -750,17 +759,18 @@ EXT:\r\n\r\n",
 
     fn action_get_generic(&self, nat: &Nat, body: &[u8]) -> SoapResult {
         let xml = String::from_utf8_lossy(body);
-        let idx: i64 = xml_field(&xml, "NewPortMappingIndex")
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(-1);
-        let forwards = nat.list_port_forwards();
-        if idx < 0 || idx as usize >= forwards.len() {
-            return soap_fault(713, "SpecifiedArrayIndexInvalid");
+        let idx: Option<usize> =
+            xml_field(&xml, "NewPortMappingIndex").and_then(|s| s.trim().parse().ok());
+        // Only the entry asked for is copied out: a client walks the table
+        // one index at a time, and each request copying all of it would
+        // make the walk quadratic in the table's size.
+        match idx.and_then(|i| nat.port_forward_at(i)) {
+            Some(pf) => soap_response(&port_mapping_entry_xml(
+                &pf,
+                "GetGenericPortMappingEntryResponse",
+            )),
+            None => soap_fault(713, "SpecifiedArrayIndexInvalid"),
         }
-        soap_response(&port_mapping_entry_xml(
-            &forwards[idx as usize],
-            "GetGenericPortMappingEntryResponse",
-        ))
     }
 
     fn action_get_specific(&self, nat: &Nat, body: &[u8]) -> SoapResult {
@@ -772,15 +782,13 @@ EXT:\r\n\r\n",
         let ext_port: u16 = xml_field(&xml, "NewExternalPort")
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(0);
-        for pf in nat.list_port_forwards() {
-            if pf.proto == proto && pf.outside_port == ext_port {
-                return soap_response(&port_mapping_entry_xml(
-                    &pf,
-                    "GetSpecificPortMappingEntryResponse",
-                ));
-            }
+        match nat.port_forward(proto, ext_port) {
+            Some(pf) => soap_response(&port_mapping_entry_xml(
+                &pf,
+                "GetSpecificPortMappingEntryResponse",
+            )),
+            None => soap_fault(714, "NoSuchEntryInArray"),
         }
-        soap_fault(714, "NoSuchEntryInArray")
     }
 
     fn is_port_allowed(&self, port: u16) -> bool {
@@ -1187,6 +1195,18 @@ fn find_close(s: &str, needle: &str) -> Option<usize> {
         from = pos + 2;
     }
     None
+}
+
+/// `s` cut to at most `max` bytes, on a character boundary.
+fn truncate_utf8(mut s: String, max: usize) -> String {
+    if s.len() > max {
+        let mut end = max;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+    }
+    s
 }
 
 fn parse_protocol(s: &str) -> Option<u8> {
@@ -1852,6 +1872,52 @@ MAN: \"ssdp:discover\"\r\nST: upnp:rootdevice\r\n\r\n";
         }
         assert_eq!(ok, 128);
         assert_eq!(add(30000, "10.0.0.43", 60).status, 200);
+    }
+
+    #[test]
+    fn mappings_keep_short_descriptions_and_list_cheaply() {
+        let nat = Nat::new(pfx("10.0.0.1/24"), pfx("203.0.113.1/24"));
+        let h = UPnPHelper::new(UPnPConfig::default());
+        let long = "é".repeat(30_000);
+        let mut n = 0;
+        for i in 0..1024u16 {
+            let client = format!("10.0.0.{}", 2 + i / 128);
+            let body = String::from_utf8(add_body(20000 + i, 1000 + i, &client, "TCP", 0))
+                .unwrap()
+                .replace("test map", &long);
+            let r = h.handle_soap(
+                &nat,
+                "AddPortMapping",
+                body.as_bytes(),
+                Some(client.parse().unwrap()),
+            );
+            n += usize::from(r.status == 200);
+        }
+        assert_eq!(n, 1024);
+        let fwds = nat.list_port_forwards();
+        assert!(fwds.iter().all(|pf| pf.description.len() <= 64));
+        assert_eq!(fwds[0].description, "é".repeat(32));
+
+        // Walking the table by index copies one entry per request. Each
+        // used to copy them all, descriptions included. The bound is loose
+        // enough for a slow debug build.
+        let start = std::time::Instant::now();
+        let mut ports = HashSet::new();
+        for i in 0..1024 {
+            let q = format!("<NewPortMappingIndex>{i}</NewPortMappingIndex>");
+            let r = h.handle_soap(&nat, "GetGenericPortMappingEntry", q.as_bytes(), None);
+            assert_eq!(r.status, 200);
+            ports.insert(xml_field(&r.body, "NewExternalPort").unwrap());
+        }
+        let took = start.elapsed();
+        assert!(took < Duration::from_millis(500), "{took:?}");
+        assert_eq!(ports.len(), 1024, "each index names another entry");
+        let q = b"<NewPortMappingIndex>1024</NewPortMappingIndex>";
+        let r = h.handle_soap(&nat, "GetGenericPortMappingEntry", q, None);
+        assert_eq!(r.status, 500);
+        let q = b"<NewPortMappingIndex>-1</NewPortMappingIndex>";
+        let r = h.handle_soap(&nat, "GetGenericPortMappingEntry", q, None);
+        assert_eq!(r.status, 500);
     }
 
     #[test]
