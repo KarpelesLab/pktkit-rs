@@ -81,8 +81,18 @@ impl Defragger {
         }
 
         let ihl = (pkt[0] & 0x0F) as usize * 4;
-        if ihl < 20 || pkt.len() < ihl {
-            return Some(pkt.to_vec());
+        // A fragment has to be taken apart, so it must be well formed: the
+        // total length bounds the data (anything after it is link padding).
+        let total_len = u16::from_be_bytes([pkt[2], pkt[3]]) as usize;
+        if ihl < 20 || total_len < ihl || pkt.len() < total_len {
+            return None;
+        }
+        let payload = &pkt[ihl..total_len];
+        let end = frag_offset + payload.len();
+        // RFC 791: every fragment but the last carries a multiple of 8 bytes,
+        // and no fragment may reach past the largest datagram IPv4 can carry.
+        if (mf && !payload.len().is_multiple_of(8)) || payload.is_empty() || ihl + end > 65535 {
+            return None;
         }
 
         let mut src = [0u8; 4];
@@ -109,8 +119,24 @@ impl Defragger {
             total: None,
         });
 
-        let payload = &pkt[ihl..];
-        let fd = FragData {
+        if !mf {
+            // Two different last fragments means the datagram is corrupt.
+            if entry.total.is_some_and(|t| t != end) {
+                inner.entries.remove(&k);
+                return None;
+            }
+            entry.total = Some(end);
+        }
+        // Data past the end of the datagram is as corrupt as an overlap
+        // (RFC 791 gives it nowhere to go), whichever fragment arrived first.
+        if let Some(total) = entry.total
+            && (end > total || entry.frags.iter().any(|f| f.offset + f.data.len() > total))
+        {
+            inner.entries.remove(&k);
+            return None;
+        }
+
+        entry.frags.push(FragData {
             offset: frag_offset,
             data: payload.to_vec(),
             hdr: if frag_offset == 0 {
@@ -118,18 +144,9 @@ impl Defragger {
             } else {
                 None
             },
-        };
-        entry.frags.push(fd);
-
-        if !mf {
-            entry.total = Some(frag_offset + payload.len());
-        }
+        });
 
         let total = entry.total?;
-        if total > 65535 {
-            inner.entries.remove(&k);
-            return None;
-        }
 
         // Coverage check; reject overlaps.
         let mut covered = vec![false; total];
@@ -263,5 +280,58 @@ mod tests {
         let b = build_ipv4(7, false, 8, &[2u8; 16]);
         assert!(d.process(&a).is_none());
         assert!(d.process(&b).is_none());
+    }
+
+    #[test]
+    fn fragment_past_the_end_is_dropped_without_panicking() {
+        let d = Defragger::new();
+        // A middle fragment at offset 800, then a last fragment saying the
+        // datagram is 16 bytes long: the first lies past the end.
+        let a = build_ipv4(9, true, 800, &[1u8; 8]);
+        let b = build_ipv4(9, false, 8, &[2u8; 8]);
+        assert!(d.process(&a).is_none());
+        assert!(d.process(&b).is_none());
+
+        // The reassembler must still work afterwards.
+        let f1 = build_ipv4(10, true, 0, &[1u8; 8]);
+        let f2 = build_ipv4(10, false, 8, &[2u8; 4]);
+        assert!(d.process(&f1).is_none());
+        assert_eq!(d.process(&f2).unwrap().len(), 32);
+    }
+
+    #[test]
+    fn fragment_past_a_known_end_is_dropped() {
+        let d = Defragger::new();
+        let last = build_ipv4(11, false, 8, &[2u8; 8]);
+        let beyond = build_ipv4(11, true, 64, &[3u8; 8]);
+        let first = build_ipv4(11, true, 0, &[1u8; 8]);
+        assert!(d.process(&last).is_none());
+        assert!(d.process(&beyond).is_none());
+        // The datagram is corrupt; it must not be reassembled.
+        assert!(d.process(&first).is_none());
+    }
+
+    #[test]
+    fn conflicting_last_fragments_are_dropped() {
+        let d = Defragger::new();
+        let first = build_ipv4(12, true, 0, &[1u8; 8]);
+        let last_a = build_ipv4(12, false, 8, &[2u8; 8]);
+        let last_b = build_ipv4(12, false, 16, &[2u8; 8]);
+        assert!(d.process(&first).is_none());
+        assert!(d.process(&last_b).is_none());
+        assert!(d.process(&last_a).is_none());
+    }
+
+    #[test]
+    fn link_padding_is_not_reassembled() {
+        let d = Defragger::new();
+        let f1 = build_ipv4(13, true, 0, &[1u8; 8]);
+        let mut f2 = build_ipv4(13, false, 8, &[2u8; 4]);
+        // Trailing bytes beyond the IP total length (e.g. Ethernet padding).
+        f2.extend_from_slice(&[0xEE; 6]);
+        assert!(d.process(&f1).is_none());
+        let out = d.process(&f2).unwrap();
+        assert_eq!(out.len(), 32);
+        assert_eq!(&out[28..32], &[2u8; 4]);
     }
 }
