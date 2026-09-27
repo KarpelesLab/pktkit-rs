@@ -13,6 +13,10 @@
 //! `close` — or dropping the device — closes the fd and stops the reader, so
 //! a non-persistent interface disappears and its name can be opened again.
 //!
+//! A [`Tap`] is two stations on one wire: the kernel interface, and the
+//! holder of the fd. `hw_addr` is the latter's, a locally administered MAC of
+//! its own; the kernel side's is [`Tap::kernel_hw_addr`].
+//!
 //! Platform support:
 //! - **Linux**: TUN and TAP via `/dev/net/tun`.
 //! - **macOS**: TUN via the `utun` kernel control. TAP is not available

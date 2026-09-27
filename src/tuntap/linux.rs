@@ -94,7 +94,7 @@ impl Tap {
     /// Open a TAP (L2) device. Requires `CAP_NET_ADMIN` or root.
     pub fn open(cfg: TuntapConfig) -> Result<Tap> {
         let (fd, name) = open_tuntap(&cfg.name, libc::IFF_TAP | libc::IFF_NO_PI)?;
-        let mac = if_hw_addr(&name).unwrap_or_else(|_| MacAddr::random_local_unicast());
+        let mac = peer_mac(if_hw_addr(&name).ok());
         let dev = Arc::new(DevFd::new(fd)?);
         let handler: Arc<HandlerSlot<L2Handler>> = Arc::new(HandlerSlot::new());
         let stats = Arc::new(DeviceStats::new());
@@ -115,6 +115,30 @@ impl Tap {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The MAC address of the kernel's side of the device: the interface the
+    /// host stack sees, and a different station from [`L2Device::hw_addr`].
+    pub fn kernel_hw_addr(&self) -> Result<MacAddr> {
+        if_hw_addr(&self.name)
+    }
+}
+
+/// The address this end of the TAP answers to.
+///
+/// A TAP is two stations on one wire: the kernel interface and whoever holds
+/// the fd. Reporting the kernel interface's own MAC here would have a
+/// userspace stack on the fd claim the host's address — same EUI-64
+/// link-local, so IPv6 duplicate address detection fails on one side or the
+/// other, and the host sees its own source MAC arrive from the wire. So this
+/// side gets a locally administered address of its own, never equal to the
+/// kernel's.
+fn peer_mac(kernel: Option<MacAddr>) -> MacAddr {
+    loop {
+        let m = MacAddr::random_local_unicast();
+        if Some(m) != kernel {
+            return m;
+        }
     }
 }
 
@@ -182,6 +206,8 @@ impl L2Device for Tap {
             }
         }
     }
+    /// This end's address, distinct from the kernel interface's; see
+    /// [`Tap::kernel_hw_addr`].
     fn hw_addr(&self) -> MacAddr {
         self.mac
     }
@@ -267,4 +293,16 @@ fn read_loop_l2(dev: Arc<DevFd>, handler: Arc<HandlerSlot<L2Handler>>, stats: Ar
 mod tests {
     // Opening /dev/net/tun requires CAP_NET_ADMIN, so the device itself is not
     // exercised here; the reader and close machinery is, in `reader.rs`.
+    use super::*;
+
+    #[test]
+    fn the_tap_peer_never_shares_the_kernel_mac() {
+        let kernel = MacAddr::new([0x02, 0, 0, 0, 0, 1]);
+        for _ in 0..1000 {
+            let m = peer_mac(Some(kernel));
+            assert_ne!(m, kernel);
+            // Locally administered unicast.
+            assert_eq!(m.0[0] & 0x03, 0x02);
+        }
+    }
 }

@@ -136,6 +136,14 @@ impl Tap {
     pub fn name(&self) -> &str {
         ""
     }
+
+    /// Always returns `ErrorKind::Unsupported` on macOS.
+    pub fn kernel_hw_addr(&self) -> Result<MacAddr> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "TAP mode is not supported on macOS",
+        ))
+    }
 }
 
 impl L2Device for Tap {

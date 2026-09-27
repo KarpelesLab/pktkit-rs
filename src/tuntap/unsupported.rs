@@ -49,6 +49,11 @@ impl Tap {
     pub fn name(&self) -> &str {
         ""
     }
+
+    /// Always fails with [`io::ErrorKind::Unsupported`] here.
+    pub fn kernel_hw_addr(&self) -> Result<MacAddr> {
+        unsupported()
+    }
 }
 
 impl L3Device for Tun {
