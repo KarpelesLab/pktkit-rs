@@ -905,7 +905,7 @@ impl Packet {
     /// "not computed".
     pub fn verify_transport_checksum(&self) -> Option<bool> {
         let proto = self.transport_protocol();
-        let (src, dst) = (self.src_addr()?, self.dst_addr()?);
+        let (src, dst) = (self.src_addr()?, self.pseudo_header_dst()?);
         if self.is_fragment() {
             return None;
         }
@@ -932,7 +932,7 @@ impl Packet {
     /// addresses or ports when an incremental update is not convenient.
     pub fn recompute_transport_checksum(&mut self) -> bool {
         let proto = self.transport_protocol();
-        let (src, dst) = match (self.src_addr(), self.dst_addr()) {
+        let (src, dst) = match (self.src_addr(), self.pseudo_header_dst()) {
             (Some(s), Some(d)) => (s, d),
             _ => return false,
         };
@@ -969,6 +969,79 @@ impl Packet {
         let payload = self.transport_payload_mut();
         payload[field..field + 2].copy_from_slice(&sum.to_be_bytes());
         true
+    }
+
+    /// The destination the transport checksum's pseudo-header uses.
+    ///
+    /// For IPv6 with a Routing header still to be followed, that is the
+    /// final destination, not the next hop in the Destination Address field
+    /// (RFC 8200 §8.1). It is found for the Routing types that list plain
+    /// addresses: type 0 (deprecated by RFC 5095, but still well defined),
+    /// type 2 (RFC 6275) and the Segment Routing Header, type 4 (RFC 8754).
+    /// Type 3 (RPL, RFC 6554) compresses its addresses against the header's
+    /// own and is not decoded; like any unknown type, it falls back to the
+    /// Destination Address.
+    fn pseudo_header_dst(&self) -> Option<IpAddr> {
+        let dst = self.dst_addr()?;
+        if self.version() != 6 || self.0.len() < 40 {
+            return Some(dst);
+        }
+        let b = &self.0;
+        let (mut nh, mut off) = (b[6], 40usize);
+        for _ in 0..MAX_EXT_HEADERS {
+            match nh {
+                ext::ROUTING => {
+                    let Some(h) = b.get(off..off + 8) else {
+                        return Some(dst);
+                    };
+                    let len = (h[1] as usize + 1) * 8;
+                    let (rtype, segments_left) = (h[2], h[3]);
+                    if segments_left == 0 {
+                        return Some(dst);
+                    }
+                    let addr_at = |i: usize| -> Option<IpAddr> {
+                        let start = off + 8 + 16 * i;
+                        if start + 16 > off + len {
+                            return None;
+                        }
+                        let a: [u8; 16] = b.get(start..start + 16)?.try_into().ok()?;
+                        Some(IpAddr::V6(Ipv6Addr::from(a)))
+                    };
+                    let n = (len - 8) / 16;
+                    let last = match rtype {
+                        0 if n > 0 => addr_at(n - 1),
+                        2 => addr_at(0),
+                        // Segment List[0] is the last segment of the path.
+                        4 => addr_at(0),
+                        _ => None,
+                    };
+                    return Some(last.unwrap_or(dst));
+                }
+                ext::HOPOPT | ext::DEST_OPTS | ext::MOBILITY | ext::HIP | ext::SHIM6 => {
+                    let Some(&l) = b.get(off + 1) else {
+                        return Some(dst);
+                    };
+                    nh = b[off];
+                    off += (l as usize + 1) * 8;
+                }
+                ext::FRAGMENT => {
+                    let Some(&n) = b.get(off) else {
+                        return Some(dst);
+                    };
+                    nh = n;
+                    off += 8;
+                }
+                ext::AH => {
+                    let Some(&l) = b.get(off + 1) else {
+                        return Some(dst);
+                    };
+                    nh = b[off];
+                    off += (l as usize + 2) * 4;
+                }
+                _ => return Some(dst),
+            }
+        }
+        Some(dst)
     }
 
     /// Recompute every checksum the packet owns: the IPv4 header checksum and
@@ -1521,5 +1594,60 @@ mod tests {
         let mut p = v4_min();
         p[0] = 0x46; // 24 bytes of header in a 20-byte packet
         assert!(!Packet::from_slice(&p).is_valid());
+    }
+
+    #[test]
+    fn ipv6_pseudo_header_uses_the_routing_header_final_destination() {
+        let src: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let hop: Ipv6Addr = "2001:db8::a".parse().unwrap();
+        let fin: Ipv6Addr = "2001:db8::f".parse().unwrap();
+        let udp = [0, 1, 0, 2, 0, 10, 0, 0, 0xab, 0xcd];
+        // RFC 8200 §8.1: the checksum is computed against the final
+        // destination, which the sender finds at the end of the route.
+        let want = transport_checksum(Protocol::UDP, src.into(), fin.into(), &udp);
+
+        let with_route = |rh: Vec<u8>| {
+            let mut p = v6_with_ext(&[(43, rh)], 17, &udp);
+            p[8..24].copy_from_slice(&src.octets());
+            p[24..40].copy_from_slice(&hop.octets());
+            p
+        };
+        let check = |mut p: Vec<u8>, what: &str| {
+            assert!(Packet::from_mut(&mut p).recompute_transport_checksum());
+            let off = p.len() - udp.len();
+            assert_eq!(
+                u16::from_be_bytes([p[off + 6], p[off + 7]]),
+                want,
+                "{what}: pseudo-header used the next hop"
+            );
+            assert_eq!(
+                Packet::from_slice(&p).verify_transport_checksum(),
+                Some(true)
+            );
+        };
+
+        // Segment Routing Header (RFC 8754): Segment List[0] is the last.
+        let mut srh = vec![4, 1, 1, 0, 0, 0];
+        srh.extend_from_slice(&fin.octets());
+        srh.extend_from_slice(&hop.octets());
+        check(with_route(srh), "SRH");
+
+        // Type 2 (RFC 6275): the one address is the final one.
+        let mut t2 = vec![2, 1, 0, 0, 0, 0];
+        t2.extend_from_slice(&fin.octets());
+        check(with_route(t2), "type 2");
+
+        // Once Segments Left is zero, the header's destination is final.
+        let mut done = vec![4, 0, 0, 0, 0, 0];
+        done.extend_from_slice(&hop.octets());
+        let mut p = with_route(done);
+        assert!(Packet::from_mut(&mut p).recompute_transport_checksum());
+        assert_eq!(
+            Packet::from_slice(&p).verify_transport_checksum(),
+            Some(true)
+        );
+        let off = p.len() - udp.len();
+        let at_hop = transport_checksum(Protocol::UDP, src.into(), hop.into(), &udp);
+        assert_eq!(u16::from_be_bytes([p[off + 6], p[off + 7]]), at_hop);
     }
 }
