@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use super::Opcode;
 use super::consts::{
-    CONTROL_CHANNEL_MTU, CONTROL_SEND_ACK_MAX, TLS_RELIABLE_N_REC_BUFFERS,
+    CONTROL_CHANNEL_MTU, CONTROL_SEND_ACK_MAX, MAX_CONTROL_PAYLOAD, TLS_RELIABLE_N_REC_BUFFERS,
     TLS_RELIABLE_N_SEND_BUFFERS,
 };
 use super::packet_ctrl::ControlPacket;
@@ -77,7 +77,8 @@ pub struct Reliable {
     /// is full (OpenVPN leaves it in the TLS engine's BIO the same way).
     held: Vec<u8>,
 
-    // Incoming reorder buffer.
+    // Incoming reorder buffer: at most TLS_RELIABLE_N_REC_BUFFERS - 1
+    // packets of at most MAX_CONTROL_PAYLOAD bytes each.
     in_counter: u32, // id of the next in-order packet we expect
     in_buf: HashMap<u32, ControlPacket>,
 
@@ -163,6 +164,13 @@ impl Reliable {
         {
             return Err(invalid("rejecting packet because pid looks invalid"));
         }
+        // Nor is one bigger than a control packet gets. The receive window
+        // holds a packet for each of its slots: without a bound on their
+        // size, a few 64 KiB packets sent out of order -- over TCP, or as
+        // UDP fragments -- would hold over a megabyte per peer.
+        if pkt.payload.len() > MAX_CONTROL_PAYLOAD {
+            return Err(invalid("incoming control channel packet too big"));
+        }
 
         let Some(pid) = pid else {
             return Ok(outcome);
@@ -185,6 +193,9 @@ impl Reliable {
         if pid < self.in_counter {
             return Ok(outcome); // already processed
         }
+        // Its ACKs were applied above; kept, they would only take room.
+        let mut pkt = pkt;
+        pkt.acked_pids = Vec::new();
         self.in_buf.entry(pid).or_insert(pkt);
         while let Some(p) = self.in_buf.remove(&self.in_counter) {
             self.in_counter += 1;
@@ -341,6 +352,12 @@ impl Reliable {
     #[allow(dead_code)]
     pub fn unacked_packets(&self) -> Vec<ControlPacket> {
         self.unacked.values().map(|u| u.pkt.clone()).collect()
+    }
+
+    /// Payload bytes held in the receive window, out of order.
+    #[cfg(test)]
+    fn in_buf_bytes(&self) -> usize {
+        self.in_buf.values().map(|p| p.payload.capacity()).sum()
     }
 
     /// Number of unacknowledged outgoing packets.
@@ -578,6 +595,37 @@ mod tests {
         assert!(r.recv(&far.to_bytes(&[0])).is_err());
         assert_eq!(r.unacked_count(), 0);
         assert!(!r.has_pending_acks(), "the packet itself is not ACKed");
+    }
+
+    /// A control packet bigger than OpenVPN's receive buffers is dropped, as
+    /// OpenVPN drops it, not held in the receive window: what the window
+    /// holds is bounded by its size times the largest packet.
+    #[test]
+    fn oversized_control_packets_are_dropped() {
+        let mut r = Reliable::new(local());
+        let sid = [9u8; 8];
+        let mut reset = ControlPacket::new(Opcode::CONTROL_HARD_RESET_CLIENT_V2, 0, sid, [0; 8]);
+        reset.set_pid(0);
+        r.recv(&reset.to_bytes(&[])).unwrap();
+        r.take_pending_acks();
+        let _p0 = r.build_control(b"x");
+
+        // Packet 1 withheld, so everything after it waits in the window.
+        let mut big = ControlPacket::new(Opcode::CONTROL_V1, 0, sid, r.local_id);
+        big.set_pid(2);
+        big.payload = vec![0x16; 65000];
+        assert!(r.recv(&big.to_bytes(&[0])).is_err());
+        assert_eq!(r.unacked_count(), 0, "its ACK still counts");
+        assert!(!r.has_pending_acks(), "the packet itself is not ACKed");
+        for pid in 2..=12 {
+            let mut p = ControlPacket::new(Opcode::CONTROL_V1, 0, sid, [0; 8]);
+            p.set_pid(pid);
+            p.payload = vec![0x16; 65000];
+            assert!(r.recv(&p.to_bytes(&[])).is_err());
+            p.payload = vec![0x16; MAX_CONTROL_PAYLOAD];
+            assert!(r.recv(&p.to_bytes(&[])).is_ok());
+        }
+        assert!(r.in_buf_bytes() <= (TLS_RELIABLE_N_REC_BUFFERS - 1) * MAX_CONTROL_PAYLOAD);
     }
 
     #[test]

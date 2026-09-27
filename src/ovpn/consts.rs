@@ -79,6 +79,15 @@ pub const MAX_CONTROL_HEADER_SIZE: usize = 1 + 8 + 1 + 4 * CONTROL_SEND_ACK_MAX 
 /// Most TLS bytes a control packet carries.
 pub const CONTROL_CHANNEL_MTU: usize = TLS_MTU - DATAGRAM_OVERHEAD - MAX_CONTROL_HEADER_SIZE;
 
+/// Most TLS bytes a received control packet may carry. OpenVPN 2.6 sizes
+/// its control-channel buffers at `max(1500, tls-mtu) + 100` (ssl.c
+/// tls_init_control_channel_frame_parameters) and drops a packet too big
+/// for one ("Incoming control channel packet too big"). A client on the
+/// default tls-mtu sends at most [`CONTROL_CHANNEL_MTU`] (older ones capped
+/// control packets at 1250 bytes too); OpenVPN's slack is kept all the
+/// same, for a client configured with a tls-mtu of up to 1500.
+pub const MAX_CONTROL_PAYLOAD: usize = 1500 + 100;
+
 pub const KEY_METHOD_MASK: u8 = 0x0f;
 
 /// PIA control payload prefix used in `P_CONTROL_HARD_RESET_CLIENT_V2`.
