@@ -11,7 +11,7 @@
 //! require a real macOS host + root and are marked
 //! `// TODO(tuntap): needs macOS to verify`.
 
-use super::reader::{DevFd, HandlerSlot, MAX_MTU, is_whole, msg_buffer, read_or_record};
+use super::reader::{DevFd, HandlerSlot, MAX_MTU, deliver, is_whole, msg_buffer, read_or_record};
 use crate::{
     DeviceStats, Frame, IpPrefix, L2Device, L2Handler, L3Device, L3Handler, MacAddr, Packet, Result,
 };
@@ -295,13 +295,40 @@ fn read_loop(dev: Arc<DevFd>, handler: Arc<HandlerSlot<L3Handler>>, stats: Arc<D
             return;
         };
         // Strip the 4-byte protocol-family header.
-        let _ = h(Packet::from_slice(&buf[4..n]));
+        deliver(&h, Packet::from_slice(&buf[4..n]));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A handler that panics costs its packet, not the reader thread.
+    #[test]
+    fn a_panicking_handler_does_not_stop_the_reader() {
+        use std::os::unix::net::UnixDatagram;
+        let (dev, peer) = UnixDatagram::pair().unwrap();
+        let dev = Arc::new(DevFd::new(OwnedFd::from(dev)).unwrap());
+        let slot: Arc<HandlerSlot<L3Handler>> = Arc::new(HandlerSlot::new());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let tx = Mutex::new(tx);
+        slot.set(Arc::new(move |p: &Packet| {
+            assert_ne!(p.as_bytes(), b"boom", "handler panics");
+            let _ = tx.lock().unwrap().send(p.as_bytes().to_vec());
+            Ok(())
+        }));
+        let (d, s) = (dev.clone(), slot.clone());
+        let reader = std::thread::spawn(move || read_loop(d, s, Arc::new(DeviceStats::new())));
+        peer.send(b"\0\0\0\x02boom").unwrap();
+        peer.send(b"\0\0\0\x02next").unwrap();
+        let got = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the reader stopped");
+        assert_eq!(got, b"next");
+        dev.close();
+        slot.wake();
+        reader.join().unwrap();
+    }
 
     #[test]
     fn utun_unit_n_is_interface_n_minus_one() {

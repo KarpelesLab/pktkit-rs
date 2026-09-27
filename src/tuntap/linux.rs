@@ -4,7 +4,7 @@
 //! handed to the handler is the read scratch and is only valid for the
 //! duration of the call (mirroring the rest of the crate).
 
-use super::reader::{DevFd, HandlerSlot, MAX_MTU, is_whole, msg_buffer, read_or_record};
+use super::reader::{DevFd, HandlerSlot, MAX_MTU, deliver, is_whole, msg_buffer, read_or_record};
 use crate::sys::if_hw_addr;
 use crate::{
     DeviceStats, Frame, IpPrefix, L2Device, L2Handler, L3Device, L3Handler, MacAddr, Packet, Result,
@@ -281,7 +281,7 @@ fn read_loop_l3(dev: Arc<DevFd>, handler: Arc<HandlerSlot<L3Handler>>, stats: Ar
         let Some(h) = handler.wait(dev.closed()) else {
             return;
         };
-        let _ = h(Packet::from_slice(&buf[..n]));
+        deliver(&h, Packet::from_slice(&buf[..n]));
     }
 }
 
@@ -298,7 +298,7 @@ fn read_loop_l2(dev: Arc<DevFd>, handler: Arc<HandlerSlot<L2Handler>>, stats: Ar
         let Some(h) = handler.wait(dev.closed()) else {
             return;
         };
-        let _ = h(Frame::from_slice(&buf[..n]));
+        deliver(&h, Frame::from_slice(&buf[..n]));
     }
 }
 
@@ -307,6 +307,63 @@ mod tests {
     // Opening /dev/net/tun requires CAP_NET_ADMIN, so the device itself is not
     // exercised here; the reader and close machinery is, in `reader.rs`.
     use super::*;
+
+    /// A handler that panics costs its message, not the reader thread, in
+    /// both TUN and TAP mode.
+    #[test]
+    fn a_panicking_handler_does_not_stop_the_reader() {
+        use std::os::unix::net::UnixDatagram;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (boom, next) = ([0xbb_u8; 20], [0x11_u8; 20]);
+        let device = || {
+            let (dev, peer) = UnixDatagram::pair().unwrap();
+            (Arc::new(DevFd::new(OwnedFd::from(dev)).unwrap()), peer)
+        };
+
+        let (dev, peer) = device();
+        let slot: Arc<HandlerSlot<L3Handler>> = Arc::new(HandlerSlot::new());
+        let (tx, rx) = mpsc::channel();
+        let tx = Mutex::new(tx);
+        slot.set(Arc::new(move |p: &Packet| {
+            assert_ne!(p.as_bytes(), boom, "handler panics");
+            let _ = tx.lock().unwrap().send(p.as_bytes().to_vec());
+            Ok(())
+        }));
+        let (d, s) = (dev.clone(), slot.clone());
+        let reader = std::thread::spawn(move || read_loop_l3(d, s, Arc::new(DeviceStats::new())));
+        peer.send(&boom).unwrap();
+        peer.send(&next).unwrap();
+        let got = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("tun reader stopped");
+        assert_eq!(got, next);
+        dev.close();
+        slot.wake();
+        reader.join().unwrap();
+
+        let (dev, peer) = device();
+        let slot: Arc<HandlerSlot<L2Handler>> = Arc::new(HandlerSlot::new());
+        let (tx, rx) = mpsc::channel();
+        let tx = Mutex::new(tx);
+        slot.set(Arc::new(move |f: &Frame| {
+            assert_ne!(f.as_bytes(), boom, "handler panics");
+            let _ = tx.lock().unwrap().send(f.as_bytes().to_vec());
+            Ok(())
+        }));
+        let (d, s) = (dev.clone(), slot.clone());
+        let reader = std::thread::spawn(move || read_loop_l2(d, s, Arc::new(DeviceStats::new())));
+        peer.send(&boom).unwrap();
+        peer.send(&next).unwrap();
+        let got = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("tap reader stopped");
+        assert_eq!(got, next);
+        dev.close();
+        slot.wake();
+        reader.join().unwrap();
+    }
 
     #[test]
     fn the_tap_peer_never_shares_the_kernel_mac() {

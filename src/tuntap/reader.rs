@@ -11,7 +11,7 @@
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Condvar, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 use crate::{DeviceStats, Result};
 
@@ -200,6 +200,16 @@ pub(super) fn is_whole(n: usize, buf: &[u8]) -> bool {
     n < buf.len()
 }
 
+/// Hand one message to the handler, containing a panic in it.
+///
+/// This runs on the reader thread, which nothing joins or watches: a panic
+/// that unwound out of it would end receive for good, silently, while the
+/// device still looked open and `send` still worked. One bad message should
+/// cost that message, not the device.
+pub(super) fn deliver<T: ?Sized>(h: &Arc<dyn Fn(&T) -> Result<()> + Send + Sync>, msg: &T) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h(msg)));
+}
+
 /// A handler the reader thread can wait for.
 ///
 /// Until one is installed, the reader holds on to the message it has and
@@ -277,7 +287,6 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::os::unix::net::UnixDatagram;
-    use std::sync::Arc;
     use std::time::Duration;
 
     /// A datagram socket pair stands in for the device: one message per read,
@@ -317,6 +326,20 @@ mod tests {
         let n = dev.read(&mut buf).unwrap().unwrap();
         assert!(is_whole(n, &buf));
         assert_eq!(&buf[..n], &[3; 5]);
+    }
+
+    #[test]
+    fn deliver_contains_a_panicking_handler() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let s = seen.clone();
+        let h: Arc<dyn Fn(&[u8]) -> Result<()> + Send + Sync> = Arc::new(move |m: &[u8]| {
+            assert_ne!(m, b"boom", "handler panics");
+            s.lock().unwrap().push(m.to_vec());
+            Ok(())
+        });
+        deliver(&h, &b"boom"[..]);
+        deliver(&h, &b"next"[..]);
+        assert_eq!(*seen.lock().unwrap(), [b"next".to_vec()]);
     }
 
     #[test]
