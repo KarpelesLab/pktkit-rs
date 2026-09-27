@@ -11,8 +11,8 @@
 //! and pushed into the virtual network through the stack's dispatch sink.
 
 use crate::time::Instant;
-use crate::vtcp::Conn;
 use crate::vtcp::segment::Segment;
+use crate::vtcp::{Conn, State};
 use std::io::{self};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Condvar, Mutex};
@@ -285,7 +285,17 @@ impl TcpStream {
         let mut written = 0;
         while written < buf.len() {
             let mut conn = self.state.conn.lock().expect("poisoned");
-            if conn.is_closed() {
+            // Past our own FIN the engine takes no more data, and never
+            // will: waiting for room would only spin until the timeout.
+            let after_fin = matches!(
+                conn.state(),
+                State::FinWait1
+                    | State::FinWait2
+                    | State::Closing
+                    | State::LastAck
+                    | State::TimeWait
+            );
+            if conn.is_closed() || after_fin {
                 return Err(self.state.error().unwrap_or_else(|| {
                     io::Error::new(io::ErrorKind::BrokenPipe, "connection closed")
                 }));

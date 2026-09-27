@@ -526,3 +526,24 @@ fn a_new_syn_takes_over_a_4_tuple_in_time_wait() {
         SocketAddr::new(IpAddr::V4(PEER_IP), PEER_PORT)
     );
 }
+
+/// After our own close a write can never go out: it fails at once with
+/// `BrokenPipe`, as on a socket shut down for writing, rather than waiting
+/// for a window no state past FIN-WAIT-1 will use.
+#[test]
+fn write_after_close_is_a_broken_pipe() {
+    let client = client(2);
+    let _server = raw_server(&client, |_| Vec::new());
+    let conn = client
+        .dial_tcp_timeout(
+            SocketAddr::new(IpAddr::V4(SERVER_IP), SERVER_PORT),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+    conn.close().unwrap();
+    conn.set_write_timeout(Some(Duration::from_secs(2)));
+    let start = std::time::Instant::now();
+    let err = conn.write(b"late").unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+    assert!(start.elapsed() < Duration::from_secs(1));
+}

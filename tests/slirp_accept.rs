@@ -171,7 +171,13 @@ fn inbound_accept_handshake_and_bidirectional_data() {
     assert!(n > 0, "expected client data on server side");
     assert_eq!(&buf[..n], b"hi from client");
 
-    let _ = server_conn.close();
+    server_conn.close().unwrap();
+    // Closed for writing: a late write fails at once, it does not wait.
+    server_conn.set_write_timeout(Some(Duration::from_secs(2)));
+    let start = Instant::now();
+    let err = server_conn.write(b"late").unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+    assert!(start.elapsed() < Duration::from_secs(1));
     let _ = listener.close();
     let _ = stack.shutdown();
 }

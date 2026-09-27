@@ -120,6 +120,12 @@ impl ConnState {
     }
 }
 
+/// Whether `state` comes after a FIN of ours, so no data can be sent.
+fn closed_for_writing(state: crate::vtcp::State) -> bool {
+    use crate::vtcp::State::*;
+    matches!(state, FinWait1 | FinWait2 | Closing | LastAck | TimeWait)
+}
+
 /// Whether a handle may wait. On targets without threads nothing could ever
 /// wake it, so it never does.
 #[inline]
@@ -222,7 +228,9 @@ impl TcpConn {
         let mut written = 0;
         while written < buf.len() {
             let mut conn = self.state.conn.lock().unwrap();
-            if conn.is_closed() {
+            // Past our own FIN the engine takes no more data, and never
+            // will: waiting for room would only spin until the timeout.
+            if conn.is_closed() || closed_for_writing(conn.state()) {
                 return Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     "connection closed",
