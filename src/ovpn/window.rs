@@ -35,7 +35,13 @@ impl Window {
 
     /// Returns true if `id` is new (not a replay), recording it. Returns false
     /// if the ID has already been seen or is too old to track.
+    ///
+    /// Id 0 is always refused: OpenVPN's packet ids start at 1 and
+    /// packet_id_test rejects 0, so a packet carrying it is not genuine.
     pub fn check(&mut self, id: u32) -> bool {
+        if id == 0 {
+            return false;
+        }
         let counter = id as u64;
 
         if !self.init {
@@ -103,7 +109,7 @@ mod tests {
     #[test]
     fn sequential() {
         let mut w = Window::new();
-        for i in 0..100u32 {
+        for i in 1..100u32 {
             assert!(w.check(i), "sequential id {i} rejected");
         }
     }
@@ -118,7 +124,6 @@ mod tests {
     #[test]
     fn out_of_order() {
         let mut w = Window::new();
-        w.check(0);
         w.check(1);
         w.check(2);
         assert!(w.check(10));
@@ -129,31 +134,40 @@ mod tests {
     #[test]
     fn old_reject() {
         let mut w = Window::new();
-        for i in 0..(REPLAY_WINDOW_SIZE as u32 + 100) {
+        for i in 1..(REPLAY_WINDOW_SIZE as u32 + 100) {
             w.check(i);
         }
-        assert!(!w.check(0));
+        assert!(!w.check(1));
         assert!(!w.check(50));
     }
 
     #[test]
     fn reset() {
         let mut w = Window::new();
-        w.check(0);
         w.check(1);
         let far_ahead = REPLAY_WINDOW_SIZE as u32 * 2;
         assert!(w.check(far_ahead));
-        assert!(!w.check(0));
         assert!(!w.check(1));
     }
 
     #[test]
     fn large_gap() {
         let mut w = Window::new();
-        w.check(0);
+        w.check(1);
         let gap = REPLAY_WINDOW_SIZE as u32 - 100;
         assert!(w.check(gap));
         assert!(w.check(gap / 2));
+    }
+
+    /// OpenVPN numbers data packets from 1 (packet_id_alloc_outgoing) and
+    /// packet_id_test refuses id 0, so no genuine packet carries it.
+    #[test]
+    fn id_zero_is_rejected() {
+        let mut w = Window::new();
+        assert!(!w.check(0), "0 as the first id");
+        assert!(w.check(1));
+        assert!(!w.check(0), "0 after the window started");
+        assert!(w.check(2));
     }
 
     #[test]
