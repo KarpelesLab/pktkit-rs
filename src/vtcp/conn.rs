@@ -221,9 +221,11 @@ pub struct Conn {
     rto_deadline: std::option::Option<Instant>,
     retries: u32,
     /// SND.NXT when the last RTO fired, while data sent before it is still
-    /// unacknowledged. ACKs short of it are partial: each one retransmits the
-    /// next hole (RFC 6582 §3.2 applied to timeout recovery), where the
-    /// cumulative ACK alone would leave every hole to its own timeout.
+    /// unacknowledged (RFC 6582's `recover`, applied to timeout recovery).
+    /// Everything below it counts as lost (RFC 5681 §3.1, RFC 6298 §5):
+    /// the send loop resends it from HighRxt on, as cwnd allows, before
+    /// any new data, so slow start repairs a whole lost flight in a
+    /// logarithmic number of round trips rather than a hole per round trip.
     rto_recover: std::option::Option<u32>,
     /// Our SYN or SYN-ACK timed out and was resent. The data transfer then
     /// starts from the loss window (RFC 5681 §3.1), not the initial window.
@@ -1473,7 +1475,7 @@ impl Conn {
                 self.send_buf.as_mut().unwrap().mark_sacked(&blocks);
             }
         }
-        if (fast_partial || rto_partial) && self.sack_ok {
+        if fast_partial && self.sack_ok {
             // With SACK, the hole at SND.UNA may already have gone out this
             // episode through retransmit_lost_hole; resending it would be
             // spurious and spoil RTT timing. RFC 6675 §5 NextSeg: only what
@@ -1484,8 +1486,16 @@ impl Conn {
             } else {
                 let _ = self.retransmit_lost_hole();
             }
-        } else if fast_partial || rto_partial {
+        } else if fast_partial {
             let _ = self.retransmit();
+        } else if rto_partial {
+            // The rest of what the timeout marked lost goes out from the
+            // send loop below, as far as the grown cwnd allows. Nothing
+            // below SND.UNA needs it any more.
+            let una = self.send_buf.as_ref().unwrap().una();
+            if seq_before(self.high_rxt, una) {
+                self.high_rxt = una;
+            }
         }
 
         if self.snd_wnd > 0 && self.persist_deadline.is_some() {
@@ -1530,11 +1540,10 @@ impl Conn {
             // far past the single segment slow start restarted from (RFC
             // 6582 §3.2 step 1, §4.1).
             //
-            // Their SACK blocks still show what else was lost, and each one
-            // means a segment left the network: resend the next such hole
-            // now rather than a partial ACK later (RFC 6675 §5.1 NextSeg),
-            // leaving congestion control to the timeout's slow start.
-            let _ = self.retransmit_lost_hole();
+            // Their SACK blocks may show retransmissions arrived, which
+            // leaves room in cwnd for the send loop to resend more of what
+            // the timeout marked lost.
+            self.flush_send_queue();
             return;
         }
         let sb = self.send_buf.as_ref().unwrap();
@@ -1651,22 +1660,102 @@ impl Conn {
         self.start_rto();
     }
 
+    /// Bytes counted against cwnd. Normally everything unacknowledged; in
+    /// timeout recovery, what the timeout marked lost has left the network
+    /// (RFC 5681 §3.1), so only what has been resent since and not SACKed,
+    /// plus anything new sent past `recover`, is still in it (Linux's
+    /// packets_out - lost_out - sacked_out + retrans_out).
+    fn in_flight(&self) -> u32 {
+        let sb = self.send_buf.as_ref().unwrap();
+        let Some(recover) = self.rto_recover else {
+            return sb.unacked() as u32;
+        };
+        let una = sb.una();
+        let resent_to = if seq_after(self.high_rxt, una) {
+            self.high_rxt
+        } else {
+            una
+        };
+        let resent = resent_to.wrapping_sub(una) - sb.sacked_between(una, resent_to);
+        let new = if seq_after(sb.nxt(), recover) {
+            sb.nxt().wrapping_sub(recover)
+        } else {
+            0
+        };
+        resent + new
+    }
+
+    /// Timeout recovery's go-back-N: resend what the timeout marked lost,
+    /// from HighRxt up, skipping what the receiver has SACKed since, while
+    /// cwnd has room. The FIN too, once the data before it has gone.
+    fn rto_retransmit(&mut self) {
+        let Some(recover) = self.rto_recover else {
+            return;
+        };
+        // A zero window is the persist timer's and the RTO's to probe.
+        if self.snd_wnd == 0 {
+            return;
+        }
+        while self.in_flight() < self.cc.send_window() {
+            let room = self.send_mss();
+            let sb = self.send_buf.as_ref().unwrap();
+            let from = if seq_after(self.high_rxt, sb.una()) {
+                self.high_rxt
+            } else {
+                sb.una()
+            };
+            if let Some((seq, data)) = sb.next_unsacked(from, room, recover) {
+                let data = data.to_vec();
+                self.send_retransmission(seq, data);
+                continue;
+            }
+            let fin_seq = sb.nxt().wrapping_sub(1);
+            if self.fin_sent
+                && !self.fin_acked()
+                && seq_before(fin_seq, recover)
+                && seq_before_eq(from, fin_seq)
+            {
+                self.resend_fin();
+                self.high_rxt = fin_seq.wrapping_add(1);
+            }
+            break;
+        }
+    }
+
+    fn resend_fin(&mut self) {
+        // queue_fin advances NXT by 1, which a retransmit must not do.
+        let fin_seq = self.send_buf.as_ref().unwrap().nxt().wrapping_sub(1);
+        let rcv_nxt = self.recv_buf.as_ref().unwrap().nxt();
+        let mut seg = Segment {
+            src_port: self.cfg.local_port,
+            dst_port: self.cfg.remote_port,
+            seq: fin_seq,
+            ack: rcv_nxt,
+            flags: flags::FIN | flags::ACK,
+            window: self.rcv_window(),
+            ..Default::default()
+        };
+        self.add_options(&mut seg);
+        self.queue_seg(seg);
+    }
+
     fn flush_send_queue(&mut self) {
+        // Lost data before new data: the receiver can deliver nothing past
+        // the first hole until it is filled.
+        self.rto_retransmit();
         loop {
             let pending = self.send_buf.as_ref().unwrap().pending();
             if pending == 0 {
                 break;
             }
-            let mut eff_wnd = self.snd_wnd;
             let cc_wnd = self.cc.send_window().saturating_add(self.limited_transmit);
-            if cc_wnd < eff_wnd {
-                eff_wnd = cc_wnd;
-            }
+            let cc_room = cc_wnd.saturating_sub(self.in_flight());
             let unacked = self.send_buf.as_ref().unwrap().unacked() as u32;
-            if eff_wnd <= unacked {
+            let rcv_room = self.snd_wnd.saturating_sub(unacked);
+            if cc_room == 0 || rcv_room == 0 {
                 break;
             }
-            let avail = (eff_wnd - unacked) as usize;
+            let avail = cc_room.min(rcv_room) as usize;
             let opts = self.segment_options();
             let room = self.payload_room(&opts);
             let n = avail.min(room).min(pending);
@@ -1966,20 +2055,11 @@ impl Conn {
                 // once only it is outstanding.
                 let resent = self.retransmit();
                 if !resent && self.fin_sent && !self.fin_acked() {
-                    // queue_fin advances NXT by 1, which a retransmit must not do.
-                    let fin_seq = self.send_buf.as_ref().unwrap().nxt().wrapping_sub(1);
-                    let rcv_nxt = self.recv_buf.as_ref().unwrap().nxt();
-                    let mut seg = Segment {
-                        src_port: self.cfg.local_port,
-                        dst_port: self.cfg.remote_port,
-                        seq: fin_seq,
-                        ack: rcv_nxt,
-                        flags: flags::FIN | flags::ACK,
-                        window: self.rcv_window(),
-                        ..Default::default()
-                    };
-                    self.add_options(&mut seg);
-                    self.queue_seg(seg);
+                    self.resend_fin();
+                    let nxt = self.send_buf.as_ref().unwrap().nxt();
+                    if seq_before(self.high_rxt, nxt) {
+                        self.high_rxt = nxt;
+                    }
                 }
             }
             _ => {}
@@ -3351,6 +3431,58 @@ mod tests {
         assert_eq!(segs.len(), 1, "one segment, not the initial window");
     }
 
+    /// A blackout loses a whole flight of a few hundred segments. After
+    /// the RTO all of it counts as lost (RFC 5681 §3.1), and slow start
+    /// resends it at a doubling rate: a logarithmic number of round trips,
+    /// not one per segment.
+    fn blackout_run(sack: bool, port: u16) {
+        let conf = |l, r| {
+            big(l, r)
+                .send_buf_size(1 << 22)
+                .recv_buf_size(1 << 20)
+                .enable_sack(sack)
+        };
+        let mut client = Conn::new(conf(port, 80));
+        let mut server = Conn::new(conf(80, port));
+        drive_handshake(&mut client, &mut server);
+        let data: Vec<u8> = (0..1u32 << 22).map(|i| ((i * 13) >> 5) as u8).collect();
+        let (n, mut out) = client.write(&data);
+        assert_eq!(n, data.len());
+        let mut received = Vec::new();
+        while out.len() < 300 {
+            let acks = deliver(&mut server, &out);
+            received.extend(read_all(&mut server));
+            out = deliver(&mut client, &acks);
+        }
+        let lost = out.len();
+        let recover = client.send_buf.as_ref().unwrap().nxt();
+
+        let mut out = fire_rto(&mut client);
+        let mut rtts = 0;
+        while seq_before(client.send_buf.as_ref().unwrap().una(), recover) {
+            rtts += 1;
+            assert!(
+                rtts <= 20,
+                "sack={sack}: {lost} lost segments, {rtts} round trips"
+            );
+            let acks = deliver(&mut server, &out);
+            received.extend(read_all(&mut server));
+            out = deliver(&mut client, &acks);
+        }
+        assert!(
+            rtts <= 2 * (lost as f64).log2().ceil() as usize,
+            "sack={sack}: {rtts} round trips for {lost} segments"
+        );
+        received.extend(read_all(&mut server));
+        assert_eq!(received[..], data[..received.len()]);
+    }
+
+    #[test]
+    fn blackout_recovers_in_log_round_trips() {
+        blackout_run(false, 40235);
+        blackout_run(true, 40236);
+    }
+
     fn big(local: u16, remote: u16) -> ConnConfig {
         let mut c = cfg(local, remote);
         c.mss = 1000;
@@ -3427,10 +3559,11 @@ mod tests {
     }
 
     /// Segments 0 and 5 lost, and the duplicate ACKs held up until the RTO
-    /// has resent segment 0. Their SACK blocks show segment 5 lost as well:
-    /// it goes out on them (RFC 6675 NextSeg), without waiting for the
-    /// partial ACK, and without touching cwnd. A HighRxt left over from an
-    /// earlier recovery must not hide the hole.
+    /// has resent segment 0. They report nothing that left the network
+    /// since the timeout, so with cwnd at one segment they send nothing,
+    /// and leave cwnd alone. The partial ACK for segment 0 then resends
+    /// segment 5, skipping the SACKed segments around it, and only once. A
+    /// HighRxt left over from an earlier recovery must not hide the hole.
     #[test]
     fn duplicate_acks_during_rto_recovery_resend_sacked_holes() {
         let mut client = Conn::new(big(40228, 80));
@@ -3452,25 +3585,24 @@ mod tests {
         assert_eq!(seqs(&rexmit), vec![parse(&segs[0]).seq]);
         let cwnd = client.cc.send_window();
         let out = deliver(&mut client, &late_dups);
+        assert!(out.is_empty(), "past cwnd, sent {:?}", seqs(&out));
+        assert!(!client.cc.in_recovery());
+        assert_eq!(client.cc.send_window(), cwnd);
+
+        // The partial ACK the first retransmission draws stops at segment
+        // 5: the go-back-N resend goes straight to it.
+        let partial = deliver(&mut server, &rexmit);
+        assert_eq!(parse(partial.last().unwrap()).ack, parse(&segs[5]).seq);
+        let out = deliver(&mut client, &partial);
         assert_eq!(
             seqs(&out),
             vec![parse(&segs[5]).seq],
             "the SACKed-around hole, once"
         );
-        assert!(!client.cc.in_recovery());
-        assert_eq!(client.cc.send_window(), cwnd);
-
-        // The partial ACK the first retransmission draws stops at segment
-        // 5, which is below HighRxt now: resending it would be spurious.
-        let partial = deliver(&mut server, &rexmit);
-        assert_eq!(parse(partial.last().unwrap()).ack, parse(&segs[5]).seq);
-        let again = deliver(&mut client, &partial);
-        assert!(
-            !seqs(&again).contains(&parse(&segs[5]).seq),
-            "hole resent twice"
-        );
-        deliver(&mut server, &out);
+        let acks = deliver(&mut server, &out);
         assert_eq!(read_all(&mut server).len(), 10_000);
+        assert!(deliver(&mut client, &acks).is_empty(), "hole resent twice");
+        assert!(client.rto_recover.is_none());
     }
 
     /// The MSS counts payload only; options come out of it (RFC 6691 §2,

@@ -229,6 +229,63 @@ impl SendBuf {
         Some((seq, &self.data()[from..from + len]))
     }
 
+    /// The first data at or after `from` and before `limit` that the
+    /// receiver has not SACKed: its sequence number and up to `n` bytes,
+    /// stopping where the next SACKed range begins.
+    pub fn next_unsacked(&self, from: u32, n: usize, limit: u32) -> Option<(u32, &[u8])> {
+        let data = self.data();
+        let unacked = (self.nxt.wrapping_sub(self.una) as usize).min(data.len());
+        let mut end = self.una.wrapping_add(unacked as u32);
+        if seq_before(limit, end) {
+            end = limit;
+        }
+        let mut seq = if seq_before(from, self.una) {
+            self.una
+        } else {
+            from
+        };
+        let mut hole_end = end;
+        for b in &self.sacked {
+            if seq_before_eq(b.right, seq) {
+                continue;
+            }
+            if seq_before_eq(b.left, seq) {
+                seq = b.right;
+            } else {
+                if seq_before(b.left, hole_end) {
+                    hole_end = b.left;
+                }
+                break;
+            }
+        }
+        if !seq_before(seq, end) {
+            return None;
+        }
+        let off = seq.wrapping_sub(self.una) as usize;
+        let len = (hole_end.wrapping_sub(seq) as usize).min(n);
+        Some((seq, &data[off..off + len]))
+    }
+
+    /// How many bytes in `from..to` the receiver has SACKed.
+    pub fn sacked_between(&self, from: u32, to: u32) -> u32 {
+        self.sacked
+            .iter()
+            .map(|b| {
+                let l = if seq_after(b.left, from) {
+                    b.left
+                } else {
+                    from
+                };
+                let r = if seq_before(b.right, to) { b.right } else { to };
+                if seq_after(r, l) {
+                    r.wrapping_sub(l)
+                } else {
+                    0
+                }
+            })
+            .sum()
+    }
+
     /// The first hole at or after `from` that counts as lost, and up to `n`
     /// bytes of it.
     ///
