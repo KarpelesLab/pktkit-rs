@@ -9,13 +9,13 @@
 //!
 //! Port of `alg_h323.go`.
 
-use crate::nat::helper::{Expectation, Helper, NatMapping, PROTO_TCP, PROTO_UDP, PacketHelper};
+use crate::nat::helper::{
+    Expectation, Helper, NatMapping, OpenedPorts, PROTO_TCP, PROTO_UDP, PacketHelper,
+};
 use crate::nat::l4::replace_payload;
 use crate::nat::nat::Nat;
 use crate::time::Instant;
-use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr};
-use std::sync::Mutex;
+use std::net::IpAddr;
 use std::time::Duration;
 
 const H323_PORT: u16 = 1720;
@@ -33,40 +33,24 @@ const MAX_PORTS_PER_MESSAGE: usize = 8;
 /// open mappings across the NAT's port pool either.
 const MAX_PORTS_PER_HOST: usize = 32;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct H323Helper {
-    /// Per inside host (namespace, address): the inside ports opened, with
-    /// when each was last announced.
-    opened: Mutex<HashMap<(u64, Ipv4Addr), Vec<(u16, Instant)>>>,
+    /// The inside ports each host has opened (a port already open counts
+    /// once however often it is announced).
+    opened: OpenedPorts,
+}
+
+impl Default for H323Helper {
+    fn default() -> Self {
+        H323Helper {
+            opened: OpenedPorts::new(MAX_PORTS_PER_HOST, H323_RTP_TIMEOUT),
+        }
+    }
 }
 
 impl H323Helper {
     pub fn new() -> H323Helper {
         H323Helper::default()
-    }
-
-    /// Whether `host` may open inside port `port` now; if so, it is counted.
-    /// A port already open counts once however often it is announced.
-    fn admit(&self, host: (u64, Ipv4Addr), port: u16, now: Instant) -> bool {
-        let mut opened = self.opened.lock().unwrap();
-        let ports = opened.entry(host).or_default();
-        ports.retain(|&(_, t)| now.saturating_duration_since(t) < H323_RTP_TIMEOUT);
-        if let Some(p) = ports.iter_mut().find(|(p, _)| *p == port) {
-            p.1 = now;
-            return true;
-        }
-        if ports.len() >= MAX_PORTS_PER_HOST {
-            return false;
-        }
-        ports.push((port, now));
-        // Hosts that went quiet leave no record behind.
-        if opened.len() > 64 {
-            opened.retain(|_, ports| {
-                ports.retain(|&(_, t)| now.saturating_duration_since(t) < H323_RTP_TIMEOUT);
-                !ports.is_empty()
-            });
-        }
-        true
     }
 }
 
@@ -111,7 +95,7 @@ impl PacketHelper for H323Helper {
                     let admitted = if opened.contains(&port) {
                         true
                     } else if opened.len() < MAX_PORTS_PER_MESSAGE
-                        && self.admit((m.namespace, inside_ip), port, now)
+                        && self.opened.admit((m.namespace, inside_ip), &[port], now)
                     {
                         opened.push(port);
                         true

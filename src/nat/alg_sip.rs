@@ -10,7 +10,9 @@
 //!
 //! Port of `alg_sip.go`.
 
-use crate::nat::helper::{Expectation, Helper, NatMapping, PROTO_TCP, PROTO_UDP, PacketHelper};
+use crate::nat::helper::{
+    Expectation, Helper, NatMapping, OpenedPorts, PROTO_TCP, PROTO_UDP, PacketHelper,
+};
 use crate::nat::l4::replace_payload;
 use crate::nat::nat::Nat;
 use crate::time::Instant;
@@ -19,13 +21,33 @@ use std::time::Duration;
 
 const SIP_PORT: u16 = 5060;
 const SIP_RTP_TIMEOUT: Duration = Duration::from_secs(120);
+/// Cap on the inside ports one SIP message may open. Each `m=` line opens
+/// its RTP and RTCP ports to any remote, and a message is the inside
+/// host's to fill with as many as it likes; a real offer carries a few
+/// streams (audio, video, perhaps another), not hundreds.
+const MAX_PORTS_PER_MESSAGE: usize = 8;
+/// Cap on the distinct ports one inside host may have opened within
+/// [`SIP_RTP_TIMEOUT`], so that a stream of messages cannot spread open
+/// mappings across the NAT's port pool either.
+const MAX_PORTS_PER_HOST: usize = 32;
 
-#[derive(Debug, Default)]
-pub struct SipHelper;
+#[derive(Debug)]
+pub struct SipHelper {
+    /// The inside media ports each host has opened.
+    opened: OpenedPorts,
+}
+
+impl Default for SipHelper {
+    fn default() -> Self {
+        SipHelper {
+            opened: OpenedPorts::new(MAX_PORTS_PER_HOST, SIP_RTP_TIMEOUT),
+        }
+    }
+}
 
 impl SipHelper {
     pub fn new() -> SipHelper {
-        SipHelper
+        SipHelper::default()
     }
 }
 
@@ -126,7 +148,28 @@ impl SipHelper {
             {
                 let sdp_body = new_payload[sdp_start + 4..].to_vec();
                 let new_sdp = if outbound {
-                    rewrite_sdp_outbound(nat, m.namespace, &sdp_body, &outside_addr, inside_ip)
+                    // Past either cap a media line is left as it is, as
+                    // when the port pool is exhausted.
+                    let now = Instant::now();
+                    let mut in_message: Vec<u16> = Vec::new();
+                    let mut admit = |ports: &[u16]| {
+                        let new = ports.iter().filter(|p| !in_message.contains(p));
+                        if in_message.len() + new.clone().count() > MAX_PORTS_PER_MESSAGE
+                            || !self.opened.admit((m.namespace, inside_ip), ports, now)
+                        {
+                            return false;
+                        }
+                        let new: Vec<u16> = new.copied().collect();
+                        in_message.extend(new);
+                        true
+                    };
+                    let media = Media {
+                        nat,
+                        ns: m.namespace,
+                        inside_ip,
+                        admit: &mut admit,
+                    };
+                    rewrite_sdp_outbound(media, &sdp_body, &outside_addr)
                 } else {
                     sip_rewrite_sdp_addr(&sdp_body, &outside_addr, &inside_addr)
                 };
@@ -179,14 +222,8 @@ impl SipHelper {
 /// §8.4), and a relay or multicast group receives the media itself, so
 /// rewriting it to the public address, or mapping ports for it, would send
 /// the media to the wrong place.
-fn rewrite_sdp_outbound(
-    nat: &Nat,
-    ns: u64,
-    sdp: &[u8],
-    outside_addr: &str,
-    inside_ip: Ipv4Addr,
-) -> Vec<u8> {
-    let inside_addr = inside_ip.to_string();
+fn rewrite_sdp_outbound(mut media: Media<'_>, sdp: &[u8], outside_addr: &str) -> Vec<u8> {
+    let inside_addr = media.inside_ip.to_string();
     let lines = split_subslice(sdp, b"\r\n");
     // The session-level connection address: a c= line before the first m=.
     let session_c = lines
@@ -213,7 +250,7 @@ fn rewrite_sdp_outbound(
             let explicit = section().find_map(|l| rtcp_attr(l).map(|(port, _)| port));
             if conn == Some(inside_addr.as_bytes())
                 && let Some((new_line, rtp, rtcp)) =
-                    sip_parse_media_line(&line, nat, ns, inside_ip, explicit)
+                    sip_parse_media_line(&line, &mut media, explicit)
             {
                 out.push(new_line);
                 rtcp_out = rtcp;
@@ -262,18 +299,28 @@ fn sip_rewrite_sdp_addr(sdp: &[u8], old_addr: &str, new_addr: &str) -> Vec<u8> {
     replace_addr(sdp, &old, &new)
 }
 
+/// What mapping an outbound SDP's media streams takes: the NAT, the inside
+/// host (namespace and address) that sent it, and whether the ports a
+/// stream needs may be opened (see [`MAX_PORTS_PER_MESSAGE`]).
+struct Media<'a> {
+    nat: &'a Nat,
+    ns: u64,
+    inside_ip: Ipv4Addr,
+    admit: &'a mut dyn FnMut(&[u16]) -> bool,
+}
+
 /// Parse an SDP `m=` media line, map its RTP port and the RTCP port that
 /// goes with it (`explicit` if an a=rtcp attribute names one, else RTP + 1),
 /// register expectations for both, and return the rewritten line with the
 /// outside RTP and RTCP ports. Returns `None` if the line could not be
-/// processed (left unchanged by the caller).
+/// processed, or its ports may not be opened (left unchanged by the
+/// caller).
 fn sip_parse_media_line(
     line: &[u8],
-    nat: &Nat,
-    ns: u64,
-    inside_ip: Ipv4Addr,
+    media: &mut Media<'_>,
     explicit: Option<u16>,
 ) -> Option<(Vec<u8>, u16, Option<u16>)> {
+    let (nat, ns, inside_ip) = (media.nat, media.ns, media.inside_ip);
     let mut parts: Vec<Vec<u8>> = line
         .split(|b| b.is_ascii_whitespace())
         .filter(|f| !f.is_empty())
@@ -287,6 +334,10 @@ fn sip_parse_media_line(
         return None;
     }
     let rtcp_inside = explicit.or(inside_port.checked_add(1));
+    let ports: Vec<u16> = std::iter::once(inside_port).chain(rtcp_inside).collect();
+    if !(media.admit)(&ports) {
+        return None;
+    }
 
     // RTP on an even port and RTCP on the next (RFC 3550 §11), allocated
     // together so the peer's default of RTP + 1 lands on the RTCP mapping.
@@ -659,6 +710,65 @@ Content-Length: {}\r\n\r\n{}",
             "RTP packet should reach inside via expectation"
         );
         assert_eq!(&inbound[0][16..20], &[10, 0, 0, 5]);
+    }
+
+    /// An SDP offer from 10.0.0.5 with `n` audio streams on even ports from
+    /// `first` up.
+    fn many_streams(first: u16, n: u16) -> String {
+        let mut sdp = String::from("v=0\r\nc=IN IP4 10.0.0.5\r\n");
+        for k in 0..n {
+            sdp.push_str(&format!("m=audio {} RTP/AVP 0\r\n", first + 2 * k));
+        }
+        sdp
+    }
+
+    /// Which of the `n` streams of [`many_streams`] got ports opened.
+    fn opened_streams(nat: &Nat, first: u16, n: u16) -> Vec<u16> {
+        (0..n)
+            .map(|k| first + 2 * k)
+            .filter(|&p| {
+                nat.take_expectation(PROTO_UDP, Ipv4Addr::new(10, 0, 0, 5), p)
+                    .is_some()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn one_message_opens_only_a_few_ports() {
+        let (nat, _, _) = invite_with_sdp(&many_streams(20000, 50), |_| {});
+        // Four streams of RTP and RTCP.
+        assert_eq!(
+            opened_streams(&nat, 20000, 50),
+            [20000, 20002, 20004, 20006]
+        );
+    }
+
+    #[test]
+    fn one_host_opens_only_so_many_media_ports() {
+        let (nat, _, _) = invite_with_sdp(&many_streams(20000, 4), |_| {});
+        let mut opened = opened_streams(&nat, 20000, 4).len();
+        for i in 1..10 {
+            let first = 20000 + 8 * i;
+            let sdp = many_streams(first, 4);
+            let body = format!(
+                "INVITE sip:bob@example.com SIP/2.0\r\n\
+Content-Type: application/sdp\r\n\
+Content-Length: {}\r\n\r\n{}",
+                sdp.len(),
+                sdp
+            );
+            let pkt = build_sip_udp(
+                Ipv4Addr::new(10, 0, 0, 5),
+                5060,
+                Ipv4Addr::new(198, 51, 100, 9),
+                5060,
+                body.as_bytes(),
+            );
+            nat.inside().send(Packet::from_slice(&pkt)).unwrap();
+            opened += opened_streams(&nat, first, 4).len();
+        }
+        // 32 ports: 16 streams.
+        assert_eq!(opened, 16);
     }
 
     /// Send an INVITE carrying `sdp` from 10.0.0.5; returns the SDP that

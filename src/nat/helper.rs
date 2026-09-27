@@ -6,13 +6,76 @@
 
 use crate::Packet;
 use crate::time::Instant;
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::Mutex;
+use std::time::Duration;
 
 /// IP protocol numbers used throughout the NAT.
 pub(crate) const PROTO_ICMP: u8 = 1;
 pub(crate) const PROTO_TCP: u8 = 6;
 pub(crate) const PROTO_UDP: u8 = 17;
 pub(crate) const PROTO_ICMPV6: u8 = 58;
+
+/// The inside ports an ALG has opened for each inside host (namespace,
+/// address), with when each was last announced, so that it can cap them.
+///
+/// ALGs open ports on what inside hosts send, and every one opened is
+/// reachable by any remote; without a cap, a host sending one message after
+/// another could spread open mappings across the NAT's whole port pool.
+#[derive(Debug)]
+pub(crate) struct OpenedPorts {
+    by_host: Mutex<HashMap<(u64, Ipv4Addr), Vec<(u16, Instant)>>>,
+    /// Most distinct ports one host may have open at a time.
+    max_per_host: usize,
+    /// How long an announced port counts as open.
+    window: Duration,
+}
+
+impl OpenedPorts {
+    pub(crate) fn new(max_per_host: usize, window: Duration) -> OpenedPorts {
+        OpenedPorts {
+            by_host: Mutex::new(HashMap::new()),
+            max_per_host,
+            window,
+        }
+    }
+
+    /// Whether `host` may open all of inside `ports` now; if so, they are
+    /// counted, or refreshed where already open. All or none, so a media
+    /// stream is never left with only part of its ports.
+    pub(crate) fn admit(&self, host: (u64, Ipv4Addr), ports: &[u16], now: Instant) -> bool {
+        let window = self.window;
+        let live = |t: &Instant| now.saturating_duration_since(*t) < window;
+        let mut by_host = self.by_host.lock().unwrap();
+        let open = by_host.entry(host).or_default();
+        open.retain(|(_, t)| live(t));
+        let mut new: Vec<u16> = ports
+            .iter()
+            .copied()
+            .filter(|p| !open.iter().any(|(q, _)| q == p))
+            .collect();
+        new.sort_unstable();
+        new.dedup();
+        if open.len() + new.len() > self.max_per_host {
+            return false;
+        }
+        for (p, t) in open.iter_mut() {
+            if ports.contains(p) {
+                *t = now;
+            }
+        }
+        open.extend(new.into_iter().map(|p| (p, now)));
+        // Hosts that went quiet leave no record behind.
+        if by_host.len() > 64 {
+            by_host.retain(|_, open| {
+                open.retain(|(_, t)| live(t));
+                !open.is_empty()
+            });
+        }
+        true
+    }
+}
 
 /// Common base every NAT helper exposes.
 ///
