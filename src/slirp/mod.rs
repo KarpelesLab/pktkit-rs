@@ -31,6 +31,7 @@ mod icmpv6;
 mod ipv6;
 mod listener;
 mod listener6;
+mod ns_table;
 mod packet;
 mod tcp_out;
 mod tcp_stream;

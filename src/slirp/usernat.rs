@@ -28,6 +28,7 @@ use crate::slirp::icmpv6::build_icmpv6_echo_reply;
 use crate::slirp::ipv6::skip_extension_headers;
 use crate::slirp::listener::{Listener, ListenerKey, resolve_v4};
 use crate::slirp::listener6::{Listener6, ListenerKey6, resolve_v6};
+use crate::slirp::ns_table::{NsKey, NsTable};
 use crate::slirp::packet::fit_link;
 use crate::slirp::tcp_out::{TcpOutConn, build_refused_rst, build_rst_for_stray};
 use crate::slirp::tcp_stream::{ConnState, Endpoints, tick_conn};
@@ -41,7 +42,7 @@ use crate::time::Instant;
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::thread;
 use std::time::Duration;
@@ -64,9 +65,39 @@ struct Key6 {
     dst_port: u16,
 }
 
-/// Cap on simultaneous virtual-side TCP connections; mirrors the Go
-/// constant of the same name.
-const MAX_VIRT_TCP_CONNS: usize = 10_000;
+impl NsKey for Key {
+    #[inline]
+    fn ns(&self) -> u64 {
+        self.ns
+    }
+}
+
+impl NsKey for Key6 {
+    #[inline]
+    fn ns(&self) -> u64 {
+        self.ns
+    }
+}
+
+/// Every stack-wide cap below is also shared out between namespaces: one
+/// namespace may hold at most this fraction (1/`NS_SHARE`) of it, so a
+/// guest that opens flows until a table is full leaves the others room.
+///
+/// Namespace 0, the single-peer path ([`Stack`]'s own `send`), gets the
+/// whole of each cap as long as no peer is attached through
+/// [`L3Connector::connect_l3`]: alone, it has nobody to leave room for.
+/// Attached namespaces always get their share only, however few are
+/// attached at the moment: a share that grew while a namespace was alone
+/// would let it fill a table before the next one arrives, and keep it
+/// full. The price is that a stack serving one attached peer holds it to a
+/// quarter of each cap.
+const NS_SHARE: usize = 4;
+
+/// Cap on simultaneous virtual-side TCP connections per address family;
+/// mirrors the Go constant of the same name. Smaller under test so the
+/// per-namespace share can be exercised, though still above a listener's
+/// backlog.
+const MAX_VIRT_TCP_CONNS: usize = if cfg!(test) { 256 } else { 10_000 };
 
 /// Cap on outbound TCP bridges per address family. Each holds a real socket
 /// and two pump threads, and any guest can open them, so this bounds the
@@ -83,19 +114,19 @@ const MAX_TIME_WAIT: usize = if cfg!(test) { 4 } else { 8192 };
 /// Cap on outbound TCP dials in flight at once. A dial to a destination that
 /// drops SYNs holds a thread for up to the connect timeout; SYNs past the cap
 /// are dropped, and the client's retransmissions try again later.
-const MAX_PENDING_DIALS: usize = 256;
-
-/// Cap on the dials of [`MAX_PENDING_DIALS`] one namespace may hold, so that
-/// one guest cannot hold them all and leave every other guest unable to
-/// open a connection. Small under test so the cap itself can be exercised.
-const MAX_PENDING_DIALS_PER_NS: usize = if cfg!(test) { 4 } else { 64 };
+///
+/// Like every cap here it is shared out between namespaces (see
+/// [`NS_SHARE`]), so that one guest cannot hold every dial and leave every
+/// other guest unable to open a connection. Small under test so that
+/// share can be exercised.
+const MAX_PENDING_DIALS: usize = if cfg!(test) { 16 } else { 256 };
 
 /// Cap on dials still running for a bridge that has already gone (the guest
 /// reset it while it was dialing). Nothing waits on such a dial any more, so
 /// it gives its place under [`MAX_PENDING_DIALS`] back; but its thread runs
 /// on until the connect ends, so these are capped too, stack-wide and per
-/// namespace (at [`MAX_PENDING_DIALS_PER_NS`]). A dial past these caps keeps
-/// counting as pending until it ends.
+/// namespace (at the namespace's share of [`MAX_PENDING_DIALS`]). A dial
+/// past these caps keeps counting as pending until it ends.
 const MAX_ORPHAN_DIALS: usize = 256;
 
 /// Cap on UDP flows per address family. Each one holds a real socket and a
@@ -122,17 +153,17 @@ struct Inner {
     handler: Mutex<Option<L3Handler>>,
     // Per-protocol connection tables. Outbound TCP terminates the virtual side
     // with a server-side vtcp::Conn and bridges to a real socket (`TcpOutConn`).
-    tcp: Mutex<HashMap<Key, Arc<TcpOutConn>>>,
-    tcp6: Mutex<HashMap<Key6, Arc<TcpOutConn>>>,
+    tcp: Mutex<NsTable<Key, Arc<TcpOutConn>>>,
+    tcp6: Mutex<NsTable<Key6, Arc<TcpOutConn>>>,
     /// How many of the `tcp` / `tcp6` entries are in TIME-WAIT, as of the
     /// last tick: those do not count against [`MAX_OUTBOUND_TCP`].
-    tcp_time_wait: AtomicUsize,
-    tcp6_time_wait: AtomicUsize,
-    udp: Mutex<HashMap<Key, Arc<UdpConn>>>,
-    udp6: Mutex<HashMap<Key6, Arc<UdpConn6>>>,
+    tcp_time_wait: Mutex<TimeWaits>,
+    tcp6_time_wait: Mutex<TimeWaits>,
+    udp: Mutex<NsTable<Key, Arc<UdpConn>>>,
+    udp6: Mutex<NsTable<Key6, Arc<UdpConn6>>>,
     // Inbound virtual TCP connections accepted by a Listener (vtcp-backed).
-    virt_tcp: Mutex<HashMap<Key, Arc<ConnState>>>,
-    virt_tcp6: Mutex<HashMap<Key6, Arc<ConnState>>>,
+    virt_tcp: Mutex<NsTable<Key, Arc<ConnState>>>,
+    virt_tcp6: Mutex<NsTable<Key6, Arc<ConnState>>>,
     // Held weakly: the application owns its listeners, and dropping the last
     // handle closes one and frees its address.
     listeners: Mutex<HashMap<ListenerKey, Weak<Listener>>>,
@@ -143,8 +174,12 @@ struct Inner {
     /// Outbound dials still waiting on the real destination; each holds a
     /// thread, so they are capped separately from established flows.
     dials: Arc<Mutex<Dials>>,
-    /// Fragments from the virtual network awaiting the rest of their datagram.
-    defrag: Mutex<Reassembler>,
+    /// Fragments from the virtual network awaiting the rest of their
+    /// datagram, a reassembler per namespace: its caps evict the oldest
+    /// datagrams, and a shared one would let one guest's fragments evict
+    /// every other guest's. Each holds at most 1 MiB, as Linux budgets per
+    /// network namespace; a namespace's goes when it is detached.
+    defrag: Mutex<HashMap<u64, Reassembler>>,
     /// Which host destinations the guests may reach; `None` allows all.
     filter: RwLock<Option<DestFilter>>,
     closed: AtomicBool,
@@ -200,6 +235,14 @@ impl L3Device for NsSide {
 /// IP prefix, then wire it up either via `connect_l3` (single peer) or via
 /// [`L3Connector::connect_l3`] (multi-tenant, each peer in its own
 /// namespace).
+///
+/// The stack caps the flows it keeps of each kind (UDP flows, outbound TCP
+/// connections and dials, connections to virtual listeners, TIME-WAIT
+/// entries), and a peer attached through `connect_l3` may hold at most a
+/// quarter of each, so that one peer cannot use a cap up for the others.
+/// The single-peer path (the stack's own `send` and `set_handler`) gets
+/// the whole of each cap for as long as no peer is attached, and a quarter
+/// too from then on.
 pub struct Stack {
     inner: Arc<Inner>,
 }
@@ -219,20 +262,20 @@ impl Stack {
         let inner = Arc::new(Inner {
             addr: RwLock::new(IpPrefix::default()),
             handler: Mutex::new(None),
-            tcp: Mutex::new(HashMap::new()),
-            tcp6: Mutex::new(HashMap::new()),
-            tcp_time_wait: AtomicUsize::new(0),
-            tcp6_time_wait: AtomicUsize::new(0),
-            udp: Mutex::new(HashMap::new()),
-            udp6: Mutex::new(HashMap::new()),
-            virt_tcp: Mutex::new(HashMap::new()),
-            virt_tcp6: Mutex::new(HashMap::new()),
+            tcp: Mutex::default(),
+            tcp6: Mutex::default(),
+            tcp_time_wait: Mutex::default(),
+            tcp6_time_wait: Mutex::default(),
+            udp: Mutex::default(),
+            udp6: Mutex::default(),
+            virt_tcp: Mutex::default(),
+            virt_tcp6: Mutex::default(),
             listeners: Mutex::new(HashMap::new()),
             listeners6: Mutex::new(HashMap::new()),
             ns_sides: Mutex::new(HashMap::new()),
             ns_counter: AtomicU64::new(0),
             dials: Arc::new(Mutex::new(Dials::default())),
-            defrag: Mutex::new(Reassembler::default()),
+            defrag: Mutex::new(HashMap::new()),
             filter: RwLock::new(None),
             closed: AtomicBool::new(false),
         });
@@ -327,8 +370,9 @@ impl Stack {
                 // Outbound NAT bridges: tick the virtual-side engine; reap when the
                 // bridge has fully torn down.
                 let now = Instant::now();
-                tick_outbound(&inner.tcp, &inner.tcp_time_wait, now);
-                tick_outbound(&inner.tcp6, &inner.tcp6_time_wait, now);
+                let shared = ns0_shared(&inner);
+                tick_outbound(&inner.tcp, &inner.tcp_time_wait, now, shared);
+                tick_outbound(&inner.tcp6, &inner.tcp6_time_wait, now, shared);
                 drop(inner);
             }
         });
@@ -606,12 +650,13 @@ impl Stack {
         // A fragment is not a datagram: past the first one there is no
         // transport header at all, and the first alone is truncated.
         if u16::from_be_bytes([pkt[6], pkt[7]]) & 0x3FFF != 0 {
-            let whole =
-                inner
-                    .defrag
-                    .lock()
-                    .expect("poisoned")
-                    .push_v4(Instant::now(), ns, pkt, ihl);
+            let whole = inner
+                .defrag
+                .lock()
+                .expect("poisoned")
+                .entry(ns)
+                .or_default()
+                .push_v4(Instant::now(), ns, pkt, ihl);
             return match whole {
                 Some(p) => Self::handle_ipv4(inner, ns, &p),
                 None => Ok(()),
@@ -732,14 +777,14 @@ impl Stack {
 
         // SYN → dial the real destination and bridge it to a server-side
         // vtcp::Conn terminating the virtual side.
-        if !outbound_slot_free(&inner.tcp, &inner.tcp_time_wait) {
+        if !outbound_slot_free(inner, &inner.tcp, &inner.tcp_time_wait, ns) {
             return Ok(()); // silently drop; client will retransmit
         }
         let seg = match Segment::parse(tcp) {
             Ok(s) => s,
             Err(_) => return Ok(()),
         };
-        let Some(slot) = DialSlot::reserve(&inner.dials, ns) else {
+        let Some(slot) = DialSlot::reserve(inner, ns) else {
             return Ok(()); // as above
         };
 
@@ -811,7 +856,9 @@ impl Stack {
             dst_ip: dst.octets(),
             dst_port,
         };
-        if inner.virt_tcp.lock().expect("poisoned").len() >= MAX_VIRT_TCP_CONNS {
+        let cap = ns_cap(inner, ns, MAX_VIRT_TCP_CONNS);
+        let full = |t: &NsTable<Key, _>| t.len() >= MAX_VIRT_TCP_CONNS || t.ns_len(ns) >= cap;
+        if full(&inner.virt_tcp.lock().expect("poisoned")) {
             return Ok(()); // silently drop; client will retransmit
         }
         // TODO(slirp): when the accept queue is near-full, fall back to a
@@ -912,7 +959,9 @@ impl Stack {
             let mut t = inner.udp.lock().expect("poisoned");
             if let Some(c) = t.get(&key).filter(|c| !c.is_closed()) {
                 c.clone()
-            } else if t.len() >= MAX_UDP_FLOWS && !t.contains_key(&key) {
+            } else if !t.contains_key(&key)
+                && (t.len() >= MAX_UDP_FLOWS || t.ns_len(ns) >= ns_cap(inner, ns, MAX_UDP_FLOWS))
+            {
                 return Ok(()); // table full: drop, as a full conntrack table would
             } else {
                 let weak = Arc::downgrade(inner);
@@ -951,6 +1000,8 @@ impl Stack {
                 .defrag
                 .lock()
                 .expect("poisoned")
+                .entry(ns)
+                .or_default()
                 .reassemble(Instant::now(), ns, pkt);
             // Straight to the datagram path, never back through this one:
             // reassembly happens once, and a rebuilt packet that still
@@ -1085,14 +1136,14 @@ impl Stack {
             return Self::dispatch(inner, ns, &pkt);
         };
 
-        if !outbound_slot_free(&inner.tcp6, &inner.tcp6_time_wait) {
+        if !outbound_slot_free(inner, &inner.tcp6, &inner.tcp6_time_wait, ns) {
             return Ok(()); // silently drop; client will retransmit
         }
         let seg = match Segment::parse(tcp) {
             Ok(s) => s,
             Err(_) => return Ok(()),
         };
-        let Some(slot) = DialSlot::reserve(&inner.dials, ns) else {
+        let Some(slot) = DialSlot::reserve(inner, ns) else {
             return Ok(()); // as above
         };
 
@@ -1154,7 +1205,9 @@ impl Stack {
             dst_ip: dst.octets(),
             dst_port,
         };
-        if inner.virt_tcp6.lock().expect("poisoned").len() >= MAX_VIRT_TCP_CONNS {
+        let cap = ns_cap(inner, ns, MAX_VIRT_TCP_CONNS);
+        let full = |t: &NsTable<Key6, _>| t.len() >= MAX_VIRT_TCP_CONNS || t.ns_len(ns) >= cap;
+        if full(&inner.virt_tcp6.lock().expect("poisoned")) {
             return Ok(()); // silently drop; client will retransmit
         }
         // TODO(slirp): when the accept queue is near-full, fall back to a
@@ -1248,7 +1301,9 @@ impl Stack {
             let mut t = inner.udp6.lock().expect("poisoned");
             if let Some(c) = t.get(&key).filter(|c| !c.is_closed()) {
                 c.clone()
-            } else if t.len() >= MAX_UDP_FLOWS && !t.contains_key(&key) {
+            } else if !t.contains_key(&key)
+                && (t.len() >= MAX_UDP_FLOWS || t.ns_len(ns) >= ns_cap(inner, ns, MAX_UDP_FLOWS))
+            {
                 return Ok(()); // table full: drop, as a full conntrack table would
             } else {
                 let weak = Arc::downgrade(inner);
@@ -1275,8 +1330,8 @@ impl Stack {
     /// closing sends RSTs through the handler, and a handler that answers
     /// synchronously re-enters `send`, which needs those same table locks.
     fn close_flows(inner: &Arc<Inner>, which: impl Fn(u64) -> bool) {
-        fn take<K: Copy + Eq + std::hash::Hash, V>(
-            m: &Mutex<HashMap<K, V>>,
+        fn take<K: NsKey, V>(
+            m: &Mutex<NsTable<K, V>>,
             ns: impl Fn(&K) -> u64,
             which: &impl Fn(u64) -> bool,
         ) -> Vec<V> {
@@ -1285,6 +1340,9 @@ impl Stack {
             };
             let keys: Vec<K> = t.keys().filter(|k| which(ns(k))).copied().collect();
             keys.iter().filter_map(|k| t.remove(k)).collect()
+        }
+        if let Ok(mut d) = inner.defrag.lock() {
+            d.retain(|&ns, _| !which(ns));
         }
         let virt: Vec<Arc<ConnState>> = take(&inner.virt_tcp, |k| k.ns, &which)
             .into_iter()
@@ -1383,6 +1441,8 @@ struct Dials {
 struct DialSlot {
     dials: Arc<Mutex<Dials>>,
     ns: u64,
+    /// Its namespace's share of the caps, as of the reservation.
+    cap: usize,
     /// Whether it counts as an orphan rather than as pending; only ever
     /// changed with `dials` locked.
     orphan: AtomicBool,
@@ -1390,17 +1450,19 @@ struct DialSlot {
 
 impl DialSlot {
     /// Take a place for a new dial from namespace `ns`, if the caps allow.
-    fn reserve(dials: &Arc<Mutex<Dials>>, ns: u64) -> Option<DialSlot> {
-        let mut d = dials.lock().expect("poisoned");
+    fn reserve(inner: &Inner, ns: u64) -> Option<DialSlot> {
+        let cap = ns_cap(inner, ns, MAX_PENDING_DIALS);
+        let mut d = inner.dials.lock().expect("poisoned");
         let mine = d.per_ns.get(&ns).map_or(0, |c| c.0);
-        if d.all.0 >= MAX_PENDING_DIALS || mine >= MAX_PENDING_DIALS_PER_NS {
+        if d.all.0 >= MAX_PENDING_DIALS || mine >= cap {
             return None;
         }
         d.all.0 += 1;
         d.per_ns.entry(ns).or_default().0 += 1;
         Some(DialSlot {
-            dials: dials.clone(),
+            dials: inner.dials.clone(),
             ns,
+            cap,
             orphan: AtomicBool::new(false),
         })
     }
@@ -1411,9 +1473,7 @@ impl DialSlot {
         let mut d = self.dials.lock().expect("poisoned");
         let d = &mut *d;
         let mine = d.per_ns.entry(self.ns).or_default();
-        if self.orphan.load(Ordering::Relaxed)
-            || d.all.1 >= MAX_ORPHAN_DIALS
-            || mine.1 >= MAX_PENDING_DIALS_PER_NS
+        if self.orphan.load(Ordering::Relaxed) || d.all.1 >= MAX_ORPHAN_DIALS || mine.1 >= self.cap
         {
             return;
         }
@@ -1460,27 +1520,78 @@ fn call_handler(h: &L3Handler, pkt: &[u8]) -> Result<()> {
         .unwrap_or_else(|_| Err(io::Error::other("packet handler panicked")))
 }
 
-/// Whether a new outbound bridge may be opened in `table`. Bridges in
-/// TIME-WAIT hold no thread and are bounded on their own, by
+/// Whether namespace 0 is held to its share of the caps: once a peer is
+/// attached, it has others to leave room for (see [`NS_SHARE`]).
+fn ns0_shared(inner: &Inner) -> bool {
+    !inner.ns_sides.lock().expect("poisoned").is_empty()
+}
+
+/// The part of the stack-wide cap `global` that namespace `ns` may hold.
+///
+/// It may be called with a flow table locked: nothing takes a table lock
+/// with `ns_sides` locked.
+fn ns_cap(inner: &Inner, ns: u64, global: usize) -> usize {
+    share(global, ns, ns != 0 || ns0_shared(inner))
+}
+
+/// `global`, or a namespace's share of it; `shared` is whether namespace 0
+/// is held to its share too.
+fn share(global: usize, ns: u64, shared: bool) -> usize {
+    if ns != 0 || shared {
+        global / NS_SHARE
+    } else {
+        global
+    }
+}
+
+/// Outbound bridges in TIME-WAIT, stack-wide and per namespace, as of the
+/// last tick.
+#[derive(Default)]
+struct TimeWaits {
+    all: usize,
+    per_ns: HashMap<u64, usize>,
+}
+
+/// Whether namespace `ns` may open a new outbound bridge in `table`.
+/// Bridges in TIME-WAIT hold no thread and are bounded on their own, by
 /// [`MAX_TIME_WAIT`]; the hard stop covers the entries that entered
 /// TIME-WAIT, or left it, since the tick last counted them.
-fn outbound_slot_free<K>(
-    table: &Mutex<HashMap<K, Arc<TcpOutConn>>>,
-    time_wait: &AtomicUsize,
+fn outbound_slot_free<K: NsKey>(
+    inner: &Inner,
+    table: &Mutex<NsTable<K, Arc<TcpOutConn>>>,
+    time_wait: &Mutex<TimeWaits>,
+    ns: u64,
 ) -> bool {
-    let len = table.lock().expect("poisoned").len();
+    let live_cap = ns_cap(inner, ns, MAX_OUTBOUND_TCP);
+    let tw_cap = ns_cap(inner, ns, MAX_TIME_WAIT);
+    let (len, mine) = {
+        let t = table.lock().expect("poisoned");
+        (t.len(), t.ns_len(ns))
+    };
+    let (tw, my_tw) = {
+        let w = time_wait.lock().expect("poisoned");
+        (w.all, w.per_ns.get(&ns).copied().unwrap_or(0))
+    };
     len < MAX_OUTBOUND_TCP + MAX_TIME_WAIT
-        && len.saturating_sub(time_wait.load(Ordering::Acquire)) < MAX_OUTBOUND_TCP
+        && len.saturating_sub(tw) < MAX_OUTBOUND_TCP
+        && mine < live_cap + tw_cap
+        && mine.saturating_sub(my_tw) < live_cap
 }
 
 /// Drive the timers of every outbound bridge in `table`, reset those whose
 /// client has not completed the handshake in time, reap those that have
 /// torn down, and keep those in TIME-WAIT within [`MAX_TIME_WAIT`] by
 /// dropping the oldest early.
-fn tick_outbound<K: Copy + Eq + std::hash::Hash>(
-    table: &Mutex<HashMap<K, Arc<TcpOutConn>>>,
-    time_wait: &AtomicUsize,
+///
+/// `shared` is whether namespace 0 is held to its share (see [`ns_cap`]):
+/// each namespace's own oldest go first when it has more than its share,
+/// so that one namespace's churn cannot push every other's connections out
+/// of TIME-WAIT early.
+fn tick_outbound<K: NsKey>(
+    table: &Mutex<NsTable<K, Arc<TcpOutConn>>>,
+    time_wait: &Mutex<TimeWaits>,
     now: Instant,
+    shared: bool,
 ) {
     let out: Vec<(K, Arc<TcpOutConn>)> = table
         .lock()
@@ -1501,12 +1612,35 @@ fn tick_outbound<K: Copy + Eq + std::hash::Hash>(
             waiting.push((since, k, c));
         }
     }
-    if waiting.len() > MAX_TIME_WAIT {
-        waiting.sort_by_key(|w| w.0);
-        let excess = waiting.len() - MAX_TIME_WAIT;
-        dead.extend(waiting.drain(..excess).map(|(_, k, c)| (k, c)));
+    // Oldest first, for both evictions below.
+    waiting.sort_by_key(|w| w.0);
+    let mut per_ns: HashMap<u64, usize> = HashMap::new();
+    for (_, k, _) in &waiting {
+        *per_ns.entry(k.ns()).or_default() += 1;
     }
-    time_wait.store(waiting.len(), Ordering::Release);
+    let mut kept = Vec::with_capacity(waiting.len());
+    for (since, k, c) in waiting {
+        let n = per_ns.get_mut(&k.ns()).expect("counted above");
+        if *n > share(MAX_TIME_WAIT, k.ns(), shared) {
+            *n -= 1;
+            dead.push((k, c));
+        } else {
+            kept.push((since, k, c));
+        }
+    }
+    let mut waiting = kept;
+    if waiting.len() > MAX_TIME_WAIT {
+        let excess = waiting.len() - MAX_TIME_WAIT;
+        for (_, k, c) in waiting.drain(..excess) {
+            *per_ns.get_mut(&k.ns()).expect("counted above") -= 1;
+            dead.push((k, c));
+        }
+    }
+    per_ns.retain(|_, n| *n > 0);
+    *time_wait.lock().expect("poisoned") = TimeWaits {
+        all: waiting.len(),
+        per_ns,
+    };
     if dead.is_empty() {
         return;
     }
@@ -1537,7 +1671,7 @@ fn tick_outbound<K: Copy + Eq + std::hash::Hash>(
 /// never ends, or writing to one that never reads), and that pump holds the
 /// bridge alive. Only shutting the socket down frees it; dropping the table's
 /// handle would leave the pump, its thread and the descriptor stuck.
-fn reap_closed<K: Copy + Eq + std::hash::Hash>(table: &Mutex<HashMap<K, Arc<TcpOutConn>>>) {
+fn reap_closed<K: NsKey>(table: &Mutex<NsTable<K, Arc<TcpOutConn>>>) {
     let gone: Vec<Arc<TcpOutConn>> = {
         let Ok(mut t) = table.lock() else {
             return;
@@ -3525,7 +3659,15 @@ mod tests {
         assert!(bridge.is_closed());
         // Standing in for a pump blocked on the socket.
         let _pump = bridge.clone();
-        let table = Mutex::new(HashMap::from([(1u32, bridge)]));
+        let key = Key {
+            ns: 0,
+            src_ip: [10, 0, 0, 5],
+            src_port: 5000,
+            dst_ip: [1, 1, 1, 1],
+            dst_port: 80,
+        };
+        let table = Mutex::new(NsTable::default());
+        table.lock().unwrap().insert(key, bridge);
         reap_closed(&table);
         assert!(table.lock().unwrap().is_empty());
         theirs
@@ -3599,13 +3741,13 @@ mod tests {
     #[test]
     fn one_namespace_cannot_hold_every_dial() {
         let stack = Stack::new();
-        for i in 0..MAX_PENDING_DIALS_PER_NS as u16 {
+        for i in 0..(MAX_PENDING_DIALS / NS_SHARE) as u16 {
             if !blackholed_dial(&stack, 1, 20000 + i) {
                 eprintln!("no route to TEST-NET-1 here: the dial cannot be held open");
                 return;
             }
         }
-        assert_eq!(dials_of(&stack, 1).0, MAX_PENDING_DIALS_PER_NS);
+        assert_eq!(dials_of(&stack, 1).0, (MAX_PENDING_DIALS / NS_SHARE));
         assert!(!blackholed_dial(&stack, 1, 21000), "past the cap");
         assert!(blackholed_dial(&stack, 2, 21000), "another namespace");
     }
@@ -3649,6 +3791,7 @@ mod tests {
             &stack.inner.tcp,
             &stack.inner.tcp_time_wait,
             Instant::now() + crate::slirp::tcp_out::HANDSHAKE_TIMEOUT,
+            false,
         );
         assert!(stack.inner.tcp.lock().unwrap().is_empty());
         assert!(
@@ -3666,5 +3809,238 @@ mod tests {
             Ok(0),
             "the host connection was kept"
         );
+    }
+
+    /// Entries of namespace `ns` in a flow table.
+    fn in_ns<K: NsKey, V>(t: &Mutex<NsTable<K, V>>, ns: u64) -> usize {
+        t.lock().unwrap().keys().filter(|k| k.ns() == ns).count()
+    }
+
+    /// One namespace filling the UDP table leaves the others room; the
+    /// single-peer path keeps the whole table while it is alone.
+    #[test]
+    fn udp_flows_are_shared_out_between_namespaces() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let sport = server.local_addr().unwrap().port();
+        let stack = Stack::new();
+        let dgram = |port: u16| {
+            build_udp_v4_packet(
+                Ipv4Addr::new(10, 0, 0, 5),
+                port,
+                Ipv4Addr::new(127, 0, 0, 1),
+                sport,
+                b"x",
+            )
+        };
+        for i in 0..MAX_UDP_FLOWS as u16 {
+            Stack::handle_packet(&stack.inner, 1, &dgram(41000 + i)).unwrap();
+        }
+        assert_eq!(in_ns(&stack.inner.udp, 1), MAX_UDP_FLOWS / NS_SHARE);
+        Stack::handle_packet(&stack.inner, 2, &dgram(41000)).unwrap();
+        assert_eq!(in_ns(&stack.inner.udp, 2), 1, "another namespace");
+
+        // Namespace 0 is held to its share once a peer is attached.
+        let peer = Arc::new(Recorder::default());
+        let _cleanup = L3Connector::connect_l3(&*stack, peer).unwrap();
+        for i in 0..MAX_UDP_FLOWS as u16 {
+            Stack::handle_packet(&stack.inner, 0, &dgram(42000 + i)).unwrap();
+        }
+        assert_eq!(in_ns(&stack.inner.udp, 0), MAX_UDP_FLOWS / NS_SHARE);
+    }
+
+    /// Likewise for outbound TCP bridges.
+    #[test]
+    fn outbound_bridges_are_shared_out_between_namespaces() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let mut held = Vec::new();
+            for s in listener.incoming() {
+                held.push(s);
+            }
+        });
+        let stack = Stack::new();
+        let open = |ns: u64, cport: u16| {
+            let syn = build_tcp_v4_packet(
+                Ipv4Addr::new(10, 0, 0, 5),
+                cport,
+                Ipv4Addr::new(127, 0, 0, 1),
+                port,
+                1,
+                0,
+                tcp_flags::SYN,
+                &[],
+            );
+            Stack::handle_packet(&stack.inner, ns, &syn).unwrap();
+            // One dial at a time, so that only the bridge caps come into it.
+            wait_for("the dial", || {
+                !stack.inner.dials.lock().unwrap().per_ns.contains_key(&ns)
+            });
+        };
+        for i in 0..MAX_OUTBOUND_TCP as u16 {
+            open(1, 43000 + i);
+        }
+        assert_eq!(in_ns(&stack.inner.tcp, 1), MAX_OUTBOUND_TCP / NS_SHARE);
+        open(2, 43000);
+        assert_eq!(in_ns(&stack.inner.tcp, 2), 1, "another namespace");
+    }
+
+    /// Likewise for connections to virtual listeners.
+    #[test]
+    fn virtual_connections_are_shared_out_between_namespaces() {
+        let stack = Stack::new();
+        let _a = stack.listen("tcp", "10.0.0.1:80").unwrap();
+        let _b = stack.listen("tcp", "10.0.0.1:81").unwrap();
+        let syn = |cport: u16, dport: u16| {
+            build_tcp_v4_packet(
+                Ipv4Addr::new(10, 0, 0, 5),
+                cport,
+                Ipv4Addr::new(10, 0, 0, 1),
+                dport,
+                1,
+                0,
+                tcp_flags::SYN,
+                &[],
+            )
+        };
+        // Within one listener's backlog, but past the namespace's share.
+        for i in 0..100 {
+            Stack::handle_packet(&stack.inner, 1, &syn(44000 + i, 80)).unwrap();
+        }
+        assert_eq!(
+            in_ns(&stack.inner.virt_tcp, 1),
+            MAX_VIRT_TCP_CONNS / NS_SHARE
+        );
+        Stack::handle_packet(&stack.inner, 2, &syn(44000, 81)).unwrap();
+        assert_eq!(in_ns(&stack.inner.virt_tcp, 2), 1, "another namespace");
+    }
+
+    /// An outbound bridge, not registered anywhere, driven into TIME-WAIT
+    /// against a client of its own (the bridge closing first).
+    fn time_wait_bridge(cport: u16) -> Arc<TcpOutConn> {
+        fn pump(a: &mut Conn, b: &mut Conn, mut segs: Vec<Vec<u8>>) {
+            let mut to_b = true;
+            while !segs.is_empty() {
+                let mut next = Vec::new();
+                for s in segs {
+                    let seg = Segment::parse(&s).unwrap();
+                    next.extend(if to_b {
+                        b.handle_segment(&seg)
+                    } else {
+                        a.handle_segment(&seg)
+                    });
+                }
+                segs = next;
+                to_b = !to_b;
+            }
+        }
+        let mut client = Conn::new(ConnConfig::default().local_port(cport).remote_port(80));
+        let syn = Segment::parse(&client.connect()[0]).unwrap();
+        let bridge = TcpOutConn::pending(
+            Endpoints::V4 {
+                local_ip: Ipv4Addr::new(1, 1, 1, 1),
+                local_port: 80,
+                remote_ip: Ipv4Addr::new(10, 0, 0, 5),
+                remote_port: cport,
+            },
+            &syn,
+            Arc::new(|_: &[u8]| {}),
+        );
+        {
+            let mut conn = bridge.state().conn.lock().unwrap();
+            let synack = conn.accept_syn(&syn);
+            pump(&mut conn, &mut client, synack);
+            let fin = conn.close();
+            pump(&mut conn, &mut client, fin);
+            let fin = client.close();
+            pump(&mut client, &mut conn, fin);
+            assert_eq!(conn.state(), VtcpState::TimeWait);
+        }
+        bridge
+    }
+
+    /// One namespace's churn through TIME-WAIT pushes out its own oldest
+    /// connections, not another namespace's.
+    #[test]
+    fn time_wait_is_shared_out_between_namespaces() {
+        let key = |ns: u64, cport: u16| Key {
+            ns,
+            src_ip: [10, 0, 0, 5],
+            src_port: cport,
+            dst_ip: [1, 1, 1, 1],
+            dst_port: 80,
+        };
+        let t0 = Instant::now();
+        let table = Mutex::new(NsTable::default());
+        // Namespace 2's is the oldest of all.
+        let b = time_wait_bridge(45000);
+        b.time_wait_since(t0);
+        table.lock().unwrap().insert(key(2, 45000), b);
+        for i in 1..=MAX_TIME_WAIT as u16 + 1 {
+            let b = time_wait_bridge(45000 + i);
+            b.time_wait_since(t0 + Duration::from_secs(i.into()));
+            table.lock().unwrap().insert(key(1, 45000 + i), b);
+        }
+        let counts = Mutex::default();
+        tick_outbound(&table, &counts, t0 + Duration::from_secs(60), false);
+        let t = table.lock().unwrap();
+        assert!(
+            t.contains_key(&key(2, 45000)),
+            "evicted another namespace's"
+        );
+        assert_eq!(t.ns_len(1), MAX_TIME_WAIT / NS_SHARE);
+        // Its newest.
+        assert!(t.contains_key(&key(1, 45000 + MAX_TIME_WAIT as u16 + 1)));
+        let c = counts.lock().unwrap();
+        assert_eq!((c.all, c.per_ns.get(&2).copied()), (t.len(), Some(1)));
+    }
+
+    /// One namespace's fragments cannot evict another's datagram in
+    /// reassembly.
+    #[test]
+    fn reassembly_is_per_namespace() {
+        use crate::fragment::{Fragmentation, fragment_ipv4};
+
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let sport = server.local_addr().unwrap().port();
+        let stack = Stack::new();
+        let frags = |id: u16| {
+            let body: Vec<u8> = (0..3000u32).map(|i| (i % 251) as u8).collect();
+            let mut dgram = build_udp_v4_packet(
+                Ipv4Addr::new(10, 0, 0, 5),
+                46000,
+                Ipv4Addr::new(127, 0, 0, 1),
+                sport,
+                &body,
+            );
+            dgram[4..6].copy_from_slice(&id.to_be_bytes());
+            dgram[10..12].copy_from_slice(&[0, 0]);
+            let cs = ipv4_header_checksum(&dgram[..20]);
+            dgram[10..12].copy_from_slice(&cs.to_be_bytes());
+            let Fragmentation::Fragments(f) = fragment_ipv4(Packet::from_slice(&dgram), 1500)
+            else {
+                panic!("expected fragments");
+            };
+            (f, body)
+        };
+        let (mine, body) = frags(1);
+        Stack::handle_packet(&stack.inner, 2, &mine[0]).unwrap();
+        // More datagrams in progress than one reassembler holds.
+        for id in 0..=crate::defrag::MAX_DATAGRAMS as u16 {
+            let (f, _) = frags(100 + id);
+            Stack::handle_packet(&stack.inner, 1, &f[0]).unwrap();
+        }
+        for f in &mine[1..] {
+            Stack::handle_packet(&stack.inner, 2, f).unwrap();
+        }
+        let mut buf = vec![0u8; 4096];
+        let (n, _) = server
+            .recv_from(&mut buf)
+            .expect("namespace 2's datagram was evicted");
+        assert_eq!(&buf[..n], &body[..]);
     }
 }
