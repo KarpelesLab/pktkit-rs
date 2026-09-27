@@ -407,6 +407,14 @@ pub(crate) fn process_handshake_initiation(
                 peer_key: NoisePublicKey::zero(),
             });
         }
+        // A cookie shows the sender receives at its address, not that it
+        // sends at a sane rate: one host holding a cookie could still keep
+        // us doing DH work flat out. As the reference's
+        // wg_cookie_validate_packet does, hold each source to its share
+        // while under load, dropping the excess without a reply.
+        if !h.ratelimit_allow(remote_addr.ip()) {
+            return Err(io::Error::other("handshake rate limited"));
+        }
     }
 
     let msg_type = u32::from_le_bytes(data[INIT_OFF_TYPE..INIT_OFF_SENDER].try_into().unwrap());

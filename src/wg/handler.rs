@@ -215,6 +215,8 @@ pub struct Handler {
     load: Mutex<LoadMeter>,
     /// Responder-side cookie validator + reply generator.
     cookie_checker: Mutex<crate::wg::cookie::CookieChecker>,
+    /// Handshakes per source address, limited under load.
+    ratelimiter: Mutex<crate::wg::ratelimiter::RateLimiter>,
     /// The multiplexer this handler is a member of, if any. Its members
     /// share one UDP port and a packet is routed to them by receiver index,
     /// so an index has to be unique across all of them, not only here.
@@ -254,6 +256,7 @@ impl Handler {
             load_threshold: lt,
             load: Mutex::new(LoadMeter::default()),
             cookie_checker: Mutex::new(crate::wg::cookie::CookieChecker::new(&pub_key)),
+            ratelimiter: Mutex::default(),
             group: RwLock::new(Weak::new()),
         }))
     }
@@ -1023,6 +1026,15 @@ impl Handler {
             .check_mac2(data, src)
     }
 
+    /// Whether a handshake from `ip` may be processed now, under load and
+    /// with a valid MAC2.
+    pub(crate) fn ratelimit_allow(&self, ip: std::net::IpAddr) -> bool {
+        self.ratelimiter
+            .lock()
+            .expect("ratelimiter lock")
+            .allow(ip, Instant::now())
+    }
+
     /// Mint a cookie-reply message for a requester.
     pub(crate) fn cookie_generate_reply(
         &self,
@@ -1346,6 +1358,40 @@ mod tests {
         let mut init = a.initiate_handshake(&b.public_key()).unwrap();
         init.push(0);
         assert!(b.process_packet(&init, &loopback()).is_err());
+    }
+
+    /// Under load, a source holding a valid cookie is still held to its
+    /// share of handshakes (20 a second, 5 at once), as in the reference.
+    /// Before, a cookie let one host have us do DH work as fast as it sent.
+    #[test]
+    fn under_load_handshakes_are_rate_limited_per_source() {
+        let a = Handler::new(Config::default()).unwrap();
+        let b = Handler::new(Config::default().load_threshold(0)).unwrap();
+        a.add_peer(b.public_key());
+        b.add_peer(a.public_key());
+        let with_cookie = |addr: &SocketAddr| {
+            let init = a.initiate_handshake(&b.public_key()).unwrap();
+            let reply = b.process_packet(&init, addr).unwrap();
+            assert_eq!(reply.ty, PacketType::CookieReply);
+            let got = a.process_packet(&reply.response, addr).unwrap();
+            assert_eq!(got.ty, PacketType::CookieReceived);
+            a.initiate_handshake(&b.public_key()).unwrap()
+        };
+        let here = loopback();
+        let init = with_cookie(&here);
+        for _ in 0..5 {
+            b.ratelimit_allow(here.ip());
+        }
+        let err = b.process_packet(&init, &here).unwrap_err();
+        assert!(err.to_string().contains("rate limited"), "{err}");
+
+        // Another address has its own allowance.
+        let there: SocketAddr = "127.0.0.2:51820".parse().unwrap();
+        let init = with_cookie(&there);
+        assert_eq!(
+            b.process_packet(&init, &there).unwrap().ty,
+            PacketType::HandshakeResponse
+        );
     }
 
     /// Past the threshold of initiations per second, MAC2 is demanded. With

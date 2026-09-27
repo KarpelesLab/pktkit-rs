@@ -42,6 +42,7 @@ mod crypto;
 mod handler;
 mod handshake;
 mod multihandler;
+mod ratelimiter;
 mod replay;
 #[cfg(not(target_family = "wasm"))]
 mod server;
