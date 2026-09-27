@@ -1009,6 +1009,21 @@ impl Nat {
             3 | 11 | 12 if whole => return self.outbound_icmp_error(ns, pkt, ihl),
             _ => return,
         }
+        let Some(outside_ip) = self.outside_addr() else {
+            return;
+        };
+        // An echo request to the NAT's public address, the one TCP and UDP
+        // are hairpinned on. Under NAPT no inside host owns it for ICMP (an
+        // echo request names no port to forward by), so it is the NAT's own
+        // address, and the NAT answers as any host must (RFC 1122
+        // §3.2.2.6). Sent out, it would only reach the upstream, addressed
+        // back to the NAT.
+        if pkt[16..20] == outside_ip.octets() {
+            if whole && let Some(reply) = echo_reply(pkt, ihl) {
+                emit(&reply, fmax, |p| self.send_ns(ns, p));
+            }
+            return;
+        }
         let src_ip = Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]);
         let id = u16::from_be_bytes([pkt[ihl + 4], pkt[ihl + 5]]);
         let k = NatKey {
@@ -1028,11 +1043,6 @@ impl Nat {
                 }
                 None => return,
             }
-        };
-
-        let outside_ip = match self.outside_addr() {
-            Some(a) => a,
-            None => return,
         };
 
         let mut out = pkt.to_vec();
@@ -1746,6 +1756,33 @@ fn ipv4_datagram(pkt: &[u8]) -> Option<(&[u8], usize)> {
 /// step. Better the ALG's rewrite be lost than the connection.
 fn untracked_original(pkt: &[u8], proto: u8, whole: bool, tracked: bool) -> Option<Vec<u8>> {
     (proto == PROTO_TCP && whole && !tracked).then(|| pkt.to_vec())
+}
+
+/// The Echo Reply to an ICMP Echo Request `pkt`, from its destination back
+/// to its source (RFC 792), or `None` if the request is corrupt. Options are
+/// left out: the reply's route is not the request's.
+fn echo_reply(pkt: &[u8], ihl: usize) -> Option<Vec<u8>> {
+    let icmp = &pkt[ihl..];
+    if checksum(icmp) != 0 {
+        return None;
+    }
+    let mut r = vec![0u8; 20];
+    r[0] = 0x45;
+    r[1] = pkt[1];
+    r[2..4].copy_from_slice(&((20 + icmp.len()) as u16).to_be_bytes());
+    r[8] = 64;
+    r[9] = PROTO_ICMP;
+    r[12..16].copy_from_slice(&pkt[16..20]);
+    r[16..20].copy_from_slice(&pkt[12..16]);
+    let ic = checksum(&r);
+    r[10..12].copy_from_slice(&ic.to_be_bytes());
+    let at = r.len();
+    r.extend_from_slice(icmp);
+    r[at] = 0;
+    r[at + 2..at + 4].copy_from_slice(&[0, 0]);
+    let cs = checksum(&r[at..]);
+    r[at + 2..at + 4].copy_from_slice(&cs.to_be_bytes());
+    Some(r)
 }
 
 /// Whether a first fragment holds its whole transport header. The NAT
@@ -2863,6 +2900,23 @@ mod tests {
         assert_eq!(sack(44), 1000 + orig);
         assert_eq!(sack(48), 1000 + orig + 6);
         assert!(crate::nat::l4::v4_l4_checksum_ok(r, 20));
+    }
+
+    #[test]
+    fn ping_to_the_public_address_from_inside_is_answered() {
+        let (nat, i, o) = setup();
+        let p = build_icmp_echo(INSIDE, PUBLIC, 0x77, 3);
+        nat.inside().send(Packet::from_slice(&p)).unwrap();
+        assert!(o.lock().unwrap().is_empty(), "sent out to the upstream");
+        let got = i.lock().unwrap();
+        assert_eq!(got.len(), 1);
+        let r = &got[0];
+        assert_eq!(&r[12..16], &PUBLIC.octets());
+        assert_eq!(&r[16..20], &INSIDE.octets());
+        assert_eq!(r[20], 0, "echo reply");
+        assert_eq!(&r[24..], &p[24..], "identifier, sequence and data");
+        assert_eq!(checksum(&r[..20]), 0);
+        assert_eq!(checksum(&r[20..]), 0);
     }
 
     #[test]
