@@ -9,4 +9,5 @@ use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     pktkit::fuzz::vtcp_segment(data);
+    pktkit::fuzz::vtcp_conversation(data);
 });

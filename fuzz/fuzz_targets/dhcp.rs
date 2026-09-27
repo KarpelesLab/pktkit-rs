@@ -9,4 +9,5 @@ use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     pktkit::fuzz::dhcp_parse(data);
+    pktkit::fuzz::dhcp_exchange(data);
 });

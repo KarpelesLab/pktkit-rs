@@ -90,3 +90,10 @@ path = "fuzz_targets/wg.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "l2"
+path = "fuzz_targets/l2.rs"
+test = false
+doc = false
+bench = false

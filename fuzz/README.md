@@ -28,6 +28,17 @@ The targets are thin: every one calls into `pktkit::fuzz`, which is behind the
 that `tests/robustness.rs` — which runs on stable, in ordinary CI — exercises
 exactly the same code. Add a parser there and both halves pick it up.
 
+## Sequences
+
+Some bugs take more than one packet: a fragment that overlaps an earlier one,
+a segment arriving in the state the last one left behind. Bodies that keep
+state (defragmentation, both NATs, the DHCP server and client, the
+L2Adapter, slirp's reassembler, and a TCP conversation between two vtcp
+engines) read their input as a sequence of messages, each a 2-byte
+big-endian length followed by that many bytes — see `pktkit::fuzz::messages`.
+The TCP body puts the fuzzer on the wire between an honest peer and the engine
+under test, so its corruptions start from segments valid for the connection.
+
 ## The contract
 
 A body may return an error, or nonsense. It may not panic, hang, or read out of

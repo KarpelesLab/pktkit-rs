@@ -10,4 +10,5 @@ use libfuzzer_sys::fuzz_target;
 fuzz_target!(|data: &[u8]| {
     pktkit::fuzz::icmp_errors(data);
     pktkit::fuzz::fragmentation(data);
+    pktkit::fuzz::slirp_reassembly(data);
 });

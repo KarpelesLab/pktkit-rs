@@ -36,18 +36,48 @@ pub fn all(data: &[u8]) {
     #[cfg(feature = "dhcp")]
     dhcp_parse(data);
     #[cfg(feature = "vtcp")]
-    vtcp_segment(data);
+    {
+        vtcp_segment(data);
+        vtcp_conversation(data);
+    }
+    #[cfg(feature = "dhcp")]
+    dhcp_exchange(data);
+    #[cfg(feature = "l2adapter")]
+    l2adapter_frames(data);
+    #[cfg(feature = "slirp")]
+    slirp_reassembly(data);
     #[cfg(feature = "vclient")]
     dns_parse(data);
     #[cfg(feature = "nat")]
     {
         defrag(data);
         nat_forward(data);
+        nat64_forward(data);
     }
     #[cfg(feature = "ovpn")]
     ovpn_control(data);
     #[cfg(feature = "wg")]
     wg_process(data);
+}
+
+/// Split one input into a sequence of messages, each a 2-byte big-endian
+/// length and that many bytes (cut short at the end of the input).
+///
+/// A single input is one packet to most bodies, which can never reach the
+/// bugs that take two: a fragment overlapping an earlier one, a segment
+/// arriving in the state an earlier one left behind. Bodies that keep state
+/// read their input through this instead.
+pub fn messages(mut data: &[u8]) -> impl Iterator<Item = &[u8]> {
+    std::iter::from_fn(move || {
+        if data.len() < 2 {
+            return None;
+        }
+        let n = (u16::from_be_bytes([data[0], data[1]]) as usize).min(data.len() - 2);
+        let (msg, rest) = data[2..].split_at(n);
+        data = rest;
+        Some(msg)
+    })
+    .take(256)
 }
 
 /// Every [`Frame`] accessor, including the VLAN paths.
@@ -297,6 +327,223 @@ pub fn vtcp_segment(data: &[u8]) {
     let _ = crate::vtcp::parse_options(data);
 }
 
+/// A TCP conversation between two engines, with the fuzzer as the network
+/// between them.
+///
+/// ISNs are keyed-random, so bytes the fuzzer invents almost never land in
+/// the window. Instead the peer is an honest engine, and the fuzzer decides
+/// what each side does and what becomes of the peer's segments on the way:
+/// delivered, dropped, reordered, duplicated, or corrupted at chosen offsets.
+/// Corruptions start from a segment that is valid for the connection, so
+/// they reach the state machine rather than its first sequence check.
+#[cfg(feature = "vtcp")]
+pub fn vtcp_conversation(data: &[u8]) {
+    use crate::vtcp::{Conn, ConnConfig, Segment};
+    use std::collections::VecDeque;
+
+    let cfg = |local, remote| {
+        ConnConfig::default()
+            .local_port(local)
+            .remote_port(remote)
+            .mss(536)
+            .send_buf_size(4096)
+            .recv_buf_size(4096)
+    };
+    let mut us = Conn::new(cfg(40000, 80));
+    let mut peer = Conn::new(cfg(80, 40000));
+    // Segments the peer has sent that the network still holds.
+    let mut wire: VecDeque<Vec<u8>> = VecDeque::new();
+
+    let Some(syn) = us.connect().into_iter().next() else {
+        return;
+    };
+    let Ok(syn) = Segment::parse(&syn) else {
+        return;
+    };
+    wire.extend(peer.accept_syn(&syn));
+
+    fn to_peer(peer: &mut Conn, wire: &mut VecDeque<Vec<u8>>, segs: Vec<Vec<u8>>) {
+        for s in segs {
+            if let Ok(seg) = Segment::parse(&s) {
+                wire.extend(peer.handle_segment(&seg));
+            }
+        }
+    }
+
+    let mut buf = [0u8; 1024];
+    for msg in messages(data) {
+        let Some((&op, arg)) = msg.split_first() else {
+            continue;
+        };
+        match op % 12 {
+            0 => {
+                let (_, segs) = us.write(arg);
+                to_peer(&mut peer, &mut wire, segs);
+            }
+            1 => wire.extend(peer.write(arg).1),
+            2 | 3 => {
+                if let Some(s) = wire.pop_front()
+                    && let Ok(seg) = Segment::parse(&s)
+                {
+                    let out = us.handle_segment(&seg);
+                    to_peer(&mut peer, &mut wire, out);
+                }
+            }
+            4 => {
+                // Corrupt: (offset, value) pairs XORed into the next segment.
+                if let Some(mut s) = wire.pop_front() {
+                    for pair in arg.as_chunks::<2>().0 {
+                        let at = pair[0] as usize % s.len().max(1);
+                        if let Some(b) = s.get_mut(at) {
+                            *b ^= pair[1];
+                        }
+                    }
+                    if let Ok(seg) = Segment::parse(&s) {
+                        let out = us.handle_segment(&seg);
+                        to_peer(&mut peer, &mut wire, out);
+                    }
+                }
+            }
+            5 => {
+                wire.pop_front();
+            }
+            6 => {
+                if let Some(s) = wire.front().cloned() {
+                    wire.push_back(s);
+                }
+            }
+            7 => {
+                if wire.len() >= 2 {
+                    wire.swap(0, 1);
+                }
+            }
+            8 => {
+                let _ = us.read(&mut buf);
+                let out = us.take_outgoing();
+                to_peer(&mut peer, &mut wire, out);
+                let _ = peer.read(&mut buf);
+                wire.extend(peer.take_outgoing());
+            }
+            9 => {
+                if arg.first().is_some_and(|b| b & 1 == 0) {
+                    let out = us.close();
+                    to_peer(&mut peer, &mut wire, out);
+                } else {
+                    wire.extend(peer.close());
+                }
+            }
+            10 => {
+                let out = us.tick();
+                to_peer(&mut peer, &mut wire, out);
+                wire.extend(peer.tick());
+            }
+            _ => {
+                // Wholly attacker-built, as from someone off the path.
+                if let Ok(seg) = Segment::parse(arg) {
+                    let out = us.handle_segment(&seg);
+                    to_peer(&mut peer, &mut wire, out);
+                }
+            }
+        }
+        wire.truncate(1024);
+    }
+}
+
+/// A DHCP server and client each handed a sequence of messages.
+#[cfg(feature = "dhcp")]
+pub fn dhcp_exchange(data: &[u8]) {
+    use crate::dhcp::{Client, ClientConfig, ClientTransport, Server, ServerConfig};
+    use crate::{Frame, IpPrefix, MacAddr};
+    use std::net::Ipv4Addr;
+
+    struct Quiet;
+    impl ClientTransport for Quiet {
+        fn mac(&self) -> MacAddr {
+            MacAddr([2, 0, 0, 0, 0, 1])
+        }
+        fn send_broadcast(&self, _: &Frame) {}
+        fn send_unicast(&self, _: Ipv4Addr, _: &Frame) {}
+        fn on_bound(&self, _: IpPrefix, _: Option<Ipv4Addr>) {}
+    }
+
+    let server = Server::new(ServerConfig::new(
+        Ipv4Addr::new(10, 0, 0, 1),
+        Ipv4Addr::new(10, 0, 0, 100),
+        Ipv4Addr::new(10, 0, 0, 110),
+    ));
+    // Starting a client spawns its timer thread, so one serves every input,
+    // as the wg body does with its handler.
+    static CLIENT: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
+    let client = CLIENT.get_or_init(|| {
+        let c = Client::new(Quiet, ClientConfig::default());
+        c.start();
+        c
+    });
+    for msg in messages(data) {
+        server.handle_dhcp(msg);
+        client.handle_packet(msg);
+        client.tick();
+    }
+}
+
+/// Frames into an L2Adapter: the ARP and NDP handling, the NDP queue, and
+/// its cache, fed one frame after another.
+#[cfg(feature = "l2adapter")]
+pub fn l2adapter_frames(data: &[u8]) {
+    use crate::{IpPrefix, L2Adapter, L2AdapterConfig, L2Device, L3Device, MacAddr, PipeL3};
+    use std::sync::Arc;
+
+    // An adapter spawns its ARP queue's sweeper thread, so one serves every
+    // input, as the wg body does with its handler.
+    static ADAPTER: std::sync::OnceLock<(Arc<PipeL3>, Arc<L2Adapter>)> = std::sync::OnceLock::new();
+    let (inner, adapter) = ADAPTER.get_or_init(|| {
+        let inner = Arc::new(PipeL3::new("10.0.0.2/24".parse::<IpPrefix>().unwrap()));
+        let adapter = L2Adapter::new(
+            inner.clone(),
+            L2AdapterConfig::default()
+                .mac(MacAddr([2, 0, 0, 0, 0, 2]))
+                .gateway_v4("10.0.0.1".parse().unwrap()),
+        );
+        (inner, adapter)
+    });
+    for msg in messages(data) {
+        if msg.first().is_some_and(|b| b & 1 == 0) {
+            // From the network.
+            let _ = adapter.send(Frame::from_slice(&msg[1..]));
+        } else if msg.len() > 1 {
+            // From the L3 side, to be resolved and framed.
+            let _ = inner.send(Packet::from_slice(&msg[1..]));
+        }
+    }
+}
+
+/// slirp's IP reassembler, fed one fragment after another, as slirp's input
+/// path would after validating each header.
+#[cfg(feature = "slirp")]
+pub fn slirp_reassembly(data: &[u8]) {
+    let mut r = crate::slirp::defrag::Reassembler::default();
+    let now = crate::time::Instant::now();
+    for msg in messages(data) {
+        let p = Packet::from_slice(msg);
+        match msg.first().map(|b| b >> 4) {
+            Some(4) if msg.len() >= 20 => {
+                let ihl = (msg[0] & 0x0F) as usize * 4;
+                let total = u16::from_be_bytes([msg[2], msg[3]]) as usize;
+                if ihl >= 20 && total >= ihl && total <= msg.len() {
+                    let _ = r.push_v4(now, 0, &msg[..total], ihl);
+                }
+            }
+            Some(6) if msg.len() >= 48 => {
+                // The fragment header right after the fixed one.
+                let _ = r.push_v6(now, 0, msg, 40);
+            }
+            _ => {
+                let _ = p.is_valid();
+            }
+        }
+    }
+}
+
 #[cfg(feature = "vclient")]
 pub fn dns_parse(data: &[u8]) {
     let _ = crate::vclient::dns::wire::parse_response(data, 0x1234);
@@ -311,10 +558,12 @@ pub fn dns_parse(data: &[u8]) {
 #[cfg(feature = "nat")]
 pub fn defrag(data: &[u8]) {
     let d = crate::nat::defrag::Defragger::new();
-    // Feed it twice: the second pass exercises the "we already have a piece of
-    // this datagram" path, where overlapping fragments are resolved.
+    // The whole input once, then as a sequence of fragments: overlaps and
+    // bounds only show up across fragments of one datagram.
     let _ = d.process(data);
-    let _ = d.process(data);
+    for msg in messages(data) {
+        let _ = d.process(msg);
+    }
     d.sweep();
 }
 
@@ -340,6 +589,41 @@ pub fn nat_forward(data: &[u8]) {
     let pkt = Packet::from_slice(data);
     let _ = nat.inside().send(pkt);
     let _ = nat.outside().send(pkt);
+    // Then a conversation: the low bit of each message's first byte picks
+    // the side, so mappings made by one packet meet the next.
+    for msg in messages(data) {
+        if let Some((&side, pkt)) = msg.split_first() {
+            let dev = if side & 1 == 0 {
+                nat.inside()
+            } else {
+                nat.outside()
+            };
+            let _ = dev.send(Packet::from_slice(pkt));
+        }
+    }
+    nat.sweep();
+}
+
+/// NAT64, fed a conversation from both sides.
+#[cfg(feature = "nat")]
+pub fn nat64_forward(data: &[u8]) {
+    use crate::L3Device;
+    use crate::nat::Nat64;
+
+    let nat = Nat64::new(
+        "64:ff9b::/96".parse().unwrap(),
+        "192.0.2.1/24".parse().unwrap(),
+    );
+    for msg in messages(data) {
+        if let Some((&side, pkt)) = msg.split_first() {
+            let dev = if side & 1 == 0 {
+                nat.inside()
+            } else {
+                nat.outside()
+            };
+            let _ = dev.send(Packet::from_slice(pkt));
+        }
+    }
     nat.sweep();
 }
 
