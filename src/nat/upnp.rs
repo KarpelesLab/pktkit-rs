@@ -482,10 +482,22 @@ EXT:\r\n\r\n",
         if !self.is_port_allowed(ext_port) {
             return soap_fault(718, "External port not in allowed range");
         }
-        if self.cfg.max_mappings > 0 && nat.list_port_forwards().len() >= self.cfg.max_mappings {
+        let mut owned = self.owned.lock().unwrap();
+        let existing = Self::owner_locked(&mut owned, nat, proto, ext_port);
+        if existing.is_some_and(|o| o != Some((ns, inside_ip))) {
+            return soap_fault(718, "ConflictInMappingEntry");
+        }
+        // Clients renew a lease by adding the same mapping again before it
+        // runs out; one already counted must not be refused by the caps it
+        // counts towards.
+        let renewal = existing.is_some();
+        if !renewal
+            && self.cfg.max_mappings > 0
+            && nat.list_port_forwards().len() >= self.cfg.max_mappings
+        {
             return soap_fault(728, "Too many port mappings");
         }
-        if self.cfg.max_per_client > 0 {
+        if !renewal && self.cfg.max_per_client > 0 {
             let count = nat
                 .list_port_forwards()
                 .iter()
@@ -506,11 +518,6 @@ EXT:\r\n\r\n",
             .description(desc)
             .namespace(ns);
         pf.expires = expires;
-        let mut owned = self.owned.lock().unwrap();
-        let existing = Self::owner_locked(&mut owned, nat, proto, ext_port);
-        if existing.is_some_and(|o| o != Some((ns, inside_ip))) {
-            return soap_fault(718, "ConflictInMappingEntry");
-        }
         if nat.add_port_forward(pf).is_err() {
             return soap_fault(718, "ConflictInMappingEntry");
         }
@@ -1449,5 +1456,32 @@ MAN: \"ssdp:discover\"\r\nST: upnp:rootdevice\r\n\r\n";
             ))))
             .unwrap();
         assert!(inside.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_lease_renewal_is_not_refused_by_the_caps() {
+        let client = Ipv4Addr::new(10, 0, 0, 42);
+        for cfg in [
+            UPnPConfig::default().max_per_client(1),
+            UPnPConfig::default().max_mappings(1),
+        ] {
+            let nat = Nat::new(pfx("10.0.0.1/24"), pfx("203.0.113.1/24"));
+            let h = UPnPHelper::new(cfg);
+            let add = |ext, lease| {
+                h.handle_soap(
+                    &nat,
+                    "AddPortMapping",
+                    &add_body(ext, 80, "10.0.0.42", "TCP", lease),
+                    Some(client),
+                )
+            };
+            assert_eq!(add(8080, 60).status, 200);
+            let r = add(8080, 3600);
+            assert_eq!(r.status, 200, "renewal refused: {}", r.body);
+            let lease = nat.list_port_forwards()[0].expires.unwrap();
+            assert!(lease > Instant::now() + Duration::from_secs(60));
+            // A second mapping is still over the cap.
+            assert!(add(8081, 60).body.contains("728"));
+        }
     }
 }
