@@ -125,6 +125,10 @@ impl<W: Write> PcapWriter<W> {
         self.record
             .extend_from_slice(&(data.len() as u32).to_le_bytes());
         self.record.extend_from_slice(&data[..incl]);
+        // Presumed torn until the write returns: a writer that panics part
+        // way never gets to say so, and a caller recovering the writer from
+        // a poisoned lock must not append after its partial record.
+        self.torn = true;
         let r = self.inner.write_all(&self.record);
         self.torn = r.is_err();
         r
@@ -164,9 +168,10 @@ impl Shared {
     /// A capture is an observer: a full disk should not take the network down
     /// with it. Failures surface as the tap's `errors` counter.
     fn mirror(&self, data: &[u8]) {
-        // A poisoned capture lock means some other thread panicked mid-write.
-        // The file may have a torn record, but dropping the rest of the
-        // capture as well would be worse.
+        // A poisoned capture lock means some other thread panicked while
+        // holding it. If that was inside a record the writer knows it is
+        // torn and refuses further records; otherwise the capture is intact
+        // and carries on.
         let mut w = match self.sink.lock() {
             Ok(w) => w,
             Err(poisoned) => poisoned.into_inner(),
@@ -416,6 +421,60 @@ mod tests {
         let len = out.bytes().len();
         // The writer would take this one, but it would land mid-record.
         assert!(w.write(&[3; 4]).is_err());
+        assert_eq!(out.bytes().len(), len, "wrote past a torn record");
+    }
+
+    /// Writes part of the record, then panics mid-write, once.
+    struct PanicsOnce {
+        out: SharedBuf,
+        budget: usize,
+        panicked: bool,
+    }
+
+    impl Write for PanicsOnce {
+        fn write(&mut self, buf: &[u8]) -> Result<usize> {
+            if !self.panicked && self.budget == 0 {
+                self.panicked = true;
+                panic!("writer panics (expected by the test)");
+            }
+            let n = if self.panicked {
+                buf.len()
+            } else {
+                buf.len().min(self.budget)
+            };
+            if !self.panicked {
+                self.budget -= n;
+            }
+            self.out.write(&buf[..n])
+        }
+        fn flush(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_writer_panicking_mid_record_also_ends_the_capture() {
+        let out = SharedBuf::default();
+        let sink = PanicsOnce {
+            out: out.clone(),
+            budget: 24 + 16 + 4 + 10,
+            panicked: false,
+        };
+        let w = PcapWriter::new(Box::new(sink) as Box<dyn Write + Send>, LINKTYPE_RAW).unwrap();
+        let shared = Arc::new(Shared {
+            sink: Mutex::new(w),
+            stats: DeviceStats::new(),
+        });
+        shared.mirror(&[1; 4]);
+        let s2 = shared.clone();
+        // Poisons the lock, as a panic inside any tap's send would.
+        assert!(
+            std::thread::spawn(move || s2.mirror(&[2; 40]))
+                .join()
+                .is_err()
+        );
+        let len = out.bytes().len();
+        shared.mirror(&[3; 4]);
         assert_eq!(out.bytes().len(), len, "wrote past a torn record");
     }
 
