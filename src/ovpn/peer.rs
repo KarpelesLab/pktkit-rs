@@ -131,7 +131,11 @@ enum AuthMode {
 
 /// Effects produced by processing one inbound datagram: raw datagrams to send
 /// back to the peer, and an optional decrypted data-channel payload to deliver.
+///
+/// Built by the crate and read by callers, so it is `#[non_exhaustive]`: a
+/// new kind of effect can be added without breaking anyone.
 #[derive(Default, Debug)]
+#[non_exhaustive]
 pub struct PeerOutput {
     /// Raw datagrams (each already framed with opcode etc.) to transmit.
     pub send: Vec<Vec<u8>>,
