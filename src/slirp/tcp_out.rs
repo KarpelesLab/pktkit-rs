@@ -258,7 +258,17 @@ impl TcpOutConn {
             // Holding it for the whole of TIME-WAIT would let a guest keep
             // a host descriptor open per parked bridge (up to MAX_TIME_WAIT
             // per family), enough to run the process out of them.
-            self.remote.lock().expect("poisoned").take();
+            //
+            // Shut down, not merely dropped: the client→remote pump may be
+            // blocked writing, through its own clone, to a server that
+            // stopped reading. Dropping our handle would close nothing, and
+            // leave `close` nothing to shut down: the pump, its thread and
+            // the descriptor would stay stuck for good. A TIME-WAIT bridge
+            // holds no thread, so the bytes the server never took are lost,
+            // as they are whenever a bridge is torn down.
+            if let Some(s) = self.remote.lock().expect("poisoned").take() {
+                shutdown(&s, Shutdown::Both);
+            }
             now
         }))
     }
@@ -291,7 +301,7 @@ impl TcpOutConn {
     fn shutdown_remote(&self, how: Shutdown) {
         let s = self.remote.lock().expect("poisoned").clone();
         if let Some(s) = s {
-            let _ = s.shutdown(how);
+            shutdown(&s, how);
         }
     }
 
@@ -408,6 +418,11 @@ impl TcpOutConn {
                     None => Ok(()),
                 };
                 if res.is_err() {
+                    // Shut down on entering TIME-WAIT (see `time_wait_since`):
+                    // both sides are done, and TIME-WAIT runs its course.
+                    if self.state.conn.lock().expect("poisoned").state() == State::TimeWait {
+                        return;
+                    }
                     // Real socket gone: RST the virtual client and tear down.
                     self.close();
                     return;
@@ -427,6 +442,24 @@ impl TcpOutConn {
         self.shutdown_remote(Shutdown::Both);
         self.closed.store(true, Ordering::Release);
         self.state.signal.notify_all();
+    }
+}
+
+/// Shut down `s`, or a half of it, ignoring errors.
+///
+/// Both halves are shut down one at a time: macOS refuses a `Both` with
+/// `ENOTCONN`, shutting down neither half, once the peer has sent its FIN.
+/// That is just when a server that half-closed and stopped reading leaves a
+/// pump blocked writing to it, which only shutting the write half unblocks.
+fn shutdown(s: &TcpStream, how: Shutdown) {
+    match how {
+        Shutdown::Both => {
+            let _ = s.shutdown(Shutdown::Write);
+            let _ = s.shutdown(Shutdown::Read);
+        }
+        how => {
+            let _ = s.shutdown(how);
+        }
     }
 }
 

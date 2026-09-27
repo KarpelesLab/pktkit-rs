@@ -238,12 +238,8 @@ impl Stack {
                 }
                 let now = Instant::now();
                 // TCP: drop closed entries.
-                if let Ok(mut t) = inner.tcp.lock() {
-                    t.retain(|_, c| !c.is_closed());
-                }
-                if let Ok(mut t) = inner.tcp6.lock() {
-                    t.retain(|_, c| !c.is_closed());
-                }
+                reap_closed(&inner.tcp);
+                reap_closed(&inner.tcp6);
                 // UDP: drop entries idle for more than UDP_IDLE.
                 if let Ok(mut u) = inner.udp.lock() {
                     u.retain(|_, conn| {
@@ -1435,6 +1431,31 @@ fn tick_outbound<K: Copy + Eq + std::hash::Hash>(
     // Closing shuts the real socket, which is what ends a pump still
     // blocked reading it; outside the table lock, as close() may emit and
     // so re-enter `send`.
+    for c in gone {
+        c.close();
+    }
+}
+
+/// Remove the bridges in `table` that have torn down, and close them.
+///
+/// Closing, not merely dropping: a bridge whose engine reached CLOSED may
+/// still have a pump blocked on the real socket (reading from a server that
+/// never ends, or writing to one that never reads), and that pump holds the
+/// bridge alive. Only shutting the socket down frees it; dropping the table's
+/// handle would leave the pump, its thread and the descriptor stuck.
+fn reap_closed<K: Copy + Eq + std::hash::Hash>(table: &Mutex<HashMap<K, Arc<TcpOutConn>>>) {
+    let gone: Vec<Arc<TcpOutConn>> = {
+        let Ok(mut t) = table.lock() else {
+            return;
+        };
+        let keys: Vec<K> = t
+            .iter()
+            .filter(|(_, c)| c.is_closed())
+            .map(|(k, _)| *k)
+            .collect();
+        keys.iter().filter_map(|k| t.remove(k)).collect()
+    };
+    // Outside the table lock, as close() may emit and so re-enter `send`.
     for c in gone {
         c.close();
     }
@@ -3288,5 +3309,139 @@ mod tests {
             thread::sleep(Duration::from_millis(50));
             got.load(Ordering::SeqCst) > 0
         });
+    }
+
+    /// A bridge reaching TIME-WAIT while its client→remote pump is blocked
+    /// writing to a server that stopped reading must not leave that pump,
+    /// and the socket it holds, stuck for good: whatever reaps the bridge
+    /// has to be able to shut the socket down.
+    #[test]
+    fn time_wait_does_not_strand_a_blocked_pump() {
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+
+        // A server that ends its side at once and never reads.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (held_tx, held_rx) = mpsc::channel();
+        thread::spawn(move || {
+            if let Ok((s, _)) = listener.accept() {
+                s.shutdown(std::net::Shutdown::Write).unwrap();
+                let _ = held_tx.send(s);
+            }
+        });
+        let stack = Stack::new();
+        let client = Ipv4Addr::new(10, 0, 0, 5);
+        let server = Ipv4Addr::new(127, 0, 0, 1);
+        let vc = Arc::new(Mutex::new(Conn::new(ConnConfig {
+            local_port: 50077,
+            remote_port: port,
+            mss: 1460,
+            ..Default::default()
+        })));
+        // The window the bridge last advertised.
+        let win = Arc::new(AtomicUsize::new(0));
+        let (w2, c2, weak) = (win.clone(), vc.clone(), Arc::downgrade(&stack));
+        stack.set_handler(Arc::new(move |p: &Packet| {
+            let Ok(seg) = Segment::parse(&p.as_bytes()[20..]) else {
+                return Ok(());
+            };
+            if seg.flags & tcp_flags::SYN == 0 {
+                w2.store(seg.window as usize, Ordering::SeqCst);
+            }
+            let replies = c2.lock().unwrap().handle_segment(&seg);
+            if let Some(s) = weak.upgrade() {
+                inject_segs(&s, client, server, replies);
+            }
+            Ok(())
+        }));
+        let syn = vc.lock().unwrap().connect();
+        inject_segs(&stack, client, server, syn);
+        wait_for("the server's FIN", || vc.lock().unwrap().fin_received());
+        let _held = held_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let bridge = stack
+            .inner
+            .tcp
+            .lock()
+            .unwrap()
+            .values()
+            .next()
+            .cloned()
+            .unwrap();
+
+        // Push until the bridge's window has half closed: the server's
+        // socket buffers are full by then, and the pump blocked writing,
+        // while there is still room for the rest and our FIN.
+        let w0 = win.load(Ordering::SeqCst);
+        let chunk = vec![0x5au8; 16 * 1024];
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while win.load(Ordering::SeqCst) >= w0 / 2 {
+            assert!(Instant::now() < deadline, "the remote never pushed back");
+            let (_, segs) = vc.lock().unwrap().write(&chunk);
+            inject_segs(&stack, client, server, segs);
+            thread::sleep(Duration::from_millis(5));
+            let segs = vc.lock().unwrap().tick();
+            inject_segs(&stack, client, server, segs);
+        }
+        // Our FIN puts the bridge, which closed first, in TIME-WAIT.
+        let fin = vc.lock().unwrap().close();
+        inject_segs(&stack, client, server, fin);
+        wait_for("the bridge in TIME-WAIT", || {
+            let segs = vc.lock().unwrap().tick();
+            inject_segs(&stack, client, server, segs);
+            bridge.state().conn.lock().unwrap().state() == VtcpState::TimeWait
+                && bridge.time_wait_since(Instant::now()).is_some()
+        });
+        stack.shutdown().unwrap();
+        wait_for("the pumps to let go of the bridge", || {
+            Arc::strong_count(&bridge) == 1
+        });
+    }
+
+    /// The maintenance sweep reaps a torn-down bridge by closing it, which
+    /// shuts its real socket down: a pump blocked on that socket holds the
+    /// bridge alive, and nothing else would ever free it.
+    #[test]
+    fn reaping_a_closed_bridge_shuts_its_socket_down() {
+        use std::io::Read;
+        use std::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let ours = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut theirs, _) = listener.accept().unwrap();
+        let syn = Segment::parse(
+            &Conn::new(ConnConfig::default().local_port(5000).remote_port(80)).connect()[0],
+        )
+        .unwrap();
+        let bridge = TcpOutConn::pending(
+            Endpoints::V4 {
+                local_ip: Ipv4Addr::new(1, 1, 1, 1),
+                local_port: 80,
+                remote_ip: Ipv4Addr::new(10, 0, 0, 5),
+                remote_port: 5000,
+            },
+            &syn,
+            Arc::new(|_: &[u8]| {}),
+        );
+        *bridge.remote.lock().unwrap() = Some(Arc::new(ours));
+        let mut conn = bridge.state().conn.lock().unwrap();
+        let _ = conn.accept_syn(&syn);
+        let _ = conn.abort();
+        drop(conn);
+        assert!(bridge.is_closed());
+        // Standing in for a pump blocked on the socket.
+        let _pump = bridge.clone();
+        let table = Mutex::new(HashMap::from([(1u32, bridge)]));
+        reap_closed(&table);
+        assert!(table.lock().unwrap().is_empty());
+        theirs
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut b = [0u8; 1];
+        assert_eq!(
+            theirs.read(&mut b).map_err(|e| e.kind()),
+            Ok(0),
+            "the server never saw the bridge's socket shut down"
+        );
     }
 }
