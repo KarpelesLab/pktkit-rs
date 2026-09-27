@@ -322,14 +322,14 @@ impl Engine {
         let duplicate = cfg.duplicate > 0.0 && rng.next_f64() < cfg.duplicate;
         drop(rng);
 
-        let latency = cfg.delay + jitter;
         let now = Instant::now();
 
         let mut q = self.queue.lock().unwrap();
         if !q.running {
             return None;
         }
-        if q.len() >= cfg.queue_limit.max(1) {
+        let limit = cfg.queue_limit.max(1);
+        if q.len() >= limit {
             drop(q);
             self.record_drop(dir);
             return None;
@@ -344,18 +344,31 @@ impl Engine {
         };
         // Time to clock this many bits onto the link; an unset rate is
         // instantaneous.
-        let serialize = (buf.len() as u64 * 8 * 1_000_000_000)
+        let serialize = (buf.len() as u64)
+            .saturating_mul(8 * 1_000_000_000)
             .checked_div(cfg.rate_bps)
             .map(Duration::from_nanos)
             .unwrap_or(Duration::ZERO);
-        let done = ready + serialize;
+        // A delay (or a backlog) too long for the clock to represent is a
+        // message that never arrives, not a panic in the caller's `send`.
+        let Some((done, at)) = ready.checked_add(serialize).and_then(|done| {
+            let at = done.checked_add(cfg.delay.checked_add(jitter)?)?;
+            Some((done, at))
+        }) else {
+            drop(q);
+            self.record_drop(dir);
+            return None;
+        };
         q.free_at[slot] = Some(done);
 
-        let at = done + latency;
         push(&mut q, at, dir, buf.clone());
-        if duplicate {
-            // A duplicate arrives just behind the original, not on top of it.
-            push(&mut q, at + Duration::from_micros(1), dir, buf);
+        // A duplicate arrives just behind the original, not on top of it,
+        // and only if the buffer has room for it too.
+        if duplicate
+            && q.len() < limit
+            && let Some(dup_at) = at.checked_add(Duration::from_micros(1))
+        {
+            push(&mut q, dup_at, dir, buf);
         }
         drop(q);
         self.wake.notify_one();
@@ -411,8 +424,9 @@ fn push(q: &mut Queue, at: Instant, dir: Direction, data: Vec<u8>) {
 /// Wait for the queue to drain, up to `timeout`.
 #[cfg(not(target_family = "wasm"))]
 fn drain(engine: &Engine, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
+    // No deadline the clock can represent means no deadline.
+    let deadline = Instant::now().checked_add(timeout);
+    while deadline.is_none_or(|d| Instant::now() < d) {
         if engine.queued() == 0 {
             return true;
         }
@@ -885,6 +899,42 @@ mod tests {
         assert_eq!(wire.count(), 0);
         // Dropping the link must not block on the 30-second deadline.
         drop(link);
+    }
+
+    #[test]
+    fn a_duplicate_does_not_overflow_the_queue_limit() {
+        let (_wire, link) = wrap(
+            Impairment::default()
+                .delay(Duration::from_secs(30))
+                .duplicate(1.0)
+                .queue_limit(3)
+                .seed(5),
+        );
+        link.send(Frame::from_slice(&frame(0))).unwrap();
+        assert_eq!(link.queued(), 2, "original and duplicate");
+        // Room for the original only.
+        link.send(Frame::from_slice(&frame(1))).unwrap();
+        assert_eq!(link.queued(), 3);
+        link.send(Frame::from_slice(&frame(2))).unwrap();
+        assert_eq!(link.queued(), 3);
+    }
+
+    #[test]
+    fn an_unrepresentable_delay_drops_instead_of_panicking() {
+        let (wire, link) = wrap(Impairment::default().delay(Duration::MAX).seed(1));
+        link.send(Frame::from_slice(&frame(0))).unwrap();
+        let (wire2, link2) = wrap(
+            Impairment::default()
+                .delay(Duration::MAX - Duration::from_secs(1))
+                .jitter(Duration::from_secs(10))
+                .seed(1),
+        );
+        link2.send(Frame::from_slice(&frame(0))).unwrap();
+        assert_eq!(link.queued() + link2.queued(), 0);
+        assert_eq!(link.stats().unwrap().snapshot().tx_dropped, 1);
+        assert_eq!(wire.count() + wire2.count(), 0);
+        // Waiting forever is spelled Duration::MAX, and must not panic either.
+        assert!(link.wait_idle(Duration::MAX));
     }
 
     #[test]
