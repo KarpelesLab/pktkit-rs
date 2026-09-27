@@ -38,7 +38,24 @@ pub(crate) fn system_now() -> std::time::SystemTime {
 /// The current wall-clock time.
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 pub(crate) fn system_now() -> std::time::SystemTime {
-    std::time::UNIX_EPOCH + host::ms_to_duration(unsafe { host::unix_ms() })
+    let since = host::ms_to_duration(unsafe { host::unix_ms() });
+    std::time::UNIX_EPOCH
+        .checked_add(since)
+        .unwrap_or(std::time::UNIX_EPOCH)
+}
+
+/// Host clocks hand back floats; anything negative or non-finite is a
+/// broken embedder, and is read as the epoch rather than panicking. So is
+/// anything past what a `Duration` holds, which `from_secs_f64` would panic
+/// on: it saturates instead.
+#[cfg(any(test, all(target_family = "wasm", target_os = "unknown")))]
+fn ms_to_duration(ms: f64) -> std::time::Duration {
+    use std::time::Duration;
+    if ms.is_finite() && ms > 0.0 {
+        Duration::try_from_secs_f64(ms / 1000.0).unwrap_or(Duration::MAX)
+    } else {
+        Duration::ZERO
+    }
 }
 
 /// Time since the Unix epoch, or zero if the clock is set before it.
@@ -64,15 +81,7 @@ mod host {
         pub(super) fn unix_ms() -> f64;
     }
 
-    /// Host clocks hand back floats; anything negative or non-finite is a
-    /// broken embedder, and is read as the epoch rather than panicking.
-    pub(super) fn ms_to_duration(ms: f64) -> Duration {
-        if ms.is_finite() && ms > 0.0 {
-            Duration::from_secs_f64(ms / 1000.0)
-        } else {
-            Duration::ZERO
-        }
-    }
+    pub(super) use super::ms_to_duration;
 
     /// The latest reading handed out, in nanoseconds. Timer code assumes the
     /// clock never runs backwards; `performance.now()` promises that, but the
@@ -152,5 +161,23 @@ mod host {
         fn sub(self, other: Instant) -> Duration {
             self.duration_since(other)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn host_clock_readings_never_panic() {
+        assert_eq!(ms_to_duration(1500.0), Duration::from_millis(1500));
+        assert_eq!(ms_to_duration(-1.0), Duration::ZERO);
+        assert_eq!(ms_to_duration(f64::NAN), Duration::ZERO);
+        assert_eq!(ms_to_duration(f64::INFINITY), Duration::ZERO);
+        // Finite, but past what a Duration holds: an embedder bug, not a
+        // reason to take the whole module down.
+        assert_eq!(ms_to_duration(1e300), Duration::MAX);
+        assert_eq!(ms_to_duration(f64::MAX), Duration::MAX);
     }
 }
