@@ -721,6 +721,11 @@ impl Handler {
                 .expect("keypairs lock")
                 .remove(&old.local_index);
         }
+        // The handshake is complete from our side too, as in the reference
+        // (wg_timers_handshake_complete). An attempt of our own still under
+        // way, after both ends initiated at once, would otherwise keep
+        // retrying for REKEY_ATTEMPT_TIME, replacing this keypair each time.
+        self.with_timers(&kp.peer_key, |t| t.handshake_complete());
     }
 
     /// Snapshot of `(last_received, last_sent)` for `peer_key`.
@@ -1209,6 +1214,24 @@ mod tests {
                 .sum();
             assert_eq!(sent, 1);
         }
+    }
+
+    /// Both ends initiate at once and ours is lost. The peer's handshake,
+    /// once its first packet confirms it, is a completed handshake for us
+    /// too (the reference calls wg_timers_handshake_complete there): our
+    /// own attempt must stop, not keep retrying and rotating keys.
+    #[test]
+    fn a_confirmed_responder_handshake_ends_our_attempt() {
+        let (a, b) = pair();
+        let addr = loopback();
+        let _lost = a.initiate_handshake(&b.public_key()).unwrap();
+        let init = b.initiate_handshake(&a.public_key()).unwrap();
+        let resp = a.process_packet(&init, &addr).unwrap();
+        let ka = b.process_packet(&resp.response, &addr).unwrap();
+        a.process_packet(&ka.response, &addr).unwrap();
+        assert!(a.has_session(&b.public_key()));
+        rewind(&a, &b.public_key(), Duration::from_secs(6));
+        assert!(timer_actions(&a).is_empty(), "still retrying");
     }
 
     #[test]
