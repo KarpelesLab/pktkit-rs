@@ -183,6 +183,14 @@ impl L2Adapter {
         if !f.is_broadcast() && !f.is_multicast() && dst != Some(self.mac) {
             return;
         }
+        // The adapter is a host on the untagged VLAN. The accessors below
+        // look through an 802.1Q tag, so without this a frame for VLAN 7
+        // would be answered, untagged, on ours -- bridging the two. VID 0 is
+        // only a priority tag and belongs to the untagged VLAN (802.1Q
+        // §6.9.1).
+        if f.has_vlan() && f.vlan_id() != 0 {
+            return;
+        }
         match f.ether_type() {
             EtherType::ARP => self.handle_arp(f),
             EtherType::IPV4 | EtherType::IPV6 => {
@@ -903,6 +911,50 @@ mod tests {
             [10, 0, 0, 9],
         );
         assert_eq!(adapter.arp.lookup(Ipv4Addr::new(10, 0, 0, 7)), Some(moved));
+    }
+
+    /// `frame` with an 802.1Q tag carrying `vid` inserted after the MACs.
+    fn tagged(frame: &[u8], vid: u16) -> Vec<u8> {
+        let mut t = frame[..12].to_vec();
+        t.extend_from_slice(&EtherType::VLAN.as_u16().to_be_bytes());
+        t.extend_from_slice(&vid.to_be_bytes());
+        t.extend_from_slice(&frame[12..]);
+        t
+    }
+
+    #[test]
+    fn frames_tagged_for_another_vlan_are_not_ours() {
+        let (pipe, adapter, out) = rig("10.0.0.5/24");
+        let peer = MacAddr([2, 0, 0, 0, 0, 1]);
+        let payload = arp::build_packet(
+            arp::OP_REQUEST,
+            peer,
+            Ipv4Addr::new(10, 0, 0, 1),
+            MacAddr::zero(),
+            Ipv4Addr::new(10, 0, 0, 5),
+        );
+        let arp = build_frame(MacAddr::broadcast(), peer, EtherType::ARP, &payload);
+
+        adapter.send(Frame::from_slice(&tagged(&arp, 7))).unwrap();
+        assert!(take(&out).is_empty(), "answered an ARP on VLAN 7");
+        assert_eq!(adapter.arp.lookup(Ipv4Addr::new(10, 0, 0, 1)), None);
+
+        let ip = v4_packet([10, 0, 0, 1], [10, 0, 0, 5]);
+        let data = build_frame(adapter.mac, peer, EtherType::IPV4, &ip);
+        let got = Arc::new(Mutex::new(0usize));
+        let g = got.clone();
+        pipe.set_handler(Arc::new(move |_p: &Packet| {
+            *g.lock().unwrap() += 1;
+            Ok(())
+        }));
+        adapter.send(Frame::from_slice(&tagged(&data, 7))).unwrap();
+        assert_eq!(*got.lock().unwrap(), 0, "bridged VLAN 7 into the host");
+
+        // Priority-tagged (VID 0) is the untagged VLAN (802.1Q §6.9.1).
+        adapter
+            .send(Frame::from_slice(&tagged(&arp, 0x6000)))
+            .unwrap();
+        assert_eq!(take(&out).len(), 1, "priority-tagged ARP ignored");
     }
 
     #[test]
