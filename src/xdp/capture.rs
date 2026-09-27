@@ -699,6 +699,56 @@ fn build_program_with_fds(
     v4_fd: i32,
     v6_fd: i32,
 ) -> Result<Vec<Insn>> {
+    build_program_inner(cfg, xskmap_fd, v4_fd, v6_fd, RedirectFlags::Fallback)
+}
+
+/// The `flags` a capture program passes `bpf_redirect_map`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RedirectFlags {
+    /// [`Action::PASS`]: the verdict when the XSKMAP has no socket for the
+    /// queue. Kernel 5.3 and later.
+    Fallback,
+    /// No flags at all. Before 5.3 ("bpf_xdp_redirect_map: Perform map lookup
+    /// in eBPF helper") the helper returned `XDP_ABORTED` for any non-zero
+    /// flags, which dropped every captured packet. There, a queue with no
+    /// socket drops what is captured on it whatever the flags; nor can the
+    /// program look the XSKMAP up first to avoid that, since
+    /// `bpf_map_lookup_elem` on an XSKMAP also only arrived in 5.3.
+    Zero,
+}
+
+/// The tiny program [`probe_redirect_flags`] runs: a redirect through `xskmap`
+/// with [`Action::PASS`] as flags, on queue 0, which has no socket yet.
+fn redirect_probe_program(xskmap_fd: i32) -> Vec<Insn> {
+    let mut v = ld_map_fd(R1, xskmap_fd).to_vec();
+    v.push(Insn::mov64_imm(R2, 0));
+    v.push(Insn::mov64_imm(R3, Action::PASS.0 as i32));
+    v.push(Insn::call(BPF_FUNC_REDIRECT_MAP));
+    v.push(Insn::exit());
+    v
+}
+
+/// Whether this kernel honours the fallback verdict in `bpf_redirect_map`'s
+/// flags, found by asking it: run a redirect against the still-empty `xskmap`
+/// with `BPF_PROG_TEST_RUN` (4.12, older than XSKMAP itself). A new kernel
+/// returns the fallback, an old one `XDP_ABORTED`. If the probe cannot run at
+/// all, assume a current kernel.
+fn probe_redirect_flags(xskmap: &Map) -> RedirectFlags {
+    let probe = redirect_probe_program(xskmap.as_raw_fd());
+    let run = Program::load(&probe, "pktkit_probe").and_then(|p| p.test_run(&[0u8; 64], 1));
+    match run {
+        Ok(r) if r.action == Action::ABORTED => RedirectFlags::Zero,
+        _ => RedirectFlags::Fallback,
+    }
+}
+
+fn build_program_inner(
+    cfg: &CaptureConfig,
+    xskmap_fd: i32,
+    v4_fd: i32,
+    v6_fd: i32,
+    redirect_flags: RedirectFlags,
+) -> Result<Vec<Insn>> {
     let mut asm = Asm::new();
     let l_v4 = asm.label();
     let l_v6 = asm.label();
@@ -825,8 +875,12 @@ fn build_program_with_fds(
     // The low bits of `flags` are the verdict the helper returns when the map
     // has no socket for this queue. XDP_PASS keeps traffic flowing to the host
     // stack on queues we did not bind, instead of the XDP_ABORTED that flags=0
-    // would produce.
-    asm.emit(Insn::mov64_imm(R3, Action::PASS.0 as i32));
+    // would produce, on kernels that have it (see `RedirectFlags`).
+    let flags = match redirect_flags {
+        RedirectFlags::Fallback => Action::PASS.0 as i32,
+        RedirectFlags::Zero => 0,
+    };
+    asm.emit(Insn::mov64_imm(R3, flags));
     asm.emit(Insn::call(BPF_FUNC_REDIRECT_MAP));
     asm.emit(Insn::exit());
 
@@ -866,7 +920,13 @@ impl Capture {
     pub fn attach(ifindex: u32, cfg: CaptureConfig, mode: Mode) -> Result<Capture> {
         cfg.validate()?;
         let maps = CaptureMaps::create(&cfg)?;
-        let insns = build_program(&cfg, &maps)?;
+        let insns = build_program_inner(
+            &cfg,
+            maps.xskmap.as_raw_fd(),
+            maps.v4.as_raw_fd(),
+            maps.v6.as_raw_fd(),
+            probe_redirect_flags(&maps.xskmap),
+        )?;
         let prog = Program::load(&insns, "pktkit_cap")?;
         let link = prog.attach(ifindex, mode)?;
         Ok(Capture {
@@ -1160,6 +1220,31 @@ mod tests {
         // flags (r3) is the verdict returned when the XSKMAP has no socket for
         // this queue; XDP_ABORTED (0) would black-hole unbound queues.
         assert_eq!(p[call - 1], Insn::mov64_imm(R3, Action::PASS.0 as i32));
+    }
+
+    #[test]
+    fn redirect_flags_zero_before_5_3() {
+        let p = build_program_inner(&CaptureConfig::default(), 10, 11, 12, RedirectFlags::Zero)
+            .unwrap();
+        let call = p
+            .iter()
+            .position(|i| *i == Insn::call(BPF_FUNC_REDIRECT_MAP))
+            .expect("redirect call present");
+        // A pre-5.3 helper answers any non-zero flags with XDP_ABORTED.
+        assert_eq!(p[call - 1], Insn::mov64_imm(R3, 0));
+    }
+
+    #[test]
+    fn redirect_probe_asks_for_the_fallback_on_an_empty_slot() {
+        let p = redirect_probe_program(vm::XSK_FD);
+        let empty = |addr_len| Trie {
+            addr_len,
+            entries: vec![],
+        };
+        let mut vm = Vm::new(&[0u8; 64], empty(4), empty(16));
+        vm.xsk_queues = vec![];
+        // A 5.3+ kernel, as the VM models, answers with the fallback.
+        assert_eq!(vm.run(&p), PASS);
     }
 
     #[test]
