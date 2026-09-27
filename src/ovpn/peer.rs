@@ -54,11 +54,23 @@ fn invalid(msg: impl Into<String>) -> io::Error {
 }
 
 /// Credentials and metadata presented by a client during the key exchange.
+///
+/// Built by the crate and read by [`OnAuth`], so it is `#[non_exhaustive]`:
+/// more of what the client presents can be added without breaking anyone.
+/// Every field is what the client sent, as it sent it: checking it is the
+/// callback's job.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct AuthInfo {
+    /// The `auth-user-pass` username; empty if the client sent none.
     pub username: String,
+    /// The `auth-user-pass` password; empty if the client sent none.
     pub password: String,
+    /// The client's peer-info key/values (`IV_VER`, `IV_PLAT`,
+    /// `IV_CIPHERS`, ...), for information: a client can claim anything.
     pub peer_info: HashMap<String, String>,
+    /// The `dev-type` from the client's options string: `"tun"` or
+    /// `"tap"`.
     pub dev_type: String,
 }
 
