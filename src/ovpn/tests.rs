@@ -124,6 +124,37 @@ pub(super) struct TestClient {
     tls: TlsConnection,
     reliable: Reliable,
     ctrl_buf: Vec<u8>,
+    /// What the client puts in its key-method-2 message.
+    kx: ClientKx,
+}
+
+/// The strings of a client's key-method-2 message. `None` is sent the way
+/// OpenVPN's write_empty_string does: a zero length and no bytes.
+struct ClientKx {
+    options: String,
+    username: Option<String>,
+    password: Option<String>,
+    peer_info: Option<String>,
+}
+
+impl Default for ClientKx {
+    fn default() -> ClientKx {
+        let opts = Options {
+            cipher_crypto: CipherCryptoAlg::Aes,
+            cipher_size: 256,
+            cipher_block: CipherBlockMethod::Gcm,
+            auth: super::options::AuthHash::None,
+            compression: "lzo".into(),
+            is_server: false,
+            ..Default::default()
+        };
+        ClientKx {
+            options: opts.to_string(),
+            username: Some(String::new()),
+            password: Some(String::new()),
+            peer_info: Some("IV_VER=2.6\n".into()),
+        }
+    }
 }
 
 impl TestClient {
@@ -137,6 +168,7 @@ impl TestClient {
             tls,
             reliable: Reliable::new(local_id),
             ctrl_buf: Vec::new(),
+            kx: ClientKx::default(),
         }
     }
 
@@ -730,6 +762,37 @@ fn auth_failure_sends_auth_failed_and_stops() {
     assert!(server.peer_config().is_none());
 }
 
+/// A client without auth-user-pass sends its username and password as
+/// OpenVPN's write_empty_string does -- a zero length, not even a NUL -- and
+/// may send no peer info the same way. That is a valid key exchange.
+#[test]
+fn empty_strings_in_key_exchange_are_accepted() {
+    use std::sync::Mutex;
+
+    let seen = Arc::new(Mutex::new(None));
+    let hook: OnAuth = {
+        let seen = seen.clone();
+        Arc::new(move |info: &AuthInfo| {
+            *seen.lock().unwrap() = Some(info.clone());
+            auth_hook()(info)
+        })
+    };
+    let mut server = Peer::new(server_config(), *b"SERVERID", hook).unwrap();
+    let mut client = TestClient::new(*b"CLIENTID");
+    client.kx.username = None;
+    client.kx.password = None;
+    client.kx.peer_info = None;
+    let keys = connect(&mut server, &mut client);
+    assert_eq!(
+        deliver(&mut server, &keys, 1, b"hello"),
+        Some(b"hello".to_vec())
+    );
+    let info = seen.lock().unwrap().clone().expect("on_auth called");
+    assert_eq!(info.username, "");
+    assert_eq!(info.password, "");
+    assert!(info.peer_info.is_empty());
+}
+
 // --- helpers ----------------------------------------------------------------
 
 /// Exchange what `client` has queued with `server` until both go quiet;
@@ -843,21 +906,14 @@ fn send_client_key_material(client: &mut TestClient) -> ([u8; 48], [u8; 32], [u8
     blob.extend_from_slice(&random1);
     blob.extend_from_slice(&random2);
 
-    // options string (must round-trip through Options::parse on the server).
-    let opts = Options {
-        cipher_crypto: CipherCryptoAlg::Aes,
-        cipher_size: 256,
-        cipher_block: CipherBlockMethod::Gcm,
-        auth: super::options::AuthHash::None,
-        compression: "lzo".into(),
-        is_server: false,
-        ..Default::default()
-    };
-    let opt_str = opts.to_string();
-    write_ctrl_string(&mut blob, &opt_str);
-    write_ctrl_string(&mut blob, ""); // username
-    write_ctrl_string(&mut blob, ""); // password
-    write_ctrl_string(&mut blob, "IV_VER=2.6\n"); // peer info
+    let kx = &client.kx;
+    write_ctrl_string(&mut blob, &kx.options);
+    for s in [&kx.username, &kx.password, &kx.peer_info] {
+        match s {
+            Some(s) => write_ctrl_string(&mut blob, s),
+            None => blob.extend_from_slice(&0u16.to_be_bytes()),
+        }
+    }
 
     client.tls.send(&blob).unwrap();
     (pre_master, random1, random2)

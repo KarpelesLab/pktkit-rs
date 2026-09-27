@@ -943,15 +943,19 @@ struct KeyExchange {
 /// Read a control string at `pos`: a big-endian u16 length followed by that
 /// many bytes, NUL-terminated. Returns the string (without the NUL) and the
 /// new position, or `None` if the buffer doesn't yet hold the whole string.
+///
+/// A zero length is an absent string: OpenVPN's write_empty_string sends
+/// one for the username and password of a client without auth-user-pass,
+/// and ssl.c read_string reads it as empty.
 fn read_control_string(buf: &[u8], pos: usize) -> io::Result<Option<(String, usize)>> {
     if pos + 2 > buf.len() {
         return Ok(None);
     }
     let len = u16::from_be_bytes([buf[pos], buf[pos + 1]]) as usize;
-    if len == 0 {
-        return Err(invalid("empty control string"));
-    }
     let start = pos + 2;
+    if len == 0 {
+        return Ok(Some((String::new(), start)));
+    }
     if start + len > buf.len() {
         return Ok(None);
     }
