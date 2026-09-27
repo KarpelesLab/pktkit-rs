@@ -567,6 +567,58 @@ fn ack_for_another_session_is_ignored() {
     );
 }
 
+/// A session that has not finished its key exchange within the handshake
+/// window (OpenVPN's `hand-window`, 60s) is abandoned.
+#[test]
+fn handshake_window_expires_a_stalled_session() {
+    use crate::time::Instant;
+    use std::time::Duration;
+
+    let mut server = Peer::new(server_config(), *b"SERVERID", auth_hook()).unwrap();
+    let mut client = TestClient::new(*b"CLIENTID");
+    let start = Instant::now();
+    server.handle_packet(&client.hard_reset()).unwrap();
+    let out = server.tick(start + Duration::from_secs(59)).unwrap();
+    assert!(!out.close);
+    let out = server.tick(start + Duration::from_secs(61)).unwrap();
+    assert!(out.close, "handshake window should have expired");
+}
+
+/// An established peer that goes quiet is pinged every keepalive interval,
+/// and dropped once nothing has been heard for twice the keepalive timeout
+/// (OpenVPN's `--keepalive 10 60` on a server).
+#[test]
+fn keepalive_pings_and_restarts() {
+    use super::Opcode;
+    use crate::time::Instant;
+    use std::time::Duration;
+
+    let mut server = Peer::new(server_config(), *b"SERVERID", auth_hook()).unwrap();
+    let mut client = TestClient::new(*b"CLIENTID");
+    let keys = connect(&mut server, &mut client);
+    let start = Instant::now();
+
+    let out = server.tick(start + Duration::from_secs(11)).unwrap();
+    assert!(!out.close);
+    let mut pings = out
+        .send
+        .into_iter()
+        .filter(|d| Opcode::from_byte(d[0]).0 == Opcode::DATA_V1);
+    let mut ping = pings.next().expect("a keepalive ping");
+    let dec = data::decrypt(&gcm_opts(), &keys, &mut ping)
+        .unwrap()
+        .unwrap();
+    assert!(dec.is_ping);
+
+    // Hearing from the client keeps it alive...
+    assert_eq!(deliver(&mut server, &keys, 1, b"hi"), Some(b"hi".to_vec()));
+    let out = server.tick(start + Duration::from_secs(100)).unwrap();
+    assert!(!out.close);
+    // ...silence past the restart timeout ends it.
+    let out = server.tick(start + Duration::from_secs(125)).unwrap();
+    assert!(out.close, "ping-restart should have fired");
+}
+
 // --- helpers ----------------------------------------------------------------
 
 /// Drive a client through hard reset, TLS handshake and key exchange against

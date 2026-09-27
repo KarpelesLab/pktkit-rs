@@ -20,7 +20,6 @@
 //! TODO (tracked under `// TODO(ovpn): …` markers):
 //! - tls-crypt / tls-auth HMAC wrapping of control packets.
 //! - Full PUSH_REPLY option negotiation beyond ifconfig/ping/comp-lzo.
-//! - Idle-peer reaping / keepalive ping generation.
 
 #[cfg(not(target_family = "wasm"))]
 mod adapter;
@@ -47,6 +46,6 @@ pub use addr::{PeerKey, Transport};
 pub use consts::{AES, CBC, CipherBlockMethod, CipherCryptoAlg, GCM};
 pub use opcode::Opcode;
 pub use options::Options;
-pub use peer::{AuthInfo, OnAuth, Peer, PeerConfig, PeerOutput};
+pub use peer::{AuthInfo, OnAuth, Peer, PeerConfig, PeerOutput, PeerTimers};
 #[cfg(not(target_family = "wasm"))]
 pub use server::{OnConnect, OnData, OnDisconnect, Server, ServerConfig};

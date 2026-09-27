@@ -110,35 +110,31 @@ impl Adapter {
             me: me.clone(),
         });
 
-        let server_cfg = ServerConfig {
-            tls_config: cfg.tls_config,
-            listen_addr: cfg.listen_addr,
-            on_auth: cfg.on_auth,
-            on_data: {
-                let a = adapter.me.clone();
-                Arc::new(move |key, layer, payload| {
-                    if let Some(a) = a.upgrade() {
-                        a.deliver(key, layer, payload);
-                    }
-                })
-            },
-            on_connect: Some({
+        let on_data: super::server::OnData = {
+            let a = adapter.me.clone();
+            Arc::new(move |key, layer, payload| {
+                if let Some(a) = a.upgrade() {
+                    a.deliver(key, layer, payload);
+                }
+            })
+        };
+        let server_cfg = ServerConfig::new(cfg.tls_config, cfg.listen_addr, cfg.on_auth, on_data)
+            .on_connect({
                 let a = adapter.me.clone();
                 Arc::new(move |key, cfg| {
                     if let Some(a) = a.upgrade() {
                         a.on_connect(key, cfg);
                     }
                 })
-            }),
-            on_disconnect: Some({
+            })
+            .on_disconnect({
                 let a = adapter.me.clone();
                 Arc::new(move |key| {
                     if let Some(a) = a.upgrade() {
                         a.on_disconnect(key);
                     }
                 })
-            }),
-        };
+            });
 
         let server = Server::new(server_cfg)?;
         *adapter.server.lock().unwrap() = Some(server);

@@ -15,12 +15,13 @@
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use super::addr::{PeerKey, Transport};
-use super::peer::{OnAuth, Peer, PeerConfig};
+use super::peer::{OnAuth, Peer, PeerConfig, PeerTimers};
 
 /// Callback fired for each decrypted data-channel payload. Receives the peer
 /// key, the peer's layer (2=tap, 3=tun), and the payload bytes.
@@ -63,12 +64,34 @@ pub struct ServerConfig {
     pub on_connect: Option<OnConnect>,
     /// Optional disconnect notification.
     pub on_disconnect: Option<OnDisconnect>,
+    /// Most peers (UDP and TCP together) held at once; a client hard reset
+    /// beyond it is dropped. Default 1024.
+    pub max_peers: usize,
+    /// Most TCP connections served at once; each has a thread. Default 256.
+    pub max_tcp_connections: usize,
+    /// How long a client has to complete the TLS handshake and key
+    /// exchange (OpenVPN's `hand-window`). Default 60s.
+    pub handshake_window: Duration,
+    /// Keepalive ping interval (first argument of OpenVPN's `--keepalive`):
+    /// pushed to clients as `ping`, and the server pings an idle client this
+    /// often. Zero disables. Default 10s.
+    pub keepalive_interval: Duration,
+    /// Keepalive timeout (second argument of `--keepalive`): pushed to
+    /// clients as `ping-restart`; the server drops a client it has not heard
+    /// from for twice this, as OpenVPN's server does. Zero disables.
+    /// Default 60s.
+    pub keepalive_timeout: Duration,
 }
 
 setters! {
     ServerConfig {
         some on_connect: OnConnect;
         some on_disconnect: OnDisconnect;
+        set max_peers: usize;
+        set max_tcp_connections: usize;
+        set handshake_window: Duration;
+        set keepalive_interval: Duration;
+        set keepalive_timeout: Duration;
     }
 }
 
@@ -80,6 +103,7 @@ impl ServerConfig {
         on_auth: OnAuth,
         on_data: OnData,
     ) -> ServerConfig {
+        let timers = PeerTimers::default();
         ServerConfig {
             tls_config,
             listen_addr,
@@ -87,6 +111,19 @@ impl ServerConfig {
             on_data,
             on_connect: None,
             on_disconnect: None,
+            max_peers: 1024,
+            max_tcp_connections: 256,
+            handshake_window: timers.handshake_window,
+            keepalive_interval: timers.keepalive_interval,
+            keepalive_timeout: timers.keepalive_timeout,
+        }
+    }
+
+    fn timers(&self) -> PeerTimers {
+        PeerTimers {
+            handshake_window: self.handshake_window,
+            keepalive_interval: self.keepalive_interval,
+            keepalive_timeout: self.keepalive_timeout,
         }
     }
 }
@@ -112,7 +149,10 @@ struct PeerEntry {
 pub struct Server {
     cfg: ServerConfig,
     udp: Arc<UdpSocket>,
+    tcp_addr: SocketAddr,
     peers: RwLock<HashMap<PeerKey, Arc<PeerEntry>>>,
+    /// TCP connections currently being served.
+    tcp_conns: AtomicUsize,
     closed: Arc<AtomicBool>,
     threads: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -130,11 +170,14 @@ impl Server {
     pub fn new(cfg: ServerConfig) -> io::Result<Arc<Server>> {
         let udp = Arc::new(UdpSocket::bind(cfg.listen_addr)?);
         let tcp = TcpListener::bind(cfg.listen_addr)?;
+        let tcp_addr = tcp.local_addr()?;
 
         let server = Arc::new(Server {
             cfg,
             udp,
+            tcp_addr,
             peers: RwLock::new(HashMap::new()),
+            tcp_conns: AtomicUsize::new(0),
             closed: Arc::new(AtomicBool::new(false)),
             threads: Mutex::new(Vec::new()),
         });
@@ -164,6 +207,13 @@ impl Server {
     /// Local UDP address the server is bound to.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.udp.local_addr()
+    }
+
+    /// Local TCP address the server listens on. The same as
+    /// [`local_addr`](Self::local_addr) unless the configured port was 0, in
+    /// which case each transport got its own ephemeral port.
+    pub fn tcp_local_addr(&self) -> SocketAddr {
+        self.tcp_addr
     }
 
     /// Shut the server down: stop the loops and drop all peers.
@@ -202,9 +252,21 @@ impl Server {
                 }
                 Err(_) => return,
             };
+            let data = &buf[..n];
             let key = PeerKey::new(src, Transport::Udp);
-            let entry = self.get_or_create_peer(key, Transport::Udp, src, None);
-            self.dispatch(&entry, &buf[..n]);
+            let entry = match self.get_peer(&key) {
+                Some(e) => e,
+                // Only a client hard reset may allocate state for a new
+                // address; anything else from a stranger is dropped.
+                None if Peer::is_session_start(data) => {
+                    match self.create_peer(key, Transport::Udp, src, None) {
+                        Some(e) => e,
+                        None => continue,
+                    }
+                }
+                None => continue,
+            };
+            self.dispatch(&entry, data);
         }
     }
 
@@ -221,34 +283,49 @@ impl Server {
                 Ok(a) => a,
                 Err(_) => continue,
             };
+            // Each connection costs a thread: refuse (close) past the cap.
+            if self.tcp_conns.fetch_add(1, Ordering::SeqCst) >= self.cfg.max_tcp_connections {
+                self.tcp_conns.fetch_sub(1, Ordering::SeqCst);
+                continue;
+            }
             let _ = stream.set_nodelay(true);
             let s = self.clone();
-            thread::spawn(move || s.tcp_conn(stream, peer_addr));
+            thread::spawn(move || {
+                s.tcp_conn(stream, peer_addr);
+                s.tcp_conns.fetch_sub(1, Ordering::SeqCst);
+            });
         }
     }
 
-    fn tcp_conn(self: Arc<Self>, stream: TcpStream, peer_addr: SocketAddr) {
+    fn tcp_conn(&self, stream: TcpStream, peer_addr: SocketAddr) {
         let key = PeerKey::new(peer_addr, Transport::Tcp);
         let write_half = match stream.try_clone() {
             Ok(w) => w,
             Err(_) => return,
         };
-        let entry = self.get_or_create_peer(key, Transport::Tcp, peer_addr, Some(write_half));
-
+        // The client must open with a hard reset within the handshake
+        // window; after that, it pings at least every keepalive interval, so
+        // a read blocked past the ping-restart timeout means it is gone.
+        let timers = self.cfg.timers();
+        let _ = stream.set_read_timeout(Some(timers.handshake_window));
         let mut reader = io::BufReader::new(stream);
-        loop {
-            if self.closed.load(Ordering::SeqCst) {
+        let Some(first) = read_frame(&mut reader) else {
+            return;
+        };
+        if !Peer::is_session_start(&first) {
+            return;
+        }
+        let Some(entry) = self.create_peer(key, Transport::Tcp, peer_addr, Some(write_half)) else {
+            return;
+        };
+        let idle = (timers.keepalive_timeout * 2).max(timers.handshake_window);
+        let _ = reader.get_ref().set_read_timeout(Some(idle));
+
+        self.dispatch(&entry, &first);
+        while !self.closed.load(Ordering::SeqCst) {
+            let Some(data) = read_frame(&mut reader) else {
                 break;
-            }
-            let mut len_buf = [0u8; 2];
-            if reader.read_exact(&mut len_buf).is_err() {
-                break;
-            }
-            let len = u16::from_be_bytes(len_buf) as usize;
-            let mut data = vec![0u8; len];
-            if reader.read_exact(&mut data).is_err() {
-                break;
-            }
+            };
             self.dispatch(&entry, &data);
         }
 
@@ -300,19 +377,25 @@ impl Server {
         }
     }
 
-    fn get_or_create_peer(
+    fn get_peer(&self, key: &PeerKey) -> Option<Arc<PeerEntry>> {
+        self.peers.read().unwrap().get(key).cloned()
+    }
+
+    /// Add a peer for `key`, or return the one already there. `None` when
+    /// the peer table is full.
+    fn create_peer(
         &self,
         key: PeerKey,
         transport: Transport,
         addr: SocketAddr,
         tcp: Option<TcpStream>,
-    ) -> Arc<PeerEntry> {
-        if let Some(e) = self.peers.read().unwrap().get(&key) {
-            return e.clone();
-        }
+    ) -> Option<Arc<PeerEntry>> {
         let mut peers = self.peers.write().unwrap();
         if let Some(e) = peers.get(&key) {
-            return e.clone();
+            return Some(e.clone());
+        }
+        if peers.len() >= self.cfg.max_peers {
+            return None;
         }
         let mut local_id = [0u8; 8];
         let _ = super::peer::fill_random(&mut local_id);
@@ -321,7 +404,8 @@ impl Server {
             local_id,
             self.cfg.on_auth.clone(),
         )
-        .expect("peer creation");
+        .expect("peer creation")
+        .with_timers(self.cfg.timers());
         let entry = Arc::new(PeerEntry {
             peer: Mutex::new(peer),
             transport,
@@ -329,7 +413,7 @@ impl Server {
             tcp: tcp.map(Mutex::new),
         });
         peers.insert(key, entry.clone());
-        entry
+        Some(entry)
     }
 
     fn remove_peer(&self, key: PeerKey) {
@@ -407,6 +491,16 @@ impl Server {
             }
         }
     }
+}
+
+/// Read one length-prefixed OpenVPN-over-TCP frame. `None` on EOF, error or
+/// timeout, all of which end the connection.
+fn read_frame(reader: &mut impl Read) -> Option<Vec<u8>> {
+    let mut len_buf = [0u8; 2];
+    reader.read_exact(&mut len_buf).ok()?;
+    let mut data = vec![0u8; u16::from_be_bytes(len_buf) as usize];
+    reader.read_exact(&mut data).ok()?;
+    Some(data)
 }
 
 impl Drop for Server {
@@ -489,6 +583,132 @@ mod tests {
                 break;
             }
         }
+        server.close();
+    }
+
+    /// Only a client hard reset opens a peer: anything else from an unknown
+    /// address -- an ACK, a data packet, an unknown opcode, a control packet
+    /// -- is dropped without allocating state.
+    #[test]
+    fn only_a_hard_reset_creates_a_peer() {
+        let server = test_server();
+        let stranger = udp_client(&server);
+        let ack = ControlPacket::new(Opcode::ACK_V1, 0, *b"STRANGER", [0; 8]);
+        let mut ctl = ControlPacket::new(Opcode::CONTROL_V1, 0, *b"STRANGER", [0; 8]);
+        ctl.set_pid(0);
+        let mut late_reset = ControlPacket::new(
+            Opcode::CONTROL_HARD_RESET_CLIENT_V2,
+            0,
+            *b"STRANGER",
+            [0; 8],
+        );
+        late_reset.set_pid(5);
+        for d in [
+            ack.to_bytes(&[1]),
+            ctl.to_bytes(&[]),
+            late_reset.to_bytes(&[]),
+            vec![Opcode::DATA_V1.to_byte(0); 40],
+            vec![0x00; 20],
+            vec![Opcode(10).to_byte(0); 20],
+        ] {
+            stranger.send(&d).unwrap();
+        }
+        // Sync on a real client being answered: the datagrams above were
+        // read before its reset.
+        let c = udp_client(&server);
+        c.send(&client_reset(*b"CLIENT01")).unwrap();
+        recv_ctrl(&c);
+        assert_eq!(server.peers.read().unwrap().len(), 1);
+        server.close();
+    }
+
+    fn tcp_client(server: &Server) -> TcpStream {
+        let s = TcpStream::connect(server.tcp_local_addr()).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        s
+    }
+
+    fn tcp_send(s: &mut TcpStream, dgram: &[u8]) {
+        s.write_all(&(dgram.len() as u16).to_be_bytes()).unwrap();
+        s.write_all(dgram).unwrap();
+    }
+
+    fn tcp_recv(s: &mut TcpStream) -> io::Result<Vec<u8>> {
+        let mut len = [0u8; 2];
+        s.read_exact(&mut len)?;
+        let mut d = vec![0u8; u16::from_be_bytes(len) as usize];
+        s.read_exact(&mut d)?;
+        Ok(d)
+    }
+
+    /// A TCP connection has to open with a hard reset; anything else closes
+    /// it without a peer being created.
+    #[test]
+    fn tcp_connection_must_open_with_a_hard_reset() {
+        let server = test_server();
+        let mut c = tcp_client(&server);
+        tcp_send(&mut c, &[Opcode::ACK_V1.to_byte(0); 20]);
+        let mut b = [0u8; 1];
+        assert_eq!(c.read(&mut b).unwrap(), 0, "server should close");
+        assert_eq!(server.peers.read().unwrap().len(), 0);
+        server.close();
+    }
+
+    #[test]
+    fn tcp_connections_are_capped() {
+        let on_auth: OnAuth = Arc::new(|_| Err(io::Error::other("no auth in this test")));
+        let on_data: OnData = Arc::new(|_, _, _| {});
+        let cfg = ServerConfig::new(
+            crate::ovpn::tests::server_config(),
+            "127.0.0.1:0".parse().unwrap(),
+            on_auth,
+            on_data,
+        )
+        .max_tcp_connections(1);
+        let server = Server::new(cfg).unwrap();
+        let mut first = tcp_client(&server);
+        tcp_send(&mut first, &client_reset(*b"CLIENT01"));
+        tcp_recv(&mut first).expect("first connection is served");
+
+        let mut second = tcp_client(&server);
+        let mut b = [0u8; 1];
+        match second.read(&mut b) {
+            Ok(0) => {}
+            Err(e)
+                if !matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) => {}
+            other => panic!("second connection must be refused, got {other:?}"),
+        }
+        server.close();
+    }
+
+    #[test]
+    fn peer_table_is_capped() {
+        let on_auth: OnAuth = Arc::new(|_| Err(io::Error::other("no auth in this test")));
+        let on_data: OnData = Arc::new(|_, _, _| {});
+        let cfg = ServerConfig::new(
+            crate::ovpn::tests::server_config(),
+            "127.0.0.1:0".parse().unwrap(),
+            on_auth,
+            on_data,
+        )
+        .max_peers(2);
+        let server = Server::new(cfg).unwrap();
+        let clients: Vec<UdpSocket> = (0..3).map(|_| udp_client(&server)).collect();
+        for (i, c) in clients.iter().take(2).enumerate() {
+            c.send(&client_reset([b'A' + i as u8; 8])).unwrap();
+            recv_ctrl(c);
+        }
+        let third = &clients[2];
+        third
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        third.send(&client_reset(*b"CCCCCCCC")).unwrap();
+        let mut buf = [0u8; 2048];
+        assert!(third.recv(&mut buf).is_err(), "third peer must be refused");
+        assert_eq!(server.peers.read().unwrap().len(), 2);
         server.close();
     }
 }

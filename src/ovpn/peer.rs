@@ -33,11 +33,12 @@
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
+use std::time::Duration;
 
 use purecrypto::tls::Connection as TlsConnection;
 
 use super::Opcode;
-use super::consts::{KEY_EXPANSION_ID, KEY_METHOD_MASK};
+use super::consts::{KEY_EXPANSION_ID, KEY_METHOD_MASK, OPENVPN_PING};
 use super::data;
 use super::keys::PeerKeys;
 use super::options::Options;
@@ -45,6 +46,7 @@ use super::packet_ctrl::ControlPacket;
 use super::prf::prf10;
 use super::reliable::Reliable;
 use super::window::Window;
+use crate::time::Instant;
 
 fn invalid(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
@@ -106,9 +108,45 @@ pub struct PeerOutput {
     pub authenticated: bool,
     /// True if the connection should be torn down.
     pub close: bool,
-    /// Why the connection is being torn down, when `close` is set by an
-    /// error rather than a timeout.
+    /// Why the connection is being torn down, when `close` is set and the
+    /// reason is known.
     pub error: Option<io::Error>,
+}
+
+/// Timers a [`Peer`] runs on, driven by [`Peer::tick`].
+#[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
+pub struct PeerTimers {
+    /// How long a TLS handshake plus key exchange may take (OpenVPN's
+    /// `hand-window`).
+    pub handshake_window: Duration,
+    /// Send a keepalive ping after this long without sending anything
+    /// (`--keepalive` first argument); zero disables.
+    pub keepalive_interval: Duration,
+    /// The `ping-restart` pushed to the client (`--keepalive` second
+    /// argument). The server itself gives up after twice this without
+    /// hearing from the client, as OpenVPN's server does; zero disables.
+    pub keepalive_timeout: Duration,
+}
+
+impl Default for PeerTimers {
+    /// OpenVPN's defaults: `hand-window 60`, and the `keepalive 10 60` its
+    /// sample server configuration uses.
+    fn default() -> PeerTimers {
+        PeerTimers {
+            handshake_window: Duration::from_secs(60),
+            keepalive_interval: Duration::from_secs(10),
+            keepalive_timeout: Duration::from_secs(60),
+        }
+    }
+}
+
+setters! {
+    PeerTimers {
+        set handshake_window: Duration;
+        set keepalive_interval: Duration;
+        set keepalive_timeout: Duration;
+    }
 }
 
 /// One OpenVPN peer (one client address).
@@ -122,6 +160,11 @@ pub struct Peer {
     /// A session still negotiating (OpenVPN's `TM_INITIAL`). Every session
     /// starts here and replaces `active` once it authenticates.
     initial: Option<Session>,
+    timers: PeerTimers,
+    /// Last time an accepted packet arrived from the client.
+    last_recv: Instant,
+    /// Last time we produced a datagram for the client.
+    last_sent: Instant,
 }
 
 impl std::fmt::Debug for Peer {
@@ -161,7 +204,31 @@ impl Peer {
             first_local_id: Some(local_id),
             active: None,
             initial: None,
+            timers: PeerTimers::default(),
+            last_recv: Instant::now(),
+            last_sent: Instant::now(),
         })
+    }
+
+    /// Whether `data` is a datagram that opens a session: a well-formed
+    /// `P_CONTROL_HARD_RESET_CLIENT_V2`, packet 0 on key 0. A server should
+    /// allocate a peer for an unknown address only on one of these.
+    pub fn is_session_start(data: &[u8]) -> bool {
+        let Some(&first) = data.first() else {
+            return false;
+        };
+        let (opcode, key_id) = Opcode::from_byte(first);
+        if opcode != Opcode::CONTROL_HARD_RESET_CLIENT_V2 || key_id != 0 {
+            return false;
+        }
+        ControlPacket::parse(data)
+            .is_ok_and(|p| p.pid == Some(0) && p.session_id != [0; 8] && p.acked_pids.is_empty())
+    }
+
+    /// Replace the default timers.
+    pub fn with_timers(mut self, timers: PeerTimers) -> Peer {
+        self.timers = timers;
+        self
     }
 
     /// The session whose settings describe the connection: the active one,
@@ -207,7 +274,12 @@ impl Peer {
     /// once per retransmit interval (~1s) — for each live peer. Returns the
     /// datagrams to re-send in [`PeerOutput`]`::send`; if a packet exhausts its
     /// retries the connection is abandoned and `PeerOutput::close` is set.
-    pub fn tick(&mut self, now: crate::time::Instant) -> io::Result<PeerOutput> {
+    ///
+    /// The same tick runs the peer's other timers: a session that has not
+    /// completed its key exchange within the handshake window is abandoned,
+    /// an idle established peer is sent a keepalive ping, and one not heard
+    /// from for the ping-restart timeout is closed.
+    pub fn tick(&mut self, now: Instant) -> io::Result<PeerOutput> {
         let mut out = PeerOutput::default();
         for slot in [Slot::Active, Slot::Initial] {
             let Some(s) = self.session_mut(slot) else {
@@ -217,7 +289,35 @@ impl Peer {
             out.send.extend(tick.resend);
             if tick.timed_out {
                 self.fail_session(slot, &mut out, None);
+            } else if !s.ks.kx_done && now >= s.ks.must_negotiate {
+                let e = io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "key negotiation did not complete within the handshake window",
+                );
+                self.fail_session(slot, &mut out, Some(e));
             }
+        }
+
+        if self.active.is_some() {
+            let restart = self.timers.keepalive_timeout * 2;
+            if !restart.is_zero() && now.saturating_duration_since(self.last_recv) >= restart {
+                out.close = true;
+                out.error = Some(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "nothing received within the ping-restart timeout",
+                ));
+                return Ok(out);
+            }
+            let interval = self.timers.keepalive_interval;
+            if !interval.is_zero()
+                && now.saturating_duration_since(self.last_sent) >= interval
+                && let Ok(ping) = self.send_data(&OPENVPN_PING)
+            {
+                out.send.push(ping);
+            }
+        }
+        if !out.send.is_empty() {
+            self.last_sent = now;
         }
         Ok(out)
     }
@@ -235,7 +335,7 @@ impl Peer {
             return Err(invalid("empty packet"));
         };
         let (opcode, key_id) = Opcode::from_byte(first);
-        match opcode {
+        let out = match opcode {
             Opcode::DATA_V1 => self.handle_data(key_id, data),
             // Only a client (key method 2) hard reset may open a session;
             // P_DATA_V2 needs a peer-id we never push; the rest are unknown.
@@ -244,7 +344,15 @@ impl Peer {
             | Opcode::CONTROL_V1
             | Opcode::ACK_V1 => self.handle_control(key_id, data),
             _ => Err(invalid(format!("unexpected opcode {opcode}"))),
+        }?;
+        // Only a packet that got past validation counts as hearing from
+        // the client.
+        let now = Instant::now();
+        self.last_recv = now;
+        if !out.send.is_empty() {
+            self.last_sent = now;
         }
+        Ok(out)
     }
 
     fn handle_control(&mut self, key_id: u8, data: &[u8]) -> io::Result<PeerOutput> {
@@ -274,7 +382,7 @@ impl Peer {
                     id
                 }
             };
-            let (session, server_reset) = Session::new(&self.config, local_id, sid)?;
+            let (session, server_reset) = Session::new(&self.config, local_id, sid, self.timers)?;
             // Replaces any session still negotiating: the client that sent
             // it has given up on it.
             self.initial = Some(session);
@@ -361,6 +469,7 @@ impl Peer {
             .out_pid
             .checked_add(1)
             .ok_or_else(|| invalid("data channel packet id exhausted; renegotiation required"))?;
+        self.last_sent = Instant::now();
         data::encrypt(opts, &dk.keys, dk.out_pid, payload, fill_random)
     }
 }
@@ -380,6 +489,7 @@ struct Session {
     /// Peer-info key/values (`IV_*`) the client advertised during the key
     /// exchange, retained for post-auth queries / diagnostics.
     peer_info: HashMap<String, String>,
+    timers: PeerTimers,
 }
 
 /// One TLS handshake and what it produced (OpenVPN's `key_state`): its own
@@ -391,6 +501,8 @@ struct KeyState {
     /// Key-method-2 exchange scratch (read incrementally from the TLS stream).
     ctrl_buf: Vec<u8>,
     kx_done: bool,
+    /// The key exchange must complete by then.
+    must_negotiate: Instant,
     /// Server random material (r1||r2) generated for the key exchange and
     /// reused by [`Session::derive_keys`] so the PRF inputs match what was
     /// sent.
@@ -412,6 +524,7 @@ impl KeyState {
         key_id: u8,
         local_id: [u8; 8],
         remote_id: [u8; 8],
+        must_negotiate: Instant,
     ) -> io::Result<KeyState> {
         let tls = TlsConnection::server(config)
             .map_err(|e| invalid(format!("TLS server connection: {e:?}")))?;
@@ -423,6 +536,7 @@ impl KeyState {
             reliable,
             ctrl_buf: Vec::new(),
             kx_done: false,
+            must_negotiate,
             server_random: [0u8; 64],
             data: None,
         })
@@ -445,8 +559,10 @@ impl Session {
         config: &purecrypto::tls::Config,
         local_id: [u8; 8],
         remote_id: [u8; 8],
+        timers: PeerTimers,
     ) -> io::Result<(Session, ControlPacket)> {
-        let mut ks = KeyState::new(config, 0, local_id, remote_id)?;
+        let must_negotiate = Instant::now() + timers.handshake_window;
+        let mut ks = KeyState::new(config, 0, local_id, remote_id, must_negotiate)?;
         let reset = ks.reliable.build_hard_reset();
         Ok((
             Session {
@@ -457,6 +573,7 @@ impl Session {
                 peer_cfg: None,
                 layer: 3,
                 peer_info: HashMap::new(),
+                timers,
             },
             reset,
         ))
@@ -622,10 +739,16 @@ impl Session {
             Some(c) => (c.ip.to_string(), c.gateway.to_string()),
             None => ("0.0.0.0".to_string(), "0.0.0.0".to_string()),
         };
-        format!(
-            "PUSH_REPLY,ping 10,comp-lzo no,topology net30,ifconfig {} {}\0",
-            ip, gw_or_mask
-        )
+        let mut reply = String::from("PUSH_REPLY");
+        let t = &self.timers;
+        if !t.keepalive_interval.is_zero() {
+            reply += &format!(",ping {}", t.keepalive_interval.as_secs().max(1));
+        }
+        if !t.keepalive_timeout.is_zero() {
+            reply += &format!(",ping-restart {}", t.keepalive_timeout.as_secs().max(1));
+        }
+        reply += &format!(",comp-lzo no,topology net30,ifconfig {ip} {gw_or_mask}\0");
+        reply
     }
 
     /// Derive the 256-byte key expansion via the TLS-1.0 PRF and split it into
@@ -832,7 +955,8 @@ mod tests {
         let tls = crate::ovpn::tests::server_config();
         let on_auth: OnAuth = Arc::new(|_: &AuthInfo| Err(invalid("unused")));
         let mut p = Peer::new(tls.clone(), *b"SERVERID", on_auth).unwrap();
-        let (mut s, _) = Session::new(&tls, *b"SERVERID", *b"CLIENTID").unwrap();
+        let (mut s, _) =
+            Session::new(&tls, *b"SERVERID", *b"CLIENTID", PeerTimers::default()).unwrap();
         s.opts = Some(Options {
             cipher_block: super::super::GCM,
             cipher_size: 256,
