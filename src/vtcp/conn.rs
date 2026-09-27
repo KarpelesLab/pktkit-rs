@@ -27,7 +27,7 @@ use super::rto::{MAX_RTO, RtoState};
 use super::segment::{Segment, flags};
 use super::sendbuf::SendBuf;
 use super::seqspace::{
-    seq_after, seq_after_eq, seq_before_eq, seq_in_range, seq_in_range_inclusive,
+    seq_after, seq_after_eq, seq_before, seq_before_eq, seq_in_range, seq_in_range_inclusive,
 };
 
 // --- Tunables -------------------------------------------------------------
@@ -200,6 +200,10 @@ pub struct Conn {
     sack_enabled: bool,
     sack_ok: bool,
 
+    // Right edge of the receive window as last advertised (RCV.NXT +
+    // RCV.WND), once an ACK has carried one.
+    rcv_adv: Option<u32>,
+
     // Deferred FIN.
     fin_pending: bool,
     pending_fin_seq: u32,
@@ -282,6 +286,7 @@ impl Conn {
             ts_offset_ms,
             sack_enabled: cfg.enable_sack,
             sack_ok: false,
+            rcv_adv: None,
             fin_pending: false,
             pending_fin_seq: 0,
             fin_queued: false,
@@ -349,7 +354,7 @@ impl Conn {
         self.state = State::SynSent;
 
         let opts = self.build_syn_options();
-        let win = self.rcv_window();
+        let win = self.syn_window();
         let syn = Segment {
             src_port: self.cfg.local_port,
             dst_port: self.cfg.remote_port,
@@ -387,7 +392,7 @@ impl Conn {
         self.state = State::SynReceived;
 
         let opts = self.build_syn_options();
-        let win = self.rcv_window();
+        let win = self.syn_window();
         let rcv_nxt = self.recv_buf.as_ref().unwrap().nxt();
         let synack = Segment {
             src_port: self.cfg.local_port,
@@ -521,26 +526,59 @@ impl Conn {
 
     // --- Outgoing helpers -------------------------------------------------
 
-    fn rcv_window(&self) -> u16 {
-        let avail = self
-            .recv_buf
-            .as_ref()
-            .map(|r| r.window() as usize)
-            .unwrap_or(self.cfg.recv_buf_size);
-        // SWS avoidance (RFC 9293 §3.8.6.2.2 / Clark's algorithm).
+    fn sws_thresh(&self) -> u32 {
         let half = self.cfg.recv_buf_size / 2;
-        let sws_thresh = (self.mss as usize).min(half.max(1));
-        let mut w = if avail < sws_thresh { 0 } else { avail };
+        (self.mss as usize).min(half.max(1)) as u32
+    }
+
+    /// Receive window to advertise, in bytes.
+    fn rcv_wnd_bytes(&self) -> u32 {
+        let Some(rb) = self.recv_buf.as_ref() else {
+            return self.cfg.recv_buf_size as u32;
+        };
+        let avail = rb.window();
+        let thresh = self.sws_thresh();
+        // Receiver SWS avoidance (RFC 9293 §3.8.6.2.2): move the right edge
+        // only in steps of at least `thresh`, and never back — a shrinking
+        // window strands data the peer was already allowed to send.
+        let Some(adv) = self.rcv_adv else {
+            return if avail < thresh { 0 } else { avail };
+        };
+        let nxt = rb.nxt();
+        if seq_after_eq(nxt.wrapping_add(avail), adv.wrapping_add(thresh)) {
+            avail
+        } else if seq_after(adv, nxt) {
+            adv.wrapping_sub(nxt).min(avail)
+        } else {
+            0
+        }
+    }
+
+    fn rcv_window(&self) -> u16 {
+        let mut w = self.rcv_wnd_bytes() as usize;
         if self.wscale_ok {
             w >>= self.rcv_wnd_shift;
         }
-        if w > 65535 {
-            w = 65535;
-        }
-        w as u16
+        w.min(65535) as u16
+    }
+
+    /// Window for a SYN or SYN-ACK, which is never scaled (RFC 7323 §2.2).
+    fn syn_window(&self) -> u16 {
+        self.rcv_wnd_bytes().min(65535) as u16
     }
 
     fn queue_seg(&mut self, seg: Segment) {
+        if seg.has_flag(flags::ACK) && self.recv_buf.is_some() {
+            let shift = if seg.has_flag(flags::SYN) || !self.wscale_ok {
+                0
+            } else {
+                self.rcv_wnd_shift
+            };
+            let edge = seg.ack.wrapping_add((seg.window as u32) << shift);
+            if self.rcv_adv.is_none_or(|adv| seq_after(edge, adv)) {
+                self.rcv_adv = Some(edge);
+            }
+        }
         self.outgoing.push(seg.marshal());
     }
 
@@ -642,10 +680,12 @@ impl Conn {
             return true;
         };
         let rcv_nxt = rb.nxt();
-        let mut rcv_wnd = self.cfg.recv_buf_size as u32;
-        if rcv_wnd == 0 {
-            rcv_wnd = DEFAULT_RECV_BUF as u32;
-        }
+        // What we advertised, or more if a read has freed room since.
+        let advertised = self
+            .rcv_adv
+            .filter(|&adv| seq_after(adv, rcv_nxt))
+            .map_or(0, |adv| adv.wrapping_sub(rcv_nxt));
+        let rcv_wnd = advertised.max(rb.window());
         let seg_len = seg.seg_len();
         if seg_len == 0 {
             // RFC 9293 wants SEG.SEQ < RCV.NXT+RCV.WND, but a peer that has
@@ -693,7 +733,37 @@ impl Conn {
         }
     }
 
+    fn resend_syn_ack(&mut self) {
+        let opts = self.build_syn_options();
+        let win = self.syn_window();
+        let una = self.send_buf.as_ref().unwrap().una();
+        let rcv_nxt = self.recv_buf.as_ref().unwrap().nxt();
+        let synack = Segment {
+            src_port: self.cfg.local_port,
+            dst_port: self.cfg.remote_port,
+            seq: una,
+            ack: rcv_nxt,
+            flags: flags::SYN | flags::ACK,
+            window: win,
+            options: opts,
+            ..Default::default()
+        };
+        self.queue_seg(synack);
+    }
+
     fn handle_synchronized(&mut self, seg: &Segment) -> Vec<Vec<u8>> {
+        // A retransmitted SYN means our SYN-ACK was lost. The RFC's answer,
+        // an ACK for an unacceptable segment, is useless to a peer in
+        // SYN-SENT, which then has to outlast our RTO; resend the SYN-ACK
+        // now, as Linux does.
+        if self.state == State::SynReceived
+            && seg.flags & (flags::SYN | flags::ACK | flags::RST) == flags::SYN
+            && seq_before(seg.seq, self.recv_buf.as_ref().unwrap().nxt())
+        {
+            self.resend_syn_ack();
+            return self.take_outgoing();
+        }
+
         // 1) Sequence number check.
         if !self.segment_acceptable(seg) {
             let syn_rcvd_simopen = self.state == State::SynReceived
@@ -838,7 +908,7 @@ impl Conn {
         }
 
         let opts = self.build_syn_options();
-        let win = self.rcv_window();
+        let win = self.syn_window();
         let una = self.send_buf.as_ref().unwrap().una();
         let rcv_nxt = self.recv_buf.as_ref().unwrap().nxt();
         let synack = Segment {
@@ -1256,10 +1326,21 @@ impl Conn {
     }
 
     fn on_rto_timeout(&mut self) {
-        self.retries += 1;
-        if self.retries > MAX_RETRIES {
-            self.tear_down(State::Closed);
-            return;
+        if self.snd_wnd == 0 && !matches!(self.state, State::SynSent | State::SynReceived) {
+            // The receiver closed its window under data in flight, so our
+            // retransmits are really zero-window probes and its duplicate
+            // ACKs never count as progress. Keep going while it answers, as
+            // Linux does; give up only once it has gone quiet.
+            if self.last_recv.elapsed() > MAX_RTO {
+                self.tear_down(State::Closed);
+                return;
+            }
+        } else {
+            self.retries += 1;
+            if self.retries > MAX_RETRIES {
+                self.tear_down(State::Closed);
+                return;
+            }
         }
         self.rto.backoff();
         self.rto.invalidate_timing();
@@ -1268,7 +1349,7 @@ impl Conn {
         match self.state {
             State::SynSent => {
                 let opts = self.build_syn_options();
-                let win = self.rcv_window();
+                let win = self.syn_window();
                 let una = self.send_buf.as_ref().unwrap().una();
                 let syn = Segment {
                     src_port: self.cfg.local_port,
@@ -1281,23 +1362,7 @@ impl Conn {
                 };
                 self.queue_seg(syn);
             }
-            State::SynReceived => {
-                let opts = self.build_syn_options();
-                let win = self.rcv_window();
-                let una = self.send_buf.as_ref().unwrap().una();
-                let rcv_nxt = self.recv_buf.as_ref().unwrap().nxt();
-                let synack = Segment {
-                    src_port: self.cfg.local_port,
-                    dst_port: self.cfg.remote_port,
-                    seq: una,
-                    ack: rcv_nxt,
-                    flags: flags::SYN | flags::ACK,
-                    window: win,
-                    options: opts,
-                    ..Default::default()
-                };
-                self.queue_seg(synack);
-            }
+            State::SynReceived => self.resend_syn_ack(),
             State::Established
             | State::CloseWait
             | State::FinWait1
@@ -1415,18 +1480,26 @@ impl Conn {
     /// no data is currently available. Use [`Conn::fin_received`] / [`Conn::is_closed`]
     /// to distinguish "would block" from EOF.
     ///
-    /// A read that reopens a closed receive window queues a window update,
-    /// sent with the next [`Conn::tick`] or [`Conn::take_outgoing`]; without
-    /// it the peer would wait on its persist timer.
+    /// A read that opens the receive window well past what was advertised
+    /// queues a window update, sent with the next [`Conn::tick`] or
+    /// [`Conn::take_outgoing`]; without it a peer facing a closed window
+    /// would wait on its persist timer.
     pub fn read(&mut self, buf: &mut [u8]) -> usize {
-        let was_closed = self.rcv_window() == 0;
         let Some(rb) = self.recv_buf.as_mut() else {
             return 0;
         };
         let n = rb.read(buf);
+        let nxt = rb.nxt();
+        let remaining = self
+            .rcv_adv
+            .filter(|&adv| seq_after(adv, nxt))
+            .map_or(0, |adv| adv.wrapping_sub(nxt));
+        // The same test as Linux's tcp_cleanup_rbuf: worth a segment once
+        // the window at least doubles.
+        let open = self.rcv_wnd_bytes();
         if n > 0
-            && was_closed
-            && self.rcv_window() > 0
+            && open > remaining
+            && open >= remaining.saturating_mul(2)
             && matches!(
                 self.state,
                 State::Established | State::FinWait1 | State::FinWait2
@@ -2006,6 +2079,115 @@ mod tests {
         assert_eq!(server.send_buf.as_ref().unwrap().unacked(), 0);
     }
 
+    // A segment arriving ahead of a loss must not pull the advertised right
+    // edge back: the sender is entitled to fill the window it was given.
+    #[test]
+    fn out_of_order_data_keeps_right_edge() {
+        let (mut client, mut server) = established(40019);
+        let (_, pkts) = client.write(&[4u8; 2920]);
+        assert_eq!(pkts.len(), 2);
+        let first_ack = parse(&deliver(&mut server, &pkts[1..])[0]);
+        let rcv_nxt = server.recv_buf.as_ref().unwrap().nxt();
+        assert_eq!(first_ack.ack, rcv_nxt);
+        assert_eq!(first_ack.window, 4096, "edge moved back by the OOO bytes");
+
+        let acks = deliver(&mut server, &pkts[..1]);
+        let ack = parse(acks.last().unwrap());
+        assert_eq!(
+            ack.ack.wrapping_add(ack.window as u32),
+            rcv_nxt.wrapping_add(4096)
+        );
+        assert_eq!(read_all(&mut server), vec![4u8; 2920]);
+    }
+
+    // Once the window is nearly full, SWS avoidance holds the right edge
+    // where it is rather than advertising a zero window that retracts it.
+    #[test]
+    fn sws_avoidance_does_not_retract_edge() {
+        let (mut client, mut server) = established(40020);
+        let (_, pkts) = client.write(&[1u8; 2920]);
+        let acks = deliver(&mut server, &pkts);
+        // 1176 bytes free is below the 1460-byte SWS threshold, but the
+        // edge advertised at connection start still stands.
+        assert_eq!(parse(acks.last().unwrap()).window, 1176);
+
+        // Reading 100 bytes would move the edge by less than the threshold:
+        // no update is worth sending, and ACKs keep showing the same edge.
+        let mut buf = [0u8; 4096];
+        assert_eq!(server.read(&mut buf[..100]), 100);
+        assert!(server.take_outgoing().is_empty());
+        server.queue_ack();
+        assert_eq!(parse(&server.take_outgoing()[0]).window, 1176);
+
+        // Reading the rest opens it enough to be worth a window update.
+        assert_eq!(server.read(&mut buf), 2820);
+        let update = server.take_outgoing();
+        assert_eq!(parse(&update[0]).window, 4096);
+    }
+
+    #[test]
+    fn duplicate_syn_resends_syn_ack() {
+        let mut client = Conn::new(cfg(40022, 80));
+        let mut server = Conn::new(cfg(80, 40022));
+        let syn = client.connect();
+        let _lost_synack = server.accept_syn(&parse(&syn[0]));
+
+        let again = deliver(&mut server, &fire_rto(&mut client));
+        assert_eq!(again.len(), 1);
+        let synack = parse(&again[0]);
+        assert_eq!(synack.flags, flags::SYN | flags::ACK);
+        let ack = deliver(&mut client, &again);
+        assert_eq!(client.state(), State::Established);
+        deliver(&mut server, &ack);
+        assert_eq!(server.state(), State::Established);
+    }
+
+    // A receiver that stops reading closes its window under our data. While
+    // it keeps answering, that is flow control, not a dead peer.
+    #[test]
+    fn zero_window_under_data_in_flight_is_not_a_timeout() {
+        let (mut client, server) = established(40023);
+        client.write(b"data the peer cannot take");
+        let una = client.send_buf.as_ref().unwrap().una();
+        let zero_window_ack = Segment {
+            src_port: 80,
+            dst_port: 40023,
+            seq: server.send_buf.as_ref().unwrap().nxt(),
+            ack: una,
+            flags: flags::ACK,
+            window: 0,
+            ..Default::default()
+        };
+        for _ in 0..MAX_RETRIES * 2 {
+            client.handle_segment(&zero_window_ack);
+            let probe = fire_rto(&mut client);
+            assert_eq!(parse(&probe[0]).seq, una);
+            assert!(!client.is_closed());
+        }
+
+        // A peer silent for longer than MAX_RTO is gone after all.
+        client.last_recv = Instant::now() - MAX_RTO - Duration::from_secs(1);
+        fire_rto(&mut client);
+        assert!(client.is_closed());
+    }
+
+    #[test]
+    fn syn_ack_window_is_not_scaled() {
+        let mut client = Conn::new(ConnConfig {
+            recv_buf_size: 1 << 20,
+            ..cfg(40021, 80)
+        });
+        let mut server = Conn::new(ConnConfig {
+            recv_buf_size: 1 << 20,
+            ..cfg(80, 40021)
+        });
+        let syn = parse(&client.connect()[0]);
+        assert_eq!(syn.window, 65535);
+        let synack = parse(&server.accept_syn(&syn)[0]);
+        assert!(server.wscale_ok);
+        assert_eq!(synack.window, 65535);
+    }
+
     struct Rng(u64);
     impl Rng {
         fn next(&mut self) -> u64 {
@@ -2044,12 +2226,12 @@ mod tests {
             c
         };
         let mut a = Conn::new(small(40100));
-        let mut b = Conn::new({
+        let b = Conn::new({
             let mut c = small(80);
             c.remote_port = 40100;
             c
         });
-        drive_handshake(&mut a, &mut b);
+        let syn = a.connect();
 
         let mut sides = [a, b].map(|conn| {
             let len = rng.below(20_000) as usize;
@@ -2062,7 +2244,8 @@ mod tests {
             }
         });
         // links[i] carries segments sent by side i.
-        let mut links: [Vec<Vec<u8>>; 2] = [Vec::new(), Vec::new()];
+        // The handshake runs over the lossy link too.
+        let mut links: [Vec<Vec<u8>>; 2] = [syn, Vec::new()];
         // Loss comes in short bursts only: enough back-to-back losses make
         // the engine give up after MAX_RETRIES, which is correct but would
         // make the run's outcome luck rather than behaviour.
@@ -2090,7 +2273,10 @@ mod tests {
                         let (n, out) = s.conn.write(&s.to_send[s.written..end]);
                         s.written += n;
                         links[i].extend(out);
-                    } else if !s.close_called && rng.below(4) == 0 {
+                    } else if !s.close_called
+                        && !matches!(s.conn.state(), State::Closed | State::SynSent)
+                        && rng.below(4) == 0
+                    {
                         s.close_called = true;
                         links[i].extend(s.conn.close());
                     }
@@ -2123,7 +2309,17 @@ mod tests {
                     if fate == 2 {
                         links[i].insert(0, pkt.clone());
                     }
-                    let out = sides[1 - i].conn.handle_segment(&parse(&pkt));
+                    let seg = parse(&pkt);
+                    let peer = &mut sides[1 - i].conn;
+                    // Side 1 plays the listener until the first SYN arrives.
+                    let out = if peer.state() == State::Closed
+                        && !peer.is_closed()
+                        && seg.flags & (flags::SYN | flags::ACK) == flags::SYN
+                    {
+                        peer.accept_syn(&seg)
+                    } else {
+                        peer.handle_segment(&seg)
+                    };
                     links[1 - i].extend(out);
                 }
                 // Time passes: fire whatever timer is armed.

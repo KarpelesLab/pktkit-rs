@@ -34,15 +34,15 @@ impl RecvBuf {
     }
 
     /// Bytes available to advertise. Returns `65535` when unbounded.
+    ///
+    /// Only unread in-order data counts against it. Out-of-order data sits
+    /// inside the window already, and counting it would pull the right edge
+    /// back each time a segment arrives ahead of a loss.
     pub fn window(&self) -> u32 {
         if self.window_size == 0 {
             return 65535;
         }
-        let mut used = self.buf.len();
-        for e in &self.ooo {
-            used += e.data.len();
-        }
-        self.window_size.saturating_sub(used) as u32
+        self.window_size.saturating_sub(self.buf.len()) as u32
     }
 
     /// Insert `data` at sequence `seq`. Returns the number of new
@@ -67,9 +67,10 @@ impl RecvBuf {
             seq = self.nxt;
         }
 
-        // Trim past the right edge of the window.
+        // Trim past the right edge of the window, which also bounds the
+        // in-order and out-of-order data together to `window_size`.
         if self.window_size > 0 {
-            let right_edge = self.nxt.wrapping_add(self.window_size as u32);
+            let right_edge = self.nxt.wrapping_add(self.window());
             if seq_after(end_seq, right_edge) {
                 let trim = end_seq.wrapping_sub(right_edge) as usize;
                 if trim >= (end - start) {
@@ -241,6 +242,19 @@ mod tests {
         r.insert(1000, b"hello");
         let n = r.insert(1000, b"hello"); // exact duplicate
         assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn ooo_data_does_not_shrink_window() {
+        let mut r = RecvBuf::new(1000, 100);
+        r.insert(1050, &[0u8; 30]);
+        assert_eq!(r.window(), 100);
+        // The right edge stays at 1100: only 20 bytes past the hole fit.
+        r.insert(1080, &[0u8; 40]);
+        r.insert(1000, &[0u8; 50]);
+        assert_eq!(r.nxt(), 1100);
+        assert_eq!(r.readable(), 100);
+        assert_eq!(r.window(), 0);
     }
 
     #[test]
