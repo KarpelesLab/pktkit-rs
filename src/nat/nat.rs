@@ -308,7 +308,10 @@ impl Nat {
     /// Fails with `AlreadyExists` if the port is forwarded to another host,
     /// and with `AddrInUse` if a live dynamic mapping or a pending expectation
     /// holds it: taking the port over would hand that session's traffic to
-    /// the forward's host.
+    /// the forward's host. Also fails with `AddrInUse` if another port is
+    /// already forwarded to the same inside endpoint: the NAT gives each
+    /// inside endpoint a single public port, from which all its traffic
+    /// leaves.
     pub fn add_port_forward(&self, pf: PortForward) -> Result<()> {
         let rk = NatRevKey {
             proto: pf.proto,
@@ -316,6 +319,18 @@ impl Nat {
         };
         let mut inner = self.inner.lock().unwrap();
         let inner = &mut *inner;
+        let now = Instant::now();
+        // Lapsed forwards are purged first, so they hold no port or endpoint.
+        let lapsed: Vec<NatRevKey> = inner
+            .forwards
+            .iter()
+            .filter(|(_, f)| f.expires.is_some_and(|e| e < now))
+            .map(|(k, _)| *k)
+            .collect();
+        for k in lapsed {
+            inner.forwards.remove(&k);
+            Self::remove_mapping_at_locked(inner, k);
+        }
         if let Some(existing) = inner.forwards.get(&rk)
             && (existing.inside_ip != pf.inside_ip || existing.namespace != pf.namespace)
         {
@@ -324,13 +339,23 @@ impl Nat {
                 "port already forwarded to another host",
             ));
         }
-        let now = Instant::now();
         let reserved = inner
             .expectations
             .iter()
             .any(|e| e.proto == pf.proto && e.outside_port == pf.outside_port && now <= e.expires);
         let dynamic = inner.reverse.contains_key(&rk) && !inner.forwards.contains_key(&rk);
-        if reserved || dynamic {
+        // An inside endpoint has one mapping, so one public port (RFC 5382
+        // REQ-1: endpoint-independent mapping). A second forward to it
+        // would move that mapping to whichever port saw traffic last,
+        // resetting its sessions and sending every reply from that port.
+        let taken = inner.forwards.iter().any(|(k, f)| {
+            *k != rk
+                && f.proto == pf.proto
+                && f.namespace == pf.namespace
+                && f.inside_ip == pf.inside_ip
+                && f.inside_port == pf.inside_port
+        });
+        if reserved || dynamic || taken {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AddrInUse,
                 "port in use by another session",
@@ -2341,6 +2366,35 @@ mod tests {
         nat.remove_port_forward(PROTO_TCP, 8080);
         nat.outside().send(Packet::from_slice(&syn)).unwrap();
         assert_eq!(i.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn second_forward_to_one_inside_endpoint_is_refused() {
+        let (nat, _i, _o) = setup();
+        let server = Ipv4Addr::new(10, 0, 0, 50);
+        nat.add_port_forward(PortForward::new(PROTO_TCP, 8080, server, 80))
+            .unwrap();
+        let err = nat
+            .add_port_forward(PortForward::new(PROTO_TCP, 8081, server, 80))
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+        // Another protocol, port or namespace is another endpoint.
+        nat.add_port_forward(PortForward::new(PROTO_UDP, 8081, server, 80))
+            .unwrap();
+        nat.add_port_forward(PortForward::new(PROTO_TCP, 8082, server, 81))
+            .unwrap();
+        nat.add_port_forward(PortForward::new(PROTO_TCP, 8083, server, 80).namespace(7))
+            .unwrap();
+        // Once the first is gone, the endpoint is free again.
+        nat.remove_port_forward(PROTO_TCP, 8080);
+        nat.add_port_forward(PortForward::new(PROTO_TCP, 8081, server, 80))
+            .unwrap();
+        // And a lapsed forward does not hold it either.
+        let past = Instant::now() - Duration::from_secs(1);
+        nat.add_port_forward(PortForward::new(PROTO_TCP, 9000, server, 22).expires(past))
+            .unwrap();
+        nat.add_port_forward(PortForward::new(PROTO_TCP, 9001, server, 22))
+            .unwrap();
     }
 
     #[test]
