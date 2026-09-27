@@ -31,6 +31,10 @@ use crate::Packet;
 /// anything below this is not useful.
 pub const MIN_IPV4_MTU: usize = 68;
 
+/// The largest fragment offset the header can carry, in bytes: 13 bits of
+/// 8-byte units.
+const MAX_FRAGMENT_OFFSET: usize = 0x1FFF * 8;
+
 /// What [`fragment`] decided to do with a packet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Fragmentation {
@@ -44,8 +48,10 @@ pub enum Fragmentation {
     /// [`icmp::packet_too_big`](crate::icmp::packet_too_big).
     DontFragment,
     /// The packet cannot be fragmented by an intermediate node: it is IPv6, it
-    /// is malformed, or the MTU is too small to hold a header plus data. Reply
-    /// with [`icmp::packet_too_big`](crate::icmp::packet_too_big).
+    /// is malformed, the MTU is too small to hold a header plus data, or it
+    /// is a fragment so far into its datagram that the pieces' offsets would
+    /// not fit the 13-bit field. Reply with
+    /// [`icmp::packet_too_big`](crate::icmp::packet_too_big).
     NotFragmentable,
 }
 
@@ -115,6 +121,11 @@ pub fn fragment_ipv4(pkt: &Packet, mtu: usize) -> Fragmentation {
         let first = pos == 0;
         let room = if first { first_room } else { later_room };
         let take = room.min(data.len() - pos);
+        // Only a fragment that was already far into its datagram gets here;
+        // setting the offset would silently wrap it.
+        if base_offset + pos > MAX_FRAGMENT_OFFSET {
+            return Fragmentation::NotFragmentable;
+        }
         let header: &[u8] = if first { &buf[..hl] } else { &later_header };
 
         let mut frag = Vec::with_capacity(header.len() + take);
@@ -375,5 +386,27 @@ mod tests {
             fragment(Packet::from_slice(short), 500),
             Fragmentation::NotFragmentable
         );
+    }
+
+    #[test]
+    fn refragmenting_past_the_largest_offset_is_refused() {
+        // A fragment sitting near the end of the offset space: splitting it
+        // would need offsets beyond 8191 * 8, which the 13-bit field wraps.
+        let mut buf = packet_with_payload(2000);
+        {
+            let p = Packet::from_mut(&mut buf);
+            p.set_ipv4_fragment_offset(64_000);
+            p.recompute_ipv4_checksum();
+        }
+        let got = fragment(Packet::from_slice(&buf), 576);
+        if let Fragmentation::Fragments(parts) = &got {
+            for part in parts {
+                assert!(
+                    Packet::from_slice(part).ipv4_fragment_offset() >= 64_000,
+                    "offset wrapped"
+                );
+            }
+        }
+        assert_eq!(got, Fragmentation::NotFragmentable);
     }
 }
