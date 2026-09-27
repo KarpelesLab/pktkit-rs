@@ -135,6 +135,24 @@ pub fn get_mss(opts: &[TcpOption]) -> u16 {
     0
 }
 
+/// The smallest MSS vtcp sends with, whatever the peer advertises: Linux's
+/// `TCP_MIN_MSS`. An MSS of a few bytes is legal on the wire but no real
+/// path needs it, and it would let a peer make us spend a 40-byte header on
+/// every byte of data.
+pub const MIN_MSS: u16 = 88;
+
+/// The MSS to send with, given a SYN's options: the advertised value, or
+/// when there is none, 536 for IPv4 (RFC 9293 §3.7.1, RFC 1122 §4.2.2.6) and
+/// 1220 for IPv6 (its 1280-byte minimum MTU less 60 bytes of headers, RFC
+/// 8200 §5). Never below [`MIN_MSS`].
+pub(crate) fn peer_mss(opts: &[TcpOption], ipv6: bool) -> u16 {
+    match get_mss(opts) {
+        0 if ipv6 => 1220,
+        0 => 536,
+        m => m.max(MIN_MSS),
+    }
+}
+
 /// Extract the window scale shift, returning `None` if absent.
 pub fn get_wscale(opts: &[TcpOption]) -> std::option::Option<u8> {
     for o in opts {

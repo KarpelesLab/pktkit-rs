@@ -46,13 +46,19 @@ pub(crate) fn keyed_hash<T: Hash>(v: T) -> u64 {
     k.state.hash_one((k.salt, v))
 }
 
+/// Time since the key was made: a monotonic clock shared by ISNs and cookie
+/// counters.
+pub(crate) fn elapsed() -> std::time::Duration {
+    key().epoch.elapsed()
+}
+
 /// An initial sequence number per RFC 6528 §3: `M + F(localip, localport,
 /// remoteip, remoteport, secretkey)`, where M ticks every 4 µs. F keeps
 /// another connection's ISN from revealing this one's; M keeps a new
 /// incarnation of the same 4-tuple from starting inside the old one's
 /// sequence space.
 pub(crate) fn isn(local: Option<IpAddr>, lport: u16, remote: Option<IpAddr>, rport: u16) -> u32 {
-    let m = (key().epoch.elapsed().as_micros() / 4) as u32;
+    let m = (elapsed().as_micros() / 4) as u32;
     let f = keyed_hash(("isn", local, lport, remote, rport)) as u32;
     m.wrapping_add(f)
 }
