@@ -1160,7 +1160,10 @@ impl Conn {
         let mut need_ack = false;
 
         if !self.update_timestamp(seg) {
-            self.queue_ack();
+            // RFC 7323 §5.3 answers with an ACK, but through the invalid-
+            // segment throttle as Linux does: replayed old segments must
+            // not each draw one.
+            self.queue_oow_ack(seg);
             return self.take_outgoing();
         }
 
@@ -3649,6 +3652,19 @@ mod tests {
         seg.seq = seg.seq.wrapping_sub(100);
         client.handle_segment(&seg);
         assert_eq!(client.ts_recent, before.wrapping_add(1000));
+    }
+
+    // The duplicate ACK a PAWS rejection draws goes through the same
+    // throttle as other invalid segments (Linux's TCPACKSKIPPEDPAWS):
+    // otherwise replayed old segments get an ACK each.
+    #[test]
+    fn paws_rejections_are_throttled() {
+        let (mut client, server) = ts_pair(40314);
+        let una = client.send_buf.as_ref().unwrap().una();
+        let mut seg = bare_ack(&client, &server, una, 4096);
+        seg.options = vec![timestamp_option(client.ts_recent.wrapping_sub(1000), 0)];
+        assert_eq!(client.handle_segment(&seg).len(), 1);
+        assert!(client.handle_segment(&seg).is_empty(), "unthrottled");
     }
 
     // Once negotiated, every segment but a RST carries a timestamp (RFC
