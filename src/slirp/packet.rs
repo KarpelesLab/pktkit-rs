@@ -89,7 +89,11 @@ pub(crate) fn build_packet4(src_ip: Ipv4Addr, dst_ip: Ipv4Addr, tcp_seg: &[u8]) 
     ip[0] = (4 << 4) | 5;
     ip[1] = 0;
     ip[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
-    ip[4..6].copy_from_slice(&0u16.to_be_bytes());
+    // DF stays clear (the stack does no path-MTU discovery, so a narrower
+    // hop downstream must be free to fragment), which makes the datagram
+    // non-atomic: RFC 6864 §4.1 requires a distinct ID, or reassembly at the
+    // guest could splice fragments of two segments together.
+    ip[4..6].copy_from_slice(&(next_ip_id() as u16).to_be_bytes());
     ip[6..8].copy_from_slice(&0u16.to_be_bytes());
     ip[8] = 64; // TTL
     ip[9] = 6; // TCP
@@ -239,6 +243,43 @@ mod tests {
         assert_eq!(&pkt[16..20], &dst.octets());
         // IP header checksum should verify to zero when re-summed.
         assert_eq!(ipv4_header_checksum(&pkt[..20]), 0);
+    }
+
+    /// A path narrower than the link fragments the stack's segments (DF is
+    /// clear). Were two segments to share an ID, a reassembler seeing their
+    /// fragments interleaved would splice one's head onto the other's tail.
+    #[test]
+    fn v4_tcp_segments_reassemble_when_fragmented_and_reordered() {
+        use crate::fragment::{Fragmentation, fragment_ipv4};
+        let src = Ipv4Addr::new(10, 0, 0, 1);
+        let dst = Ipv4Addr::new(10, 0, 0, 2);
+        let seg = |fill: u8| {
+            let mut tcp = vec![fill; 1480];
+            tcp[12] = 5 << 4;
+            tcp
+        };
+        let a = build_packet4(src, dst, &seg(0xAA));
+        let b = build_packet4(src, dst, &seg(0xBB));
+        let frags = |p: &[u8]| match fragment_ipv4(Packet::from_slice(p), 576) {
+            Fragmentation::Fragments(f) => f,
+            _ => panic!("segment was not fragmented"),
+        };
+        let (fa, fb) = (frags(&a), frags(&b));
+        // Heads of both first, then the tails in swapped order.
+        let order = [&fa[..1], &fb[..1], &fb[1..], &fa[1..]]
+            .into_iter()
+            .flat_map(|s| s.iter())
+            .collect::<Vec<_>>();
+        let mut r = crate::defrag::Reassembler::default();
+        let now = crate::time::Instant::now();
+        let mut whole = Vec::new();
+        for f in order {
+            whole.extend(r.push_v4(now, 0, f, 20));
+        }
+        assert_eq!(whole.len(), 2, "segments lost in reassembly");
+        for w in &whole {
+            assert!(w == &a || w == &b, "fragments of different segments merged");
+        }
     }
 
     #[test]
