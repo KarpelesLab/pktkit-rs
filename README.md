@@ -66,7 +66,8 @@ re-cast into idiomatic Rust:
 | `full`       | All of the above                                                              |
 
 `full` builds on every platform. `xdp` and `afxdp` are Linux kernel interfaces
-with no analogue elsewhere, so those two modules are simply absent off Linux;
+with no analogue elsewhere, so those two modules are simply absent off Linux
+(and on 32-bit targets, whose syscall ABI they do not speak);
 `tuntap` and `afpacket` keep their types everywhere and report
 `ErrorKind::Unsupported` when opened on a platform that has no such device.
 

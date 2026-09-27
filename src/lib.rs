@@ -107,8 +107,12 @@ pub type Result<T> = std::io::Result<T>;
 mod sys;
 
 // The syscalls XDP and AF_XDP make, on both targets with a Linux kernel
-// underneath: `linux`, and the libc-free `fullrust`.
-#[cfg(all(feature = "xdp", any(target_os = "linux", target_os = "fullrust")))]
+// underneath: `linux`, and the libc-free `fullrust`. 64-bit only: see `xdp`.
+#[cfg(all(
+    feature = "xdp",
+    target_pointer_width = "64",
+    any(target_os = "linux", target_os = "fullrust")
+))]
 mod syscall;
 
 // Parser entry points collected for fuzzing. Not an API; see `src/fuzz.rs`.
@@ -166,11 +170,25 @@ pub mod tuntap;
 // absent without a Linux kernel, so that enabling `full` -- which includes
 // them -- still builds everywhere. `fullrust` is a Linux kernel without libc
 // (and outside the `unix` family), which is all these modules need.
-#[cfg(all(feature = "xdp", any(target_os = "linux", target_os = "fullrust")))]
+//
+// They are also absent on 32-bit targets. The raw syscalls assume the 64-bit
+// ABI -- `mmap` with a byte offset (32-bit ABIs have `mmap2` in pages, and
+// armv7 has no `mmap` at all), `ppoll` with a 64-bit `timespec`, the AF_XDP
+// ring page offsets past 4 GiB -- and the ethtool structs are laid out with
+// 8-byte `u64` alignment, which i686 does not have.
+#[cfg(all(
+    feature = "xdp",
+    target_pointer_width = "64",
+    any(target_os = "linux", target_os = "fullrust")
+))]
 #[cfg_attr(docsrs, doc(cfg(feature = "xdp")))]
 pub mod xdp;
 
-#[cfg(all(feature = "afxdp", any(target_os = "linux", target_os = "fullrust")))]
+#[cfg(all(
+    feature = "afxdp",
+    target_pointer_width = "64",
+    any(target_os = "linux", target_os = "fullrust")
+))]
 #[cfg_attr(docsrs, doc(cfg(feature = "afxdp")))]
 pub mod afxdp;
 

@@ -10,6 +10,10 @@
 //! On Linux the constants still come from libc, which knows the handful of
 //! architectures where they differ; fullrust is x86-64 only, so its values are
 //! the x86-64 ones from the kernel headers.
+//!
+//! Only 64-bit ABIs are spoken (the module is not compiled elsewhere; see
+//! `lib.rs`): `mmap` takes a byte offset, and `ppoll` a `timespec` of two
+//! 64-bit fields. A 32-bit ABI has neither.
 
 // Most of this is AF_XDP's; `xdp` alone needs only sockets and `bpf(2)`.
 #![cfg_attr(not(feature = "afxdp"), allow(dead_code, unused_imports))]

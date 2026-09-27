@@ -46,7 +46,8 @@ tuntap = ["dep:libc"]
 afpacket = ["dep:libc"]
 
 # Linux XDP: load/attach eBPF programs on a device's receive path, with an
-# IP-prefix capture program and the maps that drive it.
+# IP-prefix capture program and the maps that drive it. 64-bit targets only;
+# elsewhere the module is absent.
 xdp = ["dep:libc"]
 
 # Linux AF_XDP zero-copy sockets. Layers a userspace datapath on `xdp`.
