@@ -1179,9 +1179,13 @@ impl Conn {
             // RFC 5681 §2: only an ACK of SND.UNA with data outstanding, no
             // payload or FIN, and the same window is a duplicate. A window
             // update is not a loss signal, and its window must be used.
+            //
+            // Nor is an ACK of a zero window: it is what a probe draws, and
+            // the receiver taking nothing says nothing about loss.
             if ack == una
                 && una != snd_nxt
                 && !wnd_changed
+                && self.snd_wnd > 0
                 && seg.payload.is_empty()
                 && !seg.has_flag(flags::FIN)
             {
@@ -1611,34 +1615,37 @@ impl Conn {
             }
             return;
         }
-        // 1-byte window probe.
-        if self
-            .send_buf
-            .as_ref()
-            .map(|s| s.pending() > 0)
-            .unwrap_or(false)
-        {
-            let data: Vec<u8> = self.send_buf.as_ref().unwrap().peek_unsent(1).to_vec();
-            if !data.is_empty() {
-                let snd_nxt = self.send_buf.as_ref().unwrap().nxt();
-                let rcv_nxt = self.recv_buf.as_ref().unwrap().nxt();
-                let seg = Segment {
-                    src_port: self.cfg.local_port,
-                    dst_port: self.cfg.remote_port,
-                    seq: snd_nxt,
-                    ack: rcv_nxt,
-                    flags: flags::ACK,
-                    window: self.rcv_window(),
-                    payload: data.clone(),
-                    ..Default::default()
-                };
-                self.queue_seg(seg);
-                self.send_buf.as_mut().unwrap().advance_sent(data.len());
-                // The probe byte is real data: if it or its ACK is lost, only
-                // the RTO will send it again.
-                if self.rto_deadline.is_none() {
-                    self.start_rto();
-                }
+        // A 1-byte window probe. Once one is out, later probes resend that
+        // byte (RFC 9293 §3.8.6.1) rather than a new one each time: every
+        // new byte would sit further past a window the receiver never
+        // opened. Bytes in flight from before the window closed are probed
+        // the same way, from SND.UNA.
+        let sb = self.send_buf.as_ref().unwrap();
+        let (seq, data, new) = match sb.retransmit_data(1) {
+            Some((seq, d)) => (seq, d.to_vec(), false),
+            None => (sb.nxt(), sb.peek_unsent(1).to_vec(), true),
+        };
+        if !data.is_empty() {
+            let rcv_nxt = self.recv_buf.as_ref().unwrap().nxt();
+            let mut seg = Segment {
+                src_port: self.cfg.local_port,
+                dst_port: self.cfg.remote_port,
+                seq,
+                ack: rcv_nxt,
+                flags: flags::ACK,
+                window: self.rcv_window(),
+                payload: data,
+                ..Default::default()
+            };
+            self.add_options(&mut seg);
+            self.queue_seg(seg);
+            if new {
+                self.send_buf.as_mut().unwrap().advance_sent(1);
+            }
+            // The probe byte is real data: if it or its ACK is lost after
+            // the last probe, only the RTO will send it again.
+            if self.rto_deadline.is_none() {
+                self.start_rto();
             }
         }
         self.persist_backoff = self.persist_backoff.saturating_mul(2);
@@ -2899,6 +2906,58 @@ mod tests {
         let seg = data_with_ack(&client, &server, una.wrapping_sub(1000), b"good", false);
         client.handle_segment(&seg);
         assert_eq!(read_all(&mut client), b"good");
+    }
+
+    fn fire_persist(c: &mut Conn) -> Vec<Vec<u8>> {
+        assert!(c.persist_deadline.is_some(), "persist not armed");
+        c.persist_deadline = Some(Instant::now());
+        c.tick()
+    }
+
+    /// A pure ACK from `server` to `client` for `ack`, offering `window`.
+    fn bare_ack(client: &Conn, server: &Conn, ack: u32, window: u16) -> Segment {
+        Segment {
+            window,
+            ..data_with_ack(client, server, ack, b"", false)
+        }
+    }
+
+    // RFC 9293 §3.8.6.1: while the window stays shut, every probe carries
+    // the same byte. A new one each time would push data past a window the
+    // receiver never opened.
+    #[test]
+    fn persist_probes_resend_the_same_byte() {
+        let (mut client, server) = established(40270);
+        client.snd_wnd = 0;
+        client.write(b"abcdef");
+        let una = client.send_buf.as_ref().unwrap().una();
+        for _ in 0..3 {
+            let probe = fire_persist(&mut client);
+            assert_eq!(probe.len(), 1);
+            let seg = parse(&probe[0]);
+            assert_eq!((seg.seq, &seg.payload[..]), (una, &b"a"[..]));
+            // The receiver still has no room.
+            client.handle_segment(&bare_ack(&client, &server, una, 0));
+        }
+        assert_eq!(client.send_buf.as_ref().unwrap().nxt(), una.wrapping_add(1));
+    }
+
+    // The zero-window ACK a probe draws matches SND.UNA and the last window,
+    // but it is flow control, not a loss signal: no Early Retransmit.
+    #[test]
+    fn zero_window_probe_reply_is_not_a_duplicate_ack() {
+        let (mut client, server) = established(40271);
+        client.snd_wnd = 0;
+        client.write(b"abcdef");
+        let una = client.send_buf.as_ref().unwrap().una();
+        let cwnd = client.cc.send_window();
+        fire_persist(&mut client);
+        for _ in 0..3 {
+            let out = client.handle_segment(&bare_ack(&client, &server, una, 0));
+            assert!(out.is_empty(), "retransmitted on a zero-window ACK");
+        }
+        assert!(!client.cc.in_recovery());
+        assert_eq!(client.cc.send_window(), cwnd);
     }
 
     // RFC 6528: a new connection on the same 4-tuple starts just past the
