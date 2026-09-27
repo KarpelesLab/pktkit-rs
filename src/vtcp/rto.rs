@@ -9,6 +9,8 @@ use super::seqspace::seq_after;
 pub const DEFAULT_RTO: Duration = Duration::from_secs(1);
 /// Floor for the RTO (RFC 6298 §2.4 — most implementations).
 pub const MIN_RTO: Duration = Duration::from_millis(200);
+/// RTO once data transfer begins after a lost SYN (RFC 6298 §5.7).
+const SYN_LOSS_RTO: Duration = Duration::from_secs(3);
 /// Hard upper bound (RFC 6298 allows up to 60s).
 pub const MAX_RTO: Duration = Duration::from_secs(60);
 
@@ -67,6 +69,15 @@ impl RtoState {
     pub fn backoff(&mut self) {
         self.rto = self.rto.saturating_mul(2);
         self.clamp();
+    }
+
+    /// The SYN timed out, and data transfer is about to begin: RFC 6298
+    /// §5.7 re-initializes an RTO below 3 s to 3 s, since the handshake
+    /// gave no RTT sample and 1 s has proven too short for this path.
+    pub fn reset_after_syn_loss(&mut self) {
+        if !self.measured {
+            self.rto = SYN_LOSS_RTO;
+        }
     }
 
     #[inline]

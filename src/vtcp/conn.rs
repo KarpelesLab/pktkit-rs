@@ -225,6 +225,9 @@ pub struct Conn {
     /// next hole (RFC 6582 §3.2 applied to timeout recovery), where the
     /// cumulative ACK alone would leave every hole to its own timeout.
     rto_recover: std::option::Option<u32>,
+    /// Our SYN or SYN-ACK timed out and was resent. The data transfer then
+    /// starts from the loss window (RFC 5681 §3.1), not the initial window.
+    syn_lost: bool,
     /// When we last answered an invalid segment (a challenge ACK or an
     /// out-of-window duplicate), for the RFC 5961 §7 throttle.
     last_oow_ack: std::option::Option<Instant>,
@@ -360,6 +363,7 @@ impl Conn {
             rto_deadline: None,
             retries: 0,
             rto_recover: None,
+            syn_lost: false,
             last_oow_ack: None,
             dup_acks: 0,
             high_rxt: 0,
@@ -857,6 +861,15 @@ impl Conn {
     /// the loss-recovery state belongs to the handshake, not to the data
     /// that follows.
     fn handshake_done(&mut self) {
+        if self.syn_lost {
+            // RFC 5681 §3.1 (and RFC 6928 §2): after a lost SYN or SYN-ACK
+            // the initial window MUST be one segment, with ssthresh left
+            // alone. The client's controller was only just rebuilt for the
+            // peer's MSS, so this has to come after that. RFC 6298 §5.7:
+            // the RTO, never sampled (Karn), starts data transfer at 3 s.
+            self.cc.on_handshake_loss();
+            self.rto.reset_after_syn_loss();
+        }
         self.rto_recover = None;
         self.dup_acks = 0;
         if let Some(sb) = self.send_buf.as_ref() {
@@ -1894,17 +1907,25 @@ impl Conn {
         }
         self.rto.backoff();
         self.rto.invalidate_timing();
-        // Only the first timeout of a segment sets ssthresh (RFC 5681 §3.1);
-        // `retries` counts timeouts without an ACK in between. A zero
-        // window does not count them, but its timeouts after the first are
-        // probes, not new losses.
-        let repeated = self.retries > 1 || (zero_window && self.rto_recover.is_some());
-        let flight = self.send_buf.as_ref().map_or(0, |s| s.unacked() as u32);
-        self.cc.on_retransmit_timeout(flight, repeated);
+        let synchronized = self.state.is_synchronized();
+        if synchronized {
+            // Only the first timeout of a segment sets ssthresh (RFC 5681
+            // §3.1); `retries` counts timeouts without an ACK in between. A
+            // zero window does not count them, but its timeouts after the
+            // first are probes, not new losses.
+            let repeated = self.retries > 1 || (zero_window && self.rto_recover.is_some());
+            let flight = self.send_buf.as_ref().map_or(0, |s| s.unacked() as u32);
+            self.cc.on_retransmit_timeout(flight, repeated);
+        } else {
+            // With only the SYN or SYN-ACK out there is no flight to halve:
+            // ssthresh would drop to its 2-segment floor and hold the whole
+            // connection in congestion avoidance from the start. RFC 5681
+            // §3.1 asks only for the loss window once data begins.
+            self.syn_lost = true;
+        }
         self.dup_acks = 0;
         self.er_deadline = None;
         self.limited_transmit = 0;
-        let synchronized = self.state.is_synchronized();
         if let Some(sb) = self.send_buf.as_mut() {
             sb.clear_sacked();
             // A SYN or SYN-ACK alone is not a loss the data's repair has to
@@ -3264,6 +3285,10 @@ mod tests {
             client.rto_recover.is_none(),
             "timeout recovery outlived the SYN"
         );
+        // After the lost SYN data starts from one segment. Stand in for the
+        // round trips of slow start that would grow it, without the new
+        // ACKs that would also clear any stale loss state.
+        client.cc = make_cc(client.cfg.congestion, client.mss as u32);
 
         let (_, segs) = client.write(&[4; 10_000]);
         assert_eq!(segs.len(), 10);
@@ -3271,6 +3296,59 @@ mod tests {
         let out = deliver(&mut client, &dups);
         assert!(client.cc.in_recovery(), "no fast retransmit");
         assert!(seqs(&out).contains(&parse(&segs[0]).seq));
+    }
+
+    /// Rounds of: the sender fills its window, the receiver ACKs it all.
+    fn stream_rounds(tx: &mut Conn, rx: &mut Conn, rounds: usize) {
+        let (_, mut out) = tx.write(&vec![9; 1 << 20]);
+        for _ in 0..rounds {
+            let acks = deliver(rx, &out);
+            read_all(rx);
+            out = deliver(tx, &acks);
+            out.extend(tx.take_outgoing());
+        }
+    }
+
+    /// A lost SYN-ACK: the server's RTO fired with only the SYN-ACK out.
+    /// That must not cut ssthresh to its two-segment floor, which would
+    /// hold the connection in congestion avoidance for good; the data
+    /// transfer starts from one segment (RFC 5681 §3.1) and slow-starts.
+    #[test]
+    fn lost_syn_ack_starts_from_the_loss_window_in_slow_start() {
+        let conf = |l, r| big(l, r).send_buf_size(1 << 20).recv_buf_size(1 << 20);
+        let mut client = Conn::new(conf(40232, 80));
+        let mut server = Conn::new(conf(80, 40232));
+        let syn = client.connect();
+        let _lost = server.accept_syn(&parse(&syn[0]));
+        let synack = fire_rto(&mut server);
+        let ack = deliver(&mut client, &synack);
+        deliver(&mut server, &ack);
+        assert_eq!(server.state(), State::Established);
+        let mss = server.mss as u32;
+        assert_eq!(server.cc.send_window(), mss, "loss window");
+        assert_eq!(server.rto.rto(), Duration::from_secs(3));
+        stream_rounds(&mut server, &mut client, 4);
+        assert!(
+            server.cc.send_window() >= 16 * mss,
+            "not in slow start: cwnd {}",
+            server.cc.send_window() / mss
+        );
+    }
+
+    /// The client's controller is rebuilt when the SYN-ACK brings the
+    /// peer's MSS; a SYN lost before it still means the loss window.
+    #[test]
+    fn lost_syn_starts_the_client_from_the_loss_window() {
+        let mut client = Conn::new(big(40233, 80));
+        let mut server = Conn::new(big(80, 40233));
+        let _lost = client.connect();
+        let syn = fire_rto(&mut client);
+        let synack = server.accept_syn(&parse(&syn[0]));
+        deliver(&mut client, &synack);
+        assert_eq!(client.state(), State::Established);
+        assert_eq!(client.cc.send_window(), client.mss as u32);
+        let (_, segs) = client.write(&[1; 5000]);
+        assert_eq!(segs.len(), 1, "one segment, not the initial window");
     }
 
     fn big(local: u16, remote: u16) -> ConnConfig {

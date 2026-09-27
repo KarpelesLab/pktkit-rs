@@ -31,6 +31,13 @@ pub trait CongestionController: Send {
         let _ = (flight_size, repeated);
         self.on_timeout();
     }
+    /// The SYN or SYN-ACK was lost and resent; the handshake has just
+    /// completed. RFC 5681 §3.1 has data start from the loss window (one
+    /// segment) with ssthresh untouched. The default does that as a
+    /// repeated timeout, which the built-in controllers take the same way.
+    fn on_handshake_loss(&mut self) {
+        self.on_retransmit_timeout(0, true);
+    }
     /// Fast retransmit triggered; enter recovery.
     fn on_fast_retransmit(&mut self, flight_size: u32, snd_nxt: u32);
     /// A partial ACK during fast recovery (RFC 6582 §3.2 step 5):
