@@ -421,6 +421,24 @@ fn drain(engine: &Engine, timeout: Duration) -> bool {
     engine.queued() == 0
 }
 
+/// Join the release thread, unless this *is* the release thread.
+///
+/// The worker delivers through a `Weak` it upgrades per message, so when every
+/// other reference goes away mid-delivery, the wrapper's last `Arc` is dropped
+/// on the worker itself. Joining there would be a thread joining itself, which
+/// std turns into a panic (`EDEADLK`). The worker is on its way out anyway:
+/// `stop` has cleared `running`, so it returns once the delivery is done.
+#[cfg(not(target_family = "wasm"))]
+fn join_unless_current(w: JoinHandle<()>) {
+    if w.thread().id() != std::thread::current().id() {
+        let _ = w.join();
+    }
+}
+
+/// Without threads there is never a worker to join.
+#[cfg(target_family = "wasm")]
+fn join_unless_current(_w: JoinHandle<()>) {}
+
 macro_rules! impaired_device {
     (
         $name:ident, $device:ident, $handler:ident, $msg:ident, $doc:literal
@@ -538,7 +556,7 @@ macro_rules! impaired_device {
                 // without this the thread would outlive the wrapper.
                 self.engine.stop();
                 if let Some(w) = self.worker.lock().unwrap().take() {
-                    let _ = w.join();
+                    join_unless_current(w);
                 }
             }
         }
@@ -900,6 +918,68 @@ mod tests {
         // Drop returns only once the worker has joined; a leaked thread would
         // hang this test rather than fail it.
         drop(link);
+    }
+
+    #[test]
+    fn the_release_thread_does_not_join_itself() {
+        // What the release thread does when it turns out to hold the
+        // wrapper's last reference: drop its own handle, not join it.
+        let (handle_tx, handle_rx) = std::sync::mpsc::channel::<JoinHandle<()>>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let t = std::thread::spawn(move || {
+            join_unless_current(handle_rx.recv().unwrap());
+            done_tx.send(()).unwrap();
+        });
+        handle_tx.send(t).unwrap();
+        // A self-join panics the thread, which drops `done_tx` unsent.
+        assert!(done_rx.recv_timeout(Duration::from_secs(5)).is_ok());
+    }
+
+    #[test]
+    fn a_wrapper_dropped_during_its_own_delivery_shuts_down_cleanly() {
+        // The wrapper's last `Arc` goes away while the release thread is
+        // delivering, so the release thread runs `Drop`.
+        struct Slow {
+            entered: std::sync::mpsc::Sender<()>,
+            release: Mutex<std::sync::mpsc::Receiver<()>>,
+            done: std::sync::mpsc::Sender<()>,
+        }
+        impl L2Device for Slow {
+            fn set_handler(&self, _h: L2Handler) {}
+            fn send(&self, _f: &Frame) -> Result<()> {
+                self.entered.send(()).unwrap();
+                self.release.lock().unwrap().recv().unwrap();
+                Ok(())
+            }
+            fn hw_addr(&self) -> MacAddr {
+                MacAddr::zero()
+            }
+            fn close(&self) -> Result<()> {
+                Ok(())
+            }
+        }
+        impl Drop for Slow {
+            fn drop(&mut self) {
+                let _ = self.done.send(());
+            }
+        }
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let link = ImpairL2::new(
+            Arc::new(Slow {
+                entered: entered_tx,
+                release: Mutex::new(release_rx),
+                done: done_tx,
+            }),
+            Impairment::default().delay(Duration::from_millis(1)),
+        );
+        link.send(Frame::from_slice(&frame(0))).unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        drop(link);
+        release_tx.send(()).unwrap();
+        // The wrapped device goes with the wrapper, on the release thread.
+        assert!(done_rx.recv_timeout(Duration::from_secs(5)).is_ok());
     }
 
     #[test]
