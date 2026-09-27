@@ -11,10 +11,10 @@
 //! require a real macOS host + root and are marked
 //! `// TODO(tuntap): needs macOS to verify`.
 
+use super::reader::{DevFd, HandlerSlot};
 use crate::{Frame, IpPrefix, L2Device, L2Handler, L3Device, L3Handler, MacAddr, Packet, Result};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 const UTUN_CONTROL_NAME: &[u8] = b"com.apple.net.utun_control";
@@ -28,29 +28,20 @@ pub struct TuntapConfig {
     pub name: String,
 }
 
-struct DevInner {
-    fd: OwnedFd,
-    name: String,
-    closed: AtomicBool,
-}
-
-impl DevInner {
-    fn raw(&self) -> i32 {
-        self.fd.as_raw_fd()
-    }
-}
-
 /// macOS TUN device — raw IPv4/IPv6 packets.
+///
+/// Dropping it closes the device, as [`L3Device::close`] does.
 pub struct Tun {
-    inner: Arc<DevInner>,
-    handler: Arc<Mutex<Option<L3Handler>>>,
+    dev: Arc<DevFd>,
+    name: String,
+    handler: Arc<HandlerSlot<L3Handler>>,
     addr: Mutex<IpPrefix>,
 }
 
 impl core::fmt::Debug for Tun {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("tuntap::Tun")
-            .field("name", &self.inner.name)
+            .field("name", &self.name)
             .finish()
     }
 }
@@ -59,19 +50,16 @@ impl Tun {
     /// Open a utun device. Requires root.
     pub fn open(_cfg: TuntapConfig) -> Result<Tun> {
         let (fd, name) = open_utun()?;
-        let inner = Arc::new(DevInner {
-            fd,
-            name,
-            closed: AtomicBool::new(false),
-        });
-        let handler: Arc<Mutex<Option<L3Handler>>> = Arc::new(Mutex::new(None));
+        let dev = Arc::new(DevFd::new(fd)?);
+        let handler: Arc<HandlerSlot<L3Handler>> = Arc::new(HandlerSlot::new());
 
-        let inner_t = inner.clone();
+        let dev_t = dev.clone();
         let handler_t = handler.clone();
-        std::thread::spawn(move || read_loop(inner_t, handler_t));
+        std::thread::spawn(move || read_loop(dev_t, handler_t));
 
         Ok(Tun {
-            inner,
+            dev,
+            name,
             handler,
             addr: Mutex::new(IpPrefix::default()),
         })
@@ -79,13 +67,13 @@ impl Tun {
 
     /// OS interface name (e.g. `utun3`).
     pub fn name(&self) -> &str {
-        &self.inner.name
+        &self.name
     }
 }
 
 impl L3Device for Tun {
     fn set_handler(&self, h: L3Handler) {
-        *self.handler.lock().unwrap() = Some(h);
+        self.handler.set(h);
     }
     fn send(&self, pkt: &Packet) -> Result<()> {
         let bytes = pkt.as_bytes();
@@ -106,7 +94,7 @@ impl L3Device for Tun {
         let mut framed = Vec::with_capacity(4 + bytes.len());
         framed.extend_from_slice(&proto.to_be_bytes());
         framed.extend_from_slice(bytes);
-        write_all(self.inner.raw(), &framed)
+        self.dev.write_all(&framed)
     }
     fn addr(&self) -> IpPrefix {
         *self.addr.lock().unwrap()
@@ -115,9 +103,19 @@ impl L3Device for Tun {
         *self.addr.lock().unwrap() = p;
         Ok(())
     }
+    /// Close the fd, which removes the utun interface, and stop the reader
+    /// thread.
     fn close(&self) -> Result<()> {
-        self.inner.closed.store(true, Ordering::Release);
+        if self.dev.close() {
+            self.handler.wake();
+        }
         Ok(())
+    }
+}
+
+impl Drop for Tun {
+    fn drop(&mut self) {
+        let _ = L3Device::close(self);
     }
 }
 
@@ -230,51 +228,18 @@ fn getsockopt_ifname(fd: i32) -> Option<String> {
     Some(String::from_utf8_lossy(&buf[..end]).into_owned())
 }
 
-fn write_all(fd: i32, buf: &[u8]) -> Result<()> {
-    let mut written = 0;
-    while written < buf.len() {
-        let n = unsafe {
-            libc::write(
-                fd,
-                buf[written..].as_ptr() as *const libc::c_void,
-                buf.len() - written,
-            )
-        };
-        if n < 0 {
-            let e = io::Error::last_os_error();
-            if e.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(e);
-        }
-        written += n as usize;
-    }
-    Ok(())
-}
-
-fn read_loop(inner: Arc<DevInner>, handler: Arc<Mutex<Option<L3Handler>>>) {
+fn read_loop(dev: Arc<DevFd>, handler: Arc<HandlerSlot<L3Handler>>) {
     // TODO(tuntap): needs macOS to verify the live read path.
     let mut buf = vec![0u8; 65536];
-    while !inner.closed.load(Ordering::Acquire) {
-        let n = unsafe {
-            libc::read(
-                inner.raw(),
-                buf.as_mut_ptr() as *mut libc::c_void,
-                buf.len(),
-            )
-        };
+    while let Some(n) = dev.read(&mut buf) {
+        // Nothing past the 4-byte protocol-family header: no packet.
         if n <= 4 {
-            // <= 4 means header-only or error/EOF.
-            if n <= 0 {
-                return;
-            }
             continue;
         }
+        let Some(h) = handler.wait(dev.closed()) else {
+            return;
+        };
         // Strip the 4-byte protocol-family header.
-        let pkt = &buf[4..n as usize];
-        let h = handler.lock().unwrap().clone();
-        if let Some(h) = h {
-            let _ = h(Packet::from_slice(pkt));
-        }
+        let _ = h(Packet::from_slice(&buf[4..n]));
     }
 }

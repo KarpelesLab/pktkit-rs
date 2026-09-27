@@ -4,14 +4,14 @@
 //! handed to the handler is the read scratch and is only valid for the
 //! duration of the call (mirroring the rest of the crate).
 
-use crate::sys::{if_hw_addr, write_all};
+use super::reader::{DevFd, HandlerSlot};
+use crate::sys::if_hw_addr;
 use crate::{
     DeviceStats, Frame, IpPrefix, L2Device, L2Handler, L3Device, L3Handler, MacAddr, Packet, Result,
 };
 use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Knobs for opening a TUN or TAP device.
@@ -24,37 +24,31 @@ pub struct TuntapConfig {
 }
 
 /// Linux TUN device — raw IPv4/IPv6 packets.
+///
+/// Dropping it closes the device, as [`L3Device::close`] does.
 pub struct Tun {
-    inner: Arc<DevInner>,
-    handler: Arc<Mutex<Option<L3Handler>>>,
+    dev: Arc<DevFd>,
+    name: String,
+    handler: Arc<HandlerSlot<L3Handler>>,
     addr: Mutex<IpPrefix>,
     stats: Arc<DeviceStats>,
 }
 
 /// Linux TAP device — full Ethernet frames including header.
+///
+/// Dropping it closes the device, as [`L2Device::close`] does.
 pub struct Tap {
-    inner: Arc<DevInner>,
-    handler: Arc<Mutex<Option<L2Handler>>>,
+    dev: Arc<DevFd>,
+    name: String,
+    handler: Arc<HandlerSlot<L2Handler>>,
     mac: MacAddr,
     stats: Arc<DeviceStats>,
-}
-
-struct DevInner {
-    fd: OwnedFd,
-    name: String,
-    closed: AtomicBool,
-}
-
-impl DevInner {
-    fn raw(&self) -> i32 {
-        self.fd.as_raw_fd()
-    }
 }
 
 impl core::fmt::Debug for Tun {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("tuntap::Tun")
-            .field("name", &self.inner.name)
+            .field("name", &self.name)
             .finish()
     }
 }
@@ -62,7 +56,7 @@ impl core::fmt::Debug for Tun {
 impl core::fmt::Debug for Tap {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("tuntap::Tap")
-            .field("name", &self.inner.name)
+            .field("name", &self.name)
             .field("mac", &self.mac)
             .finish()
     }
@@ -72,21 +66,18 @@ impl Tun {
     /// Open a TUN (L3) device. Requires `CAP_NET_ADMIN` or root.
     pub fn open(cfg: TuntapConfig) -> Result<Tun> {
         let (fd, name) = open_tuntap(&cfg.name, libc::IFF_TUN | libc::IFF_NO_PI)?;
-        let inner = Arc::new(DevInner {
-            fd,
-            name,
-            closed: AtomicBool::new(false),
-        });
-        let handler: Arc<Mutex<Option<L3Handler>>> = Arc::new(Mutex::new(None));
+        let dev = Arc::new(DevFd::new(fd)?);
+        let handler: Arc<HandlerSlot<L3Handler>> = Arc::new(HandlerSlot::new());
         let stats = Arc::new(DeviceStats::new());
 
-        let inner_t = inner.clone();
+        let dev_t = dev.clone();
         let handler_t = handler.clone();
         let stats_t = stats.clone();
-        std::thread::spawn(move || read_loop_l3(inner_t, handler_t, stats_t));
+        std::thread::spawn(move || read_loop_l3(dev_t, handler_t, stats_t));
 
         Ok(Tun {
-            inner,
+            dev,
+            name,
             handler,
             addr: Mutex::new(IpPrefix::default()),
             stats,
@@ -95,7 +86,7 @@ impl Tun {
 
     /// OS interface name (e.g. `tun0`).
     pub fn name(&self) -> &str {
-        &self.inner.name
+        &self.name
     }
 }
 
@@ -104,21 +95,18 @@ impl Tap {
     pub fn open(cfg: TuntapConfig) -> Result<Tap> {
         let (fd, name) = open_tuntap(&cfg.name, libc::IFF_TAP | libc::IFF_NO_PI)?;
         let mac = if_hw_addr(&name).unwrap_or_else(|_| MacAddr::random_local_unicast());
-        let inner = Arc::new(DevInner {
-            fd,
-            name,
-            closed: AtomicBool::new(false),
-        });
-        let handler: Arc<Mutex<Option<L2Handler>>> = Arc::new(Mutex::new(None));
+        let dev = Arc::new(DevFd::new(fd)?);
+        let handler: Arc<HandlerSlot<L2Handler>> = Arc::new(HandlerSlot::new());
         let stats = Arc::new(DeviceStats::new());
 
-        let inner_t = inner.clone();
+        let dev_t = dev.clone();
         let handler_t = handler.clone();
         let stats_t = stats.clone();
-        std::thread::spawn(move || read_loop_l2(inner_t, handler_t, stats_t));
+        std::thread::spawn(move || read_loop_l2(dev_t, handler_t, stats_t));
 
         Ok(Tap {
-            inner,
+            dev,
+            name,
             handler,
             mac,
             stats,
@@ -126,7 +114,7 @@ impl Tap {
     }
 
     pub fn name(&self) -> &str {
-        &self.inner.name
+        &self.name
     }
 }
 
@@ -134,10 +122,10 @@ impl Tap {
 
 impl L3Device for Tun {
     fn set_handler(&self, h: L3Handler) {
-        *self.handler.lock().unwrap() = Some(h);
+        self.handler.set(h);
     }
     fn send(&self, pkt: &Packet) -> Result<()> {
-        match write_all(self.inner.raw(), pkt.as_bytes()) {
+        match self.dev.write_all(pkt.as_bytes()) {
             Ok(()) => {
                 self.stats.record_tx(pkt.len());
                 Ok(())
@@ -156,13 +144,12 @@ impl L3Device for Tun {
         *self.addr.lock().unwrap() = p;
         Ok(())
     }
+    /// Close the fd, which for a non-persistent device removes the interface,
+    /// and stop the reader thread.
     fn close(&self) -> Result<()> {
-        self.inner.closed.store(true, Ordering::Release);
-        // OwnedFd will close when DevInner is dropped — but to make the
-        // reader thread exit promptly we shutdown the fd by closing a dup.
-        // Easiest is to just trust Drop on the Arc<DevInner> when the last
-        // reference goes; the reader holds one too. Caller should drop the
-        // Tun and let GC do its thing.
+        if self.dev.close() {
+            self.handler.wake();
+        }
         Ok(())
     }
     fn stats(&self) -> Option<&DeviceStats> {
@@ -170,14 +157,20 @@ impl L3Device for Tun {
     }
 }
 
+impl Drop for Tun {
+    fn drop(&mut self) {
+        let _ = L3Device::close(self);
+    }
+}
+
 // --- L2Device for Tap -----------------------------------------------------
 
 impl L2Device for Tap {
     fn set_handler(&self, h: L2Handler) {
-        *self.handler.lock().unwrap() = Some(h);
+        self.handler.set(h);
     }
     fn send(&self, f: &Frame) -> Result<()> {
-        match write_all(self.inner.raw(), f.as_bytes()) {
+        match self.dev.write_all(f.as_bytes()) {
             Ok(()) => {
                 self.stats.record_tx(f.len());
                 Ok(())
@@ -192,12 +185,22 @@ impl L2Device for Tap {
     fn hw_addr(&self) -> MacAddr {
         self.mac
     }
+    /// Close the fd, which for a non-persistent device removes the interface,
+    /// and stop the reader thread.
     fn close(&self) -> Result<()> {
-        self.inner.closed.store(true, Ordering::Release);
+        if self.dev.close() {
+            self.handler.wake();
+        }
         Ok(())
     }
     fn stats(&self) -> Option<&DeviceStats> {
         Some(&self.stats)
+    }
+}
+
+impl Drop for Tap {
+    fn drop(&mut self) {
+        let _ = L2Device::close(self);
     }
 }
 
@@ -234,70 +237,34 @@ fn open_tuntap(name: &str, flags: i32) -> Result<(OwnedFd, String)> {
     Ok((owned, assigned))
 }
 
-fn read_loop_l3(
-    inner: Arc<DevInner>,
-    handler: Arc<Mutex<Option<L3Handler>>>,
-    stats: Arc<DeviceStats>,
-) {
+fn read_loop_l3(dev: Arc<DevFd>, handler: Arc<HandlerSlot<L3Handler>>, stats: Arc<DeviceStats>) {
     let mut buf = vec![0u8; 65536];
-    while !inner.closed.load(Ordering::Acquire) {
-        let n = unsafe {
-            libc::read(
-                inner.raw(),
-                buf.as_mut_ptr() as *mut libc::c_void,
-                buf.len(),
-            )
-        };
-        if n <= 0 {
+    while let Some(n) = dev.read(&mut buf) {
+        stats.record_rx(n);
+        let Some(h) = handler.wait(dev.closed()) else {
             return;
-        }
-        stats.record_rx(n as usize);
-        let h = handler.lock().unwrap().clone();
-        match h {
-            Some(h) => {
-                let _ = h(Packet::from_slice(&buf[..n as usize]));
-            }
-            None => stats.record_rx_drop(),
-        }
+        };
+        let _ = h(Packet::from_slice(&buf[..n]));
     }
 }
 
-fn read_loop_l2(
-    inner: Arc<DevInner>,
-    handler: Arc<Mutex<Option<L2Handler>>>,
-    stats: Arc<DeviceStats>,
-) {
+fn read_loop_l2(dev: Arc<DevFd>, handler: Arc<HandlerSlot<L2Handler>>, stats: Arc<DeviceStats>) {
     let mut buf = vec![0u8; 65536];
-    while !inner.closed.load(Ordering::Acquire) {
-        let n = unsafe {
-            libc::read(
-                inner.raw(),
-                buf.as_mut_ptr() as *mut libc::c_void,
-                buf.len(),
-            )
-        };
-        if n <= 0 {
-            return;
-        }
-        let n = n as usize;
+    while let Some(n) = dev.read(&mut buf) {
         if n < 14 {
             stats.record_rx_drop();
             continue;
         }
         stats.record_rx(n);
-        let h = handler.lock().unwrap().clone();
-        match h {
-            Some(h) => {
-                let _ = h(Frame::from_slice(&buf[..n]));
-            }
-            None => stats.record_rx_drop(),
-        }
+        let Some(h) = handler.wait(dev.closed()) else {
+            return;
+        };
+        let _ = h(Frame::from_slice(&buf[..n]));
     }
 }
 
 #[cfg(test)]
 mod tests {
-    // No unit tests here — opening /dev/net/tun requires CAP_NET_ADMIN and
-    // is not appropriate for CI. Wire-level behaviour is exercised by users
-    // of the crate in integration scenarios.
+    // Opening /dev/net/tun requires CAP_NET_ADMIN, so the device itself is not
+    // exercised here; the reader and close machinery is, in `reader.rs`.
 }

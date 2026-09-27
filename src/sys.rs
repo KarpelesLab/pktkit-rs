@@ -91,26 +91,3 @@ pub(crate) fn if_mtu(name: &str) -> Result<usize> {
     }
     Ok(mtu as usize)
 }
-
-/// `write(2)` the whole buffer, retrying on `EINTR`.
-pub(crate) fn write_all(fd: i32, buf: &[u8]) -> Result<()> {
-    let mut written = 0;
-    while written < buf.len() {
-        let n = unsafe {
-            libc::write(
-                fd,
-                buf[written..].as_ptr() as *const libc::c_void,
-                buf.len() - written,
-            )
-        };
-        if n < 0 {
-            let e = io::Error::last_os_error();
-            if e.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(e);
-        }
-        written += n as usize;
-    }
-    Ok(())
-}

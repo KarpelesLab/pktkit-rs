@@ -4,7 +4,14 @@
 //! - [`Tap`] is an L2 device that reads/writes Ethernet frames.
 //!
 //! Both spawn a background reader thread which invokes the installed handler
-//! for each received message.
+//! for each received message. Until a handler is installed the reader waits
+//! for one rather than discarding what arrives, so the first packets the
+//! kernel sends on a fresh interface (router solicitations, MLD reports,
+//! DHCP) are not lost; meanwhile the kernel queues, and drops once its queue
+//! is full.
+//!
+//! `close` — or dropping the device — closes the fd and stops the reader, so
+//! a non-persistent interface disappears and its name can be opened again.
 //!
 //! Platform support:
 //! - **Linux**: TUN and TAP via `/dev/net/tun`.
@@ -15,6 +22,9 @@
 //!   Linux CI sandbox; runtime paths are marked `// TODO(tuntap): needs macOS`.
 //! - **Everywhere else**: the types compile but [`Tun::open`] and [`Tap::open`]
 //!   return `ErrorKind::Unsupported`.
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod reader;
 
 #[cfg(target_os = "linux")]
 mod linux;
