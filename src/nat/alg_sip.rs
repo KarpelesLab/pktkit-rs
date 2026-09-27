@@ -121,22 +121,18 @@ impl SipHelper {
             }
 
             // SDP body, separated from headers by a blank line.
-            if let Some(sdp_start) = find_subslice(&new_payload, b"\r\n\r\n") {
-                let header_part = &new_payload[..sdp_start];
-                let lower = header_part.to_ascii_lowercase();
-                if find_subslice(&lower, b"content-type: application/sdp").is_some()
-                    || find_subslice(&lower, b"c: application/sdp").is_some()
-                {
-                    let sdp_body = new_payload[sdp_start + 4..].to_vec();
-                    let new_sdp = if outbound {
-                        rewrite_sdp_outbound(nat, m.namespace, &sdp_body, &outside_addr, inside_ip)
-                    } else {
-                        sip_rewrite_sdp_addr(&sdp_body, &outside_addr, &inside_addr)
-                    };
-                    if new_sdp != sdp_body {
-                        let mut headers = new_payload[..sdp_start + 4].to_vec();
-                        new_payload = sip_update_content_length(&mut headers, &new_sdp);
-                    }
+            if let Some(sdp_start) = find_subslice(&new_payload, b"\r\n\r\n")
+                && is_sdp(&new_payload[..sdp_start])
+            {
+                let sdp_body = new_payload[sdp_start + 4..].to_vec();
+                let new_sdp = if outbound {
+                    rewrite_sdp_outbound(nat, m.namespace, &sdp_body, &outside_addr, inside_ip)
+                } else {
+                    sip_rewrite_sdp_addr(&sdp_body, &outside_addr, &inside_addr)
+                };
+                if new_sdp != sdp_body {
+                    let mut headers = new_payload[..sdp_start + 4].to_vec();
+                    new_payload = sip_update_content_length(&mut headers, &new_sdp);
                 }
             }
             new_payload
@@ -362,45 +358,49 @@ fn sip_rewrite_header(payload: &[u8], prefix: &[u8], old_val: &[u8], new_val: &[
 }
 
 /// Rebuild the SIP message with a corrected `Content-Length` header for the
-/// given SDP body. `headers` ends with the `\r\n\r\n` separator.
+/// given SDP body. `headers` ends with the `\r\n\r\n` separator. Only the
+/// header's value changes, on the line [`content_length`] reads it from.
 fn sip_update_content_length(headers: &mut Vec<u8>, sdp_body: &[u8]) -> Vec<u8> {
-    let new_cl = sdp_body.len().to_string().into_bytes();
-    let lower = headers.to_ascii_lowercase();
-    let mut cl_idx = find_subslice(&lower, b"content-length:");
-    if cl_idx.is_none() {
-        // SIP compact form "l:" at the start of a line.
-        let mut off = 0;
-        while off < lower.len() {
-            if let Some(idx) = find_subslice(&lower[off..], b"l:") {
-                let abs = off + idx;
-                if abs == 0 || (abs >= 2 && lower[abs - 2] == b'\r' && lower[abs - 1] == b'\n') {
-                    cl_idx = Some(abs);
-                    break;
-                }
-                off = abs + 2;
-            } else {
-                break;
-            }
-        }
+    if let Some(value) = header_value(headers, CONTENT_LENGTH) {
+        headers.splice(value, sdp_body.len().to_string().into_bytes());
     }
-
-    if let Some(cl) = cl_idx
-        && let Some(line_end) = find_subslice(&headers[cl..], b"\r\n")
-        && let Some(colon) = headers[cl..cl + line_end].iter().position(|&b| b == b':')
-    {
-        let before = headers[..cl + colon + 1].to_vec();
-        let after = headers[cl + line_end..].to_vec();
-        let mut rebuilt = before;
-        rebuilt.push(b' ');
-        rebuilt.extend_from_slice(&new_cl);
-        rebuilt.extend_from_slice(&after);
-        *headers = rebuilt;
-    }
-
     let mut result = Vec::with_capacity(headers.len() + sdp_body.len());
     result.extend_from_slice(headers);
     result.extend_from_slice(sdp_body);
     result
+}
+
+/// `Content-Length` and its compact form (RFC 3261 §7.3.3, §20.14).
+const CONTENT_LENGTH: [&[u8]; 2] = [b"content-length", b"l"];
+/// `Content-Type` and its compact form (RFC 3261 §7.3.3, §20.15).
+const CONTENT_TYPE: [&[u8]; 2] = [b"content-type", b"c"];
+
+/// Where the value of the first header called one of `names` (lower case)
+/// lies in `head`, a message head: its start line, then header lines, each
+/// `name HCOLON value` where HCOLON allows whitespace on either side of
+/// the colon (RFC 3261 §25.1). A name is matched whole and case-blind, so
+/// `X-Content-Length` is not `Content-Length`. The range excludes the
+/// surrounding whitespace.
+fn header_value(head: &[u8], names: [&[u8]; 2]) -> Option<std::ops::Range<usize>> {
+    let mut at = 0;
+    let mut first = true;
+    while at < head.len() {
+        let end = find_subslice(&head[at..], b"\r\n").map_or(head.len(), |e| at + e);
+        let line = &head[at..end];
+        if !first && let Some(colon) = line.iter().position(|&b| b == b':') {
+            let name = line[..colon].trim_ascii();
+            if names.iter().any(|n| name.eq_ignore_ascii_case(n)) {
+                let value = &line[colon + 1..];
+                let lead = value.len() - value.trim_ascii_start().len();
+                let len = value.trim_ascii().len();
+                let start = at + colon + 1 + lead;
+                return Some(start..start + len);
+            }
+        }
+        first = false;
+        at = end + 2;
+    }
+    None
 }
 
 /// Where the complete SIP messages at the start of a TCP segment's payload
@@ -441,20 +441,16 @@ fn sip_messages(payload: &[u8]) -> Vec<std::ops::Range<usize>> {
 /// The value of the `Content-Length` (compact form `l`) header among
 /// `headers`, the message head without its terminating blank line.
 fn content_length(headers: &[u8]) -> Option<usize> {
-    split_subslice(headers, b"\r\n")
-        .iter()
-        .skip(1)
-        .find_map(|line| {
-            let colon = line.iter().position(|&b| b == b':')?;
-            let name = line[..colon].trim_ascii();
-            if !(name.eq_ignore_ascii_case(b"content-length") || name.eq_ignore_ascii_case(b"l")) {
-                return None;
-            }
-            std::str::from_utf8(line[colon + 1..].trim_ascii())
-                .ok()?
-                .parse()
-                .ok()
-        })
+    let value = header_value(headers, CONTENT_LENGTH)?;
+    std::str::from_utf8(&headers[value]).ok()?.parse().ok()
+}
+
+/// Whether the message head `headers` declares an SDP body.
+fn is_sdp(headers: &[u8]) -> bool {
+    header_value(headers, CONTENT_TYPE).is_some_and(|v| {
+        let media = headers[v].split(|&b| b == b';').next().unwrap_or(&[]);
+        media.trim_ascii().eq_ignore_ascii_case(b"application/sdp")
+    })
 }
 
 // ---- small byte-slice helpers (std-only) ----
@@ -956,5 +952,55 @@ Content-Length: 21\r\n\r\nc=IN IP4 10.0.0.5\r\nxy";
         );
         let out = h.process_outbound(&nat, pkt.clone(), &m);
         assert_eq!(out, pkt);
+    }
+
+    #[test]
+    fn content_length_is_found_by_header_name() {
+        let body = b"0123456789";
+        for (head, want) in [
+            // Another header merely ending in the name comes first.
+            (
+                &b"INVITE sip:a@b SIP/2.0\r\nX-Orig-Content-Length: 5\r\nContent-Length: 3\r\n\r\n"[..],
+                &b"INVITE sip:a@b SIP/2.0\r\nX-Orig-Content-Length: 5\r\nContent-Length: 10\r\n\r\n"[..],
+            ),
+            // Whitespace before the colon (RFC 3261 HCOLON).
+            (
+                b"INVITE sip:a@b SIP/2.0\r\nContent-Length : 3\r\n\r\n",
+                b"INVITE sip:a@b SIP/2.0\r\nContent-Length : 10\r\n\r\n",
+            ),
+            // The compact form, with a header ending in "l" before it.
+            (
+                b"INVITE sip:a@b SIP/2.0\r\nX-Url: x\r\nl:3\r\n\r\n",
+                b"INVITE sip:a@b SIP/2.0\r\nX-Url: x\r\nl:10\r\n\r\n",
+            ),
+            (
+                b"INVITE sip:a@b SIP/2.0\r\ncontent-LENGTH:\t3 \r\n\r\n",
+                b"INVITE sip:a@b SIP/2.0\r\ncontent-LENGTH:\t10 \r\n\r\n",
+            ),
+        ] {
+            let out = sip_update_content_length(&mut head.to_vec(), body);
+            let (h, b) = out.split_at(want.len());
+            assert_eq!(
+                String::from_utf8_lossy(h),
+                String::from_utf8_lossy(want),
+                "from {}",
+                String::from_utf8_lossy(head)
+            );
+            assert_eq!(b, body);
+            // What is written is what is read.
+            assert_eq!(content_length(&h[..h.len() - 4]), Some(body.len()));
+        }
+    }
+
+    #[test]
+    fn sdp_is_recognised_by_the_content_type_header_only() {
+        assert!(is_sdp(b"INVITE x SIP/2.0\r\nContent-Type: application/sdp"));
+        assert!(is_sdp(b"INVITE x SIP/2.0\r\nc :Application/SDP; charset=x"));
+        assert!(!is_sdp(
+            b"INVITE x SIP/2.0\r\nX-Content-Type: application/sdp"
+        ));
+        assert!(!is_sdp(
+            b"INVITE x SIP/2.0\r\nContent-Type: text/plain\r\nX-Rc: application/sdp"
+        ));
     }
 }
