@@ -461,6 +461,15 @@ impl<K: Eq + Hash + Copy> Pending<K> {
         self.inner.lock().unwrap().clear();
     }
 
+    /// Keep only the queued packets `keep` accepts; a queue left empty is
+    /// dropped, and its resolution with it.
+    pub fn retain_packets(&self, mut keep: impl FnMut(&[u8]) -> bool) {
+        self.inner.lock().unwrap().retain(|_, e| {
+            e.packets.retain(|p| keep(p));
+            !e.packets.is_empty()
+        });
+    }
+
     /// Remove and return every packet waiting for `ip`.
     pub fn drain(&self, ip: K) -> Vec<Vec<u8>> {
         self.inner

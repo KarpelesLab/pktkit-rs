@@ -73,9 +73,13 @@ pub trait ClientTransport: Send + Sync + 'static {
     fn send_broadcast(&self, frame: &Frame);
 
     /// Send a unicast Ethernet frame to `dst_ip`. The transport is expected
-    /// to resolve `dst_ip` to a MAC (e.g. via ARP) — the wire layer here
-    /// builds an Ethernet broadcast as a fallback when no resolver is in
-    /// reach.
+    /// to route it like any other traffic: resolve the next hop -- `dst_ip`
+    /// itself, or a router when it is off-link -- to a MAC (e.g. via ARP),
+    /// holding the frame until it answers. The frame comes addressed to the
+    /// Ethernet broadcast, as a fallback for a transport with no resolver.
+    /// The `L2Adapter`'s transport does all this, and sends a DHCPRELEASE
+    /// held so even when the lease it gives up is lost before the server
+    /// answers.
     fn send_unicast(&self, dst_ip: Ipv4Addr, frame: &Frame);
 
     /// Called whenever the client transitions into BOUND or refreshes its

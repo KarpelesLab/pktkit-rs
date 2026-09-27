@@ -270,6 +270,12 @@ impl L2Adapter {
     fn report_unreachable(&self, pkts: Vec<Vec<u8>>) {
         for buf in pkts {
             let pkt = Packet::from_slice(&buf);
+            // The DHCP client's own messages were never the host's, and
+            // the client retransmits on its own timers.
+            #[cfg(feature = "dhcp")]
+            if is_dhcp_to_server(pkt) {
+                continue;
+            }
             let (from, err) = match (pkt.version(), self.l3.addr().addr()) {
                 (4, IpAddr::V4(a)) if !a.is_unspecified() => (
                     IpAddr::V4(a),
@@ -713,11 +719,19 @@ impl L2Adapter {
     }
 
     /// Drop the ARP cache and whatever was queued for resolution, when the
-    /// IPv4 configuration they were learnt under goes away.
+    /// IPv4 configuration they were learnt under goes away. `keep_dhcp`
+    /// spares the DHCP client's own messages still waiting for the server
+    /// to be resolved: a DHCPRELEASE goes out just before the lease it
+    /// gives up is lost, and is still due.
     #[cfg(feature = "dhcp")]
-    fn forget_ipv4_neighbours(&self) {
+    fn forget_ipv4_neighbours(&self, keep_dhcp: bool) {
         self.arp.clear();
-        self.arp_pending.clear();
+        if keep_dhcp {
+            self.arp_pending
+                .retain_packets(|p| is_dhcp_to_server(Packet::from_slice(p)));
+        } else {
+            self.arp_pending.clear();
+        }
     }
 
     /// Cache a neighbour's MAC, as [`arp::Table::update`] takes it, and send
@@ -805,6 +819,21 @@ fn spawn_timer(a: &Arc<L2Adapter>) {
 
 // --- DHCP integration ------------------------------------------------------
 
+/// A DHCP client-to-server datagram (UDP 68 to 67), as the adapter's DHCP
+/// client sends by unicast.
+#[cfg(feature = "dhcp")]
+fn is_dhcp_to_server(pkt: &Packet) -> bool {
+    if !pkt.is_valid()
+        || pkt.version() != 4
+        || pkt.ipv4_protocol() != Protocol::UDP
+        || pkt.ipv4_is_fragment()
+    {
+        return false;
+    }
+    let udp = pkt.ipv4_payload();
+    udp.len() >= 8 && udp[0..2] == 68u16.to_be_bytes() && udp[2..4] == 67u16.to_be_bytes()
+}
+
 #[cfg(feature = "dhcp")]
 struct AdapterDhcpTransport {
     weak: Weak<L2Adapter>,
@@ -823,17 +852,18 @@ impl crate::dhcp::ClientTransport for AdapterDhcpTransport {
             a.send_l2(frame);
         }
     }
-    fn send_unicast(&self, dst_ip: Ipv4Addr, frame: &Frame) {
+    fn send_unicast(&self, _dst_ip: Ipv4Addr, frame: &Frame) {
         let Some(a) = self.weak.upgrade() else {
             return;
         };
-        // Rewrite the Ethernet destination if we have an ARP entry for dst_ip.
-        let bytes = frame.as_bytes();
-        let mut buf = bytes.to_vec();
-        if let Some(mac) = a.arp.lookup(dst_ip) {
-            buf[0..6].copy_from_slice(&mac.octets());
+        // Routed like the host's own traffic: to the server, or to the
+        // gateway if the server is off our subnet, ARPing for it (and
+        // queueing the message) on a miss. Sent to the broadcast MAC, a
+        // datagram for a unicast address would be discarded by a host
+        // following RFC 1122 §3.3.6.
+        if frame.ether_type() == EtherType::IPV4 {
+            a.handle_outgoing(Packet::from_slice(frame.payload()));
         }
-        a.send_l2(Frame::from_slice(&buf));
     }
     fn can_probe(&self) -> bool {
         true
@@ -884,7 +914,7 @@ impl crate::dhcp::ClientTransport for AdapterDhcpTransport {
             // A lease on another network makes every neighbour we know of
             // somebody else's; a renewal of the same one does not.
             if a.l3.addr() != prefix {
-                a.forget_ipv4_neighbours();
+                a.forget_ipv4_neighbours(false);
             }
             let _ = a.l3.set_addr(prefix);
             // The lease is the whole configuration: one naming no router
@@ -902,7 +932,7 @@ impl crate::dhcp::ClientTransport for AdapterDhcpTransport {
                     a.l3.set_addr(IpPrefix::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0));
             }
             *a.gateway_v4.lock().unwrap() = None;
-            a.forget_ipv4_neighbours();
+            a.forget_ipv4_neighbours(true);
         }
     }
 }
@@ -1835,6 +1865,66 @@ mod tests {
         t.on_bound("10.0.0.5/24".parse().unwrap(), Some(gw));
         t.on_bound("192.168.7.5/24".parse().unwrap(), None);
         assert_eq!(*adapter.gateway_v4.lock().unwrap(), None);
+    }
+
+    /// A DHCP message from `ip` to `server`, framed as the client frames a
+    /// unicast one: to the broadcast MAC, for the transport to resolve.
+    #[cfg(feature = "dhcp")]
+    fn dhcp_unicast(adapter: &L2Adapter, ip: Ipv4Addr, server: Ipv4Addr) -> Vec<u8> {
+        let udp = crate::build::build_udp(ip.into(), server.into(), 68, 67, &[0; 240]);
+        let pkt = crate::build::build_ipv4(ip, server, Protocol::UDP, 64, &udp);
+        build_frame(MacAddr::broadcast(), adapter.mac, EtherType::IPV4, &pkt)
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn dhcp_unicasts_are_resolved_like_any_other_traffic() {
+        use crate::dhcp::ClientTransport;
+        let (_pipe, adapter, out) = rig("0.0.0.0/0");
+        let t = AdapterDhcpTransport {
+            weak: Arc::downgrade(&adapter),
+        };
+        let (us, gw) = (Ipv4Addr::new(10, 0, 0, 5), Ipv4Addr::new(10, 0, 0, 1));
+        let gw_mac = MacAddr([2, 0, 0, 0, 0, 1]);
+        t.on_bound("10.0.0.5/24".parse().unwrap(), Some(gw));
+
+        // A renewal to an on-link server: ARP for it, then unicast to it.
+        let server = Ipv4Addr::new(10, 0, 0, 2);
+        t.send_unicast(
+            server,
+            Frame::from_slice(&dhcp_unicast(&adapter, us, server)),
+        );
+        assert_eq!(
+            solicited(&take(&out)),
+            [IpAddr::V4(server)],
+            "not ARPed for"
+        );
+        let server_mac = MacAddr([2, 0, 0, 0, 0, 2]);
+        arp_reply_to(&adapter, server_mac, server.octets(), us.octets());
+        let sent = take(&out);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(Frame::from_slice(&sent[0]).dst_mac(), Some(server_mac));
+
+        // An off-subnet server is reached through the gateway.
+        let far = Ipv4Addr::new(192, 168, 9, 1);
+        t.send_unicast(far, Frame::from_slice(&dhcp_unicast(&adapter, us, far)));
+        assert_eq!(solicited(&take(&out)), [IpAddr::V4(gw)]);
+        arp_reply_to(&adapter, gw_mac, gw.octets(), us.octets());
+        assert_eq!(Frame::from_slice(&take(&out)[0]).dst_mac(), Some(gw_mac));
+
+        // A RELEASE goes out just before the lease is lost; still waiting
+        // for the server's MAC then, it is sent once that arrives.
+        adapter.arp.clear();
+        t.send_unicast(
+            server,
+            Frame::from_slice(&dhcp_unicast(&adapter, us, server)),
+        );
+        t.on_lease_lost();
+        assert_eq!(solicited(&take(&out)), [IpAddr::V4(server)]);
+        arp_reply_to(&adapter, server_mac, server.octets(), us.octets());
+        let sent = take(&out);
+        assert_eq!(sent.len(), 1, "RELEASE lost with the lease");
+        assert_eq!(Frame::from_slice(&sent[0]).dst_mac(), Some(server_mac));
     }
 
     #[test]
