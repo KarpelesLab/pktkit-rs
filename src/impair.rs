@@ -223,7 +223,8 @@ struct Engine {
 
 /// A lock a thread cannot take twice: the second, nested attempt is told so
 /// instead of deadlocking. A handler that calls `poll` from inside a delivery
-/// is the nested case.
+/// is the nested case. `poll` never waits for it at all (see
+/// [`try_acquire`](Self::try_acquire)).
 #[derive(Default)]
 struct DeliveryLock {
     owner: Mutex<Option<std::thread::ThreadId>>,
@@ -233,7 +234,24 @@ struct DeliveryLock {
 struct DeliveryGuard<'a>(&'a DeliveryLock);
 
 impl DeliveryLock {
+    /// Take the lock if nobody holds it; `None` otherwise, without waiting.
+    ///
+    /// For `poll`: the release thread holds this while running handlers, and
+    /// a handler may want a lock the thread calling `poll` already holds.
+    /// Waiting would be a deadlock; and while the release thread is
+    /// delivering there is nothing for `poll` to do, since that thread goes
+    /// on to deliver whatever else has come due before it sleeps again.
+    fn try_acquire(&self) -> Option<DeliveryGuard<'_>> {
+        let mut owner = self.owner.lock().unwrap();
+        if owner.is_some() {
+            return None;
+        }
+        *owner = Some(std::thread::current().id());
+        Some(DeliveryGuard(self))
+    }
+
     /// Wait for the lock; `None` if this thread already holds it.
+    #[cfg(not(target_family = "wasm"))]
     fn acquire(&self) -> Option<DeliveryGuard<'_>> {
         let me = std::thread::current().id();
         let mut owner = self.owner.lock().unwrap();
@@ -600,11 +618,14 @@ macro_rules! impaired_device {
             /// call it again after the returned delay.
             ///
             /// Messages leave in release order even while the release thread
-            /// is delivering too. Called from a handler in the middle of a
-            /// delivery, it delivers nothing: the delivery in progress would
-            /// otherwise be overtaken.
+            /// is delivering too. While a delivery is in progress -- on the
+            /// release thread, or further up this thread's stack when called
+            /// from a handler -- it delivers nothing and does not wait: that
+            /// delivery would otherwise be overtaken, and waiting for it could
+            /// deadlock against a handler that wants a lock the caller holds.
+            /// The delivery in progress picks up what has come due.
             pub fn poll(&self) -> Option<Duration> {
-                if let Some(_delivering) = self.engine.delivering.acquire() {
+                if let Some(_delivering) = self.engine.delivering.try_acquire() {
                     for item in self.engine.take_due() {
                         self.deliver(item.dir, &item.data);
                     }
@@ -1174,6 +1195,54 @@ mod tests {
         release_tx.send(()).unwrap();
         // The wrapped device goes with the wrapper, on the release thread.
         assert!(done_rx.recv_timeout(Duration::from_secs(5)).is_ok());
+    }
+
+    #[test]
+    fn poll_does_not_wait_for_the_release_thread_to_finish_delivering() {
+        // The far side wants a lock the application holds while it polls --
+        // an application-wide state mutex, say. Were poll to wait for the
+        // release thread's delivery, each would wait on the other forever.
+        struct Locking {
+            app: Arc<Mutex<()>>,
+            entered: Mutex<std::sync::mpsc::Sender<()>>,
+        }
+        impl L2Device for Locking {
+            fn set_handler(&self, _h: L2Handler) {}
+            fn send(&self, _f: &Frame) -> Result<()> {
+                let _ = self.entered.lock().unwrap().send(());
+                drop(self.app.lock().unwrap());
+                Ok(())
+            }
+            fn hw_addr(&self) -> MacAddr {
+                MacAddr::zero()
+            }
+            fn close(&self) -> Result<()> {
+                Ok(())
+            }
+        }
+        let app = Arc::new(Mutex::new(()));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let link = ImpairL2::new(
+            Arc::new(Locking {
+                app: app.clone(),
+                entered: Mutex::new(entered_tx),
+            }),
+            Impairment::default().delay(Duration::from_millis(1)),
+        );
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let held = app.lock().unwrap();
+            link.send(Frame::from_slice(&frame(0))).unwrap();
+            // The release thread is now inside the delivery, blocked on us.
+            entered_rx.recv().unwrap();
+            link.poll();
+            drop(held);
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "poll deadlocked against the release thread"
+        );
     }
 
     #[test]
