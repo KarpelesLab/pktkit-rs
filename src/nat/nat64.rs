@@ -2,12 +2,12 @@
 //! IPv6 side as IPv4-embedded addresses under the NAT64 prefix (RFC 6052),
 //! e.g. `64:ff9b::192.0.2.33` for the Well-Known Prefix.
 //!
-//! Inside faces IPv6; outside faces IPv4. Only the happy paths for TCP, UDP
-//! and ICMP echo are implemented; ICMP error translation covers Destination
-//! Unreachable and Time Exceeded (mapping ICMPv4 → ICMPv6 codes per
-//! RFC 6145 §4.2). Fragment and extension-header handling is best-effort.
+//! Inside faces IPv6; outside faces IPv4. TCP, UDP and ICMP echo sessions
+//! are translated; ICMPv4 errors about them are translated to ICMPv6 per
+//! RFC 7915 §4.2 (ICMPv6 errors from the inside are not translated).
 
 use crate::nat::helper::{PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP};
+use crate::nat::l4::csum_replace;
 use crate::nat::track::Peers;
 use crate::time::Instant;
 use crate::{
@@ -143,13 +143,28 @@ impl Nat64 {
         let Some(dst_v4) = self.pref64().and_then(|p| p.extract(dst_v6)) else {
             return;
         };
-        let hop = pkt[7];
         let payload_len = u16::from_be_bytes([pkt[4], pkt[5]]) as usize;
         let src_v6 = read_v6(&pkt[8..24]);
 
         if pkt.len() < IPV6_HEADER_LEN + payload_len {
             return;
         }
+        // Link padding past the payload is not part of the packet.
+        let pkt = &pkt[..IPV6_HEADER_LEN + payload_len];
+        // The translator is a router (RFC 7915 §5.1): it spends one hop, and
+        // owes the sender a Hop Limit Exceeded when none is left. It answers
+        // from its own IPv4 address as seen through the prefix.
+        let hop = pkt[7];
+        if hop <= 1 {
+            if let Some(me) = self.outside_ipv4().and_then(|ip| self.pref64()?.embed(ip))
+                && let Some(err) =
+                    crate::icmp::time_exceeded(Packet::from_slice(pkt), IpAddr::V6(me))
+            {
+                self.inside.deliver(Packet::from_slice(&err));
+            }
+            return;
+        }
+        let hop = hop - 1;
 
         // Walk extension headers.
         let mut next_header = pkt[6];
@@ -334,7 +349,19 @@ impl Nat64 {
             return;
         }
         let transport = &pkt[ihl..total];
+        // The translator is a router (RFC 7915 §4.1): it spends one hop, and
+        // owes the sender a Time Exceeded when none is left.
         let ttl = pkt[8];
+        if ttl <= 1 {
+            if let Some(ip) = self.outside_ipv4()
+                && let Some(err) =
+                    crate::icmp::time_exceeded(Packet::from_slice(&pkt[..total]), IpAddr::V4(ip))
+            {
+                self.outside.deliver(Packet::from_slice(&err));
+            }
+            return;
+        }
+        let ttl = ttl - 1;
         let src_v4 = Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]);
 
         match proto {
@@ -416,24 +443,43 @@ impl Nat64 {
         self.inside.deliver(Packet::from_slice(&out));
     }
 
-    fn inbound_icmp(&self, icmp: &[u8], src_v4: Ipv4Addr, ttl: u8) {
-        if icmp.len() < 8 {
+    fn inbound_icmp(&self, icmp: &[u8], src_v4: Ipv4Addr, hop: u8) {
+        // Every ICMP message is rebuilt with a fresh checksum below, so a
+        // corrupted one must be caught here rather than laundered.
+        if icmp.len() < 8 || checksum(icmp) != 0 {
             return;
         }
-        match icmp[0] {
-            0 => self.inbound_echo_reply(icmp, src_v4, ttl),
-            3 => {
-                let (v6t, v6c) = icmpv4_to_v6_dest_unreach(icmp[1]);
-                if v6t != 0 {
-                    self.inbound_icmp_error(icmp, src_v4, ttl, v6t, v6c);
-                }
+        let rest = [icmp[4], icmp[5], icmp[6], icmp[7]];
+        // RFC 7915 §4.2: the ICMPv6 type, code and 32-bit field for each
+        // ICMPv4 message; anything without a counterpart is dropped.
+        let (v6_type, v6_code, word) = match (icmp[0], icmp[1]) {
+            (0, 0) => return self.inbound_echo_reply(icmp, src_v4, hop),
+            (3, 0 | 1 | 5 | 6 | 7 | 8 | 11 | 12) => (1, 0, 0),
+            (3, 9 | 10 | 13 | 15) => (1, 1, 0),
+            (3, 3) => (1, 4, 0),
+            // Protocol unreachable: a parameter problem at Next Header.
+            (3, 2) => (4, 1, 6),
+            (3, 4) => {
+                let emb_total = icmp
+                    .get(10..12)
+                    .map_or(0, |b| u16::from_be_bytes([b[0], b[1]]));
+                (
+                    2,
+                    0,
+                    packet_too_big_mtu(u16::from_be_bytes([rest[2], rest[3]]), emb_total),
+                )
             }
-            11 => self.inbound_icmp_error(icmp, src_v4, ttl, 3, icmp[1]),
-            _ => {}
-        }
+            (11, 0 | 1) => (3, icmp[1], 0),
+            (12, 0 | 2) => match v4_pointer_to_v6(rest[0]) {
+                Some(p) => (4, 0, p as u32),
+                None => return,
+            },
+            _ => return,
+        };
+        self.inbound_icmp_error(icmp, src_v4, hop, v6_type, v6_code, word);
     }
 
-    fn inbound_echo_reply(&self, icmp: &[u8], src_v4: Ipv4Addr, ttl: u8) {
+    fn inbound_echo_reply(&self, icmp: &[u8], src_v4: Ipv4Addr, hop: u8) {
         let id = u16::from_be_bytes([icmp[4], icmp[5]]);
         let rk = Nat64RevKey {
             proto: PROTO_ICMP,
@@ -456,15 +502,8 @@ impl Nat64 {
             return;
         };
         let dst_v6 = mapping_key.ip;
-        let out_len = IPV6_HEADER_LEN + icmp.len();
-        let mut out = vec![0u8; out_len];
-        out[0] = 0x60;
-        out[4..6].copy_from_slice(&(icmp.len() as u16).to_be_bytes());
-        out[6] = PROTO_ICMPV6;
-        out[7] = ttl;
-        out[8..24].copy_from_slice(&src_v6.octets());
-        out[24..40].copy_from_slice(&dst_v6.octets());
-        out[IPV6_HEADER_LEN..].copy_from_slice(icmp);
+        let mut out = v6_header(src_v6, dst_v6, PROTO_ICMPV6, hop, icmp.len());
+        out.extend_from_slice(icmp);
         let icmp_off = IPV6_HEADER_LEN;
         out[icmp_off] = 129; // ICMPv6 Echo Reply
         out[icmp_off + 1] = 0;
@@ -475,120 +514,139 @@ impl Nat64 {
         self.inside.deliver(Packet::from_slice(&out));
     }
 
-    fn inbound_icmp_error(&self, icmp: &[u8], src_v4: Ipv4Addr, ttl: u8, v6_type: u8, v6_code: u8) {
-        if icmp.len() < 8 + IPV4_MIN_HEADER {
+    /// Translate an ICMPv4 error about a packet this NAT64 sent out into the
+    /// ICMPv6 error `v6_type`/`v6_code` (with `word` in its second 32-bit
+    /// word) about the IPv6 packet it came from (RFC 7915 §4.2 and §4.3).
+    fn inbound_icmp_error(
+        &self,
+        icmp: &[u8],
+        src_v4: Ipv4Addr,
+        hop: u8,
+        v6_type: u8,
+        v6_code: u8,
+        word: u32,
+    ) {
+        let emb = &icmp[8..];
+        if emb.len() < IPV4_MIN_HEADER {
             return;
         }
-        let emb_off = 8;
-        let emb_ihl = (icmp[emb_off] & 0x0F) as usize * 4;
-        if emb_ihl < IPV4_MIN_HEADER || icmp.len() < emb_off + emb_ihl + 4 {
+        let emb_ihl = (emb[0] & 0x0F) as usize * 4;
+        if emb[0] >> 4 != 4 || emb_ihl < IPV4_MIN_HEADER || emb.len() < emb_ihl + 8 {
             return;
         }
-        let emb_proto_raw = icmp[emb_off + 9];
-        let (emb_proto_lookup, emb_port) = match emb_proto_raw {
+        let emb_proto = emb[9];
+        let l4 = &emb[emb_ihl..];
+        let emb_dst_v4 = Ipv4Addr::new(emb[16], emb[17], emb[18], emb[19]);
+        let (emb_port, remote) = match emb_proto {
             PROTO_TCP | PROTO_UDP => (
-                emb_proto_raw,
-                u16::from_be_bytes([icmp[emb_off + emb_ihl], icmp[emb_off + emb_ihl + 1]]),
+                u16::from_be_bytes([l4[0], l4[1]]),
+                SocketAddrV4::new(emb_dst_v4, u16::from_be_bytes([l4[2], l4[3]])),
             ),
-            PROTO_ICMP => {
-                if icmp.len() < emb_off + emb_ihl + 6 {
-                    return;
-                }
-                (
-                    PROTO_ICMP,
-                    u16::from_be_bytes([icmp[emb_off + emb_ihl + 4], icmp[emb_off + emb_ihl + 5]]),
-                )
-            }
+            PROTO_ICMP if l4[0] == 8 => (
+                u16::from_be_bytes([l4[4], l4[5]]),
+                SocketAddrV4::new(emb_dst_v4, 0),
+            ),
             _ => return,
         };
+        if Some(Ipv4Addr::new(emb[12], emb[13], emb[14], emb[15])) != self.outside_ipv4() {
+            return;
+        }
         let rk = Nat64RevKey {
-            proto: emb_proto_lookup,
+            proto: emb_proto,
             port: emb_port,
         };
         let mapping_key = {
-            let mut inner = self.inner.lock().unwrap();
+            let inner = self.inner.lock().unwrap();
             let k = match inner.reverse.get(&rk).copied() {
                 Some(k) => k,
                 None => return,
             };
-            if let Some(m) = inner.mappings.get_mut(&k) {
-                m.last_active = Instant::now();
+            // Only errors about traffic the mapping really sent: anyone could
+            // otherwise forge them against an inside host's sessions.
+            match inner.mappings.get(&k) {
+                Some(m) if m.peers.contains(&remote) => {}
+                _ => return,
             }
             k
         };
 
-        let Some(src_v6) = self.pref64().and_then(|p| p.embed(src_v4)) else {
+        let pref = self.pref64();
+        let (Some(src_v6), Some(emb_dst_v6)) = (
+            pref.and_then(|p| p.embed(src_v4)),
+            pref.and_then(|p| p.embed(emb_dst_v4)),
+        ) else {
             return;
         };
         let dst_v6 = mapping_key.ip;
-        let emb_transport_len = icmp.len().saturating_sub(emb_off + emb_ihl);
-        let emb_ipv6_len = IPV6_HEADER_LEN + emb_transport_len;
-        let icmpv6_len = 8 + emb_ipv6_len;
-        let out_len = IPV6_HEADER_LEN + icmpv6_len;
+        let emb_src_v6 = mapping_key.ip;
 
-        let mut out = vec![0u8; out_len];
-        out[0] = 0x60;
-        out[4..6].copy_from_slice(&(icmpv6_len as u16).to_be_bytes());
-        out[6] = PROTO_ICMPV6;
-        out[7] = ttl;
-        out[8..24].copy_from_slice(&src_v6.octets());
-        out[24..40].copy_from_slice(&dst_v6.octets());
-
-        let icmp_off = IPV6_HEADER_LEN;
-        out[icmp_off] = v6_type;
-        out[icmp_off + 1] = v6_code;
-        // bytes 2..4 = checksum, 4..8 = zero
-
-        let emb_off_out = icmp_off + 8;
-        out[emb_off_out] = 0x60;
-        out[emb_off_out + 4..emb_off_out + 6]
-            .copy_from_slice(&(emb_transport_len as u16).to_be_bytes());
-        let emb_nh = if emb_proto_raw == PROTO_ICMP {
+        // The quoted IPv6 packet: header rebuilt from the quoted IPv4 one, then
+        // as much of the transport data as was quoted, within the 1280-byte
+        // IPv6 minimum MTU the whole error must fit (RFC 7915 §4.2).
+        let emb_total = u16::from_be_bytes([emb[2], emb[3]]) as usize;
+        let emb_nh = if emb_proto == PROTO_ICMP {
             PROTO_ICMPV6
         } else {
-            emb_proto_raw
+            emb_proto
         };
-        out[emb_off_out + 6] = emb_nh;
-        out[emb_off_out + 7] = icmp[emb_off + 8]; // original TTL
-
-        // Embedded source IPv6 = original inside client (mapping key).
-        out[emb_off_out + 8..emb_off_out + 24].copy_from_slice(&dst_v6.octets());
-        // Embedded destination = original dst IPv4, IPv4-mapped.
-        let emb_dst_v4 = Ipv4Addr::new(
-            icmp[emb_off + 16],
-            icmp[emb_off + 17],
-            icmp[emb_off + 18],
-            icmp[emb_off + 19],
-        );
-        let Some(emb_dst_v6) = self.pref64().and_then(|p| p.embed(emb_dst_v4)) else {
-            return;
-        };
-        out[emb_off_out + 24..emb_off_out + 40].copy_from_slice(&emb_dst_v6.octets());
-
-        if emb_transport_len > 0 {
-            let emb_ip6_off = emb_off_out + IPV6_HEADER_LEN;
-            let copy_from = emb_off + emb_ihl;
-            out[emb_ip6_off..emb_ip6_off + emb_transport_len]
-                .copy_from_slice(&icmp[copy_from..copy_from + emb_transport_len]);
-            let emb_transport_off = emb_ip6_off;
-            match emb_proto_raw {
-                PROTO_TCP | PROTO_UDP if emb_transport_len >= 2 => {
-                    out[emb_transport_off..emb_transport_off + 2]
-                        .copy_from_slice(&mapping_key.port.to_be_bytes());
+        let room = 1280 - 2 * IPV6_HEADER_LEN - 8;
+        let quoted_l4 = &l4[..l4.len().min(room)];
+        let emb_payload_len = emb_total.saturating_sub(emb_ihl);
+        let mut quote = v6_header(emb_src_v6, emb_dst_v6, emb_nh, emb[8], emb_payload_len);
+        // Traffic class from the quoted TOS.
+        quote[0] = 0x60 | (emb[1] >> 4);
+        quote[1] = (emb[1] & 0x0F) << 4;
+        let l4_off = quote.len();
+        quote.extend_from_slice(quoted_l4);
+        let q = &mut quote[l4_off..];
+        let (s4, d4) = (&emb[12..16], &emb[16..20]);
+        let (s6, d6) = (emb_src_v6.octets(), emb_dst_v6.octets());
+        let new_port = mapping_key.port.to_be_bytes();
+        match emb_proto {
+            PROTO_TCP | PROTO_UDP => {
+                q[0..2].copy_from_slice(&new_port);
+                let field = if emb_proto == PROTO_TCP { 16 } else { 6 };
+                if q.len() >= field + 2 && !(emb_proto == PROTO_UDP && q[6..8] == [0, 0]) {
+                    let cs = u16::from_be_bytes([q[field], q[field + 1]]);
+                    let cs = csum_replace(
+                        cs,
+                        &[s4, d4, &emb_port.to_be_bytes()],
+                        &[&s6, &d6, &new_port],
+                    );
+                    q[field..field + 2].copy_from_slice(&cs.to_be_bytes());
                 }
-                PROTO_ICMP if emb_transport_len >= 6 => {
-                    out[emb_transport_off] = 128;
-                    out[emb_transport_off + 4..emb_transport_off + 6]
-                        .copy_from_slice(&mapping_key.port.to_be_bytes());
-                }
-                _ => {}
+            }
+            _ => {
+                // An echo request: ICMPv6 type 128, and the ICMPv6 checksum
+                // covers a pseudo-header the ICMPv4 one did not have.
+                let old_type = [q[0], q[1]];
+                q[0] = 128;
+                q[4..6].copy_from_slice(&new_port);
+                let len = (emb_payload_len as u32).to_be_bytes();
+                let cs = u16::from_be_bytes([q[2], q[3]]);
+                let cs = csum_replace(
+                    cs,
+                    &[&old_type, &emb_port.to_be_bytes()],
+                    &[
+                        &[q[0], q[1]],
+                        &new_port,
+                        &s6,
+                        &d6,
+                        &len,
+                        &[0, 0, 0, PROTO_ICMPV6],
+                    ],
+                );
+                q[2..4].copy_from_slice(&cs.to_be_bytes());
             }
         }
 
-        out[icmp_off + 2..icmp_off + 4].copy_from_slice(&[0, 0]);
-        let cs = compute_icmpv6_checksum(src_v6, dst_v6, &out[icmp_off..]);
-        out[icmp_off + 2..icmp_off + 4].copy_from_slice(&cs.to_be_bytes());
-
+        let mut msg = vec![v6_type, v6_code, 0, 0];
+        msg.extend_from_slice(&word.to_be_bytes());
+        msg.extend_from_slice(&quote);
+        let cs = compute_icmpv6_checksum(src_v6, dst_v6, &msg);
+        msg[2..4].copy_from_slice(&cs.to_be_bytes());
+        let mut out = v6_header(src_v6, dst_v6, PROTO_ICMPV6, hop, msg.len());
+        out.extend_from_slice(&msg);
         self.inside.deliver(Packet::from_slice(&out));
     }
 
@@ -812,18 +870,49 @@ fn compute_icmpv6_checksum(src: Ipv6Addr, dst: Ipv6Addr, data: &[u8]) -> u16 {
     transport_checksum(Protocol::ICMPV6, IpAddr::V6(src), IpAddr::V6(dst), data)
 }
 
-fn icmpv4_to_v6_dest_unreach(code: u8) -> (u8, u8) {
-    match code {
-        0 => (1, 0),
-        1 => (1, 0),
-        2 => (4, 1),
-        3 => (1, 4),
-        4 => (0, 0), // Packet Too Big — handled separately, drop here.
-        5 => (1, 5),
-        6 | 7 => (1, 0),
-        9 | 10 => (1, 1),
-        13 => (1, 1),
-        _ => (0, 0),
+/// An IPv6 header (payload to follow) with the given fields, zero traffic
+/// class and flow label.
+fn v6_header(src: Ipv6Addr, dst: Ipv6Addr, next: u8, hop: u8, payload_len: usize) -> Vec<u8> {
+    let mut h = vec![0u8; IPV6_HEADER_LEN];
+    h[0] = 0x60;
+    h[4..6].copy_from_slice(&(payload_len.min(u16::MAX as usize) as u16).to_be_bytes());
+    h[6] = next;
+    h[7] = hop;
+    h[8..24].copy_from_slice(&src.octets());
+    h[24..40].copy_from_slice(&dst.octets());
+    h
+}
+
+/// The MTU for an ICMPv6 Packet Too Big translated from an ICMPv4
+/// Fragmentation Needed advertising `mtu` about a packet of `total_len`
+/// bytes (RFC 7915 §4.2): 20 more, for the larger IPv6 header. A router that
+/// predates RFC 1191 advertises zero; the likely path MTU is then the largest
+/// RFC 1191 plateau below the packet's length.
+fn packet_too_big_mtu(mtu: u16, total_len: u16) -> u32 {
+    const PLATEAUS: [u16; 11] = [
+        65535, 32000, 17914, 8166, 4352, 2002, 1492, 1006, 508, 296, 68,
+    ];
+    let mtu = if mtu == 0 {
+        PLATEAUS.into_iter().find(|&p| p < total_len).unwrap_or(68)
+    } else {
+        mtu
+    };
+    mtu as u32 + 20
+}
+
+/// RFC 7915 figure 3: where an ICMPv4 Parameter Problem pointer into the
+/// IPv4 header lands in the IPv6 header. Fields with no counterpart (ID,
+/// flags, fragment offset, header checksum) give `None`.
+fn v4_pointer_to_v6(p: u8) -> Option<u8> {
+    match p {
+        0 => Some(0),
+        1 => Some(1),
+        2 | 3 => Some(4),
+        8 => Some(7),
+        9 => Some(6),
+        12..=15 => Some(8),
+        16..=19 => Some(24),
+        _ => None,
     }
 }
 
@@ -1112,5 +1201,187 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0][40], 129);
         assert!(v6_sum_ok(&got[0]), "ICMPv6 echo reply must verify");
+    }
+
+    type Captured = Arc<StdMutex<Vec<Vec<u8>>>>;
+
+    fn wired() -> (Arc<Nat64>, Captured, Captured) {
+        let nat = Nat64::new(pfx("64:ff9b::/96"), pfx("198.51.100.1/24"));
+        let inside: Captured = Arc::default();
+        let outside: Captured = Arc::default();
+        let c = inside.clone();
+        nat.inside().set_handler(Arc::new(move |p| {
+            c.lock().unwrap().push(p.as_bytes().to_vec());
+            Ok(())
+        }));
+        let c = outside.clone();
+        nat.outside().set_handler(Arc::new(move |p| {
+            c.lock().unwrap().push(p.as_bytes().to_vec());
+            Ok(())
+        }));
+        (nat, inside, outside)
+    }
+
+    const CLIENT: &str = "2001:db8::5";
+    const SERVER: Ipv4Addr = Ipv4Addr::new(8, 8, 8, 8);
+    const ROUTER: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 9);
+
+    /// Send one UDP datagram out through the NAT64 and return what left.
+    fn send_udp(nat: &Nat64, outside: &Captured) -> Vec<u8> {
+        let pkt = build_v6_udp(CLIENT.parse().unwrap(), 5555, wkp(SERVER), 53, b"query");
+        nat.inside().send(Packet::from_slice(&pkt)).unwrap();
+        outside.lock().unwrap().last().unwrap().clone()
+    }
+
+    /// An ICMPv4 error from `from` with the given type, code and second word,
+    /// quoting `quoted` whole.
+    fn icmp4_error(from: Ipv4Addr, t: u8, code: u8, word: [u8; 4], quoted: &[u8]) -> Vec<u8> {
+        let mut msg = vec![t, code, 0, 0];
+        msg.extend_from_slice(&word);
+        msg.extend_from_slice(quoted);
+        let cs = checksum(&msg);
+        msg[2..4].copy_from_slice(&cs.to_be_bytes());
+        let total = 20 + msg.len();
+        let mut p = vec![0u8; 20];
+        p[0] = 0x45;
+        p[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+        p[8] = 64;
+        p[9] = PROTO_ICMP;
+        p[12..16].copy_from_slice(&from.octets());
+        p[16..20].copy_from_slice(&[198, 51, 100, 1]);
+        let ic = checksum(&p);
+        p[10..12].copy_from_slice(&ic.to_be_bytes());
+        p.extend_from_slice(&msg);
+        p
+    }
+
+    /// Translate one ICMPv4 error about an outbound datagram; returns what
+    /// reached the inside, if anything.
+    fn translate_error(t: u8, code: u8, word: [u8; 4]) -> Option<Vec<u8>> {
+        let (nat, inside, outside) = wired();
+        let sent = send_udp(&nat, &outside);
+        let err = icmp4_error(ROUTER, t, code, word, &sent);
+        nat.outside().send(Packet::from_slice(&err)).unwrap();
+        inside.lock().unwrap().pop()
+    }
+
+    #[test]
+    fn fragmentation_needed_becomes_packet_too_big() {
+        let (nat, inside, outside) = wired();
+        let sent = send_udp(&nat, &outside);
+        let err = icmp4_error(ROUTER, 3, 4, [0, 0, 0x05, 0x78], &sent); // MTU 1400
+        nat.outside().send(Packet::from_slice(&err)).unwrap();
+        let got = inside
+            .lock()
+            .unwrap()
+            .pop()
+            .expect("PTB must reach the client");
+        assert_eq!(&got[8..24], &wkp(ROUTER).octets());
+        assert_eq!(&got[24..40], &CLIENT.parse::<Ipv6Addr>().unwrap().octets());
+        assert_eq!((got[40], got[41]), (2, 0));
+        assert_eq!(
+            u32::from_be_bytes([got[44], got[45], got[46], got[47]]),
+            1420
+        );
+        assert!(v6_sum_ok(&got), "ICMPv6 checksum");
+
+        // The quote is the client's own packet, checksum included.
+        let quote = &got[48..];
+        assert_eq!(quote[0] >> 4, 6);
+        assert_eq!(&quote[8..24], &CLIENT.parse::<Ipv6Addr>().unwrap().octets());
+        assert_eq!(&quote[24..40], &wkp(SERVER).octets());
+        assert_eq!(u16::from_be_bytes([quote[40], quote[41]]), 5555);
+        assert!(v6_sum_ok(quote), "quoted UDP checksum");
+    }
+
+    #[test]
+    fn fragmentation_needed_without_mtu_uses_a_plateau() {
+        assert_eq!(packet_too_big_mtu(0, 1500), 1492 + 20);
+        assert_eq!(packet_too_big_mtu(1400, 1500), 1420);
+    }
+
+    #[test]
+    fn destination_unreachable_codes_follow_rfc7915() {
+        for (code, want) in [
+            (0, Some((1, 0))),
+            (1, Some((1, 0))),
+            (3, Some((1, 4))),
+            (5, Some((1, 0))),
+            (9, Some((1, 1))),
+            (11, Some((1, 0))),
+            (12, Some((1, 0))),
+            (13, Some((1, 1))),
+            (15, Some((1, 1))),
+            (14, None),
+        ] {
+            let got = translate_error(3, code, [0; 4]);
+            assert_eq!(got.map(|g| (g[40], g[41])), want, "code {code}");
+        }
+        // Protocol unreachable is a parameter problem at Next Header.
+        let got = translate_error(3, 2, [0; 4]).unwrap();
+        assert_eq!((got[40], got[41]), (4, 1));
+        assert_eq!(u32::from_be_bytes([got[44], got[45], got[46], got[47]]), 6);
+    }
+
+    #[test]
+    fn parameter_problem_pointer_is_translated() {
+        // Pointer 9 (Protocol) is the IPv6 Next Header, at 6.
+        let got = translate_error(12, 0, [9, 0, 0, 0]).unwrap();
+        assert_eq!((got[40], got[41]), (4, 0));
+        assert_eq!(u32::from_be_bytes([got[44], got[45], got[46], got[47]]), 6);
+        assert!(v6_sum_ok(&got));
+        // The IPv4 identification field has no IPv6 counterpart.
+        assert!(translate_error(12, 0, [4, 0, 0, 0]).is_none());
+    }
+
+    #[test]
+    fn time_exceeded_is_translated() {
+        let got = translate_error(11, 0, [0; 4]).unwrap();
+        assert_eq!((got[40], got[41]), (3, 0));
+    }
+
+    #[test]
+    fn forged_error_is_dropped() {
+        let (nat, inside, outside) = wired();
+        let mut sent = send_udp(&nat, &outside);
+        // Claim the datagram went somewhere the mapping never sent to.
+        sent[16..20].copy_from_slice(&[9, 9, 9, 9]);
+        let err = icmp4_error(ROUTER, 3, 4, [0, 0, 5, 0x78], &sent);
+        nat.outside().send(Packet::from_slice(&err)).unwrap();
+        assert!(inside.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn hop_limit_and_ttl_are_decremented() {
+        let (nat, inside, outside) = wired();
+        let sent = send_udp(&nat, &outside);
+        assert_eq!(sent[8], 63);
+        let port = u16::from_be_bytes([sent[20], sent[21]]);
+        let mut reply = vec![0u8; 28];
+        reply[0] = 0x45;
+        reply[2..4].copy_from_slice(&28u16.to_be_bytes());
+        reply[8] = 64;
+        reply[9] = PROTO_UDP;
+        reply[12..16].copy_from_slice(&SERVER.octets());
+        reply[16..20].copy_from_slice(&[198, 51, 100, 1]);
+        let ic = checksum(&reply[..20]);
+        reply[10..12].copy_from_slice(&ic.to_be_bytes());
+        reply[20..22].copy_from_slice(&53u16.to_be_bytes());
+        reply[22..24].copy_from_slice(&port.to_be_bytes());
+        reply[24..26].copy_from_slice(&8u16.to_be_bytes());
+        nat.outside().send(Packet::from_slice(&reply)).unwrap();
+        assert_eq!(inside.lock().unwrap()[0][7], 63);
+    }
+
+    #[test]
+    fn expiring_hop_limit_is_answered_not_forwarded() {
+        let (nat, inside, outside) = wired();
+        let mut pkt = build_v6_udp(CLIENT.parse().unwrap(), 5555, wkp(SERVER), 53, b"q");
+        pkt[7] = 1;
+        nat.inside().send(Packet::from_slice(&pkt)).unwrap();
+        assert!(outside.lock().unwrap().is_empty());
+        let got = inside.lock().unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!((got[0][40], got[0][41]), (3, 0));
     }
 }

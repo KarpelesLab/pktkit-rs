@@ -102,3 +102,56 @@ pub(crate) fn fill_v4_l4_checksum(pkt: &mut [u8], ihl: usize) {
     }
     pkt[ihl + field..ihl + field + 2].copy_from_slice(&cs.to_be_bytes());
 }
+
+/// Patch a stored Internet checksum for 16-bit words that left the summed
+/// data (`old`) and words that entered it (`new`): RFC 1624 equation 3,
+/// generalised to regions of different sizes, as when a pseudo-header
+/// changes address family. Every slice must have an even length.
+pub(crate) fn csum_replace(csum: u16, old: &[&[u8]], new: &[&[u8]]) -> u16 {
+    fn words(b: &[u8]) -> impl Iterator<Item = u16> + '_ {
+        debug_assert!(
+            b.len().is_multiple_of(2),
+            "checksum patch needs whole words"
+        );
+        b.as_chunks::<2>().0.iter().map(|w| u16::from_be_bytes(*w))
+    }
+    let mut sum = (!csum) as u32;
+    for w in old.iter().flat_map(|b| words(b)) {
+        sum += (!w) as u32;
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    for w in new.iter().flat_map(|b| words(b)) {
+        sum += w as u32;
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv6Addr;
+
+    #[test]
+    fn csum_replace_matches_a_recompute_across_families() {
+        let src4 = Ipv4Addr::new(198, 51, 100, 1);
+        let dst4 = Ipv4Addr::new(192, 0, 2, 33);
+        let src6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let dst6: Ipv6Addr = "64:ff9b::c000:221".parse().unwrap();
+        let mut seg = vec![0x30, 0x39, 0, 53, 0, 13, 0, 0, b'h', b'e', b'l', b'l', b'o'];
+        let v6 = transport_checksum(Protocol::UDP, IpAddr::V6(src6), IpAddr::V6(dst6), &seg);
+        // Same datagram with a new source port, under the IPv4 pseudo-header.
+        seg[0..2].copy_from_slice(&10000u16.to_be_bytes());
+        let v4 = transport_checksum(Protocol::UDP, IpAddr::V4(src4), IpAddr::V4(dst4), &seg);
+        let patched = csum_replace(
+            v6,
+            &[&src6.octets(), &dst6.octets(), &12345u16.to_be_bytes()],
+            &[&src4.octets(), &dst4.octets(), &10000u16.to_be_bytes()],
+        );
+        // Equal as one's-complement values (0 and 0xFFFF are the same).
+        assert_eq!(patched % 0xFFFF, v4 % 0xFFFF);
+    }
+}
