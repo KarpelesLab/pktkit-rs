@@ -15,7 +15,9 @@
 //! A transport that can send ARP (the `L2Adapter`'s
 //! does) lets the client check a newly granted address before using it: a
 //! few seconds of ARP probes after the DHCPACK, and a DHCPDECLINE if anyone
-//! turns out to hold it (RFC 2131 §2.2, RFC 5227).
+//! turns out to hold it (RFC 2131 §2.2, RFC 5227). Once the address is
+//! bound, the client announces it with two ARP announcements, two seconds
+//! apart (RFC 5227 §2.3).
 
 use super::wire;
 use crate::time::Instant;
@@ -46,9 +48,9 @@ setters! {
 /// The callbacks run with no client lock held, so they may call back into
 /// the [`Client`].
 ///
-/// The calls that act on the client's behalf -- the sends, `on_bound`,
-/// `on_lease_lost` and the probe calls `begin_probe`, `send_probe` and
-/// `end_probe` -- are made one at a time, in the order of the state changes
+/// The calls that act on the client's behalf -- the sends (among them
+/// `send_announcement`), `on_bound`, `on_lease_lost` and the probe calls
+/// `begin_probe`, `send_probe` and `end_probe` -- are made one at a time, in the order of the state changes
 /// behind them: an `on_bound` never overtakes the `on_lease_lost` of a
 /// [`stop`](Client::stop) that came after it. So a call into the client
 /// made from a callback, or from another thread while one is running, has
@@ -131,6 +133,16 @@ pub trait ClientTransport: Send + Sync + 'static {
         let _ = ip;
         false
     }
+
+    /// Send one ARP announcement for `ip`: an ARP request from our MAC with
+    /// both sender and target address `ip` (RFC 5227 §2.3), so that other
+    /// hosts replace any stale cache entry for the address. After binding
+    /// an address that was probed, the client sends two, two seconds apart;
+    /// a renewal sends none. Only asked of a transport that
+    /// [can probe](Self::can_probe). The default does nothing.
+    fn send_announcement(&self, ip: Ipv4Addr) {
+        let _ = ip;
+    }
 }
 
 /// First retransmission delay and its ceiling (RFC 2131 §4.1: 4 s, doubled
@@ -151,6 +163,10 @@ const MIN_RENEW_RETRANSMIT: Duration = Duration::from_secs(60);
 const PROBE_NUM: u32 = 3;
 const PROBE_INTERVAL: Duration = Duration::from_secs(1);
 const ANNOUNCE_WAIT: Duration = Duration::from_secs(2);
+/// RFC 5227 §1.1: announcements sent once the address is claimed, and the
+/// gap between them.
+const ANNOUNCE_NUM: u32 = 2;
+const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(2);
 /// RFC 2131 §3.1.5: after declining an address, wait at least ten seconds
 /// before starting over, so a conflict does not turn into a storm.
 const DECLINE_WAIT: Duration = Duration::from_secs(10);
@@ -206,6 +222,9 @@ struct Inner {
     /// started its clock when it got the request, and the client must not
     /// think its lease lasts longer than the server does.
     requested_at: Option<Instant>,
+    /// ARP announcements of a newly bound address still to send, and when
+    /// the next is due.
+    announce: Option<(u32, Instant)>,
     /// Bumped by every start and stop, so the timer thread of an earlier run
     /// knows to exit.
     run: u64,
@@ -220,6 +239,7 @@ impl Inner {
         self.server_ip = None;
         self.lease = None;
         self.pending = None;
+        self.announce = None;
         self.tries = 0;
         self.next_tx = Some(now + backoff(0));
         Out::Discover(self.xid)
@@ -235,6 +255,7 @@ impl Inner {
         self.state = State::Bound;
         self.next_tx = None;
         self.pending = None;
+        self.announce = None;
         self.lease = lease;
         Event::Bound(prefix, router)
     }
@@ -267,6 +288,8 @@ enum Out {
         ip: Ipv4Addr,
         check: Option<u64>,
     },
+    /// ARP announcement of a newly bound address (RFC 5227 §2.3).
+    Announce(Ipv4Addr),
     /// Give the lease back (RFC 2131 §4.4.6).
     Release {
         xid: u32,
@@ -361,6 +384,7 @@ impl Client {
                     probe_check: 0,
                     probe_live: false,
                     requested_at: None,
+                    announce: None,
                     run: 0,
                 }),
                 queue: Mutex::new(Queue::default()),
@@ -440,6 +464,7 @@ impl Client {
             i.state = State::Init;
             i.lease = None;
             i.pending = None;
+            i.announce = None;
             i.next_tx = None;
             // The RELEASE goes out first, from the address it gives up: once
             // the transport hears the lease is lost it may unconfigure it.
@@ -710,6 +735,7 @@ impl Shared {
                 }
                 self.transport.send_probe(ip)
             }
+            Out::Announce(ip) => self.transport.send_announcement(ip),
             // RFC 2131 Table 5: a RELEASE carries the address in ciaddr and
             // the server identifier, and is unicast to that server.
             Out::Release { xid, ip, server } => {
@@ -770,7 +796,13 @@ fn step(i: &mut Inner, now: Instant, conflict: bool) -> (Option<Event>, Option<O
             let Some((prefix, router, lease)) = i.pending else {
                 return (None, Some(i.restart(now)));
             };
-            (Some(i.bind(prefix, router, lease)), None)
+            // RFC 5227 §2.3: a host that has probed an address and found it
+            // free MUST announce it, so that stale cache entries elsewhere
+            // -- from its last holder -- are replaced. The first goes out
+            // once the address is configured.
+            let bound = i.bind(prefix, router, lease);
+            i.announce = Some((ANNOUNCE_NUM - 1, now + ANNOUNCE_INTERVAL));
+            (Some(bound), Some(Out::Announce(ip)))
         }
         State::Selecting => {
             if !due(i.next_tx) {
@@ -800,6 +832,12 @@ fn step(i: &mut Inner, now: Instant, conflict: bool) -> (Option<Event>, Option<O
             (None, Some(out))
         }
         State::Bound | State::Renewing | State::Rebinding => {
+            if let (Some((left, at)), Some(ip)) = (i.announce, i.offered_ip)
+                && at <= now
+            {
+                i.announce = (left > 1).then(|| (left - 1, now + ANNOUNCE_INTERVAL));
+                return (None, Some(Out::Announce(ip)));
+            }
             let Some(lease) = i.lease else {
                 return (None, None); // infinite
             };
@@ -1010,6 +1048,7 @@ mod tests {
         /// Checks started with `begin_probe`, and ended with `end_probe`.
         checks: Mutex<u32>,
         ended: Mutex<u32>,
+        announced: Mutex<Vec<Ipv4Addr>>,
     }
     impl ClientTransport for Recorder {
         fn mac(&self) -> MacAddr {
@@ -1459,6 +1498,9 @@ mod tests {
         fn probe_conflict(&self, _ip: Ipv4Addr) -> bool {
             *self.0.conflict.lock().unwrap()
         }
+        fn send_announcement(&self, ip: Ipv4Addr) {
+            self.0.announced.lock().unwrap().push(ip);
+        }
     }
 
     fn probing() -> (Arc<Recorder>, Client) {
@@ -1493,6 +1535,36 @@ mod tests {
         assert_eq!(r.bound.lock().unwrap().unwrap().0.addr(), IpAddr::V4(ip));
         assert_eq!(state(&c), State::Bound);
         assert!(sent(&r).is_empty());
+    }
+
+    #[test]
+    fn a_newly_bound_address_is_announced_twice() {
+        let (r, c) = probing();
+        tick_after(&c, Duration::from_millis(1100));
+        tick_after(&c, Duration::from_millis(2200));
+        tick_after(&c, Duration::from_millis(4300));
+        assert_eq!(state(&c), State::Bound);
+        assert_eq!(
+            *r.announced.lock().unwrap(),
+            [IP],
+            "not announced on binding"
+        );
+
+        // ANNOUNCE_INTERVAL later, the second and last.
+        tick_after(&c, Duration::from_millis(5300));
+        assert_eq!(r.announced.lock().unwrap().len(), 1, "too soon");
+        tick_after(&c, Duration::from_millis(6300));
+        assert_eq!(*r.announced.lock().unwrap(), [IP, IP]);
+        tick_after(&c, Duration::from_millis(9000));
+        assert_eq!(r.announced.lock().unwrap().len(), 2, "ANNOUNCE_NUM is two");
+
+        // A renewal is not a fresh claim: nothing more is announced.
+        tick_after(&c, Duration::from_secs(1801));
+        assert_eq!(state(&c), State::Renewing);
+        c.handle_packet(&make_ack(xid(&c), r.mac));
+        tick_after(&c, Duration::from_secs(1810));
+        assert_eq!(r.announced.lock().unwrap().len(), 2);
+        assert!(sent(&r).iter().all(|m| m.2.msg_type != wire::MSG_DECLINE));
     }
 
     #[test]

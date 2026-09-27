@@ -900,6 +900,14 @@ impl crate::dhcp::ClientTransport for AdapterDhcpTransport {
         let frame = build_frame(MacAddr::broadcast(), a.mac, EtherType::ARP, &payload);
         a.send_l2(Frame::from_slice(&frame));
     }
+    fn send_announcement(&self, ip: Ipv4Addr) {
+        let Some(a) = self.weak.upgrade() else {
+            return;
+        };
+        let payload = arp::build_packet(arp::OP_REQUEST, a.mac, ip, MacAddr::zero(), ip);
+        let frame = build_frame(MacAddr::broadcast(), a.mac, EtherType::ARP, &payload);
+        a.send_l2(Frame::from_slice(&frame));
+    }
     fn probe_conflict(&self, ip: Ipv4Addr) -> bool {
         self.weak.upgrade().is_some_and(|a| {
             a.probe
@@ -1741,6 +1749,33 @@ mod tests {
         t.begin_probe(ip2);
         t.send_probe(ip2);
         assert!(!t.probe_conflict(ip2));
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn an_announcement_claims_the_address_for_everyone() {
+        use crate::dhcp::ClientTransport;
+        let (_pipe, adapter, out) = rig("10.0.0.50/24");
+        let t = AdapterDhcpTransport {
+            weak: Arc::downgrade(&adapter),
+        };
+        let ip = Ipv4Addr::new(10, 0, 0, 50);
+        t.send_announcement(ip);
+        let sent = take(&out);
+        assert_eq!(sent.len(), 1);
+        let f = Frame::from_slice(&sent[0]);
+        assert_eq!(f.dst_mac(), Some(MacAddr::broadcast()));
+        let (op, sm, si, tm, ti) = arp::parse(f.payload()).unwrap();
+        // RFC 5227 §2.3: an ARP request with our address as both sender
+        // and target.
+        assert_eq!(
+            (op, sm, si, tm, ti),
+            (arp::OP_REQUEST, adapter.mac, ip, MacAddr::zero(), ip)
+        );
+        // Looped back by a hub, it is neither a conflict nor answered.
+        adapter.send(f).unwrap();
+        assert!(take(&out).is_empty());
+        assert_eq!(adapter.address_conflicts(), 0);
     }
 
     #[cfg(feature = "dhcp")]
