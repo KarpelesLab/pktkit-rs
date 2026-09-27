@@ -55,6 +55,9 @@ pub(crate) struct ConnState {
     /// When the connection was opened: bounds how long a passive one may
     /// sit in SYN-RECEIVED (see [`SYN_RECEIVED_TIMEOUT`]).
     opened: Instant,
+    /// For a passively opened connection not yet accepted, what it has
+    /// taken of its listener's [`UNACCEPTED_BYTES`] budget.
+    charge: Mutex<Option<Charge>>,
 }
 
 impl ConnState {
@@ -72,10 +75,43 @@ impl ConnState {
             signal: Condvar::new(),
             sink,
             connected: AtomicBool::new(false),
-            pending_accept: Mutex::new(pending_accept),
             error: Mutex::new(None),
             opened: Instant::now(),
+            charge: Mutex::new(pending_accept.as_ref().map(|p| Charge {
+                listener: Arc::downgrade(&p.listener),
+                bytes: 0,
+            })),
+            pending_accept: Mutex::new(pending_accept),
         })
+    }
+
+    /// Whether `seg`'s data may go into the connection. Once accepted, it
+    /// always may: the receive window bounds it. Until then, it counts
+    /// against the listener's budget, and data past it is dropped, for the
+    /// peer to send again once the application has taken the connection.
+    /// Retransmissions are charged again, so this errs towards dropping.
+    fn admit(&self, seg: &Segment) -> bool {
+        let len = seg.payload.len();
+        if len == 0 {
+            return true;
+        }
+        let mut charge = self.charge.lock().unwrap();
+        let Some(c) = charge.as_mut() else {
+            return true;
+        };
+        let Some(listener) = c.listener.upgrade() else {
+            return true;
+        };
+        let taken = listener
+            .unaccepted_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n + len <= UNACCEPTED_BYTES).then_some(n + len)
+            })
+            .is_ok();
+        if taken {
+            c.bytes += len;
+        }
+        taken
     }
 
     /// Record why the connection failed; the first reason sticks.
@@ -393,6 +429,26 @@ pub(crate) struct ListenerState {
     /// the port would be a guess at a 24-bit MAC, and a lucky one would open
     /// a connection nobody asked for.
     cookie_sent: Mutex<Option<Instant>>,
+    /// Data held by this listener's connections that have not been
+    /// accepted, bounded by [`UNACCEPTED_BYTES`].
+    unaccepted_bytes: AtomicUsize,
+}
+
+/// What a connection not yet accepted has taken of its listener's
+/// [`UNACCEPTED_BYTES`] budget, given back when it is accepted or goes.
+/// The listener is held weakly: a queued connection holding it strongly
+/// would keep a listener nobody closed alive through its own queue.
+struct Charge {
+    listener: std::sync::Weak<ListenerState>,
+    bytes: usize,
+}
+
+impl Drop for Charge {
+    fn drop(&mut self) {
+        if let Some(l) = self.listener.upgrade() {
+            l.unaccepted_bytes.fetch_sub(self.bytes, Ordering::AcqRel);
+        }
+    }
 }
 
 /// A passively opened connection's claim on its listener: the accept queue
@@ -416,6 +472,15 @@ impl Drop for PendingAccept {
 }
 
 const ACCEPT_QUEUE_CAP: usize = 128;
+
+/// Data a listener's connections may hold between them before they are
+/// accepted. Each may be sent a full receive window (vtcp's 1 MiB) before
+/// the application has so much as seen it, and with 128 queued and 128
+/// half open, a peer could park a quarter of a gigabyte on a listener
+/// whose application is slow to accept. Past this, their data is dropped
+/// until they are accepted; a few connections with a window's worth each
+/// still fit.
+const UNACCEPTED_BYTES: usize = if cfg!(test) { 64 * 1024 } else { 8 << 20 };
 
 /// Connections a listener holds in SYN-RECEIVED at once, as a listen
 /// backlog bounds them: each SYN would otherwise mint a connection that
@@ -530,6 +595,8 @@ impl Listener {
         let mut q = self.state.queue.lock().unwrap();
         loop {
             if let Some(conn) = q.pop_front() {
+                // Accepted: its window alone bounds it from now on.
+                conn.state.charge.lock().unwrap().take();
                 return Ok(conn);
             }
             if self.state.closed.load(Ordering::Acquire) {
@@ -658,6 +725,7 @@ impl TcpStack {
         // A connection that never completed its handshake gives its
         // half-open slot back now, not whenever the last clone of it goes.
         state.pending_accept.lock().unwrap().take();
+        state.charge.lock().unwrap().take();
     }
 
     /// Open a connection and send the SYN, without waiting for the answer.
@@ -781,6 +849,7 @@ impl TcpStack {
             half_open: AtomicUsize::new(0),
             cookies: SynCookies::new(),
             cookie_sent: Mutex::new(None),
+            unaccepted_bytes: AtomicUsize::new(0),
         });
         listeners.insert(port, state.clone());
         Ok(Listener {
@@ -836,7 +905,18 @@ impl TcpStack {
                 // Closing marks the FIN as received too, so this tells a
                 // stream that had ended from one cut short.
                 let ended = conn.fin_received();
-                let segs = conn.handle_segment(&seg);
+                let segs = if state.admit(&seg) {
+                    conn.handle_segment(&seg)
+                } else {
+                    // Its ACK and window still count; the data, and a FIN
+                    // that follows it, the peer sends again.
+                    let bare = Segment {
+                        payload: Vec::new(),
+                        flags: seg.flags & !(flags::FIN | flags::PSH),
+                        ..seg.clone()
+                    };
+                    conn.handle_segment(&bare)
+                };
                 // Noted under the lock, before sending anything: the reply
                 // can loop back through a synchronous link and close the
                 // connection before this function returns.
@@ -1454,6 +1534,54 @@ mod tests {
             out.lock().unwrap().is_empty(),
             "sent a RST to a SYN's source"
         );
+    }
+
+    /// Connections nobody has accepted yet share a small data budget: a
+    /// listener whose application is slow to accept must not let peers
+    /// park a full receive window on each of 128 queued connections.
+    #[test]
+    fn unaccepted_connections_share_a_data_budget() {
+        let (stack, out) = capturing_stack();
+        let listener = stack.listen(own(US), 80).unwrap();
+        listener.set_nonblocking(true);
+        let feed = |seg: Segment| {
+            stack.handle_inbound(Packet::from_slice(&inbound(seg)), IpAddr::V4(US));
+        };
+        feed(syn_from(4000));
+        let our_seq = last_sent(&out).seq.wrapping_add(1);
+        let data = |seq: u32, len: usize| Segment {
+            src_port: 4000,
+            dst_port: 80,
+            seq,
+            ack: our_seq,
+            flags: flags::ACK,
+            window: 65535,
+            payload: vec![7; len],
+            ..Default::default()
+        };
+        // Twice the budget, in order and well inside the receive window.
+        let mut seq = 2u32;
+        for _ in 0..2 * UNACCEPTED_BYTES / 1000 {
+            feed(data(seq, 1000));
+            seq = seq.wrapping_add(1000);
+        }
+        assert_eq!(
+            listener.state.unaccepted_bytes.load(Ordering::Acquire),
+            65_000
+        );
+        let conn = listener.accept().unwrap();
+        assert_eq!(listener.state.unaccepted_bytes.load(Ordering::Acquire), 0);
+        conn.set_nonblocking(true);
+        let mut total = 0;
+        let mut buf = [0; 4096];
+        while let Ok(n) = conn.read(&mut buf) {
+            total += n;
+        }
+        assert_eq!(total, 65_000, "held more than the budget before accept");
+
+        // Accepted, it takes data again: what was dropped comes back.
+        feed(data(2 + 65_000, 1000));
+        assert_eq!(conn.read(&mut buf).unwrap(), 1000);
     }
 
     #[test]
