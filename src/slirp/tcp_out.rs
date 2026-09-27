@@ -11,7 +11,8 @@
 //! ([`ConnState`]): inbound segments are fed via [`ConnState::deliver`],
 //! outbound segments are wrapped back into IP and pushed into the virtual
 //! network, and the stack's tick thread drives RTO / persist / keepalive /
-//! TIME-WAIT timers. Two background threads form the byte pump:
+//! TIME-WAIT timers. Two background threads form the byte pump, started only
+//! once the client has ACKed our SYN-ACK (within [`HANDSHAKE_TIMEOUT`]):
 //!
 //! - **remote→client**: read from the real socket, `Conn::write` the bytes
 //!   (blocking on the send window via the shared `Condvar`), and flush the
@@ -52,6 +53,14 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// over the 2048 bridges of each address family.
 const BRIDGE_BUF: usize = 256 * 1024;
 
+/// How long the client has to ACK our SYN-ACK once the destination has
+/// accepted, as for the inbound handshakes of a listener. Until then the
+/// bridge holds a real connection to a third party on the client's behalf,
+/// and vtcp's own SYN-ACK retransmissions would keep it for minutes: a client
+/// that never ACKs could otherwise hold every outbound slot, and as many
+/// host connections, with a trickle of SYNs.
+pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// A live outbound TCP NAT bridge: a server-side `vtcp::Conn` facing the
 /// virtual client, glued to a real OS [`TcpStream`] facing the destination.
 pub(crate) struct TcpOutConn {
@@ -77,6 +86,12 @@ pub(crate) struct TcpOutConn {
     /// Called if the bridge goes while its dial is still running; taken
     /// once the dial finishes.
     on_orphan: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// From the SYN-ACK until the client's ACK: the read half of the real
+    /// socket, waiting for the pumps, and the deadline for that ACK. The
+    /// pumps (two threads and their buffers) start only once the client
+    /// has completed the handshake, so a client that never does costs no
+    /// thread; taken by whichever comes first, the ACK or the deadline.
+    handshake: Mutex<Option<(Instant, TcpStream)>>,
 }
 
 impl TcpOutConn {
@@ -139,11 +154,12 @@ impl TcpOutConn {
             syn: Mutex::new(Some(syn.clone())),
             time_wait_since: OnceLock::new(),
             on_orphan: Mutex::new(None),
+            handshake: Mutex::new(None),
         })
     }
 
-    /// Dial `dest` on a thread of its own and, once it answers, complete the
-    /// virtual handshake and start the byte pumps. `on_done` runs when the
+    /// Dial `dest` on a thread of its own and, once it answers, answer the
+    /// client's SYN; the byte pumps start once the client ACKs. `on_done` runs when the
     /// dial has finished either way; `on_orphan` runs before that if the
     /// bridge is torn down (the guest reset it, say) while the dial is still
     /// running, as nothing waits on the dial from then on.
@@ -219,9 +235,37 @@ impl TcpOutConn {
             return;
         }
         let synack = self.state.conn.lock().expect("poisoned").accept_syn(syn);
+        // In place before the SYN-ACK goes out: the client's ACK may come
+        // back through the sink before `wrap_and_send` even returns.
+        *self.handshake.lock().expect("poisoned") =
+            Some((Instant::now() + HANDSHAKE_TIMEOUT, remote_read));
         *pending = None;
         drop(pending);
+        self.state.wrap_and_send(synack);
+    }
 
+    /// Start the byte pumps if the client has just completed the handshake.
+    fn start_pumps(self: &Arc<Self>) {
+        let remote_read = {
+            let mut hs = self.handshake.lock().expect("poisoned");
+            // Checked and taken under the lock the deadline is taken under
+            // too, so exactly one of the ACK and the deadline gets it.
+            if hs.is_none()
+                || !self
+                    .state
+                    .conn
+                    .lock()
+                    .expect("poisoned")
+                    .state()
+                    .is_synchronized()
+            {
+                return;
+            }
+            hs.take().expect("checked above").1
+        };
+        if self.closed.load(Ordering::SeqCst) {
+            return; // torn down meanwhile; dropping the half closes it
+        }
         // remote → client: real socket bytes become vtcp writes (→ segments).
         let b_r = self.clone();
         let reader = super::spawn_flow_thread(move || b_r.pump_remote_to_client(remote_read));
@@ -232,15 +276,35 @@ impl TcpOutConn {
             // Out of threads: a bridge with half its pumps would stall, so
             // reset both sides instead.
             self.close();
-            return;
         }
+    }
 
-        self.state.wrap_and_send(synack);
+    /// Whether the client has let the handshake run past its deadline
+    /// (as of `now`). Once this has said so, the ACK can no longer start the
+    /// pumps, and the caller should [`close`](Self::close) the bridge.
+    pub(crate) fn handshake_expired(&self, now: Instant) -> bool {
+        let mut hs = self.handshake.lock().expect("poisoned");
+        let due = hs.as_ref().is_some_and(|(deadline, _)| now >= *deadline);
+        // An ACK that has completed the handshake but not yet started the
+        // pumps wins: the connection is up, and resetting it would lose it.
+        if !due
+            || self
+                .state
+                .conn
+                .lock()
+                .expect("poisoned")
+                .state()
+                .is_synchronized()
+        {
+            return false;
+        }
+        hs.take();
+        true
     }
 
     /// Feed an inbound TCP segment from the virtual client into the engine and
     /// transmit its replies. (Called from the stack's packet dispatch path.)
-    pub(crate) fn handle_segment(&self, tcp: &[u8]) -> Result<()> {
+    pub(crate) fn handle_segment(self: &Arc<Self>, tcp: &[u8]) -> Result<()> {
         let Ok(seg) = Segment::parse(tcp) else {
             return Ok(());
         };
@@ -255,6 +319,7 @@ impl TcpOutConn {
             return Ok(());
         }
         self.state.deliver(&seg);
+        self.start_pumps();
         Ok(())
     }
 

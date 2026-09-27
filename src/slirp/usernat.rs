@@ -326,8 +326,9 @@ impl Stack {
 
                 // Outbound NAT bridges: tick the virtual-side engine; reap when the
                 // bridge has fully torn down.
-                tick_outbound(&inner.tcp, &inner.tcp_time_wait);
-                tick_outbound(&inner.tcp6, &inner.tcp6_time_wait);
+                let now = Instant::now();
+                tick_outbound(&inner.tcp, &inner.tcp_time_wait, now);
+                tick_outbound(&inner.tcp6, &inner.tcp6_time_wait, now);
                 drop(inner);
             }
         });
@@ -1472,12 +1473,14 @@ fn outbound_slot_free<K>(
         && len.saturating_sub(time_wait.load(Ordering::Acquire)) < MAX_OUTBOUND_TCP
 }
 
-/// Drive the timers of every outbound bridge in `table`, reap those that
-/// have torn down, and keep those in TIME-WAIT within [`MAX_TIME_WAIT`] by
+/// Drive the timers of every outbound bridge in `table`, reset those whose
+/// client has not completed the handshake in time, reap those that have
+/// torn down, and keep those in TIME-WAIT within [`MAX_TIME_WAIT`] by
 /// dropping the oldest early.
 fn tick_outbound<K: Copy + Eq + std::hash::Hash>(
     table: &Mutex<HashMap<K, Arc<TcpOutConn>>>,
     time_wait: &AtomicUsize,
+    now: Instant,
 ) {
     let out: Vec<(K, Arc<TcpOutConn>)> = table
         .lock()
@@ -1485,11 +1488,13 @@ fn tick_outbound<K: Copy + Eq + std::hash::Hash>(
         .iter()
         .map(|(k, v)| (*k, v.clone()))
         .collect();
-    let now = Instant::now();
     let mut dead = Vec::new();
     let mut waiting = Vec::new();
     for (k, c) in out {
         tick_conn(c.state());
+        if c.handshake_expired(now) {
+            c.close();
+        }
         if c.is_closed() {
             dead.push((k, c));
         } else if let Some(since) = c.time_wait_since(now) {
@@ -3603,5 +3608,63 @@ mod tests {
         assert_eq!(dials_of(&stack, 1).0, MAX_PENDING_DIALS_PER_NS);
         assert!(!blackholed_dial(&stack, 1, 21000), "past the cap");
         assert!(blackholed_dial(&stack, 2, 21000), "another namespace");
+    }
+
+    /// A client that never ACKs our SYN-ACK costs no pump thread, and loses
+    /// the bridge, and the host connection behind it, once the handshake
+    /// deadline passes, rather than after minutes of SYN-ACK retries.
+    #[test]
+    fn an_unacked_syn_ack_starts_no_pumps_and_times_out() {
+        use std::io::Read;
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (held_tx, held_rx) = mpsc::channel();
+        thread::spawn(move || {
+            if let Ok((s, _)) = listener.accept() {
+                let _ = held_tx.send(s);
+            }
+        });
+        let stack = Stack::new();
+        let captured = capture(&stack);
+        let client = Ipv4Addr::new(10, 0, 0, 5);
+        let server = Ipv4Addr::new(127, 0, 0, 1);
+        let syn = build_tcp_v4_packet(client, 40500, server, port, 1000, 0, tcp_flags::SYN, &[]);
+        L3Device::send(&*stack, Packet::from_slice(&syn)).unwrap();
+        wait_for("the SYN-ACK", || !captured.lock().unwrap().is_empty());
+        let mut held = held_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let bridge = stack.inner.tcp.lock().unwrap().values().next().cloned();
+        let bridge = bridge.expect("bridge registered");
+        thread::sleep(Duration::from_millis(100));
+        // The table's handle and ours: no pump holds one.
+        assert_eq!(
+            Arc::strong_count(&bridge),
+            2,
+            "pumps started before the ACK"
+        );
+
+        tick_outbound(
+            &stack.inner.tcp,
+            &stack.inner.tcp_time_wait,
+            Instant::now() + crate::slirp::tcp_out::HANDSHAKE_TIMEOUT,
+        );
+        assert!(stack.inner.tcp.lock().unwrap().is_empty());
+        assert!(
+            captured
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|p| Segment::parse(&p[20..]).is_ok_and(|s| s.has_flag(tcp_flags::RST))),
+            "the client was not reset"
+        );
+        held.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut b = [0u8; 1];
+        assert_eq!(
+            held.read(&mut b).map_err(|e| e.kind()),
+            Ok(0),
+            "the host connection was kept"
+        );
     }
 }
