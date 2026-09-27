@@ -357,8 +357,7 @@ println!("zero-copy: {}, queues: {:?}", dev.zerocopy(), dev.queue_ids());
 
 Matching is longest-prefix, so a `/24` captures a whole subnet. ARP for a
 captured IPv4 address is captured too (otherwise nothing could resolve it), and
-adding an IPv6 `/128` also captures its solicited-node multicast address so
-neighbour discovery arrives.
+so is an IPv6 neighbour solicitation whose target is a captured address.
 
 `capture_add` takes the whole address. To share one with the host stack, name
 a protocol or a TCP/UDP port on it instead:

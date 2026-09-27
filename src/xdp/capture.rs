@@ -28,16 +28,17 @@
 //! travelling.
 //!
 //! ARP and neighbor discovery follow the rules too. Only a prefix with an
-//! [`Rule::Any`] entry has its ARP captured, and only a `/128` with one gets a
-//! solicited-node multicast entry: a narrower rule means the address is shared
-//! with the host stack, which then has to keep answering for it.
+//! [`Rule::Any`] entry has its ARP and neighbor solicitations captured: a
+//! narrower rule means the address is shared with the host stack, which then
+//! has to keep answering for it.
 //!
-//! IPv6 neighbor discovery needs the equivalent treatment, but a neighbor
-//! solicitation is addressed to a *solicited-node multicast* address rather
-//! than to the target, so no amount of destination matching finds it. Instead
-//! [`Capture::add`] inserts that multicast address into the trie alongside a
-//! `/128` (see [`CaptureConfig::neighbor_discovery`]) — same effect, and it
-//! costs nothing in the datapath.
+//! A neighbor solicitation is addressed to a *solicited-node multicast* group
+//! rather than to the address it asks about, so destination matching cannot
+//! find it. With [`CaptureConfig::neighbor_discovery`] set, the program looks
+//! up the solicitation's *target address* instead, the way the ARP branch
+//! looks up `tpa`. The group itself is never captured: it is derived from only
+//! the low 24 bits of an address, so the host's own addresses can share it,
+//! and diverting the group would divert the host's neighbor discovery with it.
 //!
 //! Anything that matches nothing returns [`CaptureConfig::default_action`],
 //! normally [`Action::PASS`]. A capture device therefore coexists with the
@@ -142,6 +143,16 @@ const V4_SRC_KEY: i16 = -16;
 /// `{ u32 prefixlen; u8 addr[16]; }`
 const V6_DST_KEY: i16 = -40;
 const V6_SRC_KEY: i16 = -64;
+/// A neighbor solicitation's target address, same layout.
+const V6_TGT_KEY: i16 = -88;
+
+/// ICMPv6 Neighbor Solicitation (RFC 4861 §4.3): the type byte, and the
+/// target address 8 bytes into the message.
+const ICMPV6_NS: i32 = 135;
+const NS_TYPE: i16 = IPV6_MIN as i16;
+const NS_TARGET: i16 = IPV6_MIN as i16 + 8;
+/// Ethernet, the fixed IPv6 header, and a solicitation up to its target.
+const NS_MIN: i32 = IPV6_MIN + 24;
 
 /// Where a TCP or UDP header keeps its two ports.
 const L4_SPORT: i16 = 0;
@@ -168,8 +179,10 @@ const _: () = {
         V6_DST_KEY + 20 <= V4_SRC_KEY,
         "v6 dst key overlaps a v4 key"
     );
+    assert!(V6_TGT_KEY % 4 == 0);
     assert!(V6_SRC_KEY + 20 <= V6_DST_KEY, "v6 keys overlap");
-    assert!(V6_SRC_KEY > -512, "keys exceed the BPF stack");
+    assert!(V6_TGT_KEY + 20 <= V6_SRC_KEY, "v6 target key overlaps");
+    assert!(V6_TGT_KEY > -512, "keys exceed the BPF stack");
 };
 
 // --- rules -----------------------------------------------------------------
@@ -310,9 +323,11 @@ pub struct CaptureConfig {
     /// [`Rule::Any`]. Required for a captured IPv4 address to be reachable at
     /// all.
     pub arp: bool,
-    /// When adding a `/128` with a [`Rule::Any`], also capture its
-    /// solicited-node multicast address so IPv6 neighbor discovery reaches
-    /// userspace.
+    /// Also capture an IPv6 neighbor solicitation whose target address is in
+    /// the v6 set with a [`Rule::Any`], so a captured IPv6 address can be
+    /// resolved at all. Matched on the target, not on the solicited-node
+    /// group the solicitation is sent to, which the host's own addresses can
+    /// share.
     pub neighbor_discovery: bool,
     /// Verdict for traffic that matches nothing.
     ///
@@ -748,6 +763,23 @@ fn build_program_with_fds(
     if cfg.match_field.wants_src() {
         stage_v6(&mut asm, V6_SRC_KEY, IPV6_SRC);
     }
+    // A neighbor solicitation is judged by the address it asks about, like
+    // ARP, and only a whole-address capture takes it. Anything that is not a
+    // complete solicitation goes on to the ordinary lookups.
+    if cfg.neighbor_discovery && cfg.match_field.wants_dst() {
+        let l_not_ns = asm.label();
+        asm.emit(Insn::ldx(Size::B, R1, R7, IPV6_NEXT));
+        asm.jump(
+            Insn::jmp_imm(Jmp::JNE, R1, Protocol::ICMPV6.as_u8() as i32, 0),
+            l_not_ns,
+        );
+        need_bytes(&mut asm, NS_MIN, l_not_ns);
+        asm.emit(Insn::ldx(Size::B, R1, R7, NS_TYPE));
+        asm.jump(Insn::jmp_imm(Jmp::JNE, R1, ICMPV6_NS, 0), l_not_ns);
+        stage_v6(&mut asm, V6_TGT_KEY, NS_TARGET);
+        lookup_and_match(&mut asm, cfg, v6_fd, V6_TGT_KEY, None, l_redirect);
+        asm.place(l_not_ns);
+    }
     if cfg.match_field.wants_dst() {
         let l4 = Some((Family::V6, L4_DPORT));
         lookup_and_match(&mut asm, cfg, v6_fd, V6_DST_KEY, l4, l_redirect);
@@ -820,9 +852,8 @@ pub struct Capture {
     prog: Program,
     link: Link,
     cfg: CaptureConfig,
-    /// What the caller added, kept so a removal can tell whether a derived
-    /// entry (a solicited-node multicast address) is still needed, and so a
-    /// rule can be added to a prefix without reading the trie back.
+    /// What the caller added, kept so a rule can be added to a prefix without
+    /// reading the trie back.
     entries: Mutex<Vec<Entry>>,
 }
 
@@ -916,11 +947,6 @@ impl Capture {
                 });
             }
         }
-        if rule == Rule::Any
-            && let Some(sn) = self.solicited_node(prefix)
-        {
-            self.sync_solicited_node(&held, sn)?;
-        }
         Ok(())
     }
 
@@ -937,7 +963,6 @@ impl Capture {
             None => false,
         };
         let removed = self.map_for(prefix).delete(lpm_key(prefix).as_bytes())?;
-        self.after_removal(&held, prefix)?;
         Ok(had || removed)
     }
 
@@ -960,9 +985,6 @@ impl Capture {
         } else {
             self.write(prefix, &rules)?;
             held[i].rules = rules;
-        }
-        if rule == Rule::Any {
-            self.after_removal(&held, prefix)?;
         }
         Ok(true)
     }
@@ -988,8 +1010,7 @@ impl Capture {
         }
     }
 
-    /// The prefixes added through [`Capture::add`] / [`Capture::add_rule`],
-    /// excluding derived entries.
+    /// The prefixes added through [`Capture::add`] / [`Capture::add_rule`].
     pub fn prefixes(&self) -> Vec<IpPrefix> {
         self.entries
             .lock()
@@ -1028,53 +1049,6 @@ impl Capture {
             &self.maps.v6
         }
     }
-
-    /// Bring the derived entries `prefix` could have touched back in line: the
-    /// group it derives, and — if `prefix` is itself a solicited-node group
-    /// the caller had claimed — the group another `/128` may still need.
-    fn after_removal(&self, held: &[Entry], prefix: IpPrefix) -> Result<()> {
-        if let Some(sn) = self.solicited_node(prefix) {
-            self.sync_solicited_node(held, sn)?;
-        }
-        if is_solicited_node_group(prefix) {
-            self.sync_solicited_node(held, prefix)?;
-        }
-        Ok(())
-    }
-
-    /// Insert or delete the derived entry for the solicited-node group `sn`
-    /// according to whether any `/128` with a [`Rule::Any`] still derives it.
-    ///
-    /// A caller who added the group address in its own right owns it: its
-    /// rules stand, and it is neither overwritten nor deleted here.
-    fn sync_solicited_node(&self, held: &[Entry], sn: IpPrefix) -> Result<()> {
-        if held.iter().any(|e| e.prefix == sn) {
-            return Ok(());
-        }
-        // Two addresses can share a group (it is derived from the low 24
-        // bits), so it stays as long as any of them needs it.
-        let needed = held
-            .iter()
-            .any(|e| e.rules.contains(&Rule::Any) && self.solicited_node(e.prefix) == Some(sn));
-        if needed {
-            // Derived entries are always /128, so they cannot move coverage.
-            self.write(sn, &[Rule::Any])
-        } else {
-            self.map_for(sn).delete(lpm_key(sn).as_bytes()).map(|_| ())
-        }
-    }
-
-    /// The solicited-node multicast address a `/128` must also listen on for
-    /// neighbor discovery to work. `None` for anything else.
-    fn solicited_node(&self, prefix: IpPrefix) -> Option<IpPrefix> {
-        if !self.cfg.neighbor_discovery || prefix.bits() != 128 {
-            return None;
-        }
-        match prefix.addr() {
-            IpAddr::V6(a) => Some(IpPrefix::new(solicited_node_multicast(a).into(), 128)),
-            IpAddr::V4(_) => None,
-        }
-    }
 }
 
 /// `ff02::1:ffXX:XXXX` for `addr`, per RFC 4291 §2.7.1.
@@ -1087,17 +1061,6 @@ pub fn solicited_node_multicast(addr: Ipv6Addr) -> Ipv6Addr {
     sn[12] = 0xff;
     sn[13..16].copy_from_slice(&o[13..16]);
     Ipv6Addr::from(sn)
-}
-
-/// True if `prefix` is a single address inside `ff02::1:ff00:0/104`.
-fn is_solicited_node_group(prefix: IpPrefix) -> bool {
-    match prefix.addr() {
-        IpAddr::V6(a) if prefix.bits() == 128 => {
-            let o = a.octets();
-            o[..13] == [0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0xff]
-        }
-        _ => false,
-    }
 }
 
 #[cfg(test)]
@@ -1203,6 +1166,7 @@ mod tests {
         let p = program(&CaptureConfig {
             match_field: MatchField::Dst,
             arp: false,
+            neighbor_discovery: false,
             ..Default::default()
         });
         let n = p
@@ -1217,6 +1181,7 @@ mod tests {
         let p = program(&CaptureConfig {
             match_field: MatchField::Either,
             arp: false,
+            neighbor_discovery: false,
             ..Default::default()
         });
         let n = p
@@ -1228,17 +1193,31 @@ mod tests {
 
     #[test]
     fn arp_adds_a_third_family_branch() {
-        let with = program(&CaptureConfig::default());
-        let without = program(&CaptureConfig {
-            arp: false,
-            ..Default::default()
-        });
+        let base = CaptureConfig::default().neighbor_discovery(false);
+        let with = program(&base);
+        let without = program(&base.clone().arp(false));
         assert!(with.len() > without.len());
         let n = with
             .iter()
             .filter(|i| **i == Insn::call(BPF_FUNC_MAP_LOOKUP_ELEM))
             .count();
         assert_eq!(n, 3, "v4 + v6 + arp");
+    }
+
+    #[test]
+    fn neighbor_discovery_adds_one_target_lookup() {
+        let lookups = |cfg: &CaptureConfig| {
+            program(cfg)
+                .iter()
+                .filter(|i| **i == Insn::call(BPF_FUNC_MAP_LOOKUP_ELEM))
+                .count()
+        };
+        let base = CaptureConfig::default().arp(false);
+        assert_eq!(lookups(&base), 3, "v4 + v6 + ns target");
+        assert_eq!(lookups(&base.clone().neighbor_discovery(false)), 2);
+        // Solicitations are judged by the address asked about, a destination
+        // concept, so a source-only capture leaves them alone.
+        assert_eq!(lookups(&base.clone().match_field(MatchField::Src)), 2);
     }
 
     #[test]
@@ -1566,16 +1545,6 @@ mod tests {
         }
         .validate()
         .unwrap();
-    }
-
-    #[test]
-    fn solicited_node_groups_are_recognised() {
-        let sn: Ipv6Addr = "ff02::1:ffad:beef".parse().unwrap();
-        assert!(is_solicited_node_group(IpPrefix::new(sn.into(), 128)));
-        assert!(!is_solicited_node_group(IpPrefix::new(sn.into(), 104)));
-        let other: Ipv6Addr = "ff02::16".parse().unwrap();
-        assert!(!is_solicited_node_group(IpPrefix::new(other.into(), 128)));
-        assert!(!is_solicited_node_group(v4([224, 0, 0, 1], 32)));
     }
 
     #[test]
@@ -2035,6 +2004,89 @@ mod tests {
 
     const HOST: [u8; 4] = [10, 0, 0, 7];
     const PEER: [u8; 4] = [10, 0, 0, 9];
+
+    /// An ICMPv6 neighbor solicitation for `target`, sent to its
+    /// solicited-node group as RFC 4861 has it.
+    fn ns(target: &str) -> Vec<u8> {
+        let t: Ipv6Addr = target.parse().unwrap();
+        let mut icmp = vec![ICMPV6_NS as u8, 0, 0, 0, 0, 0, 0, 0];
+        icmp.extend_from_slice(&t.octets());
+        // Source link-layer address option.
+        icmp.extend_from_slice(&[1, 1, 0x02, 0, 0, 0, 0, 2]);
+        let group = solicited_node_multicast(t).to_string();
+        ipv6(Protocol::ICMPV6, "fe80::2", &group, &icmp)
+    }
+
+    const MINE: &str = "2001:db8::dead:beef";
+    /// Shares MINE's low 24 bits, and so its solicited-node group.
+    const HOSTS: &str = "2001:db8::1:ad:beef";
+
+    #[test]
+    fn a_solicitation_for_a_captured_address_is_captured() {
+        let cfg = CaptureConfig::default();
+        let set: &[(IpPrefix, &[Rule])] = &[(v6(MINE, 128), &[Rule::Any])];
+        assert_eq!(verdict(&cfg, set, &ns(MINE)), REDIRECT);
+        // A whole captured subnet answers for every address in it.
+        let set: &[(IpPrefix, &[Rule])] = &[(v6("2001:db8::", 64), &[Rule::Any])];
+        assert_eq!(verdict(&cfg, set, &ns(MINE)), REDIRECT);
+    }
+
+    #[test]
+    fn a_solicitation_for_the_hosts_address_in_the_same_group_is_not() {
+        // Same solicited-node group, different target: this one is the host
+        // stack's, and taking it would break the host's IPv6.
+        assert_eq!(
+            solicited_node_multicast(MINE.parse().unwrap()),
+            solicited_node_multicast(HOSTS.parse().unwrap())
+        );
+        let cfg = CaptureConfig::default();
+        let set: &[(IpPrefix, &[Rule])] = &[(v6(MINE, 128), &[Rule::Any])];
+        assert_eq!(verdict(&cfg, set, &ns(HOSTS)), PASS);
+    }
+
+    #[test]
+    fn a_narrow_rule_leaves_neighbor_discovery_to_the_host() {
+        let cfg = CaptureConfig::default();
+        let set: &[(IpPrefix, &[Rule])] = &[(v6(MINE, 128), &[Rule::Proto(Protocol::ICMPV6)])];
+        assert_eq!(verdict(&cfg, set, &ns(MINE)), PASS);
+    }
+
+    #[test]
+    fn neighbor_discovery_can_be_turned_off() {
+        let cfg = CaptureConfig::default().neighbor_discovery(false);
+        let set: &[(IpPrefix, &[Rule])] = &[(v6(MINE, 128), &[Rule::Any])];
+        assert_eq!(verdict(&cfg, set, &ns(MINE)), PASS);
+    }
+
+    #[test]
+    fn a_truncated_solicitation_is_not_read_past_its_end() {
+        // The interpreter panics on a read past data_end, as the verifier
+        // would refuse one.
+        let cfg = CaptureConfig::default();
+        let set: &[(IpPrefix, &[Rule])] = &[(v6(MINE, 128), &[Rule::Any])];
+        let full = ns(MINE);
+        for len in [
+            IPV6_MIN as usize,
+            IPV6_MIN as usize + 1,
+            NS_MIN as usize - 1,
+        ] {
+            assert_eq!(verdict(&cfg, set, &full[..len]), PASS, "{len} bytes");
+        }
+    }
+
+    #[test]
+    fn other_icmpv6_to_the_group_is_not_captured() {
+        // An echo request that happens to carry the address where a target
+        // would be.
+        let t: Ipv6Addr = MINE.parse().unwrap();
+        let mut icmp = vec![128, 0, 0, 0, 0, 0, 0, 0];
+        icmp.extend_from_slice(&t.octets());
+        let group = solicited_node_multicast(t).to_string();
+        let pkt = ipv6(Protocol::ICMPV6, "fe80::2", &group, &icmp);
+        let cfg = CaptureConfig::default();
+        let set: &[(IpPrefix, &[Rule])] = &[(v6(MINE, 128), &[Rule::Any])];
+        assert_eq!(verdict(&cfg, set, &pkt), PASS);
+    }
 
     #[test]
     fn any_rule_takes_every_protocol_on_the_address() {

@@ -446,54 +446,61 @@ fn rules_are_tracked_per_prefix() {
     assert_eq!(cap.rules_for(addr).unwrap().len(), 2);
 }
 
-/// Neighbor discovery is only diverted for an address that is wholly ours.
+/// Neighbor discovery is diverted by the address a solicitation asks about,
+/// and only for an address that is wholly ours. The solicited-node group it is
+/// sent to is shared with any host address with the same low 24 bits, so the
+/// group itself is never captured.
 #[test]
 #[ignore = "needs CAP_BPF + CAP_NET_ADMIN"]
-fn a_narrow_v6_rule_leaves_the_solicited_node_group_alone() {
+fn neighbor_solicitations_are_captured_by_target() {
     if !root() {
         return;
     }
-    let veth = Veth::new("nd2");
-    let cap =
-        Capture::attach(ifindex(&veth.host), CaptureConfig::default(), Mode::AUTO).expect("attach");
+    const HIT: Action = Action::PASS;
+    const MISS: Action = Action::DROP;
+    let veth = Veth::new("nd");
+    let cap = Capture::attach(
+        ifindex(&veth.host),
+        CaptureConfig::default().default_action(MISS),
+        Mode::AUTO,
+    )
+    .expect("attach");
 
-    let addr: Ipv6Addr = "2001:db8::dead:beef".parse().unwrap();
-    let p = IpPrefix::new(addr.into(), 128);
-    let sn = IpAddr::V6(pktkit::xdp::solicited_node_multicast(addr));
+    let mine: Ipv6Addr = "2001:db8::dead:beef".parse().unwrap();
+    let hosts: Ipv6Addr = "2001:db8::1:ad:beef".parse().unwrap();
+    let p = IpPrefix::new(mine.into(), 128);
+    let sn = pktkit::xdp::solicited_node_multicast(mine);
+    assert_eq!(sn, pktkit::xdp::solicited_node_multicast(hosts));
+
+    let run = |target: Ipv6Addr| cap.test_run(&ns_frame(target), 1).unwrap().action;
 
     cap.add_rule(p, Rule::Port(Protocol::UDP, 53)).unwrap();
-    assert!(!cap.contains(sn).unwrap());
-    // Widening to the whole address brings the group in...
+    assert_eq!(run(mine), MISS, "a narrow rule leaves ND to the host");
     cap.add_rule(p, Rule::Any).unwrap();
-    assert!(cap.contains(sn).unwrap());
-    // ...and narrowing again takes it back out, leaving the port rule.
+    assert_eq!(run(mine), HIT);
+    assert_eq!(run(hosts), MISS, "the host's own address, same group");
+    assert!(!cap.contains(IpAddr::V6(sn)).unwrap());
     assert!(cap.remove_rule(p, Rule::Any).unwrap());
-    assert!(!cap.contains(sn).unwrap());
-    assert!(cap.contains(IpAddr::V6(addr)).unwrap());
+    assert_eq!(run(mine), MISS);
 }
 
-/// A `/128` has to bring its solicited-node multicast address with it, or
-/// nothing on the network can resolve it.
-#[test]
-#[ignore = "needs CAP_BPF + CAP_NET_ADMIN"]
-fn adding_a_v6_host_captures_its_solicited_node_group() {
-    if !root() {
-        return;
-    }
-    let veth = Veth::new("nd");
-    let cap =
-        Capture::attach(ifindex(&veth.host), CaptureConfig::default(), Mode::AUTO).expect("attach");
-
-    let addr: Ipv6Addr = "2001:db8::dead:beef".parse().unwrap();
-    cap.add(IpPrefix::new(addr.into(), 128)).unwrap();
-
-    let sn = pktkit::xdp::solicited_node_multicast(addr);
-    assert_eq!(sn, "ff02::1:ffad:beef".parse::<Ipv6Addr>().unwrap());
-    assert!(cap.contains(IpAddr::V6(sn)).unwrap());
-
-    // And it goes away with the address it was derived from.
-    cap.remove(IpPrefix::new(addr.into(), 128)).unwrap();
-    assert!(!cap.contains(IpAddr::V6(sn)).unwrap());
+/// An ICMPv6 neighbor solicitation for `target`, sent to its solicited-node
+/// group.
+fn ns_frame(target: Ipv6Addr) -> Vec<u8> {
+    let group = pktkit::xdp::solicited_node_multicast(target);
+    let mut icmp = vec![135, 0, 0, 0, 0, 0, 0, 0];
+    icmp.extend_from_slice(&target.octets());
+    icmp.extend_from_slice(&[1, 1, 0x02, 0, 0, 0, 0, 2]);
+    let mut f = vec![0x33, 0x33, 0xff, 0, 0, 0, 0x02, 0, 0, 0, 0, 2];
+    f[3..6].copy_from_slice(&group.octets()[13..16]);
+    f.extend_from_slice(&EtherType::IPV6.0.to_be_bytes());
+    f.extend_from_slice(&[0x60, 0, 0, 0]);
+    f.extend_from_slice(&(icmp.len() as u16).to_be_bytes());
+    f.extend_from_slice(&[Protocol::ICMPV6.as_u8(), 255]);
+    f.extend_from_slice(&"fe80::2".parse::<Ipv6Addr>().unwrap().octets());
+    f.extend_from_slice(&group.octets());
+    f.extend_from_slice(&icmp);
+    f
 }
 
 // --- datapath ---------------------------------------------------------------
