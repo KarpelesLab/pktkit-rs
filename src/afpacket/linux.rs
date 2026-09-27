@@ -170,12 +170,15 @@ fn spawn_reader(sock: &Arc<Socket>, inbound_only: bool) {
             // fit, so a truncated frame can be told apart and dropped.
             let n = unsafe { libc::recvmsg(fd.as_raw_fd(), &mut msg, libc::MSG_TRUNC) };
             if n < 0 {
-                let e = io::Error::last_os_error();
-                match e.kind() {
-                    // The read timeout fired: loop round and re-check `closed`.
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => continue,
-                    io::ErrorKind::Interrupted => continue,
-                    _ => {
+                let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                match classify_recv_error(errno) {
+                    RecvFailure::Retry => continue,
+                    RecvFailure::Backoff => {
+                        stats.record_error();
+                        std::thread::sleep(RECV_ERROR_BACKOFF);
+                        continue;
+                    }
+                    RecvFailure::Fatal => {
                         stats.record_error();
                         return;
                     }
@@ -210,6 +213,41 @@ fn spawn_reader(sock: &Arc<Socket>, inbound_only: bool) {
             }
         }
     });
+}
+
+/// What the reader thread does after `recvmsg` fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecvFailure {
+    /// Nothing went wrong: loop round and re-check `closed`.
+    Retry,
+    /// Something the socket recovers from; pause briefly so an error that
+    /// repeats cannot spin the thread, then read again.
+    Backoff,
+    /// The socket itself is unusable. Nothing but `close` can follow.
+    Fatal,
+}
+
+/// Pause after a recoverable receive error.
+const RECV_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Classify a `recvmsg` errno.
+///
+/// The one the reader must survive is `ENETDOWN`: when the bound interface
+/// goes down, `packet_notifier` unhooks the socket and reports `ENETDOWN`
+/// through `sk_err`, and on the way back up it re-registers the socket on its
+/// own. A reader that took that for the end of the socket would leave the
+/// device deaf for good once the link returned. Only errors that say the fd
+/// is not a usable socket end the thread; anything else is waited out, and
+/// `close` still stops the loop.
+fn classify_recv_error(errno: i32) -> RecvFailure {
+    match errno {
+        // EAGAIN is the SO_RCVTIMEO timeout.
+        libc::EAGAIN | libc::EINTR | libc::ETIMEDOUT => RecvFailure::Retry,
+        libc::EBADF | libc::ENOTSOCK | libc::EFAULT | libc::EINVAL => RecvFailure::Fatal,
+        // ENETDOWN, ENODEV and ENXIO as the interface goes and comes back,
+        // ENOBUFS and ENOMEM under memory pressure, and whatever else.
+        _ => RecvFailure::Backoff,
+    }
 }
 
 /// The stripped VLAN tag reported in `msg`'s `PACKET_AUXDATA`, if any.
@@ -409,6 +447,38 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn a_link_going_down_does_not_end_the_reader() {
+        for errno in [
+            libc::ENETDOWN,
+            libc::ENODEV,
+            libc::ENXIO,
+            libc::ENOBUFS,
+            libc::ENOMEM,
+        ] {
+            assert_eq!(classify_recv_error(errno), RecvFailure::Backoff, "{errno}");
+        }
+    }
+
+    #[test]
+    fn timeouts_and_signals_just_loop() {
+        for errno in [
+            libc::EAGAIN,
+            libc::EWOULDBLOCK,
+            libc::EINTR,
+            libc::ETIMEDOUT,
+        ] {
+            assert_eq!(classify_recv_error(errno), RecvFailure::Retry, "{errno}");
+        }
+    }
+
+    #[test]
+    fn only_a_broken_fd_ends_the_reader() {
+        for errno in [libc::EBADF, libc::ENOTSOCK, libc::EFAULT, libc::EINVAL] {
+            assert_eq!(classify_recv_error(errno), RecvFailure::Fatal, "{errno}");
+        }
     }
 
     // Binding a real interface needs CAP_NET_RAW, so the success path is
