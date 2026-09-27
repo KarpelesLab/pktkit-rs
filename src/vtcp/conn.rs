@@ -1283,6 +1283,12 @@ impl Conn {
     fn set_snd_wnd(&mut self, wnd: u32) {
         self.snd_wnd = wnd;
         self.max_snd_wnd = self.max_snd_wnd.max(wnd);
+        if wnd == 0 {
+            // A pending Early Retransmit would go past the right edge. The
+            // receiver shutting its window explains the missing ACKs as
+            // well as a loss does, and the RTO still covers a real one.
+            self.er_deadline = None;
+        }
     }
 
     /// Process the ACK field. Returns false if the segment must be dropped
@@ -1472,7 +1478,7 @@ impl Conn {
         let Some(sb) = self.send_buf.as_ref() else {
             return;
         };
-        if self.dup_acks == 0 || self.cc.in_recovery() || sb.unacked() == 0 {
+        if self.dup_acks == 0 || self.cc.in_recovery() || sb.unacked() == 0 || self.snd_wnd == 0 {
             return;
         }
         let (flight, snd_nxt) = (sb.unacked() as u32, sb.nxt());
@@ -3137,6 +3143,34 @@ mod tests {
         assert!(!get_sack_blocks(&parse(&out[0]).options).is_empty());
         fits(&out);
         fits(&fire_rto(&mut server));
+    }
+
+    /// The receiver closes its window while an Early Retransmit is pending.
+    /// A retransmission now would go past the right edge, and entering
+    /// recovery would halve cwnd for flow control, not loss.
+    #[test]
+    fn zero_window_cancels_early_retransmit() {
+        let mut client = Conn::new(big(40227, 80));
+        let mut server = Conn::new(big(80, 40227));
+        drive_handshake(&mut client, &mut server);
+        warm_up(&mut client, &mut server);
+        let (_, segs) = client.write(&[5; 3000]);
+        let dups = deliver(&mut server, &segs[1..]);
+        assert!(deliver(&mut client, &dups).is_empty());
+        assert!(client.er_deadline.is_some());
+        let una = client.send_buf.as_ref().unwrap().una();
+        let mut shut = bare_ack(&client, &server, una, 0);
+        shut.seq = parse(&dups[0]).seq;
+        client.handle_segment(&shut);
+        assert_eq!(client.snd_wnd, 0);
+        assert!(client.er_deadline.is_none(), "ER still pending");
+
+        // Nor does one that was already due fire into the closed window.
+        client.dup_acks = 2;
+        client.er_deadline = Some(Instant::now());
+        let out = client.tick();
+        assert!(out.is_empty(), "sent {:?}", seqs(&out));
+        assert!(!client.cc.in_recovery());
     }
 
     fn fire_er(c: &mut Conn) -> Vec<Vec<u8>> {
