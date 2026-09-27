@@ -600,6 +600,7 @@ impl Nat {
                     old_port,
                     outside_port,
                 );
+                udp_nonzero_checksum(&mut out, csum_off);
             }
         }
 
@@ -806,6 +807,7 @@ impl Nat {
                     old_port,
                     mapping_key.port,
                 );
+                udp_nonzero_checksum(&mut out, csum_off);
             }
         }
 
@@ -1135,6 +1137,16 @@ pub(crate) fn update_l4_checksum(
     pkt[csum_off..csum_off + 2].copy_from_slice(&csum.to_be_bytes());
 }
 
+/// RFC 768: a UDP checksum that computes to zero is sent as all ones, since a
+/// zero field means the sender did not compute one. An incremental update can
+/// land on zero like any other value, and must not silently switch the
+/// receiver's checksum verification off.
+fn udp_nonzero_checksum(pkt: &mut [u8], csum_off: usize) {
+    if pkt[csum_off..csum_off + 2] == [0, 0] {
+        pkt[csum_off..csum_off + 2].copy_from_slice(&[0xFF, 0xFF]);
+    }
+}
+
 fn update_icmp_checksum(pkt: &mut [u8], ihl: usize, old_id: u16, new_id: u16) {
     let csum_off = ihl + 2;
     let csum = u16::from_be_bytes([pkt[csum_off], pkt[csum_off + 1]]);
@@ -1452,5 +1464,86 @@ mod tests {
         let live = nat.list_port_forwards();
         assert_eq!(live.len(), 1);
         assert_eq!(live[0].outside_port, 8080);
+    }
+
+    /// A UDP datagram from `src` whose checksum, once its source has become
+    /// `xlat_src:xlat_sport`, sums to zero: the value an incremental update
+    /// would store as 0x0000.
+    fn udp_zero_after_xlat(
+        src: Ipv4Addr,
+        sport: u16,
+        dst: Ipv4Addr,
+        dport: u16,
+        xlat: (Ipv4Addr, u16, Ipv4Addr, u16),
+    ) -> Vec<u8> {
+        let mut p = build_udp(src, sport, dst, dport, &[0, 0]);
+        let mut t = build_udp(xlat.0, xlat.1, xlat.2, xlat.3, &[0, 0]);
+        // Choose the payload word so the translated datagram sums to all
+        // ones, i.e. its checksum computes to zero.
+        let c = crate::transport_checksum(
+            crate::Protocol::UDP,
+            IpAddr::V4(xlat.0),
+            IpAddr::V4(xlat.2),
+            &t[20..],
+        );
+        p[28..30].copy_from_slice(&c.to_be_bytes());
+        t[28..30].copy_from_slice(&c.to_be_bytes());
+        assert_eq!(
+            crate::transport_checksum(
+                crate::Protocol::UDP,
+                IpAddr::V4(xlat.0),
+                IpAddr::V4(xlat.2),
+                &t[20..]
+            ),
+            0
+        );
+        crate::nat::l4::fill_v4_l4_checksum(&mut p, 20);
+        p
+    }
+
+    #[test]
+    fn udp_checksum_never_becomes_zero_outbound() {
+        let (nat, _i, o) = setup();
+        let (inside, remote, outside) = (
+            Ipv4Addr::new(10, 0, 0, 5),
+            Ipv4Addr::new(8, 8, 8, 8),
+            Ipv4Addr::new(203, 0, 113, 1),
+        );
+        // A fresh NAT hands out its first port.
+        let p = udp_zero_after_xlat(
+            inside,
+            5000,
+            remote,
+            53,
+            (outside, NAT_PORT_MIN, remote, 53),
+        );
+        nat.inside().send(Packet::from_slice(&p)).unwrap();
+        let out = o.lock().unwrap();
+        assert_eq!(u16::from_be_bytes([out[0][20], out[0][21]]), NAT_PORT_MIN);
+        assert_eq!(u16::from_be_bytes([out[0][26], out[0][27]]), 0xFFFF);
+        assert!(crate::nat::l4::v4_l4_checksum_ok(&out[0], 20));
+    }
+
+    #[test]
+    fn udp_checksum_never_becomes_zero_inbound() {
+        let (nat, i, _o) = setup();
+        let (inside, remote, outside) = (
+            Ipv4Addr::new(10, 0, 0, 5),
+            Ipv4Addr::new(8, 8, 8, 8),
+            Ipv4Addr::new(203, 0, 113, 1),
+        );
+        let p = build_udp(inside, 5000, remote, 53, &[1]);
+        nat.inside().send(Packet::from_slice(&p)).unwrap();
+        let reply = udp_zero_after_xlat(
+            remote,
+            53,
+            outside,
+            NAT_PORT_MIN,
+            (remote, 53, inside, 5000),
+        );
+        nat.outside().send(Packet::from_slice(&reply)).unwrap();
+        let got = i.lock().unwrap();
+        assert_eq!(u16::from_be_bytes([got[0][26], got[0][27]]), 0xFFFF);
+        assert!(crate::nat::l4::v4_l4_checksum_ok(&got[0], 20));
     }
 }
