@@ -9,7 +9,8 @@
 use crate::nat::frag::FragTable;
 use crate::nat::helper::{PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP};
 use crate::nat::l4::csum_replace;
-use crate::nat::nat::{SWEEP_INTERVAL, frag_info};
+use crate::nat::nat::{RECLAIM_INTERVAL, SWEEP_INTERVAL, frag_info};
+use crate::nat::ports::{PortKey, PortMap, PortUse};
 use crate::nat::track::{HostQuota, MappingHold, NatLimits, PeerQuotas, Peers, Quota};
 use crate::time::Instant;
 use crate::{
@@ -41,6 +42,12 @@ struct Nat64Key {
 struct Nat64RevKey {
     proto: u8,
     port: u16,
+}
+
+impl PortKey for Nat64RevKey {
+    fn port(&self) -> u16 {
+        self.port
+    }
 }
 
 #[derive(Debug)]
@@ -96,8 +103,13 @@ pub struct Nat64 {
 
 struct Nat64Inner {
     mappings: HashMap<Nat64Key, Mapping>,
-    reverse: HashMap<Nat64RevKey, Nat64Key>,
+    reverse: PortMap<Nat64RevKey, Nat64Key>,
+    /// Which outside ports the reverse table holds.
+    ports: Arc<PortUse>,
     next_port: u16,
+    /// When a full pool may next reclaim idle mappings (see
+    /// [`RECLAIM_INTERVAL`]).
+    next_reclaim: Instant,
     /// What each inside host holds; an entry goes once nothing refers to
     /// it.
     hosts: HashMap<Ipv6Addr, Arc<HostQuota>>,
@@ -126,13 +138,16 @@ impl Nat64 {
         // no lock to take on the packet path: a lock held there would be
         // held through delivery, deadlocking a handler that replies from
         // inside it and poisoned by one that panics.
+        let ports = PortUse::new(NAT_PORT_MIN, NAT_PORT_MAX);
         Arc::new_cyclic(|me: &Weak<Nat64>| Nat64 {
             inside: Arc::new(Nat64Side::new(true, inside_addr, me.clone())),
             outside: Arc::new(Nat64Side::new(false, outside_addr, me.clone())),
             inner: Mutex::new(Nat64Inner {
                 mappings: HashMap::new(),
-                reverse: HashMap::new(),
+                reverse: PortMap::new(ports.clone()),
+                ports,
                 next_port: NAT_PORT_MIN,
+                next_reclaim: Instant::now(),
                 hosts: HashMap::new(),
                 peer_quota: Arc::new(Quota::new(NatLimits::default().max_peers)),
                 limits: NatLimits::default(),
@@ -1201,34 +1216,36 @@ impl Nat64 {
         }
     }
 
-    /// A free outside port. When none is left, idle mappings are reclaimed
-    /// first, so a caller that never sweeps does not lose the pool to them.
+    /// A free outside port, for any protocol. When none is left, idle
+    /// mappings are reclaimed first, so a caller that never sweeps does not
+    /// lose the pool to them; but at most once a [`RECLAIM_INTERVAL`], as
+    /// each walks the whole table.
     fn alloc_port_locked(inner: &mut Nat64Inner) -> Option<u16> {
         Self::scan_port_locked(inner).or_else(|| {
-            Self::expire_locked(inner, Instant::now());
+            let now = Instant::now();
+            if now < inner.next_reclaim {
+                return None;
+            }
+            inner.next_reclaim = now + RECLAIM_INTERVAL;
+            Self::expire_locked(inner, now);
             Self::scan_port_locked(inner)
         })
     }
 
     fn scan_port_locked(inner: &mut Nat64Inner) -> Option<u16> {
-        let start = inner.next_port;
-        loop {
-            let p = inner.next_port;
-            inner.next_port = if inner.next_port == NAT_PORT_MAX {
-                NAT_PORT_MIN
-            } else {
-                inner.next_port + 1
-            };
-            let in_use = [PROTO_TCP, PROTO_UDP, PROTO_ICMP]
-                .iter()
-                .any(|&proto| inner.reverse.contains_key(&Nat64RevKey { proto, port: p }));
-            if !in_use {
-                return Some(p);
-            }
-            if inner.next_port == start {
-                return None;
-            }
+        // The count answers for a full pool without a search.
+        if inner.ports.pool_free(None) == 0 {
+            return None;
         }
+        let p = inner
+            .ports
+            .find((NAT_PORT_MIN, NAT_PORT_MAX), inner.next_port, None)?;
+        inner.next_port = if p == NAT_PORT_MAX {
+            NAT_PORT_MIN
+        } else {
+            p + 1
+        };
+        Some(p)
     }
 }
 
@@ -2133,6 +2150,33 @@ mod tests {
             .send(Packet::from_slice(&v4_reply(ROUTER, 1)))
             .unwrap();
         assert!(nat.inner.lock().unwrap().mappings.is_empty());
+    }
+
+    #[test]
+    fn a_full_pool_refuses_new_flows_cheaply() {
+        let (nat, _inside, outside) = wired();
+        nat.set_limits(NatLimits::default().max_mappings_per_host(0));
+        let pool = usize::from(NAT_PORT_MAX - NAT_PORT_MIN) + 1;
+        let client: Ipv6Addr = CLIENT.parse().unwrap();
+        for i in 0..pool {
+            let k = Nat64Key {
+                proto: PROTO_UDP,
+                ip: Ipv6Addr::from(u128::from(client) + 1 + (i / 60000) as u128),
+                port: 1 + (i % 60000) as u16,
+            };
+            assert!(nat.get_or_create_mapping(k).is_some());
+        }
+        // All live: each new flow is refused by the free count, with a
+        // reclaim at most once a second, not a rescan and a table walk
+        // apiece. The bound is loose enough for a slow debug build.
+        let start = std::time::Instant::now();
+        for sport in 1..=2000 {
+            let pkt = build_v6_udp(client, sport, wkp(SERVER), 53, b"q");
+            nat.inside().send(Packet::from_slice(&pkt)).unwrap();
+        }
+        let took = start.elapsed();
+        assert!(outside.lock().unwrap().is_empty());
+        assert!(took < std::time::Duration::from_millis(500), "{took:?}");
     }
 
     #[test]

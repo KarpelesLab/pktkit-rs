@@ -13,6 +13,7 @@ use crate::nat::helper::{
     Expectation, Helper, LocalHelper, NatMapping, PROTO_ICMP, PROTO_TCP, PROTO_UDP, PacketHelper,
     PortForward,
 };
+use crate::nat::ports::{PortKey, PortMap, PortUse};
 use crate::nat::track::{HostQuota, MappingHold, NatLimits, PeerQuotas, Peers, Quota, SeqAdj};
 use crate::time::Instant;
 use crate::{
@@ -43,6 +44,11 @@ const ALG_OPEN_WINDOW: Duration = Duration::from_secs(120);
 /// §4.3.2.8 wants them rate-limited).
 const ICMP_RATE: u32 = 100;
 const ICMP_BURST: u32 = 50;
+/// Shortest time between two reclaims of idle mappings for want of a free
+/// port (see [`Nat::alloc_port_locked`]). Each walks the whole table; with
+/// the pool full of live mappings, every new flow would otherwise pay for
+/// one, under the lock every packet takes.
+pub(crate) const RECLAIM_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Key into the forward connection table.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -57,6 +63,12 @@ struct NatKey {
 struct NatRevKey {
     proto: u8,
     port: u16,
+}
+
+impl PortKey for NatRevKey {
+    fn port(&self) -> u16 {
+        self.port
+    }
 }
 
 #[derive(Debug)]
@@ -173,13 +185,19 @@ pub struct Nat {
 
 struct NatInner {
     mappings: HashMap<NatKey, Mapping>,
-    reverse: HashMap<NatRevKey, NatKey>,
+    reverse: PortMap<NatRevKey, NatKey>,
+    /// Which outside ports the reverse table, forwards and expectations
+    /// hold.
+    ports: Arc<PortUse>,
     next_port: u16,
+    /// When a full pool may next reclaim idle mappings (see
+    /// [`RECLAIM_INTERVAL`]).
+    next_reclaim: Instant,
     helpers: Vec<Arc<dyn HelperKind>>,
     forwards: Forwards,
     /// The last [`PortForward::id`] handed out.
     forward_id: u64,
-    expectations: Vec<Expectation>,
+    expectations: Expectations,
     /// What each inside host, by namespace and address, holds; an entry
     /// goes once nothing refers to it.
     hosts: HashMap<(u64, Ipv4Addr), Arc<HostQuota>>,
@@ -192,13 +210,19 @@ struct NatInner {
 /// (one per endpoint: see [`Nat::add_port_forward`]). The outbound path asks
 /// for every new mapping whether its endpoint is forwarded, and UPnP lets
 /// inside hosts add forwards by the hundred, so that must not be a scan.
-#[derive(Default)]
 struct Forwards {
-    by_port: HashMap<NatRevKey, PortForward>,
+    by_port: PortMap<NatRevKey, PortForward>,
     by_endpoint: HashMap<NatKey, NatRevKey>,
 }
 
 impl Forwards {
+    fn new(ports: Arc<PortUse>) -> Forwards {
+        Forwards {
+            by_port: PortMap::new(ports),
+            by_endpoint: HashMap::new(),
+        }
+    }
+
     fn endpoint(pf: &PortForward) -> NatKey {
         NatKey {
             ns: pf.namespace,
@@ -252,6 +276,63 @@ impl Forwards {
     }
 }
 
+/// Pending expectations, each holding its outside port while listed.
+/// Read through `Deref`; changed only through the methods, which keep the
+/// port counts right.
+struct Expectations {
+    list: Vec<Expectation>,
+    ports: Arc<PortUse>,
+}
+
+impl std::ops::Deref for Expectations {
+    type Target = [Expectation];
+    fn deref(&self) -> &[Expectation] {
+        &self.list
+    }
+}
+
+impl Expectations {
+    fn new(ports: Arc<PortUse>) -> Expectations {
+        Expectations {
+            list: Vec::new(),
+            ports,
+        }
+    }
+
+    fn push(&mut self, e: Expectation) {
+        self.ports.acquire(e.outside_port);
+        self.list.push(e);
+    }
+
+    fn remove(&mut self, i: usize) -> Expectation {
+        let e = self.list.remove(i);
+        self.ports.release(e.outside_port);
+        e
+    }
+
+    fn swap_remove(&mut self, i: usize) {
+        let e = self.list.swap_remove(i);
+        self.ports.release(e.outside_port);
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&Expectation) -> bool) {
+        let ports = &self.ports;
+        self.list.retain(|e| {
+            let kept = keep(e);
+            if !kept {
+                ports.release(e.outside_port);
+            }
+            kept
+        });
+    }
+
+    /// Keep expectation `i` until at least `expires`.
+    fn extend(&mut self, i: usize, expires: Instant) {
+        let e = &mut self.list[i];
+        e.expires = e.expires.max(expires);
+    }
+}
+
 /// Object-safe enum-like trait so the helper vector can hold both packet and
 /// local helpers in one place.
 trait HelperKind: Helper {
@@ -280,17 +361,20 @@ impl Nat {
         // no lock to take on the packet path: a lock held there would be
         // held through delivery, deadlocking a handler that replies from
         // inside it and poisoned by one that panics.
+        let ports = PortUse::new(NAT_PORT_MIN, NAT_PORT_MAX);
         Arc::new_cyclic(|me: &Weak<Nat>| Nat {
             inside: Arc::new(NatSide::new(true, inside_addr, me.clone())),
             outside: Arc::new(NatSide::new(false, outside_addr, me.clone())),
             inner: Mutex::new(NatInner {
                 mappings: HashMap::new(),
-                reverse: HashMap::new(),
+                reverse: PortMap::new(ports.clone()),
                 next_port: NAT_PORT_MIN,
+                next_reclaim: Instant::now(),
                 helpers: Vec::new(),
-                forwards: Forwards::default(),
+                forwards: Forwards::new(ports.clone()),
                 forward_id: 0,
-                expectations: Vec::new(),
+                expectations: Expectations::new(ports.clone()),
+                ports,
                 hosts: HashMap::new(),
                 peer_quota: Arc::new(Quota::new(NatLimits::default().max_peers)),
                 limits: NatLimits::default(),
@@ -448,7 +532,7 @@ impl Nat {
         {
             return;
         }
-        if let Some(old) = inner.expectations.iter_mut().find(|o| {
+        if let Some(old) = inner.expectations.iter().position(|o| {
             o.proto == e.proto
                 && o.outside_port == e.outside_port
                 && o.namespace == e.namespace
@@ -457,7 +541,7 @@ impl Nat {
                 && o.remote_ip == e.remote_ip
                 && o.remote_port == e.remote_port
         }) {
-            old.expires = old.expires.max(e.expires);
+            inner.expectations.extend(old, e.expires);
             return;
         }
         if inner.expectations.len() >= MAX_EXPECTATIONS {
@@ -935,73 +1019,60 @@ impl Nat {
 
     /// A free outside port. When none is left, idle mappings are reclaimed
     /// first, so a caller that never sweeps does not lose the pool to them.
+    ///
+    /// A port is free when nothing holds it for any protocol: ports a
+    /// forward or a pending expectation will receive traffic on count too,
+    /// or that traffic would reach a new session.
     fn alloc_port_locked(inner: &mut NatInner) -> Option<u16> {
-        Self::scan_port_locked(inner).or_else(|| {
-            Self::expire_locked(inner, Instant::now());
-            Self::scan_port_locked(inner)
-        })
+        Self::scan_port_locked(inner)
+            .or_else(|| Self::reclaim_locked(inner).then(|| Self::scan_port_locked(inner))?)
     }
 
     fn scan_port_locked(inner: &mut NatInner) -> Option<u16> {
-        let now = Instant::now();
-        let start = inner.next_port;
-        loop {
-            let p = inner.next_port;
-            inner.next_port = if inner.next_port == NAT_PORT_MAX {
-                NAT_PORT_MIN
-            } else {
-                inner.next_port + 1
-            };
-            if !Self::port_in_use_locked(inner, p, now) {
-                return Some(p);
-            }
-            if inner.next_port == start {
-                return None;
-            }
+        // The count answers for a full pool without a search.
+        if inner.ports.pool_free(None) == 0 {
+            return None;
         }
+        let p = inner
+            .ports
+            .find((NAT_PORT_MIN, NAT_PORT_MAX), inner.next_port, None)?;
+        inner.next_port = if p == NAT_PORT_MAX {
+            NAT_PORT_MIN
+        } else {
+            p + 1
+        };
+        Some(p)
     }
 
     /// An even outside port that is free along with the next one, reclaiming
     /// idle mappings if there is none.
     fn alloc_pair_locked(inner: &mut NatInner) -> Option<u16> {
-        Self::scan_pair_locked(inner).or_else(|| {
-            Self::expire_locked(inner, Instant::now());
-            Self::scan_pair_locked(inner)
-        })
+        Self::scan_pair_locked(inner)
+            .or_else(|| Self::reclaim_locked(inner).then(|| Self::scan_pair_locked(inner))?)
     }
 
     fn scan_pair_locked(inner: &mut NatInner) -> Option<u16> {
-        let now = Instant::now();
-        let pairs = (NAT_PORT_MAX - NAT_PORT_MIN).div_ceil(2);
-        // Start at the next even port; the range starts even, so a pair
-        // never straddles its end.
-        let mut p = inner.next_port.saturating_add(1) & !1;
-        for _ in 0..pairs {
-            if !(NAT_PORT_MIN..NAT_PORT_MAX).contains(&p) {
-                p = NAT_PORT_MIN;
-            }
-            if !Self::port_in_use_locked(inner, p, now)
-                && !Self::port_in_use_locked(inner, p + 1, now)
-            {
-                inner.next_port = p.checked_add(2).unwrap_or(NAT_PORT_MIN);
-                return Some(p);
-            }
-            p = p.saturating_add(2);
+        if inner.ports.pool_free(Some(false)) == 0 || inner.ports.pool_free(Some(true)) == 0 {
+            return None;
         }
-        None
+        let p = inner
+            .ports
+            .find_pair((NAT_PORT_MIN, NAT_PORT_MAX), inner.next_port)?;
+        inner.next_port = p.checked_add(2).unwrap_or(NAT_PORT_MIN);
+        Some(p)
     }
 
-    /// Whether outside port `p` is taken, for any protocol. Ports a forward
-    /// or a pending expectation will receive traffic on count too, or that
-    /// traffic would reach a new session.
-    fn port_in_use_locked(inner: &NatInner, p: u16, now: Instant) -> bool {
-        [PROTO_TCP, PROTO_UDP, PROTO_ICMP].iter().any(|&proto| {
-            let rk = NatRevKey { proto, port: p };
-            inner.reverse.contains_key(&rk) || inner.forwards.contains_key(&rk)
-        }) || inner
-            .expectations
-            .iter()
-            .any(|e| e.outside_port == p && now <= e.expires)
+    /// Drop idle mappings (and lapsed expectations and forwards) for want
+    /// of a free port, unless that was done less than
+    /// [`RECLAIM_INTERVAL`] ago. Returns whether it ran.
+    fn reclaim_locked(inner: &mut NatInner) -> bool {
+        let now = Instant::now();
+        if now < inner.next_reclaim {
+            return false;
+        }
+        inner.next_reclaim = now + RECLAIM_INTERVAL;
+        Self::expire_locked(inner, now);
+        true
     }
 
     fn match_expectation_locked(
@@ -3288,12 +3359,63 @@ mod tests {
         assert!(nat.create_mapping(PROTO_UDP, REMOTE, 1).is_none(), "full");
         // Every mapping has been idle past its timeout; nobody swept.
         age_mappings(&nat, UDP_TIMEOUT + Duration::from_secs(1));
+        // And the last reclaim, which found nothing, was long enough ago.
+        nat.inner.lock().unwrap().next_reclaim = Instant::now();
         assert!(nat.create_mapping(PROTO_UDP, REMOTE, 1).is_some());
         assert!(
             nat.create_mapping_pair_in(0, PROTO_UDP, REMOTE, (2, 3))
                 .is_some()
         );
         assert_eq!(mapped(&nat), 3);
+    }
+
+    #[test]
+    fn a_full_pool_refuses_new_flows_cheaply() {
+        let (nat, _i, o) = setup();
+        nat.set_limits(NatLimits::default().max_mappings_per_host(0));
+        let pool = usize::from(NAT_PORT_MAX - NAT_PORT_MIN) + 1;
+        for i in 0..pool {
+            let ip = Ipv4Addr::from(u32::from(INSIDE) + (i / 60000) as u32);
+            assert!(
+                nat.create_mapping(PROTO_UDP, ip, 1 + (i % 60000) as u16)
+                    .is_some()
+            );
+        }
+        // Every mapping is live: nothing can be reclaimed. Each new flow
+        // used to rescan the pool and walk the whole table under the lock,
+        // some 5 ms apiece; now the free count refuses it, and a reclaim
+        // runs at most once a second. The bound is loose enough for a slow
+        // debug build.
+        let start = std::time::Instant::now();
+        for sport in 1..=2000 {
+            let p = build_udp(Ipv4Addr::new(10, 0, 0, 200), sport, REMOTE, 53, b"q");
+            nat.inside().send(Packet::from_slice(&p)).unwrap();
+        }
+        let took = start.elapsed();
+        assert!(o.lock().unwrap().is_empty());
+        assert!(took < Duration::from_millis(500), "{took:?} for 2000 flows");
+
+        // As ports come free, they are found again.
+        {
+            let mut inner = nat.inner.lock().unwrap();
+            let k = NatKey {
+                ns: 0,
+                proto: PROTO_UDP,
+                ip: INSIDE,
+                port: 1,
+            };
+            let port = inner.mappings[&k].outside_port;
+            Nat::remove_mapping_at_locked(
+                &mut inner,
+                NatRevKey {
+                    proto: PROTO_UDP,
+                    port,
+                },
+            );
+        }
+        let p = build_udp(Ipv4Addr::new(10, 0, 0, 200), 1, REMOTE, 53, b"q");
+        nat.inside().send(Packet::from_slice(&p)).unwrap();
+        assert_eq!(o.lock().unwrap().len(), 1);
     }
 
     #[test]
