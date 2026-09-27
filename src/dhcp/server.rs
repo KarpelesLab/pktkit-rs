@@ -126,13 +126,82 @@ struct Lease {
     bound: bool,
 }
 
+/// The lease table, indexed by address too, so that whether an address is
+/// taken is a lookup rather than a walk over every lease on each packet.
+#[derive(Default)]
+struct Leases {
+    by_key: HashMap<ClientKey, Lease>,
+    /// How many leases hold each address. More than one only for a machine
+    /// seen under two keys (with and without a client identifier), each
+    /// given the address reserved for its MAC.
+    by_ip: HashMap<Ipv4Addr, u32>,
+}
+
+/// Reads go straight to the table; writes go through [`Leases`]'s own
+/// methods, which keep the index in step.
+impl core::ops::Deref for Leases {
+    type Target = HashMap<ClientKey, Lease>;
+    fn deref(&self) -> &Self::Target {
+        &self.by_key
+    }
+}
+
+impl Leases {
+    fn insert(&mut self, key: ClientKey, lease: Lease) {
+        if let Some(old) = self.by_key.insert(key, lease) {
+            self.unindex(old.ip);
+        }
+        *self.by_ip.entry(lease.ip).or_default() += 1;
+    }
+
+    fn remove(&mut self, key: &ClientKey) -> Option<Lease> {
+        let old = self.by_key.remove(key)?;
+        self.unindex(old.ip);
+        Some(old)
+    }
+
+    fn unindex(&mut self, ip: Ipv4Addr) {
+        if let Some(n) = self.by_ip.get_mut(&ip) {
+            *n -= 1;
+            if *n == 0 {
+                self.by_ip.remove(&ip);
+            }
+        }
+    }
+
+    /// Drop the leases and offers run out by `now`.
+    fn expire(&mut self, now: Instant) {
+        let by_ip = &mut self.by_ip;
+        self.by_key.retain(|_, l| {
+            let live = l.expiry > now;
+            if !live && let Some(n) = by_ip.get_mut(&l.ip) {
+                *n -= 1;
+                if *n == 0 {
+                    by_ip.remove(&l.ip);
+                }
+            }
+            live
+        });
+    }
+
+    /// Whether a lease other than `key`'s holds `ip`.
+    fn held_by_other(&self, ip: Ipv4Addr, key: &ClientKey) -> bool {
+        let n = self.by_ip.get(&ip).copied().unwrap_or(0);
+        let own = self.by_key.get(key).is_some_and(|l| l.ip == ip);
+        n > u32::from(own)
+    }
+}
+
 /// A DHCP server, implementing [`L2Device`] so it plugs into an
 /// [`L2Hub`](crate::L2Hub) like any other device.
 pub struct Server {
     cfg: ServerConfig,
     handler: Mutex<Option<L2Handler>>,
-    leases: Mutex<HashMap<ClientKey, Lease>>,
+    leases: Mutex<Leases>,
     declined: Mutex<HashMap<Ipv4Addr, Instant>>,
+    /// [`ServerConfig::static_leases`] by address: the MACs each is
+    /// reserved for.
+    reserved: HashMap<Ipv4Addr, Vec<MacAddr>>,
     /// How many clients the server can hold leases for: the pool's size,
     /// up to [`MAX_LEASES`].
     capacity: usize,
@@ -150,11 +219,16 @@ impl core::fmt::Debug for Server {
 impl Server {
     /// Build a new server.
     pub fn new(cfg: ServerConfig) -> Server {
+        let mut reserved = HashMap::<_, Vec<_>>::new();
+        for (mac, ip) in &cfg.static_leases {
+            reserved.entry(*ip).or_default().push(*mac);
+        }
         Server {
             capacity: pool_size(&cfg).min(MAX_LEASES),
+            reserved,
             cfg,
             handler: Mutex::new(None),
-            leases: Mutex::new(HashMap::new()),
+            leases: Mutex::new(Leases::default()),
             declined: Mutex::new(HashMap::new()),
         }
     }
@@ -274,33 +348,26 @@ impl Server {
     /// The table as of `now`: leases and offers that have run out are
     /// dropped, so they neither keep their address from anyone else nor
     /// count toward [`MAX_LEASES`].
-    fn live_leases(&self, now: Instant) -> std::sync::MutexGuard<'_, HashMap<ClientKey, Lease>> {
+    fn live_leases(&self, now: Instant) -> std::sync::MutexGuard<'_, Leases> {
         let mut leases = self.leases.lock().unwrap();
-        leases.retain(|_, l| l.expiry > now);
+        leases.expire(now);
         self.declined.lock().unwrap().retain(|_, exp| *exp > now);
         leases
     }
 
-    /// Addresses that client `key` (with reservation `res`) cannot have
-    /// because another client holds or has them reserved.
+    /// Whether client `key` (with reservation `res`) cannot have `ip`
+    /// because another client holds or has it reserved.
     fn held_by_others(
         &self,
-        leases: &HashMap<ClientKey, Lease>,
-        key: &ClientKey,
-        res: Reservation,
-    ) -> std::collections::HashSet<Ipv4Addr> {
-        let mut held = std::collections::HashSet::new();
-        for (k, l) in leases {
-            if k != key {
-                held.insert(l.ip);
-            }
-        }
-        for (m, ip) in &self.cfg.static_leases {
-            if Some(*m) != res.mac {
-                held.insert(*ip);
-            }
-        }
-        held
+        leases: &Leases,
+        (key, res): (&ClientKey, Reservation),
+        ip: Ipv4Addr,
+    ) -> bool {
+        leases.held_by_other(ip, key)
+            || self
+                .reserved
+                .get(&ip)
+                .is_some_and(|macs| macs.iter().any(|m| Some(*m) != res.mac))
     }
 
     /// Pick an address to OFFER. The offer only reserves it for
@@ -315,12 +382,12 @@ impl Server {
             return self.on_our_subnet(ip).then_some(ip);
         }
         let mut leases = self.live_leases(now);
-        let held = self.held_by_others(&leases, key, res);
 
-        if let Some(l) = leases.get_mut(key) {
-            if !held.contains(&l.ip) {
+        if let Some(l) = leases.get(key).copied() {
+            if !self.held_by_others(&leases, (key, res), l.ip) {
                 if !l.bound {
-                    l.expiry = now + OFFER_HOLD;
+                    let expiry = now + OFFER_HOLD;
+                    leases.insert(key.clone(), Lease { expiry, ..l });
                 }
                 return Some(l.ip);
             }
@@ -334,9 +401,11 @@ impl Server {
         let declined = self.declined.lock().unwrap();
         let start = u32::from(self.cfg.range_start);
         let end = u32::from(self.cfg.range_end);
-        let ip = (start..=end)
-            .map(Ipv4Addr::from)
-            .find(|ip| self.in_pool(*ip) && !held.contains(ip) && !declined.contains_key(ip))?;
+        let ip = (start..=end).map(Ipv4Addr::from).find(|ip| {
+            self.in_pool(*ip)
+                && !self.held_by_others(&leases, (key, res), *ip)
+                && !declined.contains_key(ip)
+        })?;
         leases.insert(
             key.clone(),
             Lease {
@@ -389,7 +458,7 @@ impl Server {
     /// RENEWING or REBINDING, which is already using `ip`.
     fn commit(
         &self,
-        leases: &mut HashMap<ClientKey, Lease>,
+        leases: &mut Leases,
         (key, res): (&ClientKey, Reservation),
         ip: Ipv4Addr,
         renewing: bool,
@@ -411,9 +480,9 @@ impl Server {
             return Answer::Ack(ip, self.lease_secs());
         }
 
-        let held = self.held_by_others(leases, key, res);
+        let held = self.held_by_others(leases, (key, res), ip);
         match leases.get(key) {
-            Some(l) if l.ip == ip && !held.contains(&ip) => {
+            Some(l) if l.ip == ip && !held => {
                 leases.insert(key.clone(), lease);
                 return Answer::Ack(ip, self.lease_secs());
             }
@@ -435,7 +504,7 @@ impl Server {
         if !self.in_pool(ip) {
             return Answer::Silent;
         }
-        if held.contains(&ip) {
+        if held {
             return Answer::Nak;
         }
         {
@@ -885,7 +954,13 @@ mod tests {
         assert_eq!(replies(&r).last().unwrap().msg_type, wire::MSG_ACK);
 
         // A's lease runs out and B takes the address.
-        s.leases.lock().unwrap().get_mut(&hw(a)).unwrap().expiry = Instant::now();
+        s.leases
+            .lock()
+            .unwrap()
+            .by_key
+            .get_mut(&hw(a))
+            .unwrap()
+            .expiry = Instant::now();
         s.handle_dhcp(&build_discover(2, b));
         s.handle_dhcp(&request(2, b, ip, server));
         let got = replies(&r);
@@ -1011,8 +1086,13 @@ mod tests {
         let (s, r) = recording(one_address_pool());
         let mac = MacAddr([2, 0, 0, 0, 0, 1]);
         let ip = bound_lease(&s, &r, mac);
-        s.leases.lock().unwrap().get_mut(&hw(mac)).unwrap().expiry =
-            Instant::now() + Duration::from_secs(5);
+        s.leases
+            .lock()
+            .unwrap()
+            .by_key
+            .get_mut(&hw(mac))
+            .unwrap()
+            .expiry = Instant::now() + Duration::from_secs(5);
 
         let mut m = wire::Builder::new(1, 7, mac);
         m.message_type(wire::MSG_REQUEST).ciaddr(ip);
@@ -1099,6 +1179,40 @@ mod tests {
                 .count();
             assert_eq!(pool_size(&s.cfg), n, "{start:?}-{end:?}");
         }
+    }
+
+    #[test]
+    fn the_address_index_follows_the_table() {
+        let check = |s: &Server| {
+            let l = s.leases.lock().unwrap();
+            let mut counts = HashMap::new();
+            for lease in l.by_key.values() {
+                *counts.entry(lease.ip).or_insert(0u32) += 1;
+            }
+            assert_eq!(counts, l.by_ip);
+        };
+        let (s, r) = recording(two_address_pool());
+        let server = Ipv4Addr::new(10, 0, 0, 1);
+        let (a, b) = (MacAddr([2, 0, 0, 0, 0, 0xa]), MacAddr([2, 0, 0, 0, 0, 0xb]));
+        let ip = bound_lease(&s, &r, a);
+        s.handle_dhcp(&build_discover(2, b));
+        check(&s);
+        s.handle_dhcp(&release(a, ip, Some(server)));
+        check(&s);
+        let ip = bound_lease(&s, &r, b);
+        s.handle_dhcp(&decline(b, Some(ip), Some(server)));
+        check(&s);
+        bound_lease(&s, &r, a);
+        s.leases
+            .lock()
+            .unwrap()
+            .by_key
+            .get_mut(&hw(a))
+            .unwrap()
+            .expiry = Instant::now();
+        s.handle_dhcp(&build_discover(3, b));
+        check(&s);
+        assert_eq!(s.leases.lock().unwrap().len(), 1);
     }
 
     #[test]
