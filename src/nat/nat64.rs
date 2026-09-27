@@ -175,7 +175,9 @@ impl Nat64 {
             }
             return;
         }
-        let hop = hop - 1;
+        // RFC 7915 §5.1: the Traffic Class becomes the TOS, DSCP and ECN
+        // alike.
+        let hop = (hop - 1, (pkt[0] << 4) | (pkt[1] >> 4));
 
         // Walk the extension headers (RFC 7915 §5.1), noting a Fragment
         // Header: its fields carry over to the IPv4 header.
@@ -267,7 +269,7 @@ impl Nat64 {
         proto: u8,
         (src_v6, dst_v6): (Ipv6Addr, Ipv6Addr),
         (outside_ip, dst_v4): (Ipv4Addr, Ipv4Addr),
-        hop: u8,
+        hop: Hop,
         frag: Option<V6Frag>,
     ) {
         let field = if proto == PROTO_TCP { 16 } else { 6 };
@@ -342,7 +344,7 @@ impl Nat64 {
         src_v6: Ipv6Addr,
         dst_v6: Ipv6Addr,
         (outside_ip, dst_v4): (Ipv4Addr, Ipv4Addr),
-        hop: u8,
+        hop: Hop,
     ) {
         if icmp.len() < 8 {
             return;
@@ -400,7 +402,7 @@ impl Nat64 {
         icmp: &[u8],
         dst_v6: Ipv6Addr,
         (outside_ip, dst_v4): (Ipv4Addr, Ipv4Addr),
-        ttl: u8,
+        hop: Hop,
     ) {
         let rest = [icmp[4], icmp[5], icmp[6], icmp[7]];
         // Packet Too Big's MTU is filled in once the quote is parsed.
@@ -483,12 +485,8 @@ impl Nat64 {
         let payload_len = usize::from(u16::from_be_bytes([emb[4], emb[5]]));
         let v4_payload = payload_len.saturating_sub(off - IPV6_HEADER_LEN);
         let (id, flags) = frag.map_or((0, 0), |(id, more)| (id, if more { 0x2000 } else { 0 }));
-        let mut quote = v4_header(dst_v4, outside_ip, nh, emb[7], v4_payload, id, flags);
-        // Type of Service from the Traffic Class.
-        quote[1] = (emb[0] << 4) | (emb[1] >> 4);
-        quote[10..12].copy_from_slice(&[0, 0]);
-        let cs = checksum(&quote);
-        quote[10..12].copy_from_slice(&cs.to_be_bytes());
+        let quoted_hop = (emb[7], (emb[0] << 4) | (emb[1] >> 4));
+        let mut quote = v4_header(dst_v4, outside_ip, nh, quoted_hop, v4_payload, id, flags);
 
         // An ICMPv4 error stays within 576 bytes (RFC 1812 §4.3.2.3).
         let room = 576 - 2 * IPV4_MIN_HEADER - 8;
@@ -521,7 +519,7 @@ impl Nat64 {
         let cs = checksum(&msg);
         msg[2..4].copy_from_slice(&cs.to_be_bytes());
         let (ip_id, flags) = self.unfragmented_v4_id(IPV4_MIN_HEADER + msg.len());
-        let mut out = v4_header(outside_ip, dst_v4, PROTO_ICMP, ttl, msg.len(), ip_id, flags);
+        let mut out = v4_header(outside_ip, dst_v4, PROTO_ICMP, hop, msg.len(), ip_id, flags);
         out.extend_from_slice(&msg);
         self.outside.deliver(Packet::from_slice(&out));
     }
@@ -554,7 +552,9 @@ impl Nat64 {
             }
             return;
         }
-        let ttl = ttl - 1;
+        // RFC 7915 §4.1: the TOS becomes the Traffic Class, DSCP and ECN
+        // alike.
+        let hop = (ttl - 1, pkt[1]);
         let src_v4 = Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]);
         let transport = &pkt[ihl..];
 
@@ -574,7 +574,7 @@ impl Nat64 {
 
         match proto {
             PROTO_TCP | PROTO_UDP => {
-                let Some(dst_v6) = self.inbound_tcpudp(transport, proto, src_v4, ttl, frag_id)
+                let Some(dst_v6) = self.inbound_tcpudp(transport, proto, src_v4, hop, frag_id)
                 else {
                     return;
                 };
@@ -590,7 +590,7 @@ impl Nat64 {
                 }
             }
             // See outbound: fragmented ICMP is not translated.
-            PROTO_ICMP if frag_id.is_none() => self.inbound_icmp(transport, src_v4, ttl),
+            PROTO_ICMP if frag_id.is_none() => self.inbound_icmp(transport, src_v4, hop),
             _ => {}
         }
     }
@@ -606,7 +606,8 @@ impl Nat64 {
         let (more, offset) = frag_info(pkt);
         let id = u16::from_be_bytes([pkt[4], pkt[5]]);
         let data = &pkt[ihl..];
-        let mut out = v6_header(src_v6, dst_v6, 44, pkt[8].saturating_sub(1), 8 + data.len());
+        let hop = (pkt[8].saturating_sub(1), pkt[1]);
+        let mut out = v6_header(src_v6, dst_v6, 44, hop, 8 + data.len());
         out.extend_from_slice(&v6_frag_header(pkt[9], offset, more, id));
         out.extend_from_slice(data);
         self.inside.deliver(Packet::from_slice(&out));
@@ -619,7 +620,7 @@ impl Nat64 {
         transport: &[u8],
         proto: u8,
         src_v4: Ipv4Addr,
-        hop: u8,
+        hop: Hop,
         frag_id: Option<u16>,
     ) -> Option<Ipv6Addr> {
         let field = if proto == PROTO_TCP { 16 } else { 6 };
@@ -695,7 +696,7 @@ impl Nat64 {
         Some(dst_v6)
     }
 
-    fn inbound_icmp(&self, icmp: &[u8], src_v4: Ipv4Addr, hop: u8) {
+    fn inbound_icmp(&self, icmp: &[u8], src_v4: Ipv4Addr, hop: Hop) {
         // Every ICMP message is rebuilt with a fresh checksum below, so a
         // corrupted one must be caught here rather than laundered.
         if icmp.len() < 8 || checksum(icmp) != 0 {
@@ -731,7 +732,7 @@ impl Nat64 {
         self.inbound_icmp_error(icmp, src_v4, hop, v6_type, v6_code, word);
     }
 
-    fn inbound_echo_reply(&self, icmp: &[u8], src_v4: Ipv4Addr, hop: u8) {
+    fn inbound_echo_reply(&self, icmp: &[u8], src_v4: Ipv4Addr, hop: Hop) {
         let id = u16::from_be_bytes([icmp[4], icmp[5]]);
         let rk = Nat64RevKey {
             proto: PROTO_ICMP,
@@ -773,7 +774,7 @@ impl Nat64 {
         &self,
         icmp: &[u8],
         src_v4: Ipv4Addr,
-        hop: u8,
+        hop: Hop,
         v6_type: u8,
         v6_code: u8,
         word: u32,
@@ -844,10 +845,8 @@ impl Nat64 {
         let room = 1280 - 2 * IPV6_HEADER_LEN - 8;
         let quoted_l4 = &l4[..l4.len().min(room)];
         let emb_payload_len = emb_total.saturating_sub(emb_ihl);
-        let mut quote = v6_header(emb_src_v6, emb_dst_v6, emb_nh, emb[8], emb_payload_len);
-        // Traffic class from the quoted TOS.
-        quote[0] = 0x60 | (emb[1] >> 4);
-        quote[1] = (emb[1] & 0x0F) << 4;
+        let quoted_hop = (emb[8], emb[1]);
+        let mut quote = v6_header(emb_src_v6, emb_dst_v6, emb_nh, quoted_hop, emb_payload_len);
         let l4_off = quote.len();
         quote.extend_from_slice(quoted_l4);
         let q = &mut quote[l4_off..];
@@ -1127,19 +1126,26 @@ struct V6Frag {
     id: u32,
 }
 
+/// The hop count (TTL or Hop Limit) and traffic class (TOS or Traffic
+/// Class) of a translated header. RFC 7915 §4.1 and §5.1 copy the traffic
+/// class across by default: DSCP keeps the packet's service class, and ECN
+/// its congestion marks, which endpoints would otherwise never see.
+type Hop = (u8, u8);
+
 /// An IPv4 header (payload to follow) with the given fields and its
 /// checksum; `flags` holds the flags and fragment offset word.
 fn v4_header(
     src: Ipv4Addr,
     dst: Ipv4Addr,
     proto: u8,
-    ttl: u8,
+    (ttl, tos): Hop,
     payload_len: usize,
     id: u16,
     flags: u16,
 ) -> Vec<u8> {
     let mut h = vec![0u8; IPV4_MIN_HEADER];
     h[0] = 0x45;
+    h[1] = tos;
     h[2..4].copy_from_slice(&((IPV4_MIN_HEADER + payload_len) as u16).to_be_bytes());
     h[4..6].copy_from_slice(&id.to_be_bytes());
     h[6..8].copy_from_slice(&flags.to_be_bytes());
@@ -1174,11 +1180,18 @@ fn fill_v6_checksum(l4: &mut [u8], field: usize, proto: u8, src: Ipv6Addr, dst: 
     l4[field..field + 2].copy_from_slice(&cs.to_be_bytes());
 }
 
-/// An IPv6 header (payload to follow) with the given fields, zero traffic
-/// class and flow label.
-fn v6_header(src: Ipv6Addr, dst: Ipv6Addr, next: u8, hop: u8, payload_len: usize) -> Vec<u8> {
+/// An IPv6 header (payload to follow) with the given fields and a zero
+/// flow label.
+fn v6_header(
+    src: Ipv6Addr,
+    dst: Ipv6Addr,
+    next: u8,
+    (hop, tc): Hop,
+    payload_len: usize,
+) -> Vec<u8> {
     let mut h = vec![0u8; IPV6_HEADER_LEN];
-    h[0] = 0x60;
+    h[0] = 0x60 | (tc >> 4);
+    h[1] = tc << 4;
     h[4..6].copy_from_slice(&(payload_len.min(u16::MAX as usize) as u16).to_be_bytes());
     h[6] = next;
     h[7] = hop;
@@ -1721,7 +1734,7 @@ mod tests {
         msg.extend_from_slice(quoted);
         let cs = compute_icmpv6_checksum(client, to, &msg);
         msg[2..4].copy_from_slice(&cs.to_be_bytes());
-        let mut p = v6_header(client, to, PROTO_ICMPV6, 64, msg.len());
+        let mut p = v6_header(client, to, PROTO_ICMPV6, (64, 0), msg.len());
         p.extend_from_slice(&msg);
         p
     }
@@ -1825,7 +1838,7 @@ mod tests {
         let other = Ipv4Addr::new(9, 9, 9, 9);
         let src = wkp(other);
         let client: Ipv6Addr = CLIENT.parse().unwrap();
-        let mut q = v6_header(src, client, PROTO_UDP, 60, 12);
+        let mut q = v6_header(src, client, PROTO_UDP, (60, 0), 12);
         let mut udp = [53u16, 5555, 12, 0].map(u16::to_be_bytes).concat();
         udp.extend_from_slice(b"resp");
         fill_v6_checksum(&mut udp, 6, PROTO_UDP, src, client);
@@ -1997,5 +2010,40 @@ mod tests {
         let out = outside.lock().unwrap();
         assert_eq!(out[0][6] & 0x40, 0);
         assert_eq!(out[1][6] & 0x40, 0x40);
+    }
+
+    /// Set an IPv6 packet's Traffic Class (no checksum covers it).
+    fn set_tc(p: &mut [u8], tc: u8) {
+        p[0] = 0x60 | (tc >> 4);
+        p[1] = (tc << 4) | (p[1] & 0x0F);
+    }
+
+    fn tc_of(p: &[u8]) -> u8 {
+        (p[0] << 4) | (p[1] >> 4)
+    }
+
+    /// Set an IPv4 packet's TOS, keeping its header checksum.
+    fn set_tos(p: &mut [u8], tos: u8) {
+        p[1] = tos;
+        p[10..12].copy_from_slice(&[0, 0]);
+        let ic = checksum(&p[..20]);
+        p[10..12].copy_from_slice(&ic.to_be_bytes());
+    }
+
+    #[test]
+    fn traffic_class_and_tos_carry_dscp_and_ecn() {
+        let (nat, inside, outside) = wired();
+        // DSCP EF with ECT(1) out; CE marked by a router on the way back.
+        let mut pkt = build_v6_udp(CLIENT.parse().unwrap(), 5555, wkp(SERVER), 53, b"q");
+        set_tc(&mut pkt, 0xB9);
+        nat.inside().send(Packet::from_slice(&pkt)).unwrap();
+        let sent = outside.lock().unwrap()[0].clone();
+        assert_eq!(sent[1], 0xB9);
+        assert_eq!(checksum(&sent[..20]), 0);
+
+        let mut r = v4_reply(SERVER, u16::from_be_bytes([sent[20], sent[21]]));
+        set_tos(&mut r, 0xBB);
+        nat.outside().send(Packet::from_slice(&r)).unwrap();
+        assert_eq!(tc_of(&inside.lock().unwrap()[0]), 0xBB);
     }
 }
