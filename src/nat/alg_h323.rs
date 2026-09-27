@@ -13,7 +13,7 @@ use crate::nat::helper::{Expectation, Helper, NatMapping, PROTO_TCP, PROTO_UDP, 
 use crate::nat::l4::replace_payload;
 use crate::nat::nat::Nat;
 use crate::time::Instant;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::IpAddr;
 use std::time::Duration;
 
 const H323_PORT: u16 = 1720;
@@ -65,37 +65,33 @@ impl PacketHelper for H323Helper {
             if new_payload[i..i + 4] == inside {
                 let port = u16::from_be_bytes([new_payload[i + 4], new_payload[i + 5]]);
                 if port >= H245_PORT_MIN {
-                    // Transport address: allocate a mapping (TCP for H.245, with
-                    // a UDP fallback for RTP) and register expectations.
-                    let mut outside_port = nat.create_mapping(PROTO_TCP, inside_ip, port);
-                    if outside_port.is_none() {
-                        outside_port = nat.create_mapping(PROTO_UDP, inside_ip, port);
-                    }
-                    nat.add_expectation(Expectation {
-                        proto: PROTO_TCP,
-                        remote_ip: Ipv4Addr::UNSPECIFIED,
-                        remote_port: 0,
-                        inside_ip,
-                        inside_port: port,
-                        expires: Instant::now() + H323_RTP_TIMEOUT,
-                    });
-                    nat.add_expectation(Expectation {
-                        proto: PROTO_UDP,
-                        remote_ip: Ipv4Addr::UNSPECIFIED,
-                        remote_port: 0,
-                        inside_ip,
-                        inside_port: port,
-                        expires: Instant::now() + H323_RTP_TIMEOUT,
-                    });
-                    if port % 2 == 0 {
-                        nat.add_expectation(Expectation {
-                            proto: PROTO_UDP,
-                            remote_ip: Ipv4Addr::UNSPECIFIED,
-                            remote_port: 0,
-                            inside_ip,
-                            inside_port: port + 1,
-                            expires: Instant::now() + H323_RTP_TIMEOUT,
-                        });
+                    // Transport address: H.245 runs over TCP and media over UDP,
+                    // and the heuristic cannot tell which this is, so both are
+                    // expected on the one outside port written into the message.
+                    let outside_port =
+                        nat.create_mapping_in(m.namespace, PROTO_TCP, inside_ip, port);
+                    if let Some(op) = outside_port {
+                        let expires = Instant::now() + H323_RTP_TIMEOUT;
+                        let expect = |proto, inside_port, outside_port| {
+                            nat.add_expectation(
+                                Expectation::new(
+                                    proto,
+                                    inside_ip,
+                                    inside_port,
+                                    outside_port,
+                                    expires,
+                                )
+                                .namespace(m.namespace),
+                            )
+                        };
+                        expect(PROTO_TCP, port, op);
+                        expect(PROTO_UDP, port, op);
+                        // RTCP rides on the next port up.
+                        if port % 2 == 0
+                            && let Some(rtcp) = op.checked_add(1)
+                        {
+                            expect(PROTO_UDP, port + 1, rtcp);
+                        }
                     }
                     new_payload[i..i + 4].copy_from_slice(&outside);
                     if let Some(op) = outside_port {
@@ -193,6 +189,7 @@ mod tests {
     use crate::checksum;
     use crate::nat::nat::Nat;
     use crate::{IpPrefix, L3Device, Packet};
+    use std::net::Ipv4Addr;
     use std::sync::{Arc, Mutex as StdMutex};
 
     fn pfx(s: &str) -> IpPrefix {
@@ -307,12 +304,7 @@ mod tests {
         let mut body = vec![0x01];
         body.extend_from_slice(&inside.octets());
         body.extend_from_slice(&[0x00, 0x50]); // port 80, below H245_PORT_MIN
-        let m = NatMapping {
-            proto: PROTO_TCP,
-            inside_ip: IpAddr::V4(inside),
-            inside_port: 40000,
-            outside_port: 20000,
-        };
+        let m = NatMapping::new(PROTO_TCP, IpAddr::V4(inside), 40000, 20000);
         let pkt = build_h323(
             inside,
             40000,
@@ -337,12 +329,7 @@ mod tests {
         let mut body = vec![0x09];
         body.extend_from_slice(&outside.octets());
         body.extend_from_slice(&[0x00, 0x01]); // low port -> bare IP path
-        let m = NatMapping {
-            proto: PROTO_TCP,
-            inside_ip: IpAddr::V4(inside),
-            inside_port: 1720,
-            outside_port: 25000,
-        };
+        let m = NatMapping::new(PROTO_TCP, IpAddr::V4(inside), 1720, 25000);
         let pkt = build_h323(outside, 1720, outside, 1720, &body);
         let out = h.process_inbound(&nat, pkt, &m);
         let p = payload_of(&out);

@@ -105,18 +105,23 @@ impl PacketHelper for IrcHelper {
         if !is_own_endpoint(m, inside_ip, port_val) {
             return pkt;
         }
-        let outside_port = match nat.create_mapping(PROTO_TCP, inside_ip, port_val) {
+        let outside_port = match nat.create_mapping_in(m.namespace, PROTO_TCP, inside_ip, port_val)
+        {
             Some(p) => p,
             None => return pkt,
         };
-        nat.add_expectation(Expectation {
-            proto: PROTO_TCP,
-            remote_ip: Ipv4Addr::UNSPECIFIED,
-            remote_port: 0,
-            inside_ip,
-            inside_port: port_val,
-            expires: Instant::now() + IRC_EXPECT_TIMEOUT,
-        });
+        // The DCC peer is not known yet: any remote may connect, but only to
+        // the port advertised in the rewritten message.
+        nat.add_expectation(
+            Expectation::new(
+                PROTO_TCP,
+                inside_ip,
+                port_val,
+                outside_port,
+                Instant::now() + IRC_EXPECT_TIMEOUT,
+            )
+            .namespace(m.namespace),
+        );
 
         let outside_octets = match nat.outside_addr() {
             Some(a) => a.octets(),

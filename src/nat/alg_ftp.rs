@@ -102,20 +102,24 @@ fn rewrite_port(nat: &Nat, pkt: &[u8], ihl: usize, data_off: usize, m: &NatMappi
         return pkt.to_vec();
     }
 
-    let outside_data_port = match nat.create_mapping(PROTO_TCP, inside_ip, inside_port) {
-        Some(p) => p,
-        None => return pkt.to_vec(),
-    };
+    let outside_data_port =
+        match nat.create_mapping_in(m.namespace, PROTO_TCP, inside_ip, inside_port) {
+            Some(p) => p,
+            None => return pkt.to_vec(),
+        };
 
     let dst_ip = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
-    nat.add_expectation(Expectation {
-        proto: PROTO_TCP,
-        remote_ip: dst_ip,
-        remote_port: 0,
-        inside_ip,
-        inside_port,
-        expires: Instant::now() + FTP_EXPECT_TIMEOUT,
-    });
+    nat.add_expectation(
+        Expectation::new(
+            PROTO_TCP,
+            inside_ip,
+            inside_port,
+            outside_data_port,
+            Instant::now() + FTP_EXPECT_TIMEOUT,
+        )
+        .remote_ip(dst_ip)
+        .namespace(m.namespace),
+    );
 
     let outside_ip = match nat.outside_addr() {
         Some(a) => a.octets(),
@@ -173,19 +177,23 @@ fn rewrite_eprt(nat: &Nat, pkt: &[u8], ihl: usize, data_off: usize, m: &NatMappi
         return pkt.to_vec();
     }
 
-    let outside_data_port = match nat.create_mapping(PROTO_TCP, inside_ip, inside_port) {
-        Some(p) => p,
-        None => return pkt.to_vec(),
-    };
+    let outside_data_port =
+        match nat.create_mapping_in(m.namespace, PROTO_TCP, inside_ip, inside_port) {
+            Some(p) => p,
+            None => return pkt.to_vec(),
+        };
     let dst_ip = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
-    nat.add_expectation(Expectation {
-        proto: PROTO_TCP,
-        remote_ip: dst_ip,
-        remote_port: 0,
-        inside_ip,
-        inside_port,
-        expires: Instant::now() + FTP_EXPECT_TIMEOUT,
-    });
+    nat.add_expectation(
+        Expectation::new(
+            PROTO_TCP,
+            inside_ip,
+            inside_port,
+            outside_data_port,
+            Instant::now() + FTP_EXPECT_TIMEOUT,
+        )
+        .remote_ip(dst_ip)
+        .namespace(m.namespace),
+    );
 
     let outside_ip = match nat.outside_addr() {
         Some(a) => a,

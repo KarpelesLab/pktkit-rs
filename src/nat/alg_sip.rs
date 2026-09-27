@@ -127,7 +127,7 @@ impl SipHelper {
             {
                 let sdp_body = new_payload[sdp_start + 4..].to_vec();
                 let new_sdp = if outbound {
-                    rewrite_sdp_outbound(nat, &sdp_body, &outside_addr, inside_ip)
+                    rewrite_sdp_outbound(nat, m.namespace, &sdp_body, &outside_addr, inside_ip)
                 } else {
                     sip_rewrite_sdp_addr(&sdp_body, &outside_addr, &inside_addr)
                 };
@@ -148,7 +148,13 @@ impl SipHelper {
 /// Rewrite SDP `c=` connection lines and `m=` media lines outbound, swapping
 /// the inside address for the outside address and registering RTP/RTCP
 /// expectations for each media stream.
-fn rewrite_sdp_outbound(nat: &Nat, sdp: &[u8], outside_addr: &str, inside_ip: Ipv4Addr) -> Vec<u8> {
+fn rewrite_sdp_outbound(
+    nat: &Nat,
+    ns: u64,
+    sdp: &[u8],
+    outside_addr: &str,
+    inside_ip: Ipv4Addr,
+) -> Vec<u8> {
     let inside_addr = inside_ip.to_string();
     let mut remote_ip = Ipv4Addr::UNSPECIFIED;
     let mut out: Vec<Vec<u8>> = Vec::new();
@@ -164,7 +170,7 @@ fn rewrite_sdp_outbound(nat: &Nat, sdp: &[u8], outside_addr: &str, inside_ip: Ip
             }
             line = format!("c=IN IP4 {}", outside_addr).into_bytes();
         } else if line.starts_with(b"m=")
-            && let Some(new_line) = sip_parse_media_line(&line, nat, remote_ip, inside_ip)
+            && let Some(new_line) = sip_parse_media_line(&line, nat, ns, remote_ip, inside_ip)
         {
             line = new_line;
         }
@@ -186,6 +192,7 @@ fn sip_rewrite_sdp_addr(sdp: &[u8], old_addr: &str, new_addr: &str) -> Vec<u8> {
 fn sip_parse_media_line(
     line: &[u8],
     nat: &Nat,
+    ns: u64,
     remote_ip: Ipv4Addr,
     inside_ip: Ipv4Addr,
 ) -> Option<Vec<u8>> {
@@ -205,28 +212,25 @@ fn sip_parse_media_line(
     // Allocate an outside port for the RTP stream. The Go upstream additionally
     // prefers an even port (RFC 3550 convention); our allocator is a plain
     // counter, so we accept whatever it returns and use it for the rewrite.
-    let rtp_out_port = nat.create_mapping(PROTO_UDP, inside_ip, inside_port)?;
+    let rtp_out_port = nat.create_mapping_in(ns, PROTO_UDP, inside_ip, inside_port)?;
 
-    nat.add_expectation(Expectation {
-        proto: PROTO_UDP,
-        remote_ip,
-        remote_port: 0, // remote RTP port not yet known
-        inside_ip,
-        inside_port,
-        expires: Instant::now() + SIP_RTP_TIMEOUT,
-    });
+    // The remote RTP port is not known yet.
+    let expires = Instant::now() + SIP_RTP_TIMEOUT;
+    nat.add_expectation(
+        Expectation::new(PROTO_UDP, inside_ip, inside_port, rtp_out_port, expires)
+            .remote_ip(remote_ip)
+            .namespace(ns),
+    );
 
     // RTCP is conventionally RTP port + 1.
     let rtcp_inside = inside_port.wrapping_add(1);
-    nat.create_mapping(PROTO_UDP, inside_ip, rtcp_inside);
-    nat.add_expectation(Expectation {
-        proto: PROTO_UDP,
-        remote_ip,
-        remote_port: 0,
-        inside_ip,
-        inside_port: rtcp_inside,
-        expires: Instant::now() + SIP_RTP_TIMEOUT,
-    });
+    if let Some(rtcp_out_port) = nat.create_mapping_in(ns, PROTO_UDP, inside_ip, rtcp_inside) {
+        nat.add_expectation(
+            Expectation::new(PROTO_UDP, inside_ip, rtcp_inside, rtcp_out_port, expires)
+                .remote_ip(remote_ip)
+                .namespace(ns),
+        );
+    }
 
     parts[1] = rtp_out_port.to_string().into_bytes();
     Some(join_subslice(&parts, b" "))
@@ -524,12 +528,12 @@ Content-Length: 0\r\n\r\n";
             5060,
             body,
         );
-        let m = NatMapping {
-            proto: PROTO_UDP,
-            inside_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)),
-            inside_port: 5060,
-            outside_port: 20000,
-        };
+        let m = NatMapping::new(
+            PROTO_UDP,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)),
+            5060,
+            20000,
+        );
         let out = h.process_outbound(&nat, pkt.clone(), &m);
         assert_eq!(out, pkt);
     }
@@ -547,12 +551,12 @@ Content-Length: 0\r\n\r\n";
             5060,
             body,
         );
-        let m = NatMapping {
-            proto: PROTO_UDP,
-            inside_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)),
-            inside_port: 5060,
-            outside_port: 20000,
-        };
+        let m = NatMapping::new(
+            PROTO_UDP,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)),
+            5060,
+            20000,
+        );
         let out = h.process_outbound(&nat, pkt.clone(), &m);
         assert_eq!(out, pkt);
     }

@@ -89,9 +89,11 @@ pub struct SoapResult {
     pub body: String,
 }
 
-/// Identifies a control-port TCP connection by the inside client's 4-tuple.
+/// Identifies a control-port TCP connection by the inside client's 4-tuple
+/// (and namespace, since namespaces may reuse addresses).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct CtrlKey {
+    ns: u64,
     client_ip: Ipv4Addr,
     client_port: u16,
 }
@@ -139,7 +141,7 @@ impl UPnPHelper {
 
     /// Handle a UDP packet, returning true if it was an SSDP M-SEARCH that we
     /// answered.
-    fn handle_udp(&self, nat: &Nat, pkt: &[u8], ihl: usize) -> bool {
+    fn handle_udp(&self, nat: &Nat, ns: u64, pkt: &[u8], ihl: usize) -> bool {
         if pkt.len() < ihl + 8 {
             return false;
         }
@@ -161,12 +163,12 @@ impl UPnPHelper {
         }
         let src_ip = Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]);
         let src_port = u16::from_be_bytes([pkt[ihl], pkt[ihl + 1]]);
-        self.send_ssdp_response(nat, src_ip, src_port);
+        self.send_ssdp_response(nat, ns, src_ip, src_port);
         true
     }
 
     /// Build and inject an SSDP 200 OK reply onto the inside network.
-    fn send_ssdp_response(&self, nat: &Nat, dst_ip: Ipv4Addr, dst_port: u16) {
+    fn send_ssdp_response(&self, nat: &Nat, ns: u64, dst_ip: Ipv4Addr, dst_port: u16) {
         let inside_ip = match nat.inside_addr() {
             Some(a) => a,
             None => return,
@@ -186,7 +188,7 @@ EXT:\r\n\r\n",
             location
         );
         let pkt = build_udp_packet(inside_ip, SSDP_PORT, dst_ip, dst_port, resp.as_bytes());
-        nat.send_inside(Packet::from_slice(&pkt));
+        nat.send_inside_in(ns, Packet::from_slice(&pkt));
     }
 
     // ---- TCP control termination ---------------------------------------
@@ -195,7 +197,7 @@ EXT:\r\n\r\n",
     /// port with a server-side [`vtcp::Conn`], run a one-shot HTTP/1.1 server
     /// over it, and call [`Self::handle_soap`]. Returns `true` if the packet was
     /// addressed to the control port and consumed.
-    fn handle_tcp(&self, nat: &Nat, pkt: &[u8], ihl: usize) -> bool {
+    fn handle_tcp(&self, nat: &Nat, ns: u64, pkt: &[u8], ihl: usize) -> bool {
         if pkt.len() < ihl + 20 {
             return false;
         }
@@ -218,6 +220,7 @@ EXT:\r\n\r\n",
         let client_ip = Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]);
         let client_port = seg.src_port;
         let key = CtrlKey {
+            ns,
             client_ip,
             client_port,
         };
@@ -293,7 +296,7 @@ EXT:\r\n\r\n",
                     _ if remove => {}
                     Ok(Some(req)) => {
                         let res =
-                            self.handle_soap(nat, &req.soap_action, &req.body, Some(cc.client_ip));
+                            self.soap(nat, ns, &req.soap_action, &req.body, Some(cc.client_ip));
                         let resp = build_http_response(&res);
                         let (_, segs) = cc.conn.write(&resp);
                         outgoing.extend(segs);
@@ -328,7 +331,7 @@ EXT:\r\n\r\n",
         // Wrap each emitted segment in IPv4 (server->client) and inject inside.
         for seg in outgoing {
             let ip = wrap_tcp_v4(inside_ip, client_ip, &seg);
-            nat.send_inside(Packet::from_slice(&ip));
+            nat.send_inside_in(ns, Packet::from_slice(&ip));
         }
         true
     }
@@ -382,10 +385,23 @@ EXT:\r\n\r\n",
         body: &[u8],
         client_ip: Option<Ipv4Addr>,
     ) -> SoapResult {
+        self.soap(nat, 0, soap_action, body, client_ip)
+    }
+
+    /// [`handle_soap`](Self::handle_soap) for a client in inside namespace
+    /// `ns`, where the forwards it creates must point.
+    fn soap(
+        &self,
+        nat: &Nat,
+        ns: u64,
+        soap_action: &str,
+        body: &[u8],
+        client_ip: Option<Ipv4Addr>,
+    ) -> SoapResult {
         let action = normalize_action(soap_action);
         match action.as_str() {
             "GetExternalIPAddress" => self.action_get_external_ip(nat),
-            "AddPortMapping" => self.action_add_port_mapping(nat, body, client_ip),
+            "AddPortMapping" => self.action_add_port_mapping(nat, ns, body, client_ip),
             "DeletePortMapping" => self.action_delete_port_mapping(nat, body),
             "GetGenericPortMappingEntry" => self.action_get_generic(nat, body),
             "GetSpecificPortMappingEntry" => self.action_get_specific(nat, body),
@@ -409,6 +425,7 @@ EXT:\r\n\r\n",
     fn action_add_port_mapping(
         &self,
         nat: &Nat,
+        ns: u64,
         body: &[u8],
         client_ip: Option<Ipv4Addr>,
     ) -> SoapResult {
@@ -464,14 +481,10 @@ EXT:\r\n\r\n",
         let expires = compute_expiry(lease_secs, self.cfg.lease_duration);
 
         let desc = xml_field(&xml, "NewPortMappingDescription").unwrap_or_default();
-        let pf = PortForward {
-            proto,
-            outside_port: ext_port,
-            inside_ip,
-            inside_port: int_port,
-            description: desc,
-            expires,
-        };
+        let mut pf = PortForward::new(proto, ext_port, inside_ip, int_port)
+            .description(desc)
+            .namespace(ns);
+        pf.expires = expires;
         if nat.add_port_forward(pf).is_err() {
             return soap_fault(718, "Port already mapped to another host");
         }
@@ -556,14 +569,18 @@ impl Helper for UPnPHelper {
 
 impl LocalHelper for UPnPHelper {
     fn handle_local(&self, nat: &Nat, pkt: &Packet) -> bool {
+        self.handle_local_in(nat, 0, pkt)
+    }
+
+    fn handle_local_in(&self, nat: &Nat, ns: u64, pkt: &Packet) -> bool {
         let bytes = pkt.as_bytes();
         if bytes.len() < 20 || bytes[0] >> 4 != 4 {
             return false;
         }
         let ihl = (bytes[0] & 0x0F) as usize * 4;
         match bytes[9] {
-            PROTO_UDP => self.handle_udp(nat, bytes, ihl),
-            PROTO_TCP => self.handle_tcp(nat, bytes, ihl),
+            PROTO_UDP => self.handle_udp(nat, ns, bytes, ihl),
+            PROTO_TCP => self.handle_tcp(nat, ns, bytes, ihl),
             _ => false,
         }
     }

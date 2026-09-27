@@ -41,14 +41,18 @@ impl PacketHelper for TftpHelper {
             IpAddr::V4(a) => a,
             _ => return pkt,
         };
-        nat.add_expectation(Expectation {
-            proto: PROTO_UDP,
-            remote_ip: dst_ip,
-            remote_port: 0,
-            inside_ip,
-            inside_port: m.inside_port,
-            expires: Instant::now() + TFTP_EXPECT_TIMEOUT,
-        });
+        // The server answers from a fresh port, to the client's mapped port.
+        nat.add_expectation(
+            Expectation::new(
+                PROTO_UDP,
+                inside_ip,
+                m.inside_port,
+                m.outside_port,
+                Instant::now() + TFTP_EXPECT_TIMEOUT,
+            )
+            .remote_ip(dst_ip)
+            .namespace(m.namespace),
+        );
         pkt
     }
 }
