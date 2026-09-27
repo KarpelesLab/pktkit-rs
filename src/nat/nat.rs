@@ -842,6 +842,20 @@ impl Nat {
         if group {
             return;
         }
+        if local {
+            // Addressed to the NAT itself and no helper wanted it. Translated,
+            // it would leave upstream from the public address to a private
+            // one, reaching nobody (or the wrong host). The NAT answers pings
+            // like any host (RFC 1122 §3.2.2.6) and drops the rest.
+            if pkt[9] == PROTO_ICMP
+                && pkt.len() >= ihl + 8
+                && pkt[ihl] == 8
+                && let Some(reply) = echo_reply(pkt, ihl)
+            {
+                emit(&reply, fmax, |p| self.send_ns(ns, p));
+            }
+            return;
+        }
 
         if offset != 0 {
             self.outbound_later_fragment(pkt);
@@ -2916,6 +2930,28 @@ mod tests {
         assert_eq!(r[20], 0, "echo reply");
         assert_eq!(&r[24..], &p[24..], "identifier, sequence and data");
         assert_eq!(checksum(&r[..20]), 0);
+        assert_eq!(checksum(&r[20..]), 0);
+    }
+
+    #[test]
+    fn traffic_to_the_inside_address_is_not_translated_out() {
+        let (nat, i, o) = setup();
+        let gw = Ipv4Addr::new(10, 0, 0, 1);
+        let p = build_icmp_echo(INSIDE, gw, 0x78, 1);
+        nat.inside().send(Packet::from_slice(&p)).unwrap();
+        let p = build_udp(INSIDE, 5000, gw, 53, b"q");
+        nat.inside().send(Packet::from_slice(&p)).unwrap();
+        let p = build_tcp(INSIDE, 5001, gw, 80, 0x02);
+        nat.inside().send(Packet::from_slice(&p)).unwrap();
+        assert!(o.lock().unwrap().is_empty(), "sent out to the upstream");
+        assert_eq!(mapped(&nat), 0);
+        // The ping is answered from the inside address.
+        let got = i.lock().unwrap();
+        assert_eq!(got.len(), 1);
+        let r = &got[0];
+        assert_eq!(&r[12..16], &gw.octets());
+        assert_eq!(&r[16..20], &INSIDE.octets());
+        assert_eq!(r[20], 0, "echo reply");
         assert_eq!(checksum(&r[20..]), 0);
     }
 

@@ -144,6 +144,22 @@ impl Nat64 {
         });
     }
 
+    /// Send a translated IPv4 packet on the outside, unless it is addressed
+    /// to the NAT64's own IPv4 address: sent there, it would reach only the
+    /// upstream, with the NAT64's address on both ends. It is another inside
+    /// host's session, reached through the NAT64 (hairpinning, RFC 6146
+    /// §3.8), and turns around as if it had arrived from outside.
+    fn send_v4(&self, out: &[u8]) {
+        if self
+            .outside_ipv4()
+            .is_some_and(|a| out[16..20] == a.octets())
+        {
+            self.handle_inbound(out);
+            return;
+        }
+        self.outside.deliver(Packet::from_slice(out));
+    }
+
     // ---------- Outbound (IPv6 -> IPv4) ----------
 
     fn handle_outbound(&self, pkt: &[u8]) {
@@ -264,7 +280,7 @@ impl Nat64 {
                     flags,
                 );
                 out.extend_from_slice(data);
-                self.outside.deliver(Packet::from_slice(&out));
+                self.send_v4(&out);
             }
             (PROTO_TCP | PROTO_UDP, _) => self.outbound_tcpudp(
                 data,
@@ -347,7 +363,7 @@ impl Nat64 {
         };
         let mut out = v4_header(outside_ip, dst_v4, proto, hop, l4.len(), id, flags);
         out.extend_from_slice(&l4);
-        self.outside.deliver(Packet::from_slice(&out));
+        self.send_v4(&out);
     }
 
     /// Identification and flags for an IPv4 packet translated from an
@@ -389,6 +405,20 @@ impl Nat64 {
         if icmp[0] != 128 {
             return self.outbound_icmpv6_error(icmp, dst_v6, (outside_ip, dst_v4), hop);
         }
+        // An echo request to the NAT64's own address: no inside host owns
+        // it for ICMP (an echo names no port to hairpin by), so the NAT64
+        // answers, as any host must (RFC 4443 §4.1).
+        if dst_v4 == outside_ip {
+            let mut out = v6_header(dst_v6, src_v6, PROTO_ICMPV6, (64, 0), icmp.len());
+            out.extend_from_slice(icmp);
+            let at = IPV6_HEADER_LEN;
+            out[at] = 129;
+            out[at + 2..at + 4].copy_from_slice(&[0, 0]);
+            let cs = compute_icmpv6_checksum(dst_v6, src_v6, &out[at..]);
+            out[at + 2..at + 4].copy_from_slice(&cs.to_be_bytes());
+            self.inside.deliver(Packet::from_slice(&out));
+            return;
+        }
         let id = u16::from_be_bytes([icmp[4], icmp[5]]);
         let k = Nat64Key {
             proto: PROTO_ICMP,
@@ -412,7 +442,7 @@ impl Nat64 {
         let (ip_id, flags) = self.unfragmented_v4_id(IPV4_MIN_HEADER + msg.len());
         let mut out = v4_header(outside_ip, dst_v4, PROTO_ICMP, hop, msg.len(), ip_id, flags);
         out.extend_from_slice(&msg);
-        self.outside.deliver(Packet::from_slice(&out));
+        self.send_v4(&out);
     }
 
     /// Translate an ICMPv6 error the inside sends about a packet that came
@@ -543,7 +573,7 @@ impl Nat64 {
         let (ip_id, flags) = self.unfragmented_v4_id(IPV4_MIN_HEADER + msg.len());
         let mut out = v4_header(outside_ip, dst_v4, PROTO_ICMP, hop, msg.len(), ip_id, flags);
         out.extend_from_slice(&msg);
-        self.outside.deliver(Packet::from_slice(&out));
+        self.send_v4(&out);
     }
 
     // ---------- Inbound (IPv4 -> IPv6) ----------
@@ -583,7 +613,7 @@ impl Nat64 {
                     crate::icmp::IcmpError::DestUnreachable(5),
                 )
             {
-                self.outside.deliver(Packet::from_slice(&err));
+                self.send_v4(&err);
             }
             return;
         }
@@ -593,7 +623,7 @@ impl Nat64 {
                 && let Some(err) =
                     crate::icmp::time_exceeded(Packet::from_slice(pkt), IpAddr::V4(ip))
             {
-                self.outside.deliver(Packet::from_slice(&err));
+                self.send_v4(&err);
             }
             return;
         }
@@ -2224,5 +2254,58 @@ mod tests {
         let out = outside.lock().unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(u16::from_be_bytes([out[0][2], out[0][3]]), 65535);
+    }
+
+    #[test]
+    fn traffic_to_the_nat64s_own_address_does_not_leave() {
+        let (nat, inside, outside) = wired();
+        let me = wkp(Ipv4Addr::new(198, 51, 100, 1));
+        let a: Ipv6Addr = CLIENT.parse().unwrap();
+        let b: Ipv6Addr = "2001:db8::6".parse().unwrap();
+
+        // A ping is answered by the NAT64.
+        let mut req = vec![0u8; IPV6_HEADER_LEN + 12];
+        req[0] = 0x60;
+        req[4..6].copy_from_slice(&12u16.to_be_bytes());
+        req[6] = PROTO_ICMPV6;
+        req[7] = 64;
+        req[8..24].copy_from_slice(&a.octets());
+        req[24..40].copy_from_slice(&me.octets());
+        req[40] = 128;
+        req[44..48].copy_from_slice(&[0x12, 0x34, 0, 1]);
+        req[48..52].copy_from_slice(b"ping");
+        let cs = compute_icmpv6_checksum(a, me, &req[40..]);
+        req[42..44].copy_from_slice(&cs.to_be_bytes());
+        nat.inside().send(Packet::from_slice(&req)).unwrap();
+        assert!(outside.lock().unwrap().is_empty(), "ping sent upstream");
+        {
+            let got = inside.lock().unwrap();
+            assert_eq!(got.len(), 1);
+            assert_eq!(read_v6(&got[0][8..24]), me);
+            assert_eq!(read_v6(&got[0][24..40]), a);
+            assert_eq!(got[0][40], 129);
+            assert_eq!(&got[0][44..], &req[44..]);
+            assert!(v6_sum_ok(&got[0]));
+        }
+        inside.lock().unwrap().clear();
+
+        // B's session through the NAT64 gives it a public port; A reaches
+        // it there, hairpinned, and B sees A's public endpoint.
+        let pkt = build_v6_udp(b, 7000, wkp(SERVER), 53, b"q");
+        nat.inside().send(Packet::from_slice(&pkt)).unwrap();
+        let b_port = u16::from_be_bytes({
+            let o = outside.lock().unwrap();
+            [o[0][20], o[0][21]]
+        });
+        outside.lock().unwrap().clear();
+        let pkt = build_v6_udp(a, 5555, me, b_port, b"hi");
+        nat.inside().send(Packet::from_slice(&pkt)).unwrap();
+        assert!(outside.lock().unwrap().is_empty(), "hairpin sent upstream");
+        let got = inside.lock().unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(read_v6(&got[0][8..24]), me);
+        assert_eq!(read_v6(&got[0][24..40]), b);
+        assert_eq!(u16::from_be_bytes([got[0][42], got[0][43]]), 7000);
+        assert!(v6_sum_ok(&got[0]));
     }
 }
