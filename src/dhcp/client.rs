@@ -77,6 +77,14 @@ pub trait ClientTransport: Send + Sync + 'static {
         false
     }
 
+    /// A new check of `ip` starts: forget any conflict seen before, for this
+    /// address or another. Called before the first
+    /// [`send_probe`](Self::send_probe) of each check, so an address
+    /// declined once and offered again later is judged afresh.
+    fn begin_probe(&self, ip: Ipv4Addr) {
+        let _ = ip;
+    }
+
     /// Send one ARP probe for `ip`: an ARP request from our MAC with sender
     /// address 0.0.0.0 and target `ip` (RFC 5227 §2.1.1). The client sends a
     /// few, a second apart, between the DHCPACK and binding.
@@ -84,7 +92,7 @@ pub trait ClientTransport: Send + Sync + 'static {
         let _ = ip;
     }
 
-    /// True if, since the first [`send_probe`](Self::send_probe) for `ip`,
+    /// True if, since [`begin_probe`](Self::begin_probe) for `ip`,
     /// another station has shown it is using `ip`: any ARP whose sender
     /// address is `ip`, or another host's probe for it (RFC 5227 §2.1.1).
     /// The client then sends a DHCPDECLINE and starts over.
@@ -213,8 +221,11 @@ enum Out {
         xid: u32,
         ip: Ipv4Addr,
     },
-    /// ARP probe for an address about to be bound.
-    Probe(Ipv4Addr),
+    /// ARP probe for an address about to be bound; `first` starts a check.
+    Probe {
+        ip: Ipv4Addr,
+        first: bool,
+    },
     /// The ACKed address is in use by someone else (RFC 2131 §4.4.1).
     Decline {
         xid: u32,
@@ -380,7 +391,13 @@ impl Client {
                         i.pending = Some((prefix, p.router, lease));
                         i.tries = 1;
                         i.next_tx = Some(now + PROBE_INTERVAL);
-                        (None, Some(Out::Probe(p.yiaddr)))
+                        (
+                            None,
+                            Some(Out::Probe {
+                                ip: p.yiaddr,
+                                first: true,
+                            }),
+                        )
                     } else {
                         (Some(i.bind(prefix, p.router, lease)), None)
                     }
@@ -477,7 +494,12 @@ impl Shared {
                 let frame = wrap_unicast(mac, ip, Ipv4Addr::BROADCAST, &b.finish());
                 self.transport.send_broadcast(Frame::from_slice(&frame));
             }
-            Out::Probe(ip) => self.transport.send_probe(ip),
+            Out::Probe { ip, first } => {
+                if first {
+                    self.transport.begin_probe(ip);
+                }
+                self.transport.send_probe(ip)
+            }
             // RFC 2131 Table 5: the declined address and the server go in
             // options; ciaddr stays zero, since the client has no address.
             Out::Decline { xid, ip, server } => {
@@ -521,7 +543,7 @@ fn step(i: &mut Inner, now: Instant, conflict: bool) -> (Option<Event>, Option<O
                     PROBE_INTERVAL
                 };
                 i.next_tx = Some(now + wait);
-                return (None, Some(Out::Probe(ip)));
+                return (None, Some(Out::Probe { ip, first: false }));
             }
             let Some((prefix, router, lease)) = i.pending else {
                 return (None, Some(i.restart(now)));
@@ -763,6 +785,8 @@ mod tests {
         probing: bool,
         probes: Mutex<Vec<Ipv4Addr>>,
         conflict: Mutex<bool>,
+        /// Checks started with `begin_probe`.
+        checks: Mutex<u32>,
     }
     impl ClientTransport for Recorder {
         fn mac(&self) -> MacAddr {
@@ -1158,6 +1182,9 @@ mod tests {
         fn can_probe(&self) -> bool {
             self.0.probing
         }
+        fn begin_probe(&self, _ip: Ipv4Addr) {
+            *self.0.checks.lock().unwrap() += 1;
+        }
         fn send_probe(&self, ip: Ipv4Addr) {
             self.0.probes.lock().unwrap().push(ip);
         }
@@ -1190,6 +1217,7 @@ mod tests {
         tick_after(&c, Duration::from_millis(1100));
         tick_after(&c, Duration::from_millis(2200));
         assert_eq!(r.probes.lock().unwrap().len(), 3, "RFC 5227 PROBE_NUM");
+        assert_eq!(*r.checks.lock().unwrap(), 1, "one check, three probes");
         assert!(r.bound.lock().unwrap().is_none());
 
         // ANNOUNCE_WAIT after the last probe with no answer: it is ours.

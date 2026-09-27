@@ -582,6 +582,11 @@ impl crate::dhcp::ClientTransport for AdapterDhcpTransport {
     fn can_probe(&self) -> bool {
         true
     }
+    fn begin_probe(&self, ip: Ipv4Addr) {
+        if let Some(a) = self.weak.upgrade() {
+            *a.probe.lock().unwrap() = Some((ip, false));
+        }
+    }
     fn send_probe(&self, ip: Ipv4Addr) {
         let Some(a) = self.weak.upgrade() else {
             return;
@@ -1056,6 +1061,7 @@ mod tests {
         assert!(t.can_probe());
         let ip = Ipv4Addr::new(10, 0, 0, 50);
 
+        t.begin_probe(ip);
         t.send_probe(ip);
         let sent = take(&out);
         assert_eq!(sent.len(), 1);
@@ -1087,6 +1093,7 @@ mod tests {
 
         // Another host probing for the same address also counts.
         let ip2 = Ipv4Addr::new(10, 0, 0, 51);
+        t.begin_probe(ip2);
         t.send_probe(ip2);
         assert!(!t.probe_conflict(ip2));
         arp_in(
@@ -1097,6 +1104,12 @@ mod tests {
             [10, 0, 0, 51],
         );
         assert!(t.probe_conflict(ip2));
+
+        // Declined, then offered again: a new check starts clean, rather
+        // than declining at once on the old conflict.
+        t.begin_probe(ip2);
+        t.send_probe(ip2);
+        assert!(!t.probe_conflict(ip2));
     }
 
     #[cfg(feature = "dhcp")]
