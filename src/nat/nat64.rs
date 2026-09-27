@@ -1,5 +1,6 @@
-//! NAT64 (RFC 6146): IPv6-to-IPv4 translation using IPv4-mapped IPv6
-//! addresses (`::ffff:x.x.x.x`).
+//! NAT64 (RFC 6146): IPv6-to-IPv4 translation. IPv4 hosts appear on the
+//! IPv6 side as IPv4-embedded addresses under the NAT64 prefix (RFC 6052),
+//! e.g. `64:ff9b::192.0.2.33` for the Well-Known Prefix.
 //!
 //! Inside faces IPv6; outside faces IPv4. Only the happy paths for TCP, UDP
 //! and ICMP echo are implemented; ICMP error translation covers Destination
@@ -69,6 +70,11 @@ impl std::fmt::Debug for Nat64 {
 }
 
 impl Nat64 {
+    /// Construct a NAT64. `inside_addr` is the NAT64 prefix (Pref64::/n) IPv4
+    /// hosts are mapped into, of length 32, 40, 48, 56, 64 or 96 (RFC 6052
+    /// §2.2), such as the Well-Known Prefix `64:ff9b::/96`; with any other
+    /// prefix nothing is translated. `outside_addr` is the IPv4 address the
+    /// translated traffic uses.
     pub fn new(inside_addr: IpPrefix, outside_addr: IpPrefix) -> Arc<Nat64> {
         let inside = Arc::new(Nat64Side::new(true, inside_addr));
         let outside = Arc::new(Nat64Side::new(false, outside_addr));
@@ -93,6 +99,10 @@ impl Nat64 {
     }
     pub fn outside(&self) -> Arc<dyn L3Device> {
         self.outside.clone()
+    }
+
+    fn pref64(&self) -> Option<Pref64> {
+        Pref64::new(self.inside.addr())
     }
 
     fn outside_ipv4(&self) -> Option<Ipv4Addr> {
@@ -130,10 +140,9 @@ impl Nat64 {
             return;
         }
         let dst_v6 = read_v6(&pkt[24..40]);
-        if !is_ipv4_mapped(&dst_v6) {
+        let Some(dst_v4) = self.pref64().and_then(|p| p.extract(dst_v6)) else {
             return;
-        }
-        let dst_v4 = ipv4_from_mapped(&dst_v6);
+        };
         let hop = pkt[7];
         let payload_len = u16::from_be_bytes([pkt[4], pkt[5]]) as usize;
         let src_v6 = read_v6(&pkt[8..24]);
@@ -360,7 +369,9 @@ impl Nat64 {
             k
         };
 
-        let src_v6 = ipv4_to_mapped(src_v4);
+        let Some(src_v6) = self.pref64().and_then(|p| p.embed(src_v4)) else {
+            return;
+        };
         let dst_v6 = mapping_key.ip;
         let out_len = IPV6_HEADER_LEN + transport.len();
         let mut out = vec![0u8; out_len];
@@ -441,7 +452,9 @@ impl Nat64 {
             }
             k
         };
-        let src_v6 = ipv4_to_mapped(src_v4);
+        let Some(src_v6) = self.pref64().and_then(|p| p.embed(src_v4)) else {
+            return;
+        };
         let dst_v6 = mapping_key.ip;
         let out_len = IPV6_HEADER_LEN + icmp.len();
         let mut out = vec![0u8; out_len];
@@ -504,7 +517,9 @@ impl Nat64 {
             k
         };
 
-        let src_v6 = ipv4_to_mapped(src_v4);
+        let Some(src_v6) = self.pref64().and_then(|p| p.embed(src_v4)) else {
+            return;
+        };
         let dst_v6 = mapping_key.ip;
         let emb_transport_len = icmp.len().saturating_sub(emb_off + emb_ihl);
         let emb_ipv6_len = IPV6_HEADER_LEN + emb_transport_len;
@@ -545,7 +560,9 @@ impl Nat64 {
             icmp[emb_off + 18],
             icmp[emb_off + 19],
         );
-        let emb_dst_v6 = ipv4_to_mapped(emb_dst_v4);
+        let Some(emb_dst_v6) = self.pref64().and_then(|p| p.embed(emb_dst_v4)) else {
+            return;
+        };
         out[emb_off_out + 24..emb_off_out + 40].copy_from_slice(&emb_dst_v6.octets());
 
         if emb_transport_len > 0 {
@@ -703,23 +720,88 @@ fn read_v6(b: &[u8]) -> Ipv6Addr {
     Ipv6Addr::from(a)
 }
 
-pub(crate) fn is_ipv4_mapped(addr: &Ipv6Addr) -> bool {
-    let o = addr.octets();
-    o[..10].iter().all(|&b| b == 0) && o[10] == 0xFF && o[11] == 0xFF
+/// A NAT64 prefix and the RFC 6052 §2.2 layout that goes with its length.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Pref64 {
+    prefix: [u8; 16],
+    /// Where the four IPv4 octets sit in the IPv6 address. Octet 8 (bits
+    /// 64..71, the "u" octet) is skipped for compatibility with interface
+    /// identifiers, which splits the address for prefixes shorter than 64.
+    at: [usize; 4],
+    bits: u8,
 }
 
-pub(crate) fn ipv4_from_mapped(addr: &Ipv6Addr) -> Ipv4Addr {
-    let o = addr.octets();
-    Ipv4Addr::new(o[12], o[13], o[14], o[15])
+/// The Well-Known Prefix, `64:ff9b::/96` (RFC 6052 §2.1).
+const WKP: [u8; 12] = [0, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0];
+
+impl Pref64 {
+    fn new(p: IpPrefix) -> Option<Pref64> {
+        let IpAddr::V6(a) = p.addr() else {
+            return None;
+        };
+        let at = match p.bits() {
+            32 => [4, 5, 6, 7],
+            40 => [5, 6, 7, 9],
+            48 => [6, 7, 9, 10],
+            56 => [7, 9, 10, 11],
+            64 => [9, 10, 11, 12],
+            96 => [12, 13, 14, 15],
+            _ => return None,
+        };
+        let mut prefix = [0u8; 16];
+        let n = p.bits() as usize / 8;
+        prefix[..n].copy_from_slice(&a.octets()[..n]);
+        Some(Pref64 {
+            prefix,
+            at,
+            bits: p.bits(),
+        })
+    }
+
+    fn is_wkp(&self) -> bool {
+        self.bits == 96 && self.prefix[..12] == WKP
+    }
+
+    /// The IPv6 address standing for `v4`, with the u octet and the suffix
+    /// zero. `None` if the prefix cannot represent it: RFC 6052 §3.1 forbids
+    /// the Well-Known Prefix for non-global IPv4 addresses.
+    fn embed(&self, v4: Ipv4Addr) -> Option<Ipv6Addr> {
+        if self.is_wkp() && !is_global_v4(v4) {
+            return None;
+        }
+        let mut o = self.prefix;
+        for (i, b) in self.at.iter().zip(v4.octets()) {
+            o[*i] = b;
+        }
+        Some(Ipv6Addr::from(o))
+    }
+
+    /// The IPv4 address embedded in `v6`, if it lies under this prefix.
+    fn extract(&self, v6: Ipv6Addr) -> Option<Ipv4Addr> {
+        let o = v6.octets();
+        let n = self.bits as usize / 8;
+        if o[..n] != self.prefix[..n] {
+            return None;
+        }
+        let v4 = Ipv4Addr::new(o[self.at[0]], o[self.at[1]], o[self.at[2]], o[self.at[3]]);
+        (!self.is_wkp() || is_global_v4(v4)).then_some(v4)
+    }
 }
 
-pub(crate) fn ipv4_to_mapped(addr: Ipv4Addr) -> Ipv6Addr {
-    let v4 = addr.octets();
-    let mut o = [0u8; 16];
-    o[10] = 0xFF;
-    o[11] = 0xFF;
-    o[12..16].copy_from_slice(&v4);
-    Ipv6Addr::from(o)
+/// Close enough to "global" for RFC 6052 §3.1: not private (RFC 1918),
+/// shared (RFC 6598), loopback, link-local or otherwise special-use.
+fn is_global_v4(a: Ipv4Addr) -> bool {
+    let o = a.octets();
+    let shared = o[0] == 100 && (o[1] & 0xC0) == 64;
+    !(a.is_private()
+        || shared
+        || a.is_loopback()
+        || a.is_link_local()
+        || a.is_unspecified()
+        || a.is_broadcast()
+        || a.is_multicast()
+        || o[0] == 0
+        || o[0] >= 240)
 }
 
 fn compute_transport_checksum(proto: Protocol, src: IpAddr, dst: IpAddr, segment: &[u8]) -> u16 {
@@ -755,18 +837,79 @@ mod tests {
         s.parse().unwrap()
     }
 
-    #[test]
-    fn ipv4_mapped_roundtrip() {
-        let v4 = Ipv4Addr::new(1, 2, 3, 4);
-        let v6 = ipv4_to_mapped(v4);
-        assert!(is_ipv4_mapped(&v6));
-        assert_eq!(ipv4_from_mapped(&v6), v4);
+    /// Map an IPv4 address into the Well-Known Prefix, as the tests' NAT64
+    /// is configured.
+    fn wkp(v4: Ipv4Addr) -> Ipv6Addr {
+        Pref64::new(pfx("64:ff9b::/96")).unwrap().embed(v4).unwrap()
     }
 
     #[test]
-    fn non_mapped_v6_is_not_mapped() {
-        let v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
-        assert!(!is_ipv4_mapped(&v6));
+    fn rfc6052_examples() {
+        // RFC 6052 §2.4, with 192.0.2.33.
+        let v4 = Ipv4Addr::new(192, 0, 2, 33);
+        for (prefix, addr) in [
+            ("2001:db8::/32", "2001:db8:c000:221::"),
+            ("2001:db8:100::/40", "2001:db8:1c0:2:21::"),
+            ("2001:db8:122::/48", "2001:db8:122:c000:2:2100::"),
+            ("2001:db8:122:300::/56", "2001:db8:122:3c0:0:221::"),
+            ("2001:db8:122:344::/64", "2001:db8:122:344:c0:2:2100:0"),
+            ("2001:db8:122:344::/96", "2001:db8:122:344::192.0.2.33"),
+            ("64:ff9b::/96", "64:ff9b::192.0.2.33"),
+        ] {
+            let p = Pref64::new(pfx(prefix)).unwrap();
+            let v6: Ipv6Addr = addr.parse().unwrap();
+            assert_eq!(p.embed(v4), Some(v6), "{prefix}");
+            assert_eq!(p.extract(v6), Some(v4), "{prefix}");
+        }
+    }
+
+    #[test]
+    fn pref64_rejects_foreign_and_non_global_addresses() {
+        let p = Pref64::new(pfx("64:ff9b::/96")).unwrap();
+        assert_eq!(p.extract("2001:db8::1".parse().unwrap()), None);
+        // IPv4-mapped addresses must never appear on the wire (RFC 4291
+        // §2.5.5.2), and are not under the prefix.
+        assert_eq!(p.extract("::ffff:8.8.8.8".parse().unwrap()), None);
+        // The WKP cannot stand for private IPv4 space (RFC 6052 §3.1).
+        assert_eq!(p.embed(Ipv4Addr::new(10, 1, 2, 3)), None);
+        assert_eq!(p.extract("64:ff9b::10.1.2.3".parse().unwrap()), None);
+        // A network-specific prefix can.
+        let nsp = Pref64::new(pfx("2001:db8:64::/96")).unwrap();
+        assert!(nsp.embed(Ipv4Addr::new(10, 1, 2, 3)).is_some());
+        assert!(Pref64::new(pfx("2001:db8::/60")).is_none());
+    }
+
+    #[test]
+    fn translates_under_a_network_specific_prefix() {
+        let nat = Nat64::new(pfx("2001:db8:122::/48"), pfx("198.51.100.1/24"));
+        let captured = Arc::new(StdMutex::new(Vec::<Vec<u8>>::new()));
+        let c = captured.clone();
+        nat.outside().set_handler(Arc::new(move |p| {
+            c.lock().unwrap().push(p.as_bytes().to_vec());
+            Ok(())
+        }));
+        let client: Ipv6Addr = "2001:db8:1::100".parse().unwrap();
+        let dst: Ipv6Addr = "2001:db8:122:c000:2:2100::".parse().unwrap();
+        let pkt = build_v6_udp(client, 5555, dst, 53, b"hello");
+        nat.inside().send(Packet::from_slice(&pkt)).unwrap();
+        let out = captured.lock().unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(&out[0][16..20], &[192, 0, 2, 33]);
+    }
+
+    #[test]
+    fn ipv4_mapped_destination_is_not_translated() {
+        let nat = Nat64::new(pfx("64:ff9b::/96"), pfx("198.51.100.1/24"));
+        let captured = Arc::new(StdMutex::new(Vec::<Vec<u8>>::new()));
+        let c = captured.clone();
+        nat.outside().set_handler(Arc::new(move |p| {
+            c.lock().unwrap().push(p.as_bytes().to_vec());
+            Ok(())
+        }));
+        let client: Ipv6Addr = "2001:db8::100".parse().unwrap();
+        let pkt = build_v6_udp(client, 5555, "::ffff:8.8.8.8".parse().unwrap(), 53, b"x");
+        nat.inside().send(Packet::from_slice(&pkt)).unwrap();
+        assert!(captured.lock().unwrap().is_empty());
     }
 
     fn build_v6_udp(
@@ -815,7 +958,7 @@ mod tests {
         }));
 
         let client: Ipv6Addr = "2001:db8::100".parse().unwrap();
-        let dst = ipv4_to_mapped(Ipv4Addr::new(8, 8, 8, 8));
+        let dst = wkp(Ipv4Addr::new(8, 8, 8, 8));
         let pkt = build_v6_udp(client, 5555, dst, 53, b"hello");
         nat.inside().send(Packet::from_slice(&pkt)).unwrap();
 
@@ -856,13 +999,7 @@ mod tests {
         }
 
         let client: Ipv6Addr = "2001:db8::5".parse().unwrap();
-        let pkt = build_v6_udp(
-            client,
-            44000,
-            ipv4_to_mapped(Ipv4Addr::new(1, 1, 1, 1)),
-            53,
-            b"q",
-        );
+        let pkt = build_v6_udp(client, 44000, wkp(Ipv4Addr::new(1, 1, 1, 1)), 53, b"q");
         nat.inside().send(Packet::from_slice(&pkt)).unwrap();
         let outbound_pkts = outbound.lock().unwrap();
         let mapped_port = u16::from_be_bytes([outbound_pkts[0][20], outbound_pkts[0][21]]);
@@ -929,7 +1066,7 @@ mod tests {
         }));
 
         let client: Ipv6Addr = "2001:db8::5".parse().unwrap();
-        let dst = ipv4_to_mapped(Ipv4Addr::new(1, 1, 1, 1));
+        let dst = wkp(Ipv4Addr::new(1, 1, 1, 1));
         let mut req = vec![0u8; IPV6_HEADER_LEN + 12];
         req[0] = 0x60;
         req[4..6].copy_from_slice(&12u16.to_be_bytes());

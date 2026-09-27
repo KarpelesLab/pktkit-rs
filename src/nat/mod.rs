@@ -7,7 +7,7 @@
 //!   edge) and [`L3Connector`](crate::L3Connector) (for namespace-isolated
 //!   inside attachments).
 //! - [`Nat64`] — RFC 6146 stateful translation between an IPv6 inside and an
-//!   IPv4 outside, using IPv4-mapped IPv6 addresses (`::ffff:x.x.x.x`).
+//!   IPv4 outside, with IPv4 hosts mapped into a NAT64 prefix (RFC 6052).
 //!
 //! Optional pieces:
 //!
