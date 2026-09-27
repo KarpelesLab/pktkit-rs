@@ -363,17 +363,15 @@ pub(crate) fn process_handshake_initiation(
         ));
     }
 
-    h.inc_active_handshakes();
-    let _guard = DecGuard(h);
-
     // Validate MAC1 against our public key — always drop if invalid.
     if !h.cookie_check_mac1(data) {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid MAC1"));
     }
+    let under_load = h.note_initiation_under_load();
 
     // Under load: require a valid MAC2. The sender index lives at
     // data[4..8]; MAC1 occupies data[116..132] on a 148-byte initiation.
-    if h.is_under_load() {
+    if under_load {
         let sender = u32::from_le_bytes(
             data[INIT_OFF_SENDER..INIT_OFF_EPHEMERAL]
                 .try_into()
@@ -661,13 +659,6 @@ pub(crate) fn check_mac1(local_pub: &[u8; NOISE_PUBLIC_KEY_SIZE], msg: &[u8]) ->
 }
 
 // === Helpers ===============================================================
-
-struct DecGuard<'a>(&'a Handler);
-impl<'a> Drop for DecGuard<'a> {
-    fn drop(&mut self) {
-        self.0.dec_active_handshakes();
-    }
-}
 
 /// Helper: produce a mutable view of a `[u8; 32]` as the type the kdf2 helper
 /// in `crypto` expects (a 32-byte chain-key shaped buffer). We use this when

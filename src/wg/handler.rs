@@ -9,7 +9,7 @@ use crate::time::Instant;
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -37,10 +37,10 @@ pub struct Config {
     /// Optional callback for unauthorized peers.
     pub on_unknown_peer: Option<UnknownPeerFn>,
 
-    /// Concurrent handshakes allowed before MAC2 cookie validation kicks in.
-    /// `None` uses the default (20); `Some(n)` sets it
-    /// exactly, so `Some(0)` makes every initiation under-load (useful in
-    /// tests to force the cookie path).
+    /// Handshake initiations per second allowed before MAC2 cookie
+    /// validation kicks in (whitepaper §5.3). `None` uses the default
+    /// (1000); `Some(n)` sets it exactly, so `Some(0)` makes every
+    /// initiation under-load (useful in tests to force the cookie path).
     pub load_threshold: Option<usize>,
 }
 
@@ -130,6 +130,13 @@ impl PeerEntry {
     }
 }
 
+#[derive(Default)]
+struct LoadMeter {
+    window_start: Option<Instant>,
+    count: usize,
+    until: Option<Instant>,
+}
+
 /// A derived transport keypair (rotates on each handshake completion).
 pub(crate) struct Keypair {
     pub send_key: [u8; CHACHAPOLY_KEY_SIZE],
@@ -185,7 +192,11 @@ pub struct Handler {
 
     on_unknown_peer: Mutex<Option<UnknownPeerFn>>,
     load_threshold: usize,
-    active_handshakes: AtomicUsize,
+    /// Initiations seen in the current one-second window, and when being
+    /// under load lapses. Initiations are processed inline, so the
+    /// reference's measure (the depth of a handshake queue) has no
+    /// equivalent here; their rate is what costs CPU.
+    load: Mutex<LoadMeter>,
     /// Responder-side cookie validator + reply generator.
     cookie_checker: Mutex<crate::wg::cookie::CookieChecker>,
 }
@@ -221,7 +232,7 @@ impl Handler {
             sessions: RwLock::new(HashMap::new()),
             on_unknown_peer: Mutex::new(cfg.on_unknown_peer),
             load_threshold: lt,
-            active_handshakes: AtomicUsize::new(0),
+            load: Mutex::new(LoadMeter::default()),
             cookie_checker: Mutex::new(crate::wg::cookie::CookieChecker::new(&pub_key)),
         }))
     }
@@ -673,14 +684,24 @@ impl Handler {
         Some((kp, age))
     }
 
-    pub(crate) fn inc_active_handshakes(&self) {
-        self.active_handshakes.fetch_add(1, Ordering::SeqCst);
-    }
-
-    /// True when there are more concurrent handshakes in flight than the
-    /// configured load threshold — the trigger for requiring a valid MAC2.
-    pub(crate) fn is_under_load(&self) -> bool {
-        self.active_handshakes.load(Ordering::SeqCst) > self.load_threshold
+    /// Count one incoming initiation and say whether we are under load, the
+    /// trigger for requiring a valid MAC2. As in the reference, being under
+    /// load lasts a second past the last time the threshold was exceeded,
+    /// so a flood does not flicker between the two paths.
+    pub(crate) fn note_initiation_under_load(&self) -> bool {
+        let now = Instant::now();
+        let mut m = self.load.lock().expect("load lock");
+        if m.window_start
+            .is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1))
+        {
+            m.window_start = Some(now);
+            m.count = 0;
+        }
+        m.count = m.count.saturating_add(1);
+        if m.count > self.load_threshold {
+            m.until = Some(now + Duration::from_secs(1));
+        }
+        m.until.is_some_and(|u| now < u)
     }
 
     // --- cookie integration ------------------------------------------------
@@ -770,14 +791,6 @@ impl Handler {
             .lock()
             .expect("cookie_gen lock")
             .consume_reply(nonce, ct)
-    }
-
-    pub(crate) fn dec_active_handshakes(&self) {
-        let prev = self.active_handshakes.fetch_sub(1, Ordering::SeqCst);
-        if prev == 0 {
-            // Should not happen; clamp to 0.
-            self.active_handshakes.store(0, Ordering::SeqCst);
-        }
     }
 
     /// Authorize a previously unknown peer and complete its handshake by
@@ -987,6 +1000,25 @@ mod tests {
         let mut init = a.initiate_handshake(&b.public_key()).unwrap();
         init.push(0);
         assert!(b.process_packet(&init, &loopback()).is_err());
+    }
+
+    /// Past the threshold of initiations per second, MAC2 is demanded. With
+    /// inline processing a count of concurrent handshakes never passed 1, so
+    /// the cookie defence never engaged.
+    #[test]
+    fn an_initiation_burst_triggers_the_cookie_path() {
+        let a = Handler::new(Config::default()).unwrap();
+        let b = Handler::new(Config::default().load_threshold(3)).unwrap();
+        a.add_peer(b.public_key());
+        b.add_peer(a.public_key());
+        let tys: Vec<PacketType> = (0..5)
+            .map(|_| {
+                let init = a.initiate_handshake(&b.public_key()).unwrap();
+                b.process_packet(&init, &loopback()).unwrap().ty
+            })
+            .collect();
+        assert_eq!(tys[..3], [PacketType::HandshakeResponse; 3]);
+        assert_eq!(tys[3..], [PacketType::CookieReply; 2]);
     }
 
     #[test]

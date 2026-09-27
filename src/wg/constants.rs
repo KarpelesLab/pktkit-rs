@@ -73,7 +73,7 @@ pub const REKEY_AFTER_TIME: Duration = Duration::from_secs(120);
 
 // === DoS mitigation thresholds =============================================
 
-pub(crate) const DEFAULT_LOAD_THRESHOLD: usize = 20;
+pub(crate) const DEFAULT_LOAD_THRESHOLD: usize = 1000;
 
 /// Size of the per-keypair replay window.
 pub const WINDOW_SIZE: usize = 8192;

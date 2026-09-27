@@ -210,7 +210,7 @@ impl Adapter {
                 on_packet,
                 on_peer_connected: Some(on_connected),
                 maintenance_interval: None,
-                read_buffer_size: 2048,
+                read_buffer_size: 65535,
             }
         } else {
             let h = Handler::new(HandlerConfig {
@@ -224,7 +224,7 @@ impl Adapter {
                 on_packet,
                 on_peer_connected: Some(on_connected),
                 maintenance_interval: None,
-                read_buffer_size: 2048,
+                read_buffer_size: 65535,
             }
         };
         let handler = server_cfg.handler.clone();
@@ -287,7 +287,9 @@ impl Adapter {
         }
     }
 
-    /// Authorize an unknown peer's handshake (call from `on_unknown_peer`).
+    /// Authorize an unknown peer's handshake (call from `on_unknown_peer`)
+    /// and complete it: the response goes out, the peer's address is
+    /// recorded and `on_peer_connected` fires, as for any other handshake.
     pub fn accept_unknown_peer(
         &self,
         key: NoisePublicKey,
@@ -295,22 +297,20 @@ impl Adapter {
         addr: SocketAddr,
     ) -> Result<()> {
         if let Some(mh) = self.multi_handler.as_ref() {
-            for h in mh.handlers() {
-                if crate::wg::handshake::check_mac1(h.public_key().as_bytes(), packet) {
-                    let _ = h.accept_unknown_peer(key, packet, &addr)?;
-                    return Ok(());
-                }
-            }
-            Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "no handler matched MAC1",
-            ))
+            let h = mh
+                .handlers()
+                .into_iter()
+                .find(|h| crate::wg::handshake::check_mac1(h.public_key().as_bytes(), packet))
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "no handler matched MAC1")
+                })?;
+            h.add_peer(key);
         } else if let Some(h) = self.handler.as_ref() {
-            let _ = h.accept_unknown_peer(key, packet, &addr)?;
-            Ok(())
+            h.add_peer(key);
         } else {
-            Err(io::Error::other("no handler"))
+            return Err(io::Error::other("no handler"));
         }
+        self.server.handle_packet(packet, addr)
     }
 
     /// Remove a peer and tear down its plumbing.
@@ -422,5 +422,63 @@ impl Adapter {
         {
             let _ = cleanup();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::L3Hub;
+    use crate::wg::handler::PacketType;
+    use std::time::Duration;
+
+    /// An unknown peer accepted from `on_unknown_peer` gets its handshake
+    /// response, over the wire, without having to retry.
+    #[test]
+    fn accepted_unknown_peer_gets_its_response() {
+        let hub = L3Hub::new();
+        let slot: Arc<Mutex<Option<Weak<Adapter>>>> = Arc::new(Mutex::new(None));
+        let s = slot.clone();
+        let on_unknown: crate::wg::handler::UnknownPeerFn =
+            Arc::new(move |key, addr, pkt: &[u8]| {
+                let a = s.lock().unwrap().as_ref().and_then(Weak::upgrade);
+                if let Some(a) = a {
+                    a.accept_unknown_peer(key, pkt, addr).unwrap();
+                }
+            });
+        let server_key = crate::wg::generate_private_key().unwrap();
+        let adapter = Adapter::new(
+            AdapterConfig::new(
+                server_key,
+                Arc::new(Arc::new(hub)),
+                "10.0.0.1/24".parse().unwrap(),
+            )
+            .on_unknown_peer(on_unknown),
+        )
+        .unwrap();
+        *slot.lock().unwrap() = Some(Arc::downgrade(&adapter));
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let server_addr = sock.local_addr().unwrap();
+        let _t = adapter.spawn_serve(sock);
+
+        let client = Handler::new(HandlerConfig::default()).unwrap();
+        let server_pub = adapter.handler.as_ref().unwrap().public_key();
+        client.add_peer(server_pub);
+        let csock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        csock
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let init = client.initiate_handshake(&server_pub).unwrap();
+        csock.send_to(&init, server_addr).unwrap();
+
+        let mut buf = [0u8; 256];
+        let (n, from) = csock.recv_from(&mut buf).expect("no handshake response");
+        let res = client.process_packet(&buf[..n], &from).unwrap();
+        assert_eq!(res.ty, PacketType::HandshakeResponse);
+        assert_eq!(
+            adapter.server.peer_addr(&client.public_key()),
+            Some(csock.local_addr().unwrap())
+        );
+        adapter.close().unwrap();
     }
 }

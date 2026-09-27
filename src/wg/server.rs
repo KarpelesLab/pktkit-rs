@@ -68,7 +68,7 @@ impl Default for ServerConfig {
             on_packet: Arc::new(|_d, _k, _h| {}),
             on_peer_connected: None,
             maintenance_interval: None,
-            read_buffer_size: 2048,
+            read_buffer_size: 65535,
         }
     }
 }
@@ -116,8 +116,11 @@ impl Server {
             _ => {}
         }
         let interval = cfg.maintenance_interval.unwrap_or(Duration::from_secs(10));
+        // A UDP datagram can be up to 65535 bytes; a smaller buffer would
+        // silently truncate a peer's large packet, which then fails to
+        // decrypt.
         let rb = if cfg.read_buffer_size == 0 {
-            2048
+            65535
         } else {
             cfg.read_buffer_size
         };
@@ -183,11 +186,33 @@ impl Server {
                     self.process_incoming(&data, addr, &conn);
                 }
                 Err(e) => match e.kind() {
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => continue,
+                    // An ICMP unreachable from one peer surfaces here (as
+                    // ConnectionReset on Windows, ConnectionRefused on some
+                    // Unixes). It says nothing about the socket, and ending
+                    // the loop would cut off every other peer.
+                    io::ErrorKind::WouldBlock
+                    | io::ErrorKind::TimedOut
+                    | io::ErrorKind::Interrupted
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionRefused => continue,
                     _ => break,
                 },
             }
         }
+    }
+
+    /// Handle `data` as if it had just arrived from `addr`: reply, record
+    /// the peer's address and fire the callbacks. For a handshake held back
+    /// while its peer was being authorized.
+    pub(crate) fn handle_packet(&self, data: &[u8], addr: SocketAddr) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .expect("conn lock")
+            .clone()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "server not serving"))?;
+        self.process_incoming(data, addr, &conn);
+        Ok(())
     }
 
     fn process_incoming(&self, data: &[u8], addr: SocketAddr, conn: &UdpSocket) {
