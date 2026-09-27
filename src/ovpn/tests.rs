@@ -667,6 +667,87 @@ fn spoofed_hard_reset_does_not_kill_a_handshake_in_progress() {
     assert_eq!(deliver(&mut server, &keys, 1, b"hi"), Some(b"hi".to_vec()));
 }
 
+/// Control datagrams in `send` carrying TLS (P_CONTROL_V1).
+fn tls_packets(send: &[Vec<u8>]) -> usize {
+    send.iter()
+        .filter(|d| ControlPacket::parse(d).is_ok_and(|p| p.opcode == Opcode::CONTROL_V1))
+        .count()
+}
+
+/// Without tls-auth, anyone can send a hard reset and a ClientHello from a
+/// client's address. Until the sender ACKs our reset -- which only whoever
+/// receives at that address can -- the server must answer with no more
+/// than the reset and ACKs, not its TLS flight (ssl.c only moves TLS
+/// output to the reliable layer from S_START): else a few small spoofed
+/// datagrams make it send kilobytes to the victim, and retransmit them.
+#[test]
+fn no_tls_flight_before_our_reset_is_acked() {
+    let mut server = Peer::new(server_config(), *b"SERVERID", auth_hook())
+        .unwrap()
+        .with_timers(quiet_timers());
+    let mut client = TestClient::new(*b"CLIENTID");
+    connect(&mut server, &mut client);
+
+    let mut attacker = TestClient::new(*b"ATTACKER");
+    let mut dgrams = vec![attacker.hard_reset()];
+    // It never sees our reset, so it guesses our session id.
+    attacker.reliable.peer_id = [0x55; 8];
+    attacker.pump_tls(&mut dgrams);
+    let sent_in: usize = dgrams.iter().map(Vec::len).sum();
+    let mut sent_out = 0;
+    for d in &dgrams {
+        let out = server.handle_packet(d).unwrap();
+        assert_eq!(tls_packets(&out.send), 0, "TLS before the reset was ACKed");
+        sent_out += out.send.iter().map(Vec::len).sum::<usize>();
+    }
+    let start = Instant::now();
+    for s in 1..=59 {
+        // Only what the attacker's session sends: the genuine client's
+        // (our first session id) may have something of its own in flight.
+        let out: Vec<Vec<u8>> = server
+            .tick(start + Duration::from_secs(s))
+            .unwrap()
+            .send
+            .into_iter()
+            .filter(|d| ControlPacket::parse(d).is_ok_and(|p| p.session_id != *b"SERVERID"))
+            .collect();
+        assert_eq!(tls_packets(&out), 0, "TLS retransmitted at {s}s");
+        sent_out += out.iter().map(Vec::len).sum::<usize>();
+    }
+    // The reset and its retransmissions: small datagrams, few of them.
+    assert!(
+        sent_out < 4 * sent_in,
+        "{sent_out} bytes out for {sent_in} in"
+    );
+}
+
+/// The same holds for a renegotiation: the new key's TLS flight waits for
+/// the ACK of our soft reset, then goes out.
+#[test]
+fn soft_reset_key_sends_tls_only_after_our_reset_is_acked() {
+    let mut server = Peer::new(server_config(), *b"SERVERID", auth_hook())
+        .unwrap()
+        .with_timers(quiet_timers());
+    let mut client = TestClient::new(*b"CLIENTID");
+    connect(&mut server, &mut client);
+
+    let mut dgrams = vec![client.renegotiate(1)];
+    client.pump_tls(&mut dgrams);
+    let mut replies = Vec::new();
+    for d in &dgrams {
+        replies.extend(server.handle_packet(d).unwrap().send);
+    }
+    assert_eq!(tls_packets(&replies), 0, "TLS before the reset was ACKed");
+    let reset = replies
+        .iter()
+        .map(|d| ControlPacket::parse(d).unwrap())
+        .find(|p| p.opcode == Opcode::CONTROL_SOFT_RESET_V1)
+        .expect("our soft reset");
+    let ack = ControlPacket::new(Opcode::ACK_V1, 1, *b"CLIENTID", reset.session_id);
+    let out = server.handle_packet(&ack.to_bytes(&[0])).unwrap();
+    assert!(tls_packets(&out.send) > 0, "the ACK releases the flight");
+}
+
 /// A new session that does prove the client got our answer -- the ACK of
 /// our hard reset -- takes over from one still negotiating: the client
 /// restarted and gave up on the old one.

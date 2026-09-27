@@ -1042,12 +1042,20 @@ impl KeyState {
         if self.reliable.held_len() > MAX_HELD_TLS {
             return Err(invalid("control channel send backlog exceeded"));
         }
-        // Whatever the send window has room for: ACKs arriving later open
-        // it, and this runs again for every packet received.
-        for pkt in self.reliable.flush_tls() {
-            // The ACKs we owe ride along, as many as fit each packet.
-            let acks = self.reliable.take_pending_acks();
-            out.send.push(pkt.to_bytes(&acks));
+        // No TLS goes out until the client has ACKed our reset (ssl.c moves
+        // TLS output to the reliable layer only from S_START): until then
+        // nothing shows the reset came from whoever receives at the
+        // address, and without tls-auth anyone can send one and a
+        // ClientHello, to have our whole flight -- many times their size,
+        // and retransmitted -- sent to a victim. Past that, whatever the
+        // send window has room for: ACKs arriving later open it, and this
+        // runs again for every packet received.
+        if self.reliable.reset_acked() {
+            for pkt in self.reliable.flush_tls() {
+                // The ACKs we owe ride along, as many as fit each packet.
+                let acks = self.reliable.take_pending_acks();
+                out.send.push(pkt.to_bytes(&acks));
+            }
         }
 
         // ACKs no control packet carried go in plain ACKs.
