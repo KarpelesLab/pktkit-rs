@@ -177,7 +177,7 @@ fn rewrite_sdp_outbound(nat: &Nat, sdp: &[u8], outside_addr: &str, inside_ip: Ip
 fn sip_rewrite_sdp_addr(sdp: &[u8], old_addr: &str, new_addr: &str) -> Vec<u8> {
     let old = format!("c=IN IP4 {}", old_addr).into_bytes();
     let new = format!("c=IN IP4 {}", new_addr).into_bytes();
-    replace_all(sdp, &old, &new)
+    replace_addr(sdp, &old, &new)
 }
 
 /// Parse an SDP `m=` media line, allocate an outside port, register RTP and
@@ -247,7 +247,7 @@ fn sip_rewrite_header(payload: &[u8], prefix: &[u8], old_val: &[u8], new_val: &[
         if !line[..prefix.len()].eq_ignore_ascii_case(prefix) {
             continue;
         }
-        let new_line = replace_all(line, old_val, new_val);
+        let new_line = replace_addr(line, old_val, new_val);
         if new_line != *line {
             *line = new_line;
             changed = true;
@@ -338,14 +338,24 @@ fn join_subslice(parts: &[Vec<u8>], sep: &[u8]) -> Vec<u8> {
     out
 }
 
-fn replace_all(data: &[u8], old: &[u8], new: &[u8]) -> Vec<u8> {
+/// Replace every occurrence of the address (or `address:port`) `old` that
+/// stands on its own. A plain substring match would also hit `10.0.0.50`,
+/// `110.0.0.5` or `10.0.0.5:50600` when rewriting `10.0.0.5` / `10.0.0.5:5060`,
+/// corrupting another host's address, so the bytes either side of a match must
+/// not continue the number.
+fn replace_addr(data: &[u8], old: &[u8], new: &[u8]) -> Vec<u8> {
     if old.is_empty() {
         return data.to_vec();
     }
     let mut out = Vec::with_capacity(data.len());
     let mut i = 0;
     while i < data.len() {
-        if i + old.len() <= data.len() && &data[i..i + old.len()] == old {
+        let end = i + old.len();
+        if end <= data.len()
+            && &data[i..end] == old
+            && (i == 0 || !(data[i - 1].is_ascii_digit() || data[i - 1] == b'.'))
+            && data.get(end).is_none_or(|b| !b.is_ascii_digit())
+        {
             out.extend_from_slice(new);
             i += old.len();
         } else {
@@ -497,6 +507,31 @@ Content-Length: {}\r\n\r\n{}",
             "RTP packet should reach inside via expectation"
         );
         assert_eq!(&inbound[0][16..20], &[10, 0, 0, 5]);
+    }
+
+    #[test]
+    fn sip_leaves_addresses_that_merely_contain_the_inside_one() {
+        let nat = Nat::new(pfx("10.0.0.1/24"), pfx("203.0.113.1/24"));
+        let h = SipHelper::new();
+        let body = b"REGISTER sip:reg SIP/2.0\r\n\
+Via: SIP/2.0/UDP 10.0.0.50:5060\r\n\
+Contact: <sip:a@110.0.0.5>\r\n\
+Content-Length: 0\r\n\r\n";
+        let pkt = build_sip_udp(
+            Ipv4Addr::new(10, 0, 0, 5),
+            5060,
+            Ipv4Addr::new(198, 51, 100, 9),
+            5060,
+            body,
+        );
+        let m = NatMapping {
+            proto: PROTO_UDP,
+            inside_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)),
+            inside_port: 5060,
+            outside_port: 20000,
+        };
+        let out = h.process_outbound(&nat, pkt.clone(), &m);
+        assert_eq!(out, pkt);
     }
 
     #[test]
