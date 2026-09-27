@@ -2069,10 +2069,15 @@ impl Conn {
     ///
     /// If data the application never read is still buffered, the connection
     /// is reset instead of closed (RFC 2525 §2.17, as Linux's `tcp_close`):
-    /// a FIN would tell the peer everything it sent was consumed.
+    /// a FIN would tell the peer everything it sent was consumed. Not in
+    /// TIME-WAIT, though: both sides have closed and ACKed, so a reset has
+    /// nothing left to abort and would only cut TIME-WAIT short (Linux's
+    /// socket is in CLOSE by then, where `tcp_close` sends nothing).
     pub fn release(&mut self) -> Vec<Vec<u8>> {
         self.released = true;
-        if self.recv_buf.as_ref().is_some_and(|rb| rb.readable() > 0) {
+        if !matches!(self.state, State::TimeWait | State::Closed)
+            && self.recv_buf.as_ref().is_some_and(|rb| rb.readable() > 0)
+        {
             return self.abort();
         }
         self.close()
@@ -3540,6 +3545,27 @@ mod tests {
         let (_, data) = server.write(b"still wanted");
         deliver(&mut client, &data);
         assert_eq!(read_all(&mut client), b"still wanted");
+    }
+
+    /// Unread data at release resets only a connection that is still
+    /// running. In TIME-WAIT both FINs are in and ACKed: there is nothing
+    /// left to abort, and TIME-WAIT must carry on, as Linux's tcp_close
+    /// does for a socket already in CLOSE.
+    #[test]
+    fn release_in_time_wait_with_unread_data_sends_nothing() {
+        let (mut client, mut server) = established(40383);
+        let fin = client.close();
+        let acks = deliver(&mut server, &fin);
+        deliver(&mut client, &acks);
+        let (_, data) = server.write(b"never read");
+        let mut out = data;
+        out.extend(server.close());
+        deliver(&mut client, &out);
+        assert_eq!(client.state(), State::TimeWait);
+
+        assert!(client.release().is_empty(), "reset from TIME-WAIT");
+        assert_eq!(client.state(), State::TimeWait);
+        assert!(client.time_wait_deadline.is_some());
     }
 
     /// A SYN numbered beyond the old connection may take over a 4-tuple in
