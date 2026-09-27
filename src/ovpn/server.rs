@@ -1481,7 +1481,10 @@ mod tests {
             let mut buf = [0u8; 2048];
             c.recv(&mut buf).is_ok()
         };
-        assert!(open_udp(&udp_client(&server), *b"REALPEER").1);
+        // Kept open: dropped, its port could be handed to a later client
+        // below, which would then hear the real peer's retransmissions.
+        let real = udp_client(&server);
+        assert!(open_udp(&real, *b"REALPEER").1);
         assert!(answered(*b"SPOOF-01"));
         assert!(answered(*b"SPOOF-02"));
         assert!(!answered(*b"SPOOF-03"), "over the limit");
@@ -1504,7 +1507,9 @@ mod tests {
         .max_peers(1)
         .connect_freq_initial((2, Duration::from_secs(600)));
         let server = Server::new(cfg).unwrap();
-        assert!(open_udp(&udp_client(&server), *b"REALPEER").1);
+        // Kept open, so its port is not reused by a client below.
+        let real = udp_client(&server);
+        assert!(open_udp(&real, *b"REALPEER").1);
 
         // A valid echo, replayed, while the table is full.
         let c = udp_client(&server);
