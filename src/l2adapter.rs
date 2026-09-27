@@ -635,12 +635,12 @@ impl crate::dhcp::ClientTransport for AdapterDhcpTransport {
         let Some(a) = self.weak.upgrade() else {
             return;
         };
-        {
-            let mut probe = a.probe.lock().unwrap();
-            if probe.is_none_or(|(p, _)| p != ip) {
-                *probe = Some((ip, false));
-            }
-        }
+        // Only begin_probe starts watching for a conflict. A probe can
+        // reach here late: after its check ended, or after a new client
+        // (start_dhcp again) began one for another address. Recording it
+        // would revive a check nothing is left to end, or wipe what the
+        // current one has found.
+
         // Sender address zero: the probe must not teach anyone's cache an
         // address we do not have yet.
         let payload = arp::build_packet(
@@ -1210,6 +1210,33 @@ mod tests {
         t.begin_probe(ip2);
         t.send_probe(ip2);
         assert!(!t.probe_conflict(ip2));
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn a_late_probe_leaves_the_check_alone() {
+        use crate::dhcp::ClientTransport;
+        let (_pipe, adapter, out) = rig("0.0.0.0/0");
+        let t = AdapterDhcpTransport {
+            weak: Arc::downgrade(&adapter),
+        };
+        let (old, new) = (Ipv4Addr::new(10, 0, 0, 50), Ipv4Addr::new(10, 0, 0, 51));
+        let other = MacAddr([2, 0, 0, 0, 0, 9]);
+
+        // After its check ended, it starts no new one.
+        t.begin_probe(old);
+        t.end_probe();
+        t.send_probe(old);
+        assert_eq!(take(&out).len(), 1, "the probe itself still goes out");
+        assert!(adapter.probe.lock().unwrap().is_none(), "check revived");
+
+        // Nor does it take over another address's check, or wipe what
+        // that one found.
+        t.begin_probe(new);
+        arp_in(&adapter, arp::OP_REPLY, other, [10, 0, 0, 51], [0, 0, 0, 0]);
+        t.send_probe(old);
+        assert!(t.probe_conflict(new), "the current check lost its conflict");
+        assert!(!t.probe_conflict(old));
     }
 
     #[cfg(feature = "dhcp")]

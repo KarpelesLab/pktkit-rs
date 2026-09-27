@@ -45,6 +45,17 @@ setters! {
 ///
 /// The callbacks run with no client lock held, so they may call back into
 /// the [`Client`].
+///
+/// They are made one at a time, in the order of the state changes behind
+/// them: an `on_bound` never overtakes the `on_lease_lost` of a
+/// [`stop`](Client::stop) that came after it. So a call into the client
+/// made from a callback, or from another thread while one is running, has
+/// its own callbacks made after that one returns, by whichever thread is
+/// making them: it may return before they are made. Those of a run that
+/// has since been stopped or restarted are dropped, except the ones that
+/// wind it up ([`on_lease_lost`](Self::on_lease_lost),
+/// [`end_probe`](Self::end_probe), a DHCPRELEASE or DHCPDECLINE); so
+/// `on_lease_lost` can come without the `on_bound` it would have followed.
 pub trait ClientTransport: Send + Sync + 'static {
     /// MAC to use as the client identifier and Ethernet source.
     fn mac(&self) -> MacAddr;
@@ -261,12 +272,32 @@ enum Event {
     Lost,
 }
 
+/// A transport call, worked out under the lock.
+enum Call {
+    Event(Event),
+    Out(Out),
+    EndProbe,
+}
+
+/// Transport calls not made yet. They are queued under the state lock, so
+/// in the order of the state changes behind them, and made by one thread at
+/// a time, so they reach the transport in that order.
+#[derive(Default)]
+struct Queue {
+    /// Each call with the run it belongs to, `None` if it is to be made even
+    /// once that run is over.
+    calls: std::collections::VecDeque<(Option<u64>, Call)>,
+    /// Some thread is making the calls.
+    busy: bool,
+}
+
 struct Shared {
     transport: Arc<dyn ClientTransport>,
     mac: MacAddr,
     /// [`ClientTransport::can_probe`], asked once.
     can_probe: bool,
     inner: Mutex<Inner>,
+    queue: Mutex<Queue>,
 }
 
 /// DHCP client state machine.
@@ -317,6 +348,7 @@ impl Client {
                     requested_at: None,
                     run: 0,
                 }),
+                queue: Mutex::new(Queue::default()),
             }),
         }
     }
@@ -333,21 +365,23 @@ impl Client {
     }
 
     fn begin(&self, timer_thread: bool) {
-        let (out, run, left) = {
+        let run = {
             let mut i = self.shared.inner.lock().unwrap();
             let left = Left::of(i.state);
             i.run += 1;
-            (i.restart(Instant::now()), i.run, left)
+            let out = i.restart(Instant::now());
+            // Starting over drops any lease held: the transport has to stop
+            // using its address, or it would keep it past the lease.
+            self.shared.queue_left(&i, left);
+            self.shared.queue(&i, [(Some(i.run), Call::Out(out))]);
+            i.run
         };
-        // Starting over drops any lease held: the transport has to stop
-        // using its address, or it would keep it past the lease.
-        self.shared.left(left);
         #[cfg(not(target_family = "wasm"))]
         if timer_thread {
             spawn_timer(&self.shared, run);
         }
         let _ = (timer_thread, run);
-        self.shared.send(out);
+        self.shared.deliver();
     }
 
     /// Cancel any pending operations. A lease held is given up:
@@ -370,7 +404,7 @@ impl Client {
     }
 
     fn halt(&self, release: bool) {
-        let (left, out) = {
+        {
             let mut i = self.shared.inner.lock().unwrap();
             let left = Left::of(i.state);
             let out = match (release && left.lease, i.offered_ip, i.server_ip) {
@@ -386,14 +420,14 @@ impl Client {
             i.lease = None;
             i.pending = None;
             i.next_tx = None;
-            (left, out)
-        };
-        // The RELEASE goes out first, from the address it gives up: once
-        // the transport hears the lease is lost it may unconfigure it.
-        if let Some(out) = out {
-            self.shared.send(out);
+            // The RELEASE goes out first, from the address it gives up: once
+            // the transport hears the lease is lost it may unconfigure it.
+            if let Some(out) = out {
+                self.shared.queue(&i, [(None, Call::Out(out))]);
+            }
+            self.shared.queue_left(&i, left);
         }
-        self.shared.left(left);
+        self.shared.deliver();
     }
 
     /// Process an inbound DHCP UDP payload (full BOOTP message).
@@ -407,12 +441,12 @@ impl Client {
         }
 
         let now = Instant::now();
-        let (event, out) = {
+        {
             let mut i = self.shared.inner.lock().unwrap();
             if i.xid != p.xid {
                 return;
             }
-            match (i.state, p.msg_type) {
+            let (event, out) = match (i.state, p.msg_type) {
                 // RFC 2131 Table 3: an OFFER and an ACK carry the address
                 // in yiaddr and a lease time. One without either grants
                 // nothing usable, and binding it would configure 0.0.0.0 or
@@ -472,12 +506,10 @@ impl Client {
                     (Some(Event::Lost), Some(i.restart(now)))
                 }
                 _ => (None, None),
-            }
-        };
-        self.shared.notify(event);
-        if let Some(out) = out {
-            self.shared.send(out);
+            };
+            self.shared.queue_step(&i, event, out);
         }
+        self.shared.deliver();
     }
 
     /// Run whatever timer has come due: retransmit an unanswered DISCOVER
@@ -508,13 +540,77 @@ impl Left {
 }
 
 impl Shared {
-    /// Tell the transport what leaving a state gave up. No lock held.
-    fn left(&self, left: Left) {
-        if left.probe {
-            self.transport.end_probe();
+    /// Queue transport calls. Taking the locked state makes sure they are
+    /// queued in the order of the state changes behind them.
+    fn queue(&self, _state: &Inner, calls: impl IntoIterator<Item = (Option<u64>, Call)>) {
+        self.queue.lock().unwrap().calls.extend(calls);
+    }
+
+    /// Queue what leaving a state gave up, to be told whatever follows.
+    fn queue_left(&self, i: &Inner, left: Left) {
+        let probe = left.probe.then_some((None, Call::EndProbe));
+        let lease = left.lease.then_some((None, Call::Event(Event::Lost)));
+        self.queue(i, probe.into_iter().chain(lease));
+    }
+
+    /// Queue what a transition produced. A lost lease and a DECLINE (which
+    /// ends the check) are told even once the run is over; a binding and
+    /// anything else sent only while it lasts.
+    fn queue_step(&self, i: &Inner, event: Option<Event>, out: Option<Out>) {
+        let run = |c: &Call| match c {
+            Call::Event(Event::Lost) | Call::Out(Out::Decline { .. }) => None,
+            _ => Some(i.run),
+        };
+        let calls = event.map(Call::Event).into_iter().chain(out.map(Call::Out));
+        self.queue(i, calls.map(|c| (run(&c), c)));
+    }
+
+    /// Make the queued transport calls, unless another thread (or a call
+    /// further up this one's stack) is making them already: it will make
+    /// these too, after its current one.
+    fn deliver(&self) {
+        {
+            let mut q = self.queue.lock().unwrap();
+            if q.busy {
+                return;
+            }
+            q.busy = true;
         }
-        if left.lease {
-            self.transport.on_lease_lost();
+        // Should a callback panic, the next call must not find the queue
+        // taken for good.
+        struct Unbusy<'a>(&'a Mutex<Queue>);
+        impl Drop for Unbusy<'_> {
+            fn drop(&mut self) {
+                if std::thread::panicking() {
+                    let mut q = self.0.lock().unwrap_or_else(|e| e.into_inner());
+                    q.busy = false;
+                }
+            }
+        }
+        let _unbusy = Unbusy(&self.queue);
+        loop {
+            let (run, call) = {
+                let mut q = self.queue.lock().unwrap();
+                match q.calls.pop_front() {
+                    Some(c) => c,
+                    None => {
+                        q.busy = false;
+                        return;
+                    }
+                }
+            };
+            // Of a run stopped or restarted since: that stop has queued the
+            // lease's loss behind this, but a binding it would undo, or a
+            // message for a transaction abandoned, need not happen at all.
+            if run.is_some_and(|r| self.inner.lock().unwrap().run != r) {
+                continue;
+            }
+            match call {
+                Call::Event(Event::Bound(prefix, gw)) => self.transport.on_bound(prefix, gw),
+                Call::Event(Event::Lost) => self.transport.on_lease_lost(),
+                Call::Out(out) => self.send(out),
+                Call::EndProbe => self.transport.end_probe(),
+            }
         }
     }
 
@@ -531,24 +627,14 @@ impl Shared {
             }
         };
         let conflict = probing.filter(|&(ip, _)| self.transport.probe_conflict(ip));
-        let (event, out) = {
+        {
             let mut i = self.inner.lock().unwrap();
             let conflict = conflict
                 .is_some_and(|(_, check)| i.state == State::Probing && i.probe_check == check);
-            step(&mut i, now, conflict)
-        };
-        self.notify(event);
-        if let Some(out) = out {
-            self.send(out);
+            let (event, out) = step(&mut i, now, conflict);
+            self.queue_step(&i, event, out);
         }
-    }
-
-    fn notify(&self, event: Option<Event>) {
-        match event {
-            Some(Event::Bound(prefix, gw)) => self.transport.on_bound(prefix, gw),
-            Some(Event::Lost) => self.transport.on_lease_lost(),
-            None => {}
-        }
+        self.deliver();
     }
 
     fn send(&self, out: Out) {
@@ -1471,5 +1557,61 @@ mod tests {
         assert!(sent(&r).is_empty());
         tick_after(&c, Duration::from_secs(11));
         assert_eq!(sent(&r)[0].2.msg_type, wire::MSG_DISCOVER);
+    }
+
+    /// A transport that logs its callbacks, and holds `on_bound` until let
+    /// go, so another thread can act while a binding is being delivered.
+    struct Gate {
+        log: Mutex<Vec<&'static str>>,
+        entered: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+    struct GateT(Arc<Gate>);
+    impl ClientTransport for GateT {
+        fn mac(&self) -> MacAddr {
+            MacAddr([2, 0, 0, 0, 0, 1])
+        }
+        fn send_broadcast(&self, _: &Frame) {}
+        fn send_unicast(&self, _: Ipv4Addr, _: &Frame) {}
+        fn on_bound(&self, _: IpPrefix, _: Option<Ipv4Addr>) {
+            if let Some(tx) = self.0.entered.lock().unwrap().take() {
+                tx.send(()).unwrap();
+                let rx = self.0.release.lock().unwrap().take().unwrap();
+                let _ = rx.recv_timeout(Duration::from_secs(5));
+            }
+            self.0.log.lock().unwrap().push("bound");
+        }
+        fn on_lease_lost(&self) {
+            self.0.log.lock().unwrap().push("lost");
+        }
+    }
+
+    #[test]
+    fn a_stop_during_a_binding_is_told_after_it() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let g = Arc::new(Gate {
+            log: Mutex::new(Vec::new()),
+            entered: Mutex::new(Some(entered_tx)),
+            release: Mutex::new(Some(release_rx)),
+        });
+        let c = Arc::new(Client::new(GateT(g.clone()), ClientConfig::default()));
+        let mac = MacAddr([2, 0, 0, 0, 0, 1]);
+        c.begin(false);
+        c.handle_packet(&make_offer(xid(&c), mac));
+        let ack = make_ack(xid(&c), mac);
+        let c2 = c.clone();
+        let t = std::thread::spawn(move || c2.handle_packet(&ack));
+
+        // The binding is on its way to the transport when the client stops.
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        c.stop();
+        release_tx.send(()).unwrap();
+        t.join().unwrap();
+        assert_eq!(
+            *g.log.lock().unwrap(),
+            ["bound", "lost"],
+            "the address outlived the stop"
+        );
     }
 }
