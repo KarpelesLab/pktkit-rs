@@ -1140,16 +1140,49 @@ struct EthtoolChannels {
     combined_count: u32,
 }
 
+/// `struct ethtool_rx_flow_spec`. Only its size matters here: it sits between
+/// the field `ETHTOOL_GRXRINGS` answers in and the end of the struct.
+#[repr(C)]
+#[derive(Default)]
+struct EthtoolRxFlowSpec {
+    flow_type: u32,
+    /// `union ethtool_flow_union h_u`.
+    h_u: [u32; 13],
+    /// `struct ethtool_flow_ext h_ext`.
+    h_ext: [u32; 5],
+    /// `union ethtool_flow_union m_u`.
+    m_u: [u32; 13],
+    /// `struct ethtool_flow_ext m_ext`.
+    m_ext: [u32; 5],
+    ring_cookie: u64,
+    location: u32,
+}
+
+/// `struct ethtool_rxnfc`, minus the flexible `rule_locs[]` no `GRXRINGS`
+/// reply uses.
+///
+/// Every field has to be here even though only `data` is read: the kernel
+/// copies the whole struct back for `ETHTOOL_GRXRINGS`, so a shorter buffer is
+/// overrun on the caller's stack.
 #[repr(C)]
 #[derive(Default)]
 struct EthtoolRxnfc {
     cmd: u32,
     flow_type: u32,
     data: u64,
-    // The kernel copies back only as much as the command produces; the rest of
-    // `struct ethtool_rxnfc` is not read for ETHTOOL_GRXRINGS.
-    _rest: [u64; 8],
+    fs: EthtoolRxFlowSpec,
+    /// `union { __u32 rule_cnt; __u32 rss_context; }`.
+    rule_cnt: u32,
 }
+
+// The kernel ABI (<linux/ethtool.h>), on the 64-bit targets XDP builds for.
+const _: () = {
+    assert!(std::mem::size_of::<EthtoolChannels>() == 36);
+    assert!(std::mem::size_of::<EthtoolRxFlowSpec>() == 168);
+    assert!(std::mem::offset_of!(EthtoolRxnfc, fs) == 16);
+    assert!(std::mem::offset_of!(EthtoolRxnfc, rule_cnt) == 184);
+    assert!(std::mem::size_of::<EthtoolRxnfc>() == 192);
+};
 
 /// Number of receive queues on `name`.
 ///
@@ -1541,6 +1574,15 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert!(e.to_string().contains("pin RX thread"), "{e}");
+    }
+
+    #[test]
+    fn ethtool_rxnfc_covers_everything_grxrings_copies_back() {
+        // ETHTOOL_GRXRINGS copies all of `struct ethtool_rxnfc` to the caller,
+        // header, flow spec and rule count alike; anything shorter is a stack
+        // overrun in `rx_queue_count`.
+        assert_eq!(std::mem::size_of::<EthtoolRxnfc>(), 192);
+        assert_eq!(std::mem::offset_of!(EthtoolRxnfc, data), 8);
     }
 
     #[test]
