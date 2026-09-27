@@ -1172,6 +1172,14 @@ impl Conn {
         }
 
         if !seg.payload.is_empty() {
+            // Released: nobody will ever read this, and ACKing it would tell
+            // the peer it was delivered. Linux resets instead
+            // (TCPABORTONDATA); it also stops a peer that keeps talking from
+            // holding the connection open past the FIN-WAIT-2 timeout.
+            let end = seg.seq.wrapping_add(seg.payload.len() as u32);
+            if self.released && seq_after(end, self.recv_buf.as_ref().unwrap().nxt()) {
+                return self.abort();
+            }
             self.process_data(seg);
             need_ack = true;
         }
@@ -2048,8 +2056,15 @@ impl Conn {
     ///
     /// Call it where a socket API would drop or fully close its socket:
     /// when the last handle goes away, or on an explicit full close.
+    ///
+    /// If data the application never read is still buffered, the connection
+    /// is reset instead of closed (RFC 2525 §2.17, as Linux's `tcp_close`):
+    /// a FIN would tell the peer everything it sent was consumed.
     pub fn release(&mut self) -> Vec<Vec<u8>> {
         self.released = true;
+        if self.recv_buf.as_ref().is_some_and(|rb| rb.readable() > 0) {
+            return self.abort();
+        }
         self.close()
     }
 
@@ -3438,6 +3453,38 @@ mod tests {
         }
     }
 
+    /// A released connection answers new data with a reset, and releasing
+    /// with unread data resets rather than closes (RFC 2525 §2.17).
+    #[test]
+    fn released_connections_reset_on_data() {
+        let (mut client, mut server) = established(40380);
+        let fin = client.release();
+        assert!(parse(&fin[0]).has_flag(flags::FIN));
+        deliver(&mut server, &fin);
+        let (_, data) = server.write(b"too late");
+        let out = deliver(&mut client, &data);
+        assert!(out.iter().any(|p| parse(p).has_flag(flags::RST)));
+        assert!(client.is_closed());
+
+        let (mut client, mut server) = established(40381);
+        let (_, data) = server.write(b"unread");
+        deliver(&mut client, &data);
+        let out = client.release();
+        assert!(
+            parse(&out[0]).has_flag(flags::RST),
+            "unread data: reset, not FIN"
+        );
+        assert!(client.is_closed());
+
+        // A plain half-close keeps receiving.
+        let (mut client, mut server) = established(40382);
+        let fin = client.close();
+        deliver(&mut server, &fin);
+        let (_, data) = server.write(b"still wanted");
+        deliver(&mut client, &data);
+        assert_eq!(read_all(&mut client), b"still wanted");
+    }
+
     /// A SYN numbered beyond the old connection may take over a 4-tuple in
     /// TIME-WAIT (RFC 6191); anything else may not.
     #[test]
@@ -3688,13 +3735,11 @@ mod tests {
         deliver(&mut client, &ack);
         assert_eq!(client.state(), State::FinWait2);
 
-        // A peer still sending keeps it open (a half-close is legitimate).
+        // Not yet at half the timeout. (Data from the peer would reset it at
+        // once: see released_connections_reset_on_data.)
         let half = client.cfg.fin_wait2_timeout.unwrap() / 2;
         client.last_recv = Instant::now() - half;
         assert!(client.tick().is_empty());
-        let (_, data) = server.write(b"still talking");
-        deliver(&mut client, &data);
-        assert_eq!(read_all(&mut client), b"still talking");
 
         client.last_recv = Instant::now() - client.cfg.fin_wait2_timeout.unwrap();
         let rst = client.tick();
