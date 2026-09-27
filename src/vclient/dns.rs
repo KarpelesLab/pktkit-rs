@@ -48,7 +48,7 @@ pub mod wire {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     /// Build a DNS query for `name`/`rtype` with transaction id `id`.
-    /// Returns `None` if any label exceeds 63 bytes (RFC 1035 §2.3.4).
+    /// Returns `None` if the name cannot be encoded (see [`encode_name`]).
     pub fn build_query(id: u16, name: &str, rtype: RecordType) -> Option<Vec<u8>> {
         let qname = encode_name(name)?;
         let mut pkt = Vec::with_capacity(12 + qname.len() + 4);
@@ -65,13 +65,18 @@ pub mod wire {
         Some(pkt)
     }
 
-    /// Encode a domain name in wire format. `None` if a label is too long.
+    /// Encode a domain name in wire format. `None` if it has an empty
+    /// label, a label over 63 octets, or is over 255 octets encoded
+    /// (RFC 1035 §2.3.4, §3.1). One trailing dot, marking the name as
+    /// absolute, is allowed.
     pub fn encode_name(name: &str) -> Option<Vec<u8>> {
         let name = name.strip_suffix('.').unwrap_or(name);
         let mut buf = Vec::with_capacity(name.len() + 2);
         if !name.is_empty() {
             for part in name.split('.') {
-                if part.len() > 63 {
+                // A zero length is the root label, which ends a name: one
+                // in the middle would cut the name short on the wire.
+                if part.is_empty() || part.len() > 63 {
                     return None;
                 }
                 buf.push(part.len() as u8);
@@ -79,7 +84,7 @@ pub mod wire {
             }
         }
         buf.push(0); // root label
-        Some(buf)
+        (buf.len() <= 255).then_some(buf)
     }
 
     /// Parse a DNS response, returning the A/AAAA addresses it carries.
@@ -299,7 +304,7 @@ impl Resolver {
     ) -> io::Result<Vec<IpAddr>> {
         let id = query_id();
         let query = wire::build_query(id, name, rtype)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "label too long"))?;
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid domain name"))?;
 
         let bind = if server.is_ipv6() {
             "[::]:0"
@@ -448,6 +453,25 @@ mod tests {
     fn encode_name_rejects_long_label() {
         let long = "a".repeat(64);
         assert!(wire::encode_name(&long).is_none());
+    }
+
+    #[test]
+    fn encode_name_rejects_empty_labels_and_long_names() {
+        for bad in ["a..com", ".com", "..", "a.com.."] {
+            assert!(wire::encode_name(bad).is_none(), "{bad:?}");
+        }
+        // The root, with or without its dot.
+        assert_eq!(wire::encode_name(".").unwrap(), b"\x00");
+        assert_eq!(wire::encode_name("").unwrap(), b"\x00");
+
+        // 4 labels of 63 octets and one of 1: 4 * 64 + 2 + 1 = 259 octets.
+        let label = "a".repeat(63);
+        let long = format!("{label}.{label}.{label}.{label}.b");
+        assert!(wire::encode_name(&long).is_none());
+        // 3 labels of 63 and one of 61: 3 * 64 + 62 + 1 = 255, the most.
+        let max = format!("{label}.{label}.{label}.{}", "a".repeat(61));
+        assert_eq!(wire::encode_name(&max).unwrap().len(), 255);
+        assert!(wire::encode_name(&format!("{max}.")).is_some());
     }
 
     #[test]
