@@ -29,6 +29,8 @@
 mod adapter;
 mod addr;
 mod consts;
+#[cfg(not(target_family = "wasm"))]
+mod cookie;
 mod data;
 mod keys;
 mod opcode;

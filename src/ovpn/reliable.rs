@@ -244,6 +244,15 @@ impl Reliable {
         self.build_reset(Opcode::CONTROL_HARD_RESET_SERVER_V2)
     }
 
+    /// Count the hard resets as exchanged without this transport having
+    /// seen either: the peer's reset (packet 0) as received, and ours as
+    /// sent and acknowledged. For a session opened after the server answered
+    /// the client's reset statelessly (ssl.c session_skip_to_pre_start).
+    pub fn skip_reset(&mut self) {
+        self.out_counter = self.out_counter.max(1);
+        self.in_counter = self.in_counter.max(1);
+    }
+
     /// Build the P_CONTROL_SOFT_RESET_V1 that opens a renegotiated key's
     /// stream.
     pub fn build_soft_reset(&mut self) -> ControlPacket {

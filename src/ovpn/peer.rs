@@ -306,6 +306,23 @@ impl Peer {
             .is_ok_and(|p| p.pid == Some(0) && p.session_id != [0; 8] && p.acked_pids.is_empty())
     }
 
+    /// Open the peer's first session for a client whose hard reset was
+    /// answered statelessly, and which has since proved it got the answer
+    /// (OpenVPN 2.6's HMAC session id; ssl.c session_skip_to_pre_start).
+    /// The local session id given to [`new`](Self::new) must be the one the
+    /// answer carried, and `remote_id` is the client's. The hard resets
+    /// then count as exchanged: pass the client's packet that proved it to
+    /// [`handle_packet`](Self::handle_packet) next.
+    pub fn open_after_stateless_reset(&mut self, remote_id: [u8; 8]) -> io::Result<()> {
+        let local_id = self
+            .first_local_id
+            .ok_or_else(|| invalid("the peer already opened a session"))?;
+        let session = Session::after_reset(&self.config, local_id, remote_id, self.timers)?;
+        self.first_local_id = None;
+        self.initial = Some(session);
+        Ok(())
+    }
+
     /// Replace the default timers.
     pub fn with_timers(mut self, timers: PeerTimers) -> Peer {
         self.timers = timers;
@@ -884,23 +901,37 @@ impl Session {
     ) -> io::Result<(Session, ControlPacket)> {
         let mut ks = KeyState::new(config, 0, local_id, remote_id, &timers, Instant::now())?;
         let reset = ks.reliable.build_hard_reset();
-        Ok((
-            Session {
-                local_id,
-                remote_id,
-                primary: ks,
-                lame: None,
-                next_key_id: 1,
-                opts: None,
-                peer_cfg: None,
-                layer: 3,
-                peer_info: HashMap::new(),
-                timers,
-                auth_failed: None,
-                pushed_cipher: None,
-            },
-            reset,
-        ))
+        Ok((Session::with_key(ks, timers), reset))
+    }
+
+    /// Open a session whose hard resets were exchanged statelessly: the
+    /// client's reset was answered, ours acknowledged.
+    fn after_reset(
+        config: &purecrypto::tls::Config,
+        local_id: [u8; 8],
+        remote_id: [u8; 8],
+        timers: PeerTimers,
+    ) -> io::Result<Session> {
+        let mut ks = KeyState::new(config, 0, local_id, remote_id, &timers, Instant::now())?;
+        ks.reliable.skip_reset();
+        Ok(Session::with_key(ks, timers))
+    }
+
+    fn with_key(ks: KeyState, timers: PeerTimers) -> Session {
+        Session {
+            local_id: ks.reliable.local_id,
+            remote_id: ks.reliable.peer_id,
+            primary: ks,
+            lame: None,
+            next_key_id: 1,
+            opts: None,
+            peer_cfg: None,
+            layer: 3,
+            peer_info: HashMap::new(),
+            timers,
+            auth_failed: None,
+            pushed_cipher: None,
+        }
     }
 
     /// Whether the server should start a renegotiation itself: the key in

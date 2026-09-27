@@ -7,6 +7,10 @@
 //! written back on the same socket, and any decrypted data-channel payload is
 //! handed to the configured callbacks.
 //!
+//! Over UDP, a client's first packet is answered statelessly, as OpenVPN 2.6
+//! does: its peer only comes into being once it echoes the session id that
+//! answer carried (see the `cookie` module).
+//!
 //! Concurrency follows the crate conventions: one reader thread for UDP and one
 //! acceptor thread for TCP (plus a reader and a writer thread per TCP
 //! connection). Peers live in `Arc<Mutex<Peer>>` so the reader threads and
@@ -22,6 +26,8 @@ use std::thread::{self, ThreadId};
 use std::time::Duration;
 
 use super::addr::{PeerKey, Transport};
+use super::cookie::{Cookies, RateLimit};
+use super::packet_ctrl::ControlPacket;
 use super::peer::{AuthRequest, OnAuth, Peer, PeerConfig, PeerOutput, PeerTimers};
 
 /// Callback fired for each decrypted data-channel payload. Receives the peer
@@ -68,8 +74,8 @@ pub struct ServerConfig {
     pub on_connect: Option<OnConnect>,
     /// Optional disconnect notification.
     pub on_disconnect: Option<OnDisconnect>,
-    /// Most peers (UDP and TCP together) held at once; a client hard reset
-    /// beyond it is dropped. Default 1024.
+    /// Most peers (UDP and TCP together) held at once; a client beyond it is
+    /// not served. Default 1024.
     pub max_peers: usize,
     /// Most TCP connections served at once; each has two threads, a reader
     /// and a writer. Default 256.
@@ -77,12 +83,20 @@ pub struct ServerConfig {
     /// Each peer's timers: handshake window, keepalive, renegotiation.
     /// Defaults to OpenVPN's (see [`PeerTimers`]).
     pub timers: PeerTimers,
+    /// At most this many answers to UDP clients' first packets per period
+    /// (OpenVPN's `connect-freq-initial`, default 100 per 10 s). The first
+    /// answer goes to an address nobody has vouched for yet, so this bounds
+    /// how much the server can be made to reflect at a spoofed victim.
+    /// Clients that complete the handshake are not counted.
+    pub connect_freq_initial: (u32, Duration),
 }
 
 /// Default [`ServerConfig::max_peers`].
 pub(super) const DEFAULT_MAX_PEERS: usize = 1024;
 /// Default [`ServerConfig::max_tcp_connections`].
 pub(super) const DEFAULT_MAX_TCP_CONNECTIONS: usize = 256;
+/// Default [`ServerConfig::connect_freq_initial`].
+const DEFAULT_CONNECT_FREQ_INITIAL: (u32, Duration) = (100, Duration::from_secs(10));
 
 setters! {
     ServerConfig {
@@ -91,6 +105,7 @@ setters! {
         set max_peers: usize;
         set max_tcp_connections: usize;
         set timers: PeerTimers;
+        set connect_freq_initial: (u32, Duration);
     }
 }
 
@@ -112,6 +127,7 @@ impl ServerConfig {
             max_peers: DEFAULT_MAX_PEERS,
             max_tcp_connections: DEFAULT_MAX_TCP_CONNECTIONS,
             timers: PeerTimers::default(),
+            connect_freq_initial: DEFAULT_CONNECT_FREQ_INITIAL,
         }
     }
 }
@@ -199,6 +215,10 @@ pub struct Server {
     loops: Mutex<Vec<SocketLoop>>,
     /// The server itself, for the threads it starts along the way.
     me: Weak<Server>,
+    /// Session ids for stateless answers to UDP clients' first packets.
+    cookies: Cookies,
+    /// Bounds those answers (`connect_freq_initial`).
+    initial_limit: Mutex<RateLimit>,
 }
 
 /// A thread serving a listening socket.
@@ -267,8 +287,13 @@ impl Server {
         // A blocking accept cannot be interrupted portably; poll instead.
         tcp.set_nonblocking(true)?;
 
+        let cookies = Cookies::new(cfg.timers.handshake_window);
+        let (max, period) = cfg.connect_freq_initial;
+        let initial_limit = Mutex::new(RateLimit::new(max, period));
         let server = Arc::new_cyclic(|me| Server {
             me: me.clone(),
+            cookies,
+            initial_limit,
             cfg,
             udp: RwLock::new(Some(Arc::new(udp))),
             tcp_addr,
@@ -359,17 +384,42 @@ impl Server {
         let key = PeerKey::new(src, Transport::Udp);
         let entry = match self.get_peer(&key) {
             Some(e) => e,
-            // Only a client hard reset may allocate state for a new
-            // address; anything else from a stranger is dropped.
-            None if Peer::is_session_start(data) => {
-                match self.create_peer(key, Transport::Udp, src, None) {
-                    Some(e) => e,
-                    None => return,
-                }
-            }
-            None => return,
+            None => match self.handle_stranger(data, src) {
+                Some(e) => e,
+                None => return,
+            },
         };
         self.dispatch(&entry, data);
+    }
+
+    /// A datagram from an address without a peer (mudp.c
+    /// do_pre_decrypt_check). A client hard reset is answered without
+    /// keeping any state (see [`super::cookie`]); the peer is only created
+    /// -- and returned, for the datagram to be dispatched to -- when the
+    /// client echoes the session id that answer gave it. Anything else is
+    /// dropped.
+    fn handle_stranger(&self, data: &[u8], src: SocketAddr) -> Option<Arc<PeerEntry>> {
+        let now = crate::time::Instant::now();
+        if Peer::is_session_start(data) {
+            let reset = ControlPacket::parse(data).ok()?;
+            if self.initial_limit.lock().unwrap().allow(now) {
+                let reply = self.cookies.reply(&reset, src, now);
+                if let Some(udp) = self.udp.read().unwrap().as_ref() {
+                    let _ = udp.send_to(&reply, src);
+                }
+            }
+            return None;
+        }
+        let pkt = ControlPacket::parse(data).ok()?;
+        if !self.cookies.check(&pkt, src, now) {
+            return None;
+        }
+        // A completed three-way handshake does not count against the
+        // limit on replies to strangers.
+        self.initial_limit.lock().unwrap().refund();
+        let key = PeerKey::new(src, Transport::Udp);
+        let ids = (pkt.remote_id, pkt.session_id);
+        self.create_peer(key, Transport::Udp, src, None, Some(ids))
     }
 
     fn accept_tcp(&self, weak: &Weak<Server>, stream: TcpStream, addr: SocketAddr) {
@@ -426,12 +476,16 @@ impl Server {
 
     /// Add a peer for `key`, or return the one already there. `None` when
     /// the peer table is full.
+    ///
+    /// `stateless` is for a UDP client whose hard reset was answered
+    /// statelessly: our session id from that answer and the client's.
     fn create_peer(
         &self,
         key: PeerKey,
         transport: Transport,
         addr: SocketAddr,
         tcp: Option<TcpOut>,
+        stateless: Option<([u8; 8], [u8; 8])>,
     ) -> Option<Arc<PeerEntry>> {
         let mut peers = self.peers.write().unwrap();
         if let Some(e) = peers.get(&key) {
@@ -440,19 +494,28 @@ impl Server {
         if peers.len() >= self.cfg.max_peers {
             return None;
         }
-        let mut local_id = [0u8; 8];
-        let _ = super::peer::fill_random(&mut local_id);
+        let local_id = match stateless {
+            Some((ours, _)) => ours,
+            None => {
+                let mut id = [0u8; 8];
+                let _ = super::peer::fill_random(&mut id);
+                id
+            }
+        };
         // Server::new checked the TLS config, so this does not fail in
         // practice; if it does, the client is just not served.
-        let peer = Peer::new(
+        let mut peer = Peer::new(
             self.cfg.tls_config.clone(),
             local_id,
             self.cfg.on_auth.clone(),
         )
         .ok()?
         .with_timers(self.cfg.timers)
-        // on_auth runs on a thread of its own: see dispatch.
+        // on_auth runs on a thread of its own: see start_auth.
         .deferred_auth();
+        if let Some((_, theirs)) = stateless {
+            peer.open_after_stateless_reset(theirs).ok()?;
+        }
         let entry = Arc::new(PeerEntry {
             peer: Mutex::new(peer),
             transport,
@@ -716,7 +779,7 @@ fn tcp_conn(server: &Weak<Server>, stream: TcpStream, addr: SocketAddr) {
     let Ok(out) = TcpOut::spawn(write_half, idle) else {
         return;
     };
-    let Some(entry) = s.create_peer(key, Transport::Tcp, addr, Some(out)) else {
+    let Some(entry) = s.create_peer(key, Transport::Tcp, addr, Some(out), None) else {
         return;
     };
     s.dispatch(&entry, &first);
@@ -806,6 +869,21 @@ mod tests {
         ControlPacket::parse(&buf[..n]).unwrap()
     }
 
+    /// Open a session from `c` as a client does: a hard reset, then the ACK
+    /// of the server's (stateless) answer. Then repeat the reset, which a
+    /// peer holding the session answers with a bare ACK. Returns the
+    /// server's session id, and whether a peer answered.
+    fn open_udp(c: &UdpSocket, sid: [u8; 8]) -> ([u8; 8], bool) {
+        c.send(&client_reset(sid)).unwrap();
+        let first = recv_ctrl(c);
+        assert_eq!(first.opcode, Opcode::CONTROL_HARD_RESET_SERVER_V2);
+        let ack = ControlPacket::new(Opcode::ACK_V1, 0, sid, first.session_id);
+        c.send(&ack.to_bytes(&[0])).unwrap();
+        c.send(&client_reset(sid)).unwrap();
+        let again = recv_ctrl(c);
+        (first.session_id, again.opcode == Opcode::ACK_V1)
+    }
+
     /// Junk from a peer's address -- a truncated control packet, a data
     /// packet before any key exists, a control packet far outside the
     /// receive window, an unknown opcode -- is dropped. It must not tear
@@ -816,10 +894,8 @@ mod tests {
         let server = test_server();
         let c = udp_client(&server);
         let sid = *b"CLIENT01";
-        c.send(&client_reset(sid)).unwrap();
-        let first = recv_ctrl(&c);
-        assert_eq!(first.opcode, Opcode::CONTROL_HARD_RESET_SERVER_V2);
-        let server_sid = first.session_id;
+        let (server_sid, served) = open_udp(&c, sid);
+        assert!(served);
 
         let mut far = ControlPacket::new(Opcode::CONTROL_V1, 0, sid, [0; 8]);
         far.set_pid(1000);
@@ -842,6 +918,76 @@ mod tests {
                 break;
             }
         }
+        server.close();
+    }
+
+    /// A client's first packet is answered without keeping any state
+    /// (OpenVPN 2.6's HMAC session-id cookie): anyone can send one from any
+    /// address, so it must cost neither a peer slot nor a TLS connection.
+    /// The peer only comes into being once the client proves it received
+    /// the answer by echoing our session id -- a forged echo does nothing.
+    #[test]
+    fn first_packet_is_answered_statelessly() {
+        let server = test_server();
+        let c = udp_client(&server);
+        c.send(&client_reset(*b"CLIENT01")).unwrap();
+        let reply = recv_ctrl(&c);
+        assert_eq!(reply.opcode, Opcode::CONTROL_HARD_RESET_SERVER_V2);
+        assert_eq!(reply.pid, Some(0));
+        assert_eq!(reply.acked_pids, vec![0]);
+        assert_eq!(reply.remote_id, *b"CLIENT01");
+        assert_eq!(server.peers.read().unwrap().len(), 0);
+
+        // An echo of a session id we did not hand out.
+        let bogus = ControlPacket::new(Opcode::ACK_V1, 0, *b"CLIENT01", *b"GUESSED!");
+        c.send(&bogus.to_bytes(&[0])).unwrap();
+        // The same client with a different session id is answered with a
+        // different server session id: it cannot reuse the one it got.
+        c.send(&client_reset(*b"CLIENT02")).unwrap();
+        let other = recv_ctrl(&c);
+        assert_ne!(other.session_id, reply.session_id);
+        let reuse = ControlPacket::new(Opcode::ACK_V1, 0, *b"CLIENT02", reply.session_id);
+        c.send(&reuse.to_bytes(&[0])).unwrap();
+        c.send(&client_reset(*b"CLIENT03")).unwrap();
+        recv_ctrl(&c);
+        assert_eq!(server.peers.read().unwrap().len(), 0);
+
+        // The real echo: the ACK of our reset, naming our session id.
+        let ack = ControlPacket::new(Opcode::ACK_V1, 0, *b"CLIENT01", reply.session_id);
+        c.send(&ack.to_bytes(&[0])).unwrap();
+        c.send(&client_reset(*b"CLIENT04")).unwrap();
+        recv_ctrl(&c);
+        assert_eq!(server.peers.read().unwrap().len(), 1);
+        server.close();
+    }
+
+    /// Stateless answers are rate-limited (connect-freq-initial), so the
+    /// server cannot be made to reflect a flood of spoofed resets; a client
+    /// that completes the handshake gives its answer back to the budget.
+    #[test]
+    fn stateless_answers_are_rate_limited() {
+        let on_auth: OnAuth = Arc::new(|_| Err(io::Error::other("no auth in this test")));
+        let on_data: OnData = Arc::new(|_, _, _| {});
+        let cfg = ServerConfig::new(
+            crate::ovpn::tests::server_config(),
+            "127.0.0.1:0".parse().unwrap(),
+            on_auth,
+            on_data,
+        )
+        .connect_freq_initial((2, Duration::from_secs(600)));
+        let server = Server::new(cfg).unwrap();
+        let answered = |sid: [u8; 8]| {
+            let c = udp_client(&server);
+            c.set_read_timeout(Some(Duration::from_millis(300)))
+                .unwrap();
+            c.send(&client_reset(sid)).unwrap();
+            let mut buf = [0u8; 2048];
+            c.recv(&mut buf).is_ok()
+        };
+        assert!(open_udp(&udp_client(&server), *b"REALPEER").1);
+        assert!(answered(*b"SPOOF-01"));
+        assert!(answered(*b"SPOOF-02"));
+        assert!(!answered(*b"SPOOF-03"), "over the limit");
         server.close();
     }
 
@@ -875,8 +1021,7 @@ mod tests {
         // Sync on a real client being answered: the datagrams above were
         // read before its reset.
         let c = udp_client(&server);
-        c.send(&client_reset(*b"CLIENT01")).unwrap();
-        recv_ctrl(&c);
+        assert!(open_udp(&c, *b"CLIENT01").1);
         assert_eq!(server.peers.read().unwrap().len(), 1);
         server.close();
     }
@@ -1374,8 +1519,7 @@ mod tests {
         let mut client = TestClient::new(*b"CLIENTID");
         connect_udp(&sock, &mut client);
         let half = udp_client(&server);
-        half.send(&client_reset(*b"HALFOPEN")).unwrap();
-        recv_ctrl(&half);
+        assert!(open_udp(&half, *b"HALFOPEN").1);
         assert_eq!(server.peers.read().unwrap().len(), 2);
         assert_eq!(connects.load(Ordering::SeqCst), 1);
 
@@ -1455,16 +1599,12 @@ mod tests {
         let server = Server::new(cfg).unwrap();
         let clients: Vec<UdpSocket> = (0..3).map(|_| udp_client(&server)).collect();
         for (i, c) in clients.iter().take(2).enumerate() {
-            c.send(&client_reset([b'A' + i as u8; 8])).unwrap();
-            recv_ctrl(c);
+            assert!(open_udp(c, [b'A' + i as u8; 8]).1);
         }
-        let third = &clients[2];
-        third
-            .set_read_timeout(Some(Duration::from_millis(300)))
-            .unwrap();
-        third.send(&client_reset(*b"CCCCCCCC")).unwrap();
-        let mut buf = [0u8; 2048];
-        assert!(third.recv(&mut buf).is_err(), "third peer must be refused");
+        assert!(
+            !open_udp(&clients[2], *b"CCCCCCCC").1,
+            "third peer must be refused"
+        );
         assert_eq!(server.peers.read().unwrap().len(), 2);
         server.close();
     }

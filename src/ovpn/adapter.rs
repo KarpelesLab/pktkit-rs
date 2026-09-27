@@ -434,15 +434,24 @@ mod tests {
         p.to_bytes(&[])
     }
 
-    /// Whether the server answers a hard reset from a fresh address.
+    /// Whether a client from a fresh address gets a peer: the server's
+    /// first answer is stateless, so the client completes the three-way
+    /// handshake, then repeats its reset -- which only a peer that holds
+    /// it as its packet 0 answers with a bare ACK.
     fn answers(adapter: &Adapter, sid: [u8; 8]) -> bool {
         let s = UdpSocket::bind("127.0.0.1:0").unwrap();
         s.connect(adapter.local_addr().unwrap()).unwrap();
         s.set_read_timeout(Some(Duration::from_millis(500)))
             .unwrap();
-        s.send(&client_reset(sid)).unwrap();
         let mut buf = [0u8; 2048];
-        s.recv(&mut buf).is_ok()
+        s.send(&client_reset(sid)).unwrap();
+        let n = s.recv(&mut buf).unwrap();
+        let reply = ControlPacket::parse(&buf[..n]).unwrap();
+        let ack = ControlPacket::new(Opcode::ACK_V1, 0, sid, reply.session_id);
+        s.send(&ack.to_bytes(&[0])).unwrap();
+        s.send(&client_reset(sid)).unwrap();
+        let n = s.recv(&mut buf).unwrap();
+        ControlPacket::parse(&buf[..n]).unwrap().opcode == Opcode::ACK_V1
     }
 
     /// The server's limits are the adapter's to set: here, a one-peer cap

@@ -205,7 +205,13 @@ impl TestClient {
     }
 
     fn pump_tls(&mut self, send: &mut Vec<Vec<u8>>) {
-        let tls_out = self.tls.pop().expect("client tls pop");
+        // As an OpenVPN client, start TLS only once the server has answered
+        // the hard reset: until then there is no session to send it on.
+        let tls_out = if self.reliable.peer_id == [0; 8] {
+            Vec::new()
+        } else {
+            self.tls.pop().expect("client tls pop")
+        };
         if !tls_out.is_empty() {
             let chunks = self.reliable.chunk_tls_stream(&tls_out);
             for (i, pkt) in chunks.iter().enumerate() {
