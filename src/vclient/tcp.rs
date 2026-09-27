@@ -364,6 +364,19 @@ const ACCEPT_QUEUE_CAP: usize = 128;
 const HALF_OPEN_CAP: usize = 128;
 
 impl ListenerState {
+    /// Whether a SYN to `dst` is for this listener: one bound to an
+    /// address takes connections to that address alone, and one bound to
+    /// the unspecified address those to the client's own (`ours`) in the
+    /// same family. Anything else would answer for addresses that are not
+    /// ours, and hand the application connections it never listened for.
+    fn accepts(&self, dst: IpAddr, ours: IpAddr) -> bool {
+        if self.local_ip.is_unspecified() {
+            dst == ours && !ours.is_unspecified() && dst.is_ipv4() == self.local_ip.is_ipv4()
+        } else {
+            dst == self.local_ip
+        }
+    }
+
     /// Mark closed, reset what was waiting to be accepted, and wake `accept`.
     fn shut(&self) {
         let pending: Vec<TcpConn> = {
@@ -699,7 +712,13 @@ impl TcpStack {
 
         // No connection yet: a bare SYN to a registered listener opens one.
         if seg.has_flag(flags::SYN) && !seg.has_flag(flags::ACK) {
-            let listener = self.listeners.lock().unwrap().get(&seg.dst_port).cloned();
+            let listener = self
+                .listeners
+                .lock()
+                .unwrap()
+                .get(&seg.dst_port)
+                .filter(|l| l.accepts(dst, ours))
+                .cloned();
             if let Some(listener) = listener {
                 // A full backlog drops the SYN, as Linux does: the peer
                 // retransmits, and by then a slot may have freed up.
@@ -1050,6 +1069,43 @@ mod tests {
             stack.handle_inbound(Packet::from_slice(&inbound(syn)), IpAddr::V4(US));
         }
         assert_eq!(stack.conns.lock().unwrap().len(), HALF_OPEN_CAP);
+    }
+
+    #[test]
+    fn listener_answers_only_for_its_own_address() {
+        let (stack, out) = capturing_stack();
+        let _listener = stack.listen(IpAddr::V4(US), 80).unwrap();
+        let syn = Segment {
+            src_port: 4000,
+            dst_port: 80,
+            seq: 1,
+            flags: flags::SYN,
+            ..Default::default()
+        };
+        for dst in [Ipv4Addr::new(10, 0, 0, 9), Ipv4Addr::BROADCAST] {
+            let pkt = wrap_v4(PEER, dst, &syn.marshal());
+            stack.handle_inbound(Packet::from_slice(&pkt), IpAddr::V4(US));
+        }
+        assert!(stack.conns.lock().unwrap().is_empty());
+        assert!(
+            out.lock().unwrap().is_empty(),
+            "answered for another address"
+        );
+        stack.handle_inbound(Packet::from_slice(&inbound(syn.clone())), IpAddr::V4(US));
+        assert_eq!(stack.conns.lock().unwrap().len(), 1);
+
+        // Bound to the unspecified address: the client's own address, in
+        // the listener's family, and nothing else.
+        let (stack, _out) = capturing_stack();
+        let _listener = stack.listen(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 80).unwrap();
+        let v6 = |dst: Ipv6Addr| wrap_v6("fd00::1".parse().unwrap(), dst, &syn.marshal());
+        let ours6: Ipv6Addr = "fd00::2".parse().unwrap();
+        stack.handle_inbound(Packet::from_slice(&v6(ours6)), IpAddr::V6(ours6));
+        let elsewhere = wrap_v4(PEER, Ipv4Addr::new(10, 0, 0, 9), &syn.marshal());
+        stack.handle_inbound(Packet::from_slice(&elsewhere), IpAddr::V4(US));
+        assert!(stack.conns.lock().unwrap().is_empty());
+        stack.handle_inbound(Packet::from_slice(&inbound(syn)), IpAddr::V4(US));
+        assert_eq!(stack.conns.lock().unwrap().len(), 1);
     }
 
     #[test]
