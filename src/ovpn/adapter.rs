@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, Weak};
 
 use super::addr::PeerKey;
@@ -273,6 +273,9 @@ struct PeerL3Device {
     key: PeerKey,
     handler: Mutex<Option<L3Handler>>,
     addr: Mutex<IpPrefix>,
+    /// The tunnel address pushed to the client: the only source its
+    /// packets may carry.
+    client_ip: IpAddr,
 }
 
 impl PeerL3Device {
@@ -282,12 +285,23 @@ impl PeerL3Device {
             key,
             handler: Mutex::new(None),
             addr: Mutex::new(addr),
+            client_ip: addr.addr(),
         })
     }
 
     fn deliver(&self, data: &[u8]) {
+        let packet = crate::Packet::from_slice(data);
+        // A client may only speak for the address it was given (multi.c
+        // multi_process_incoming_link, "bad source address from client"):
+        // otherwise it could pass for another client, or for any host at
+        // all, to whatever the connector leads to. An IPv6 packet from a
+        // client given an IPv4 address, link-local ones included, has no
+        // address of its own to come from either.
+        if !packet.is_valid() || packet.src_addr() != Some(self.client_ip) {
+            return;
+        }
         if let Some(h) = self.handler.lock().unwrap().clone() {
-            let _ = h(crate::Packet::from_slice(data));
+            let _ = h(packet);
         }
     }
 }
@@ -452,6 +466,53 @@ mod tests {
         s.send(&client_reset(sid)).unwrap();
         let n = s.recv(&mut buf).unwrap();
         ControlPacket::parse(&buf[..n]).unwrap().opcode == Opcode::ACK_V1
+    }
+
+    /// A tun client may only send from the address it was given: anything
+    /// else -- another client's address, one outside the tunnel, IPv6 when
+    /// it was given none, a truncated packet -- is dropped, as OpenVPN
+    /// drops it ("bad source address from client").
+    #[test]
+    fn packets_from_a_foreign_source_are_dropped() {
+        let key = PeerKey::new(
+            "192.0.2.1:1194".parse().unwrap(),
+            crate::ovpn::Transport::Udp,
+        );
+        let prefix = IpPrefix::new("10.8.0.2".parse().unwrap(), 24);
+        let dev = PeerL3Device::new(&Weak::new(), key, prefix);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        {
+            let seen = seen.clone();
+            dev.set_handler(Arc::new(move |p: &crate::Packet| {
+                seen.lock().unwrap().push(p.as_bytes().to_vec());
+                Ok(())
+            }));
+        }
+        let v4 = |src: [u8; 4]| {
+            let mut p = vec![0u8; 20];
+            p[0] = 0x45;
+            p[3] = 20;
+            p[12..16].copy_from_slice(&src);
+            p[16..20].copy_from_slice(&[10, 8, 0, 1]);
+            p
+        };
+        let mut v6 = vec![0u8; 40];
+        v6[0] = 0x60;
+        v6[8] = 0xfe;
+        v6[9] = 0x80;
+        v6[23] = 1;
+        for p in [
+            v4([10, 8, 0, 3]),
+            v4([192, 0, 2, 1]),
+            v6,
+            vec![0x45, 0, 0, 20],
+            Vec::new(),
+        ] {
+            dev.deliver(&p);
+        }
+        assert!(seen.lock().unwrap().is_empty());
+        dev.deliver(&v4([10, 8, 0, 2]));
+        assert_eq!(seen.lock().unwrap().len(), 1);
     }
 
     /// The server's limits are the adapter's to set: here, a one-peer cap
