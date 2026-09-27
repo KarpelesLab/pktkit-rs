@@ -809,11 +809,22 @@ impl Stack {
                     .lock()
                     .expect("poisoned")
                     .push_v6(Instant::now(), ns, pkt, frag_off);
+            // Reassembly happens once (RFC 8200 §4.5). A rebuilt packet
+            // that still carries a Fragment header is not a datagram but a
+            // nesting trick: unwrapping it again would recurse, and copy
+            // up to 64 KiB, once per 8-byte header.
             return match whole {
-                Some(p) => Self::handle_ipv6(inner, ns, &p),
-                None => Ok(()),
+                Some(p) if ipv6_fragment_header(&p).is_none() => {
+                    Self::handle_ipv6_datagram(inner, ns, &p)
+                }
+                _ => Ok(()),
             };
         }
+        Self::handle_ipv6_datagram(inner, ns, pkt)
+    }
+
+    /// Dispatch a whole (unfragmented or reassembled) IPv6 packet.
+    fn handle_ipv6_datagram(inner: &Arc<Inner>, ns: u64, pkt: &[u8]) -> Result<()> {
         let next_header = pkt[6];
         let mut src = [0u8; 16];
         let mut dst = [0u8; 16];
@@ -2226,5 +2237,57 @@ mod tests {
         assert_eq!(received, payload, "echoed payload mismatch");
 
         let _ = stack.shutdown();
+    }
+
+    /// An IPv6 echo request to `fd00::1` whose Fragmentable Part starts with
+    /// `inner` (extension headers, `next` naming what follows them), padded
+    /// so it needs fragmenting; returned as the fragments the guest sends.
+    fn v6_echo_behind(first_next: u8, inner: &[u8], pad: usize) -> Vec<Vec<u8>> {
+        let mut body = inner.to_vec();
+        body.extend_from_slice(&[128, 0, 0, 0, 0, 1, 0, 1]);
+        body.resize(body.len() + pad, 0x5A);
+        let mut p = vec![0u8; 40];
+        p[0] = 0x60;
+        p[4..6].copy_from_slice(&(body.len() as u16).to_be_bytes());
+        p[6] = first_next;
+        p[7] = 64;
+        p[8..24].copy_from_slice(&"fd00::5".parse::<Ipv6Addr>().unwrap().octets());
+        p[24..40].copy_from_slice(&"fd00::1".parse::<Ipv6Addr>().unwrap().octets());
+        p.extend_from_slice(&body);
+        crate::slirp::packet::fit_link(p)
+    }
+
+    #[test]
+    fn fragment_header_after_a_fragment_header_is_dropped() {
+        let s = Stack::new();
+        s.set_addr(IpPrefix::new(IpAddr::V6("fd00::1".parse().unwrap()), 64))
+            .unwrap();
+        let captured = capture(&s);
+        // Reassembled, this is a packet that is itself an atomic fragment:
+        // reassembly happens once (RFC 8200 §4.5), so it must not be
+        // unwrapped again.
+        let atomic = [58, 0, 0, 0, 0, 0, 0, 9];
+        for f in v6_echo_behind(44, &atomic, 3000) {
+            L3Device::send(&*s, Packet::from_slice(&f)).unwrap();
+        }
+        assert!(captured.lock().unwrap().is_empty(), "nested fragment used");
+
+        // A long chain of them must neither recurse nor copy per level.
+        let chain: Vec<u8> = (0..8000)
+            .flat_map(|i| {
+                let next = if i == 7999 { 58 } else { 44 };
+                [next, 0, 0, 0, 0, 0, 0, 9]
+            })
+            .collect();
+        for f in v6_echo_behind(44, &chain, 0) {
+            L3Device::send(&*s, Packet::from_slice(&f)).unwrap();
+        }
+        assert!(captured.lock().unwrap().is_empty());
+
+        // The same echo fragmented once is answered.
+        for f in v6_echo_behind(58, &[], 3000) {
+            L3Device::send(&*s, Packet::from_slice(&f)).unwrap();
+        }
+        assert!(!captured.lock().unwrap().is_empty());
     }
 }
