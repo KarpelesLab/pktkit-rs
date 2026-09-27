@@ -188,6 +188,11 @@ pub struct Conn {
     rto: RtoState,
     rto_deadline: std::option::Option<Instant>,
     retries: u32,
+    /// SND.NXT when the last RTO fired, while data sent before it is still
+    /// unacknowledged. ACKs short of it are partial: each one retransmits the
+    /// next hole (RFC 6582 §3.2 applied to timeout recovery), where the
+    /// cumulative ACK alone would leave every hole to its own timeout.
+    rto_recover: std::option::Option<u32>,
 
     // Window scaling (RFC 7323).
     snd_wnd_shift: u8,
@@ -284,6 +289,7 @@ impl Conn {
             rto: RtoState::new(),
             rto_deadline: None,
             retries: 0,
+            rto_recover: None,
             snd_wnd_shift: 0,
             rcv_wnd_shift: rcv_shift,
             wscale_ok: false,
@@ -1152,13 +1158,33 @@ impl Conn {
 
         let acked = self.send_buf.as_mut().unwrap().acknowledge(ack);
         self.retries = 0;
-        self.cc.on_ack(acked);
+        // An ACK short of the recovery point means the segment after it was
+        // lost too. Resend it now; waiting would cost an RTO per hole.
+        let fast_partial = self.cc.in_recovery() && seq_before(ack, self.cc.recovery_seq());
+        let rto_partial = match self.rto_recover {
+            Some(r) if seq_before(ack, r) => true,
+            Some(_) => {
+                self.rto_recover = None;
+                false
+            }
+            None => false,
+        };
+        if fast_partial {
+            self.cc.on_partial_ack(acked);
+        } else {
+            // After a timeout this is slow start, which a partial ACK
+            // should keep growing.
+            self.cc.on_ack(acked);
+        }
 
         if self.sack_ok {
             let blocks = get_sack_blocks(opts);
             if !blocks.is_empty() {
                 self.send_buf.as_mut().unwrap().mark_sacked(&blocks);
             }
+        }
+        if fast_partial || rto_partial {
+            let _ = self.retransmit();
         }
 
         if self.snd_wnd > 0 && self.persist_deadline.is_some() {
@@ -1405,6 +1431,9 @@ impl Conn {
         self.cc.on_timeout();
         if let Some(sb) = self.send_buf.as_mut() {
             sb.clear_sacked();
+            if sb.unacked() > 0 {
+                self.rto_recover = Some(sb.nxt());
+            }
         }
 
         match self.state {
@@ -2501,6 +2530,109 @@ mod tests {
             sides[0].received == sides[1].to_send,
             "seed {seed}: b→a stream corrupted"
         );
+    }
+
+    /// Lose segments 1 and 4 of a ten-segment window. Fast retransmit
+    /// repairs the first hole; the ACK for it is partial (it stops at the
+    /// second hole), and RFC 6582 §3.2 has the sender retransmit the next
+    /// hole on that ACK rather than wait for the RTO.
+    fn partial_ack_run(sack: bool) {
+        let conf = |local, remote| {
+            let mut c = cfg(local, remote);
+            c.mss = 1000;
+            c.send_buf_size = 1 << 16;
+            c.recv_buf_size = 1 << 16;
+            c.enable_sack = sack;
+            c
+        };
+        let mut client = Conn::new(conf(40200, 80));
+        let mut server = Conn::new(conf(80, 40200));
+        drive_handshake(&mut client, &mut server);
+        let data: Vec<u8> = (0..10_000u32).map(|i| i as u8).collect();
+        let (n, segs) = client.write(&data);
+        assert_eq!(
+            (n, segs.len()),
+            (10_000, 10),
+            "initial window is ten segments"
+        );
+        let lost: Vec<u32> = [1, 4].iter().map(|&i| parse(&segs[i]).seq).collect();
+
+        let arrived: Vec<Vec<u8>> = segs
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != 1 && *i != 4)
+            .map(|(_, s)| s.clone())
+            .collect();
+        let acks = deliver(&mut server, &arrived);
+        let resent = deliver(&mut client, &acks);
+        let resent_seqs: Vec<u32> = resent.iter().map(|p| parse(p).seq).collect();
+        assert!(
+            resent_seqs.contains(&lost[0]),
+            "fast retransmit of the first hole"
+        );
+
+        let partial = deliver(&mut server, &resent);
+        let seg = parse(partial.last().unwrap());
+        assert_eq!(seg.ack, lost[1], "a partial ACK, up to the second hole");
+        let out = deliver(&mut client, &partial);
+        let out_seqs: Vec<u32> = out.iter().map(|p| parse(p).seq).collect();
+        assert!(
+            out_seqs.contains(&lost[1]),
+            "sack={sack}: the partial ACK must retransmit the second hole, sent {out_seqs:?}"
+        );
+
+        deliver(&mut server, &out);
+        assert_eq!(read_all(&mut server), data);
+    }
+
+    /// Segments 1 and 4 lost, and every ACK for the rest too, so only the
+    /// RTO notices. After that one timeout, the ACKs the retransmissions
+    /// draw must carry the repair through both holes (RFC 6582 §3.2 applies
+    /// after a timeout too), not leave each hole to another, backed-off,
+    /// timeout.
+    #[test]
+    fn one_rto_repairs_every_hole() {
+        let conf = |local, remote| {
+            let mut c = cfg(local, remote);
+            c.mss = 1000;
+            c.send_buf_size = 1 << 16;
+            c.recv_buf_size = 1 << 16;
+            c
+        };
+        let mut client = Conn::new(conf(40210, 80));
+        let mut server = Conn::new(conf(80, 40210));
+        drive_handshake(&mut client, &mut server);
+        let data: Vec<u8> = (0..10_000u32).map(|i| (i * 7) as u8).collect();
+        let (_, segs) = client.write(&data);
+        let arrived: Vec<Vec<u8>> = segs
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != 1 && *i != 4)
+            .map(|(_, s)| s.clone())
+            .collect();
+        let _lost_acks = deliver(&mut server, &arrived);
+
+        let mut to_server = fire_rto(&mut client);
+        for _ in 0..10 {
+            if to_server.is_empty() {
+                break;
+            }
+            let acks = deliver(&mut server, &to_server);
+            to_server = deliver(&mut client, &acks);
+        }
+        let got = read_all(&mut server);
+        assert_eq!(got.len(), data.len(), "stalled waiting for another RTO");
+        assert_eq!(got, data);
+    }
+
+    #[test]
+    fn partial_ack_retransmits_next_hole() {
+        partial_ack_run(false);
+    }
+
+    #[test]
+    fn partial_ack_retransmits_next_hole_with_sack() {
+        partial_ack_run(true);
     }
 
     // VTCP_SEED=n replays one failing seed; VTCP_FUZZ_SEEDS=n widens the

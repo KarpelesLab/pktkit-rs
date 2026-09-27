@@ -14,6 +14,13 @@ pub trait CongestionController: Send {
     fn on_timeout(&mut self);
     /// Fast retransmit triggered; enter recovery.
     fn on_fast_retransmit(&mut self, flight_size: u32, snd_nxt: u32);
+    /// A partial ACK during fast recovery (RFC 6582 §3.2 step 5):
+    /// `bytes_acked` bytes were acknowledged, but not everything outstanding
+    /// when recovery began, and the caller is retransmitting the next hole.
+    /// The default leaves the window alone.
+    fn on_partial_ack(&mut self, bytes_acked: u32) {
+        let _ = bytes_acked;
+    }
     /// Recovery has completed (cumulative ACK passed `recovery_seq`).
     fn exit_recovery(&mut self);
     /// Current congestion window in bytes.
@@ -99,6 +106,10 @@ impl CongestionController for NewReno {
         self.recovery_seq = snd_nxt;
     }
 
+    fn on_partial_ack(&mut self, bytes_acked: u32) {
+        self.cwnd = deflate(self.cwnd, self.mss, bytes_acked);
+    }
+
     fn exit_recovery(&mut self) {
         self.cwnd = self.ssthresh;
         self.recovery = false;
@@ -115,6 +126,18 @@ impl CongestionController for NewReno {
     fn recovery_seq(&self) -> u32 {
         self.recovery_seq
     }
+}
+
+/// Partial window deflation, RFC 6582 §3.2 step 5: take back what the ACK
+/// says has left the network, and add one segment for the retransmission if a
+/// full one was acknowledged. The duplicate-ACK count is kept, so the
+/// inflation that follows carries on.
+fn deflate(cwnd: u32, mss: u32, bytes_acked: u32) -> u32 {
+    let mut cwnd = cwnd.saturating_sub(bytes_acked);
+    if bytes_acked >= mss {
+        cwnd = cwnd.saturating_add(mss);
+    }
+    cwnd.max(mss)
 }
 
 // --- HighSpeed TCP (RFC 3649) ----------------------------------------------
@@ -228,6 +251,10 @@ impl CongestionController for HighSpeed {
         self.cwnd = self.ssthresh.saturating_add(3 * self.mss);
         self.recovery = true;
         self.recovery_seq = snd_nxt;
+    }
+
+    fn on_partial_ack(&mut self, bytes_acked: u32) {
+        self.cwnd = deflate(self.cwnd, self.mss, bytes_acked);
     }
 
     fn exit_recovery(&mut self) {
