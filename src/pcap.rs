@@ -28,7 +28,7 @@
 use crate::{DeviceStats, Frame, IpPrefix, L2Device, L2Handler, L3Device, L3Handler, MacAddr};
 use crate::{Packet, Result};
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{self, BufWriter, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -51,6 +51,13 @@ pub const DEFAULT_SNAPLEN: u32 = 262_144;
 pub struct PcapWriter<W: Write> {
     inner: W,
     snaplen: u32,
+    /// One record, header and data, staged so it goes out in one `write_all`.
+    record: Vec<u8>,
+    /// Set once a write has failed. The failed record may be partly in the
+    /// file already, and since a record's position is all that tells a reader
+    /// where the next one starts, anything written after it would be read as
+    /// garbage. So nothing is.
+    torn: bool,
 }
 
 impl<W: Write> core::fmt::Debug for PcapWriter<W> {
@@ -80,7 +87,12 @@ impl<W: Write> PcapWriter<W> {
         hdr.extend_from_slice(&snaplen.to_le_bytes());
         hdr.extend_from_slice(&linktype.to_le_bytes());
         inner.write_all(&hdr)?;
-        Ok(PcapWriter { inner, snaplen })
+        Ok(PcapWriter {
+            inner,
+            snaplen,
+            record: Vec::new(),
+            torn: false,
+        })
     }
 
     /// Append a record timestamped now.
@@ -92,16 +104,30 @@ impl<W: Write> PcapWriter<W> {
     ///
     /// Data longer than the snap length is truncated in the file; the record
     /// still reports the original length, which is how a reader knows.
+    ///
+    /// After a failed write the file may end in a partial record, and every
+    /// later call fails without writing: appending past a torn record would
+    /// leave the rest of the file unreadable.
     pub fn write_at(&mut self, data: &[u8], ts: SystemTime) -> Result<()> {
+        if self.torn {
+            return Err(io::Error::other(
+                "pcap: an earlier record failed to write; the capture ends there",
+            ));
+        }
         let since = ts.duration_since(UNIX_EPOCH).unwrap_or_default();
         let incl = data.len().min(self.snaplen as usize);
-        let mut hdr = [0u8; 16];
-        hdr[0..4].copy_from_slice(&(since.as_secs() as u32).to_le_bytes());
-        hdr[4..8].copy_from_slice(&since.subsec_micros().to_le_bytes());
-        hdr[8..12].copy_from_slice(&(incl as u32).to_le_bytes());
-        hdr[12..16].copy_from_slice(&(data.len() as u32).to_le_bytes());
-        self.inner.write_all(&hdr)?;
-        self.inner.write_all(&data[..incl])
+        self.record.clear();
+        self.record
+            .extend_from_slice(&(since.as_secs() as u32).to_le_bytes());
+        self.record
+            .extend_from_slice(&since.subsec_micros().to_le_bytes());
+        self.record.extend_from_slice(&(incl as u32).to_le_bytes());
+        self.record
+            .extend_from_slice(&(data.len() as u32).to_le_bytes());
+        self.record.extend_from_slice(&data[..incl]);
+        let r = self.inner.write_all(&self.record);
+        self.torn = r.is_err();
+        r
     }
 
     /// Flush buffered records to the underlying writer.
@@ -339,6 +365,72 @@ mod tests {
         fn bytes(&self) -> Vec<u8> {
             self.0.lock().unwrap().clone()
         }
+    }
+
+    /// Accepts `budget` bytes, then fails once mid-record, then accepts
+    /// everything again: the failure a full disk or a closed pipe gives.
+    struct FailsOnce {
+        out: SharedBuf,
+        budget: usize,
+        failed: bool,
+    }
+
+    impl Write for FailsOnce {
+        fn write(&mut self, buf: &[u8]) -> Result<usize> {
+            if !self.failed && self.budget == 0 {
+                self.failed = true;
+                return Err(io::Error::other("disk full"));
+            }
+            let n = if self.failed {
+                buf.len()
+            } else {
+                buf.len().min(self.budget)
+            };
+            if !self.failed {
+                self.budget -= n;
+            }
+            self.out.write(&buf[..n])
+        }
+        fn flush(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn nothing_is_appended_after_a_torn_record() {
+        let out = SharedBuf::default();
+        let sink = FailsOnce {
+            out: out.clone(),
+            // The file header, the whole first record, and part of the second.
+            budget: 24 + 16 + 4 + 10,
+            failed: false,
+        };
+        let mut w = PcapWriter::new(sink, LINKTYPE_RAW).unwrap();
+        w.write(&[1; 4]).unwrap();
+        assert!(w.write(&[2; 40]).is_err());
+        let len = out.bytes().len();
+        // The writer would take this one, but it would land mid-record.
+        assert!(w.write(&[3; 4]).is_err());
+        assert_eq!(out.bytes().len(), len, "wrote past a torn record");
+    }
+
+    #[test]
+    fn a_record_is_handed_to_the_writer_in_one_piece() {
+        // So a writer that fails a whole call at a time never tears one.
+        #[derive(Default)]
+        struct Calls(Vec<usize>);
+        impl Write for Calls {
+            fn write(&mut self, buf: &[u8]) -> Result<usize> {
+                self.0.push(buf.len());
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+        let mut w = PcapWriter::new(Calls::default(), LINKTYPE_RAW).unwrap();
+        w.write(&[0; 100]).unwrap();
+        assert_eq!(w.into_inner().0, vec![24, 16 + 100]);
     }
 
     fn le32(b: &[u8], at: usize) -> u32 {
