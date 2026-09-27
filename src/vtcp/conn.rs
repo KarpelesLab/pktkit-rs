@@ -812,9 +812,6 @@ impl Conn {
 
     /// Process an inbound segment. Returns any outgoing segments to transmit.
     pub fn handle_segment(&mut self, seg: &Segment) -> Vec<Vec<u8>> {
-        self.last_recv = Instant::now();
-        self.keepalive_sent = 0;
-
         match self.state {
             State::Closed => self.handle_closed(seg),
             State::Listen => Vec::new(), // pure passive open uses accept_syn
@@ -828,6 +825,16 @@ impl Conn {
             | State::LastAck
             | State::TimeWait => self.handle_synchronized(seg),
         }
+    }
+
+    /// The peer is still there. Only for a segment that passed the
+    /// sequence, PAWS and ACK checks: anyone can send one that fails them,
+    /// and counting those would let a blind attacker (or a stray duplicate)
+    /// hold off the keepalive, FIN-WAIT-2 and zero-window give-up timers of
+    /// a peer that is long gone.
+    fn note_alive(&mut self) {
+        self.last_recv = Instant::now();
+        self.keepalive_sent = 0;
     }
 
     fn handle_closed(&mut self, seg: &Segment) -> Vec<Vec<u8>> {
@@ -1054,6 +1061,7 @@ impl Conn {
         }
 
         // SYN is set. Negotiate.
+        self.note_alive();
         self.negotiate_options(&seg.options);
 
         if seg.has_flag(flags::ACK) {
@@ -1179,6 +1187,7 @@ impl Conn {
         if seg.has_flag(flags::ACK) && !self.process_ack(seg) {
             return self.take_outgoing();
         }
+        self.note_alive();
 
         if !seg.payload.is_empty() {
             // Released: nobody will ever read this, and ACKing it would tell
@@ -1248,8 +1257,8 @@ impl Conn {
         if !self.check_paws(seg) {
             return self.take_outgoing();
         }
-        if seg.has_flag(flags::ACK) {
-            self.process_ack(seg);
+        if seg.has_flag(flags::ACK) && self.process_ack(seg) {
+            self.note_alive();
         }
         self.take_outgoing()
     }
@@ -1260,8 +1269,8 @@ impl Conn {
         }
         // Data and the FIN may still be in flight (or not yet sent), so ACKs
         // here need the full treatment, not just a check for the FIN's.
-        if seg.has_flag(flags::ACK) {
-            self.process_ack(seg);
+        if seg.has_flag(flags::ACK) && self.process_ack(seg) {
+            self.note_alive();
         }
         if self.fin_acked() {
             self.state = State::TimeWait;
@@ -1278,8 +1287,8 @@ impl Conn {
         if !self.check_paws(seg) {
             return self.take_outgoing();
         }
-        if seg.has_flag(flags::ACK) {
-            self.process_ack(seg);
+        if seg.has_flag(flags::ACK) && self.process_ack(seg) {
+            self.note_alive();
         }
         if self.fin_acked() {
             self.tear_down(State::Closed);
@@ -3844,6 +3853,31 @@ mod tests {
             "re-armed {:?} late",
             due - (client.last_recv + idle)
         );
+    }
+
+    // Only a segment that passes validation says the peer is alive: an
+    // out-of-window one, or one acknowledging data never sent, can come
+    // from anyone, and must not hold off the keepalive (or the FIN-WAIT-2
+    // and zero-window timeouts that read the same clock).
+    #[test]
+    fn invalid_segments_do_not_refresh_liveness() {
+        let (mut client, server) = keepalive_pair(40304);
+        let stale = Instant::now() - client.cfg.keepalive_idle;
+        client.last_recv = stale;
+        client.keepalive_sent = 2;
+        let snd_nxt = client.send_buf.as_ref().unwrap().nxt();
+        let rcv_nxt = client.recv_buf.as_ref().unwrap().nxt();
+        let mut oow = bare_ack(&client, &server, snd_nxt, 1000);
+        oow.seq = rcv_nxt.wrapping_add(1 << 30);
+        client.handle_segment(&oow);
+        let bad_ack = bare_ack(&client, &server, snd_nxt.wrapping_add(1000), 1000);
+        client.handle_segment(&bad_ack);
+        assert_eq!(client.last_recv, stale, "refreshed by an invalid segment");
+        assert_eq!(client.keepalive_sent, 2);
+
+        client.handle_segment(&bare_ack(&client, &server, snd_nxt, 1000));
+        assert!(client.last_recv > stale, "a valid ACK is a sign of life");
+        assert_eq!(client.keepalive_sent, 0);
     }
 
     // Once released, FIN-WAIT-2 has its own timeout: answered probes would
