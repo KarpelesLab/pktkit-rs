@@ -1,6 +1,6 @@
 //! Tiny non-cryptographic RNG, used for DHCP transaction IDs and randomised
-//! MAC addresses. Security-sensitive code lives in feature modules and uses
-//! audited crates (`rand_core` + `getrandom`).
+//! MAC addresses. Anything security-sensitive draws from `purecrypto`'s
+//! `OsRng` instead, in the features that depend on it.
 //!
 //! The state is a per-thread xorshift64 seeded from the system clock and a
 //! process-global counter, mixed with the thread ID. That is sufficient for

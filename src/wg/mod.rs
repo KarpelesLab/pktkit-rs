@@ -24,12 +24,12 @@
 //!
 //! # Crypto
 //!
-//! All primitives come from RustCrypto:
+//! All primitives come from [`purecrypto`](https://crates.io/crates/purecrypto):
 //!
-//! - X25519 via `curve25519-dalek` (`MontgomeryPoint::mul_clamped`).
-//! - ChaCha20-Poly1305 and XChaCha20-Poly1305 via `chacha20poly1305`.
-//! - Blake2s-128 / Blake2s-256 via `blake2`; HKDF is hand-rolled on top of
-//!   `hmac::Hmac<Blake2s256>`.
+//! - X25519 (`purecrypto::ec::x25519`).
+//! - ChaCha20-Poly1305 and XChaCha20-Poly1305 (`purecrypto::cipher`).
+//! - BLAKE2s-128 / BLAKE2s-256 and HMAC-BLAKE2s (`purecrypto::hash`), from
+//!   which the whitepaper's HKDF is built.
 //!
 //! The `crypto` submodule wraps these into the KDF/AEAD helpers the handshake
 //! and transport layers use.
