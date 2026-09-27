@@ -352,6 +352,15 @@ struct MacEntry {
     expires: Instant,
 }
 
+/// Where a unicast frame goes, per the learning table.
+enum Dest<'a> {
+    Port(&'a Arc<Port>),
+    /// Learned on the port the frame arrived on.
+    Ingress,
+    /// Not learned: flood.
+    Unknown,
+}
+
 /// MAC table key. The VLAN identifier is part of it so the same address seen
 /// on two VLANs is learned as two separate stations rather than one that keeps
 /// moving ports. Untagged frames use VLAN 0.
@@ -363,6 +372,10 @@ type MacKey = (u16, [u8; 6]);
 struct MacTable {
     entries: HashMap<MacKey, MacEntry>,
     per_port: HashMap<u64, usize>,
+    /// No entry expires before this, so sweeping any sooner would find
+    /// nothing. Keeps a port hammering at its limit from paying a full sweep
+    /// per frame.
+    prune_after: Option<Instant>,
 }
 
 impl MacTable {
@@ -388,6 +401,21 @@ impl MacTable {
 
     fn port_count(&self, port_id: u64) -> usize {
         self.per_port.get(&port_id).copied().unwrap_or(0)
+    }
+
+    /// Drop every expired entry. Expired entries are otherwise only removed
+    /// when looked up by their exact key, and until then they hold their
+    /// place against both learning limits.
+    fn prune_expired(&mut self, now: Instant) {
+        if self.prune_after.is_some_and(|t| now < t) {
+            return;
+        }
+        self.entries.retain(|_, e| e.expires > now);
+        self.per_port.clear();
+        for e in self.entries.values() {
+            *self.per_port.entry(e.port_id).or_insert(0) += 1;
+        }
+        self.prune_after = self.entries.values().map(|e| e.expires).min();
     }
 }
 
@@ -692,19 +720,24 @@ impl L2Hub {
 
         let mut dst_mac = [0u8; 6];
         dst_mac.copy_from_slice(&bytes[0..6]);
-        if let Some(dst) = self.lookup(&ports, (vlan, dst_mac), source_id) {
-            // The destination is known, but it still has to be reachable on
-            // this VLAN — a learned address on another VLAN is not a hit.
-            if let Some(action) = dst.mode.egress(vlan) {
-                let _ = dst.dev.send(egress.apply(action));
-                self.stats.record_forwarded(1);
-            } else {
-                self.stats.record_dropped();
+        match self.lookup(&ports, (vlan, dst_mac), source_id) {
+            Dest::Port(dst) => {
+                // The destination is known, but it still has to be reachable
+                // on this VLAN — a learned address on another VLAN is not a
+                // hit.
+                if let Some(action) = dst.mode.egress(vlan) {
+                    let _ = dst.dev.send(egress.apply(action));
+                    self.stats.record_forwarded(1);
+                } else {
+                    self.stats.record_dropped();
+                }
             }
-            return;
+            // The destination sits behind the port the frame came in on, so
+            // it has the frame already; 802.1D filters it rather than send
+            // it anywhere else.
+            Dest::Ingress => self.stats.record_dropped(),
+            Dest::Unknown => self.flood(&ports, &mut egress, vlan, source_id),
         }
-
-        self.flood(&ports, &mut egress, vlan, source_id);
     }
 
     /// Record that `key` lives on `source`.
@@ -731,13 +764,17 @@ impl L2Hub {
             // A new address has to fit both budgets. The per-port limit is
             // what keeps one port spraying random sources from crowding every
             // other port out of the table.
-            if table.entries.len() >= MAC_TABLE_MAX_SIZE {
-                return;
-            }
-            if let Some(limit) = source.mac_limit
-                && table.port_count(source.id) >= limit
-            {
-                return;
+            let full = |t: &MacTable| {
+                t.entries.len() >= MAC_TABLE_MAX_SIZE
+                    || source
+                        .mac_limit
+                        .is_some_and(|l| t.port_count(source.id) >= l)
+            };
+            if full(&table) {
+                table.prune_expired(now);
+                if full(&table) {
+                    return;
+                }
             }
         }
         table.insert(
@@ -749,22 +786,16 @@ impl L2Hub {
         );
     }
 
-    /// Resolve `key` to the port to send out of, or `None` to flood.
-    fn lookup<'a>(
-        &self,
-        ports: &'a PortTable,
-        key: MacKey,
-        source_id: u64,
-    ) -> Option<&'a Arc<Port>> {
+    /// Resolve `key` to where a frame for it goes.
+    fn lookup<'a>(&self, ports: &'a PortTable, key: MacKey, source_id: u64) -> Dest<'a> {
         let now = Instant::now();
         let stale = {
             let table = self.mac_table.read().unwrap();
             match table.entries.get(&key) {
-                // Never hairpin a frame back out of the port it arrived on.
-                Some(e) if e.port_id == source_id => return None,
                 Some(e) if e.expires <= now => true,
+                Some(e) if e.port_id == source_id => return Dest::Ingress,
                 Some(e) => match ports.get(e.port_id) {
-                    Some(port) => return Some(port),
+                    Some(port) => return Dest::Port(port),
                     // The port is gone; so is the entry.
                     None => true,
                 },
@@ -774,7 +805,7 @@ impl L2Hub {
         if stale {
             self.mac_table.write().unwrap().remove(&key);
         }
-        None
+        Dest::Unknown
     }
 
     /// Send out every port that carries `vlan`, except the source.
@@ -1749,5 +1780,67 @@ mod tests {
         hub.set_port_mode(&ports[0].1, access(10));
         assert_eq!(hub.mac_table_len(), 0);
         assert_eq!(hub.port_mode(&ports[0].1), Some(access(10)));
+    }
+
+    /// Let every learned address run out, as if MAC_AGING had passed.
+    fn age_out(hub: &L2Hub) {
+        let mut t = hub.mac_table.write().unwrap();
+        let now = Instant::now();
+        for e in t.entries.values_mut() {
+            e.expires = now;
+        }
+        t.prune_after = None;
+    }
+
+    #[test]
+    fn expired_addresses_free_the_per_port_budget() {
+        let hub = Arc::new(L2Hub::new());
+        let (a, ha) = sinks(&hub, 1).pop().unwrap();
+        spray(&hub, ha.id, DEFAULT_PORT_MAC_LIMIT as u16);
+        age_out(&hub);
+
+        // A new station behind the port, long after the old ones went quiet.
+        let station: MacAddr = "02:00:00:00:aa:aa".parse().unwrap();
+        let f = build_frame(MacAddr::broadcast(), station, EtherType::IPV4, &[0; 40]);
+        hub.forward_from(Frame::from_slice(&f), ha.id);
+        let t = hub.mac_table.read().unwrap();
+        assert!(
+            t.entries.contains_key(&(0, station.octets())),
+            "not learned"
+        );
+        assert_eq!(t.port_count(ha.id), 1, "expired entries still counted");
+        drop(a);
+    }
+
+    #[test]
+    fn expired_addresses_free_the_table() {
+        let hub = Arc::new(L2Hub::new());
+        let (_a, ha) = sinks(&hub, 1).pop().unwrap();
+        hub.set_port_mac_limit(&ha, None);
+        spray(&hub, ha.id, MAC_TABLE_MAX_SIZE as u16);
+        assert_eq!(hub.mac_table_len(), MAC_TABLE_MAX_SIZE);
+        age_out(&hub);
+
+        let station: MacAddr = "02:00:00:00:aa:aa".parse().unwrap();
+        let f = build_frame(MacAddr::broadcast(), station, EtherType::IPV4, &[0; 40]);
+        hub.forward_from(Frame::from_slice(&f), ha.id);
+        assert_eq!(hub.mac_table_len(), 1);
+    }
+
+    #[test]
+    fn a_frame_for_a_station_on_its_own_port_is_filtered_not_flooded() {
+        let hub = Arc::new(L2Hub::new());
+        let ports = sinks(&hub, 2);
+        let station: MacAddr = "02:00:00:00:aa:aa".parse().unwrap();
+        let announce = build_frame(MacAddr::broadcast(), station, EtherType::IPV4, &[0; 40]);
+        hub.forward_from(Frame::from_slice(&announce), ports[0].1.id);
+        ports[1].0.inner.lock().unwrap().clear();
+
+        // A neighbour on the same segment talking to the station: the
+        // station already has it, the rest of the switch must not.
+        let f = build_frame(station, ports[0].0.mac, EtherType::IPV4, &[0; 40]);
+        hub.forward_from(Frame::from_slice(&f), ports[0].1.id);
+        assert_eq!(ports[1].0.inner.lock().unwrap().len(), 0);
+        assert_eq!(ports[0].0.inner.lock().unwrap().len(), 0);
     }
 }
