@@ -208,6 +208,48 @@ impl SendBuf {
         Some((seq, &self.buf[from..from + len]))
     }
 
+    /// The first hole at or after `from` that counts as lost, and up to `n`
+    /// bytes of it.
+    ///
+    /// RFC 6675 §4 (IsLost): a hole is lost once more than `lost_after`
+    /// bytes above it have been SACKed — with `lost_after = (DupThresh - 1) *
+    /// SMSS`, the same evidence three duplicate ACKs give for the first hole.
+    /// Holes above the highest SACKed byte are never candidates: nothing yet
+    /// says that data is missing rather than still in flight.
+    pub fn lost_hole_from(&self, from: u32, n: usize, lost_after: u32) -> Option<(u32, &[u8])> {
+        let unacked = (self.nxt.wrapping_sub(self.una) as usize).min(self.buf.len());
+        let end = self.una.wrapping_add(unacked as u32);
+        let from = if seq_before(from, self.una) {
+            self.una
+        } else {
+            from
+        };
+        let mut sacked_above: u32 = self
+            .sacked
+            .iter()
+            .map(|b| b.right.wrapping_sub(b.left))
+            .sum();
+        let mut hole_start = self.una;
+        for b in &self.sacked {
+            // The hole is [hole_start, b.left); `b` and everything after it
+            // are SACKed above it.
+            let start = if seq_before(hole_start, from) {
+                from
+            } else {
+                hole_start
+            };
+            let hole_end = if seq_after(b.left, end) { end } else { b.left };
+            if seq_before(start, hole_end) && sacked_above > lost_after {
+                let off = start.wrapping_sub(self.una) as usize;
+                let len = (hole_end.wrapping_sub(start) as usize).min(n);
+                return Some((start, &self.buf[off..off + len]));
+            }
+            sacked_above -= b.right.wrapping_sub(b.left);
+            hole_start = b.right;
+        }
+        None
+    }
+
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.buf.is_empty()
@@ -323,6 +365,30 @@ mod tests {
         assert_eq!(s.retransmit_data(100), Some((20, &[7u8; 10][..])));
         s.clear_sacked();
         assert_eq!(s.retransmit_data(100), Some((12, &[7u8; 38][..])));
+    }
+
+    #[test]
+    fn lost_holes_need_enough_sacked_above() {
+        let mut s = SendBuf::new(100, 0);
+        s.write(&[3; 100]);
+        s.advance_sent(100);
+        let b = |left, right| SackBlock { left, right };
+        // Holes 0..10, 20..30, 40..60; SACKed 10..20, 30..40, 60..70.
+        s.mark_sacked(&[b(10, 20), b(30, 40), b(60, 70)]);
+        // 30 bytes SACKed above the first hole, 20 above the second, 10
+        // above the third.
+        assert_eq!(s.lost_hole_from(0, 100, 15).map(|h| h.0), Some(0));
+        assert_eq!(s.lost_hole_from(5, 100, 15), Some((5, &[3u8; 5][..])));
+        assert_eq!(s.lost_hole_from(10, 100, 15), Some((20, &[3u8; 10][..])));
+        assert_eq!(
+            s.lost_hole_from(30, 100, 15),
+            None,
+            "only 10 bytes above 40..60"
+        );
+        assert_eq!(s.lost_hole_from(30, 100, 5), Some((40, &[3u8; 20][..])));
+        assert_eq!(s.lost_hole_from(30, 8, 5), Some((40, &[3u8; 8][..])));
+        // Past the highest SACK nothing is known to be lost.
+        assert_eq!(s.lost_hole_from(70, 100, 0), None);
     }
 
     #[test]

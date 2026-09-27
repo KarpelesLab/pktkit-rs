@@ -195,6 +195,9 @@ pub struct Conn {
     rto_recover: std::option::Option<u32>,
     /// Duplicate ACKs since the last new one.
     dup_acks: u32,
+    /// HighRxt (RFC 6675): the end of the highest range retransmitted in the
+    /// current recovery, so each lost hole is resent once per episode.
+    high_rxt: u32,
     /// Extra room beyond cwnd for Limited Transmit (RFC 3042): one segment
     /// per duplicate ACK, for the first two.
     limited_transmit: u32,
@@ -296,6 +299,7 @@ impl Conn {
             retries: 0,
             rto_recover: None,
             dup_acks: 0,
+            high_rxt: 0,
             limited_transmit: 0,
             snd_wnd_shift: 0,
             rcv_wnd_shift: rcv_shift,
@@ -519,7 +523,9 @@ impl Conn {
             && let Some(rb) = self.recv_buf.as_ref()
             && rb.has_ooo()
         {
-            let blocks = rb.sack_blocks();
+            // Four blocks fit in the option space alone, three beside a
+            // timestamp (RFC 2018 §3).
+            let blocks = rb.sack_blocks_up_to(if self.ts_ok { 3 } else { 4 });
             if !blocks.is_empty() {
                 seg.options.push(sack_option(&blocks));
             }
@@ -1222,9 +1228,14 @@ impl Conn {
         self.dup_acks += 1;
         let threshold_reached = self.cc.on_dup_ack();
         if self.cc.in_recovery() {
-            // RFC 5681 §3.2 step 4: each duplicate ACK inflated cwnd because
-            // a segment left the network; send new data into the room.
-            self.flush_send_queue();
+            // A duplicate ACK means a segment left the network. With SACK,
+            // spend it on the next hole the scoreboard shows lost (RFC 6675
+            // §5 NextSeg rule 1): otherwise every hole after the first waits
+            // a round trip for its partial ACK. Failing that, RFC 5681 §3.2
+            // step 4: new data into the room cwnd inflation made.
+            if !self.retransmit_lost_hole() {
+                self.flush_send_queue();
+            }
             return;
         }
         let sb = self.send_buf.as_ref().unwrap();
@@ -1240,6 +1251,7 @@ impl Conn {
         if threshold_reached || early {
             self.limited_transmit = 0;
             self.cc.on_fast_retransmit(flight, snd_nxt);
+            self.high_rxt = self.send_buf.as_ref().unwrap().una();
             let _ = self.retransmit();
         } else if self.dup_acks <= 2 {
             // Limited Transmit (RFC 3042): a new segment for each of the
@@ -1262,6 +1274,35 @@ impl Conn {
         else {
             return false;
         };
+        self.send_retransmission(seq, data);
+        true
+    }
+
+    /// Resend the next hole past HighRxt that the SACK scoreboard shows
+    /// lost. Returns false if there is none (or no SACK).
+    fn retransmit_lost_hole(&mut self) -> bool {
+        if !self.sack_ok {
+            return false;
+        }
+        let mss = self.mss as u32;
+        let Some((seq, data)) = self
+            .send_buf
+            .as_ref()
+            .unwrap()
+            .lost_hole_from(self.high_rxt, mss as usize, 2 * mss)
+            .map(|(seq, d)| (seq, d.to_vec()))
+        else {
+            return false;
+        };
+        self.send_retransmission(seq, data);
+        true
+    }
+
+    fn send_retransmission(&mut self, seq: u32, data: Vec<u8>) {
+        let end = seq.wrapping_add(data.len() as u32);
+        if seq_after(end, self.high_rxt) {
+            self.high_rxt = end;
+        }
         let rcv_nxt = self.recv_buf.as_ref().unwrap().nxt();
         let mut seg = Segment {
             src_port: self.cfg.local_port,
@@ -1277,7 +1318,6 @@ impl Conn {
         self.queue_seg(seg);
         self.rto.invalidate_timing();
         self.start_rto();
-        true
     }
 
     fn flush_send_queue(&mut self) {
@@ -2619,6 +2659,19 @@ mod tests {
             resent_seqs.contains(&lost[0]),
             "fast retransmit of the first hole"
         );
+        if sack {
+            // The SACKs in the duplicate ACKs already show the second hole
+            // lost, so it goes out in the same round trip (RFC 6675), with
+            // no partial ACK needed.
+            assert!(
+                resent_seqs.contains(&lost[1]),
+                "SACK recovery resends both holes at once, sent {resent_seqs:?}"
+            );
+            let acks = deliver(&mut server, &resent);
+            assert_eq!(parse(acks.last().unwrap()).ack, lost[0] + 9000);
+            assert_eq!(read_all(&mut server), data);
+            return;
+        }
 
         let partial = deliver(&mut server, &resent);
         let seg = parse(partial.last().unwrap());
@@ -2759,13 +2812,30 @@ mod tests {
         );
     }
 
+    /// Without timestamps, an ACK carries four SACK blocks, not three.
+    #[test]
+    fn four_sack_blocks_without_timestamps() {
+        let mut client = Conn::new(big(40240, 80));
+        let mut server = Conn::new(big(80, 40240));
+        drive_handshake(&mut client, &mut server);
+        assert!(server.sack_ok && !server.ts_ok);
+        let (_, segs) = client.write(&[1; 9000]);
+        // Every other segment arrives: four separate out-of-order ranges.
+        let odd: Vec<Vec<u8>> = segs.iter().skip(1).step_by(2).cloned().collect();
+        let acks = deliver(&mut server, &odd);
+        let last = parse(acks.last().unwrap());
+        let blocks = get_sack_blocks(&last.options);
+        assert_eq!(blocks.len(), 4, "{blocks:?}");
+        assert_eq!(blocks[0].left, parse(&segs[7]).seq, "newest first");
+    }
+
     #[test]
     fn partial_ack_retransmits_next_hole() {
         partial_ack_run(false);
     }
 
     #[test]
-    fn partial_ack_retransmits_next_hole_with_sack() {
+    fn sack_recovery_resends_every_lost_hole_in_one_round_trip() {
         partial_ack_run(true);
     }
 

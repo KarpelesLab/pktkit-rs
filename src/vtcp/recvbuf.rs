@@ -8,8 +8,9 @@ use super::seqspace::{seq_after, seq_after_eq, seq_before, seq_before_eq};
 /// segments; the bytes they hold are bounded by the window.
 const MAX_OOO_ENTRIES: usize = 128;
 
-/// SACK blocks reported per ACK: all that fit beside a timestamp option.
-const MAX_SACK_BLOCKS: usize = 3;
+/// SACK blocks that fit in the 40 option bytes: four alone (34 bytes), three
+/// beside a timestamp option (RFC 2018 §3).
+const MAX_SACK_BLOCKS: usize = 4;
 
 #[derive(Debug, Clone)]
 struct OooEntry {
@@ -229,19 +230,27 @@ impl RecvBuf {
         self.nxt = self.nxt.wrapping_add(n);
     }
 
-    /// Up to 3 SACK blocks describing out-of-order data, ordered as RFC 2018
-    /// §4 requires: the range holding the most recently received segment
-    /// first, then the other recently extended ranges, newest first. Any room
-    /// left goes to the ranges nearest RCV.NXT, the holes to fill first.
+    /// Up to 3 SACK blocks describing out-of-order data: as many as fit
+    /// beside a timestamp option. See [`sack_blocks_up_to`](Self::sack_blocks_up_to).
     pub fn sack_blocks(&self) -> Vec<SackBlock> {
+        self.sack_blocks_up_to(3)
+    }
+
+    /// Up to `max` (at most 4) SACK blocks describing out-of-order data,
+    /// ordered as RFC 2018 §4 requires: the range holding the most recently
+    /// received segment first, then the other recently extended ranges,
+    /// newest first. Any room left goes to the ranges nearest RCV.NXT, the
+    /// holes to fill first.
+    pub fn sack_blocks_up_to(&self, max: usize) -> Vec<SackBlock> {
+        let max = max.min(MAX_SACK_BLOCKS);
         let block = |e: &OooEntry| SackBlock {
             left: e.seq,
             right: e.seq.wrapping_add(e.data.len() as u32),
         };
-        let mut out: Vec<SackBlock> = Vec::with_capacity(MAX_SACK_BLOCKS);
+        let mut out: Vec<SackBlock> = Vec::with_capacity(max);
         let recent = self.recent.iter().filter_map(|&s| self.range_of(s));
         for e in recent.chain(self.ooo.iter()) {
-            if out.len() == MAX_SACK_BLOCKS {
+            if out.len() == max {
                 break;
             }
             let b = block(e);
@@ -386,6 +395,8 @@ mod tests {
         }
         let lefts = |r: &RecvBuf| r.sack_blocks().iter().map(|b| b.left).collect::<Vec<_>>();
         assert_eq!(lefts(&r), vec![70, 50, 30]);
+        let four: Vec<u32> = r.sack_blocks_up_to(4).iter().map(|b| b.left).collect();
+        assert_eq!(four, vec![70, 50, 30, 10]);
         // Extending an older range makes it the newest; the one it pushed out
         // of the recent list is reported only if room remains.
         r.insert(15, b"yyyyy");
