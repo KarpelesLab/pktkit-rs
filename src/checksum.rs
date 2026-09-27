@@ -109,6 +109,11 @@ pub(crate) fn raw_transport_sum(proto: Protocol, src: IpAddr, dst: IpAddr, pdu: 
 /// This is what makes address and port rewriting cheap: a NAT that changes four
 /// bytes pays for four bytes, not for the whole packet.
 ///
+/// The result can be `0x0000`. For IPv4 and TCP that is just a checksum, but
+/// in a UDP header zero means "no checksum" (RFC 768; IPv6 forbids it, RFC
+/// 8200 §8.1): a datagram patched to zero would have its receiver skip the
+/// check. Patch UDP checksums with [`incremental_update_udp`] instead.
+///
 /// ```
 /// # use pktkit::{checksum, incremental_update};
 /// let mut buf = [0x45u8, 0x00, 0x00, 0x14, 0xde, 0xad, 0x00, 0x00];
@@ -129,6 +134,30 @@ pub fn incremental_update(old_checksum: u16, old: &[u8], new: &[u8]) -> u16 {
     sum += ones_complement_words(old);
     sum += word_sum(new);
     !fold(sum)
+}
+
+/// [`incremental_update`] for the checksum field of a UDP header.
+///
+/// A result of zero is written as `0xFFFF`, the same one's-complement value,
+/// since zero in that field means the sender computed no checksum (RFC 768).
+/// And a datagram that carries none (`old_checksum` of zero, allowed over
+/// IPv4 only) is left without one: there is nothing to patch, and patching
+/// the zero would produce a checksum that does not match.
+///
+/// ```
+/// # use pktkit::incremental_update_udp;
+/// // A no-op rewrite of a datagram whose checksum is all ones.
+/// assert_eq!(incremental_update_udp(0xFFFF, &[0, 0], &[0, 0]), 0xFFFF);
+/// assert_eq!(incremental_update_udp(0, &[0, 1], &[0, 2]), 0);
+/// ```
+pub fn incremental_update_udp(old_checksum: u16, old: &[u8], new: &[u8]) -> u16 {
+    if old_checksum == 0 {
+        return 0;
+    }
+    match incremental_update(old_checksum, old, new) {
+        0 => 0xFFFF,
+        sum => sum,
+    }
 }
 
 // The sums below are u64 for the reason given in `checksum`.
@@ -295,6 +324,32 @@ mod tests {
         let patched = incremental_update(sum, &data[4..5], &[0x99]);
         data[4] = 0x99;
         assert_eq!(patched, checksum(&data));
+    }
+
+    #[test]
+    fn udp_incremental_update_never_writes_zero() {
+        // A datagram whose checksum computes to zero, so it is sent as
+        // all ones; rewriting its source port and back is a no-op that
+        // plain incremental_update turns into 0x0000.
+        let (src, dst) = (Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 2));
+        let mut pdu = vec![0x12, 0x34, 0x00, 0x35, 0x00, 0x0a, 0, 0, 0, 0];
+        let sum = transport_checksum(Protocol::UDP, src.into(), dst.into(), &pdu);
+        // Choose the last word so the checksum comes out zero.
+        pdu[8..10].copy_from_slice(&sum.to_be_bytes());
+        assert_eq!(
+            transport_checksum(Protocol::UDP, src.into(), dst.into(), &pdu),
+            0
+        );
+
+        assert_eq!(incremental_update(0xFFFF, &pdu[0..2], &pdu[0..2]), 0);
+        let patched = incremental_update_udp(0xFFFF, &pdu[0..2], &pdu[0..2]);
+        assert_eq!(patched, 0xFFFF, "patched to \"no checksum\"");
+
+        // Other values pass through, and a datagram with no checksum keeps
+        // none.
+        let there = incremental_update_udp(0xFFFF, &pdu[0..2], &[0x56, 0x78]);
+        assert_eq!(there, incremental_update(0xFFFF, &pdu[0..2], &[0x56, 0x78]));
+        assert_eq!(incremental_update_udp(0, &pdu[0..2], &[0x56, 0x78]), 0);
     }
 
     #[test]

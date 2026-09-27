@@ -85,7 +85,8 @@ pub use accept::{
     Cleanup, Done, DoneSignal, L2Acceptor, L2AcceptorWithDone, L2Connector, L3Connector, serve,
 };
 pub use checksum::{
-    checksum, combine_checksums, incremental_update, pseudo_header_checksum, transport_checksum,
+    checksum, combine_checksums, incremental_update, incremental_update_udp,
+    pseudo_header_checksum, transport_checksum,
 };
 pub use connect::{connect_l2, connect_l3};
 pub use ethertype::EtherType;
