@@ -134,7 +134,9 @@ pub trait ClientTransport: Send + Sync + 'static {
 const FIRST_RETRANSMIT: Duration = Duration::from_secs(4);
 const MAX_RETRANSMIT: Duration = Duration::from_secs(64);
 /// REQUESTs sent for one offer before starting over with a DISCOVER. RFC
-/// 2131 §3.1 leaves the count to the client; five spans about a minute.
+/// 2131 §3.1 leaves the count to the client. Five, backed off 4, 8, 16 and
+/// 32 s apart, and the 64 s wait after the last, hold an offer about two
+/// minutes before discovery starts over.
 const MAX_REQUESTS: u32 = 5;
 /// Floor on the retransmission interval while RENEWING or REBINDING
 /// (RFC 2131 §4.4.5).
