@@ -624,6 +624,8 @@ struct Session {
     /// Set when the client's credentials were rejected: when to drop the
     /// session, which lingers only to deliver AUTH_FAILED.
     auth_failed: Option<Instant>,
+    /// Data cipher chosen by negotiation, pushed to the client.
+    pushed_cipher: Option<&'static str>,
 }
 
 /// One TLS handshake and what it produced (OpenVPN's `key_state`): its own
@@ -727,6 +729,7 @@ impl Session {
                 peer_info: HashMap::new(),
                 timers,
                 auth_failed: None,
+                pushed_cipher: None,
             },
             reset,
         ))
@@ -914,6 +917,7 @@ impl Session {
             };
             self.peer_info = parsed.peer_info;
             self.opts = Some(parsed.opts);
+            self.pushed_cipher = parsed.ncp_cipher;
         }
         Ok(())
     }
@@ -967,6 +971,9 @@ impl Session {
         }
         if !t.keepalive_timeout.is_zero() {
             reply += &format!(",ping-restart {}", t.keepalive_timeout.as_secs().max(1));
+        }
+        if let Some(c) = self.pushed_cipher {
+            reply += &format!(",cipher {c}");
         }
         reply += &format!(",comp-lzo no,topology net30,ifconfig {ip} {gw_or_mask}\0");
         reply
@@ -1058,13 +1065,17 @@ fn try_parse_key_exchange(buf: &[u8]) -> io::Result<Option<(KeyExchange, usize)>
     // it and ignore the rest rather than insisting it round-trips.
     let mut opts = Options::parse(&options_string).map_err(invalid)?;
     opts.is_server = false;
-    data::check_supported(&opts)?;
     // The PUSH_REPLY carries `comp-lzo no`, which puts the client on
     // stub framing (every packet starts with the no-compression byte)
     // whatever it had configured, so both directions frame.
     opts.compression = "lzo".into();
 
     let peer_info = parse_peer_info(&peer_info_raw)?;
+    let ncp_cipher = negotiate_cipher(&peer_info)?;
+    if let Some(c) = ncp_cipher {
+        opts.set_cipher(c).map_err(invalid)?;
+    }
+    data::check_supported(&opts)?;
 
     let options_server = {
         let mut o = opts.clone();
@@ -1073,6 +1084,7 @@ fn try_parse_key_exchange(buf: &[u8]) -> io::Result<Option<(KeyExchange, usize)>
     };
 
     let kx = KeyExchange {
+        ncp_cipher,
         pre_master,
         random1,
         random2,
@@ -1084,6 +1096,35 @@ fn try_parse_key_exchange(buf: &[u8]) -> io::Result<Option<(KeyExchange, usize)>
         peer_info_raw,
     };
     Ok(Some((kx, used)))
+}
+
+/// Data ciphers the server negotiates, in its order of preference (OpenVPN's
+/// default `data-ciphers`, less CHACHA20-POLY1305, which is not implemented).
+const DATA_CIPHERS: [&str; 2] = ["AES-256-GCM", "AES-128-GCM"];
+
+/// Pick the data cipher for a client that negotiates (ssl_ncp.c
+/// ncp_get_best_cipher): the first of ours in its IV_CIPHERS list, or, for a
+/// 2.4 client announcing only IV_NCP=2, the first of ours among the AES-GCM
+/// ciphers that implies. `None` for a client that does not negotiate: it
+/// uses the cipher of its options string. A negotiating client with no
+/// cipher in common is refused, as OpenVPN refuses it.
+fn negotiate_cipher(peer_info: &HashMap<String, String>) -> io::Result<Option<&'static str>> {
+    let theirs: Vec<&str> = if let Some(list) = peer_info.get("IV_CIPHERS") {
+        list.split(':').collect()
+    } else if peer_info
+        .get("IV_NCP")
+        .and_then(|v| v.parse::<u32>().ok())
+        .is_some_and(|v| v >= 2)
+    {
+        vec!["AES-256-GCM", "AES-128-GCM"]
+    } else {
+        return Ok(None);
+    };
+    DATA_CIPHERS
+        .into_iter()
+        .find(|ours| theirs.iter().any(|t| t.eq_ignore_ascii_case(ours)))
+        .map(Some)
+        .ok_or_else(|| invalid("client supports none of our data ciphers"))
 }
 
 fn build_kx_reply(server_random: &[u8; 64], kx: &KeyExchange) -> Vec<u8> {
@@ -1103,6 +1144,9 @@ fn build_kx_reply(server_random: &[u8; 64], kx: &KeyExchange) -> Vec<u8> {
 
 /// Parsed key-method 2 client exchange.
 struct KeyExchange {
+    /// The cipher chosen by negotiation, to be pushed; `None` for a client
+    /// without NCP, which uses the cipher of its options string.
+    ncp_cipher: Option<&'static str>,
     pre_master: [u8; 48],
     random1: [u8; 32],
     random2: [u8; 32],
@@ -1204,6 +1248,26 @@ mod tests {
         s.primary.established = Some(Instant::now());
         p.active = Some(s);
         p
+    }
+
+    #[test]
+    fn ncp_follows_server_preference_and_refuses_no_overlap() {
+        let pi = |kv: &[(&str, &str)]| -> HashMap<String, String> {
+            kv.iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        assert_eq!(negotiate_cipher(&pi(&[])).unwrap(), None);
+        assert_eq!(negotiate_cipher(&pi(&[("IV_NCP", "1")])).unwrap(), None);
+        assert_eq!(
+            negotiate_cipher(&pi(&[("IV_NCP", "2")])).unwrap(),
+            Some("AES-256-GCM")
+        );
+        assert_eq!(
+            negotiate_cipher(&pi(&[("IV_CIPHERS", "aes-128-gcm:AES-256-GCM")])).unwrap(),
+            Some("AES-256-GCM")
+        );
+        assert!(negotiate_cipher(&pi(&[("IV_CIPHERS", "CHACHA20-POLY1305")])).is_err());
     }
 
     /// Long before the packet ids run out, the server renegotiates

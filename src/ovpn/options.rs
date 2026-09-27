@@ -133,6 +133,11 @@ impl Options {
         !self.compression.is_empty() && self.compression != "none"
     }
 
+    /// Set the cipher from its OpenVPN name (`AES-256-GCM`, ...).
+    pub(crate) fn set_cipher(&mut self, c: &str) -> Result<(), String> {
+        self.parse_cipher(c)
+    }
+
     fn parse_cipher(&mut self, c: &str) -> Result<(), String> {
         if c == "[null-cipher]" {
             self.cipher_crypto = CipherCryptoAlg::None;

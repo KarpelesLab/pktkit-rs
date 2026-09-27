@@ -855,6 +855,53 @@ fn insecure_data_channel_is_refused() {
     }
 }
 
+/// A 2.5+ client announces its data ciphers in IV_CIPHERS and leaves the
+/// choice to the server (NCP): its options string names no cipher at all.
+/// The server picks from its own list in preference order and pushes it
+/// (ssl_ncp.c ncp_get_best_cipher).
+#[test]
+fn cipher_is_negotiated_from_iv_ciphers() {
+    for (iv_ciphers, want, opts) in [
+        (
+            "AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305",
+            "AES-256-GCM",
+            gcm_opts(),
+        ),
+        (
+            "CHACHA20-POLY1305:AES-128-GCM",
+            "AES-128-GCM",
+            Options {
+                cipher_size: 128,
+                ..gcm_opts()
+            },
+        ),
+    ] {
+        let mut server = Peer::new(server_config(), *b"SERVERID", auth_hook()).unwrap();
+        let mut client = TestClient::new(*b"CLIENTID");
+        client.kx.options = "V4,dev-type tun,link-mtu 1521,tun-mtu 1500,proto UDPv4,\
+                             auth SHA1,keysize 128,key-method 2,tls-client"
+            .into();
+        client.kx.peer_info = Some(format!("IV_VER=2.6.8\nIV_CIPHERS={iv_ciphers}\n"));
+        let keys = connect(&mut server, &mut client);
+
+        let pkt = data::encrypt(&opts, &keys, 0, 1, b"ncp", |b| {
+            b.fill(0);
+            Ok(())
+        })
+        .unwrap();
+        let out = server.handle_packet(&pkt).unwrap();
+        assert_eq!(out.deliver.as_deref(), Some(&b"ncp"[..]), "{want}");
+
+        for d in client.send_control(b"PUSH_REQUEST\0") {
+            for reply in server.handle_packet(&d).unwrap().send {
+                client.handle(&reply);
+            }
+        }
+        let text = String::from_utf8_lossy(client.control_text()).into_owned();
+        assert!(text.contains(&format!(",cipher {want}")), "{text}");
+    }
+}
+
 /// Key id of a data packet.
 fn key_id_of(pkt: &[u8]) -> u8 {
     Opcode::from_byte(pkt[0]).1
