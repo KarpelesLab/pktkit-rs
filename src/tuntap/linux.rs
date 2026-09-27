@@ -4,7 +4,7 @@
 //! handed to the handler is the read scratch and is only valid for the
 //! duration of the call (mirroring the rest of the crate).
 
-use super::reader::{DevFd, HandlerSlot};
+use super::reader::{DevFd, HandlerSlot, MAX_MTU, is_whole, msg_buffer};
 use crate::sys::if_hw_addr;
 use crate::{
     DeviceStats, Frame, IpPrefix, L2Device, L2Handler, L3Device, L3Handler, MacAddr, Packet, Result,
@@ -264,9 +264,19 @@ fn open_tuntap(name: &str, flags: i32) -> Result<(OwnedFd, String)> {
     Ok((owned, assigned))
 }
 
+/// The largest frame a TAP hands over: a packet at the largest MTU behind an
+/// Ethernet header and the 802.1Q tag the kernel puts back into a frame whose
+/// tag was offloaded.
+const MAX_TAP_FRAME: usize = MAX_MTU + 14 + 4;
+
 fn read_loop_l3(dev: Arc<DevFd>, handler: Arc<HandlerSlot<L3Handler>>, stats: Arc<DeviceStats>) {
-    let mut buf = vec![0u8; 65536];
+    let mut buf = msg_buffer(MAX_MTU);
     while let Some(n) = dev.read(&mut buf) {
+        if !is_whole(n, &buf) {
+            // Half a packet is worse than none.
+            stats.record_rx_drop();
+            continue;
+        }
         stats.record_rx(n);
         let Some(h) = handler.wait(dev.closed()) else {
             return;
@@ -276,9 +286,11 @@ fn read_loop_l3(dev: Arc<DevFd>, handler: Arc<HandlerSlot<L3Handler>>, stats: Ar
 }
 
 fn read_loop_l2(dev: Arc<DevFd>, handler: Arc<HandlerSlot<L2Handler>>, stats: Arc<DeviceStats>) {
-    let mut buf = vec![0u8; 65536];
+    // 65536 bytes, as this was, cut the last few bytes off a frame at the
+    // largest MTU, and handed on what was left as if it were the frame.
+    let mut buf = msg_buffer(MAX_TAP_FRAME);
     while let Some(n) = dev.read(&mut buf) {
-        if n < 14 {
+        if n < 14 || !is_whole(n, &buf) {
             stats.record_rx_drop();
             continue;
         }

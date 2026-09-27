@@ -11,7 +11,7 @@
 //! require a real macOS host + root and are marked
 //! `// TODO(tuntap): needs macOS to verify`.
 
-use super::reader::{DevFd, HandlerSlot};
+use super::reader::{DevFd, HandlerSlot, MAX_MTU, is_whole, msg_buffer};
 use crate::{Frame, IpPrefix, L2Device, L2Handler, L3Device, L3Handler, MacAddr, Packet, Result};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -245,10 +245,12 @@ fn getsockopt_ifname(fd: i32) -> Option<String> {
 
 fn read_loop(dev: Arc<DevFd>, handler: Arc<HandlerSlot<L3Handler>>) {
     // TODO(tuntap): needs macOS to verify the live read path.
-    let mut buf = vec![0u8; 65536];
+    // The 4-byte protocol-family header, then the packet.
+    let mut buf = msg_buffer(4 + MAX_MTU);
     while let Some(n) = dev.read(&mut buf) {
-        // Nothing past the 4-byte protocol-family header: no packet.
-        if n <= 4 {
+        // Nothing past the header is no packet; a read that filled the buffer
+        // is the front of one too long for it.
+        if n <= 4 || !is_whole(n, &buf) {
             continue;
         }
         let Some(h) = handler.wait(dev.closed()) else {

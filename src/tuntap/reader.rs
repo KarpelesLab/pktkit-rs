@@ -141,6 +141,29 @@ impl DevFd {
     }
 }
 
+/// The largest MTU the kernel lets an interface have (`ETH_MAX_MTU`, and the
+/// most an IPv4 or non-jumbo IPv6 packet can be anyway).
+pub(super) const MAX_MTU: usize = 65535;
+
+/// A buffer for [`DevFd::read`] that holds messages of up to `max` bytes, and
+/// one byte more.
+///
+/// A TUN/TAP read that does not fit is cut to the buffer's length and
+/// returned with no other sign of it (Linux `tun_chr_read_iter` clamps the
+/// count it returns; a utun control socket is a datagram socket), so the only
+/// tell is a read that fills the buffer. The spare byte keeps a message of
+/// exactly `max` bytes from looking like one.
+pub(super) fn msg_buffer(max: usize) -> Vec<u8> {
+    vec![0u8; max + 1]
+}
+
+/// Whether a read of `n` bytes into `buf`, from [`msg_buffer`], got the whole
+/// message rather than the front of a longer one.
+#[inline]
+pub(super) fn is_whole(n: usize, buf: &[u8]) -> bool {
+    n < buf.len()
+}
+
 /// A handler the reader thread can wait for.
 ///
 /// Until one is installed, the reader holds on to the message it has and
@@ -238,6 +261,26 @@ mod tests {
         dev.write_all(b"back").unwrap();
         let mut got = [0u8; 8];
         assert_eq!(peer.recv(&mut got).unwrap(), 4);
+    }
+
+    #[test]
+    fn a_message_too_long_for_the_buffer_is_told_apart() {
+        let (dev, peer) = device();
+        let mut buf = msg_buffer(8);
+        // Exactly the most the buffer is for: whole.
+        peer.send(&[1; 8]).unwrap();
+        let n = dev.read(&mut buf).unwrap();
+        assert_eq!(n, 8);
+        assert!(is_whole(n, &buf));
+        // Longer: the kernel cuts it short, and nothing but the length shows.
+        peer.send(&[2; 20]).unwrap();
+        let n = dev.read(&mut buf).unwrap();
+        assert!(!is_whole(n, &buf), "a truncated read passed as whole");
+        // The next message is unaffected.
+        peer.send(&[3; 5]).unwrap();
+        let n = dev.read(&mut buf).unwrap();
+        assert!(is_whole(n, &buf));
+        assert_eq!(&buf[..n], &[3; 5]);
     }
 
     #[test]
