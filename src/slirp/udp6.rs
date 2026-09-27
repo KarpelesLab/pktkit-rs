@@ -4,7 +4,7 @@ use crate::Result;
 use crate::slirp::packet::{build_udp_packet6, fit_link};
 use crate::slirp::udp::is_transient;
 use crate::time::Instant;
-use std::net::{Ipv6Addr, UdpSocket};
+use std::net::{Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -32,10 +32,17 @@ impl UdpConn6 {
         src_port: u16,
         dst_ip: Ipv6Addr,
         dst_port: u16,
+        dial: SocketAddr,
         send: SendFn,
     ) -> Result<Arc<UdpConn6>> {
-        let socket = UdpSocket::bind("[::]:0")?;
-        socket.connect((dst_ip, dst_port))?;
+        // `dial` is the canonical form of the destination: an IPv4-mapped
+        // one is reached over an IPv4 socket, as the filter judged it, while
+        // replies still go back to the guest from the address it used.
+        let socket = UdpSocket::bind(match dial {
+            SocketAddr::V4(_) => "0.0.0.0:0",
+            SocketAddr::V6(_) => "[::]:0",
+        })?;
+        socket.connect(dial)?;
         // A bounded read timeout lets the reader thread observe `closed`
         // promptly without relying on closing the fd (std has no UDP shutdown).
         socket.set_read_timeout(Some(READ_TIMEOUT))?;
