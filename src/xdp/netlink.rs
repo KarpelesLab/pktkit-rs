@@ -16,6 +16,7 @@ const NLM_F_ACK: u16 = 0x04;
 const NLA_F_NESTED: u16 = 0x8000;
 const IFLA_XDP: u16 = 43;
 const IFLA_XDP_FD: u16 = 1;
+const IFLA_XDP_ATTACHED: u16 = 2;
 const IFLA_XDP_FLAGS: u16 = 3;
 const IFLA_XDP_PROG_ID: u16 = 4;
 const IFLA_XDP_DRV_PROG_ID: u16 = 5;
@@ -158,6 +159,77 @@ pub fn attached_prog_id(ifindex: u32, mode: u32) -> Result<u32> {
     })
 }
 
+/// The modes, as an OR of `XDP_FLAGS_*_MODE` bits, that `ifindex` has an XDP
+/// program attached in; 0 if none.
+pub fn attached_modes(ifindex: u32) -> Result<u32> {
+    let reply = request(&build_link_msg(RTM_GETLINK, NLM_F_REQUEST, ifindex, &[], 1))?;
+    if let Some(e) = reply_errno(&reply) {
+        return Err(io::Error::from_raw_os_error(-e));
+    }
+    parse_xdp_modes(&reply).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "xdp: unexpected RTM_GETLINK reply",
+        )
+    })
+}
+
+/// The payload of the `IFLA_XDP` nest in an `RTM_NEWLINK` reply: `Some(None)`
+/// if the link has none, `None` if `reply` is not a link message at all.
+fn xdp_nest(reply: &[u8]) -> Option<Option<&[u8]>> {
+    if reply.len() < 32 || u16::from_ne_bytes([reply[4], reply[5]]) != RTM_NEWLINK {
+        return None;
+    }
+    let end = (u32::from_ne_bytes(reply[0..4].try_into().ok()?) as usize).min(reply.len());
+    Some(
+        nl_attrs(reply.get(32..end)?)
+            .find(|(t, _)| *t == IFLA_XDP)
+            .map(|(_, d)| d),
+    )
+}
+
+fn u32_of(d: &[u8]) -> Option<u32> {
+    d.get(..4)
+        .map(|b| u32::from_ne_bytes(b.try_into().unwrap()))
+}
+
+/// Which modes an `RTM_NEWLINK` reply says are occupied, as
+/// `XDP_FLAGS_*_MODE` bits. `None` if `reply` is not a link message.
+///
+/// Since 4.19 every occupied mode has its own `IFLA_XDP_*_PROG_ID`. 4.18
+/// reports only the one program, with its mode in `IFLA_XDP_ATTACHED`
+/// (`XDP_ATTACHED_DRV` = 1, `_SKB` = 2, `_HW` = 3).
+fn parse_xdp_modes(reply: &[u8]) -> Option<u32> {
+    let Some(xdp) = xdp_nest(reply)? else {
+        return Some(0);
+    };
+    let (mut modes, mut attached) = (0, 0u8);
+    for (t, d) in nl_attrs(xdp) {
+        let bit = match t {
+            IFLA_XDP_SKB_PROG_ID => 1 << 1,
+            IFLA_XDP_DRV_PROG_ID => 1 << 2,
+            IFLA_XDP_HW_PROG_ID => 1 << 3,
+            IFLA_XDP_ATTACHED => {
+                attached = d.first().copied().unwrap_or(0);
+                continue;
+            }
+            _ => continue,
+        };
+        if u32_of(d).is_some_and(|id| id != 0) {
+            modes |= bit;
+        }
+    }
+    if modes == 0 {
+        modes = match attached {
+            1 => 1 << 2,
+            2 => 1 << 1,
+            3 => 1 << 3,
+            _ => 0,
+        };
+    }
+    Some(modes)
+}
+
 /// Walk the attributes in `buf`, `(type, payload)` each, flag bits masked.
 fn nl_attrs(mut buf: &[u8]) -> impl Iterator<Item = (u16, &[u8])> {
     std::iter::from_fn(move || {
@@ -182,21 +254,13 @@ fn nl_attrs(mut buf: &[u8]) -> impl Iterator<Item = (u16, &[u8])> {
 /// programs are attached in more than one mode. `None` if `reply` is not a
 /// link message at all.
 fn parse_xdp_prog_id(reply: &[u8], mode: u32) -> Option<u32> {
-    if reply.len() < 32 || u16::from_ne_bytes([reply[4], reply[5]]) != RTM_NEWLINK {
-        return None;
-    }
-    let end = (u32::from_ne_bytes(reply[0..4].try_into().ok()?) as usize).min(reply.len());
     let per_mode = match mode {
         m if m & (1 << 1) != 0 => IFLA_XDP_SKB_PROG_ID,
         m if m & (1 << 2) != 0 => IFLA_XDP_DRV_PROG_ID,
         m if m & (1 << 3) != 0 => IFLA_XDP_HW_PROG_ID,
         _ => IFLA_XDP_PROG_ID,
     };
-    let u32_of = |d: &[u8]| {
-        d.get(..4)
-            .map(|b| u32::from_ne_bytes(b.try_into().unwrap()))
-    };
-    let Some((_, xdp)) = nl_attrs(reply.get(32..end)?).find(|(t, _)| *t == IFLA_XDP) else {
+    let Some(xdp) = xdp_nest(reply)? else {
         return Some(0);
     };
     let (mut only, mut exact, mut per_mode_seen) = (None, None, false);
@@ -293,7 +357,7 @@ mod tests {
     /// `xdp`'s attributes.
     fn newlink(xdp: &[(u16, u32)]) -> Vec<u8> {
         let mut attrs = nl_attr(4, &1500u32.to_ne_bytes());
-        let mut nested = nl_attr(2, &[1]); // IFLA_XDP_ATTACHED, padded
+        let mut nested = nl_attr(IFLA_XDP_ATTACHED, &[1]); // XDP_ATTACHED_DRV, padded
         for (t, v) in xdp {
             nested.extend_from_slice(&nl_attr(*t, &v.to_ne_bytes()));
         }
@@ -324,6 +388,41 @@ mod tests {
         assert_eq!(parse_xdp_prog_id(&bare, 1 << 2), Some(0));
         let err = build_link_msg(NLMSG_ERROR, 0, 2, &[], 1);
         assert_eq!(parse_xdp_prog_id(&err, 1 << 2), None);
+    }
+
+    #[test]
+    fn modes_come_from_the_per_mode_attributes() {
+        // newlink() puts IFLA_XDP_ATTACHED = 1 (DRV) first; the per-mode ids
+        // must win over it.
+        let r = newlink(&[(IFLA_XDP_SKB_PROG_ID, 7), (IFLA_XDP_PROG_ID, 7)]);
+        assert_eq!(parse_xdp_modes(&r), Some(1 << 1));
+        let multi = newlink(&[
+            (IFLA_XDP_SKB_PROG_ID, 7),
+            (IFLA_XDP_DRV_PROG_ID, 9),
+            (IFLA_XDP_HW_PROG_ID, 0),
+        ]);
+        assert_eq!(parse_xdp_modes(&multi), Some((1 << 1) | (1 << 2)));
+    }
+
+    #[test]
+    fn modes_fall_back_to_the_4_18_attached_byte() {
+        // Only IFLA_XDP_ATTACHED = XDP_ATTACHED_DRV and the lone prog id.
+        let r = newlink(&[(IFLA_XDP_PROG_ID, 5)]);
+        assert_eq!(parse_xdp_modes(&r), Some(1 << 2));
+        for (attached, mode) in [(0u8, 0), (2, 1 << 1), (3, 1 << 3)] {
+            let nested = nl_attr(IFLA_XDP_ATTACHED, &[attached]);
+            let attrs = nl_attr(IFLA_XDP | NLA_F_NESTED, &nested);
+            let r = build_link_msg(RTM_NEWLINK, 0, 2, &attrs, 1);
+            assert_eq!(parse_xdp_modes(&r), Some(mode), "attached={attached}");
+        }
+    }
+
+    #[test]
+    fn modes_empty_without_xdp_and_none_for_other_replies() {
+        let bare = build_link_msg(RTM_NEWLINK, 0, 2, &nl_attr(4, &[0; 4]), 1);
+        assert_eq!(parse_xdp_modes(&bare), Some(0));
+        let err = build_link_msg(NLMSG_ERROR, 0, 2, &[], 1);
+        assert_eq!(parse_xdp_modes(&err), None);
     }
 
     #[test]

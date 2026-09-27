@@ -393,10 +393,31 @@ fn prog_fd_by_id(id: u32) -> Result<OwnedFd> {
 /// Force-detach whatever XDP program is on `ifindex`.
 ///
 /// The escape hatch for a program left behind by a process that died before
-/// its [`Link`] dropped. Has no effect on a `bpf_link` attachment, which the
-/// kernel already cleaned up.
+/// its [`Link`] dropped. Clears every mode that has a program: an interface
+/// can hold a generic, a driver and an offloaded one at once. Has no effect
+/// on a `bpf_link` attachment, which the kernel already cleaned up when its
+/// owner died; one whose owner is still alive fails with `EBUSY`.
 pub fn detach(ifindex: u32) -> Result<()> {
-    netlink::set_xdp(ifindex, -1, 0)
+    // Each mode is cleared by name. With no mode flag the kernel picks one
+    // for us (dev_xdp_mode: driver if the NIC has a native hook, else
+    // generic), so a generic program on a native-XDP NIC would stay put.
+    let occupied = netlink::attached_modes(ifindex)?;
+    detach_modes(occupied, |m| netlink::set_xdp(ifindex, -1, m))
+}
+
+/// Run `clear` for each mode bit set in `occupied`, carrying on past a
+/// failure so one stuck mode does not shield the others, and report the
+/// first failure.
+fn detach_modes(occupied: u32, mut clear: impl FnMut(u32) -> Result<()>) -> Result<()> {
+    let mut first_err = None;
+    for m in [Mode::GENERIC, Mode::DRIVER, Mode::HARDWARE] {
+        if occupied & m.0 != 0
+            && let Err(e) = clear(m.0)
+        {
+            first_err.get_or_insert(e);
+        }
+    }
+    first_err.map_or(Ok(()), Err)
 }
 
 #[cfg(test)]
@@ -437,6 +458,45 @@ mod tests {
         assert_eq!(Mode::GENERIC.0, 2); // XDP_FLAGS_SKB_MODE
         assert_eq!(Mode::DRIVER.0, 4); // XDP_FLAGS_DRV_MODE
         assert_eq!(Mode::HARDWARE.0, 8); // XDP_FLAGS_HW_MODE
+    }
+
+    #[test]
+    fn detach_clears_each_occupied_mode_by_name() {
+        let mut seen = Vec::new();
+        let all = Mode::GENERIC.0 | Mode::DRIVER.0 | Mode::HARDWARE.0;
+        detach_modes(all, |m| {
+            seen.push(m);
+            Ok(())
+        })
+        .unwrap();
+        // Never the mode-less 0, which lets the kernel pick one.
+        assert_eq!(seen, [Mode::GENERIC.0, Mode::DRIVER.0, Mode::HARDWARE.0]);
+
+        seen.clear();
+        detach_modes(Mode::GENERIC.0, |m| {
+            seen.push(m);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen, [Mode::GENERIC.0]);
+
+        detach_modes(0, |_| panic!("nothing is attached")).unwrap();
+    }
+
+    #[test]
+    fn detach_goes_on_past_a_failure_and_reports_it() {
+        let mut seen = Vec::new();
+        let e = detach_modes(Mode::GENERIC.0 | Mode::DRIVER.0, |m| {
+            seen.push(m);
+            if m == Mode::GENERIC.0 {
+                Err(io::Error::from_raw_os_error(crate::syscall::EBUSY))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+        assert_eq!(seen, [Mode::GENERIC.0, Mode::DRIVER.0]);
+        assert_eq!(e.raw_os_error(), Some(crate::syscall::EBUSY));
     }
 
     #[test]
