@@ -5,7 +5,7 @@
 //! inside client opens the data connection itself, and the ordinary outbound
 //! path maps it.
 
-use crate::nat::helper::{Expectation, Helper, NatMapping, PROTO_TCP, PacketHelper};
+use crate::nat::helper::{Helper, NatMapping, PROTO_TCP, PacketHelper};
 use crate::nat::l4::replace_payload;
 use crate::nat::nat::Nat;
 use crate::time::Instant;
@@ -102,24 +102,10 @@ fn rewrite_port(nat: &Nat, pkt: &[u8], ihl: usize, data_off: usize, m: &NatMappi
         return pkt.to_vec();
     }
 
-    let outside_data_port =
-        match nat.create_mapping_in(m.namespace, PROTO_TCP, inside_ip, inside_port) {
-            Some(p) => p,
-            None => return pkt.to_vec(),
-        };
-
-    let dst_ip = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
-    nat.add_expectation(
-        Expectation::new(
-            PROTO_TCP,
-            inside_ip,
-            inside_port,
-            outside_data_port,
-            Instant::now() + FTP_EXPECT_TIMEOUT,
-        )
-        .remote_ip(dst_ip)
-        .namespace(m.namespace),
-    );
+    let outside_data_port = match expect_data_connection(nat, pkt, m, inside_ip, inside_port) {
+        Some(p) => p,
+        None => return pkt.to_vec(),
+    };
 
     let outside_ip = match nat.outside_addr() {
         Some(a) => a.octets(),
@@ -177,23 +163,10 @@ fn rewrite_eprt(nat: &Nat, pkt: &[u8], ihl: usize, data_off: usize, m: &NatMappi
         return pkt.to_vec();
     }
 
-    let outside_data_port =
-        match nat.create_mapping_in(m.namespace, PROTO_TCP, inside_ip, inside_port) {
-            Some(p) => p,
-            None => return pkt.to_vec(),
-        };
-    let dst_ip = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
-    nat.add_expectation(
-        Expectation::new(
-            PROTO_TCP,
-            inside_ip,
-            inside_port,
-            outside_data_port,
-            Instant::now() + FTP_EXPECT_TIMEOUT,
-        )
-        .remote_ip(dst_ip)
-        .namespace(m.namespace),
-    );
+    let outside_data_port = match expect_data_connection(nat, pkt, m, inside_ip, inside_port) {
+        Some(p) => p,
+        None => return pkt.to_vec(),
+    };
 
     let outside_ip = match nat.outside_addr() {
         Some(a) => a,
@@ -202,6 +175,28 @@ fn rewrite_eprt(nat: &Nat, pkt: &[u8], ihl: usize, data_off: usize, m: &NatMappi
     let mut new_payload = format!("EPRT |1|{}|{}|\r\n", outside_ip, outside_data_port).into_bytes();
     new_payload.extend_from_slice(&payload[end + 2..]);
     replace_payload(pkt, ihl, data_off, &new_payload)
+}
+
+/// Reserve the outside port the FTP server is told to connect to, open
+/// to that server alone. Active mode's data connection comes from the
+/// server we are talking to (RFC 959 §3.2, from its port 20), so there is
+/// no reason to let anyone else in; a mapping installed now would let any
+/// Internet host that guesses the port reach the client's listener first.
+fn expect_data_connection(
+    nat: &Nat,
+    pkt: &[u8],
+    m: &NatMapping,
+    inside_ip: Ipv4Addr,
+    inside_port: u16,
+) -> Option<u16> {
+    let server = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
+    nat.expect_from_in(
+        m.namespace,
+        PROTO_TCP,
+        (inside_ip, inside_port),
+        server,
+        Instant::now() + FTP_EXPECT_TIMEOUT,
+    )
 }
 
 /// Only an address belonging to the host that sent the command is opened
@@ -353,5 +348,81 @@ mod tests {
         // The passive data connection is opened by the inside client, so the
         // reply must not have opened anything towards the inside.
         assert!(nat.take_expectation(PROTO_TCP, client, 0).is_none());
+    }
+
+    /// Sends `cmd` on the client's control connection and returns the
+    /// outside data port the rewritten command announces.
+    fn announced_port(nat: &Nat, outside: &StdMutex<Vec<Vec<u8>>>, cmd: &[u8]) -> u16 {
+        let client = Ipv4Addr::new(10, 0, 0, 5);
+        let server = Ipv4Addr::new(198, 51, 100, 9);
+        let pkt = build_ftp_port_pkt(client, 45000, server, 21, cmd);
+        nat.inside().send(Packet::from_slice(&pkt)).unwrap();
+        let out = outside.lock().unwrap().pop().unwrap();
+        let s = std::str::from_utf8(&out[40..]).unwrap().trim().to_string();
+        if let Some(rest) = s.strip_prefix("PORT ") {
+            let n: Vec<u16> = rest.split(',').map(|x| x.parse().unwrap()).collect();
+            n[4] * 256 + n[5]
+        } else {
+            let f: Vec<&str> = s.split('|').collect();
+            f[3].parse().unwrap()
+        }
+    }
+
+    fn syn_from(src: Ipv4Addr, sport: u16, dport: u16) -> Vec<u8> {
+        let mut syn = build_ftp_port_pkt(src, sport, Ipv4Addr::new(203, 0, 113, 1), dport, b"");
+        syn[33] = 0x02;
+        crate::nat::l4::fill_v4_l4_checksum(&mut syn, 20);
+        syn
+    }
+
+    #[test]
+    fn only_the_ftp_server_reaches_the_active_data_port() {
+        for cmd in [
+            &b"PORT 10,0,0,5,4,210\r\n"[..],
+            b"EPRT |1|10.0.0.5|1234|\r\n",
+        ] {
+            let nat = Nat::new(pfx("10.0.0.1/24"), pfx("203.0.113.1/24"));
+            nat.add_packet_helper(Arc::new(FtpHelper::new()));
+            let outside = Arc::new(StdMutex::new(Vec::<Vec<u8>>::new()));
+            let c = outside.clone();
+            nat.outside().set_handler(Arc::new(move |p| {
+                c.lock().unwrap().push(p.as_bytes().to_vec());
+                Ok(())
+            }));
+            let inside = Arc::new(StdMutex::new(Vec::<Vec<u8>>::new()));
+            let c = inside.clone();
+            nat.inside().set_handler(Arc::new(move |p| {
+                c.lock().unwrap().push(p.as_bytes().to_vec());
+                Ok(())
+            }));
+            let dport = announced_port(&nat, &outside, cmd);
+
+            // Some other Internet host gets there first.
+            let attacker = syn_from(Ipv4Addr::new(192, 0, 2, 66), 5555, dport);
+            nat.outside().send(Packet::from_slice(&attacker)).unwrap();
+            assert!(inside.lock().unwrap().is_empty(), "third party got in");
+
+            let server = syn_from(Ipv4Addr::new(198, 51, 100, 9), 20, dport);
+            nat.outside().send(Packet::from_slice(&server)).unwrap();
+            let got = inside.lock().unwrap();
+            assert_eq!(got.len(), 1, "the FTP server must get through");
+            assert_eq!(&got[0][16..20], &[10, 0, 0, 5]);
+            assert_eq!(u16::from_be_bytes([got[0][22], got[0][23]]), 1234);
+        }
+    }
+
+    #[test]
+    fn a_retransmitted_port_command_announces_the_same_port() {
+        let nat = Nat::new(pfx("10.0.0.1/24"), pfx("203.0.113.1/24"));
+        nat.add_packet_helper(Arc::new(FtpHelper::new()));
+        let outside = Arc::new(StdMutex::new(Vec::<Vec<u8>>::new()));
+        let c = outside.clone();
+        nat.outside().set_handler(Arc::new(move |p| {
+            c.lock().unwrap().push(p.as_bytes().to_vec());
+            Ok(())
+        }));
+        let a = announced_port(&nat, &outside, b"PORT 10,0,0,5,4,210\r\n");
+        let b = announced_port(&nat, &outside, b"PORT 10,0,0,5,4,210\r\n");
+        assert_eq!(a, b);
     }
 }

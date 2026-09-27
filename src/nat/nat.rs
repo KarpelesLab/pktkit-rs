@@ -324,7 +324,11 @@ impl Nat {
             port: e.inside_port,
         };
         let mut inner = self.inner.lock().unwrap();
-        Self::expire_port_locked(&mut inner, rk, Instant::now());
+        Self::add_expectation_locked(&mut inner, e, rk, target);
+    }
+
+    fn add_expectation_locked(inner: &mut NatInner, e: Expectation, rk: NatRevKey, target: NatKey) {
+        Self::expire_port_locked(inner, rk, Instant::now());
         if inner.reverse.get(&rk).is_some_and(|k| *k != target) || inner.forwards.contains_key(&rk)
         {
             return;
@@ -490,6 +494,63 @@ impl Nat {
     /// after which only remotes it has exchanged traffic with count again.
     pub fn create_mapping(&self, proto: u8, inside_ip: Ipv4Addr, inside_port: u16) -> Option<u16> {
         self.create_mapping_in(0, proto, inside_ip, inside_port)
+    }
+
+    /// Choose the outside port for a connection an ALG expects from one
+    /// known remote, `remote_ip`, to inside endpoint
+    /// `inside_ip:inside_port`, and register the expectation on it. Returns
+    /// the port, or `None` if the pool is exhausted.
+    ///
+    /// Unlike [`create_mapping_in`](Self::create_mapping_in) this opens
+    /// nothing yet: a mapping delivers whatever reaches its port, so one
+    /// made now would let any Internet host that finds the port connect
+    /// before the expected remote does. The pending expectation holds the
+    /// port meanwhile (see `port_in_use_locked`), and the mapping is made
+    /// when the expected remote connects. An endpoint that is already
+    /// mapped, or has one pending already (a retransmitted command), keeps
+    /// its port.
+    pub(crate) fn expect_from_in(
+        &self,
+        namespace: u64,
+        proto: u8,
+        (inside_ip, inside_port): (Ipv4Addr, u16),
+        remote_ip: Ipv4Addr,
+        expires: Instant,
+    ) -> Option<u16> {
+        let k = NatKey {
+            ns: namespace,
+            proto,
+            ip: inside_ip,
+            port: inside_port,
+        };
+        let mut inner = self.inner.lock().unwrap();
+        let inner = &mut *inner;
+        let now = Instant::now();
+        Self::expire_mapping_locked(inner, k, now);
+        let pending = || {
+            inner.expectations.iter().find(|e| {
+                now <= e.expires
+                    && e.proto == proto
+                    && e.namespace == namespace
+                    && e.inside_ip == inside_ip
+                    && e.inside_port == inside_port
+            })
+        };
+        let port = match inner.mappings.get(&k) {
+            Some(m) => m.outside_port,
+            None => match pending().map(|e| e.outside_port) {
+                Some(p) => p,
+                None => match Self::forward_port_for_locked(inner, k, now) {
+                    Some(p) => p,
+                    None => Self::alloc_port_locked(inner)?,
+                },
+            },
+        };
+        let e = Expectation::new(proto, inside_ip, inside_port, port, expires)
+            .remote_ip(remote_ip)
+            .namespace(namespace);
+        Self::add_expectation_locked(inner, e, NatRevKey { proto, port }, k);
+        Some(port)
     }
 
     /// [`create_mapping`](Self::create_mapping) for a host in inside
@@ -1509,6 +1570,15 @@ impl Nat {
                 Self::expire_mapping_locked(&mut inner, k, now);
                 if !Self::install_mapping_locked(&mut inner, k, rk, false) {
                     return None;
+                }
+                // Made for one remote: only its traffic keeps the mapping
+                // alive, as on a mapping the host opened itself.
+                if !e.remote_ip.is_unspecified()
+                    && let Some(m) = inner.mappings.get_mut(&k)
+                {
+                    m.open = false;
+                    let peer = SocketAddrV4::new(src_ip, src_port);
+                    m.peers.note(peer, false, tcp_flags(pkt, ihl, proto), now);
                 }
                 k
             } else {
