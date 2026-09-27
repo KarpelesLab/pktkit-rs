@@ -250,6 +250,18 @@ impl Adapter {
             .local_addr()
     }
 
+    /// The bound TCP address. The same as [`local_addr`](Self::local_addr)
+    /// unless the configured port was 0, in which case each transport got
+    /// its own ephemeral port.
+    pub fn tcp_local_addr(&self) -> Result<SocketAddr> {
+        self.server
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|s| s.tcp_local_addr())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "server not started"))
+    }
+
     /// Shut down the adapter and its server.
     pub fn close(&self) {
         // Not under the lock: Server::close waits for the UDP reader, whose
@@ -670,6 +682,17 @@ mod tests {
         .unwrap();
         assert!(answers(&adapter, *b"CLIENT01"));
         assert!(!answers(&adapter, *b"CLIENT02"), "peer cap not applied");
+        adapter.close();
+    }
+
+    /// Bound to port 0, the TCP listener gets a port of its own, which the
+    /// caller must be able to learn to connect to it.
+    #[test]
+    fn the_tcp_port_is_reported() {
+        let adapter = Adapter::new(config(Arc::default())).unwrap();
+        let tcp = adapter.tcp_local_addr().unwrap();
+        assert_ne!(tcp.port(), 0);
+        std::net::TcpStream::connect(tcp).expect("TCP listener at the reported address");
         adapter.close();
     }
 
