@@ -1,6 +1,7 @@
 //! ARP (RFC 826) for IPv4 over Ethernet.
 //!
-//! - [`Table`] is the resolver cache: lookups, learning, capped at 4096 entries,
+//! - [`Table`] is the resolver cache: lookups, learning, capped at 4096 entries
+//!   (a full cache evicts the entry closest to expiry),
 //!   entries age out after 5 minutes.
 //! - [`Pending`] buffers packets awaiting resolution, up to 16 per target, and
 //!   discards stale queues after 3 seconds.
@@ -61,12 +62,7 @@ impl Table {
     pub fn set(&self, ip: Ipv4Addr, mac: MacAddr, ttl: Duration) {
         let mut t = self.inner.lock().unwrap();
         if !t.contains_key(&ip) && t.len() >= MAX_ENTRIES {
-            // Prune expired entries before giving up.
-            let now = Instant::now();
-            t.retain(|_, e| e.expires > now);
-            if t.len() >= MAX_ENTRIES {
-                return;
-            }
+            make_room(&mut t);
         }
         t.insert(
             ip,
@@ -75,6 +71,20 @@ impl Table {
                 expires: Instant::now() + ttl,
             },
         );
+    }
+}
+
+/// Free a slot in a full cache. Expired entries go first; failing that, the
+/// one closest to expiring -- the least recently confirmed. Refusing the new
+/// entry instead would let anyone who fills the cache with made-up senders
+/// keep every real neighbour out of it for good.
+fn make_room(t: &mut HashMap<Ipv4Addr, Entry>) {
+    let now = Instant::now();
+    t.retain(|_, e| e.expires > now);
+    if t.len() >= MAX_ENTRIES
+        && let Some(oldest) = t.iter().min_by_key(|(_, e)| e.expires).map(|(k, _)| *k)
+    {
+        t.remove(&oldest);
     }
 }
 
@@ -289,6 +299,22 @@ mod tests {
         t.set(Ipv4Addr::new(10, 0, 0, 1), m, Duration::from_secs(60));
         assert_eq!(t.lookup(Ipv4Addr::new(10, 0, 0, 1)), Some(m));
         assert_eq!(t.lookup(Ipv4Addr::new(10, 0, 0, 2)), None);
+    }
+
+    #[test]
+    fn full_table_evicts_the_entry_closest_to_expiry() {
+        let t = Table::new();
+        let m = MacAddr([0xaa; 6]);
+        let old = Ipv4Addr::new(10, 1, 0, 0);
+        t.set(old, m, Duration::from_secs(1));
+        for i in 1..MAX_ENTRIES as u32 {
+            t.set(Ipv4Addr::from(0x0a01_0000 + i), m, Duration::from_secs(60));
+        }
+        let new = Ipv4Addr::new(10, 2, 0, 1);
+        t.set(new, m, DEFAULT_TTL);
+        assert_eq!(t.lookup(new), Some(m), "a full cache refused a neighbour");
+        assert_eq!(t.lookup(old), None);
+        assert_eq!(t.inner.lock().unwrap().len(), MAX_ENTRIES);
     }
 
     #[test]

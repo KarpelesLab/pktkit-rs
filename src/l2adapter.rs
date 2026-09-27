@@ -361,14 +361,21 @@ impl L2Adapter {
         // answering our question), so the cache holds what we use rather
         // than everyone overheard. A 0.0.0.0 sender is probing for an
         // address (RFC 5227) and owns nothing yet.
+        // A stranger must also be on our subnet: we would never ARP for an
+        // address outside it, so an entry for one could only be junk, and
+        // letting anyone mint them would let one host fill the cache.
         if !sender_ip.is_unspecified()
-            && (for_us
+            && ((for_us && self.on_link_v4(sender_ip))
                 || self.arp.lookup(sender_ip).is_some()
                 || self.arp_pending.contains(sender_ip))
         {
             self.arp.set(sender_ip, sender_mac, arp::DEFAULT_TTL);
+            // Straight to the MAC just learnt rather than back through
+            // handle_outgoing: the queue was only waiting for this answer,
+            // and a second lookup that missed would queue and solicit again.
             for buf in self.arp_pending.drain(sender_ip) {
-                self.handle_outgoing(Packet::from_slice(&buf));
+                let frame = build_frame(sender_mac, self.mac, EtherType::IPV4, &buf);
+                self.send_l2(Frame::from_slice(&frame));
             }
         }
 
@@ -381,6 +388,19 @@ impl L2Adapter {
             let frame = build_frame(sender_mac, self.mac, EtherType::ARP, &payload);
             self.send_l2(Frame::from_slice(&frame));
         }
+    }
+
+    /// Whether `ip` is an address we would ARP for directly: on our subnet,
+    /// or IPv4 link-local (RFC 3927 §2.6.2).
+    fn on_link_v4(&self, ip: Ipv4Addr) -> bool {
+        let prefix = self.l3.addr();
+        ip.is_link_local() || (prefix.is_valid() && prefix.contains(IpAddr::V4(ip)))
+    }
+
+    /// The IPv6 counterpart of [`on_link_v4`](Self::on_link_v4).
+    fn on_link_v6(&self, ip: Ipv6Addr) -> bool {
+        let prefix = self.l3.addr();
+        ip.is_unicast_link_local() || (prefix.is_valid() && prefix.contains(IpAddr::V6(ip)))
     }
 
     fn send_arp_request(&self, target: Ipv4Addr) {
@@ -446,7 +466,10 @@ impl L2Adapter {
             if target != ndp::link_local_from_mac(self.mac) && dev_addr != Some(target) {
                 return true;
             }
+            // As for ARP, a neighbour we would never resolve ourselves is
+            // not worth a cache entry, and anyone may claim one.
             if !src.is_unspecified()
+                && self.on_link_v6(src)
                 && let Some(mac) = slla
             {
                 self.learn_neighbor(src, mac);
@@ -497,10 +520,12 @@ impl L2Adapter {
     /// however it was learnt.
     fn learn_neighbor(&self, ip: Ipv6Addr, mac: MacAddr) {
         self.ndp.set(ip, mac, ndp::DEFAULT_TTL);
-        // Drained before sending: a packet that misses the cache again is
-        // queued anew, which needs the queue's lock.
+        // Sent to `mac` directly, not looked up again: what was waiting was
+        // waiting for this answer, and a lookup that missed would only queue
+        // it and solicit once more.
         for buf in self.ndp_pending.drain(ip) {
-            self.handle_outgoing(Packet::from_slice(&buf));
+            let frame = build_frame(mac, self.mac, EtherType::IPV6, &buf);
+            self.send_l2(Frame::from_slice(&frame));
         }
     }
 
@@ -809,29 +834,85 @@ mod tests {
     }
 
     #[test]
-    fn advertisement_that_cannot_be_cached_does_not_deadlock() {
+    fn advertisement_into_a_full_cache_still_delivers() {
         let (pipe, adapter, out) = rig("2001:db8::5/64");
-        // A full neighbour cache: the advertised address will not stick, so
-        // the flushed packet misses again and is queued anew.
         for i in 0..ndp::MAX_ENTRIES as u32 {
-            let ip = Ipv6Addr::from(0xfd00_u128 << 112 | i as u128);
-            adapter.ndp.set(ip, PEER_MAC, ndp::DEFAULT_TTL);
+            let ip = Ipv6Addr::from(0x2001_0db8_u128 << 96 | 0x1_0000 | i as u128);
+            adapter
+                .ndp
+                .set(ip, MacAddr([2, 0, 0, 0, 0, 1]), ndp::DEFAULT_TTL);
         }
         pipe.inject(Packet::from_slice(&v6_packet(our_ip(), peer_ip())))
             .unwrap();
+        assert_eq!(take(&out).len(), 1, "NS sent");
+
+        let mut na = ndp::build_na(PEER_MAC, peer_ip(), true);
+        let f = ndp_frame(&adapter, PEER_MAC, peer_ip(), our_ip(), &mut na);
+        adapter.send(Frame::from_slice(&f)).unwrap();
+        let sent = take(&out);
+        assert_eq!(sent.len(), 1, "solicited again instead of delivering");
+        let f = Frame::from_slice(&sent[0]);
+        assert_eq!(f.dst_mac(), Some(PEER_MAC));
+        assert_eq!(
+            Packet::from_slice(f.payload()).ipv6_next_header(),
+            Protocol(59)
+        );
+        assert_eq!(adapter.ndp.lookup(peer_ip()), Some(PEER_MAC));
+    }
+
+    #[test]
+    fn arp_flood_does_not_lock_out_real_neighbours() {
+        let (pipe, adapter, out) = rig("10.0.0.5/16");
+        // Requests for us from made-up senders on our subnet fill the cache.
+        for i in 0..arp::MAX_ENTRIES as u32 {
+            let ip = (0x0a00_1000 + i).to_be_bytes();
+            let mac = MacAddr([2, 0xee, 0, 0, (i >> 8) as u8, i as u8]);
+            arp_in(&adapter, arp::OP_REQUEST, mac, ip, [10, 0, 0, 5]);
+        }
         take(&out);
 
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let a = adapter.clone();
-        std::thread::spawn(move || {
-            let mut na = ndp::build_na(PEER_MAC, peer_ip(), true);
-            let f = ndp_frame(&a, PEER_MAC, peer_ip(), our_ip(), &mut na);
-            a.send(Frame::from_slice(&f)).unwrap();
-            let _ = done_tx.send(());
-        });
-        done_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("deadlocked flushing the neighbour queue");
+        pipe.inject(Packet::from_slice(&v4_packet([10, 0, 0, 5], [10, 0, 0, 6])))
+            .unwrap();
+        assert_eq!(take(&out).len(), 1, "ARP request");
+        let real = MacAddr([2, 0, 0, 0, 0, 6]);
+        arp_in(&adapter, arp::OP_REPLY, real, [10, 0, 0, 6], [10, 0, 0, 5]);
+
+        let sent = take(&out);
+        assert_eq!(sent.len(), 1, "re-solicited instead of delivering");
+        let f = Frame::from_slice(&sent[0]);
+        assert_eq!(f.ether_type(), EtherType::IPV4);
+        assert_eq!(f.dst_mac(), Some(real));
+        assert_eq!(adapter.arp.lookup(Ipv4Addr::new(10, 0, 0, 6)), Some(real));
+    }
+
+    #[test]
+    fn neighbours_off_our_subnet_are_not_learnt() {
+        let (_pipe, adapter, _out) = rig("10.0.0.5/24");
+        let a = MacAddr([2, 0, 0, 0, 0, 7]);
+        arp_in(
+            &adapter,
+            arp::OP_REQUEST,
+            a,
+            [192, 168, 1, 7],
+            [10, 0, 0, 5],
+        );
+        assert_eq!(adapter.arp.lookup(Ipv4Addr::new(192, 168, 1, 7)), None);
+        // Link-local is on-link whatever the subnet.
+        arp_in(
+            &adapter,
+            arp::OP_REQUEST,
+            a,
+            [169, 254, 1, 7],
+            [10, 0, 0, 5],
+        );
+        assert_eq!(adapter.arp.lookup(Ipv4Addr::new(169, 254, 1, 7)), Some(a));
+
+        let (_pipe, adapter, _out) = rig("2001:db8::5/64");
+        let off: Ipv6Addr = "2001:db9::66".parse().unwrap();
+        let mut ns = ndp::build_ns(PEER_MAC, our_ip());
+        let f = ndp_frame(&adapter, PEER_MAC, off, our_ip(), &mut ns);
+        adapter.send(Frame::from_slice(&f)).unwrap();
+        assert_eq!(adapter.ndp.lookup(off), None);
     }
 
     fn v4_packet(src: [u8; 4], dst: [u8; 4]) -> Vec<u8> {

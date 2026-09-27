@@ -51,11 +51,7 @@ impl Table {
     pub fn set(&self, ip: Ipv6Addr, mac: MacAddr, ttl: Duration) {
         let mut t = self.inner.lock().unwrap();
         if !t.contains_key(&ip) && t.len() >= MAX_ENTRIES {
-            let now = Instant::now();
-            t.retain(|_, e| e.expires > now);
-            if t.len() >= MAX_ENTRIES {
-                return;
-            }
+            make_room(&mut t);
         }
         t.insert(
             ip,
@@ -64,6 +60,19 @@ impl Table {
                 expires: Instant::now() + ttl,
             },
         );
+    }
+}
+
+/// Free a slot in a full cache: expired entries first, else the one closest
+/// to expiring. Refusing new entries would let a flood of made-up neighbours
+/// lock the real ones out for good.
+fn make_room(t: &mut HashMap<Ipv6Addr, Entry>) {
+    let now = Instant::now();
+    t.retain(|_, e| e.expires > now);
+    if t.len() >= MAX_ENTRIES
+        && let Some(oldest) = t.iter().min_by_key(|(_, e)| e.expires).map(|(k, _)| *k)
+    {
+        t.remove(&oldest);
     }
 }
 
@@ -229,6 +238,21 @@ pub fn parse_option(mut opts: &[u8], opt_type: u8) -> Option<MacAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn full_table_evicts_the_entry_closest_to_expiry() {
+        let t = Table::new();
+        let m = MacAddr([0xaa; 6]);
+        let old = Ipv6Addr::from(0xfd00_u128 << 112);
+        t.set(old, m, Duration::from_secs(1));
+        for i in 1..MAX_ENTRIES as u128 {
+            t.set(Ipv6Addr::from(0xfd00_u128 << 112 | i), m, DEFAULT_TTL);
+        }
+        let new: Ipv6Addr = "fe80::1".parse().unwrap();
+        t.set(new, m, DEFAULT_TTL);
+        assert_eq!(t.lookup(new), Some(m), "a full cache refused a neighbour");
+        assert_eq!(t.lookup(old), None);
+    }
 
     #[test]
     fn link_local_eui64() {
