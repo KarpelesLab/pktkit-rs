@@ -244,14 +244,23 @@ impl Insn {
         }
     }
 
-    /// Serialize to the 8 wire bytes. eBPF is little-endian on every arch the
-    /// kernel supports for this ABI.
+    /// Serialize to the 8 bytes of a `struct bpf_insn` as `bpf(2)` reads it
+    /// on this host.
+    ///
+    /// That struct is in host byte order: `off` and `imm` are native-endian,
+    /// and `dst_reg:4` / `src_reg:4` are C bitfields, which a big-endian ABI
+    /// allocates from the most significant bit — so there `dst` is the high
+    /// nibble of the byte, not the low one [`Insn::regs`] keeps it in.
     pub fn to_bytes(self) -> [u8; 8] {
         let mut b = [0u8; 8];
         b[0] = self.code;
-        b[1] = self.regs;
-        b[2..4].copy_from_slice(&self.off.to_le_bytes());
-        b[4..8].copy_from_slice(&self.imm.to_le_bytes());
+        b[1] = if cfg!(target_endian = "big") {
+            self.regs.rotate_left(4)
+        } else {
+            self.regs
+        };
+        b[2..4].copy_from_slice(&self.off.to_ne_bytes());
+        b[4..8].copy_from_slice(&self.imm.to_ne_bytes());
         b
     }
 }
@@ -378,6 +387,26 @@ impl Asm {
 mod tests {
     use super::*;
 
+    #[test]
+    fn insn_bytes_are_host_order() {
+        // `struct bpf_insn` as this host's C compiler lays it out.
+        let i = Insn::ldx(Size::H, R3, R7, -2);
+        let b = i.to_bytes();
+        assert_eq!(b[0], i.code);
+        assert_eq!(&b[2..4], &(-2i16).to_ne_bytes());
+        let j = Insn::mov64_imm(R1, 0x0102_0304);
+        assert_eq!(&j.to_bytes()[4..8], &0x0102_0304i32.to_ne_bytes());
+        // dst_reg is the first bitfield: low nibble on little-endian, high
+        // nibble on big-endian.
+        let want = if cfg!(target_endian = "big") {
+            0x37
+        } else {
+            0x73
+        };
+        assert_eq!(b[1], want);
+    }
+
+    #[cfg(target_endian = "little")]
     #[test]
     fn insn_wire_encoding() {
         // r2 = *(u32 *)(r1 + 16)
