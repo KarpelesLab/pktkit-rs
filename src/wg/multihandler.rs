@@ -32,7 +32,10 @@ pub struct MultiPacketResult {
     pub handler: Arc<Handler>,
 }
 
-/// Multiplexer over a fixed set of handlers identified by their public keys.
+/// Multiplexer over a set of handlers identified by their public keys.
+/// Members can be added and removed while it runs
+/// ([`add_handler`](Self::add_handler), [`remove_handler`](Self::remove_handler)),
+/// no two with the same key.
 #[derive(Debug)]
 pub struct MultiHandler {
     handlers: RwLock<Vec<Arc<Handler>>>,
@@ -80,6 +83,7 @@ impl MultiHandler {
         self.handlers.read().expect("multihandler lock").clone()
     }
 
+    /// The member with public key `pubkey`, if there is one.
     pub fn handler(&self, pubkey: &NoisePublicKey) -> Option<Arc<Handler>> {
         self.handlers
             .read()
@@ -89,6 +93,9 @@ impl MultiHandler {
             .cloned()
     }
 
+    /// Add a member. Fails with `AlreadyExists` if one with the same public
+    /// key is a member already. A handler that belonged to another
+    /// `MultiHandler` moves to this one (see the module docs).
     pub fn add_handler(&self, h: Arc<Handler>) -> Result<()> {
         let mut g = self.handlers.write().expect("multihandler lock");
         let pk = h.public_key();
@@ -103,6 +110,8 @@ impl MultiHandler {
         Ok(())
     }
 
+    /// Remove the member with public key `pubkey` and return it, or `None`
+    /// if there is none.
     pub fn remove_handler(&self, pubkey: &NoisePublicKey) -> Option<Arc<Handler>> {
         let mut g = self.handlers.write().expect("multihandler lock");
         let idx = g.iter().position(|h| h.public_key() == *pubkey)?;

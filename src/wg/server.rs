@@ -167,6 +167,9 @@ impl std::fmt::Debug for Server {
 }
 
 impl Server {
+    /// Build a server; it does nothing until [`serve`](Self::serve) is
+    /// given a socket. Fails with `InvalidInput` unless exactly one of the
+    /// config's `handler` and `multi_handler` is set.
     pub fn new(cfg: ServerConfig) -> Result<Arc<Self>> {
         match (cfg.handler.is_some(), cfg.multi_handler.is_some()) {
             (false, false) => {
@@ -533,6 +536,10 @@ impl Server {
         }
     }
 
+    /// Where the server sends to `peer_key`: the source of the peer's last
+    /// authenticated packet (a handshake response or transport data, so a
+    /// roaming peer is followed), or the address [`connect`](Self::connect)
+    /// was given. `None` before either.
     pub fn peer_addr(&self, peer_key: &NoisePublicKey) -> Option<SocketAddr> {
         self.peer_addrs
             .read()

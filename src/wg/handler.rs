@@ -244,6 +244,7 @@ impl Handler {
         }))
     }
 
+    /// This identity's public key.
     #[inline]
     pub fn public_key(&self) -> NoisePublicKey {
         self.public_key
@@ -344,6 +345,15 @@ impl Handler {
     }
 
     /// Set an expiry time on an existing peer. No effect if the peer is unknown.
+    ///
+    /// Past `at` the peer counts as unauthorized, though it stays in the
+    /// table: its handshakes are refused (or handed to the unknown-peer
+    /// callback), and sessions already established stop at once, both ways
+    /// -- [`encrypt`](Self::encrypt) refuses them and its transport packets
+    /// are refused -- rather than running on until they expire by
+    /// themselves. [`add_peer`](Self::add_peer) or
+    /// [`add_peer_with_psk`](Self::add_peer_with_psk) clears the expiry and
+    /// authorizes the peer again.
     pub fn set_peer_expiry(&self, peer_key: &NoisePublicKey, at: Instant) {
         let mut peers = self.peers.write().expect("peers lock");
         if let Some(p) = peers.get_mut(peer_key) {
@@ -361,6 +371,9 @@ impl Handler {
             .collect()
     }
 
+    /// What the handler knows about an authorized peer, or `None` if the
+    /// key is not in its table. An expired peer is still reported, with its
+    /// [`expires_at`](PeerInfo::expires_at).
     pub fn get_peer_info(&self, peer_key: &NoisePublicKey) -> Option<PeerInfo> {
         let peers = self.peers.read().expect("peers lock");
         peers.get(peer_key).map(|p| PeerInfo {

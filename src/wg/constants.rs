@@ -98,16 +98,19 @@ pub const NOISE_PRESHARED_KEY_SIZE: usize = 32;
 pub struct NoisePublicKey(pub [u8; NOISE_PUBLIC_KEY_SIZE]);
 
 impl NoisePublicKey {
+    /// The all-zero public key.
     #[inline]
     pub const fn zero() -> Self {
         Self([0u8; NOISE_PUBLIC_KEY_SIZE])
     }
 
+    /// The raw 32 bytes.
     #[inline]
     pub const fn as_bytes(&self) -> &[u8; NOISE_PUBLIC_KEY_SIZE] {
         &self.0
     }
 
+    /// True for the all-zero public key.
     #[inline]
     pub fn is_zero(&self) -> bool {
         self.0 == [0u8; NOISE_PUBLIC_KEY_SIZE]
@@ -137,16 +140,19 @@ impl fmt::Debug for NoisePublicKey {
 pub struct NoisePrivateKey(pub [u8; NOISE_PRIVATE_KEY_SIZE]);
 
 impl NoisePrivateKey {
+    /// The all-zero private key.
     #[inline]
     pub const fn zero() -> Self {
         Self([0u8; NOISE_PRIVATE_KEY_SIZE])
     }
 
+    /// The raw 32 bytes.
     #[inline]
     pub const fn as_bytes(&self) -> &[u8; NOISE_PRIVATE_KEY_SIZE] {
         &self.0
     }
 
+    /// True for the all-zero private key.
     #[inline]
     pub fn is_zero(&self) -> bool {
         self.0 == [0u8; NOISE_PRIVATE_KEY_SIZE]
@@ -176,16 +182,19 @@ impl Drop for NoisePrivateKey {
 pub struct NoisePresharedKey(pub [u8; NOISE_PRESHARED_KEY_SIZE]);
 
 impl NoisePresharedKey {
+    /// The all-zero preshared key.
     #[inline]
     pub const fn zero() -> Self {
         Self([0u8; NOISE_PRESHARED_KEY_SIZE])
     }
 
+    /// The raw 32 bytes.
     #[inline]
     pub const fn as_bytes(&self) -> &[u8; NOISE_PRESHARED_KEY_SIZE] {
         &self.0
     }
 
+    /// True for the all-zero preshared key.
     #[inline]
     pub fn is_zero(&self) -> bool {
         self.0 == [0u8; NOISE_PRESHARED_KEY_SIZE]

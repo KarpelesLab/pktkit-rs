@@ -47,6 +47,7 @@ impl Inner {
 }
 
 impl SlidingWindow {
+    /// A window that has accepted no counter yet.
     pub const fn new() -> Self {
         Self {
             inner: Mutex::new(Inner {

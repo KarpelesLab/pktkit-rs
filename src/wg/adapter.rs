@@ -261,8 +261,12 @@ impl Adapter {
         thread::spawn(move || me.server.serve(Arc::new(conn)))
     }
 
-    /// Authorize a peer. In multi-handler mode this authorizes on every
-    /// member identity.
+    /// Authorize (or refresh) a peer. In multi-handler mode this authorizes
+    /// on every member identity.
+    ///
+    /// This is [`Handler::add_peer`] on each: a peer already known keeps
+    /// its preshared key, and any [expiry](Handler::set_peer_expiry) is
+    /// cleared, so a lapsed peer is authorized again.
     pub fn add_peer(&self, key: NoisePublicKey) {
         if let Some(mh) = self.multi_handler.as_ref() {
             for h in mh.handlers() {
@@ -364,10 +368,12 @@ impl Adapter {
             .public_key()
     }
 
+    /// The handler, in single-handler mode; `None` in multi-handler mode.
     pub fn handler(&self) -> Option<Arc<Handler>> {
         self.handler.clone()
     }
 
+    /// The multi-handler, in multi-handler mode; `None` otherwise.
     pub fn multi_handler(&self) -> Option<Arc<MultiHandler>> {
         self.multi_handler.clone()
     }
