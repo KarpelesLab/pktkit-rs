@@ -20,9 +20,19 @@ use std::net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex};
 
 const MAX_FRAME_SIZE: usize = 65535;
+
+/// Most frames queued for one peer's socket; past it, frames are dropped.
+///
+/// A switch port with a full transmit queue drops, and so does this: QEMU
+/// stops reading its socket whenever the guest's receive ring is full (or the
+/// VM is paused), and a sender that blocked on that would stall whatever sent
+/// the frame -- a hub forwarding inline to every port, or another peer's
+/// reader, which with two peers doing it to each other is a deadlock.
+const OUT_QUEUE_LIMIT: usize = 128;
 
 struct DoneSignal {
     closed: AtomicBool,
@@ -81,14 +91,21 @@ impl DoneSignal {
 
 /// One QEMU socket peer. Each Ethernet frame is wrapped in a 4-byte
 /// big-endian length prefix in both directions.
+///
+/// [`send`](L2Device::send) never waits on the socket: frames are queued for
+/// a writer thread, and while the peer is not reading and the queue is full,
+/// further frames are dropped with `ErrorKind::WouldBlock`, as a congested
+/// switch port would drop them.
 pub struct Conn {
     mac: MacAddr,
-    write: Mutex<Box<dyn Write + Send>>,
+    /// Length-prefixed frames for the writer thread, which alone touches the
+    /// socket's write side. Taken on close, which lets that thread finish.
+    out: Mutex<Option<SyncSender<Vec<u8>>>>,
     handler: Arc<HandlerSlot>,
     done: Arc<DoneSignal>,
     /// Shuts the socket down in both directions: the peer sees EOF and the
-    /// reader thread's blocked read returns.
-    shutdown: Box<dyn Fn() + Send + Sync>,
+    /// reader thread's blocked read returns, as does a blocked write.
+    shutdown: Arc<dyn Fn() + Send + Sync>,
 }
 
 impl core::fmt::Debug for Conn {
@@ -102,11 +119,12 @@ impl core::fmt::Debug for Conn {
 impl Conn {
     /// Build a Conn from a pre-split read/write pair and a way to shut the
     /// socket down. Spawns a reader thread that invokes the installed handler
-    /// for each received frame.
+    /// for each received frame, and a writer thread that drains the outbound
+    /// queue into the socket.
     fn from_split(
         read: Box<dyn Read + Send + 'static>,
         write: Box<dyn Write + Send + 'static>,
-        shutdown: Box<dyn Fn() + Send + Sync>,
+        shutdown: Arc<dyn Fn() + Send + Sync>,
     ) -> Arc<Conn> {
         let mac = MacAddr::random_local_unicast();
         let handler = Arc::new(HandlerSlot {
@@ -140,9 +158,25 @@ impl Conn {
             done_t.signal();
         });
 
+        let (out, rx) = mpsc::sync_channel::<Vec<u8>>(OUT_QUEUE_LIMIT);
+        let shutdown_t = shutdown.clone();
+        // Ends once the queue's sender is dropped (on close) and drained, or
+        // when a write fails. A failed write may have left half a frame on the
+        // stream, after which nothing sent could be framed right, so the
+        // connection is hung up.
+        std::thread::spawn(move || {
+            let mut write = write;
+            while let Ok(frame) = rx.recv() {
+                if write.write_all(&frame).is_err() {
+                    shutdown_t();
+                    return;
+                }
+            }
+        });
+
         Arc::new(Conn {
             mac,
-            write: Mutex::new(write),
+            out: Mutex::new(Some(out)),
             handler,
             done,
             shutdown,
@@ -155,6 +189,7 @@ impl Conn {
         let _guard = self.handler.handler.lock().unwrap();
         self.handler.ready.notify_all();
         drop(_guard);
+        drop(self.out.lock().unwrap().take());
         (self.shutdown)();
     }
 
@@ -175,12 +210,29 @@ impl L2Device for Conn {
         if bytes.len() < 14 {
             return Ok(());
         }
+        if bytes.len() > MAX_FRAME_SIZE {
+            // Our own reader hangs up on a larger one, so a Conn at the other
+            // end would too.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "qemu: frame larger than the protocol allows",
+            ));
+        }
         let mut out = Vec::with_capacity(4 + bytes.len());
         out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
         out.extend_from_slice(bytes);
-        let mut w = self.write.lock().unwrap();
-        w.write_all(&out)?;
-        Ok(())
+        let q = self.out.lock().unwrap();
+        let Some(q) = q.as_ref() else {
+            return Err(closed());
+        };
+        match q.try_send(out) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "qemu: peer is not reading, frame dropped",
+            )),
+            Err(TrySendError::Disconnected(_)) => Err(closed()),
+        }
     }
     fn hw_addr(&self) -> MacAddr {
         self.mac
@@ -203,6 +255,10 @@ impl Drop for Conn {
     }
 }
 
+fn closed() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::NotConnected, "qemu: connection closed")
+}
+
 impl crate::DoneSignal for DoneSignal {
     fn wait_done(&self) {
         self.wait();
@@ -222,7 +278,7 @@ pub fn dial_tcp(addr: impl ToSocketAddrs) -> Result<Arc<Conn>> {
 
 fn tcp_conn(s: TcpStream) -> Result<Arc<Conn>> {
     let (w, c) = (s.try_clone()?, s.try_clone()?);
-    let shutdown = Box::new(move || {
+    let shutdown = Arc::new(move || {
         let _ = c.shutdown(Shutdown::Both);
     });
     Ok(Conn::from_split(Box::new(s), Box::new(w), shutdown))
@@ -240,7 +296,7 @@ pub fn dial_unix(path: impl AsRef<Path>) -> Result<Arc<Conn>> {
 #[cfg(unix)]
 fn unix_conn(s: UnixStream) -> Result<Arc<Conn>> {
     let (w, c) = (s.try_clone()?, s.try_clone()?);
-    let shutdown = Box::new(move || {
+    let shutdown = Arc::new(move || {
         let _ = c.shutdown(Shutdown::Both);
     });
     Ok(Conn::from_split(Box::new(s), Box::new(w), shutdown))
@@ -460,6 +516,44 @@ mod tests {
         client.close().unwrap();
         rx.recv_timeout(ECHO_TIMEOUT).expect("never detached");
         assert_eq!(*attached.lock().unwrap(), 0);
+    }
+
+    /// A peer that stops reading costs frames, not the sender: `send` keeps
+    /// returning at once, with the overflow dropped, and `close` still hangs
+    /// up. Before the queue, the first send past the socket buffers blocked
+    /// for as long as the peer did.
+    #[test]
+    fn a_peer_that_stops_reading_does_not_block_the_sender() {
+        let ln = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = dial_tcp(ln.local_addr().unwrap()).unwrap();
+        // Accepted and held, never read from.
+        let (_peer, _) = ln.accept().unwrap();
+
+        let m = MacAddr([2, 0, 0, 0, 0, 1]);
+        let (tx, rx) = mpsc::channel();
+        let c = client.clone();
+        std::thread::spawn(move || {
+            let frame = build_frame(m, m, EtherType::IPV4, &[0u8; 60_000]);
+            // ~120 MB offered: far more than any socket buffers hold.
+            let mut dropped = 0;
+            for _ in 0..2_000 {
+                if let Err(e) = c.send(Frame::from_slice(&frame)) {
+                    assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock);
+                    dropped += 1;
+                }
+            }
+            let _ = tx.send(dropped);
+        });
+        let dropped = rx.recv_timeout(ECHO_TIMEOUT).expect("send blocked");
+        assert!(dropped > 0, "nothing was dropped");
+
+        // The writer is still blocked on the socket; close must free it.
+        client.close().unwrap();
+        let frame = build_frame(m, m, EtherType::IPV4, b"late");
+        assert_eq!(
+            client.send(Frame::from_slice(&frame)).unwrap_err().kind(),
+            std::io::ErrorKind::NotConnected
+        );
     }
 
     #[test]
