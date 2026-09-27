@@ -11,6 +11,12 @@
 //!
 //! Ported from the Go `adapter.go`. The auth hook maps credentials to a
 //! [`PeerConfig`]; the adapter then sets up the device and connector wiring.
+//!
+//! In tun mode a client's packets are passed on only if their source is
+//! the address it was given or lies in one of its
+//! [`iroutes`](PeerConfig::iroutes); the rest are dropped. The adapter does
+//! no routing towards clients: each has its own device, and what the
+//! connector sends to it goes to that client.
 
 use std::collections::HashMap;
 use std::io;
@@ -226,7 +232,7 @@ impl Adapter {
         // dev-type, but here we wire based on what the operator configured).
         match &self.connector {
             Connector::L3(conn) => {
-                let dev = PeerL3Device::new(&self.me, key, prefix);
+                let dev = PeerL3Device::new(&self.me, key, prefix, cfg.iroutes.clone());
                 let cleanup = match conn.connect_l3(dev.clone() as Arc<dyn L3Device>) {
                     Ok(c) => c,
                     Err(_) => return,
@@ -296,19 +302,28 @@ struct PeerL3Device {
     key: PeerKey,
     handler: Mutex<Option<L3Handler>>,
     addr: Mutex<IpPrefix>,
-    /// The tunnel address pushed to the client: the only source its
-    /// packets may carry.
+    /// The tunnel address pushed to the client: a source its packets may
+    /// carry.
     client_ip: IpAddr,
+    /// Networks behind the client, whose addresses its packets may carry
+    /// too (OpenVPN's `iroute`).
+    iroutes: Vec<IpPrefix>,
 }
 
 impl PeerL3Device {
-    fn new(adapter: &Weak<Adapter>, key: PeerKey, addr: IpPrefix) -> Arc<Self> {
+    fn new(
+        adapter: &Weak<Adapter>,
+        key: PeerKey,
+        addr: IpPrefix,
+        iroutes: Vec<IpPrefix>,
+    ) -> Arc<Self> {
         Arc::new(PeerL3Device {
             adapter: adapter.clone(),
             key,
             handler: Mutex::new(None),
             addr: Mutex::new(addr),
             client_ip: addr.addr(),
+            iroutes,
         })
     }
 
@@ -322,13 +337,20 @@ impl PeerL3Device {
 
     fn deliver(&self, data: &[u8]) {
         let packet = crate::Packet::from_slice(data);
-        // A client may only speak for the address it was given (multi.c
+        // A client may only speak for the address it was given, and for
+        // the networks routed through it (multi.c
         // multi_process_incoming_link, "bad source address from client"):
         // otherwise it could pass for another client, or for any host at
         // all, to whatever the connector leads to. An IPv6 packet from a
-        // client given an IPv4 address, link-local ones included, has no
-        // address of its own to come from either.
-        if !packet.is_valid() || packet.src_addr() != Some(self.client_ip) {
+        // client given an IPv4 address and no IPv6 iroute, link-local ones
+        // included, has no address of its own to come from either.
+        if !packet.is_valid() {
+            return;
+        }
+        let Some(src) = packet.src_addr() else {
+            return;
+        };
+        if src != self.client_ip && !self.iroutes.iter().any(|r| r.contains(src)) {
             return;
         }
         let h = self.handler();
@@ -520,7 +542,7 @@ mod tests {
             crate::ovpn::Transport::Udp,
         );
         let prefix = IpPrefix::new("10.8.0.2".parse().unwrap(), 24);
-        let dev = PeerL3Device::new(&Weak::new(), key, prefix);
+        let dev = PeerL3Device::new(&Weak::new(), key, prefix, Vec::new());
         let seen = Arc::new(Mutex::new(Vec::new()));
         {
             let seen = seen.clone();
@@ -645,6 +667,28 @@ mod tests {
             adapter.close();
         }));
         assert!(r.is_ok(), "adapter unusable after a handler panicked");
+    }
+
+    /// A client with iroutes may also send from the networks behind it,
+    /// and still from nowhere else.
+    #[test]
+    fn packets_from_an_iroute_are_accepted() {
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let adapter = adapter_with(Arc::new(HandlerConnector({
+            let seen = seen.clone();
+            move || {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        })));
+        let cfg = test_config().iroutes(vec![IpPrefix::new("192.168.5.0".parse().unwrap(), 24)]);
+        adapter.on_connect(test_key(1), &cfg);
+        for src in [[10, 8, 0, 2], [192, 168, 5, 77]] {
+            adapter.deliver(test_key(1), 3, &packet_from(src));
+        }
+        for src in [[192, 168, 6, 1], [10, 8, 0, 3]] {
+            adapter.deliver(test_key(1), 3, &packet_from(src));
+        }
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     /// A handler may call back into the adapter -- sending to a peer can

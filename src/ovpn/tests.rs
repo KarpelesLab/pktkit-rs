@@ -1739,12 +1739,12 @@ fn deliver_on(
 
 fn auth_hook() -> OnAuth {
     Arc::new(|_info: &AuthInfo| {
-        Ok(PeerConfig {
-            ip: "10.8.0.2".parse().unwrap(),
-            gateway: "10.8.0.1".parse().unwrap(),
-            mask: "255.255.255.0".parse().unwrap(),
-            prefix_len: 24,
-        })
+        Ok(PeerConfig::new(
+            "10.8.0.2".parse().unwrap(),
+            "10.8.0.1".parse().unwrap(),
+            "255.255.255.0".parse().unwrap(),
+            24,
+        ))
     })
 }
 

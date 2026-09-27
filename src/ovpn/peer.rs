@@ -66,7 +66,10 @@ pub struct AuthInfo {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct PeerConfig {
-    /// Tunnel address assigned to the client.
+    /// Tunnel address assigned to the client. In tun mode the
+    /// [`Adapter`](super::Adapter) passes on only packets from this address
+    /// or from one of the [`iroutes`](Self::iroutes); any other source is
+    /// dropped, as OpenVPN drops it ("bad source address from client").
     pub ip: std::net::IpAddr,
     /// Peer/gateway address used in the net30 topology push (tun mode).
     pub gateway: std::net::IpAddr,
@@ -74,6 +77,21 @@ pub struct PeerConfig {
     pub mask: std::net::IpAddr,
     /// Prefix length for the per-peer device address.
     pub prefix_len: u8,
+    /// Networks behind the client (OpenVPN's `iroute`), whose hosts it may
+    /// send for in tun mode as well as its own address. Empty by default.
+    ///
+    /// This only widens what the [`Adapter`](super::Adapter) accepts from
+    /// the client. Traffic *to* these networks reaches the client when the
+    /// connector sends it to the client's device: the device names one
+    /// address, so a connector that routes by device address, such as an
+    /// [`L3Hub`](crate::L3Hub), needs a route of its own for them.
+    pub iroutes: Vec<crate::IpPrefix>,
+}
+
+setters! {
+    PeerConfig {
+        set iroutes: Vec<crate::IpPrefix>;
+    }
 }
 
 impl PeerConfig {
@@ -89,6 +107,7 @@ impl PeerConfig {
             gateway,
             mask,
             prefix_len,
+            iroutes: Vec::new(),
         }
     }
 }
