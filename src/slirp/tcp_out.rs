@@ -45,6 +45,13 @@ const MSS_V6: u16 = 1440;
 /// client usually keeps retransmitting its SYN.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Send and receive buffer of the virtual side of each bridge. The virtual
+/// link is in-process, so its round trip is short and a window this size
+/// keeps it full; the engine's 1 MiB default would let a guest that stops
+/// reading, or sends to a server that does, pin 2 MiB per bridge: 8 GiB
+/// over the 2048 bridges of each address family.
+const BRIDGE_BUF: usize = 256 * 1024;
+
 /// A live outbound TCP NAT bridge: a server-side `vtcp::Conn` facing the
 /// virtual client, glued to a real OS [`TcpStream`] facing the destination.
 pub(crate) struct TcpOutConn {
@@ -117,6 +124,8 @@ impl TcpOutConn {
             remote_port,
             mss,
             keepalive: true,
+            send_buf_size: BRIDGE_BUF,
+            recv_buf_size: BRIDGE_BUF,
             ..Default::default()
         };
 
@@ -505,6 +514,34 @@ mod tests {
         assert_eq!(n.load(Ordering::SeqCst), 1);
     }
     use crate::vtcp::segment::flags;
+
+    /// What a guest can make a bridge hold is bounded by BRIDGE_BUF, not by
+    /// the engine's larger default.
+    #[test]
+    fn bridge_buffers_are_bounded() {
+        let mut client = Conn::new(ConnConfig::default().local_port(5000).remote_port(80));
+        let syn = Segment::parse(&client.connect()[0]).unwrap();
+        let bridge = TcpOutConn::pending(
+            Endpoints::V4 {
+                local_ip: "1.1.1.1".parse().unwrap(),
+                local_port: 80,
+                remote_ip: "10.0.0.5".parse().unwrap(),
+                remote_port: 5000,
+            },
+            &syn,
+            Arc::new(|_: &[u8]| {}),
+        );
+        let mut conn = bridge.state().conn.lock().unwrap();
+        let synack = conn.accept_syn(&syn);
+        for s in synack {
+            for r in client.handle_segment(&Segment::parse(&s).unwrap()) {
+                conn.handle_segment(&Segment::parse(&r).unwrap());
+            }
+        }
+        assert_eq!(conn.state(), State::Established);
+        let (n, _) = conn.write(&vec![0u8; 4 << 20]);
+        assert_eq!(n, BRIDGE_BUF);
+    }
 
     #[test]
     fn build_rst_with_ack() {
