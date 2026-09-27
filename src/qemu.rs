@@ -336,6 +336,17 @@ mod tests {
     /// a passing run returns as soon as the frame is back.
     const ECHO_TIMEOUT: Duration = Duration::from_secs(10);
 
+    /// The address a TCP listener is bound to. A `match` rather than
+    /// `let ... else`: where there are no Unix sockets `Tcp` is the only
+    /// variant, and a refutable pattern there is a warning.
+    fn tcp_addr(ln: &Listener) -> std::net::SocketAddr {
+        match ln {
+            Listener::Tcp(l) => l.local_addr().unwrap(),
+            #[cfg(unix)]
+            _ => unreachable!(),
+        }
+    }
+
     /// Accept one peer on `ln` and echo every frame back to it, holding the
     /// connection until the returned sender fires (or is dropped).
     fn echo_server(ln: Listener) -> (std::thread::JoinHandle<()>, mpsc::Sender<()>) {
@@ -375,10 +386,7 @@ mod tests {
     #[test]
     fn frames_before_the_handler_are_held() {
         let ln = Listener::bind_tcp("127.0.0.1:0").unwrap();
-        let Listener::Tcp(l) = &ln else {
-            unreachable!()
-        };
-        let addr = l.local_addr().unwrap();
+        let addr = tcp_addr(&ln);
         let client = dial_tcp(addr).unwrap();
         let server = ln.accept().unwrap();
 
@@ -400,10 +408,7 @@ mod tests {
     #[test]
     fn close_hangs_up_the_socket() {
         let ln = Listener::bind_tcp("127.0.0.1:0").unwrap();
-        let Listener::Tcp(l) = &ln else {
-            unreachable!()
-        };
-        let addr = l.local_addr().unwrap();
+        let addr = tcp_addr(&ln);
         let client = dial_tcp(addr).unwrap();
         let server = ln.accept().unwrap();
         server.set_handler(Arc::new(|_: &Frame| Ok(())));
@@ -443,10 +448,7 @@ mod tests {
         }
 
         let ln = Listener::bind_tcp("127.0.0.1:0").unwrap();
-        let Listener::Tcp(l) = &ln else {
-            unreachable!()
-        };
-        let addr = l.local_addr().unwrap();
+        let addr = tcp_addr(&ln);
         let attached = Arc::new(Mutex::new(0));
         let (tx, rx) = mpsc::channel();
         let connector = Count(attached.clone(), tx);
