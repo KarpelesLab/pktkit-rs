@@ -241,8 +241,16 @@ impl Server {
             }
         };
 
-        // Update peer address (skip zero key — cookie replies etc).
-        if !result.peer_key.is_zero() {
+        // Roaming (whitepaper §6): only a packet that authenticated as the
+        // peer may move its endpoint. A cookie reply names a peer but proves
+        // nothing: anyone who saw our initiation can forge one, and taking
+        // its source would hand them the peer's traffic.
+        let authenticated = !result.peer_key.is_zero()
+            && matches!(
+                result.ty,
+                PacketType::HandshakeResponse | PacketType::TransportData | PacketType::Keepalive
+            );
+        if authenticated {
             self.peer_addrs
                 .write()
                 .expect("addr lock")
@@ -257,7 +265,7 @@ impl Server {
 
         let peer = result.peer_key;
         self.dispatch(result, &handler, addr, conn);
-        if !peer.is_zero() {
+        if authenticated {
             self.flush_staged(&peer, &handler, addr, conn);
         }
     }
@@ -506,6 +514,46 @@ mod tests {
             thread::sleep(Duration::from_millis(1));
         }
         (s, h, addr)
+    }
+
+    /// A server for `h` with a socket installed but no threads, so tests
+    /// can feed `process_incoming` directly.
+    fn idle_server(h: &Arc<Handler>) -> (Arc<Server>, Arc<UdpSocket>) {
+        let s = Server::new(ServerConfig::default().handler(h.clone())).unwrap();
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+        *s.conn.lock().unwrap() = Some(sock.clone());
+        (s, sock)
+    }
+
+    /// A cookie reply is not authenticated by anything the peer alone
+    /// holds: its key derives from the peer's public key, and its AD is
+    /// the MAC1 of our initiation, sent in clear. Anyone who saw the
+    /// initiation can forge one, so it must not move the peer's endpoint
+    /// (whitepaper §5.4.7, §6).
+    #[test]
+    fn a_cookie_reply_does_not_move_the_endpoint() {
+        let a = Handler::new(Config::default()).unwrap();
+        let b = Handler::new(Config::default()).unwrap();
+        a.add_peer(b.public_key());
+        let (s, sock) = idle_server(&a);
+        let peer_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        peer_sock
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let peer_addr = peer_sock.local_addr().unwrap();
+        s.connect(&b.public_key(), peer_addr).unwrap();
+        let mut init = [0u8; 256];
+        let (n, _) = peer_sock.recv_from(&mut init).unwrap();
+        let init = &init[..n];
+
+        // What an on-path observer can build from b's public key alone.
+        let sender = u32::from_le_bytes(init[4..8].try_into().unwrap());
+        let forged = b
+            .cookie_generate_reply(&[1, 2, 3, 4, 0, 1], sender, &init[116..132])
+            .unwrap();
+        let attacker: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        s.process_incoming(&forged, attacker, &sock);
+        assert_eq!(s.peer_addr(&b.public_key()), Some(peer_addr));
     }
 
     /// Data sent before the handshake completes is held and delivered once
