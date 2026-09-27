@@ -819,6 +819,15 @@ impl Nat {
                 SocketAddrV4::new(Ipv4Addr::new(out[16], out[17], out[18], out[19]), dst_port);
             self.tcp_seq_fixup(mapping_key, peer, true, before, &mut out, ihl);
         }
+        // Hairpinning (RFC 4787 REQ-9, RFC 5382 REQ-8): an inside host
+        // reaching another one through the NAT's public address. The packet,
+        // already carrying the sender's public source, turns around as if it
+        // had arrived from outside, so the receiver sees that public address
+        // too.
+        if out[16..20] == outside_ip.octets() {
+            self.inbound_tcpudp(&out, ihl, proto);
+            return;
+        }
         self.outside.deliver(Packet::from_slice(&out));
     }
 
@@ -2366,5 +2375,40 @@ mod tests {
         assert_eq!(sack(44), 1000 + orig);
         assert_eq!(sack(48), 1000 + orig + 6);
         assert!(crate::nat::l4::v4_l4_checksum_ok(r, 20));
+    }
+
+    #[test]
+    fn hairpinning_reaches_a_forwarded_inside_host() {
+        let (nat, i, o) = setup();
+        let server = Ipv4Addr::new(10, 0, 0, 50);
+        nat.add_port_forward(PortForward::new(PROTO_TCP, 8080, server, 80))
+            .unwrap();
+
+        let syn = build_tcp(INSIDE, 40000, PUBLIC, 8080, 0x02);
+        nat.inside().send(Packet::from_slice(&syn)).unwrap();
+        assert!(o.lock().unwrap().is_empty(), "hairpinned packet went out");
+        let (from_port, fwd) = {
+            let got = i.lock().unwrap();
+            assert_eq!(got.len(), 1);
+            let p = got[0].clone();
+            // Delivered to the server, from the client's public endpoint.
+            assert_eq!(&p[16..20], &server.octets());
+            assert_eq!(dst_port(&p), 80);
+            assert_eq!(&p[12..16], &PUBLIC.octets());
+            (src_port(&p), p)
+        };
+        assert_eq!(checksum(&fwd[..20]), 0);
+        assert!(crate::nat::l4::v4_l4_checksum_ok(&fwd, 20));
+
+        // And the answer finds its way back the same way.
+        let synack = build_tcp(server, 80, PUBLIC, from_port, 0x12);
+        nat.inside().send(Packet::from_slice(&synack)).unwrap();
+        let got = i.lock().unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(&got[1][16..20], &INSIDE.octets());
+        assert_eq!(dst_port(&got[1]), 40000);
+        assert_eq!(&got[1][12..16], &PUBLIC.octets());
+        assert_eq!(src_port(&got[1]), 8080);
+        assert!(crate::nat::l4::v4_l4_checksum_ok(&got[1], 20));
     }
 }
