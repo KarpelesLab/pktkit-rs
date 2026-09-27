@@ -199,6 +199,9 @@ impl PortMode {
     /// The VLAN a frame arriving on this port belongs to, or `None` if the
     /// port should not have received it.
     fn ingress_vlan(&self, tagged: Option<u16>) -> Option<u16> {
+        // VID 0 marks a priority-tagged frame: it carries a PCP but no VLAN,
+        // and belongs to the port's own VLAN like an untagged one (802.1Q).
+        let tagged = tagged.filter(|&t| t != 0);
         match (self, tagged) {
             (PortMode::Access { vlan }, None) => Some(*vlan),
             // A tag matching the port's own VLAN is redundant but harmless.
@@ -1842,5 +1845,48 @@ mod tests {
         hub.forward_from(Frame::from_slice(&f), ports[0].1.id);
         assert_eq!(ports[1].0.inner.lock().unwrap().len(), 0);
         assert_eq!(ports[0].0.inner.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn priority_tagged_frames_belong_to_the_port_vlan() {
+        let hub = Arc::new(L2Hub::new());
+        let ports = sinks(&hub, 3);
+        hub.set_port_mode(&ports[0].1, access(10));
+        hub.set_port_mode(&ports[1].1, access(10));
+        hub.set_port_mode(&ports[2].1, trunk(&[10, 20], Some(20)));
+
+        // VID 0 carries a priority only (802.1Q): the frame is untagged as
+        // far as VLANs go.
+        let base = build_frame(
+            MacAddr::broadcast(),
+            ports[0].0.mac,
+            EtherType::IPV4,
+            &[0; 40],
+        );
+        let prio = crate::build::push_vlan(Frame::from_slice(&base), 0, 5);
+        hub.forward_from(Frame::from_slice(&prio), ports[0].1.id);
+        assert_eq!(ports[1].0.inner.lock().unwrap().len(), 1, "access drop");
+        let at_trunk = ports[2].0.inner.lock().unwrap().pop().expect("trunk drop");
+        let f = Frame::from_slice(&at_trunk);
+        assert!(f.has_vlan());
+        assert_eq!((f.vlan_id(), f.vlan_pcp()), (10, 5));
+
+        // On a trunk it joins the native VLAN, not VLAN 0.
+        ports[1].0.inner.lock().unwrap().clear();
+        let base = build_frame(
+            MacAddr::broadcast(),
+            ports[2].0.mac,
+            EtherType::IPV4,
+            &[0; 40],
+        );
+        let prio = crate::build::push_vlan(Frame::from_slice(&base), 0, 0);
+        hub.forward_from(Frame::from_slice(&prio), ports[2].1.id);
+        assert!(
+            hub.mac_table
+                .read()
+                .unwrap()
+                .entries
+                .contains_key(&(20, ports[2].0.mac.octets()))
+        );
     }
 }
