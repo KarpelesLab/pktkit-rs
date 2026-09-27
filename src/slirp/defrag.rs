@@ -45,8 +45,12 @@ struct Partial {
     /// Header for the rebuilt packet, from the first fragment once seen.
     header: Option<Vec<u8>>,
     data: Vec<u8>,
-    /// Received byte ranges `[start, end)`, sorted and disjoint.
-    ranges: Vec<(usize, usize)>,
+    /// Received fragments as byte ranges `[start, end)`, sorted and
+    /// disjoint. Kept as received, not merged, so that a repeat can be told
+    /// from an overlap by its bounds.
+    pieces: Vec<(usize, usize)>,
+    /// Bytes held: the sum of the pieces' lengths.
+    received: usize,
     /// Payload length, known once the last fragment has arrived.
     total: Option<usize>,
 }
@@ -189,7 +193,8 @@ impl Reassembler {
             started: now,
             header: None,
             data: Vec::new(),
-            ranges: Vec::new(),
+            pieces: Vec::new(),
+            received: 0,
             total: None,
         });
 
@@ -198,7 +203,7 @@ impl Reassembler {
             return None;
         }
         let total = d.total?;
-        if d.ranges != [(0, total)] {
+        if d.received != total {
             return None;
         }
         let d = self.partial.remove(&p.key)?;
@@ -225,18 +230,24 @@ impl Partial {
             }
         }
         if let Some(t) = self.total
-            && (end > t || self.ranges.last().is_some_and(|&(_, e)| e > t))
+            && (end > t || self.pieces.last().is_some_and(|&(_, e)| e > t))
         {
             return false;
         }
-        // An exact repeat (a retransmitted or duplicated fragment) is
-        // harmless; any other overlap is not.
-        if let Some(&(s, e)) = self
-            .ranges
-            .iter()
-            .find(|&&(s, e)| s < end.max(p.offset + 1) && p.offset < e)
-        {
-            return s == p.offset && e == end && self.data[s..e] == *p.data;
+        // An exact repeat (a retransmitted or duplicated fragment, RFC 8200
+        // §4.5) is harmless; any other overlap is not. The pieces are sorted
+        // and disjoint, so only the one starting before this fragment and
+        // the one starting at or after it can overlap it.
+        let i = self.pieces.partition_point(|&(s, _)| s < p.offset);
+        let neighbours = i
+            .checked_sub(1)
+            .and_then(|j| self.pieces.get(j))
+            .into_iter()
+            .chain(self.pieces.get(i));
+        for &(s, e) in neighbours {
+            if s < end.max(p.offset + 1) && p.offset < e {
+                return s == p.offset && e == end && self.data[s..e] == *p.data;
+            }
         }
         if p.data.is_empty() {
             // Zero-length last fragment: it only fixes the total.
@@ -249,17 +260,8 @@ impl Partial {
         if let Some(h) = &p.header {
             self.header = Some(h.clone());
         }
-        let i = self.ranges.partition_point(|&(s, _)| s < p.offset);
-        self.ranges.insert(i, (p.offset, end));
-        // Coalesce touching neighbours so completion is a single range.
-        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(self.ranges.len());
-        for &(s, e) in &self.ranges {
-            match merged.last_mut() {
-                Some(last) if last.1 == s => last.1 = e,
-                _ => merged.push((s, e)),
-            }
-        }
-        self.ranges = merged;
+        self.pieces.insert(i, (p.offset, end));
+        self.received += p.data.len();
         true
     }
 }
@@ -353,6 +355,31 @@ mod tests {
         frags.insert(1, frags[0].clone());
         let mut r = Reassembler::default();
         assert_eq!(push_all(&mut r, &frags).unwrap()[20..], dgram[20..]);
+    }
+
+    #[test]
+    fn v4_duplicate_after_its_neighbour_is_tolerated() {
+        let dgram = v4_datagram(3000);
+        let frags = split(&dgram, 1000);
+        let mut r = Reassembler::default();
+        let now = Instant::now();
+        // Fragments 0 and 1 are held as one range by the time the repeat
+        // of fragment 0 arrives.
+        assert!(r.push_v4(now, 0, &frags[0], 20).is_none());
+        assert!(r.push_v4(now, 0, &frags[1], 20).is_none());
+        assert!(r.push_v4(now, 0, &frags[0], 20).is_none());
+        assert!(r.push_v4(now, 0, &frags[1], 20).is_none());
+        assert_eq!(r.in_progress(), 1);
+        assert_eq!(push_all(&mut r, &frags[2..]).unwrap()[20..], dgram[20..]);
+
+        // A repeat with other bytes is an overlap.
+        let mut r = Reassembler::default();
+        assert!(r.push_v4(now, 0, &frags[0], 20).is_none());
+        assert!(r.push_v4(now, 0, &frags[1], 20).is_none());
+        let mut bad = frags[0].clone();
+        bad[30] ^= 0xFF;
+        assert!(r.push_v4(now, 0, &bad, 20).is_none());
+        assert_eq!(r.in_progress(), 0);
     }
 
     #[test]
