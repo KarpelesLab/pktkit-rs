@@ -2,10 +2,7 @@
 //! for IPv6.
 
 use crate::MacAddr;
-use crate::time::Instant;
-use std::collections::HashMap;
 use std::net::Ipv6Addr;
-use std::sync::Mutex;
 use std::time::Duration;
 
 pub const NS_TYPE: u8 = 135;
@@ -16,70 +13,12 @@ pub const RA_TYPE: u8 = 134;
 pub const OPT_SOURCE_LINK_ADDR: u8 = 1;
 pub const OPT_TARGET_LINK_ADDR: u8 = 2;
 
-pub const DEFAULT_TTL: Duration = Duration::from_secs(5 * 60);
-pub const MAX_ENTRIES: usize = 4096;
+pub const DEFAULT_TTL: Duration = crate::arp::DEFAULT_TTL;
+pub const MAX_ENTRIES: usize = crate::arp::MAX_ENTRIES;
 
-#[derive(Copy, Clone, Debug)]
-struct Entry {
-    mac: MacAddr,
-    expires: Instant,
-}
-
-/// IPv6 neighbor cache.
-#[derive(Default, Debug)]
-pub struct Table {
-    inner: Mutex<HashMap<Ipv6Addr, Entry>>,
-}
-
-impl Table {
-    /// An empty cache.
-    pub fn new() -> Table {
-        Table::default()
-    }
-
-    /// Look up `ip`, returning its MAC if a non-expired entry exists. An
-    /// expired entry is removed.
-    pub fn lookup(&self, ip: Ipv6Addr) -> Option<MacAddr> {
-        let mut t = self.inner.lock().unwrap();
-        match t.get(&ip).copied() {
-            Some(e) if e.expires > Instant::now() => Some(e.mac),
-            Some(_) => {
-                t.remove(&ip);
-                None
-            }
-            None => None,
-        }
-    }
-
-    /// Record that `ip` is at `mac` for `ttl`. A full cache makes room by
-    /// evicting expired entries first, else the one closest to expiring.
-    pub fn set(&self, ip: Ipv6Addr, mac: MacAddr, ttl: Duration) {
-        let mut t = self.inner.lock().unwrap();
-        if !t.contains_key(&ip) && t.len() >= MAX_ENTRIES {
-            make_room(&mut t);
-        }
-        t.insert(
-            ip,
-            Entry {
-                mac,
-                expires: Instant::now() + ttl,
-            },
-        );
-    }
-}
-
-/// Free a slot in a full cache: expired entries first, else the one closest
-/// to expiring. Refusing new entries would let a flood of made-up neighbours
-/// lock the real ones out for good.
-fn make_room(t: &mut HashMap<Ipv6Addr, Entry>) {
-    let now = Instant::now();
-    t.retain(|_, e| e.expires > now);
-    if t.len() >= MAX_ENTRIES
-        && let Some(oldest) = t.iter().min_by_key(|(_, e)| e.expires).map(|(k, _)| *k)
-    {
-        t.remove(&oldest);
-    }
-}
+/// IPv6 neighbor cache: the same cache, and the same Neighbour
+/// Unreachability Detection, as ARP's.
+pub type Table = crate::arp::Table<Ipv6Addr>;
 
 /// Derive a link-local IPv6 address from a MAC using EUI-64 (RFC 4291 §2.5.1).
 pub fn link_local_from_mac(mac: MacAddr) -> Ipv6Addr {

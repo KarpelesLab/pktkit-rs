@@ -1,8 +1,10 @@
 //! ARP (RFC 826) for IPv4 over Ethernet.
 //!
-//! - [`Table`] is the resolver cache: lookups, learning, capped at 4096 entries
-//!   (a full cache evicts the entry closest to expiry),
-//!   entries age out after 5 minutes.
+//! - [`Table`] is the neighbour cache, shared with NDP: lookups, learning,
+//!   and Neighbour Unreachability Detection (RFC 4861 §7.3), so a neighbour
+//!   that stops answering -- or moves to another MAC -- is found out within
+//!   seconds of being used. Capped at 4096 entries (a full cache evicts the
+//!   entry closest to expiry); entries unused for 5 minutes age out.
 //! - [`Pending`] buffers packets awaiting resolution, the newest 16 per target and
 //!   256 targets, and times the solicitations: three, a second apart, before
 //!   resolution fails and the packets are handed back to be reported.
@@ -34,29 +36,102 @@ pub const PENDING_MAX_PKTS: usize = 16;
 pub const PENDING_MAX_TARGETS: usize = 256;
 pub const MAX_ENTRIES: usize = 4096;
 
+/// How long a neighbour stays REACHABLE after a confirmation (RFC 4861 §10
+/// REACHABLE_TIME).
+pub const REACHABLE_TIME: Duration = Duration::from_secs(30);
+/// How long a STALE entry, once used, waits for the upper layers' traffic to
+/// confirm it before probing (RFC 4861 §10 DELAY_FIRST_PROBE_TIME).
+pub const DELAY_FIRST_PROBE_TIME: Duration = Duration::from_secs(5);
+/// Unicast probes sent, [`RETRANS_TIMER`] apart, before a neighbour that
+/// stopped answering is forgotten (RFC 4861 §10).
+pub const MAX_UNICAST_SOLICIT: u32 = 3;
+
+/// Neighbour Unreachability Detection state (RFC 4861 §7.3.2). INCOMPLETE
+/// is not here: an address being resolved is in [`Pending`], not the cache.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Nud {
+    /// Confirmed reachable, until then.
+    Reachable(Instant),
+    /// Not confirmed lately. Nothing is done until it is used.
+    Stale,
+    /// Used while stale; probe from then unless confirmed first.
+    Delay(Instant),
+    /// Unicast probes sent so far, and when the next is due.
+    Probe { sent: u32, next: Instant },
+}
+
 #[derive(Copy, Clone, Debug)]
 struct Entry {
     mac: MacAddr,
+    state: Nud,
+    /// When an entry left STALE is forgotten, [`DEFAULT_TTL`] after it was
+    /// last heard from. An entry in use never gets there: it is probed and
+    /// either confirmed or dropped first.
     expires: Instant,
 }
 
-/// Thread-safe ARP cache.
-#[derive(Default, Debug)]
-pub struct Table {
-    inner: Mutex<HashMap<Ipv4Addr, Entry>>,
+impl Entry {
+    /// Stale and past its time: as good as gone.
+    fn gone(&self, now: Instant) -> bool {
+        let stale = match self.state {
+            Nud::Stale => true,
+            Nud::Reachable(until) => until <= now,
+            _ => false,
+        };
+        stale && self.expires <= now
+    }
 }
 
-impl Table {
+/// What [`Table::resolve`] says about sending to an address.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Resolved {
+    /// Send to this MAC.
+    Hit(MacAddr),
+    /// Send to this MAC, and also a unicast probe to it now: the neighbour
+    /// has not been confirmed reachable lately.
+    Probe(MacAddr),
+    /// Unknown, or known no longer: resolve it afresh (multicast).
+    Miss,
+}
+
+/// Thread-safe neighbour cache, keyed by `Ipv4Addr` for ARP or `Ipv6Addr`
+/// for NDP ([`ndp::Table`](crate::ndp::Table)), with the Neighbour
+/// Unreachability Detection of RFC 4861 §7.3 for both.
+///
+/// An entry confirmed by a solicited answer is REACHABLE for
+/// [`REACHABLE_TIME`], then STALE. Used while STALE it waits
+/// [`DELAY_FIRST_PROBE_TIME`], then is probed by unicast
+/// ([`MAX_UNICAST_SOLICIT`] times, [`RETRANS_TIMER`] apart); a neighbour
+/// that never answers is dropped, so the next packet resolves it afresh
+/// rather than going to a MAC that is no longer there. The probes are sent
+/// by the caller: [`resolve`](Self::resolve) and [`poll`](Self::poll) say
+/// when.
+#[derive(Debug)]
+pub struct Table<K = Ipv4Addr> {
+    inner: Mutex<HashMap<K, Entry>>,
+}
+
+impl<K: Eq + Hash + Copy> Default for Table<K> {
+    fn default() -> Self {
+        Table {
+            inner: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl<K: Eq + Hash + Copy> Table<K> {
     /// An empty cache.
-    pub fn new() -> Table {
+    pub fn new() -> Table<K> {
         Table::default()
     }
 
-    /// Look up `ip`, returning its MAC if a non-expired entry exists.
-    pub fn lookup(&self, ip: Ipv4Addr) -> Option<MacAddr> {
+    /// Look up `ip`, returning its MAC if an entry exists. This only looks:
+    /// it neither counts as using the entry nor moves its state on.
+    pub fn lookup(&self, ip: K) -> Option<MacAddr> {
+        let now = Instant::now();
         let mut t = self.inner.lock().unwrap();
         match t.get(&ip).copied() {
-            Some(e) if e.expires > Instant::now() => Some(e.mac),
+            Some(e) if !e.gone(now) => Some(e.mac),
             Some(_) => {
                 t.remove(&ip);
                 None
@@ -65,34 +140,170 @@ impl Table {
         }
     }
 
+    /// The MAC to send a packet for `ip` to, as of now, and whether to
+    /// probe it (RFC 4861 §7.3.3).
+    pub fn resolve(&self, ip: K) -> Resolved {
+        self.resolve_at(ip, Instant::now())
+    }
+
+    pub(crate) fn resolve_at(&self, ip: K, now: Instant) -> Resolved {
+        let mut t = self.inner.lock().unwrap();
+        let Some(e) = t.get_mut(&ip) else {
+            return Resolved::Miss;
+        };
+        if e.gone(now) {
+            t.remove(&ip);
+            return Resolved::Miss;
+        }
+        match e.state {
+            Nud::Reachable(until) if until > now => Resolved::Hit(e.mac),
+            // Used while stale: give the traffic a chance to be confirmed
+            // by the upper layers' answers before probing.
+            Nud::Reachable(_) | Nud::Stale => {
+                e.state = Nud::Delay(now + DELAY_FIRST_PROBE_TIME);
+                Resolved::Hit(e.mac)
+            }
+            Nud::Delay(until) if until > now => Resolved::Hit(e.mac),
+            Nud::Delay(_) => {
+                e.state = Nud::Probe {
+                    sent: 1,
+                    next: now + RETRANS_TIMER,
+                };
+                Resolved::Probe(e.mac)
+            }
+            Nud::Probe { next, .. } if next > now => Resolved::Hit(e.mac),
+            Nud::Probe { sent, .. } if sent < MAX_UNICAST_SOLICIT => {
+                e.state = Nud::Probe {
+                    sent: sent + 1,
+                    next: now + RETRANS_TIMER,
+                };
+                Resolved::Probe(e.mac)
+            }
+            Nud::Probe { .. } => {
+                t.remove(&ip);
+                Resolved::Miss
+            }
+        }
+    }
+
+    /// Run the NUD timers: return each neighbour to probe now, with the MAC
+    /// to send the unicast probe to. Neighbours that have not answered
+    /// their last probe are forgotten, as are entries long stale.
+    pub fn poll(&self, now: Instant) -> Vec<(K, MacAddr)> {
+        let mut probes = Vec::new();
+        self.inner.lock().unwrap().retain(|ip, e| {
+            match e.state {
+                Nud::Delay(until) if until <= now => {
+                    e.state = Nud::Probe {
+                        sent: 1,
+                        next: now + RETRANS_TIMER,
+                    };
+                    probes.push((*ip, e.mac));
+                }
+                Nud::Probe { sent, next } if next <= now => {
+                    if sent >= MAX_UNICAST_SOLICIT {
+                        return false;
+                    }
+                    e.state = Nud::Probe {
+                        sent: sent + 1,
+                        next: now + RETRANS_TIMER,
+                    };
+                    probes.push((*ip, e.mac));
+                }
+                _ => {}
+            }
+            !e.gone(now)
+        });
+        probes
+    }
+
     /// Forget every entry, as when the network they were learnt on is left.
     pub fn clear(&self) {
         self.inner.lock().unwrap().clear();
     }
 
-    /// Install or refresh an entry.
-    pub fn set(&self, ip: Ipv4Addr, mac: MacAddr, ttl: Duration) {
+    /// Install or refresh an entry, confirmed reachable (for `ttl` or
+    /// [`REACHABLE_TIME`], whichever is shorter) and kept for `ttl`.
+    pub fn set(&self, ip: K, mac: MacAddr, ttl: Duration) {
+        let now = Instant::now();
         let mut t = self.inner.lock().unwrap();
         if !t.contains_key(&ip) && t.len() >= MAX_ENTRIES {
-            make_room(&mut t);
+            make_room(&mut t, now);
         }
         t.insert(
             ip,
             Entry {
                 mac,
-                expires: Instant::now() + ttl,
+                state: Nud::Reachable(now + ttl.min(REACHABLE_TIME)),
+                expires: now + ttl,
             },
         );
     }
+
+    /// Record that `ip` is at `mac`, as some message from the neighbour
+    /// says (RFC 4861 §7.2.5, with ARP's merge rule of RFC 826 read the same
+    /// way). `solicited` is set for an answer to our own solicitation or
+    /// probe, which confirms the neighbour reachable. Without `override_`,
+    /// a MAC other than the cached one does not replace it, and only makes
+    /// a REACHABLE entry STALE, to be checked. Otherwise a changed MAC is
+    /// taken, and the entry is STALE until confirmed. A new entry is
+    /// REACHABLE if `solicited`, else STALE.
+    pub fn update(&self, ip: K, mac: MacAddr, solicited: bool, override_: bool) {
+        self.update_at(ip, mac, solicited, override_, Instant::now());
+    }
+
+    pub(crate) fn update_at(
+        &self,
+        ip: K,
+        mac: MacAddr,
+        solicited: bool,
+        override_: bool,
+        now: Instant,
+    ) {
+        let mut t = self.inner.lock().unwrap();
+        let state = if solicited {
+            Nud::Reachable(now + REACHABLE_TIME)
+        } else {
+            Nud::Stale
+        };
+        let expires = now + DEFAULT_TTL;
+        match t.get_mut(&ip) {
+            Some(e) if !e.gone(now) => {
+                if e.mac != mac && !override_ {
+                    if matches!(e.state, Nud::Reachable(until) if until > now) {
+                        e.state = Nud::Stale;
+                    }
+                    return;
+                }
+                if solicited || e.mac != mac {
+                    e.state = state;
+                }
+                e.mac = mac;
+                e.expires = expires;
+            }
+            _ => {
+                if !t.contains_key(&ip) && t.len() >= MAX_ENTRIES {
+                    make_room(&mut t, now);
+                }
+                t.insert(
+                    ip,
+                    Entry {
+                        mac,
+                        state,
+                        expires,
+                    },
+                );
+            }
+        }
+    }
 }
 
-/// Free a slot in a full cache. Expired entries go first; failing that, the
-/// one closest to expiring -- the least recently confirmed. Refusing the new
-/// entry instead would let anyone who fills the cache with made-up senders
-/// keep every real neighbour out of it for good.
-fn make_room(t: &mut HashMap<Ipv4Addr, Entry>) {
-    let now = Instant::now();
-    t.retain(|_, e| e.expires > now);
+/// Free a slot in a full cache. Entries gone stale go first; failing that,
+/// the one closest to expiring -- the least recently heard from. Refusing
+/// the new entry instead would let anyone who fills the cache with made-up
+/// senders keep every real neighbour out of it for good.
+fn make_room<K: Eq + Hash + Copy>(t: &mut HashMap<K, Entry>, now: Instant) {
+    t.retain(|_, e| !e.gone(now));
     if t.len() >= MAX_ENTRIES
         && let Some(oldest) = t.iter().min_by_key(|(_, e)| e.expires).map(|(k, _)| *k)
     {
@@ -351,6 +562,62 @@ mod tests {
             "a stale queue is re-solicited"
         );
         assert_eq!(p.drain(ip), vec![b"two".to_vec()]);
+    }
+
+    #[test]
+    fn neighbour_unreachability_detection() {
+        let t = Table::new();
+        let ip = Ipv4Addr::new(10, 0, 0, 7);
+        let m = MacAddr([2, 0, 0, 0, 0, 7]);
+        let t0 = Instant::now();
+        let at = |s: u64, ms: u64| t0 + Duration::from_secs(s) + Duration::from_millis(ms);
+
+        // Confirmed: used freely for REACHABLE_TIME.
+        t.update_at(ip, m, true, true, t0);
+        assert_eq!(t.resolve_at(ip, at(29, 0)), Resolved::Hit(m));
+        assert!(t.poll(at(29, 0)).is_empty());
+        // Then STALE: still used, but DELAY, then probed by unicast.
+        assert_eq!(t.resolve_at(ip, at(31, 0)), Resolved::Hit(m));
+        assert!(t.poll(at(35, 0)).is_empty(), "probed before DELAY ran out");
+        assert_eq!(t.poll(at(36, 0)), [(ip, m)]);
+        assert_eq!(t.resolve_at(ip, at(36, 500)), Resolved::Hit(m));
+        assert_eq!(t.poll(at(37, 0)), [(ip, m)]);
+        // A probe can be due from a send before the timer gets to it.
+        assert_eq!(t.resolve_at(ip, at(38, 0)), Resolved::Probe(m));
+        assert!(t.poll(at(38, 500)).is_empty());
+        // MAX_UNICAST_SOLICIT unanswered: forgotten, to be resolved afresh.
+        assert!(t.poll(at(39, 0)).is_empty());
+        assert_eq!(t.lookup(ip), None);
+        assert_eq!(t.resolve_at(ip, at(39, 0)), Resolved::Miss);
+
+        // An answer to a probe makes it REACHABLE again.
+        t.update_at(ip, m, false, true, t0);
+        assert_eq!(
+            t.resolve_at(ip, at(1, 0)),
+            Resolved::Hit(m),
+            "STALE is used"
+        );
+        assert_eq!(t.poll(at(6, 0)), [(ip, m)]);
+        t.update_at(ip, m, true, true, at(6, 100));
+        assert!(t.poll(at(8, 0)).is_empty());
+        assert_eq!(t.resolve_at(ip, at(30, 0)), Resolved::Hit(m));
+    }
+
+    #[test]
+    fn a_changed_mac_is_checked_before_it_is_trusted() {
+        let t = Table::new();
+        let ip = Ipv4Addr::new(10, 0, 0, 7);
+        let (m, n) = (MacAddr([2, 0, 0, 0, 0, 7]), MacAddr([2, 0, 0, 0, 0, 8]));
+        let t0 = Instant::now();
+        t.update_at(ip, m, true, true, t0);
+        // RFC 4861 §7.2.5: without Override, a REACHABLE entry keeps its
+        // MAC but goes STALE; with it, the new MAC is taken, STALE.
+        t.update_at(ip, n, false, false, t0);
+        assert_eq!(t.lookup(ip), Some(m));
+        assert_eq!(t.resolve_at(ip, t0), Resolved::Hit(m));
+        assert_eq!(t.poll(t0 + DELAY_FIRST_PROBE_TIME), [(ip, m)]);
+        t.update_at(ip, n, false, true, t0);
+        assert_eq!(t.lookup(ip), Some(n));
     }
 
     #[test]

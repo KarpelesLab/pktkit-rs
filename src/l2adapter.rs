@@ -12,7 +12,7 @@
 //! - When DHCP is bound, the IPv4 gateway is taken from the lease (and
 //!   cleared when the lease names no router, or is lost).
 
-use crate::arp::{self, Pending as ArpPending, PendingEvent, Table as ArpTable};
+use crate::arp::{self, Pending as ArpPending, PendingEvent, Resolved, Table as ArpTable};
 use crate::icmp::{self, IcmpError, RateLimiter};
 use crate::l4::{icmpv4, icmpv6};
 use crate::ndp::{self, Table as NdpTable};
@@ -241,6 +241,12 @@ impl L2Adapter {
 
     /// The neighbour timers, as of `now`.
     fn run_timers(&self, now: Instant) {
+        for (ip, mac) in self.arp.poll(now) {
+            self.send_arp_request_to(ip, mac);
+        }
+        for (ip, mac) in self.ndp.poll(now) {
+            self.send_neighbor_solicitation_to(ip, mac);
+        }
         for ev in self.arp_pending.poll(now) {
             match ev {
                 PendingEvent::Resolicit(ip) => self.send_arp_request(ip),
@@ -366,9 +372,16 @@ impl L2Adapter {
     }
 
     fn handle_outgoing(&self, pkt: &Packet) {
+        self.handle_outgoing_at(pkt, Instant::now());
+    }
+
+    fn handle_outgoing_at(&self, pkt: &Packet, now: Instant) {
         if !pkt.is_valid() {
             return;
         }
+        // A neighbour to probe once the packet is on its way: its entry is
+        // due for Neighbour Unreachability Detection.
+        let mut probe = None;
         let (dst_mac, ether_type) = match pkt.version() {
             4 => {
                 if pkt.is_broadcast() || self.is_subnet_broadcast(pkt.ipv4_dst_addr().unwrap()) {
@@ -394,10 +407,14 @@ impl L2Adapter {
                     } else {
                         dst
                     };
-                    match self.arp.lookup(target) {
-                        Some(m) => (m, EtherType::IPV4),
-                        None => {
-                            let first = self.arp_pending.enqueue(target, pkt.as_bytes());
+                    match self.arp.resolve_at(target, now) {
+                        Resolved::Hit(m) => (m, EtherType::IPV4),
+                        Resolved::Probe(m) => {
+                            probe = Some((IpAddr::V4(target), m));
+                            (m, EtherType::IPV4)
+                        }
+                        Resolved::Miss => {
+                            let first = self.arp_pending.enqueue_at(target, pkt.as_bytes(), now);
                             if first {
                                 self.send_arp_request(target);
                             }
@@ -427,10 +444,14 @@ impl L2Adapter {
                     } else {
                         dst
                     };
-                    match self.ndp.lookup(target) {
-                        Some(m) => (m, EtherType::IPV6),
-                        None => {
-                            if self.ndp_pending.enqueue(target, pkt.as_bytes()) {
+                    match self.ndp.resolve_at(target, now) {
+                        Resolved::Hit(m) => (m, EtherType::IPV6),
+                        Resolved::Probe(m) => {
+                            probe = Some((IpAddr::V6(target), m));
+                            (m, EtherType::IPV6)
+                        }
+                        Resolved::Miss => {
+                            if self.ndp_pending.enqueue_at(target, pkt.as_bytes(), now) {
                                 self.send_neighbor_solicitation(target);
                             }
                             return;
@@ -443,6 +464,11 @@ impl L2Adapter {
 
         let frame = build_frame(dst_mac, self.mac, ether_type, pkt.as_bytes());
         self.send_l2(Frame::from_slice(&frame));
+        match probe {
+            Some((IpAddr::V4(ip), mac)) => self.send_arp_request_to(ip, mac),
+            Some((IpAddr::V6(ip), mac)) => self.send_neighbor_solicitation_to(ip, mac),
+            None => {}
+        }
     }
 
     /// The directed broadcast of our own IPv4 subnet, e.g. 10.0.0.255 in
@@ -506,7 +532,13 @@ impl L2Adapter {
                 || self.arp.lookup(sender_ip).is_some()
                 || self.arp_pending.contains(sender_ip))
         {
-            self.arp.set(sender_ip, sender_mac, arp::DEFAULT_TTL);
+            // Only a reply sent to us answers a request or probe of ours,
+            // and so shows the neighbour reachable (as RFC 4861 §7.3.1 has
+            // a solicited advertisement do). Requests and broadcast
+            // replies are overheard: they keep the MAC current, but leave
+            // it to be checked when next used.
+            let confirmed = op == arp::OP_REPLY && for_us && f.dst_mac() == Some(self.mac);
+            self.arp.update(sender_ip, sender_mac, confirmed, true);
             // Straight to the MAC just learnt rather than back through
             // handle_outgoing: the queue was only waiting for this answer,
             // and a second lookup that missed would queue and solicit again.
@@ -541,13 +573,20 @@ impl L2Adapter {
     }
 
     fn send_arp_request(&self, target: Ipv4Addr) {
+        self.send_arp_request_to(target, MacAddr::broadcast());
+    }
+
+    /// An ARP request for `target` to `dst`: broadcast to resolve it, or
+    /// unicast to the MAC we have for it to check it is still there (RFC
+    /// 1122 §2.3.2.1).
+    fn send_arp_request_to(&self, target: Ipv4Addr, dst: MacAddr) {
         let our_addr = match self.l3.addr().addr() {
             IpAddr::V4(a) => a,
             _ => Ipv4Addr::UNSPECIFIED,
         };
         let payload =
             arp::build_packet(arp::OP_REQUEST, self.mac, our_addr, MacAddr::zero(), target);
-        let frame = build_frame(MacAddr::broadcast(), self.mac, EtherType::ARP, &payload);
+        let frame = build_frame(dst, self.mac, EtherType::ARP, &payload);
         self.send_l2(Frame::from_slice(&frame));
     }
 
@@ -611,7 +650,9 @@ impl L2Adapter {
                 && self.on_link_v6(src)
                 && let Some(mac) = slla
             {
-                self.learn_neighbor(src, mac);
+                // RFC 4861 §7.2.3: not a confirmation, and a new or
+                // changed address is STALE, to be probed when used.
+                self.learn_neighbor(src, mac, false, true);
             }
 
             if src.is_unspecified() {
@@ -638,18 +679,18 @@ impl L2Adapter {
             self.note_conflict(frame_src);
             return true;
         }
-        let Some(mac) = ndp::parse_option(opts, ndp::OPT_TARGET_LINK_ADDR) else {
+        // RFC 4861 §7.2.5: an advertisement for an address nobody here
+        // asked about is not cached. One without a target link-layer
+        // address can only speak for the one already cached -- as the
+        // answer to a unicast probe may (§7.2.4).
+        let known = self.ndp.lookup(target);
+        if known.is_none() && !self.ndp_pending.contains(target) {
+            return true;
+        }
+        let Some(mac) = ndp::parse_option(opts, ndp::OPT_TARGET_LINK_ADDR).or(known) else {
             return true;
         };
-        // RFC 4861 §7.2.5: without the Override flag an advertisement may
-        // fill in an address being resolved but not replace a known one;
-        // and one for an address nobody here asked about is not cached.
-        match self.ndp.lookup(target) {
-            Some(known) if known != mac && !override_ => {}
-            Some(_) => self.learn_neighbor(target, mac),
-            None if self.ndp_pending.contains(target) => self.learn_neighbor(target, mac),
-            None => {}
-        }
+        self.learn_neighbor(target, mac, solicited, override_);
         true
     }
 
@@ -674,10 +715,12 @@ impl L2Adapter {
         self.arp_pending.clear();
     }
 
-    /// Cache a neighbour's MAC and send whatever was waiting for it,
-    /// however it was learnt.
-    fn learn_neighbor(&self, ip: Ipv6Addr, mac: MacAddr) {
-        self.ndp.set(ip, mac, ndp::DEFAULT_TTL);
+    /// Cache a neighbour's MAC, as [`arp::Table::update`] takes it, and send
+    /// whatever was waiting for it, however it was learnt.
+    fn learn_neighbor(&self, ip: Ipv6Addr, mac: MacAddr, solicited: bool, override_: bool) {
+        self.ndp.update(ip, mac, solicited, override_);
+        // An advertisement that may not override leaves the cached MAC.
+        let mac = self.ndp.lookup(ip).unwrap_or(mac);
         // Sent to `mac` directly, not looked up again: what was waiting was
         // waiting for this answer, and a lookup that missed would only queue
         // it and solicit once more.
@@ -688,9 +731,19 @@ impl L2Adapter {
     }
 
     fn send_neighbor_solicitation(&self, target: Ipv6Addr) {
-        let src = ndp::link_local_from_mac(self.mac);
         let dst = ndp::solicited_node_multicast(target);
         let dst_mac = ndp::solicited_node_mac(target);
+        self.send_ns(target, dst, dst_mac);
+    }
+
+    /// A unicast NS, checking that `target` is still at `mac` (RFC 4861
+    /// §7.3.3 PROBE).
+    fn send_neighbor_solicitation_to(&self, target: Ipv6Addr, mac: MacAddr) {
+        self.send_ns(target, target, mac);
+    }
+
+    fn send_ns(&self, target: Ipv6Addr, dst: Ipv6Addr, dst_mac: MacAddr) {
+        let src = ndp::link_local_from_mac(self.mac);
         let mut payload = ndp::build_ns(self.mac, target);
         let ip = ndp::wrap_icmpv6(src, dst, &mut payload);
         let frame = build_frame(dst_mac, self.mac, EtherType::IPV6, &ip);
@@ -855,6 +908,7 @@ mod tests {
     #[cfg(not(feature = "dhcp"))]
     use crate::IpPrefix;
     use crate::PipeL3;
+    use std::time::Duration;
 
     #[test]
     fn arp_reply_on_request_for_our_ip() {
@@ -1028,7 +1082,7 @@ mod tests {
             assert_eq!(solicited(&take(&out)), [dst]);
 
             // RETRANS_TIMER apart, MAX_MULTICAST_SOLICIT in all.
-            let at = |ms| t0 + std::time::Duration::from_millis(ms);
+            let at = |ms| t0 + Duration::from_millis(ms);
             adapter.run_timers(at(500));
             assert!(take(&out).is_empty());
             adapter.run_timers(at(1050));
@@ -1054,6 +1108,92 @@ mod tests {
             }
             assert_eq!(&icmp[8..8 + pkt.len()], &pkt[..], "original quoted");
         }
+    }
+
+    /// An ARP reply from `mac`/`ip`, sent to the adapter itself.
+    fn arp_reply_to(adapter: &L2Adapter, mac: MacAddr, ip: [u8; 4], target: [u8; 4]) {
+        let payload = arp::build_packet(arp::OP_REPLY, mac, ip.into(), adapter.mac, target.into());
+        let frame = build_frame(adapter.mac, mac, EtherType::ARP, &payload);
+        adapter.send(Frame::from_slice(&frame)).unwrap();
+    }
+
+    #[test]
+    fn a_neighbour_that_moved_is_found_again_within_seconds() {
+        let (_pipe, adapter, out) = rig("10.0.0.5/24");
+        let (old, new) = (MacAddr([2, 0, 0, 0, 0, 6]), MacAddr([2, 0, 0, 0, 0, 0x16]));
+        let pkt = v4_packet([10, 0, 0, 5], [10, 0, 0, 6]);
+        let send = |at: Instant| {
+            adapter.handle_outgoing_at(Packet::from_slice(&pkt), at);
+            take(&out)
+        };
+        let t0 = Instant::now();
+        let at = |s: u64, ms: u64| t0 + Duration::from_secs(s) + Duration::from_millis(ms);
+        let arp_to = |frames: &[Vec<u8>]| -> Vec<Option<MacAddr>> {
+            frames
+                .iter()
+                .map(|f| Frame::from_slice(f))
+                .filter(|f| f.ether_type() == EtherType::ARP)
+                .map(|f| f.dst_mac())
+                .collect()
+        };
+
+        assert_eq!(arp_to(&send(t0)), [Some(MacAddr::broadcast())]);
+        arp_reply_to(&adapter, old, [10, 0, 0, 6], [10, 0, 0, 5]);
+        assert_eq!(take(&out).len(), 1, "queued packet delivered");
+
+        // The neighbour is swapped for another machine that sends nothing.
+        // Past REACHABLE_TIME the entry is STALE; once used, it is probed
+        // at its old MAC, which never answers.
+        let got = send(at(31, 0));
+        assert_eq!(Frame::from_slice(&got[0]).dst_mac(), Some(old));
+        adapter.run_timers(at(36, 0));
+        assert_eq!(arp_to(&take(&out)), [Some(old)], "unicast probe");
+        adapter.run_timers(at(37, 0));
+        adapter.run_timers(at(38, 0));
+        assert_eq!(arp_to(&take(&out)), [Some(old), Some(old)]);
+        adapter.run_timers(at(39, 0));
+        assert!(take(&out).is_empty());
+
+        // Given up on: the next packet is resolved afresh, and reaches the
+        // new MAC -- seconds after the move, not minutes.
+        assert_eq!(arp_to(&send(at(39, 100))), [Some(MacAddr::broadcast())]);
+        arp_reply_to(&adapter, new, [10, 0, 0, 6], [10, 0, 0, 5]);
+        let got = take(&out);
+        assert_eq!(Frame::from_slice(&got[0]).dst_mac(), Some(new));
+    }
+
+    #[test]
+    fn an_ipv6_neighbour_is_probed_by_unicast_and_confirmed() {
+        let (_pipe, adapter, out) = rig("2001:db8::5/64");
+        let pkt = v6_packet(our_ip(), peer_ip());
+        let t0 = Instant::now();
+        adapter.handle_outgoing_at(Packet::from_slice(&pkt), t0);
+        take(&out);
+        let mut na = ndp::build_na(PEER_MAC, peer_ip(), true);
+        let f = ndp_frame(&adapter, PEER_MAC, peer_ip(), our_ip(), &mut na);
+        adapter.send(Frame::from_slice(&f)).unwrap();
+        take(&out);
+
+        let later = t0 + arp::REACHABLE_TIME + Duration::from_secs(1);
+        adapter.handle_outgoing_at(Packet::from_slice(&pkt), later);
+        take(&out);
+        adapter.run_timers(later + arp::DELAY_FIRST_PROBE_TIME);
+        let sent = take(&out);
+        assert_eq!(solicited(&sent), [IpAddr::V6(peer_ip())]);
+        let f = Frame::from_slice(&sent[0]);
+        assert_eq!(f.dst_mac(), Some(PEER_MAC), "probe not unicast");
+        assert_eq!(
+            Packet::from_slice(f.payload()).ipv6_dst_addr(),
+            Some(peer_ip())
+        );
+
+        // A solicited NA, even without a link-layer address, confirms it.
+        let mut na = ndp::build_na(PEER_MAC, peer_ip(), true)[..24].to_vec();
+        let f = ndp_frame(&adapter, PEER_MAC, peer_ip(), our_ip(), &mut na);
+        adapter.send(Frame::from_slice(&f)).unwrap();
+        adapter.run_timers(later + Duration::from_secs(10));
+        assert!(take(&out).is_empty(), "probed a confirmed neighbour");
+        assert_eq!(adapter.ndp.lookup(peer_ip()), Some(PEER_MAC));
     }
 
     fn take(out: &Out) -> Vec<Vec<u8>> {
