@@ -21,6 +21,7 @@ use crate::accept::{Cleanup, L3Connector};
 use crate::defrag::{Reassembler, ipv6_fragment_header};
 use crate::iface::{L3Device, L3Handler};
 use crate::packet::Packet;
+use crate::slirp::checksum::{tcp_ok, udp_ok};
 use crate::slirp::icmpv4::build_icmpv4_echo_reply;
 use crate::slirp::icmpv6::build_icmpv6_echo_reply;
 use crate::slirp::ipv6::skip_extension_headers;
@@ -550,6 +551,9 @@ impl Stack {
             return Ok(());
         }
         let tcp = &pkt[ihl..];
+        if !tcp_ok(src.into(), dst.into(), tcp) {
+            return Ok(()); // corrupt: dropped, as RFC 9293 §3.1 asks
+        }
         let src_port = u16::from_be_bytes([tcp[0], tcp[1]]);
         let dst_port = u16::from_be_bytes([tcp[2], tcp[3]]);
         let flags = tcp[13];
@@ -764,6 +768,9 @@ impl Stack {
             return Ok(());
         }
         let udp = &pkt[ihl..];
+        if !udp_datagram_ok(src.into(), dst.into(), udp) {
+            return Ok(());
+        }
         let src_port = u16::from_be_bytes([udp[0], udp[1]]);
         let dst_port = u16::from_be_bytes([udp[2], udp[3]]);
         let key = Key {
@@ -881,6 +888,9 @@ impl Stack {
         let tcp = &pkt[transport_off..];
         if tcp.len() < 20 {
             return Ok(());
+        }
+        if !tcp_ok(src.into(), dst.into(), tcp) {
+            return Ok(()); // corrupt: dropped, as RFC 9293 §3.1 asks
         }
         let src_port = u16::from_be_bytes([tcp[0], tcp[1]]);
         let dst_port = u16::from_be_bytes([tcp[2], tcp[3]]);
@@ -1077,6 +1087,9 @@ impl Stack {
     ) -> Result<()> {
         let udp = &pkt[transport_off..];
         if udp.len() < 8 {
+            return Ok(());
+        }
+        if !udp_datagram_ok(src.into(), dst.into(), udp) {
             return Ok(());
         }
         let src_port = u16::from_be_bytes([udp[0], udp[1]]);
@@ -1279,6 +1292,17 @@ fn tick_outbound<K: Copy + Eq + std::hash::Hash>(
     for c in gone {
         c.close();
     }
+}
+
+/// Whether the UDP datagram at the start of `udp` (an IP payload) is sound:
+/// its length fits, and its checksum holds (see [`udp_ok`]). Checked before
+/// a flow is looked up, so a corrupt datagram neither reaches the host nor
+/// opens a socket there.
+fn udp_datagram_ok(src: std::net::IpAddr, dst: std::net::IpAddr, udp: &[u8]) -> bool {
+    // The UDP length, not the IP payload, bounds the datagram: anything
+    // past it is link padding, and outside the checksum.
+    let len = u16::from_be_bytes([udp[4], udp[5]]) as usize;
+    (8..=udp.len()).contains(&len) && udp_ok(src, dst, &udp[..len])
 }
 
 /// Whether a segment with these flags, to a 4-tuple with no connection,
@@ -1520,6 +1544,12 @@ mod tests {
         p[ihl + 12] = 5 << 4;
         p[ihl + 13] = tcp_flags::ACK;
         p[ihl + 8..ihl + 12].copy_from_slice(&1234u32.to_be_bytes()); // ACK
+        let cs = crate::slirp::checksum::tcp_v4_checksum(
+            Ipv4Addr::new(10, 0, 0, 5),
+            Ipv4Addr::new(10, 0, 0, 1),
+            &p[ihl..],
+        );
+        p[ihl + 16..ihl + 18].copy_from_slice(&cs.to_be_bytes());
         L3Device::send(&*s, Packet::from_slice(&p)).unwrap();
 
         let got = captured.lock().unwrap();
@@ -2705,6 +2735,60 @@ mod tests {
                 .expect("accept still blocked after the stack shut down");
             assert!(failed);
         }
+    }
+
+    #[test]
+    fn segments_and_datagrams_with_bad_checksums_are_dropped() {
+        let s = Stack::new();
+        let _l = s.listen("tcp", "10.0.0.1:80").unwrap();
+        let _l6 = s.listen6("[fd00::1]:80").unwrap();
+        let captured = capture(&s);
+        let (client, us) = (Ipv4Addr::new(10, 0, 0, 5), Ipv4Addr::new(10, 0, 0, 1));
+        let (c6, us6): (Ipv6Addr, Ipv6Addr) =
+            ("fd00::5".parse().unwrap(), "fd00::1".parse().unwrap());
+        let inject = |p: &[u8]| L3Device::send(&*s, Packet::from_slice(p)).unwrap();
+        let send = |p: &mut Vec<u8>, at: usize| {
+            p[at] ^= 0x01;
+            inject(p);
+        };
+
+        let mut syn = build_tcp_v4_packet(client, 40000, us, 80, 1, 0, tcp_flags::SYN, &[]);
+        send(&mut syn, 37); // checksum's low byte
+        let syn6 = Segment {
+            src_port: 40000,
+            dst_port: 80,
+            seq: 1,
+            flags: tcp_flags::SYN,
+            ..Default::default()
+        };
+        let mut syn6 = crate::slirp::packet::build_packet6(c6, us6, &syn6.marshal());
+        send(&mut syn6, 45); // sequence number
+        assert!(s.inner.virt_tcp.lock().unwrap().is_empty());
+        assert!(s.inner.virt_tcp6.lock().unwrap().is_empty());
+        assert!(
+            captured.lock().unwrap().is_empty(),
+            "answered a corrupt SYN"
+        );
+
+        let lo = Ipv4Addr::LOCALHOST;
+        let mut dgram = build_udp_v4_packet(client, 40000, lo, 9, b"hello");
+        send(&mut dgram, 30); // payload
+        let mut dgram6 =
+            crate::slirp::packet::build_udp_packet6(c6, 40000, Ipv6Addr::LOCALHOST, 9, b"hello");
+        send(&mut dgram6, 50);
+        // Over IPv6 a zero checksum is invalid too.
+        let mut dgram6 =
+            crate::slirp::packet::build_udp_packet6(c6, 40001, Ipv6Addr::LOCALHOST, 9, b"hello");
+        dgram6[46..48].copy_from_slice(&[0, 0]);
+        inject(&dgram6);
+        assert!(s.inner.udp.lock().unwrap().is_empty(), "v4 flow opened");
+        assert!(s.inner.udp6.lock().unwrap().is_empty(), "v6 flow opened");
+
+        // Over IPv4 it means "no checksum", and the datagram goes through.
+        let mut dgram = build_udp_v4_packet(client, 40001, lo, 9, b"hello");
+        dgram[26..28].copy_from_slice(&[0, 0]);
+        inject(&dgram);
+        assert_eq!(s.inner.udp.lock().unwrap().len(), 1);
     }
 
     #[test]

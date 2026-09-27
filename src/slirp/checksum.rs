@@ -4,7 +4,9 @@
 //! buffers slirp manipulates directly. Keeping them local avoids the
 //! `IpAddr` enum dispatch on hot paths.
 
-use std::net::{Ipv4Addr, Ipv6Addr};
+use crate::Protocol;
+use crate::checksum::raw_transport_sum;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 #[inline]
 fn fold(mut sum: u32) -> u16 {
@@ -130,9 +132,63 @@ pub(crate) fn ipv6_pseudo_checksum(
     fold(sum)
 }
 
+/// Whether a TCP segment from the guest (header and payload, checksum
+/// included) checks out against its pseudo-header. RFC 9293 §3.1 makes
+/// the check a MUST; a corrupt segment must not reach the engine, whose
+/// ACKs and RSTs it could otherwise drive.
+pub(crate) fn tcp_ok(src: IpAddr, dst: IpAddr, tcp: &[u8]) -> bool {
+    raw_transport_sum(Protocol::TCP, src, dst, tcp) == 0xFFFF
+}
+
+/// Whether a UDP datagram from the guest (exactly its UDP length, header
+/// included) checks out. Over IPv4 a checksum of 0 means the sender
+/// computed none (RFC 768). Over IPv6 it is not allowed (RFC 8200 §8.1):
+/// the zero-checksum exception of RFC 6935/6936 is for tunnel protocols
+/// that opt in per port, which no destination here has, so it is dropped.
+pub(crate) fn udp_ok(src: IpAddr, dst: IpAddr, udp: &[u8]) -> bool {
+    if udp.len() < 8 {
+        return false;
+    }
+    if udp[6..8] == [0, 0] {
+        return src.is_ipv4();
+    }
+    raw_transport_sum(Protocol::UDP, src, dst, udp) == 0xFFFF
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transport_checks_accept_good_and_refuse_bad_sums() {
+        let (s4, d4) = (Ipv4Addr::new(10, 0, 0, 5), Ipv4Addr::new(1, 1, 1, 1));
+        let (s6, d6): (Ipv6Addr, Ipv6Addr) =
+            ("fd00::5".parse().unwrap(), "2001:db8::1".parse().unwrap());
+        let mut udp = vec![0x9c, 0x40, 0, 53, 0, 11, 0, 0, b'a', b'b', b'c'];
+        // No checksum: fine over IPv4, invalid over IPv6.
+        assert!(udp_ok(s4.into(), d4.into(), &udp));
+        assert!(!udp_ok(s6.into(), d6.into(), &udp));
+        let cs = udp_v4_checksum(s4, d4, &udp[..8], &udp[8..]);
+        udp[6..8].copy_from_slice(&cs.to_be_bytes());
+        assert!(udp_ok(s4.into(), d4.into(), &udp));
+        udp[9] ^= 1;
+        assert!(!udp_ok(s4.into(), d4.into(), &udp));
+        udp[9] ^= 1;
+        udp[6..8].copy_from_slice(&[0, 0]);
+        let cs = ipv6_pseudo_checksum(s6, d6, 17, udp.len() as u32, &udp);
+        udp[6..8].copy_from_slice(&cs.to_be_bytes());
+        assert!(udp_ok(s6.into(), d6.into(), &udp));
+        assert!(!udp_ok(s6.into(), "2001:db8::2".parse().unwrap(), &udp));
+
+        let mut tcp = vec![0u8; 24];
+        tcp[12] = 5 << 4;
+        tcp[20..].copy_from_slice(b"data");
+        let cs = tcp_v4_checksum(s4, d4, &tcp);
+        tcp[16..18].copy_from_slice(&cs.to_be_bytes());
+        assert!(tcp_ok(s4.into(), d4.into(), &tcp));
+        tcp[23] ^= 0x80;
+        assert!(!tcp_ok(s4.into(), d4.into(), &tcp));
+    }
 
     #[test]
     fn fold_then_recheck_ipv4_header() {

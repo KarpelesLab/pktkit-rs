@@ -20,8 +20,8 @@ const SERVER_PORT: u16 = 8080;
 const CLIENT_PORT: u16 = 51000;
 
 /// Wrap a marshaled TCP segment from `src` to `dst` in a minimal IPv6 packet.
-/// The stack reads the addresses/payload-length and parses the TCP segment; it
-/// does not require the TCP checksum to be valid here.
+/// The stack verifies the TCP checksum, as RFC 9293 requires, so it is filled
+/// in over the pseudo-header.
 fn wrap(src: Ipv6Addr, dst: Ipv6Addr, seg: &[u8]) -> Vec<u8> {
     let total = 40 + seg.len();
     let mut ip = vec![0u8; total];
@@ -32,6 +32,9 @@ fn wrap(src: Ipv6Addr, dst: Ipv6Addr, seg: &[u8]) -> Vec<u8> {
     ip[8..24].copy_from_slice(&src.octets());
     ip[24..40].copy_from_slice(&dst.octets());
     ip[40..].copy_from_slice(seg);
+    ip[56..58].copy_from_slice(&[0, 0]);
+    let cs = pktkit::transport_checksum(Protocol::TCP, src.into(), dst.into(), &ip[40..]);
+    ip[56..58].copy_from_slice(&cs.to_be_bytes());
     ip
 }
 

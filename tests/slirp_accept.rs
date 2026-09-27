@@ -20,8 +20,8 @@ const SERVER_PORT: u16 = 8080;
 const CLIENT_PORT: u16 = 51000;
 
 /// Wrap a marshaled TCP segment from `src` to `dst` in a minimal IPv4 packet.
-/// (The stack recomputes / validates only what it needs; this is the same
-/// minimal framing used by `tests/vclient_tcp.rs`.)
+/// The stack verifies the TCP checksum, as RFC 9293 requires, so it is filled
+/// in over the pseudo-header.
 fn wrap(src: Ipv4Addr, dst: Ipv4Addr, seg: &[u8]) -> Vec<u8> {
     let total = 20 + seg.len();
     let mut ip = vec![0u8; total];
@@ -34,6 +34,9 @@ fn wrap(src: Ipv4Addr, dst: Ipv4Addr, seg: &[u8]) -> Vec<u8> {
     let cs = pktkit::checksum(&ip[..20]);
     ip[10..12].copy_from_slice(&cs.to_be_bytes());
     ip[20..].copy_from_slice(seg);
+    ip[36..38].copy_from_slice(&[0, 0]);
+    let cs = pktkit::transport_checksum(Protocol::TCP, src.into(), dst.into(), &ip[20..]);
+    ip[36..38].copy_from_slice(&cs.to_be_bytes());
     ip
 }
 
