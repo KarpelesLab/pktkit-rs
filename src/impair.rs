@@ -273,6 +273,14 @@ impl DeliveryLock {
     }
 }
 
+impl DeliveryLock {
+    /// Whether this thread is inside a delivery: a handler, further up.
+    #[cfg(not(target_family = "wasm"))]
+    fn held_here(&self) -> bool {
+        *self.owner.lock().unwrap() == Some(std::thread::current().id())
+    }
+}
+
 impl Drop for DeliveryGuard<'_> {
     fn drop(&mut self) {
         *self.0.owner.lock().unwrap() = None;
@@ -522,6 +530,13 @@ fn push(q: &mut Queue, at: Instant, dir: Direction, data: Vec<u8>) {
 /// `timeout`.
 #[cfg(not(target_family = "wasm"))]
 fn drain(engine: &Engine, timeout: Duration) -> bool {
+    // From inside a handler the link cannot drain: the delivery in progress,
+    // and the rest of its batch, wait for this very call to return, and no
+    // other thread may deliver meanwhile. Waiting would only use up the
+    // timeout.
+    if engine.delivering.held_here() {
+        return engine.pending() == 0;
+    }
     // No deadline the clock can represent means no deadline.
     let deadline = Instant::now().checked_add(timeout);
     while deadline.is_none_or(|d| Instant::now() < d) {
@@ -677,6 +692,10 @@ macro_rules! impaired_device {
             /// off it has been delivered, or `timeout` elapses. Returns
             /// whether it drained. Intended for tests, which otherwise
             /// have to guess how long a delayed packet needs.
+            ///
+            /// Called from a handler during a delivery, it returns `false`
+            /// at once: nothing more can be delivered until that handler
+            /// returns.
             #[cfg(not(target_family = "wasm"))]
             pub fn wait_idle(&self, timeout: Duration) -> bool {
                 drain(&self.engine, timeout)
@@ -1358,5 +1377,25 @@ mod tests {
         assert_eq!(link.impairment().loss, 1.0);
         link.send(Frame::from_slice(&frame(1))).unwrap();
         assert_eq!(wire.count(), 1, "the second frame was lost");
+    }
+
+    #[test]
+    fn wait_idle_from_a_handler_does_not_wait_out_the_timeout() {
+        let (wire, link) = wrap(Impairment::default().delay(Duration::from_millis(1)));
+        let took = Arc::new(Mutex::new(None));
+        let (l, t) = (Arc::downgrade(&link), took.clone());
+        link.set_handler(Arc::new(move |_f: &Frame| {
+            if let Some(l) = l.upgrade() {
+                let start = Instant::now();
+                let idle = l.wait_idle(Duration::from_secs(5));
+                *t.lock().unwrap() = Some((idle, start.elapsed()));
+            }
+            Ok(())
+        }));
+        wire.deliver(Frame::from_slice(&frame(0)));
+        assert!(link.wait_idle(Duration::from_secs(5)));
+        let (idle, elapsed) = took.lock().unwrap().expect("handler ran");
+        assert!(!idle, "idle while its own delivery was in progress");
+        assert!(elapsed < Duration::from_secs(1), "waited {elapsed:?}");
     }
 }
