@@ -8,8 +8,8 @@
 //!
 //! Ported from the reliability bits of the Go `peer.go` (`ctrlIn`, `ctrlOut`,
 //! `ctrlAck`, the in/out counters) and `peerconn.go` (chunking the TLS stream
-//! into `P_CONTROL_V1` packets). This is the substrate the rustls
-//! `ServerConnection` reads from and writes to — there is no TCP socket below
+//! into `P_CONTROL_V1` packets). This is the substrate purecrypto's
+//! `tls::Connection` reads from and writes to — there is no TCP socket below
 //! the TLS, only this layer.
 
 use crate::time::Instant;

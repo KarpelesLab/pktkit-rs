@@ -640,6 +640,12 @@ impl LocalHelper for UPnPHelper {
             return false;
         }
         let ihl = (bytes[0] & 0x0F) as usize * 4;
+        // The NAT hands over validated datagrams, but this is a public entry
+        // point: an IHL under 5 would have the transport header read from
+        // inside the IP header.
+        if ihl < 20 || bytes.len() < ihl {
+            return false;
+        }
         match bytes[9] {
             PROTO_UDP => self.handle_udp(nat, ns, bytes, ihl),
             PROTO_TCP => self.handle_tcp(nat, ns, bytes, ihl),
