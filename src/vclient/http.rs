@@ -490,15 +490,15 @@ impl ResponseReader {
 
     /// Look for the end of the head and parse it. `false` if not there yet.
     fn parse_head(&mut self) -> io::Result<bool> {
-        let from = self.scan.saturating_sub(3).max(self.pos);
-        let Some(i) = find_subsequence(&self.buf[from..], b"\r\n\r\n") else {
+        // Only line feeds past `scan` are new: whether one ends the head
+        // depends on the bytes before it, which have not changed.
+        let Some(end) = head_end(&self.buf, self.pos, self.scan.max(self.pos)) else {
             if self.buf.len() - self.pos > MAX_HEAD {
                 return Err(invalid("response headers too large"));
             }
             self.scan = self.buf.len();
             return Ok(false);
         };
-        let end = from + i + 4;
         // One feed can bring a whole oversized head at once.
         if end - self.pos > MAX_HEAD {
             return Err(invalid("response headers too large"));
@@ -601,13 +601,17 @@ impl ResponseReader {
                             .extend_from_slice(&self.buf[self.pos..self.pos + take]);
                         self.pos += take;
                         *left -= take;
-                        if *left > 0 || self.buf.len() - self.pos < 2 {
+                        if *left > 0 {
                             return Ok(false);
                         }
-                        if &self.buf[self.pos..self.pos + 2] != b"\r\n" {
-                            return Err(invalid("chunk not followed by CRLF"));
+                        // The line break after the data, CRLF or, as for
+                        // every line, a bare LF.
+                        match &self.buf[self.pos..] {
+                            [b'\n', ..] => self.pos += 1,
+                            [b'\r', b'\n', ..] => self.pos += 2,
+                            [] | [b'\r'] => return Ok(false),
+                            _ => return Err(invalid("chunk not followed by a line break")),
                         }
-                        self.pos += 2;
                         *state = Chunked::Size;
                     }
                     Chunked::Trailer => {
@@ -649,17 +653,52 @@ impl ResponseReader {
     }
 }
 
-/// Take one CRLF-terminated line starting at `*pos`, if it is all there.
+/// Take one line starting at `*pos`, if it is all there, without its line
+/// break (see [`strip_cr`]).
 fn take_line<'a>(buf: &'a [u8], pos: &mut usize) -> io::Result<Option<&'a [u8]>> {
     let rest = &buf[*pos..];
-    match find_subsequence(rest, b"\r\n") {
+    match rest.iter().position(|&b| b == b'\n') {
         Some(i) => {
-            *pos += i + 2;
-            Ok(Some(&rest[..i]))
+            *pos += i + 1;
+            strip_cr(&rest[..i]).map(Some).map_err(invalid)
         }
         None if rest.len() > MAX_CHUNK_LINE => Err(invalid("chunk line too long")),
         None => Ok(None),
     }
+}
+
+/// A line cut at its LF, without the CR before it.
+///
+/// A line ends in CRLF, and RFC 9112 §2.2 lets a recipient take a bare LF
+/// as a line end as well, as servers do send; this does, for every line of
+/// a response, head and chunked body alike. A CR anywhere else is a bare
+/// CR, which §2.2 makes invalid (or to be replaced by a space): it is
+/// refused, as elsewhere the head is read strictly, since agents that
+/// split lines at a CR would read another field there.
+fn strip_cr(line: &[u8]) -> Result<&[u8], &'static str> {
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    if line.contains(&b'\r') {
+        return Err("bare CR in the response");
+    }
+    Ok(line)
+}
+
+/// Where the head starting at `start` ends, just past the line break of its
+/// empty last line, looking at line feeds from `from` on. `None` if it has
+/// not all arrived.
+fn head_end(buf: &[u8], start: usize, from: usize) -> Option<usize> {
+    let mut at = from;
+    while let Some(i) = buf[at..].iter().position(|&b| b == b'\n') {
+        let lf = at + i;
+        // The line this LF ends is empty: the previous line ended right
+        // before it, with or without a CR.
+        let before = &buf[start..lf];
+        if before.ends_with(b"\n") || before.ends_with(b"\n\r") {
+            return Some(lf + 1);
+        }
+        at = lf + 1;
+    }
+    None
 }
 
 /// Status, reason, header fields, and the `Set-Cookie` values.
@@ -671,7 +710,11 @@ type Head = (u16, String, BTreeMap<String, String>, Vec<String>);
 /// the whole response. They are decoded as UTF-8 where they are that, and
 /// replaced where not.
 fn parse_head(head: &[u8]) -> Result<Head, &'static str> {
-    let mut lines = CrlfLines(head);
+    let lines: Vec<&[u8]> = head
+        .split(|&b| b == b'\n')
+        .map(strip_cr)
+        .collect::<Result<_, _>>()?;
+    let mut lines = lines.into_iter();
     let status_line = lines.next().ok_or("empty response")?;
     // HTTP/1.1 200 OK
     let mut sp = status_line.splitn(3, |&b| b == b' ');
@@ -742,30 +785,6 @@ fn parse_head(head: &[u8]) -> Result<Head, &'static str> {
     Ok((status, reason, headers, set_cookies))
 }
 
-/// The CRLF-separated lines of a head.
-struct CrlfLines<'a>(&'a [u8]);
-
-impl<'a> Iterator for CrlfLines<'a> {
-    type Item = &'a [u8];
-
-    fn next(&mut self) -> Option<&'a [u8]> {
-        if self.0.is_empty() {
-            return None;
-        }
-        let rest = self.0;
-        match find_subsequence(rest, b"\r\n") {
-            Some(i) => {
-                self.0 = &rest[i + 2..];
-                Some(&rest[..i])
-            }
-            None => {
-                self.0 = &[];
-                Some(rest)
-            }
-        }
-    }
-}
-
 /// `s` without the optional whitespace (SP, HTAB) around it (RFC 9110
 /// §5.6.3).
 fn trim_ows(mut s: &[u8]) -> &[u8] {
@@ -794,13 +813,6 @@ fn content_length(value: &str) -> Option<usize> {
         len = Some(n);
     }
     len
-}
-
-fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return None;
-    }
-    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 #[cfg(test)]
@@ -1022,6 +1034,35 @@ mod tests {
                     5;ext=1\r\nhello\r\n6\r\n world\r\n0\r\nTrailer: x\r\n\r\n";
         for step in [1, 2, 7, raw.len()] {
             assert_eq!(read_response(raw, step).unwrap().body, b"hello world");
+        }
+    }
+
+    /// A bare LF ends a line anywhere a CRLF does (RFC 9112 §2.2), and a
+    /// bare CR is refused.
+    #[test]
+    fn bare_lf_ends_lines_and_bare_cr_is_refused() {
+        let lf = b"HTTP/1.1 200 OK\nContent-Length: 2\nX-A: a\n\nhi";
+        let mixed = b"HTTP/1.1 200 OK\r\nContent-Length: 2\nX-A: a\r\n\nhi";
+        let chunked = b"HTTP/1.1 200 OK\nTransfer-Encoding: chunked\n\n\
+                        5\nhello\n6;e=1\r\n world\n0\nT: x\n\n";
+        for raw in [&lf[..], mixed, chunked] {
+            for step in [1, 2, 5, raw.len()] {
+                let r = read_response(raw, step).unwrap();
+                assert!(r.body == b"hi" || r.body == b"hello world", "{raw:?}");
+            }
+        }
+        let r = read_response(lf, lf.len()).unwrap();
+        assert_eq!((r.header("x-a"), r.reason.as_str()), (Some("a"), "OK"));
+
+        for raw in [
+            &b"HTTP/1.1 200 OK\r\nX-A: a\rContent-Length: 0\r\n\r\n"[..],
+            b"HTTP/1.1 200 O\rK\r\nContent-Length: 0\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\r\nx\r\n0\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nT: \rx\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\rx0\r\n\r\n",
+        ] {
+            let err = read_response(raw, raw.len()).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{raw:?}");
         }
     }
 
