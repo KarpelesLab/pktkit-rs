@@ -10,9 +10,9 @@
 //! Port of `alg_h323.go`.
 
 use crate::nat::helper::{Expectation, Helper, NatMapping, PROTO_TCP, PROTO_UDP, PacketHelper};
+use crate::nat::l4::replace_payload;
 use crate::nat::nat::Nat;
 use crate::time::Instant;
-use crate::{Protocol, checksum, combine_checksums, pseudo_header_checksum};
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 
@@ -117,7 +117,8 @@ impl PacketHelper for H323Helper {
         if !modified {
             return pkt;
         }
-        h323_rebuild_packet(&pkt, payload_off, &new_payload)
+        let ihl = (pkt[0] & 0x0F) as usize * 4;
+        replace_payload(&pkt, ihl, payload_off - ihl, &new_payload)
     }
 
     fn process_inbound(&self, nat: &Nat, pkt: Vec<u8>, m: &NatMapping) -> Vec<u8> {
@@ -162,7 +163,8 @@ impl PacketHelper for H323Helper {
         if !modified {
             return pkt;
         }
-        h323_rebuild_packet(&pkt, payload_off, &new_payload)
+        let ihl = (pkt[0] & 0x0F) as usize * 4;
+        replace_payload(&pkt, ihl, payload_off - ihl, &new_payload)
     }
 }
 
@@ -185,34 +187,10 @@ fn payload(pkt: &[u8]) -> Option<(usize, &[u8])> {
     Some((off, p))
 }
 
-/// Rebuild the packet with the same-length payload, recomputing IP + TCP
-/// checksums.
-fn h323_rebuild_packet(orig: &[u8], payload_off: usize, new_payload: &[u8]) -> Vec<u8> {
-    let ihl = (orig[0] & 0x0F) as usize * 4;
-    let mut out = orig.to_vec();
-    out[payload_off..].copy_from_slice(new_payload);
-
-    // Total length is unchanged (address rewrite is same-length).
-    out[10..12].copy_from_slice(&[0, 0]);
-    let ip_csum = checksum(&out[..ihl]);
-    out[10..12].copy_from_slice(&ip_csum.to_be_bytes());
-
-    if out.len() >= ihl + 18 {
-        let tcp_len = (out.len() - ihl) as u16;
-        let src = Ipv4Addr::new(out[12], out[13], out[14], out[15]);
-        let dst = Ipv4Addr::new(out[16], out[17], out[18], out[19]);
-        out[ihl + 16..ihl + 18].copy_from_slice(&[0, 0]);
-        let ph = pseudo_header_checksum(Protocol::TCP, IpAddr::V4(src), IpAddr::V4(dst), tcp_len);
-        let seg = checksum(&out[ihl..]);
-        let cs = combine_checksums(ph, seg);
-        out[ihl + 16..ihl + 18].copy_from_slice(&cs.to_be_bytes());
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checksum;
     use crate::nat::nat::Nat;
     use crate::{IpPrefix, L3Device, Packet};
     use std::sync::{Arc, Mutex as StdMutex};
@@ -237,15 +215,7 @@ mod tests {
         p[32] = 0x50; // data offset 5
         p[33] = 0x18; // PSH|ACK
         p[40..].copy_from_slice(payload);
-        let ph = pseudo_header_checksum(
-            Protocol::TCP,
-            IpAddr::V4(src),
-            IpAddr::V4(dst),
-            (20 + payload.len()) as u16,
-        );
-        let seg = checksum(&p[20..]);
-        let cs = combine_checksums(ph, seg);
-        p[36..38].copy_from_slice(&cs.to_be_bytes());
+        crate::nat::l4::fill_v4_l4_checksum(&mut p, 20);
         p
     }
 
@@ -290,6 +260,10 @@ mod tests {
         // Port at offset 6 rewritten to a NAT-range mapped port.
         let mapped = u16::from_be_bytes([p[6], p[7]]);
         assert!(mapped >= 10000, "expected mapped port, got {}", mapped);
+        assert!(
+            crate::nat::l4::v4_l4_checksum_ok(&out[0], 20),
+            "rewritten H.225 segment must carry a valid TCP checksum"
+        );
 
         // The expectation should let an inbound RTP/UDP packet reach the inside.
         drop(out);

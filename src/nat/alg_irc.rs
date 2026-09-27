@@ -5,11 +5,11 @@
 //! incoming DCC connection is forwarded to the inside client.
 
 use crate::nat::helper::{Expectation, Helper, NatMapping, PROTO_TCP, PacketHelper};
+use crate::nat::l4::replace_payload;
 use crate::nat::nat::Nat;
 use crate::time::Instant;
-use crate::{Protocol, checksum, combine_checksums, pseudo_header_checksum};
 use std::collections::HashSet;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::Ipv4Addr;
 use std::time::Duration;
 
 const IRC_EXPECT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -141,7 +141,7 @@ impl PacketHelper for IrcHelper {
         new_payload.extend_from_slice(&new_dcc);
         new_payload.extend_from_slice(&payload[dcc_end + 1..]);
 
-        rebuild_tcp_packet(&pkt, ihl, data_off, &new_payload)
+        replace_payload(&pkt, ihl, data_off, &new_payload)
     }
 }
 
@@ -149,25 +149,79 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-fn rebuild_tcp_packet(pkt: &[u8], ihl: usize, tcp_data_off: usize, new_payload: &[u8]) -> Vec<u8> {
-    let total_len = ihl + tcp_data_off + new_payload.len();
-    let mut out = vec![0u8; total_len];
-    out[..ihl].copy_from_slice(&pkt[..ihl]);
-    out[ihl..ihl + tcp_data_off].copy_from_slice(&pkt[ihl..ihl + tcp_data_off]);
-    out[ihl + tcp_data_off..].copy_from_slice(new_payload);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::checksum;
+    use crate::nat::l4::{fill_v4_l4_checksum, v4_l4_checksum_ok};
+    use crate::{IpPrefix, L3Device, Packet};
+    use std::sync::{Arc, Mutex as StdMutex};
 
-    out[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
-    out[10..12].copy_from_slice(&[0, 0]);
-    let ip_csum = checksum(&out[..ihl]);
-    out[10..12].copy_from_slice(&ip_csum.to_be_bytes());
+    fn pfx(s: &str) -> IpPrefix {
+        s.parse().unwrap()
+    }
 
-    let tcp_len = (total_len - ihl) as u16;
-    let src = Ipv4Addr::new(out[12], out[13], out[14], out[15]);
-    let dst = Ipv4Addr::new(out[16], out[17], out[18], out[19]);
-    out[ihl + 16..ihl + 18].copy_from_slice(&[0, 0]);
-    let ph = pseudo_header_checksum(Protocol::TCP, IpAddr::V4(src), IpAddr::V4(dst), tcp_len);
-    let seg = checksum(&out[ihl..]);
-    let tcsum = combine_checksums(ph, seg);
-    out[ihl + 16..ihl + 18].copy_from_slice(&tcsum.to_be_bytes());
-    out
+    fn build_irc(src: Ipv4Addr, sport: u16, dst: Ipv4Addr, dport: u16, payload: &[u8]) -> Vec<u8> {
+        let total = 20 + 20 + payload.len();
+        let mut p = vec![0u8; total];
+        p[0] = 0x45;
+        p[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+        p[8] = 64;
+        p[9] = PROTO_TCP;
+        p[12..16].copy_from_slice(&src.octets());
+        p[16..20].copy_from_slice(&dst.octets());
+        let ic = checksum(&p[..20]);
+        p[10..12].copy_from_slice(&ic.to_be_bytes());
+        p[20..22].copy_from_slice(&sport.to_be_bytes());
+        p[22..24].copy_from_slice(&dport.to_be_bytes());
+        p[32] = 0x50;
+        p[33] = 0x18;
+        p[40..].copy_from_slice(payload);
+        fill_v4_l4_checksum(&mut p, 20);
+        p
+    }
+
+    fn setup() -> (Arc<Nat>, Arc<StdMutex<Vec<Vec<u8>>>>) {
+        let nat = Nat::new(pfx("10.0.0.1/24"), pfx("203.0.113.1/24"));
+        nat.add_packet_helper(Arc::new(IrcHelper::new(&[])));
+        let captured = Arc::new(StdMutex::new(Vec::<Vec<u8>>::new()));
+        let c = captured.clone();
+        nat.outside().set_handler(Arc::new(move |p| {
+            c.lock().unwrap().push(p.as_bytes().to_vec());
+            Ok(())
+        }));
+        (nat, captured)
+    }
+
+    #[test]
+    fn dcc_send_is_rewritten_with_a_valid_checksum() {
+        let (nat, captured) = setup();
+        let inside = Ipv4Addr::new(10, 0, 0, 5);
+        let msg = format!(
+            "PRIVMSG bob :\x01DCC SEND file.txt {} 5000 1234\x01\r\n",
+            u32::from(inside)
+        );
+        let pkt = build_irc(
+            inside,
+            40000,
+            Ipv4Addr::new(198, 51, 100, 9),
+            6667,
+            msg.as_bytes(),
+        );
+        nat.inside().send(Packet::from_slice(&pkt)).unwrap();
+
+        let out = captured.lock().unwrap();
+        assert_eq!(out.len(), 1);
+        let s = String::from_utf8_lossy(&out[0][40..]).to_string();
+        let outside = u32::from(Ipv4Addr::new(203, 0, 113, 1));
+        assert!(
+            s.contains(&format!("DCC SEND file.txt {} ", outside)),
+            "got {}",
+            s
+        );
+        assert!(
+            v4_l4_checksum_ok(&out[0], 20),
+            "rewritten DCC segment must verify"
+        );
+    }
 }

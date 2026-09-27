@@ -1146,7 +1146,6 @@ fn update_icmp_checksum(pkt: &mut [u8], ihl: usize, old_id: u16, new_id: u16) {
 mod tests {
     use super::*;
     use crate::{IpPrefix, L3Device, Packet};
-    use std::net::IpAddr;
     use std::sync::Mutex as StdMutex;
 
     fn pfx(s: &str) -> IpPrefix {
@@ -1171,20 +1170,7 @@ mod tests {
         // seq, ack are zero, data offset = 5 (5 32-bit words)
         p[32] = 0x50;
         p[33] = flags;
-        // TCP checksum: pseudo-header + segment
-        let ph = crate::pseudo_header_checksum(
-            crate::Protocol::TCP,
-            IpAddr::V4(src),
-            IpAddr::V4(dst),
-            20,
-        );
-        let seg = crate::checksum(&p[20..]);
-        let mut sum: u32 = (!ph) as u32 + (!seg) as u32;
-        while sum >> 16 != 0 {
-            sum = (sum & 0xFFFF) + (sum >> 16);
-        }
-        let tcsum = !(sum as u16);
-        p[36..38].copy_from_slice(&tcsum.to_be_bytes());
+        crate::nat::l4::fill_v4_l4_checksum(&mut p, 20);
         p
     }
 

@@ -10,9 +10,9 @@
 //! Port of `alg_sip.go`.
 
 use crate::nat::helper::{Expectation, Helper, NatMapping, PROTO_TCP, PROTO_UDP, PacketHelper};
+use crate::nat::l4::replace_payload;
 use crate::nat::nat::Nat;
 use crate::time::Instant;
-use crate::{Protocol, checksum, combine_checksums, pseudo_header_checksum};
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 
@@ -141,7 +141,7 @@ impl SipHelper {
         if new_payload == payload {
             return pkt;
         }
-        sip_rebuild_packet(&pkt, ihl, proto, &new_payload)
+        replace_payload(&pkt, ihl, hdr_len, &new_payload)
     }
 }
 
@@ -301,70 +301,6 @@ fn sip_update_content_length(headers: &mut Vec<u8>, sdp_body: &[u8]) -> Vec<u8> 
     result
 }
 
-/// Reconstruct the IP packet with a new payload, fixing lengths and checksums.
-fn sip_rebuild_packet(orig: &[u8], ihl: usize, proto: u8, new_payload: &[u8]) -> Vec<u8> {
-    let l4_hdr_len = if proto == PROTO_TCP {
-        if orig.len() < ihl + 20 {
-            return orig.to_vec();
-        }
-        (orig[ihl + 12] >> 4) as usize * 4
-    } else {
-        8
-    };
-
-    let total = ihl + l4_hdr_len + new_payload.len();
-    let mut out = vec![0u8; total];
-    out[..ihl].copy_from_slice(&orig[..ihl]);
-    if orig.len() >= ihl + l4_hdr_len {
-        out[ihl..ihl + l4_hdr_len].copy_from_slice(&orig[ihl..ihl + l4_hdr_len]);
-    }
-    out[ihl + l4_hdr_len..].copy_from_slice(new_payload);
-
-    out[2..4].copy_from_slice(&(total as u16).to_be_bytes());
-    out[10..12].copy_from_slice(&[0, 0]);
-    let ip_csum = checksum(&out[..ihl]);
-    out[10..12].copy_from_slice(&ip_csum.to_be_bytes());
-
-    if proto == PROTO_TCP {
-        recalc_tcp_checksum(&mut out, ihl);
-    } else if proto == PROTO_UDP {
-        recalc_udp_checksum(&mut out, ihl);
-    }
-    out
-}
-
-fn recalc_tcp_checksum(pkt: &mut [u8], ihl: usize) {
-    if pkt.len() < ihl + 18 {
-        return;
-    }
-    let tcp_len = (pkt.len() - ihl) as u16;
-    let src = Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]);
-    let dst = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
-    pkt[ihl + 16..ihl + 18].copy_from_slice(&[0, 0]);
-    let ph = pseudo_header_checksum(Protocol::TCP, IpAddr::V4(src), IpAddr::V4(dst), tcp_len);
-    let seg = checksum(&pkt[ihl..]);
-    let cs = combine_checksums(ph, seg);
-    pkt[ihl + 16..ihl + 18].copy_from_slice(&cs.to_be_bytes());
-}
-
-fn recalc_udp_checksum(pkt: &mut [u8], ihl: usize) {
-    if pkt.len() < ihl + 8 {
-        return;
-    }
-    let udp_len = (pkt.len() - ihl) as u16;
-    pkt[ihl + 4..ihl + 6].copy_from_slice(&udp_len.to_be_bytes());
-    let src = Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]);
-    let dst = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
-    pkt[ihl + 6..ihl + 8].copy_from_slice(&[0, 0]);
-    let ph = pseudo_header_checksum(Protocol::UDP, IpAddr::V4(src), IpAddr::V4(dst), udp_len);
-    let seg = checksum(&pkt[ihl..]);
-    let mut cs = combine_checksums(ph, seg);
-    if cs == 0 {
-        cs = 0xFFFF; // a UDP checksum of zero is transmitted as all-ones
-    }
-    pkt[ihl + 6..ihl + 8].copy_from_slice(&cs.to_be_bytes());
-}
-
 // ---- small byte-slice helpers (std-only) ----
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -423,6 +359,7 @@ fn replace_all(data: &[u8], old: &[u8], new: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checksum;
     use crate::nat::nat::Nat;
     use crate::{IpPrefix, L3Device, Packet};
     use std::sync::{Arc, Mutex as StdMutex};
@@ -486,6 +423,10 @@ Content-Length: 0\r\n\r\n";
         let s = String::from_utf8_lossy(payload_of(&out[0])).to_string();
         assert!(s.contains("203.0.113.1"), "expected outside addr in: {}", s);
         assert!(!s.contains("10.0.0.5"), "inside addr should be gone: {}", s);
+        assert!(
+            crate::nat::l4::v4_l4_checksum_ok(&out[0], 20),
+            "rewritten SIP datagram must carry a valid UDP checksum"
+        );
     }
 
     #[test]

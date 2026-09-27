@@ -10,8 +10,7 @@ use crate::nat::helper::{PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP};
 use crate::nat::nat::{NAT_ICMP_TIMEOUT, NAT_TCP_FIN_GRACE, NAT_TCP_TIMEOUT, NAT_UDP_TIMEOUT};
 use crate::time::Instant;
 use crate::{
-    IpPrefix, L3Device, L3Handler, Packet, Protocol, Result, checksum, combine_checksums,
-    pseudo_header_checksum,
+    IpPrefix, L3Device, L3Handler, Packet, Protocol, Result, checksum, transport_checksum,
 };
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -734,21 +733,11 @@ pub(crate) fn ipv4_to_mapped(addr: Ipv4Addr) -> Ipv6Addr {
 }
 
 fn compute_transport_checksum(proto: Protocol, src: IpAddr, dst: IpAddr, segment: &[u8]) -> u16 {
-    let ph = pseudo_header_checksum(proto, src, dst, segment.len() as u16);
-    let seg = checksum(segment);
-    // Both are complemented; combine_checksums folds two already-complemented sums.
-    combine_checksums(ph, seg)
+    transport_checksum(proto, src, dst, segment)
 }
 
 fn compute_icmpv6_checksum(src: Ipv6Addr, dst: Ipv6Addr, data: &[u8]) -> u16 {
-    let ph = pseudo_header_checksum(
-        Protocol::ICMPV6,
-        IpAddr::V6(src),
-        IpAddr::V6(dst),
-        data.len() as u16,
-    );
-    let seg = checksum(data);
-    combine_checksums(ph, seg)
+    transport_checksum(Protocol::ICMPV6, IpAddr::V6(src), IpAddr::V6(dst), data)
 }
 
 fn icmpv4_to_v6_dest_unreach(code: u8) -> (u8, u8) {
@@ -850,6 +839,10 @@ mod tests {
         assert!(mapped_port >= NAT_PORT_MIN);
         let dport = u16::from_be_bytes([p[22], p[23]]);
         assert_eq!(dport, 53);
+        assert!(
+            crate::nat::l4::v4_l4_checksum_ok(p, 20),
+            "translated UDP must carry a valid IPv4 checksum"
+        );
     }
 
     #[test]
@@ -912,5 +905,85 @@ mod tests {
         assert_eq!(&r[24..40], &client.octets());
         let dport = u16::from_be_bytes([r[IPV6_HEADER_LEN + 2], r[IPV6_HEADER_LEN + 3]]);
         assert_eq!(dport, 44000);
+        assert!(
+            v6_sum_ok(r),
+            "translated UDP must carry a valid IPv6 checksum"
+        );
+    }
+
+    /// True if the upper-layer checksum of an IPv6 packet without extension
+    /// headers verifies.
+    fn v6_sum_ok(p: &[u8]) -> bool {
+        crate::checksum::raw_transport_sum(
+            Protocol(p[6]),
+            IpAddr::V6(read_v6(&p[8..24])),
+            IpAddr::V6(read_v6(&p[24..40])),
+            &p[IPV6_HEADER_LEN..],
+        ) == 0xFFFF
+    }
+
+    #[test]
+    fn echo_round_trip_has_valid_checksums() {
+        let nat = Nat64::new(pfx("64:ff9b::/96"), pfx("198.51.100.1/24"));
+        let inbound = Arc::new(StdMutex::new(Vec::<Vec<u8>>::new()));
+        let outbound = Arc::new(StdMutex::new(Vec::<Vec<u8>>::new()));
+        let c = inbound.clone();
+        nat.inside().set_handler(Arc::new(move |p| {
+            c.lock().unwrap().push(p.as_bytes().to_vec());
+            Ok(())
+        }));
+        let c = outbound.clone();
+        nat.outside().set_handler(Arc::new(move |p| {
+            c.lock().unwrap().push(p.as_bytes().to_vec());
+            Ok(())
+        }));
+
+        let client: Ipv6Addr = "2001:db8::5".parse().unwrap();
+        let dst = ipv4_to_mapped(Ipv4Addr::new(1, 1, 1, 1));
+        let mut req = vec![0u8; IPV6_HEADER_LEN + 12];
+        req[0] = 0x60;
+        req[4..6].copy_from_slice(&12u16.to_be_bytes());
+        req[6] = PROTO_ICMPV6;
+        req[7] = 64;
+        req[8..24].copy_from_slice(&client.octets());
+        req[24..40].copy_from_slice(&dst.octets());
+        req[40] = 128;
+        req[44..46].copy_from_slice(&0x1234u16.to_be_bytes());
+        req[46..48].copy_from_slice(&1u16.to_be_bytes());
+        req[48..52].copy_from_slice(b"ping");
+        let cs = crate::transport_checksum(
+            Protocol::ICMPV6,
+            IpAddr::V6(client),
+            IpAddr::V6(dst),
+            &req[40..],
+        );
+        req[42..44].copy_from_slice(&cs.to_be_bytes());
+        nat.inside().send(Packet::from_slice(&req)).unwrap();
+
+        let out = outbound.lock().unwrap()[0].clone();
+        assert_eq!(checksum(&out[20..]), 0, "ICMPv4 echo must verify");
+        let id = u16::from_be_bytes([out[24], out[25]]);
+
+        // Echo reply back from 1.1.1.1.
+        let mut rep = vec![0u8; 20 + 12];
+        rep[0] = 0x45;
+        rep[2..4].copy_from_slice(&32u16.to_be_bytes());
+        rep[8] = 64;
+        rep[9] = PROTO_ICMP;
+        rep[12..16].copy_from_slice(&[1, 1, 1, 1]);
+        rep[16..20].copy_from_slice(&[198, 51, 100, 1]);
+        let ic = checksum(&rep[..20]);
+        rep[10..12].copy_from_slice(&ic.to_be_bytes());
+        rep[24..26].copy_from_slice(&id.to_be_bytes());
+        rep[26..28].copy_from_slice(&1u16.to_be_bytes());
+        rep[28..32].copy_from_slice(b"ping");
+        let cs = checksum(&rep[20..]);
+        rep[22..24].copy_from_slice(&cs.to_be_bytes());
+        nat.outside().send(Packet::from_slice(&rep)).unwrap();
+
+        let got = inbound.lock().unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0][40], 129);
+        assert!(v6_sum_ok(&got[0]), "ICMPv6 echo reply must verify");
     }
 }

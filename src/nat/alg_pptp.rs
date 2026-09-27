@@ -261,7 +261,7 @@ fn pptp_parse_header(payload: &[u8]) -> Option<(u16, u16)> {
 mod tests {
     use super::*;
     use crate::nat::nat::Nat;
-    use crate::{IpPrefix, Protocol, checksum, combine_checksums, pseudo_header_checksum};
+    use crate::{IpPrefix, checksum};
 
     fn pfx(s: &str) -> IpPrefix {
         s.parse().unwrap()
@@ -296,15 +296,7 @@ mod tests {
         p[32] = 0x50;
         p[33] = 0x18;
         p[40..].copy_from_slice(payload);
-        let ph = pseudo_header_checksum(
-            Protocol::TCP,
-            IpAddr::V4(src),
-            IpAddr::V4(dst),
-            (20 + payload.len()) as u16,
-        );
-        let seg = checksum(&p[20..]);
-        let cs = combine_checksums(ph, seg);
-        p[36..38].copy_from_slice(&cs.to_be_bytes());
+        crate::nat::l4::fill_v4_l4_checksum(&mut p, 20);
         p
     }
 
