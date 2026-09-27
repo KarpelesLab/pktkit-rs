@@ -4,12 +4,19 @@
 //! - Picks (or accepts) a MAC address.
 //! - Handles ARP for IPv4 (cache + solicitation + reply).
 //! - Handles NDP for IPv6 (cache + NS/NA).
+//! - Retries an unanswered solicitation, and once resolution fails reports
+//!   each packet that was waiting on it to the L3 device as an ICMP
+//!   destination unreachable. The timers behind this run on a background
+//!   thread; on `wasm32`, call [`L2Adapter::tick`] about once a second.
 //! - Optionally runs a DHCP client to obtain the L3 device's address.
 //! - When DHCP is bound, the IPv4 gateway is taken from the lease (and
 //!   cleared when the lease names no router, or is lost).
 
-use crate::arp::{self, Pending as ArpPending, Table as ArpTable};
+use crate::arp::{self, Pending as ArpPending, PendingEvent, Table as ArpTable};
+use crate::icmp::{self, IcmpError, RateLimiter};
+use crate::l4::{icmpv4, icmpv6};
 use crate::ndp::{self, Table as NdpTable};
+use crate::time::Instant;
 use crate::{
     EtherType, Frame, L2Device, L2Handler, L3Device, L3Handler, MacAddr, Packet, Protocol, Result,
     build_frame,
@@ -20,6 +27,11 @@ use crate::IpPrefix;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
+
+/// How often the background thread runs the neighbour timers. Well within
+/// the one second between solicitations.
+#[cfg(not(target_family = "wasm"))]
+const TIMER_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// Configure an [`L2Adapter`].
 #[derive(Default, Debug, Clone)]
@@ -76,6 +88,10 @@ pub struct L2Adapter {
     /// addresses (RFC 5227 §2.4).
     conflicts: AtomicU64,
 
+    /// Paces the ICMP errors for packets that could not be delivered (RFC
+    /// 4443 §2.4(f), RFC 1812 §4.3.2.8).
+    icmp_limit: RateLimiter,
+
     // Self-Arc, for use by closures that need to refer back to us.
     weak_self: Mutex<Weak<L2Adapter>>,
 }
@@ -101,6 +117,12 @@ impl L2Adapter {
 
     /// Same as [`new`](Self::new) but for L3 devices already shared.
     pub fn new_arc(dev: Arc<dyn L3Device>, cfg: L2AdapterConfig) -> Arc<L2Adapter> {
+        Self::build(dev, cfg, cfg!(not(target_family = "wasm")))
+    }
+
+    /// `timer` starts the thread that runs the neighbour timers; tests
+    /// leave it out to drive time themselves.
+    fn build(dev: Arc<dyn L3Device>, cfg: L2AdapterConfig, timer: bool) -> Arc<L2Adapter> {
         let mac = cfg.mac.unwrap_or_else(MacAddr::random_local_unicast);
         let a = Arc::new(L2Adapter {
             mac,
@@ -117,6 +139,9 @@ impl L2Adapter {
             #[cfg(feature = "dhcp")]
             probe: Mutex::new(None),
             conflicts: AtomicU64::new(0),
+            // A whole queue's worth at once, so one failed resolution is
+            // reported in full.
+            icmp_limit: RateLimiter::new(10, arp::PENDING_MAX_PKTS as u32),
             weak_self: Mutex::new(Weak::new()),
         });
         *a.weak_self.lock().unwrap() = Arc::downgrade(&a);
@@ -130,6 +155,11 @@ impl L2Adapter {
             Ok(())
         });
         dev.set_handler(h);
+        #[cfg(not(target_family = "wasm"))]
+        if timer {
+            spawn_timer(&a);
+        }
+        let _ = timer;
         a
     }
 
@@ -192,15 +222,73 @@ impl L2Adapter {
         }
     }
 
-    /// Drive the DHCP client's timers: retransmissions, lease renewal and
-    /// expiry. Only needed on targets without threads (`wasm32`), where
-    /// nothing runs in the background; see
-    /// [`dhcp::Client::tick`](crate::dhcp::Client::tick).
-    #[cfg(feature = "dhcp")]
+    /// Run whatever timer has come due: solicit again for an address still
+    /// unresolved, report the packets for one that failed, and drive the
+    /// DHCP client ([`dhcp::Client::tick`](crate::dhcp::Client::tick)).
+    /// Only needed on targets without threads (`wasm32`), where nothing
+    /// runs in the background: call it about once a second. Without it an
+    /// address is solicited only once, when traffic for it is queued.
     pub fn tick(&self) {
-        let client = self.dhcp.lock().unwrap().clone();
-        if let Some(c) = client {
-            c.tick();
+        self.run_timers(Instant::now());
+        #[cfg(feature = "dhcp")]
+        {
+            let client = self.dhcp.lock().unwrap().clone();
+            if let Some(c) = client {
+                c.tick();
+            }
+        }
+    }
+
+    /// The neighbour timers, as of `now`.
+    fn run_timers(&self, now: Instant) {
+        for ev in self.arp_pending.poll(now) {
+            match ev {
+                PendingEvent::Resolicit(ip) => self.send_arp_request(ip),
+                PendingEvent::Failed(_, pkts) => self.report_unreachable(pkts),
+            }
+        }
+        for ev in self.ndp_pending.poll(now) {
+            match ev {
+                PendingEvent::Resolicit(ip) => self.send_neighbor_solicitation(ip),
+                PendingEvent::Failed(_, pkts) => self.report_unreachable(pkts),
+            }
+        }
+    }
+
+    /// Tell the L3 device that each of `pkts` could not be delivered, its
+    /// next hop having failed to resolve: ICMP host unreachable (RFC 1122
+    /// §2.3.2.2) or ICMPv6 address unreachable (RFC 4861 §7.2.2). Without
+    /// it a sender learns of the failure only by timing out.
+    fn report_unreachable(&self, pkts: Vec<Vec<u8>>) {
+        for buf in pkts {
+            let pkt = Packet::from_slice(&buf);
+            let (from, err) = match (pkt.version(), self.l3.addr().addr()) {
+                (4, IpAddr::V4(a)) if !a.is_unspecified() => (
+                    IpAddr::V4(a),
+                    IcmpError::DestUnreachable(icmpv4::CODE_HOST_UNREACHABLE),
+                ),
+                // Without an address of ours to send from, there is nobody
+                // for the error to come from.
+                (4, _) => continue,
+                (6, addr) => {
+                    let from = match addr {
+                        IpAddr::V6(a) if !a.is_unspecified() => a,
+                        _ => ndp::link_local_from_mac(self.mac),
+                    };
+                    (
+                        IpAddr::V6(from),
+                        IcmpError::DestUnreachable(icmpv6::CODE_ADDR_UNREACHABLE),
+                    )
+                }
+                _ => continue,
+            };
+            // icmp::error refuses what must not be answered (errors,
+            // multicast, later fragments) before a token is spent on it.
+            if let Some(reply) = icmp::error(pkt, from, err)
+                && self.icmp_limit.allow()
+            {
+                let _ = self.l3.send(Packet::from_slice(&reply));
+            }
         }
     }
 
@@ -642,6 +730,21 @@ impl L2Device for L2Adapter {
     }
 }
 
+/// Run the adapter's timers until it is dropped.
+#[cfg(not(target_family = "wasm"))]
+fn spawn_timer(a: &Arc<L2Adapter>) {
+    let weak = Arc::downgrade(a);
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(TIMER_INTERVAL);
+            let Some(a) = weak.upgrade() else {
+                return;
+            };
+            a.run_timers(Instant::now());
+        }
+    });
+}
+
 // --- DHCP integration ------------------------------------------------------
 
 #[cfg(feature = "dhcp")]
@@ -749,6 +852,8 @@ impl crate::dhcp::ClientTransport for AdapterDhcpTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(feature = "dhcp"))]
+    use crate::IpPrefix;
     use crate::PipeL3;
 
     #[test]
@@ -818,7 +923,8 @@ mod tests {
 
     fn rig(addr: &str) -> (Arc<PipeL3>, Arc<L2Adapter>, Out) {
         let pipe = Arc::new(PipeL3::new(addr.parse().unwrap()));
-        let adapter = L2Adapter::new_arc(pipe.clone(), L2AdapterConfig::default());
+        // No timer thread: the tests say when time passes.
+        let adapter = L2Adapter::build(pipe.clone(), L2AdapterConfig::default(), false);
         let out: Out = Arc::default();
         let oc = out.clone();
         adapter.set_handler(Arc::new(move |f: &Frame| {
@@ -826,6 +932,128 @@ mod tests {
             Ok(())
         }));
         (pipe, adapter, out)
+    }
+
+    /// An L3 device that keeps what the adapter delivers to it apart from
+    /// what it sends, which a `PipeL3` runs through the same handler.
+    #[derive(Default)]
+    struct Host {
+        addr: Mutex<Option<IpPrefix>>,
+        handler: Mutex<Option<L3Handler>>,
+        got: Mutex<Vec<Vec<u8>>>,
+    }
+
+    impl core::fmt::Debug for Host {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.write_str("Host")
+        }
+    }
+
+    impl L3Device for Host {
+        fn set_handler(&self, h: L3Handler) {
+            *self.handler.lock().unwrap() = Some(h);
+        }
+        fn send(&self, p: &Packet) -> Result<()> {
+            self.got.lock().unwrap().push(p.as_bytes().to_vec());
+            Ok(())
+        }
+        fn addr(&self) -> IpPrefix {
+            self.addr.lock().unwrap().unwrap()
+        }
+        fn set_addr(&self, p: IpPrefix) -> Result<()> {
+            *self.addr.lock().unwrap() = Some(p);
+            Ok(())
+        }
+        fn close(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Host {
+        fn out(&self, p: &[u8]) {
+            let h = self.handler.lock().unwrap().clone().unwrap();
+            h(Packet::from_slice(p)).unwrap();
+        }
+        fn take(&self) -> Vec<Vec<u8>> {
+            std::mem::take(&mut *self.got.lock().unwrap())
+        }
+    }
+
+    fn host_rig(addr: &str) -> (Arc<Host>, Arc<L2Adapter>, Out) {
+        let host = Arc::new(Host::default());
+        *host.addr.lock().unwrap() = Some(addr.parse().unwrap());
+        let adapter = L2Adapter::build(host.clone(), L2AdapterConfig::default(), false);
+        let out: Out = Arc::default();
+        let oc = out.clone();
+        adapter.set_handler(Arc::new(move |f: &Frame| {
+            oc.lock().unwrap().push(f.as_bytes().to_vec());
+            Ok(())
+        }));
+        (host, adapter, out)
+    }
+
+    /// The target of each ARP request or NS among `frames`.
+    fn solicited(frames: &[Vec<u8>]) -> Vec<IpAddr> {
+        frames
+            .iter()
+            .filter_map(|f| {
+                let f = Frame::from_slice(f);
+                if f.ether_type() == EtherType::ARP {
+                    let (op, _, _, _, ti) = arp::parse(f.payload())?;
+                    return (op == arp::OP_REQUEST).then_some(IpAddr::V4(ti));
+                }
+                let p = Packet::from_slice(f.payload());
+                let icmp = p.ipv6_payload();
+                (p.version() == 6
+                    && p.ipv6_next_header() == Protocol::ICMPV6
+                    && icmp.first() == Some(&ndp::NS_TYPE))
+                .then(|| IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(&icmp[8..24]).unwrap())))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn unanswered_solicitations_are_retried_then_reported_unreachable() {
+        for (addr, src, dst) in [
+            ("10.0.0.5/24", "10.0.0.5", "10.0.0.6"),
+            ("2001:db8::5/64", "2001:db8::5", "2001:db8::66"),
+        ] {
+            let (host, adapter, out) = host_rig(addr);
+            let (src, dst): (IpAddr, IpAddr) = (src.parse().unwrap(), dst.parse().unwrap());
+            let udp = crate::build::build_udp(src, dst, 1000, 2000, b"hi");
+            let pkt = crate::build::build_ip(src, dst, Protocol::UDP, 64, &udp).unwrap();
+            let t0 = Instant::now();
+            host.out(&pkt);
+            host.out(&pkt);
+            assert_eq!(solicited(&take(&out)), [dst]);
+
+            // RETRANS_TIMER apart, MAX_MULTICAST_SOLICIT in all.
+            let at = |ms| t0 + std::time::Duration::from_millis(ms);
+            adapter.run_timers(at(500));
+            assert!(take(&out).is_empty());
+            adapter.run_timers(at(1050));
+            assert_eq!(solicited(&take(&out)), [dst], "not solicited again");
+            adapter.run_timers(at(2100));
+            assert_eq!(solicited(&take(&out)), [dst]);
+            assert!(host.take().is_empty());
+
+            // Then each waiting packet is reported to its sender.
+            adapter.run_timers(at(3200));
+            assert!(take(&out).is_empty(), "solicited a fourth time");
+            let errs = host.take();
+            assert_eq!(errs.len(), 2, "one error per queued packet");
+            let e = Packet::from_slice(&errs[0]);
+            assert_eq!(e.dst_addr(), Some(src));
+            let icmp = e.transport_payload();
+            if src.is_ipv4() {
+                assert_eq!(e.ip_protocol(), Protocol::ICMP);
+                assert_eq!((icmp[0], icmp[1]), (3, 1), "host unreachable");
+            } else {
+                assert_eq!(e.ip_protocol(), Protocol::ICMPV6);
+                assert_eq!((icmp[0], icmp[1]), (1, 3), "address unreachable");
+            }
+            assert_eq!(&icmp[8..8 + pkt.len()], &pkt[..], "original quoted");
+        }
     }
 
     fn take(out: &Out) -> Vec<Vec<u8>> {

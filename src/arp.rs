@@ -4,7 +4,8 @@
 //!   (a full cache evicts the entry closest to expiry),
 //!   entries age out after 5 minutes.
 //! - [`Pending`] buffers packets awaiting resolution, the newest 16 per target and
-//!   256 targets, and discards stale queues after 3 seconds.
+//!   256 targets, and times the solicitations: three, a second apart, before
+//!   resolution fails and the packets are handed back to be reported.
 //! - [`build_packet`] / [`parse`] encode and decode the 28-byte ARP body.
 
 use crate::MacAddr;
@@ -12,13 +13,21 @@ use crate::time::Instant;
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::net::Ipv4Addr;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::Duration;
 
 pub const OP_REQUEST: u16 = 1;
 pub const OP_REPLY: u16 = 2;
 
 pub const DEFAULT_TTL: Duration = Duration::from_secs(5 * 60);
+/// Wait between solicitations of an address being resolved (RFC 4861 §10
+/// RETRANS_TIMER; RFC 1122 §2.3.2.1 asks the same of ARP: no more than one
+/// request a second per destination).
+pub const RETRANS_TIMER: Duration = Duration::from_secs(1);
+/// Solicitations sent before resolution fails (RFC 4861 §10).
+pub const MAX_MULTICAST_SOLICIT: u32 = 3;
+/// How long resolution is tried before it fails: [`MAX_MULTICAST_SOLICIT`]
+/// solicitations, [`RETRANS_TIMER`] apart, and as long again after the last.
 pub const PENDING_TIMEOUT: Duration = Duration::from_secs(3);
 pub const PENDING_MAX_PKTS: usize = 16;
 /// Most destinations that may be awaiting resolution at once.
@@ -92,22 +101,45 @@ fn make_room(t: &mut HashMap<Ipv4Addr, Entry>) {
 }
 
 /// Buffers packets waiting for ARP/NDP resolution, keyed by the address
-/// being resolved (`Ipv4Addr` for ARP, `Ipv6Addr` for NDP). A queue older
-/// than [`PENDING_TIMEOUT`] is dropped, so the next packet for that target
-/// solicits again.
+/// being resolved (`Ipv4Addr` for ARP, `Ipv6Addr` for NDP), and times the
+/// solicitations for each (RFC 4861 §7.2.2, RFC 1122 §2.3.2.1).
 ///
-/// Stale queues are pruned whenever a packet is queued; where threads are
-/// available a background thread also sweeps every second, so memory held for
-/// targets that never answer is released even when traffic stops.
+/// Nothing here runs by itself: [`poll`](Self::poll) says when to solicit
+/// again and which resolutions have failed, and must be called regularly --
+/// the [`L2Adapter`](crate::L2Adapter) does it from its timer. A target
+/// solicited [`MAX_MULTICAST_SOLICIT`] times, [`RETRANS_TIMER`] apart, with
+/// no answer [`RETRANS_TIMER`] after the last has failed, and its packets
+/// are handed back so the sender can be told (ICMP destination
+/// unreachable).
 pub struct Pending<K = Ipv4Addr> {
-    inner: Arc<Mutex<HashMap<K, PendingEntry>>>,
-    stop: Arc<Mutex<bool>>,
+    inner: Mutex<HashMap<K, PendingEntry>>,
 }
 
-#[derive(Default)]
 struct PendingEntry {
     packets: Vec<Vec<u8>>,
-    created: Option<Instant>,
+    /// Solicitations sent so far.
+    sent: u32,
+    /// When the next is due, or the resolution fails.
+    next: Instant,
+}
+
+impl PendingEntry {
+    /// Whether the resolution has run its course and is only waiting for
+    /// [`Pending::poll`] to report the failure.
+    fn failed(&self, now: Instant) -> bool {
+        self.sent >= MAX_MULTICAST_SOLICIT && self.next <= now
+    }
+}
+
+/// What [`Pending::poll`] found due.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PendingEvent<K> {
+    /// Still unanswered: send another solicitation for this target.
+    Resolicit(K),
+    /// Resolution failed. Nothing more is queued for the target, and these
+    /// are the packets that were, oldest first, for the caller to report
+    /// as undeliverable (RFC 4861 §7.2.2).
+    Failed(K, Vec<Vec<u8>>),
 }
 
 impl<K> core::fmt::Debug for Pending<K> {
@@ -117,43 +149,18 @@ impl<K> core::fmt::Debug for Pending<K> {
     }
 }
 
-impl<K: Eq + Hash + Copy + Send + 'static> Default for Pending<K> {
+impl<K: Eq + Hash + Copy> Default for Pending<K> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-fn prune<K>(map: &mut HashMap<K, PendingEntry>, now: Instant) {
-    map.retain(|_, e| {
-        e.created
-            .map(|c| now.duration_since(c) <= PENDING_TIMEOUT)
-            .unwrap_or(true)
-    });
-}
-
-impl<K: Eq + Hash + Copy + Send + 'static> Pending<K> {
-    /// Build a new pending-queue, spawning a background cleanup thread where
-    /// the target has threads.
+impl<K: Eq + Hash + Copy> Pending<K> {
+    /// An empty set of queues.
     pub fn new() -> Pending<K> {
-        let inner = Arc::new(Mutex::new(HashMap::<K, PendingEntry>::new()));
-        let stop = Arc::new(Mutex::new(false));
-
-        #[cfg(not(target_family = "wasm"))]
-        {
-            let inner_bg = inner.clone();
-            let stop_bg = stop.clone();
-            std::thread::spawn(move || {
-                loop {
-                    std::thread::sleep(Duration::from_secs(1));
-                    if *stop_bg.lock().unwrap() {
-                        return;
-                    }
-                    prune(&mut inner_bg.lock().unwrap(), Instant::now());
-                }
-            });
+        Pending {
+            inner: Mutex::new(HashMap::new()),
         }
-
-        Pending { inner, stop }
     }
 
     /// Buffer `pkt` for `ip`. Returns `true` when this is the first packet
@@ -166,17 +173,37 @@ impl<K: Eq + Hash + Copy + Send + 'static> Pending<K> {
     /// hold a queue, and broadcast a request, for every address in it
     /// (RFC 6583 §4).
     pub fn enqueue(&self, ip: K, pkt: &[u8]) -> bool {
-        let now = Instant::now();
+        self.enqueue_at(ip, pkt, Instant::now())
+    }
+
+    pub(crate) fn enqueue_at(&self, ip: K, pkt: &[u8], now: Instant) -> bool {
         let mut map = self.inner.lock().unwrap();
-        prune(&mut map, now);
-        if !map.contains_key(&ip) && map.len() >= PENDING_MAX_TARGETS {
-            return false;
+        // A resolution that failed but was never polled: with nobody
+        // driving the timers, start over rather than hold the target, and
+        // its full queue, forever. Its old packets go unreported.
+        if map.get(&ip).is_some_and(|e| e.failed(now)) {
+            map.remove(&ip);
         }
-        let entry = map.entry(ip).or_default();
-        let first = entry.created.is_none();
-        if first {
-            entry.created = Some(now);
+        if !map.contains_key(&ip) {
+            if map.len() >= PENDING_MAX_TARGETS {
+                map.retain(|_, e| !e.failed(now));
+                if map.len() >= PENDING_MAX_TARGETS {
+                    return false;
+                }
+            }
+            map.insert(
+                ip,
+                PendingEntry {
+                    packets: Vec::new(),
+                    sent: 1,
+                    next: now + RETRANS_TIMER,
+                },
+            );
+            let entry = map.get_mut(&ip).unwrap();
+            entry.packets.push(pkt.to_vec());
+            return true;
         }
+        let entry = map.get_mut(&ip).unwrap();
         // RFC 4861 §7.2.2: a full queue makes room by dropping its oldest
         // packet. The newest is the one a sender still cares about -- a
         // retransmission supersedes what it retransmits.
@@ -184,16 +211,38 @@ impl<K: Eq + Hash + Copy + Send + 'static> Pending<K> {
             entry.packets.remove(0);
         }
         entry.packets.push(pkt.to_vec());
-        first
+        false
+    }
+
+    /// Run the retransmission timers: what is due by `now` -- a target to
+    /// solicit again, or one whose resolution has failed.
+    pub fn poll(&self, now: Instant) -> Vec<PendingEvent<K>> {
+        let mut map = self.inner.lock().unwrap();
+        let mut due = Vec::new();
+        map.retain(|ip, e| {
+            if e.next > now {
+                return true;
+            }
+            if e.sent < MAX_MULTICAST_SOLICIT {
+                e.sent += 1;
+                e.next = now + RETRANS_TIMER;
+                due.push(PendingEvent::Resolicit(*ip));
+                return true;
+            }
+            due.push(PendingEvent::Failed(*ip, std::mem::take(&mut e.packets)));
+            false
+        });
+        due
     }
 
     /// True while packets are waiting for `ip`: a resolution is under way.
     pub fn contains(&self, ip: K) -> bool {
+        self.contains_at(ip, Instant::now())
+    }
+
+    pub(crate) fn contains_at(&self, ip: K, now: Instant) -> bool {
         let map = self.inner.lock().unwrap();
-        map.get(&ip).is_some_and(|e| {
-            e.created
-                .is_some_and(|c| Instant::now().duration_since(c) <= PENDING_TIMEOUT)
-        })
+        map.get(&ip).is_some_and(|e| !e.failed(now))
     }
 
     /// Drop every queue, and the packets in them.
@@ -209,12 +258,6 @@ impl<K: Eq + Hash + Copy + Send + 'static> Pending<K> {
             .remove(&ip)
             .map(|e| e.packets)
             .unwrap_or_default()
-    }
-}
-
-impl<K> Drop for Pending<K> {
-    fn drop(&mut self) {
-        *self.stop.lock().unwrap() = true;
     }
 }
 
@@ -268,21 +311,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stale_pending_queue_solicits_again() {
+    fn unanswered_resolution_is_retried_then_fails_with_its_packets() {
         let p = Pending::new();
         let ip = Ipv4Addr::new(10, 0, 0, 9);
-        assert!(p.enqueue(ip, b"one"));
-        assert!(!p.enqueue(ip, b"two"), "still waiting on the first request");
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        assert!(p.enqueue_at(ip, b"one", t0));
+        assert!(!p.enqueue_at(ip, b"two", at(10)), "still waiting");
 
-        // Age the queue past the timeout without sleeping. Without threads
-        // nothing sweeps it, so enqueue itself must notice.
-        let old = Instant::now() - PENDING_TIMEOUT - Duration::from_millis(1);
-        p.inner.lock().unwrap().get_mut(&ip).unwrap().created = Some(old);
-        assert!(
-            p.enqueue(ip, b"three"),
-            "a stale queue must be re-solicited"
+        assert!(p.poll(at(900)).is_empty());
+        assert_eq!(p.poll(at(1000)), [PendingEvent::Resolicit(ip)]);
+        assert!(p.poll(at(1500)).is_empty());
+        assert_eq!(p.poll(at(2000)), [PendingEvent::Resolicit(ip)]);
+        assert!(p.contains_at(ip, at(2999)));
+        // RETRANS_TIMER after the third solicitation, it has failed.
+        assert_eq!(
+            p.poll(at(3000)),
+            [PendingEvent::Failed(
+                ip,
+                vec![b"one".to_vec(), b"two".to_vec()]
+            )]
         );
-        assert_eq!(p.drain(ip), vec![b"three".to_vec()]);
+        assert!(!p.contains_at(ip, at(3000)));
+        assert!(p.enqueue_at(ip, b"three", at(3100)), "solicits afresh");
+    }
+
+    #[test]
+    fn an_unpolled_failed_queue_solicits_again() {
+        let p = Pending::new();
+        let ip = Ipv4Addr::new(10, 0, 0, 9);
+        let t0 = Instant::now();
+        assert!(p.enqueue_at(ip, b"one", t0));
+        // Nobody drives the timers, as on wasm without tick(). Without a
+        // fresh start the target would never be solicited again.
+        let late = t0 + PENDING_TIMEOUT + Duration::from_millis(1);
+        p.inner.lock().unwrap().get_mut(&ip).unwrap().sent = MAX_MULTICAST_SOLICIT;
+        assert!(
+            p.enqueue_at(ip, b"two", late),
+            "a stale queue is re-solicited"
+        );
+        assert_eq!(p.drain(ip), vec![b"two".to_vec()]);
     }
 
     #[test]
