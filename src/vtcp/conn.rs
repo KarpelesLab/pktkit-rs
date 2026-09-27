@@ -1396,7 +1396,7 @@ impl Conn {
                 self.send_buf.as_mut().unwrap().mark_sacked(&blocks);
             }
         }
-        if fast_partial && self.sack_ok {
+        if (fast_partial || rto_partial) && self.sack_ok {
             // With SACK, the hole at SND.UNA may already have gone out this
             // episode through retransmit_lost_hole; resending it would be
             // spurious and spoil RTT timing. RFC 6675 §5 NextSeg: only what
@@ -1452,6 +1452,12 @@ impl Conn {
             // would cut ssthresh twice for one loss event and inflate cwnd
             // far past the single segment slow start restarted from (RFC
             // 6582 §3.2 step 1, §4.1).
+            //
+            // Their SACK blocks still show what else was lost, and each one
+            // means a segment left the network: resend the next such hole
+            // now rather than a partial ACK later (RFC 6675 §5.1 NextSeg),
+            // leaving congestion control to the timeout's slow start.
+            let _ = self.retransmit_lost_hole();
             return;
         }
         let sb = self.send_buf.as_ref().unwrap();
@@ -1811,6 +1817,10 @@ impl Conn {
             if sb.unacked() > 0 {
                 self.rto_recover = Some(sb.nxt());
             }
+            // A new repair episode: everything from SND.UNA is due again,
+            // and a HighRxt left from an earlier one would hide the holes
+            // below it from the scan.
+            self.high_rxt = sb.una();
         }
 
         match self.state {
@@ -3134,6 +3144,53 @@ mod tests {
             "resent again, sent {:?}",
             seqs(&out)
         );
+    }
+
+    /// Segments 0 and 5 lost, and the duplicate ACKs held up until the RTO
+    /// has resent segment 0. Their SACK blocks show segment 5 lost as well:
+    /// it goes out on them (RFC 6675 NextSeg), without waiting for the
+    /// partial ACK, and without touching cwnd. A HighRxt left over from an
+    /// earlier recovery must not hide the hole.
+    #[test]
+    fn duplicate_acks_during_rto_recovery_resend_sacked_holes() {
+        let mut client = Conn::new(big(40228, 80));
+        let mut server = Conn::new(big(80, 40228));
+        drive_handshake(&mut client, &mut server);
+        warm_up(&mut client, &mut server);
+        let (_, segs) = client.write(&[3; 10_000]);
+        assert_eq!(segs.len(), 10);
+        let arrived: Vec<Vec<u8>> = segs
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != 0 && *i != 5)
+            .map(|(_, s)| s.clone())
+            .collect();
+        let late_dups = deliver(&mut server, &arrived);
+
+        client.high_rxt = client.send_buf.as_ref().unwrap().nxt();
+        let rexmit = fire_rto(&mut client);
+        assert_eq!(seqs(&rexmit), vec![parse(&segs[0]).seq]);
+        let cwnd = client.cc.send_window();
+        let out = deliver(&mut client, &late_dups);
+        assert_eq!(
+            seqs(&out),
+            vec![parse(&segs[5]).seq],
+            "the SACKed-around hole, once"
+        );
+        assert!(!client.cc.in_recovery());
+        assert_eq!(client.cc.send_window(), cwnd);
+
+        // The partial ACK the first retransmission draws stops at segment
+        // 5, which is below HighRxt now: resending it would be spurious.
+        let partial = deliver(&mut server, &rexmit);
+        assert_eq!(parse(partial.last().unwrap()).ack, parse(&segs[5]).seq);
+        let again = deliver(&mut client, &partial);
+        assert!(
+            !seqs(&again).contains(&parse(&segs[5]).seq),
+            "hole resent twice"
+        );
+        deliver(&mut server, &out);
+        assert_eq!(read_all(&mut server).len(), 10_000);
     }
 
     /// The MSS counts payload only; options come out of it (RFC 6691 §2,
