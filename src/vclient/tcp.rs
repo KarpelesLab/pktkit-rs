@@ -263,9 +263,15 @@ impl TcpConn {
     }
 
     /// Read into `buf`, blocking until data is available or the peer closes.
-    /// Returns 0 at end of stream. In non-blocking mode, returns
-    /// [`WouldBlock`](io::ErrorKind::WouldBlock) when nothing is buffered.
+    /// Returns 0 at end of stream, and at once for an empty `buf`. In
+    /// non-blocking mode, returns [`WouldBlock`](io::ErrorKind::WouldBlock)
+    /// when nothing is buffered.
     pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+        // Nothing could fill it, so waiting for data would wait for ever,
+        // and `Read` has an empty buffer read return 0.
+        if buf.is_empty() {
+            return Ok(0);
+        }
         let deadline = self
             .read_timeout
             .lock()
@@ -1106,6 +1112,19 @@ mod tests {
         assert!(stack.conns.lock().unwrap().is_empty());
         stack.handle_inbound(Packet::from_slice(&inbound(syn)), IpAddr::V4(US));
         assert_eq!(stack.conns.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn empty_read_returns_at_once() {
+        let (stack, _out) = capturing_stack();
+        let state = stack
+            .start_dial(IpAddr::V4(US), SocketAddr::from((PEER, 80)))
+            .unwrap();
+        let conn = TcpConn::new(state);
+        conn.set_read_timeout(Some(Duration::from_secs(2)));
+        let start = std::time::Instant::now();
+        assert_eq!(conn.read(&mut []).unwrap(), 0);
+        assert!(start.elapsed() < Duration::from_secs(1));
     }
 
     #[test]
