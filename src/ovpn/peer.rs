@@ -435,8 +435,10 @@ impl Peer {
             let Some(s) = self.session_mut(slot) else {
                 continue;
             };
-            let tick = s.primary.reliable.tick(now);
-            out.send.extend(tick.resend);
+            out.send.extend(s.primary.reliable.tick(now).resend);
+            if let Some(lame) = s.lame.as_mut() {
+                out.send.extend(lame.reliable.tick(now).resend);
+            }
             if let Some((at, why)) = &s.auth_failed {
                 if now >= *at {
                     let e = io::Error::new(io::ErrorKind::PermissionDenied, why.clone());
@@ -624,6 +626,16 @@ impl Peer {
             && key_id == session.next_key_id
         {
             reset = Some(session.soft_reset(&config, &timers, Instant::now())?);
+        }
+        // The previous key keeps its own control channel until it expires,
+        // as every OpenVPN key state does: ACKs for what it still has in
+        // flight, and the client's retransmissions on it, go there.
+        if opened.is_none()
+            && key_id != session.primary.key_id
+            && session.lame.as_ref().is_some_and(|k| k.key_id == key_id)
+        {
+            session.handle_lame(key_id, pkt, &mut out)?;
+            return Ok((out, slot == Slot::Active));
         }
         let tls_bytes = match opened {
             Some(bytes) => bytes,
@@ -1013,6 +1025,39 @@ impl KeyState {
         }
         Ok(self.reliable.recv_packet(pkt)?.tls_bytes)
     }
+
+    /// Emit any pending TLS output as P_CONTROL_V1 packets, plus standalone
+    /// ACKs for what we owe but no control packet carried.
+    fn pump(&mut self, out: &mut PeerOutput) -> io::Result<()> {
+        // `pop` returns the whole pending wire stream in one call.
+        let tls_out = self
+            .tls
+            .pop()
+            .map_err(|e| invalid(format!("tls pop: {e:?}")))?;
+
+        self.reliable.queue_tls(&tls_out);
+        // OpenVPN gives up on a key whose output it has no buffer for; a
+        // client that never ACKs would otherwise have us hold its output
+        // without bound.
+        if self.reliable.held_len() > MAX_HELD_TLS {
+            return Err(invalid("control channel send backlog exceeded"));
+        }
+        // Whatever the send window has room for: ACKs arriving later open
+        // it, and this runs again for every packet received.
+        for pkt in self.reliable.flush_tls() {
+            // The ACKs we owe ride along, as many as fit each packet.
+            let acks = self.reliable.take_pending_acks();
+            out.send.push(pkt.to_bytes(&acks));
+        }
+
+        // ACKs no control packet carried go in plain ACKs.
+        while self.reliable.has_pending_acks() {
+            let acks = self.reliable.take_pending_acks();
+            let ack = self.reliable.build_ack();
+            out.send.push(ack.to_bytes(&acks));
+        }
+        Ok(())
+    }
 }
 
 impl Session {
@@ -1182,36 +1227,38 @@ impl Session {
         Ok(())
     }
 
-    /// Emit any pending TLS output as P_CONTROL_V1 packets, plus a standalone
-    /// ACK if we owe acknowledgements but produced no control packet to ride on.
+    /// Emit the primary key's pending TLS output and ACKs.
     fn pump_tls(&mut self, out: &mut PeerOutput) -> io::Result<()> {
-        let ks = &mut self.primary;
-        // `pop` returns the whole pending wire stream in one call.
-        let tls_out = ks
-            .tls
-            .pop()
-            .map_err(|e| invalid(format!("tls pop: {e:?}")))?;
+        self.primary.pump(out)
+    }
 
-        ks.reliable.queue_tls(&tls_out);
-        // OpenVPN gives up on a key whose output it has no buffer for; a
-        // client that never ACKs would otherwise have us hold its output
-        // without bound.
-        if ks.reliable.held_len() > MAX_HELD_TLS {
-            return Err(invalid("control channel send backlog exceeded"));
-        }
-        // Whatever the send window has room for: ACKs arriving later open
-        // it, and this runs again for every packet received.
-        for pkt in ks.reliable.flush_tls() {
-            // The ACKs we owe ride along, as many as fit each packet.
-            let acks = ks.reliable.take_pending_acks();
-            out.send.push(pkt.to_bytes(&acks));
-        }
-
-        // ACKs no control packet carried go in plain ACKs.
-        while ks.reliable.has_pending_acks() {
-            let acks = ks.reliable.take_pending_acks();
-            let ack = ks.reliable.build_ack();
-            out.send.push(ack.to_bytes(&acks));
+    /// A control packet for the previous key, still alive for its
+    /// transition window. Its reliable layer takes the ACKs and answers
+    /// with its own; TLS it carries is fed to the key's engine to keep the
+    /// stream in step, but what it decrypts to is not acted on -- OpenVPN
+    /// only reads control messages from the primary key (tls_rec_payload).
+    /// A failure takes down this key alone, which is on its way out.
+    fn handle_lame(
+        &mut self,
+        key_id: u8,
+        pkt: ControlPacket,
+        out: &mut PeerOutput,
+    ) -> io::Result<()> {
+        let ks = self.lame.as_mut().expect("caller checked the key id");
+        let tls_bytes = ks.recv(key_id, pkt)?;
+        let res = (|| {
+            if !tls_bytes.is_empty() {
+                ks.tls
+                    .feed(&tls_bytes)
+                    .map_err(|e| invalid(format!("tls feed: {e:?}")))?;
+                ks.tls
+                    .recv()
+                    .map_err(|e| invalid(format!("tls recv: {e:?}")))?;
+            }
+            ks.pump(out)
+        })();
+        if res.is_err() {
+            self.lame = None;
         }
         Ok(())
     }

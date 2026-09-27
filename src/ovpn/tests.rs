@@ -1355,6 +1355,52 @@ fn client_may_renegotiate_after_a_failed_attempt() {
     );
 }
 
+/// After a renegotiation the previous key's control channel keeps working
+/// for as long as the key does (ssl.c runs every key state's reliable
+/// layer): what it still has in flight is retransmitted, and ACKs for it
+/// on the old key id are taken, not dropped as for an unknown key.
+#[test]
+fn lame_duck_key_keeps_its_control_channel() {
+    let mut server = Peer::new(server_config(), *b"SERVERID", auth_hook())
+        .unwrap()
+        .with_timers(quiet_timers());
+    let mut client = TestClient::new(*b"CLIENTID");
+    connect(&mut server, &mut client);
+    // A reply on key 0 that the client never ACKs.
+    let mut lost = Vec::new();
+    for d in client.send_control(b"PUSH_REQUEST\0") {
+        for s in server.handle_packet(&d).unwrap().send {
+            let p = ControlPacket::parse(&s).unwrap();
+            if p.opcode == Opcode::CONTROL_V1 {
+                lost.push(p.pid.unwrap());
+            }
+        }
+    }
+    assert!(!lost.is_empty());
+    let first = vec![client.renegotiate(1)];
+    connect_from(&mut server, &mut client, first);
+
+    let start = Instant::now();
+    let key0 = |out: &super::peer::PeerOutput| {
+        out.send
+            .iter()
+            .filter(|d| ControlPacket::parse(d).is_ok_and(|p| p.key_id == 0))
+            .count()
+    };
+    let out = server.tick(start + Duration::from_secs(2)).unwrap();
+    assert!(key0(&out) > 0, "old key's reply not retransmitted");
+
+    // Everything key 0 sent: the test client's handshake loop stops as
+    // soon as the TLS handshake completes, before ACKing the last flight.
+    let all: Vec<u32> = (1..=*lost.iter().max().unwrap()).collect();
+    let ack = ControlPacket::new(Opcode::ACK_V1, 0, *b"CLIENTID", *b"SERVERID");
+    server
+        .handle_packet(&ack.to_bytes(&all))
+        .expect("ACK on the old key id is taken");
+    let out = server.tick(start + Duration::from_secs(60)).unwrap();
+    assert_eq!(key0(&out), 0, "acknowledged, so no longer retransmitted");
+}
+
 /// Have the client ask for its config and lose the server's reply, leaving
 /// a control packet on `server` that is never acknowledged.
 fn lose_a_control_reply(server: &mut Peer, client: &mut TestClient) {
