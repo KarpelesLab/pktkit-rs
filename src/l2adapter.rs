@@ -199,19 +199,21 @@ impl L2Adapter {
         self.set_gw_v6(Some(gw));
     }
 
-    /// Every off-link packet goes through the gateway, so its neighbour
-    /// entry is pinned: a cache filled by made-up neighbours must not push
-    /// it out.
+    /// Every off-link packet goes through the gateway, so it is pinned: a
+    /// cache filled by made-up neighbours must not push its entry out, nor
+    /// a subnet sweep keep it from being resolved.
     fn set_gw_v4(&self, gw: Option<Ipv4Addr>) {
         let mut g = self.gateway_v4.lock().unwrap();
         *g = gw;
         self.arp.pin(gw);
+        self.arp_pending.pin(gw);
     }
 
     fn set_gw_v6(&self, gw: Option<Ipv6Addr>) {
         let mut g = self.gateway_v6.lock().unwrap();
         *g = gw;
         self.ndp.pin(gw);
+        self.ndp_pending.pin(gw);
     }
 
     // --- DHCP --------------------------------------------------------------
@@ -1443,6 +1445,40 @@ mod tests {
             .unwrap();
         let sent = take(&out);
         assert_eq!(sent.len(), 1);
+        assert_eq!(Frame::from_slice(&sent[0]).dst_mac(), Some(gw_mac));
+    }
+
+    #[test]
+    fn a_subnet_sweep_does_not_keep_the_router_from_being_resolved() {
+        let (pipe, adapter, out) = rig("10.0.0.5/16");
+        let gw = Ipv4Addr::new(10, 0, 0, 1);
+        adapter.set_gateway_v4(gw);
+        // Traffic for every address on the subnet, none of which answers.
+        let mut big = v4_packet([10, 0, 0, 5], [0; 4]);
+        big.resize(1400, 0);
+        big[2..4].copy_from_slice(&1400u16.to_be_bytes());
+        for i in 0..2 * arp::PENDING_MAX_TARGETS as u32 {
+            big[16..20].copy_from_slice(&(0x0a00_1000 + i).to_be_bytes());
+            for _ in 0..arp::PENDING_MAX_PKTS {
+                pipe.inject(Packet::from_slice(&big)).unwrap();
+            }
+        }
+        take(&out);
+
+        pipe.inject(Packet::from_slice(&v4_packet([10, 0, 0, 5], [8, 8, 8, 8])))
+            .unwrap();
+        assert_eq!(
+            solicited(&take(&out)),
+            [IpAddr::V4(gw)],
+            "the router was not resolved"
+        );
+        let gw_mac = MacAddr([2, 0, 0, 0, 0, 1]);
+        let payload =
+            arp::build_packet(arp::OP_REPLY, gw_mac, gw, adapter.mac, [10, 0, 0, 5].into());
+        let f = build_frame(adapter.mac, gw_mac, EtherType::ARP, &payload);
+        adapter.send(Frame::from_slice(&f)).unwrap();
+        let sent = take(&out);
+        assert_eq!(sent.len(), 1, "queued packet not delivered");
         assert_eq!(Frame::from_slice(&sent[0]).dst_mac(), Some(gw_mac));
     }
 

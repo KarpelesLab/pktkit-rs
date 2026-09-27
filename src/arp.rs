@@ -7,8 +7,9 @@
 //!   by an eighth, entries learnt unasked and closest to expiry first, and
 //!   never the [pinned](Table::pin) router; entries unused for 5 minutes age
 //!   out.
-//! - [`Pending`] buffers packets awaiting resolution, the newest 16 per target and
-//!   256 targets, and times the solicitations: three, a second apart, before
+//! - [`Pending`] buffers packets awaiting resolution, the newest 16 per target,
+//!   256 targets and 1 MiB in all (the [pinned](Pending::pin) router always
+//!   admitted), and times the solicitations: three, a second apart, before
 //!   resolution fails and the packets are handed back to be reported.
 //! - [`build_packet`] / [`parse`] encode and decode the 28-byte ARP body.
 
@@ -36,6 +37,10 @@ pub const PENDING_TIMEOUT: Duration = Duration::from_secs(3);
 pub const PENDING_MAX_PKTS: usize = 16;
 /// Most destinations that may be awaiting resolution at once.
 pub const PENDING_MAX_TARGETS: usize = 256;
+/// Most bytes that may be waiting for resolution, all destinations
+/// together. The other two caps alone allow 256 x 16 packets, up to 64 KiB
+/// each: a quarter of a gigabyte held for a subnet sweep.
+pub const PENDING_MAX_BYTES: usize = 1 << 20;
 pub const MAX_ENTRIES: usize = 4096;
 /// What a full cache is cut back to. Evicting a batch, rather than one entry
 /// per insert, pays for the scan that picks the victims once per
@@ -380,7 +385,15 @@ impl<K: Eq + Hash + Copy> Cache<K> {
 /// are handed back so the sender can be told (ICMP destination
 /// unreachable).
 pub struct Pending<K = Ipv4Addr> {
-    inner: Mutex<HashMap<K, PendingEntry>>,
+    inner: Mutex<Queues<K>>,
+}
+
+struct Queues<K> {
+    map: HashMap<K, PendingEntry>,
+    /// What every queue holds together, in bytes.
+    bytes: usize,
+    /// Always admitted, whatever the caps.
+    pinned: Option<K>,
 }
 
 struct PendingEntry {
@@ -397,6 +410,36 @@ impl PendingEntry {
     fn failed(&self, now: Instant) -> bool {
         self.sent >= MAX_MULTICAST_SOLICIT && self.next <= now
     }
+
+    fn size(&self) -> usize {
+        self.packets.iter().map(Vec::len).sum()
+    }
+}
+
+impl<K: Eq + Hash + Copy> Queues<K> {
+    fn remove(&mut self, ip: &K) -> Option<PendingEntry> {
+        let e = self.map.remove(ip)?;
+        self.bytes -= e.size();
+        Some(e)
+    }
+
+    /// Drop the oldest packet of some queue other than `keep`'s, and the
+    /// queue with it if that was its last. False if there is none.
+    fn shed_other(&mut self, keep: K) -> bool {
+        let Some((k, e)) = self
+            .map
+            .iter_mut()
+            .find(|(k, e)| **k != keep && !e.packets.is_empty())
+        else {
+            return false;
+        };
+        self.bytes -= e.packets.remove(0).len();
+        if e.packets.is_empty() {
+            let k = *k;
+            self.map.remove(&k);
+        }
+        true
+    }
 }
 
 /// What [`Pending::poll`] found due.
@@ -412,7 +455,7 @@ pub enum PendingEvent<K> {
 
 impl<K> core::fmt::Debug for Pending<K> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let n = self.inner.lock().map(|m| m.len()).unwrap_or(0);
+        let n = self.inner.lock().map(|q| q.map.len()).unwrap_or(0);
         f.debug_struct("arp::Pending").field("queues", &n).finish()
     }
 }
@@ -427,8 +470,21 @@ impl<K: Eq + Hash + Copy> Pending<K> {
     /// An empty set of queues.
     pub fn new() -> Pending<K> {
         Pending {
-            inner: Mutex::new(HashMap::new()),
+            inner: Mutex::new(Queues {
+                map: HashMap::new(),
+                bytes: 0,
+                pinned: None,
+            }),
         }
+    }
+
+    /// Always admit `ip` -- the default router -- however full the queues
+    /// are, making room by dropping what waits for other destinations.
+    /// Someone sweeping the subnet fills the caps with targets that never
+    /// answer, and would otherwise keep every off-link packet from being
+    /// sent until they give up. `None` unpins.
+    pub fn pin(&self, ip: Option<K>) {
+        self.inner.lock().unwrap().pinned = ip;
     }
 
     /// Buffer `pkt` for `ip`. Returns `true` when the caller should send a
@@ -440,27 +496,54 @@ impl<K: Eq + Hash + Copy> Pending<K> {
     /// yet another one is dropped and `false` returned, so nothing is
     /// solicited: someone sweeping a large subnet would otherwise have us
     /// hold a queue, and broadcast a request, for every address in it
-    /// (RFC 6583 §4).
+    /// (RFC 6583 §4). Likewise once the queues hold [`PENDING_MAX_BYTES`]
+    /// together: a queue then makes room by dropping its own oldest packets,
+    /// and a new destination is refused. The [pinned](Self::pin) router is
+    /// the exception to both, and takes its room from the others.
     pub fn enqueue(&self, ip: K, pkt: &[u8]) -> bool {
         self.enqueue_at(ip, pkt, Instant::now())
     }
 
     pub(crate) fn enqueue_at(&self, ip: K, pkt: &[u8], now: Instant) -> bool {
-        let mut map = self.inner.lock().unwrap();
+        let q = &mut *self.inner.lock().unwrap();
+        if pkt.len() > PENDING_MAX_BYTES {
+            return false;
+        }
+        let pinned = q.pinned == Some(ip);
         // A resolution that failed but was never polled: with nobody
         // driving the timers, start over rather than hold the target, and
         // its full queue, forever. Its old packets go unreported.
-        if map.get(&ip).is_some_and(|e| e.failed(now)) {
-            map.remove(&ip);
+        if q.map.get(&ip).is_some_and(|e| e.failed(now)) {
+            q.remove(&ip);
         }
-        if !map.contains_key(&ip) {
-            if map.len() >= PENDING_MAX_TARGETS {
-                map.retain(|_, e| !e.failed(now));
-                if map.len() >= PENDING_MAX_TARGETS {
+        let fresh = !q.map.contains_key(&ip);
+        if fresh {
+            if q.map.len() >= PENDING_MAX_TARGETS {
+                let mut freed = 0;
+                q.map.retain(|_, e| {
+                    let keep = !e.failed(now);
+                    if !keep {
+                        freed += e.size();
+                    }
+                    keep
+                });
+                q.bytes -= freed;
+            }
+            if q.map.len() >= PENDING_MAX_TARGETS {
+                if !pinned {
                     return false;
                 }
+                // Give up on the destination nearest to failing anyway.
+                let victim = q
+                    .map
+                    .iter()
+                    .min_by_key(|(_, e)| (core::cmp::Reverse(e.sent), e.next))
+                    .map(|(k, _)| *k);
+                if let Some(v) = victim {
+                    q.remove(&v);
+                }
             }
-            map.insert(
+            q.map.insert(
                 ip,
                 PendingEntry {
                     packets: Vec::new(),
@@ -468,23 +551,38 @@ impl<K: Eq + Hash + Copy> Pending<K> {
                     next: now + RETRANS_TIMER,
                 },
             );
-            let entry = map.get_mut(&ip).unwrap();
-            entry.packets.push(pkt.to_vec());
-            return true;
         }
-        let entry = map.get_mut(&ip).unwrap();
         // RFC 4861 §7.2.2: a full queue makes room by dropping its oldest
         // packet. The newest is the one a sender still cares about -- a
         // retransmission supersedes what it retransmits.
-        if entry.packets.len() >= PENDING_MAX_PKTS {
-            entry.packets.remove(0);
+        let e = q.map.get_mut(&ip).unwrap();
+        if e.packets.len() >= PENDING_MAX_PKTS {
+            q.bytes -= e.packets.remove(0).len();
         }
-        entry.packets.push(pkt.to_vec());
+        while q.bytes + pkt.len() > PENDING_MAX_BYTES {
+            if pinned && q.shed_other(ip) {
+                continue;
+            }
+            let e = q.map.get_mut(&ip).unwrap();
+            if e.packets.is_empty() {
+                if fresh {
+                    q.map.remove(&ip);
+                }
+                return false;
+            }
+            q.bytes -= e.packets.remove(0).len();
+        }
+        let e = q.map.get_mut(&ip).unwrap();
+        e.packets.push(pkt.to_vec());
+        q.bytes += pkt.len();
+        if fresh {
+            return true;
+        }
         // A retransmission due that no timer has sent yet: traffic still
         // flowing gets it out, even with nothing calling poll.
-        if entry.next <= now {
-            entry.sent += 1;
-            entry.next = now + RETRANS_TIMER;
+        if e.next <= now {
+            e.sent += 1;
+            e.next = now + RETRANS_TIMER;
             return true;
         }
         false
@@ -493,9 +591,10 @@ impl<K: Eq + Hash + Copy> Pending<K> {
     /// Run the retransmission timers: what is due by `now` -- a target to
     /// solicit again, or one whose resolution has failed.
     pub fn poll(&self, now: Instant) -> Vec<PendingEvent<K>> {
-        let mut map = self.inner.lock().unwrap();
+        let q = &mut *self.inner.lock().unwrap();
         let mut due = Vec::new();
-        map.retain(|ip, e| {
+        let mut freed = 0;
+        q.map.retain(|ip, e| {
             if e.next > now {
                 return true;
             }
@@ -505,9 +604,11 @@ impl<K: Eq + Hash + Copy> Pending<K> {
                 due.push(PendingEvent::Resolicit(*ip));
                 return true;
             }
+            freed += e.size();
             due.push(PendingEvent::Failed(*ip, std::mem::take(&mut e.packets)));
             false
         });
+        q.bytes -= freed;
         due
     }
 
@@ -517,22 +618,26 @@ impl<K: Eq + Hash + Copy> Pending<K> {
     }
 
     pub(crate) fn contains_at(&self, ip: K, now: Instant) -> bool {
-        let map = self.inner.lock().unwrap();
-        map.get(&ip).is_some_and(|e| !e.failed(now))
+        let q = self.inner.lock().unwrap();
+        q.map.get(&ip).is_some_and(|e| !e.failed(now))
     }
 
     /// Drop every queue, and the packets in them.
     pub fn clear(&self) {
-        self.inner.lock().unwrap().clear();
+        let mut q = self.inner.lock().unwrap();
+        q.map.clear();
+        q.bytes = 0;
     }
 
     /// Keep only the queued packets `keep` accepts; a queue left empty is
     /// dropped, and its resolution with it.
     pub fn retain_packets(&self, mut keep: impl FnMut(&[u8]) -> bool) {
-        self.inner.lock().unwrap().retain(|_, e| {
+        let q = &mut *self.inner.lock().unwrap();
+        q.map.retain(|_, e| {
             e.packets.retain(|p| keep(p));
             !e.packets.is_empty()
         });
+        q.bytes = q.map.values().map(PendingEntry::size).sum();
     }
 
     /// Remove and return every packet waiting for `ip`.
@@ -630,7 +735,7 @@ mod tests {
         // Nobody drives the timers, as on wasm without tick(). Without a
         // fresh start the target would never be solicited again.
         let late = t0 + PENDING_TIMEOUT + Duration::from_millis(1);
-        p.inner.lock().unwrap().get_mut(&ip).unwrap().sent = MAX_MULTICAST_SOLICIT;
+        p.inner.lock().unwrap().map.get_mut(&ip).unwrap().sent = MAX_MULTICAST_SOLICIT;
         assert!(
             p.enqueue_at(ip, b"two", late),
             "a stale queue is re-solicited"
@@ -838,7 +943,53 @@ mod tests {
         // Destinations already waiting still take packets.
         assert!(!p.enqueue(Ipv4Addr::from(0x0a00_0000), b"y"));
         assert_eq!(p.drain(Ipv4Addr::from(0x0a00_0000)).len(), 2);
-        assert_eq!(p.inner.lock().unwrap().len(), PENDING_MAX_TARGETS - 1);
+        assert_eq!(p.inner.lock().unwrap().map.len(), PENDING_MAX_TARGETS - 1);
+    }
+
+    #[test]
+    fn pending_bytes_are_capped() {
+        let p = Pending::new();
+        let big = vec![0u8; 65535];
+        for i in 0..PENDING_MAX_TARGETS as u32 {
+            for _ in 0..PENDING_MAX_PKTS {
+                p.enqueue(Ipv4Addr::from(0x0a00_0000 + i), &big);
+            }
+        }
+        let q = p.inner.lock().unwrap();
+        let held: usize = q.map.values().map(PendingEntry::size).sum();
+        assert_eq!(held, q.bytes);
+        // Not the ~256 MiB the other caps allow.
+        assert!(held <= 1 << 20, "{held} bytes queued");
+    }
+
+    #[test]
+    fn the_router_is_admitted_however_full_the_queues() {
+        let gw = Ipv4Addr::new(10, 0, 0, 1);
+        let big = vec![0u8; 65535];
+        // Full of destinations.
+        let p = Pending::new();
+        p.pin(Some(gw));
+        for i in 0..PENDING_MAX_TARGETS as u32 {
+            assert!(p.enqueue(Ipv4Addr::from(0x0a01_0000 + i), b"x"));
+        }
+        assert!(p.enqueue(gw, b"to the router"), "router not solicited");
+        assert!(p.contains(gw));
+        assert_eq!(p.inner.lock().unwrap().map.len(), PENDING_MAX_TARGETS);
+
+        // Full of bytes.
+        let p = Pending::new();
+        p.pin(Some(gw));
+        for i in 0..16 {
+            for _ in 0..PENDING_MAX_PKTS {
+                p.enqueue(Ipv4Addr::from(0x0a01_0000 + i), &big);
+            }
+        }
+        assert!(!p.enqueue(Ipv4Addr::new(10, 2, 0, 1), &big), "over the cap");
+        for _ in 0..PENDING_MAX_PKTS {
+            p.enqueue(gw, &big);
+        }
+        assert_eq!(p.drain(gw).len(), PENDING_MAX_PKTS, "router starved");
+        assert!(p.inner.lock().unwrap().bytes <= PENDING_MAX_BYTES);
     }
 
     #[test]
