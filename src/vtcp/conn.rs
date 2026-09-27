@@ -1700,17 +1700,37 @@ impl Conn {
     /// that may take over its 4-tuple. True only in TIME-WAIT, for a bare SYN
     /// numbered beyond anything the old connection used (RFC 9293 §3.10.7.4
     /// and RFC 6191; Linux's `tcp_timewait_state_process`): nothing of the
-    /// old connection can then be mistaken for the new one's. The caller
-    /// drops this `Conn` and handles the SYN as for a fresh connection.
+    /// old connection can then be mistaken for the new one's. When both
+    /// connections use timestamps, the SYN's TSval decides instead, as RFC
+    /// 6191 §2 asks: one older than TS.Recent is an old duplicate (PAWS)
+    /// whatever its sequence number, and a newer one is safe even with a
+    /// lower ISN. The caller drops this `Conn` and handles the SYN as for a
+    /// fresh connection.
     pub fn accepts_new_syn(&self, seg: &Segment) -> bool {
-        self.state == State::TimeWait
-            && seg.has_flag(flags::SYN)
-            && !seg.has_flag(flags::ACK)
-            && !seg.has_flag(flags::RST)
-            && self
-                .recv_buf
-                .as_ref()
-                .is_some_and(|rb| seq_after(seg.seq, rb.nxt()))
+        if self.state != State::TimeWait
+            || !seg.has_flag(flags::SYN)
+            || seg.has_flag(flags::ACK)
+            || seg.has_flag(flags::RST)
+        {
+            return false;
+        }
+        let Some(rb) = self.recv_buf.as_ref() else {
+            return false;
+        };
+        let seq_newer = seq_after(seg.seq, rb.nxt());
+        // ts_ok: the old connection used timestamps, and the new one will
+        // too if its SYN offers them (we have them enabled).
+        let ts_val = get_timestamp(&seg.options)
+            .filter(|_| self.ts_ok)
+            .map(|(v, _)| v);
+        match ts_val {
+            Some(v) => match (v.wrapping_sub(self.ts_recent) as i32).signum() {
+                1 => true,
+                0 => seq_newer,
+                _ => false,
+            },
+            None => seq_newer,
+        }
     }
 
     fn start_keepalive(&mut self) {
@@ -3807,6 +3827,46 @@ mod tests {
         let mut server = Conn::new(conf(80, port));
         drive_handshake(&mut client, &mut server);
         (client, server)
+    }
+
+    // RFC 6191 §2: when the old connection used timestamps and the new SYN
+    // carries one, the timestamp decides, not the sequence number: an
+    // older TSval is an old duplicate (PAWS), a newer one is a new
+    // connection even if its ISN happens to be lower.
+    #[test]
+    fn time_wait_reuse_goes_by_timestamps() {
+        let (mut client, mut server) = ts_pair(40315);
+        let fin = client.close();
+        let out = deliver(&mut server, &fin);
+        deliver(&mut client, &out);
+        deliver(&mut client, &server.close());
+        assert_eq!(client.state(), State::TimeWait);
+
+        let rcv_nxt = client.recv_buf.as_ref().unwrap().nxt();
+        let recent = client.ts_recent;
+        let syn = |seq: u32, ts: Option<u32>| Segment {
+            src_port: 80,
+            dst_port: 40315,
+            seq,
+            flags: flags::SYN,
+            window: 4096,
+            options: ts.map(|v| timestamp_option(v, 0)).into_iter().collect(),
+            ..Default::default()
+        };
+        let (newer_seq, older_seq) = (rcv_nxt.wrapping_add(1000), rcv_nxt.wrapping_sub(1000));
+        let (newer_ts, older_ts) = (recent.wrapping_add(10), recent.wrapping_sub(10));
+        assert!(
+            !client.accepts_new_syn(&syn(newer_seq, Some(older_ts))),
+            "PAWS"
+        );
+        assert!(client.accepts_new_syn(&syn(older_seq, Some(newer_ts))));
+        assert!(client.accepts_new_syn(&syn(newer_seq, Some(newer_ts))));
+        // An equal TSval falls back to the sequence number.
+        assert!(client.accepts_new_syn(&syn(newer_seq, Some(recent))));
+        assert!(!client.accepts_new_syn(&syn(older_seq, Some(recent))));
+        // No timestamp on the SYN: the sequence number alone.
+        assert!(client.accepts_new_syn(&syn(newer_seq, None)));
+        assert!(!client.accepts_new_syn(&syn(older_seq, None)));
     }
 
     // RFC 7323 §3.2: the SYN-ACK echoes the SYN's TSval.
