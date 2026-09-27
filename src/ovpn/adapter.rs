@@ -21,6 +21,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
@@ -121,7 +122,12 @@ impl std::fmt::Debug for AdapterConfig {
     }
 }
 
+/// A peer's place in the adapter. It is taken before the device is
+/// connected -- with `l3` / `l2` and `cleanup` still empty -- so that of two
+/// on_connect calls for one key only one connects a device; `id` tells the
+/// one that took it whether it is still its own once connected.
 struct OvpnPeer {
+    id: u64,
     l3: Option<Arc<PeerL3Device>>,
     l2: Option<Arc<PeerL2Device>>,
     cleanup: Mutex<Option<Cleanup>>,
@@ -141,6 +147,8 @@ pub struct Adapter {
     server: Mutex<Option<Arc<Server>>>,
     connector: Connector,
     peers: Mutex<HashMap<PeerKey, OvpnPeer>>,
+    /// For [`OvpnPeer::id`].
+    next_id: AtomicU64,
     me: Weak<Adapter>,
 }
 
@@ -157,6 +165,7 @@ impl Adapter {
             server: Mutex::new(None),
             connector: cfg.connector,
             peers: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(0),
             me: me.clone(),
         });
 
@@ -237,45 +246,66 @@ impl Adapter {
     }
 
     fn on_connect(&self, key: PeerKey, cfg: &PeerConfig) {
-        // Avoid double-setup if we already wired this peer.
-        if self.peers().contains_key(&key) {
-            return;
+        // Take the key before connecting, under the lock: checked and
+        // taken apart, two calls for one key would both connect a device,
+        // and the second one's insert would drop the first's cleanup,
+        // leaving that device attached for good.
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut peers = self.peers();
+            if peers.contains_key(&key) {
+                return;
+            }
+            peers.insert(
+                key,
+                OvpnPeer {
+                    id,
+                    l3: None,
+                    l2: None,
+                    cleanup: Mutex::new(None),
+                },
+            );
         }
-        let prefix = IpPrefix::new(cfg.ip, cfg.prefix_len);
-
         // Determine layer from the connector type (the server tracks the peer's
         // dev-type, but here we wire based on what the operator configured).
-        match &self.connector {
+        // The connector runs with no lock held: it may call back into the
+        // adapter.
+        let (l3, l2, connected) = match &self.connector {
             Connector::L3(conn) => {
+                let prefix = IpPrefix::new(cfg.ip, cfg.prefix_len);
                 let dev = PeerL3Device::new(&self.me, key, prefix, cfg.iroutes.clone());
-                let cleanup = match conn.connect_l3(dev.clone() as Arc<dyn L3Device>) {
-                    Ok(c) => c,
-                    Err(_) => return,
-                };
-                self.peers().insert(
-                    key,
-                    OvpnPeer {
-                        l3: Some(dev),
-                        l2: None,
-                        cleanup: Mutex::new(Some(cleanup)),
-                    },
-                );
+                let res = conn.connect_l3(dev.clone() as Arc<dyn L3Device>);
+                (Some(dev), None, res)
             }
             Connector::L2(conn) => {
                 let dev = PeerL2Device::new(&self.me, key);
-                let cleanup = match conn.connect_l2(dev.clone() as Arc<dyn L2Device>) {
-                    Ok(c) => c,
-                    Err(_) => return,
-                };
-                self.peers().insert(
-                    key,
-                    OvpnPeer {
-                        l3: None,
-                        l2: Some(dev),
-                        cleanup: Mutex::new(Some(cleanup)),
-                    },
-                );
+                let res = conn.connect_l2(dev.clone() as Arc<dyn L2Device>);
+                (None, Some(dev), res)
             }
+        };
+        let leftover = {
+            let mut peers = self.peers();
+            let ours = peers.get_mut(&key).filter(|p| p.id == id);
+            match (ours, connected) {
+                (Some(p), Ok(cleanup)) => {
+                    p.l3 = l3;
+                    p.l2 = l2;
+                    *p.cleanup.get_mut().unwrap_or_else(PoisonError::into_inner) = Some(cleanup);
+                    None
+                }
+                (Some(_), Err(_)) => {
+                    peers.remove(&key);
+                    None
+                }
+                // on_disconnect or close() let go of the key while the
+                // device was being connected: nothing but this call is left
+                // to detach it. With no lock held, as in on_disconnect.
+                (None, Ok(cleanup)) => Some(cleanup),
+                (None, Err(_)) => None,
+            }
+        };
+        if let Some(c) = leftover {
+            let _ = c();
         }
     }
 
@@ -722,6 +752,93 @@ mod tests {
             adapter.deliver(test_key(1), 3, &packet_from(src));
         }
         assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// A connector whose first connect_l3 waits for a release; it counts
+    /// devices connected and cleaned up.
+    struct SlowConnector {
+        first: std::sync::atomic::AtomicBool,
+        connects: std::sync::atomic::AtomicUsize,
+        cleanups: Arc<std::sync::atomic::AtomicUsize>,
+        entered: Mutex<std::sync::mpsc::Sender<()>>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl L3Connector for SlowConnector {
+        fn connect_l3(&self, _dev: Arc<dyn L3Device>) -> Result<Cleanup> {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.connects.fetch_add(1, SeqCst);
+            if self.first.swap(false, SeqCst) {
+                let _ = self.entered.lock().unwrap().send(());
+                let _ = self
+                    .release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5));
+            }
+            let c = self.cleanups.clone();
+            Ok(Box::new(move || {
+                c.fetch_add(1, SeqCst);
+                Ok(())
+            }))
+        }
+    }
+
+    /// An adapter over a [`SlowConnector`], with its first on_connect for
+    /// `key` started and stuck in the connector; release it with the
+    /// sender.
+    fn slow_connect(
+        key: PeerKey,
+    ) -> (
+        Arc<Adapter>,
+        Arc<SlowConnector>,
+        std::sync::mpsc::Sender<()>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let conn = Arc::new(SlowConnector {
+            first: std::sync::atomic::AtomicBool::new(true),
+            connects: Default::default(),
+            cleanups: Default::default(),
+            entered: Mutex::new(entered_tx),
+            release: Mutex::new(release_rx),
+        });
+        let adapter = adapter_with(conn.clone());
+        let a = adapter.clone();
+        let t = std::thread::spawn(move || a.on_connect(key, &test_config()));
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        (adapter, conn, release, t)
+    }
+
+    /// Two on_connect calls for one key at once connect one device, not
+    /// two -- the second would overwrite the first's cleanup, and leave
+    /// its device attached to the connector for good.
+    #[test]
+    fn concurrent_connects_for_a_key_attach_one_device() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (adapter, conn, release, slow) = slow_connect(test_key(1));
+        adapter.on_connect(test_key(1), &test_config());
+        release.send(()).unwrap();
+        slow.join().unwrap();
+        assert_eq!(conn.connects.load(SeqCst), 1);
+        adapter.on_disconnect(test_key(1));
+        adapter.close();
+        assert_eq!(conn.cleanups.load(SeqCst), conn.connects.load(SeqCst));
+    }
+
+    /// A peer that disconnects while its device is being connected has
+    /// that device detached once connected: nothing else would.
+    #[test]
+    fn a_disconnect_during_connect_detaches_the_device() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (adapter, conn, release, slow) = slow_connect(test_key(1));
+        adapter.on_disconnect(test_key(1));
+        release.send(()).unwrap();
+        slow.join().unwrap();
+        assert!(adapter.peers().is_empty());
+        assert_eq!(conn.cleanups.load(SeqCst), 1);
+        adapter.close();
     }
 
     /// A handler may call back into the adapter -- sending to a peer can
