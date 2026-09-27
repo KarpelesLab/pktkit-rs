@@ -36,21 +36,34 @@ pub(crate) struct UdpState {
     closed: AtomicBool,
 }
 
-/// Bytes of payload a socket holds for its reader before further datagrams
-/// are dropped, as a kernel socket's receive buffer bounds it.
+/// Bytes a socket holds for its reader before further datagrams are
+/// dropped, as a kernel socket's receive buffer bounds it.
 const RX_BUF_BYTES: usize = 256 * 1024;
 
-/// Datagrams waiting to be read, and their total payload size.
+/// What each queued datagram is charged on top of its payload, for its
+/// queue slot and allocation, as a kernel charges an skb's truesize rather
+/// than its payload. Counting payload alone, empty datagrams cost nothing
+/// and could be queued without limit.
+const DATAGRAM_OVERHEAD: usize = 64;
+
+/// Datagrams a socket queues for its reader, whatever their size.
+const RX_QUEUE_MAX: usize = 1024;
+
+/// Datagrams waiting to be read, and what they are charged in all.
 #[derive(Default)]
 struct RxQueue {
     q: VecDeque<Vec<u8>>,
     bytes: usize,
 }
 
+fn charge(d: &[u8]) -> usize {
+    d.len() + DATAGRAM_OVERHEAD
+}
+
 impl RxQueue {
     fn pop_front(&mut self) -> Option<Vec<u8>> {
         let d = self.q.pop_front()?;
-        self.bytes -= d.len();
+        self.bytes -= charge(&d);
         Some(d)
     }
 }
@@ -67,10 +80,12 @@ impl UdpState {
         let mut rx = self.rx.lock().unwrap();
         // One datagram always fits, whatever its size, as with a kernel
         // socket's receive buffer.
-        if !rx.q.is_empty() && rx.bytes + payload.len() > RX_BUF_BYTES {
+        if !rx.q.is_empty()
+            && (rx.bytes + charge(payload) > RX_BUF_BYTES || rx.q.len() >= RX_QUEUE_MAX)
+        {
             return;
         }
-        rx.bytes += payload.len();
+        rx.bytes += charge(payload);
         rx.q.push_back(payload.to_vec());
         drop(rx);
         self.signal.notify_all();
@@ -611,6 +626,38 @@ mod tests {
         }
         let rx = conn.state.rx.lock().unwrap();
         assert!(rx.bytes <= RX_BUF_BYTES);
-        assert_eq!(rx.q.len(), RX_BUF_BYTES / 1000);
+        assert_eq!(rx.q.len(), RX_BUF_BYTES / (1000 + DATAGRAM_OVERHEAD));
+    }
+
+    /// Empty datagrams cost their queue slot, not nothing: a peer sending
+    /// only those must not grow an unread socket's queue without bound.
+    #[test]
+    fn empty_datagrams_are_bounded_too() {
+        let sink: Arc<dyn Fn(&[u8]) + Send + Sync> = Arc::new(|_b: &[u8]| {});
+        let stack = UdpStack::new(sink);
+        let conn = stack
+            .dial(
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+                SocketAddr::from(([10, 0, 0, 1], 53)),
+            )
+            .unwrap();
+        let reply = wrap_udp_v4(
+            Ipv4Addr::new(10, 0, 0, 1),
+            53,
+            Ipv4Addr::new(10, 0, 0, 2),
+            conn.local_addr().port(),
+            &[],
+        );
+        for _ in 0..10_000 {
+            stack.handle_inbound(Packet::from_slice(&reply));
+        }
+        assert_eq!(conn.state.rx.lock().unwrap().q.len(), RX_QUEUE_MAX);
+        // Small ones stop at the queue's length, before its bytes.
+        let mut buf = [0; 4];
+        conn.set_nonblocking(true);
+        for _ in 0..RX_QUEUE_MAX {
+            assert_eq!(conn.recv(&mut buf).unwrap(), 0);
+        }
+        assert_eq!(conn.state.rx.lock().unwrap().bytes, 0);
     }
 }
