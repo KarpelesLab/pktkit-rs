@@ -388,6 +388,10 @@ struct Socket {
     queue_id: u32,
     frame_size: usize,
     zerocopy: bool,
+    /// Whether the bind took `XDP_USE_NEED_WAKEUP`. Without it the kernel
+    /// never raises `XDP_RING_NEED_WAKEUP` on the TX ring, yet in copy mode
+    /// it still transmits only when woken, so every send has to kick.
+    need_wakeup: bool,
 
     // Mappings kept alive for the socket's lifetime (Drop -> munmap).
     umem: Mapping,
@@ -413,6 +417,7 @@ impl std::fmt::Debug for Socket {
             .field("fd", &self.fd.as_raw_fd())
             .field("queue_id", &self.queue_id)
             .field("zerocopy", &self.zerocopy)
+            .field("need_wakeup", &self.need_wakeup)
             .finish()
     }
 }
@@ -422,6 +427,21 @@ impl Socket {
     fn raw(&self) -> RawFd {
         self.fd.as_raw_fd()
     }
+
+    /// Whether descriptors queued on `ring` (this socket's TX ring) need a
+    /// `sendto` before the kernel will transmit them.
+    #[inline]
+    fn tx_wants_kick(&self, ring: &DescRing) -> bool {
+        kick_wanted(self.need_wakeup, ring.need_wakeup())
+    }
+}
+
+/// See [`Socket::tx_wants_kick`]: with `XDP_USE_NEED_WAKEUP` bound, the ring's
+/// flag says when the kernel has gone idle; without it the flag is never set
+/// and says nothing, so the kernel must be kicked every time.
+#[inline]
+fn kick_wanted(bound_with_need_wakeup: bool, ring_flag: bool) -> bool {
+    !bound_with_need_wakeup || ring_flag
 }
 
 /// A socket's transmit state: its TX ring, its COMPLETION ring, and the UMEM
@@ -865,7 +885,7 @@ impl Socket {
             .map(|i| ((rx_frames + i) as u64) * frame_size as u64)
             .collect();
 
-        let zerocopy = bind_xdp(raw, ifindex, queue_id, cfg, want_zerocopy)
+        let (zerocopy, need_wakeup) = bind_xdp(raw, ifindex, queue_id, cfg, want_zerocopy)
             .map_err(|e| step(&format!("bind queue {queue_id}"), e))?;
 
         if let Some(bp) = cfg.busy_poll {
@@ -878,6 +898,7 @@ impl Socket {
             frame_size: frame_size as usize,
             rx_spin: cfg.rx_spin,
             zerocopy,
+            need_wakeup,
             umem,
             _fill_map: fill_map,
             _comp_map: comp_map,
@@ -951,7 +972,7 @@ impl Socket {
         debug_assert_eq!(produced, 1, "TX ring shrank under its only producer");
         // With XDP_USE_NEED_WAKEUP this is only true when the kernel has gone
         // idle on this ring, so the common case costs no syscall at all.
-        let wake = tx.ring.need_wakeup();
+        let wake = self.tx_wants_kick(&tx.ring);
         drop(tx);
 
         if wake {
@@ -1044,7 +1065,7 @@ impl Socket {
             }
             taken = upto;
         }
-        let wake = queued && tx.ring.need_wakeup();
+        let wake = queued && self.tx_wants_kick(&tx.ring);
         drop(tx);
 
         if wake {
@@ -1189,7 +1210,7 @@ fn poll_loop(sock: Arc<Socket>, mut rings: RxRings) {
             let stranded = {
                 let mut tx = sock.tx.lock().unwrap();
                 tx.reclaim();
-                tx.ring.pending() > 0 && tx.ring.need_wakeup()
+                tx.ring.pending() > 0 && sock.tx_wants_kick(&tx.ring)
             };
             if stranded {
                 sock.kick_tx();
@@ -1523,16 +1544,15 @@ fn bind_flag_candidates(extra: u16, want_zerocopy: bool) -> Vec<u16> {
 }
 
 /// `bind` the socket to the interface/queue. Returns whether the kernel put it
-/// on a zero-copy path.
+/// on a zero-copy path, and whether the bind took `XDP_USE_NEED_WAKEUP`.
 fn bind_xdp(
     fd: RawFd,
     ifindex: u32,
     queue_id: u32,
     cfg: &Config,
     want_zerocopy: bool,
-) -> Result<bool> {
-    let mut last = None;
-    for flags in bind_flag_candidates(cfg.flags, want_zerocopy) {
+) -> Result<(bool, bool)> {
+    let flags = bind_first(bind_flag_candidates(cfg.flags, want_zerocopy), |flags| {
         let sa = SockaddrXdp {
             family: syscall::AF_XDP as u16,
             flags,
@@ -1540,8 +1560,18 @@ fn bind_xdp(
             queue_id,
             shared_umem_fd: 0,
         };
-        match syscall::bind(fd, &sa) {
-            Ok(()) => return Ok(socket_is_zerocopy(fd)),
+        syscall::bind(fd, &sa)
+    })?;
+    Ok((socket_is_zerocopy(fd), flags & XDP_USE_NEED_WAKEUP != 0))
+}
+
+/// Try `bind` with each of `candidates` in turn; returns the flags that took,
+/// or the last error.
+fn bind_first(candidates: Vec<u16>, mut bind: impl FnMut(u16) -> Result<()>) -> Result<u16> {
+    let mut last = None;
+    for flags in candidates {
+        match bind(flags) {
+            Ok(()) => return Ok(flags),
             Err(e) => last = Some(e),
         }
     }
@@ -1885,6 +1915,33 @@ mod tests {
     fn copy_mode_never_attempts_a_zerocopy_bind() {
         let c = bind_flag_candidates(0, false);
         assert!(c.iter().all(|f| f & XDP_ZEROCOPY == 0));
+    }
+
+    /// A kernel that refuses `XDP_USE_NEED_WAKEUP` (before 5.4) leaves a
+    /// socket whose TX ring never asks for a wakeup, so it must be kicked on
+    /// every send or nothing is ever transmitted.
+    #[test]
+    fn a_bind_without_need_wakeup_kicks_every_send() {
+        let flags = bind_first(bind_flag_candidates(0, false), |f| {
+            if f & XDP_USE_NEED_WAKEUP != 0 {
+                Err(io::Error::from_raw_os_error(syscall::EINVAL))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+        assert_eq!(flags, XDP_COPY);
+        let bound_with = flags & XDP_USE_NEED_WAKEUP != 0;
+        assert!(kick_wanted(bound_with, false));
+        // With the flag bound, the ring decides.
+        assert!(!kick_wanted(true, false));
+        assert!(kick_wanted(true, true));
+        // Every candidate refused: the last error is reported.
+        let e = bind_first(bind_flag_candidates(0, true), |_| {
+            Err(io::Error::from_raw_os_error(syscall::EINVAL))
+        })
+        .unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(syscall::EINVAL));
     }
 
     #[test]
