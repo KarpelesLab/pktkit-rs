@@ -171,6 +171,13 @@ fn open_utun() -> Result<(OwnedFd, String)> {
         return Err(io::Error::last_os_error());
     }
     let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    // macOS has no SOCK_CLOEXEC, so this is as early as it can be set. A
+    // child that inherited the fd would keep the interface alive after we
+    // close it.
+    // SAFETY: plain fcntl on an fd we own.
+    if unsafe { libc::fcntl(owned.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
 
     // ioctl(CTLIOCGINFO) to resolve the utun control id by name.
     let mut info: libc::ctl_info = unsafe { std::mem::zeroed() };

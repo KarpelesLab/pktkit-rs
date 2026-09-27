@@ -28,20 +28,22 @@ compile_error!("pktkit's XDP support on fullrust only knows the x86-64 syscall A
 
 #[cfg(target_os = "linux")]
 mod nr {
-    #[cfg(test)]
-    pub use libc::SYS_sched_getaffinity as SCHED_GETAFFINITY;
     pub use libc::{
         SYS_bind as BIND, SYS_bpf as BPF, SYS_getsockopt as GETSOCKOPT, SYS_ioctl as IOCTL,
         SYS_mmap as MMAP, SYS_munmap as MUNMAP, SYS_ppoll as PPOLL, SYS_recvfrom as RECVFROM,
         SYS_sched_setaffinity as SCHED_SETAFFINITY, SYS_sendto as SENDTO,
         SYS_setsockopt as SETSOCKOPT, SYS_socket as SOCKET,
     };
+    #[cfg(test)]
+    pub use libc::{SYS_fcntl as FCNTL, SYS_sched_getaffinity as SCHED_GETAFFINITY};
 }
 
 // arch/x86/entry/syscalls/syscall_64.tbl
 #[cfg(target_os = "fullrust")]
 mod nr {
     pub const IOCTL: i64 = 16;
+    #[cfg(test)]
+    pub const FCNTL: i64 = 72;
     pub const MMAP: i64 = 9;
     pub const MUNMAP: i64 = 11;
     pub const SOCKET: i64 = 41;
@@ -61,7 +63,7 @@ mod nr {
 pub(crate) use libc::{
     AF_INET, AF_NETLINK, AF_UNSPEC, AF_XDP, EAGAIN, EBUSY, EINVAL, ENODEV, ENOENT, MAP_ANONYMOUS,
     MAP_HUGETLB, MAP_POPULATE, MAP_PRIVATE, MAP_SHARED, MSG_DONTWAIT, POLLIN, PROT_READ,
-    PROT_WRITE, SOCK_DGRAM, SOCK_RAW, SOL_SOCKET,
+    PROT_WRITE, SOCK_CLOEXEC, SOCK_DGRAM, SOCK_RAW, SOL_SOCKET,
 };
 
 #[cfg(target_os = "fullrust")]
@@ -72,6 +74,7 @@ mod consts {
     pub(crate) const AF_XDP: i32 = 44;
     pub(crate) const SOCK_DGRAM: i32 = 2;
     pub(crate) const SOCK_RAW: i32 = 3;
+    pub(crate) const SOCK_CLOEXEC: i32 = 0o2000000;
     pub(crate) const SOL_SOCKET: i32 = 1;
     pub(crate) const MSG_DONTWAIT: i32 = 0x40;
     pub(crate) const POLLIN: i16 = 0x1;
@@ -145,7 +148,12 @@ unsafe fn syscall(nr: i64, args: [usize; 6]) -> Result<usize> {
     Ok(r as usize)
 }
 
+/// `socket(2)`, always close-on-exec: these fds (AF_XDP sockets holding a
+/// UMEM and an XSKMAP slot, netlink, ioctl sockets) are nothing a child
+/// process should inherit, and setting the flag afterwards would race with a
+/// `fork` + `exec` on another thread.
 pub(crate) fn socket(domain: i32, ty: i32, proto: i32) -> Result<OwnedFd> {
+    let ty = ty | SOCK_CLOEXEC;
     // SAFETY: no pointers.
     let fd = unsafe {
         syscall(
@@ -552,6 +560,17 @@ mod tests {
             let e = if_nametoindex(name).unwrap_err();
             assert_eq!(e.kind(), io::ErrorKind::NotFound, "{name:?}: {e}");
         }
+    }
+
+    #[test]
+    fn sockets_are_close_on_exec() {
+        const F_GETFD: usize = 1;
+        const FD_CLOEXEC: usize = 1;
+        let s = socket(AF_INET, SOCK_DGRAM, 0).unwrap();
+        // SAFETY: F_GETFD on an fd we own takes no pointer.
+        let flags =
+            unsafe { syscall(nr::FCNTL, [s.as_raw_fd() as usize, F_GETFD, 0, 0, 0, 0]) }.unwrap();
+        assert_eq!(flags & FD_CLOEXEC, FD_CLOEXEC);
     }
 
     #[test]
