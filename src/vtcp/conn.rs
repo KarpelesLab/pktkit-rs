@@ -243,6 +243,11 @@ pub struct Conn {
     // RCV.WND), once an ACK has carried one.
     rcv_adv: Option<u32>,
 
+    /// Text that came in the peer's SYN, held until ESTABLISHED (RFC 9293
+    /// §3.10.7.2-3): before the handshake completes, the SYN may come from
+    /// a spoofed source.
+    syn_data: Vec<u8>,
+
     // Deferred FIN.
     fin_pending: bool,
     pending_fin_seq: u32,
@@ -341,6 +346,7 @@ impl Conn {
             sack_ok: false,
             snd_wl: None,
             rcv_adv: None,
+            syn_data: Vec::new(),
             fin_pending: false,
             pending_fin_seq: 0,
             fin_queued: false,
@@ -467,12 +473,7 @@ impl Conn {
         self.queue_seg(synack);
         self.send_buf.as_mut().unwrap().advance_sent(1);
 
-        if !syn.payload.is_empty() {
-            self.recv_buf
-                .as_mut()
-                .unwrap()
-                .insert(syn.seq.wrapping_add(1), &syn.payload);
-        }
+        self.syn_data = syn.payload.clone();
 
         self.start_rto();
         self.take_outgoing()
@@ -1000,13 +1001,7 @@ impl Conn {
         self.state = State::SynReceived;
         self.retries = 0;
         self.stop_rto();
-
-        if !seg.payload.is_empty() {
-            self.recv_buf
-                .as_mut()
-                .unwrap()
-                .insert(seg.seq.wrapping_add(1), &seg.payload);
-        }
+        self.syn_data = seg.payload.clone();
 
         let opts = self.build_syn_options();
         let win = self.syn_window();
@@ -1045,6 +1040,15 @@ impl Conn {
         self.stop_rto();
         self.set_snd_wnd((seg.window as u32) << self.snd_wnd_shift);
         self.state = State::Established;
+        if !self.syn_data.is_empty() {
+            // Nothing else has been taken in yet, so RCV.NXT is still just
+            // past the SYN, where this text belongs.
+            let data = std::mem::take(&mut self.syn_data);
+            let rb = self.recv_buf.as_mut().unwrap();
+            let nxt = rb.nxt();
+            rb.insert(nxt, &data);
+            self.queue_ack();
+        }
         if self.cfg.keepalive {
             self.start_keepalive();
         }
@@ -3227,6 +3231,40 @@ mod tests {
         client.last_recv = Instant::now() - Duration::from_secs(3600);
         client.tick();
         assert_eq!(client.state(), State::FinWait2);
+    }
+
+    // RFC 9293 §3.10.7.2-3: text in a SYN is queued until the connection is
+    // established; until the handshake's ACK arrives it may be from a
+    // spoofed source.
+    #[test]
+    fn syn_payload_waits_for_establishment() {
+        let mut client = Conn::new(cfg(40330, 80));
+        let mut server = Conn::new(cfg(80, 40330));
+        let mut syn = parse(&client.connect()[0]);
+        syn.payload = b"early".to_vec();
+        let synack = server.accept_syn(&syn);
+        assert_eq!(read_all(&mut server), b"");
+        let ack = deliver(&mut client, &synack);
+        deliver(&mut server, &ack);
+        assert_eq!(server.state(), State::Established);
+        assert_eq!(read_all(&mut server), b"early");
+    }
+
+    #[test]
+    fn simultaneous_open_syn_payload_waits_for_establishment() {
+        let mut a = Conn::new(cfg(40331, 80));
+        let mut b = Conn::new(cfg(80, 40331));
+        let a_syn = a.connect();
+        let mut b_syn = parse(&b.connect()[0]);
+        b_syn.payload = b"early".to_vec();
+        let a_synack = a.handle_segment(&b_syn);
+        assert_eq!(a.state(), State::SynReceived);
+        assert_eq!(read_all(&mut a), b"");
+        let b_synack = deliver(&mut b, &a_syn);
+        deliver(&mut a, &b_synack);
+        deliver(&mut b, &a_synack);
+        assert_eq!(a.state(), State::Established);
+        assert_eq!(read_all(&mut a), b"early");
     }
 
     // RFC 6528: a new connection on the same 4-tuple starts just past the
