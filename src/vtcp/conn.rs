@@ -900,10 +900,15 @@ impl Conn {
             return seq_in_range_inclusive(seg.seq, rcv_nxt, rcv_nxt.wrapping_add(rcv_wnd));
         }
         if rcv_wnd == 0 {
-            // A bare FIN at RCV.NXT takes no buffer space; refusing it would
-            // leave a peer unable to close to a reader that has stopped
-            // reading (Linux accepts it too).
-            return seg.payload.is_empty() && seg.seq == rcv_nxt;
+            // No data fits, but RFC 9293 §3.10.7.4 still wants valid ACKs
+            // taken from a segment at RCV.NXT, as Linux's tcp_sequence does:
+            // a peer probing our closed window, or sending into it, may be
+            // acknowledging our data too, and rejecting the whole segment
+            // would stall our side until the window reopens. The payload is
+            // dropped later (the buffer takes none of it) and ACKed. A bare
+            // FIN there takes no buffer space and is accepted outright, or a
+            // peer could not close to a reader that has stopped reading.
+            return seg.seq == rcv_nxt;
         }
         let seg_end = seg.seq.wrapping_add(seg_len.wrapping_sub(1));
         seq_in_range(seg.seq, rcv_nxt, rcv_nxt.wrapping_add(rcv_wnd))
@@ -2819,6 +2824,37 @@ mod tests {
         deliver(&mut client, &ack);
         assert_eq!(client.state(), State::FinWait2);
         assert_eq!(read_all(&mut server).len(), 4096);
+    }
+
+    // A segment at RCV.NXT carrying data into our zero window still has
+    // its ACK processed (RFC 9293 §3.10.7.4); only the payload is dropped.
+    #[test]
+    fn zero_window_still_takes_the_ack_of_a_data_segment() {
+        let (mut client, mut server) = established(40026);
+        let (_, mut pkts) = client.write(&[6u8; 4096]);
+        while !pkts.is_empty() {
+            let acks = deliver(&mut server, &pkts);
+            pkts = deliver(&mut client, &acks);
+        }
+        assert_eq!(server.rcv_wnd_bytes(), 0);
+        let (_, reply) = server.write(b"reply");
+        let reply_end = server.send_buf.as_ref().unwrap().nxt();
+        assert_eq!(parse(&reply[0]).seq.wrapping_add(5), reply_end);
+
+        // The client's next data acknowledges the reply, but lands in a
+        // closed window.
+        let rcv_nxt = server.recv_buf.as_ref().unwrap().nxt();
+        let seg = data_with_ack(&server, &client, reply_end, b"more", false);
+        let out = server.handle_segment(&seg);
+        assert_eq!(
+            server.send_buf.as_ref().unwrap().una(),
+            reply_end,
+            "ACK ignored"
+        );
+        let ack = parse(&out[0]);
+        assert_eq!(ack.ack, rcv_nxt, "the payload must not be taken");
+        assert_eq!(ack.window, 0);
+        assert_eq!(read_all(&mut server), vec![6u8; 4096]);
     }
 
     // Pure ACKs get no reply in CLOSING or TIME-WAIT, or two ends answering
