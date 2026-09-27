@@ -20,6 +20,7 @@
 use crate::accept::{Cleanup, L3Connector};
 use crate::iface::{L3Device, L3Handler};
 use crate::packet::Packet;
+use crate::slirp::defrag::{Reassembler, ipv6_fragment_header};
 use crate::slirp::icmpv4::build_icmpv4_echo_reply;
 use crate::slirp::icmpv6::build_icmpv6_echo_reply;
 use crate::slirp::ipv6::skip_extension_headers;
@@ -100,6 +101,8 @@ struct Inner {
     /// Outbound dials still waiting on the real destination; each holds a
     /// thread, so they are capped separately from established flows.
     pending_dials: Arc<AtomicUsize>,
+    /// Fragments from the virtual network awaiting the rest of their datagram.
+    defrag: Mutex<Reassembler>,
     closed: AtomicBool,
 }
 
@@ -183,6 +186,7 @@ impl Stack {
             ns_sides: Mutex::new(HashMap::new()),
             ns_counter: AtomicU64::new(0),
             pending_dials: Arc::new(AtomicUsize::new(0)),
+            defrag: Mutex::new(Reassembler::default()),
             closed: AtomicBool::new(false),
         });
 
@@ -481,6 +485,20 @@ impl Stack {
             ));
         }
         let pkt = &pkt[..total_len];
+        // A fragment is not a datagram: past the first one there is no
+        // transport header at all, and the first alone is truncated.
+        if u16::from_be_bytes([pkt[6], pkt[7]]) & 0x3FFF != 0 {
+            let whole =
+                inner
+                    .defrag
+                    .lock()
+                    .expect("poisoned")
+                    .push_v4(Instant::now(), ns, pkt, ihl);
+            return match whole {
+                Some(p) => Self::handle_ipv4(inner, ns, &p),
+                None => Ok(()),
+            };
+        }
         let proto = pkt[9];
         let mut src_ip = [0u8; 4];
         let mut dst_ip = [0u8; 4];
@@ -763,6 +781,20 @@ impl Stack {
             ));
         }
         let pkt = &pkt[..40 + payload_len];
+        // See the IPv4 path: fragments are reassembled before anything reads
+        // a transport header.
+        if let Some(frag_off) = ipv6_fragment_header(pkt) {
+            let whole =
+                inner
+                    .defrag
+                    .lock()
+                    .expect("poisoned")
+                    .push_v6(Instant::now(), ns, pkt, frag_off);
+            return match whole {
+                Some(p) => Self::handle_ipv6(inner, ns, &p),
+                None => Ok(()),
+            };
+        }
         let next_header = pkt[6];
         let mut src = [0u8; 16];
         let mut dst = [0u8; 16];
@@ -1754,6 +1786,43 @@ mod tests {
         server.send_to(&buf[..n], from).unwrap();
         wait_for("the reply", || !captured.lock().unwrap().is_empty());
         assert_eq!(&captured.lock().unwrap()[0][28..], b"early");
+    }
+
+    #[test]
+    fn fragmented_udp_is_reassembled_before_forwarding() {
+        use crate::fragment::{Fragmentation, fragment_ipv4};
+
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let sport = server.local_addr().unwrap().port();
+        let stack = Stack::new();
+        let _captured = capture(&stack);
+        let body: Vec<u8> = (0..3000u32).map(|i| (i % 251) as u8).collect();
+        let mut dgram = build_udp_v4_packet(
+            Ipv4Addr::new(10, 0, 0, 5),
+            41600,
+            Ipv4Addr::new(127, 0, 0, 1),
+            sport,
+            &body,
+        );
+        dgram[4..6].copy_from_slice(&0x4242u16.to_be_bytes());
+        let Fragmentation::Fragments(frags) = fragment_ipv4(Packet::from_slice(&dgram), 1500)
+        else {
+            panic!("expected fragments");
+        };
+
+        // A later fragment alone must not be read as a UDP header.
+        L3Device::send(&*stack, Packet::from_slice(&frags[2])).unwrap();
+        assert!(stack.inner.udp.lock().unwrap().is_empty());
+
+        for f in &frags[..2] {
+            L3Device::send(&*stack, Packet::from_slice(f)).unwrap();
+        }
+        let mut buf = vec![0u8; 4096];
+        let (n, _) = server.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..n], &body[..]);
     }
 
     #[test]

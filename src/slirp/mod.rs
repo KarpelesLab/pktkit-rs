@@ -26,6 +26,7 @@
 //!   side.
 
 mod checksum;
+mod defrag;
 mod icmpv4;
 mod icmpv6;
 mod ipv6;
