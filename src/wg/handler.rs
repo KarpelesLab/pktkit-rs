@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
 
 use crate::Result;
@@ -201,6 +201,10 @@ pub struct Handler {
     load: Mutex<LoadMeter>,
     /// Responder-side cookie validator + reply generator.
     cookie_checker: Mutex<crate::wg::cookie::CookieChecker>,
+    /// The multiplexer this handler is a member of, if any. Its members
+    /// share one UDP port and a packet is routed to them by receiver index,
+    /// so an index has to be unique across all of them, not only here.
+    group: RwLock<Weak<crate::wg::MultiHandler>>,
 }
 
 impl std::fmt::Debug for Handler {
@@ -236,6 +240,7 @@ impl Handler {
             load_threshold: lt,
             load: Mutex::new(LoadMeter::default()),
             cookie_checker: Mutex::new(crate::wg::cookie::CookieChecker::new(&pub_key)),
+            group: RwLock::new(Weak::new()),
         }))
     }
 
@@ -614,9 +619,28 @@ impl Handler {
 
     // --- Handshake-table accessors used by handshake.rs ------------------
 
+    pub(crate) fn set_group(&self, group: Weak<crate::wg::MultiHandler>) {
+        *self.group.write().expect("group lock") = group;
+    }
+
+    /// Leave `group`, unless the handler has joined another since.
+    pub(crate) fn leave_group(&self, group: &Weak<crate::wg::MultiHandler>) {
+        let mut g = self.group.write().expect("group lock");
+        if Weak::ptr_eq(&g, group) {
+            *g = Weak::new();
+        }
+    }
+
     /// Draw a fresh, non-zero local index that no pending handshake or
     /// keypair uses, as the reference's index hashtable does. A random u32
     /// alone could repeat one in use and replace another peer's entry.
+    ///
+    /// In a [`MultiHandler`](crate::wg::MultiHandler) the index must also be
+    /// free in every other member: packets are routed to the first member
+    /// that owns their receiver index, so one index held by two members
+    /// sends one member's traffic to the other, where it fails to decrypt.
+    /// With enough sessions per member, a draw checked only locally does
+    /// that routinely.
     pub(crate) fn allocate_index(&self) -> Result<u32> {
         self.allocate_index_with(|| {
             let mut buf = [0u8; 4];
@@ -626,12 +650,21 @@ impl Handler {
     }
 
     fn allocate_index_with(&self, mut draw: impl FnMut() -> Result<u32>) -> Result<u32> {
-        // Both tables are bounded far below 2^32, so this ends quickly.
-        let hs = self.handshakes.lock().expect("handshakes lock");
-        let kps = self.keypairs.read().expect("keypairs lock");
+        let group = self.group.read().expect("group lock").upgrade();
+        let members = group.map(|mh| mh.handlers()).unwrap_or_default();
+        // Each table is looked at under its own lock, one at a time: two
+        // members allocating at once would otherwise each hold their own
+        // while waiting for the other's. The tables are bounded far below
+        // 2^32, so this ends quickly.
+        let in_use = |h: &Handler, idx| h.has_handshake_index(idx) || h.has_keypair_index(idx);
         loop {
             let idx = draw()?;
-            if idx != 0 && !hs.contains_key(&idx) && !kps.contains_key(&idx) {
+            if idx != 0
+                && !in_use(self, idx)
+                && !members
+                    .iter()
+                    .any(|m| !std::ptr::eq(&**m, self) && in_use(m, idx))
+            {
                 return Ok(idx);
             }
         }
@@ -1393,6 +1426,40 @@ mod tests {
         assert!(a.install_initiator_keypair(c.public_key(), kp).is_err());
         assert!(Arc::ptr_eq(&a.keypairs.read().unwrap()[&kp_idx], &old));
         assert!(!a.sessions.read().unwrap().contains_key(&c.public_key()));
+    }
+
+    /// Members of a MultiHandler draw indexes no other member uses: the
+    /// multiplexer routes by index to the first member owning it, so a
+    /// shared one sent a member's traffic to another.
+    #[test]
+    fn a_local_index_is_unique_across_a_multihandler() {
+        let (a, b) = pair();
+        let c = Handler::new(Config::default()).unwrap();
+        handshake(&a, &b);
+        let kp_idx = *a.keypairs.read().unwrap().keys().next().unwrap();
+        a.add_peer(c.public_key());
+        a.initiate_handshake(&c.public_key()).unwrap();
+        let hs_idx = *a.handshakes.lock().unwrap().keys().next().unwrap();
+        let other = Handler::new(Config::default()).unwrap();
+        let mh = crate::wg::MultiHandler::new(vec![a.clone(), other.clone()]).unwrap();
+
+        let mut draws = [kp_idx, hs_idx, 7].into_iter();
+        let got = other
+            .allocate_index_with(|| Ok(draws.next().unwrap()))
+            .unwrap();
+        assert_eq!(got, 7);
+
+        // Once out of the multiplexer, only its own tables count.
+        mh.remove_handler(&other.public_key()).unwrap();
+        let got = other.allocate_index_with(|| Ok(kp_idx)).unwrap();
+        assert_eq!(got, kp_idx);
+        // And a handler added later joins in.
+        mh.add_handler(other.clone()).unwrap();
+        let mut draws = [kp_idx, 9].into_iter();
+        let got = other
+            .allocate_index_with(|| Ok(draws.next().unwrap()))
+            .unwrap();
+        assert_eq!(got, 9);
     }
 
     /// Both ends initiate at once and both handshakes complete. Each side

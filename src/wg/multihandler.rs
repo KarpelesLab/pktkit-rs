@@ -6,10 +6,15 @@
 //!   index and find the handler that has a pending handshake for it.
 //! - **type 4 (transport)**: extract the receiver index and find the handler
 //!   that owns a keypair for it.
+//!
+//! Routing by index needs each index to name one handler, so while a
+//! handler is a member it draws its local indexes to be free in every
+//! member, not only in its own tables. A handler belongs to one
+//! `MultiHandler` at a time for this purpose: adding it to another moves it.
 
 use std::io;
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, Weak};
 
 use crate::Result;
 use crate::wg::NoisePublicKey;
@@ -31,6 +36,9 @@ pub struct MultiPacketResult {
 #[derive(Debug)]
 pub struct MultiHandler {
     handlers: RwLock<Vec<Arc<Handler>>>,
+    /// Handed to members, which look each other up through it when drawing
+    /// an index.
+    me: Weak<MultiHandler>,
 }
 
 impl MultiHandler {
@@ -52,8 +60,14 @@ impl MultiHandler {
                 ));
             }
         }
-        Ok(Arc::new(MultiHandler {
-            handlers: RwLock::new(handlers),
+        Ok(Arc::new_cyclic(|me: &Weak<MultiHandler>| {
+            for h in &handlers {
+                h.set_group(me.clone());
+            }
+            MultiHandler {
+                handlers: RwLock::new(handlers),
+                me: me.clone(),
+            }
         }))
     }
 
@@ -84,6 +98,7 @@ impl MultiHandler {
                 "handler with this public key already exists",
             ));
         }
+        h.set_group(self.me.clone());
         g.push(h);
         Ok(())
     }
@@ -91,7 +106,9 @@ impl MultiHandler {
     pub fn remove_handler(&self, pubkey: &NoisePublicKey) -> Option<Arc<Handler>> {
         let mut g = self.handlers.write().expect("multihandler lock");
         let idx = g.iter().position(|h| h.public_key() == *pubkey)?;
-        Some(g.remove(idx))
+        let h = g.remove(idx);
+        h.leave_group(&self.me);
+        Some(h)
     }
 
     /// Route + process one incoming packet.
