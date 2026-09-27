@@ -226,6 +226,21 @@ impl Nat64 {
         let Some(outside_ip) = self.outside_ipv4() else {
             return;
         };
+        // An IPv6 payload may reach 65535 bytes, an IPv4 packet with its
+        // header may not: the Total Length would wrap. IPv4 cannot carry it,
+        // so, as for any path MTU too small for a packet (RFC 7915 §5.1), the
+        // sender is told the largest IPv6 packet that would translate to a
+        // full-size IPv4 one.
+        if IPV4_MIN_HEADER + data.len() > usize::from(u16::MAX) {
+            let mtu = (usize::from(u16::MAX) - IPV4_MIN_HEADER + off) as u32;
+            if let Some(me) = self.pref64().and_then(|p| p.embed(outside_ip))
+                && let Some(err) =
+                    crate::icmp::packet_too_big(Packet::from_slice(pkt), IpAddr::V6(me), mtu)
+            {
+                self.inside.deliver(Packet::from_slice(&err));
+            }
+            return;
+        }
 
         match (next_header, frag) {
             // A non-first fragment carries no ports and needs no mapping:
@@ -2045,5 +2060,32 @@ mod tests {
         set_tos(&mut r, 0xBB);
         nat.outside().send(Packet::from_slice(&r)).unwrap();
         assert_eq!(tc_of(&inside.lock().unwrap()[0]), 0xBB);
+    }
+
+    #[test]
+    fn packet_too_large_for_ipv4_gets_packet_too_big() {
+        let (nat, inside, outside) = wired();
+        // The largest IPv6 payload, which no IPv4 header can describe.
+        let big = build_v6_udp(CLIENT.parse().unwrap(), 1, wkp(SERVER), 53, &[0; 65527]);
+        nat.inside().send(Packet::from_slice(&big)).unwrap();
+        assert!(
+            outside.lock().unwrap().is_empty(),
+            "sent a malformed packet"
+        );
+        {
+            let got = inside.lock().unwrap();
+            assert_eq!(got.len(), 1);
+            assert_eq!(got[0][40], 2, "Packet Too Big");
+            let mtu = u32::from_be_bytes([got[0][44], got[0][45], got[0][46], got[0][47]]);
+            assert_eq!(mtu, 65535 + 20);
+            assert!(v6_sum_ok(&got[0]));
+        }
+
+        // The largest that does fit goes through.
+        let fits = build_v6_udp(CLIENT.parse().unwrap(), 1, wkp(SERVER), 53, &[0; 65507]);
+        nat.inside().send(Packet::from_slice(&fits)).unwrap();
+        let out = outside.lock().unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(u16::from_be_bytes([out[0][2], out[0][3]]), 65535);
     }
 }
