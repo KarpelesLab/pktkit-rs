@@ -18,14 +18,15 @@
 //!    or Ethernet frames (tap) and delivered to the adapter; outgoing packets
 //!    are encrypted and emitted.
 //!
-//! The structure follows OpenVPN's `ssl.c`: a peer holds up to two
-//! [`Session`]s (`tls_session`) -- the *active* one carrying the data channel
-//! and an *initial* one a new hard reset is negotiating -- and every control
-//! packet is routed to a session by the sender's session id. A session that
-//! authenticates replaces the active one, so a client that restarts from the
-//! same address reconnects, while a stray hard reset cannot disturb a working
-//! session. Each session runs its TLS handshake in a [`KeyState`]
-//! (`key_state`).
+//! The structure follows OpenVPN's `ssl.c`: a peer holds up to three
+//! [`Session`]s (`tls_session`) -- the *active* one carrying the data channel,
+//! an *initial* one a new hard reset is negotiating, and an *untrusted* one
+//! whose hard reset has not yet been shown to come from whoever sent it --
+//! and every control packet is routed to a session by the sender's session
+//! id. A session that authenticates replaces the active one, so a client
+//! that restarts from the same address reconnects, while a stray hard reset
+//! can disturb neither a working session nor one being negotiated. Each
+//! session runs its TLS handshake in a [`KeyState`] (`key_state`).
 //!
 //! The Rust code is single-threaded and event-driven — each inbound datagram
 //! is processed synchronously and any work that can make progress does so.
@@ -249,9 +250,15 @@ pub struct Peer {
     first_local_id: Option<[u8; 8]>,
     /// The session carrying the data channel (OpenVPN's `TM_ACTIVE`).
     active: Option<Session>,
-    /// A session still negotiating (OpenVPN's `TM_INITIAL`). Every session
-    /// starts here and replaces `active` once it authenticates.
+    /// A session still negotiating (OpenVPN's `TM_INITIAL`). It replaces
+    /// `active` once it authenticates.
     initial: Option<Session>,
+    /// A session opened by a hard reset while another session exists, not
+    /// yet shown to come from whoever sent the reset: without tls-auth
+    /// anyone can send one from the client's address. It displaces
+    /// `initial` only once the sender has ACKed our hard reset, proving it
+    /// receives what we send to that address.
+    untrusted: Option<Session>,
     timers: PeerTimers,
     /// Hand authentication to the caller rather than calling `on_auth`.
     defer_auth: bool,
@@ -268,6 +275,7 @@ impl std::fmt::Debug for Peer {
         f.debug_struct("Peer")
             .field("active", &self.active.is_some())
             .field("initial", &self.initial.is_some())
+            .field("untrusted", &self.untrusted.is_some())
             .finish()
     }
 }
@@ -277,6 +285,7 @@ impl std::fmt::Debug for Peer {
 enum Slot {
     Active,
     Initial,
+    Untrusted,
 }
 
 impl Peer {
@@ -300,6 +309,7 @@ impl Peer {
             first_local_id: Some(local_id),
             active: None,
             initial: None,
+            untrusted: None,
             timers: PeerTimers::default(),
             defer_auth: false,
             next_auth_token: 0,
@@ -384,7 +394,7 @@ impl Peer {
     /// Control packets sent and not yet acknowledged, across all sessions.
     #[cfg(test)]
     pub(super) fn unacked_count(&self) -> usize {
-        [&self.active, &self.initial]
+        [&self.active, &self.initial, &self.untrusted]
             .into_iter()
             .flatten()
             .map(|s| s.primary.reliable.unacked_count())
@@ -395,6 +405,7 @@ impl Peer {
         match slot {
             Slot::Active => self.active.as_mut(),
             Slot::Initial => self.initial.as_mut(),
+            Slot::Untrusted => self.untrusted.as_mut(),
         }
     }
 
@@ -416,7 +427,7 @@ impl Peer {
     /// from for the ping-restart timeout is closed.
     pub fn tick(&mut self, now: Instant) -> io::Result<PeerOutput> {
         let mut out = PeerOutput::default();
-        for slot in [Slot::Active, Slot::Initial] {
+        for slot in [Slot::Active, Slot::Initial, Slot::Untrusted] {
             let Some(s) = self.session_mut(slot) else {
                 continue;
             };
@@ -493,31 +504,43 @@ impl Peer {
     /// fatal to the connection is reported as `Ok` with
     /// [`PeerOutput::close`] set instead.
     pub fn handle_packet(&mut self, data: &[u8]) -> io::Result<PeerOutput> {
+        self.handle_packet_at(data, Instant::now())
+    }
+
+    /// [`handle_packet`](Self::handle_packet), as if received at `now`.
+    pub(super) fn handle_packet_at(&mut self, data: &[u8], now: Instant) -> io::Result<PeerOutput> {
         let Some(&first) = data.first() else {
             return Err(invalid("empty packet"));
         };
         let (opcode, key_id) = Opcode::from_byte(first);
-        let out = match opcode {
-            Opcode::DATA_V1 => self.handle_data(key_id, data),
+        let (out, active) = match opcode {
+            // Data only ever goes to the active session.
+            Opcode::DATA_V1 => (self.handle_data(key_id, data)?, true),
             // Only a client (key method 2) hard reset may open a session;
             // P_DATA_V2 needs a peer-id we never push; the rest are unknown.
             Opcode::CONTROL_HARD_RESET_CLIENT_V2
             | Opcode::CONTROL_SOFT_RESET_V1
             | Opcode::CONTROL_V1
-            | Opcode::ACK_V1 => self.handle_control(key_id, data),
-            _ => Err(invalid(format!("unexpected opcode {opcode}"))),
-        }?;
-        // Only a packet that got past validation counts as hearing from
-        // the client.
-        let now = Instant::now();
-        self.last_recv = now;
+            | Opcode::ACK_V1 => self.handle_control(key_id, data)?,
+            _ => return Err(invalid(format!("unexpected opcode {opcode}"))),
+        };
+        // Only a packet that got past validation, and that belongs to the
+        // session in use, counts as hearing from the client: a hard reset
+        // anyone can send from its address must not hold off ping-restart.
+        // A session that has just taken over counts too.
+        if active || out.connected.is_some() {
+            self.last_recv = now;
+        }
         if !out.send.is_empty() {
             self.last_sent = now;
         }
         Ok(out)
     }
 
-    fn handle_control(&mut self, key_id: u8, data: &[u8]) -> io::Result<PeerOutput> {
+    /// Handle a control packet. Returns the output, and whether the packet
+    /// belonged to the active session -- the only one whose packets say the
+    /// client is still there.
+    fn handle_control(&mut self, key_id: u8, data: &[u8]) -> io::Result<(PeerOutput, bool)> {
         let pkt = ControlPacket::parse(data)?;
         let sid = pkt.session_id;
         if sid == [0; 8] {
@@ -529,10 +552,12 @@ impl Peer {
         let mut reset = None;
         // For a new session: what its reliable layer made of the hard reset.
         let mut opened = None;
-        let slot = if self.active.as_ref().is_some_and(|s| s.remote_id == sid) {
+        let mut slot = if self.active.as_ref().is_some_and(|s| s.remote_id == sid) {
             Slot::Active
         } else if self.initial.as_ref().is_some_and(|s| s.remote_id == sid) {
             Slot::Initial
+        } else if self.untrusted.as_ref().is_some_and(|s| s.remote_id == sid) {
+            Slot::Untrusted
         } else if pkt.opcode == Opcode::CONTROL_HARD_RESET_CLIENT_V2 {
             // A new session: it starts with packet 0 on key 0.
             if pkt.pid != Some(0) || key_id != 0 {
@@ -549,17 +574,22 @@ impl Peer {
             let (mut session, server_reset) =
                 Session::new(&self.config, local_id, sid, self.timers)?;
             // The packet has to pass the new session's checks before the
-            // session displaces anything (tls_pre_decrypt validates first):
-            // otherwise a reset it would refuse -- one ACKing packets of a
-            // session nobody knows, say -- still wipes out a handshake in
-            // progress.
+            // session takes a slot (tls_pre_decrypt validates first).
             opened = Some(session.primary.recv(key_id, pkt.clone())?);
             self.first_local_id = None;
-            // Replaces any session still negotiating: the client that sent
-            // it has given up on it.
-            self.initial = Some(session);
             reset = Some(server_reset);
-            Slot::Initial
+            // The peer's first session has nothing to displace. Any later
+            // one waits in the untrusted slot -- replacing whatever reset
+            // was waiting there, which costs nothing -- until the sender
+            // shows it gets our answers: a reset anyone could send must
+            // not end a handshake in progress.
+            if self.active.is_none() && self.initial.is_none() {
+                self.initial = Some(session);
+                Slot::Initial
+            } else {
+                self.untrusted = Some(session);
+                Slot::Untrusted
+            }
         } else {
             return Err(invalid("control packet for no known session"));
         };
@@ -588,6 +618,14 @@ impl Peer {
             Some(bytes) => bytes,
             None => session.primary.recv(key_id, pkt)?,
         };
+        // The ACK of our hard reset proves the sender receives what we send
+        // to this address: the client restarted, and has given up on any
+        // session still negotiating, which this one now replaces.
+        if slot == Slot::Untrusted && session.primary.reliable.reset_acked() {
+            self.initial = self.untrusted.take();
+            slot = Slot::Initial;
+        }
+        let session = self.session_mut(slot).expect("slot just resolved");
         if let Some(reset) = reset {
             // Our reset carries the ACK for theirs.
             out.send
@@ -595,17 +633,27 @@ impl Peer {
         }
         if let Err(e) = session.process_tls(&tls_bytes, &auth, &mut out) {
             self.fail_key(slot, &mut out, e);
-            return Ok(out);
+            return Ok((out, slot == Slot::Active));
         }
         self.settle(slot, &mut out);
-        Ok(out)
+        Ok((out, slot == Slot::Active))
     }
 
     /// After a session made progress: a session that has authenticated
     /// takes over the data channel.
     fn settle(&mut self, slot: Slot, out: &mut PeerOutput) {
-        if slot == Slot::Initial && self.initial.as_ref().is_some_and(|s| s.primary.kx_done) {
-            let session = self.initial.take();
+        // Authenticating is as good a proof as any that an untrusted
+        // session's client is the real one.
+        let done = match slot {
+            Slot::Active => None,
+            Slot::Initial => self.initial.as_ref(),
+            Slot::Untrusted => self.untrusted.as_ref(),
+        };
+        if done.is_some_and(|s| s.primary.kx_done) {
+            let session = match slot {
+                Slot::Untrusted => self.untrusted.take(),
+                _ => self.initial.take(),
+            };
             out.connected = session.as_ref().and_then(|s| s.peer_cfg.clone());
             out.replaced = self.active.is_some();
             self.active = session;
@@ -670,6 +718,8 @@ impl Peer {
             Some(Slot::Active)
         } else if pending(&self.initial) {
             Some(Slot::Initial)
+        } else if pending(&self.untrusted) {
+            Some(Slot::Untrusted)
         } else {
             None
         }
@@ -695,8 +745,9 @@ impl Peer {
         match slot {
             Slot::Active => self.active = None,
             Slot::Initial => self.initial = None,
+            Slot::Untrusted => self.untrusted = None,
         }
-        if self.active.is_none() && self.initial.is_none() {
+        if self.active.is_none() && self.initial.is_none() && self.untrusted.is_none() {
             out.close = true;
             out.error = err;
         }

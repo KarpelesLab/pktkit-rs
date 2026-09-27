@@ -640,6 +640,72 @@ fn stray_hard_reset_does_not_disturb_the_active_session() {
     );
 }
 
+/// Without tls-auth anyone who knows a client's address can send a hard
+/// reset from it. One arriving while the client's own handshake is under
+/// way must not displace it: the new session waits in an untrusted slot
+/// until it proves the sender got our answer.
+#[test]
+fn spoofed_hard_reset_does_not_kill_a_handshake_in_progress() {
+    let mut server = Peer::new(server_config(), *b"SERVERID", auth_hook()).unwrap();
+    let mut client = TestClient::new(*b"CLIENTID");
+    let out = server.handle_packet(&client.hard_reset()).unwrap();
+    let mut to_server = Vec::new();
+    for d in out.send {
+        to_server.extend(client.handle(&d));
+    }
+    client.pump_tls(&mut to_server);
+    assert!(!to_server.is_empty());
+
+    for sid in [*b"SPOOFER1", *b"SPOOFER2"] {
+        let out = server
+            .handle_packet(&TestClient::new(sid).hard_reset())
+            .unwrap();
+        assert!(!out.close);
+    }
+    // The genuine client carries on where it was, and gets through.
+    let keys = connect_from(&mut server, &mut client, to_server);
+    assert_eq!(deliver(&mut server, &keys, 1, b"hi"), Some(b"hi".to_vec()));
+}
+
+/// A new session that does prove the client got our answer -- the ACK of
+/// our hard reset -- takes over from one still negotiating: the client
+/// restarted and gave up on the old one.
+#[test]
+fn a_reachable_new_session_replaces_a_negotiating_one() {
+    let mut server = Peer::new(server_config(), *b"SERVERID", auth_hook()).unwrap();
+    let mut stale = TestClient::new(*b"CLIENT-1");
+    server.handle_packet(&stale.hard_reset()).unwrap();
+    let mut client = TestClient::new(*b"CLIENT-2");
+    let keys = connect(&mut server, &mut client);
+    assert_eq!(deliver(&mut server, &keys, 1, b"hi"), Some(b"hi".to_vec()));
+    let mut again = ControlPacket::new(Opcode::CONTROL_V1, 0, *b"CLIENT-1", [0; 8]);
+    again.set_pid(1);
+    assert!(
+        server.handle_packet(&again.to_bytes(&[])).is_err(),
+        "the abandoned session is gone"
+    );
+}
+
+/// Only the session carrying the data channel says the client is alive:
+/// hard resets anyone can send from its address must not hold off
+/// ping-restart.
+#[test]
+fn packets_for_other_sessions_do_not_count_as_hearing_from_the_client() {
+    let mut server = Peer::new(server_config(), *b"SERVERID", auth_hook()).unwrap();
+    let mut client = TestClient::new(*b"CLIENTID");
+    connect(&mut server, &mut client);
+    let t0 = Instant::now();
+    for (i, s) in [100u64, 110, 120].into_iter().enumerate() {
+        let sid = [b'0' + i as u8; 8];
+        let reset = TestClient::new(sid).hard_reset();
+        server
+            .handle_packet_at(&reset, t0 + Duration::from_secs(s))
+            .unwrap();
+    }
+    let out = server.tick(t0 + Duration::from_secs(125)).unwrap();
+    assert!(out.close, "ping-restart should have fired");
+}
+
 /// A retransmitted hard reset is a duplicate of the session's packet 0: it is
 /// ACKed again, not answered with another server reset.
 #[test]

@@ -316,6 +316,11 @@ impl Reliable {
         pkt
     }
 
+    /// Whether the peer has acknowledged our reset, this stream's packet 0.
+    pub fn reset_acked(&self) -> bool {
+        self.out_counter > 0 && !self.unacked.contains_key(&0)
+    }
+
     /// Build a standalone ACK packet (no pid of its own). The ACK pids are
     /// supplied at serialization time via [`ControlPacket::to_bytes`].
     pub fn build_ack(&self) -> ControlPacket {
