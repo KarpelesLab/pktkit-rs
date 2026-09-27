@@ -539,6 +539,11 @@ pub mod icmpv6 {
     /// Codes for [`TIME_EXCEEDED`].
     pub const CODE_HOP_LIMIT_EXCEEDED: u8 = 0;
     pub const CODE_REASSEMBLY_TIMEOUT: u8 = 1;
+
+    /// Codes for [`PARAMETER_PROBLEM`].
+    pub const CODE_BAD_HEADER_FIELD: u8 = 0;
+    pub const CODE_UNRECOGNIZED_NEXT_HEADER: u8 = 1;
+    pub const CODE_UNRECOGNIZED_OPTION: u8 = 2;
 }
 
 /// An ICMP or ICMPv6 message.

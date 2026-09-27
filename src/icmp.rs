@@ -9,7 +9,12 @@
 //! from `from` back to the offending packet's source, or `None` when the RFC
 //! forbids a reply. Those rules ([`may_reply`]) are what stop an error storm:
 //! never answer an error with an error, never answer a fragment other than the
-//! first, and never answer anything that was broadcast or multicast.
+//! first, and never answer anything that was broadcast or multicast (save the
+//! two ICMPv6 errors RFC 4443 exempts).
+//!
+//! RFC 4443 §2.4(f) and RFC 1812 §4.3.2.8 also want the rate of errors
+//! limited; a sender that generates them should gate each on a
+//! [`RateLimiter`].
 //!
 //! ```
 //! # use pktkit::{icmp, Packet, Protocol};
@@ -29,8 +34,11 @@
 
 use crate::build::{build_icmpv4, build_icmpv6, build_ipv4, build_ipv6};
 use crate::l4::{IcmpMessage, icmpv4, icmpv6};
+use crate::time::Instant;
 use crate::{Packet, Protocol};
 use std::net::IpAddr;
+use std::sync::Mutex;
+use std::time::Duration;
 
 /// TTL / hop limit given to generated error messages.
 const ERROR_TTL: u8 = 64;
@@ -64,7 +72,15 @@ pub enum IcmpError {
 /// fragment other than the first, was sent to a broadcast or multicast address,
 /// or came *from* an address that cannot be a unique host. Sending anyway is
 /// how a pair of misconfigured routers turns one bad packet into a loop.
+///
+/// This is the answer for an error of any kind. [`error`] also knows which
+/// error it is sending, and so allows the multicast exceptions of RFC 4443
+/// §2.4(e).
 pub fn may_reply(orig: &Packet) -> bool {
+    may_reply_with(orig, None)
+}
+
+fn may_reply_with(orig: &Packet, err: Option<IcmpError>) -> bool {
     if !orig.is_valid() {
         return false;
     }
@@ -72,7 +88,9 @@ pub fn may_reply(orig: &Packet) -> bool {
     if is_later_fragment(orig) {
         return false;
     }
-    if orig.is_multicast() || orig.is_broadcast() {
+    if (orig.is_multicast() || orig.is_broadcast())
+        && !err.is_some_and(|e| multicast_exempt(orig, e))
+    {
         return false;
     }
     let src = match orig.src_addr() {
@@ -82,8 +100,10 @@ pub fn may_reply(orig: &Packet) -> bool {
     if src.is_unspecified() || src.is_multicast() {
         return false;
     }
+    // RFC 1812 §4.3.2.7: no single host sends from a broadcast, loopback or
+    // Class E (240/4) address, so there is nobody to tell.
     if let IpAddr::V4(v4) = src
-        && v4.is_broadcast()
+        && (v4.is_broadcast() || v4.is_loopback() || v4.octets()[0] >= 240)
     {
         return false;
     }
@@ -109,6 +129,24 @@ pub fn may_reply(orig: &Packet) -> bool {
     true
 }
 
+/// The ICMPv6 errors RFC 4443 §2.4(e) still sends for a packet to a
+/// multicast group: Packet Too Big, so path MTU discovery works for
+/// multicast, and Parameter Problem for an unrecognised option whose type
+/// asks for a report even then (its top two bits `10`).
+fn multicast_exempt(orig: &Packet, err: IcmpError) -> bool {
+    if orig.version() != 6 {
+        return false;
+    }
+    match err {
+        IcmpError::PacketTooBig(_) => true,
+        IcmpError::ParameterProblem(icmpv6::CODE_UNRECOGNIZED_OPTION, ptr) => orig
+            .as_bytes()
+            .get(ptr as usize)
+            .is_some_and(|opt| opt >> 6 == 0b10),
+        _ => false,
+    }
+}
+
 /// True if this is a fragment other than the first — one that carries payload
 /// but none of the headers a quoted error is supposed to include.
 fn is_later_fragment(p: &Packet) -> bool {
@@ -126,7 +164,7 @@ fn is_later_fragment(p: &Packet) -> bool {
 /// Returns `None` if [`may_reply`] forbids it, if `from` is from a different
 /// address family than the packet, or if the packet is malformed.
 pub fn error(orig: &Packet, from: IpAddr, err: IcmpError) -> Option<Vec<u8>> {
-    if !may_reply(orig) {
+    if !may_reply_with(orig, Some(err)) {
         return None;
     }
     let dst = orig.src_addr()?;
@@ -240,12 +278,62 @@ pub fn packet_too_big(orig: &Packet, from: IpAddr, mtu: u32) -> Option<Vec<u8>> 
     error(orig, from, IcmpError::PacketTooBig(mtu))
 }
 
+/// A token bucket for the error rate limit that RFC 4443 §2.4(f) requires
+/// (and RFC 1812 §4.3.2.8 recommends for ICMPv4): up to `burst` errors at
+/// once, refilled at `per_second`. Share one per source of errors.
+///
+/// ```
+/// # use pktkit::icmp::RateLimiter;
+/// let limit = RateLimiter::new(10, 5);
+/// assert!(limit.allow());
+/// ```
+#[derive(Debug)]
+pub struct RateLimiter {
+    per_second: u32,
+    burst: u32,
+    /// Tokens available, and when that was last worked out.
+    state: Mutex<(f64, Option<Instant>)>,
+}
+
+impl RateLimiter {
+    /// A limiter allowing `per_second` errors a second on average, and up to
+    /// `burst` in a row. It starts full.
+    pub fn new(per_second: u32, burst: u32) -> RateLimiter {
+        RateLimiter {
+            per_second,
+            burst,
+            state: Mutex::new((burst as f64, None)),
+        }
+    }
+
+    /// Take a token if one is available: true means the error may be sent.
+    pub fn allow(&self) -> bool {
+        self.allow_at(Instant::now())
+    }
+
+    fn allow_at(&self, now: Instant) -> bool {
+        let mut st = self.state.lock().unwrap();
+        let (tokens, last) = &mut *st;
+        let elapsed = last.map_or(Duration::ZERO, |l| now.saturating_duration_since(l));
+        *tokens = (*tokens + elapsed.as_secs_f64() * self.per_second as f64).min(self.burst as f64);
+        *last = Some(now);
+        if *tokens >= 1.0 {
+            *tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::build::{build_ipv4, build_ipv6, build_udp};
     use crate::l4::IcmpMessage;
+    use crate::time::Instant;
     use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::time::Duration;
 
     const HOST: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
     const PEER: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
@@ -417,5 +505,65 @@ mod tests {
         let p = Packet::from_slice(&reply);
         let msg = IcmpMessage::from_slice(p.transport_payload());
         assert_eq!(msg.payload().len(), buf.len());
+    }
+
+    /// An IPv6 packet to a multicast group, with a hop-by-hop header whose
+    /// one option has type `opt` (at offset 42).
+    fn v6_multicast_with_option(opt: u8) -> Vec<u8> {
+        let a: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let group: Ipv6Addr = "ff0e::1".parse().unwrap();
+        let udp = build_udp(a.into(), group.into(), 5000, 53, b"payload");
+        let mut hbh = vec![Protocol::UDP.0, 0, opt, 4, 0, 0, 0, 0];
+        hbh.extend_from_slice(&udp);
+        build_ipv6(a, group, Protocol(0), 64, &hbh)
+    }
+
+    #[test]
+    fn multicast_still_gets_packet_too_big_and_unknown_option_errors() {
+        let from: IpAddr = "2001:db8::fe".parse::<Ipv6Addr>().unwrap().into();
+        let buf = v6_multicast_with_option(0x80 | 0x1e);
+        let orig = Packet::from_slice(&buf);
+
+        // RFC 4443 §2.4(e): PMTUD works for multicast too...
+        assert!(packet_too_big(orig, from, 1280).is_some());
+        // ...and an option the sender asked to hear about even from a group.
+        assert!(error(orig, from, IcmpError::ParameterProblem(2, 42)).is_some());
+        // Everything else stays quiet.
+        assert!(error(orig, from, IcmpError::ParameterProblem(1, 42)).is_none());
+        assert!(port_unreachable(orig, from).is_none());
+
+        // An option whose type says "report only for unicast".
+        let buf = v6_multicast_with_option(0xc0 | 0x1e);
+        let orig = Packet::from_slice(&buf);
+        assert!(error(orig, from, IcmpError::ParameterProblem(2, 42)).is_none());
+    }
+
+    #[test]
+    fn no_errors_for_loopback_or_class_e_sources() {
+        for src in [Ipv4Addr::new(127, 0, 0, 1), Ipv4Addr::new(240, 0, 0, 1)] {
+            let udp = build_udp(src.into(), PEER.into(), 5000, 53, b"payload");
+            let buf = build_ipv4(src, PEER, Protocol::UDP, 64, &udp);
+            let orig = Packet::from_slice(&buf);
+            assert!(!may_reply(orig), "{src}");
+            assert!(time_exceeded(orig, ROUTER.into()).is_none(), "{src}");
+        }
+    }
+
+    #[test]
+    fn rate_limiter_allows_a_burst_then_the_rate() {
+        let l = RateLimiter::new(10, 2);
+        let t0 = Instant::now();
+        assert!(l.allow_at(t0));
+        assert!(l.allow_at(t0));
+        assert!(!l.allow_at(t0), "burst spent");
+        assert!(!l.allow_at(t0 + Duration::from_millis(50)));
+        assert!(
+            l.allow_at(t0 + Duration::from_millis(100)),
+            "one token a tenth of a second"
+        );
+        assert!(!l.allow_at(t0 + Duration::from_millis(100)));
+        // Idle time refills up to the burst, not beyond.
+        let later = t0 + Duration::from_secs(60);
+        assert!(l.allow_at(later) && l.allow_at(later) && !l.allow_at(later));
     }
 }
