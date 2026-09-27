@@ -28,11 +28,30 @@ pub(crate) struct UdpKey {
 pub(crate) struct UdpState {
     key: UdpKey,
     local_ip: IpAddr,
-    rx: Mutex<VecDeque<Vec<u8>>>,
+    rx: Mutex<RxQueue>,
     signal: Condvar,
     sink: Arc<dyn Fn(&[u8]) + Send + Sync>,
     /// Set when the owning client closes.
     closed: AtomicBool,
+}
+
+/// Bytes of payload a socket holds for its reader before further datagrams
+/// are dropped, as a kernel socket's receive buffer bounds it.
+const RX_BUF_BYTES: usize = 256 * 1024;
+
+/// Datagrams waiting to be read, and their total payload size.
+#[derive(Default)]
+struct RxQueue {
+    q: VecDeque<Vec<u8>>,
+    bytes: usize,
+}
+
+impl RxQueue {
+    fn pop_front(&mut self) -> Option<Vec<u8>> {
+        let d = self.q.pop_front()?;
+        self.bytes -= d.len();
+        Some(d)
+    }
 }
 
 fn client_closed() -> io::Error {
@@ -40,8 +59,19 @@ fn client_closed() -> io::Error {
 }
 
 impl UdpState {
+    /// Queue a datagram for the reader. When the reader has fallen behind
+    /// and the buffer is full, the datagram is dropped, as UDP allows: an
+    /// unread socket must not grow without bound.
     fn deliver(&self, payload: &[u8]) {
-        self.rx.lock().unwrap().push_back(payload.to_vec());
+        let mut rx = self.rx.lock().unwrap();
+        // One datagram always fits, whatever its size, as with a kernel
+        // socket's receive buffer.
+        if !rx.q.is_empty() && rx.bytes + payload.len() > RX_BUF_BYTES {
+            return;
+        }
+        rx.bytes += payload.len();
+        rx.q.push_back(payload.to_vec());
+        drop(rx);
         self.signal.notify_all();
     }
 }
@@ -191,7 +221,7 @@ impl UdpStack {
         let state = Arc::new(UdpState {
             key,
             local_ip,
-            rx: Mutex::new(VecDeque::new()),
+            rx: Mutex::new(RxQueue::default()),
             signal: Condvar::new(),
             sink: self.sink.clone(),
             closed: AtomicBool::new(false),
@@ -398,5 +428,31 @@ mod tests {
             b"answer",
         );
         assert!(stack.handle_inbound(Packet::from_slice(&reply)));
+    }
+
+    #[test]
+    fn receive_queue_is_bounded() {
+        let sink: Arc<dyn Fn(&[u8]) + Send + Sync> = Arc::new(|_b: &[u8]| {});
+        let stack = UdpStack::new(sink);
+        let conn = stack
+            .dial(
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+                SocketAddr::from(([10, 0, 0, 1], 53)),
+            )
+            .unwrap();
+        let payload = vec![0u8; 1000];
+        let reply = wrap_udp_v4(
+            Ipv4Addr::new(10, 0, 0, 1),
+            53,
+            Ipv4Addr::new(10, 0, 0, 2),
+            conn.local_addr().port(),
+            &payload,
+        );
+        for _ in 0..1000 {
+            stack.handle_inbound(Packet::from_slice(&reply));
+        }
+        let rx = conn.state.rx.lock().unwrap();
+        assert!(rx.bytes <= RX_BUF_BYTES);
+        assert_eq!(rx.q.len(), RX_BUF_BYTES / 1000);
     }
 }
