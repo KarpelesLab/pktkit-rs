@@ -221,12 +221,18 @@ pub struct Conn {
     rto_deadline: std::option::Option<Instant>,
     retries: u32,
     /// SND.NXT when the last RTO fired, while data sent before it is still
-    /// unacknowledged (RFC 6582's `recover`, applied to timeout recovery).
-    /// Everything below it counts as lost (RFC 5681 §3.1, RFC 6298 §5):
-    /// the send loop resends it from HighRxt on, as cwnd allows, before
-    /// any new data, so slow start repairs a whole lost flight in a
-    /// logarithmic number of round trips rather than a hole per round trip.
+    /// unacknowledged: go-back-N's limit. Everything below it counts as
+    /// lost (RFC 5681 §3.1, RFC 6298 §5): the send loop resends it from
+    /// HighRxt on, as cwnd allows, before any new data, so slow start
+    /// repairs a whole lost flight in a logarithmic number of round trips
+    /// rather than a hole per round trip.
     rto_recover: std::option::Option<u32>,
+    /// RFC 6582's `recover` after a timeout: SND.NXT when the RTO fired.
+    /// Go-back-N ends once the cumulative ACK reaches it, but segments it
+    /// resent needlessly still draw duplicate ACKs there: only an ACK past
+    /// it shows new data getting through (§3.2 step 1). Until then
+    /// duplicates do not start fast retransmit.
+    timeout_recover: std::option::Option<u32>,
     /// Our SYN or SYN-ACK timed out and was resent. The data transfer then
     /// starts from the loss window (RFC 5681 §3.1), not the initial window.
     syn_lost: bool,
@@ -369,6 +375,7 @@ impl Conn {
             rto_deadline: None,
             retries: 0,
             rto_recover: None,
+            timeout_recover: None,
             syn_lost: false,
             last_oow_ack: None,
             dup_acks: 0,
@@ -879,6 +886,7 @@ impl Conn {
             self.rto.reset_after_syn_loss();
         }
         self.rto_recover = None;
+        self.timeout_recover = None;
         self.dup_acks = 0;
         if let Some(sb) = self.send_buf.as_ref() {
             self.high_rxt = sb.una();
@@ -1519,6 +1527,12 @@ impl Conn {
             }
             None => false,
         };
+        // RFC 6675 §5.1 would let a SACK sender start a new recovery once
+        // the ACK reaches the mark, but duplicates count here without new
+        // SACK information, so needless resends would still look like loss.
+        if self.timeout_recover.is_some_and(|r| seq_after(ack, r)) {
+            self.timeout_recover = None;
+        }
         if fast_partial {
             self.cc.on_partial_ack(acked);
         } else {
@@ -1590,13 +1604,14 @@ impl Conn {
             }
             return;
         }
-        if self.rto_recover.is_some() {
-            // SND.UNA is still below `recover` from the last timeout, so these
+        if self.timeout_recover.is_some() {
+            // SND.UNA has not passed `recover` from the last timeout, so these
             // duplicates report losses that timeout recovery is already
-            // repairing, one partial ACK at a time. Fast retransmit now
-            // would cut ssthresh twice for one loss event and inflate cwnd
-            // far past the single segment slow start restarted from (RFC
-            // 6582 §3.2 step 1, §4.1).
+            // repairing, one partial ACK at a time, or segments go-back-N
+            // resent needlessly. Fast retransmit now would cut ssthresh
+            // twice for one loss event, inflate cwnd far past the single
+            // segment slow start restarted from, and resend yet more of
+            // what already arrived (RFC 6582 §3.2 step 1, §4).
             //
             // Their SACK blocks may show retransmissions arrived, which
             // leaves room in cwnd for the send loop to resend more of what
@@ -2091,6 +2106,7 @@ impl Conn {
             // have the first real loss's duplicate ACKs ignored.
             if synchronized && sb.unacked() > 0 {
                 self.rto_recover = Some(sb.nxt());
+                self.timeout_recover = self.rto_recover;
             }
             // A new repair episode: everything from SND.UNA is due again,
             // and a HighRxt left from an earlier one would hide the holes
@@ -4833,6 +4849,76 @@ mod tests {
         };
         let (first, second) = (iss(0), iss(1));
         assert!(second.wrapping_sub(first) < 1 << 20, "{first} {second}");
+    }
+
+    /// Every 4th segment of a large flight lost, and every ACK for the
+    /// rest, so the RTO fires. Go-back-N then resends segments the
+    /// receiver already holds, and their duplicate ACKs arrive once the
+    /// cumulative ACK has reached `recover`. Returns whether fast recovery
+    /// started after the timeout, and how many retransmissions were of
+    /// data the receiver already had.
+    fn post_rto_run(sack: bool, port: u16) -> (bool, usize) {
+        let conf = |l, r| {
+            big(l, r)
+                .send_buf_size(1 << 20)
+                .recv_buf_size(1 << 20)
+                .enable_sack(sack)
+        };
+        let mut client = Conn::new(conf(port, 80));
+        let mut server = Conn::new(conf(80, port));
+        drive_handshake(&mut client, &mut server);
+        let (_, mut out) = client.write(&vec![1u8; 1 << 20]);
+        for _ in 0..3 {
+            let acks = deliver(&mut server, &out);
+            read_all(&mut server);
+            out = deliver(&mut client, &acks);
+        }
+        assert!(out.len() >= 40);
+        let arrived: Vec<Vec<u8>> = out
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i % 4 != 0)
+            .map(|(_, p)| p.clone())
+            .collect();
+        let _lost_acks = deliver(&mut server, &arrived);
+        let recover = client.send_buf.as_ref().unwrap().nxt();
+        let mut out = fire_rto(&mut client);
+        let (mut fast_recovery, mut spurious) = (false, 0);
+        for _ in 0..40 {
+            let mut acks = Vec::new();
+            for p in &out {
+                let s = parse(p);
+                let rcv_nxt = server.recv_buf.as_ref().unwrap().nxt();
+                let end = s.seq.wrapping_add(s.payload.len() as u32);
+                if !s.payload.is_empty() && seq_before_eq(end, rcv_nxt) {
+                    spurious += 1;
+                }
+                acks.extend(server.handle_segment(&s));
+            }
+            read_all(&mut server);
+            acks.extend(server.take_outgoing());
+            out = Vec::new();
+            for a in &acks {
+                out.extend(client.handle_segment(&parse(a)));
+                fast_recovery |= client.cc.in_recovery();
+            }
+            let una = client.send_buf.as_ref().unwrap().una();
+            if seq_after(una, recover.wrapping_add(200_000)) {
+                break;
+            }
+        }
+        (fast_recovery, spurious)
+    }
+
+    #[test]
+    fn go_back_n_duplicates_do_not_start_fast_recovery() {
+        for (sack, port) in [(false, 40290), (true, 40291)] {
+            let (fast_recovery, spurious) = post_rto_run(sack, port);
+            assert!(
+                !fast_recovery,
+                "sack {sack}: fast recovery after the RTO, {spurious} needless resends"
+            );
+        }
     }
 
     #[test]
