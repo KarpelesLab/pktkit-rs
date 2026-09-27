@@ -4,8 +4,8 @@
 //! remote and receives datagrams from that remote, all framed as IP packets
 //! pushed through the owning [`Client`](super::Client)'s L3 handler. Inbound
 //! UDP packets the client receives are demultiplexed to the matching
-//! `UdpConn` by 4-tuple. This is the building block the (tunnel-routed) DNS
-//! path uses and mirrors the Go `vclient` `udpConn`.
+//! `UdpConn` by 4-tuple. DNS does not use it: [`Resolver`](super::Resolver)
+//! queries its servers from the host's own sockets.
 
 use super::next_ipv4_id;
 use super::tcp::pick_port;

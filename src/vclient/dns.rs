@@ -5,11 +5,12 @@
 //! [`UdpSocket`], querying each configured server in turn until one answers,
 //! and asks again over TCP when the answer comes back truncated.
 //!
-//! In the Go upstream, vclient routes DNS through the *virtual* network so
-//! lookups traverse the tunnel. That path is also available here once a
-//! `Client` is wired to a UDP transport; the standalone `Resolver` uses the
-//! host's real sockets and is handy for tests and for resolving the tunnel
-//! endpoints themselves.
+//! Lookups do not traverse the virtual network: the `Resolver`, and
+//! [`Client::resolve`](super::Client::resolve) and the HTTP client built on
+//! it, send their queries from the host's real sockets, so they see the
+//! host's routes and the servers must be reachable from the host. A server
+//! only reachable inside the virtual network needs a query of the caller's
+//! own, sent over a [`UdpConn`](super::UdpConn).
 
 // The resolver needs host UDP sockets, which wasm does not have. The codec
 // still builds there (the fuzz targets use it), with nothing to call it.
@@ -300,7 +301,8 @@ fn time_left(deadline: Option<Instant>) -> io::Result<Option<Duration>> {
     super::time_left(deadline, "DNS query timed out")
 }
 
-/// A DNS resolver over real UDP sockets.
+/// A DNS resolver over the host's real sockets (UDP, then TCP for a
+/// truncated answer); its queries do not cross the virtual network.
 #[cfg(not(target_family = "wasm"))]
 #[derive(Debug, Clone)]
 pub struct Resolver {

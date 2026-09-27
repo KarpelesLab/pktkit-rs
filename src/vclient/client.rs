@@ -27,7 +27,8 @@ use std::time::Duration;
 pub struct ClientConfig {
     /// IPv4/IPv6 prefix assigned to the client.
     pub prefix: Option<IpPrefix>,
-    /// DNS servers to use (overrides anything learned via DHCP).
+    /// DNS servers [`Client::resolve`] queries, from the host's own sockets.
+    /// The client learns none by itself; empty means `resolve` fails.
     pub dns: Vec<IpAddr>,
 }
 
@@ -147,7 +148,7 @@ impl Client {
         self.tcp.dial(local_ip, addr, timeout)
     }
 
-    /// Configure DNS servers (overrides DHCP-learned values).
+    /// Replace the DNS servers [`resolve`](Self::resolve) queries.
     pub fn set_dns(&self, dns: Vec<IpAddr>) {
         self.cfg.lock().unwrap().dns = dns;
     }

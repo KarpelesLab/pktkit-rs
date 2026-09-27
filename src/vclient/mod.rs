@@ -10,6 +10,7 @@
 //!   yields inbound [`TcpConn`]s (server side).
 //! - [`Client::dial_udp`] → a connected [`UdpConn`] over the virtual network.
 //! - [`Resolver`]: an RFC 1035 DNS resolver (A / AAAA), and [`Client::resolve`].
+//!   These query from the host's own sockets, not over the virtual network.
 //! - A hand-rolled HTTP/1.1 client ([`Request`] / [`Response`],
 //!   [`Client::http_get`]) — no third-party HTTP crate.
 //!

@@ -4,7 +4,9 @@
 //! builder, and parses status line, headers, and body (Content-Length and
 //! `Transfer-Encoding: chunked`). TLS is out of scope (the virtual network is
 //! the security boundary); this is plain HTTP suitable for talking to
-//! services reachable through the tunnel.
+//! services reachable through the tunnel. The connection crosses the virtual
+//! network, but a host name is resolved first with
+//! [`Client::resolve`], from the host's own sockets.
 
 use super::Client;
 use crate::time::Instant;
