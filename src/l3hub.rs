@@ -16,9 +16,9 @@ fn next_port_id() -> u64 {
 
 /// A routing hub that forwards IP packets between connected devices.
 ///
-/// `L3Hub` looks at each packet's destination address: if any connected device
-/// owns a prefix containing the destination, the packet is delivered to that
-/// device only. Broadcast and multicast are flooded to every port except the
+/// `L3Hub` looks at each packet's destination address: the connected device
+/// owning the longest prefix containing the destination gets the packet, and
+/// no other device does. Broadcast and multicast are flooded to every port except the
 /// source. A default route may be configured to absorb packets that don't
 /// match any connected prefix.
 ///
@@ -120,6 +120,13 @@ impl L3Hub {
 
         let ports: Vec<Arc<Port>> = self.ports.read().unwrap().clone();
 
+        // A detached device may still hold the handler it was given; what
+        // it sends is no longer the hub's to route.
+        if !ports.iter().any(|p| p.id == source_id) {
+            self.stats.record_dropped();
+            return;
+        }
+
         if pkt.is_broadcast() || pkt.is_multicast() {
             let mut sent = 0u64;
             for p in &ports {
@@ -136,12 +143,22 @@ impl L3Hub {
             return;
         }
 
-        for p in &ports {
-            if p.id != source_id && p.dev.addr().contains(dst) {
-                let _ = p.dev.send(pkt);
-                self.stats.record_forwarded(1);
-                return;
-            }
+        // Longest prefix wins, so a narrower network inside a wider one is
+        // reachable whatever order the ports were attached in. A device with
+        // no address owns nothing: its unspecified 0.0.0.0/0 would otherwise
+        // match every destination. Catch-alls go through the default route.
+        let best = ports
+            .iter()
+            .filter(|p| p.id != source_id)
+            .filter_map(|p| {
+                let prefix = p.dev.addr();
+                (prefix.is_valid() && prefix.contains(dst)).then_some((prefix.bits(), p))
+            })
+            .max_by_key(|(bits, _)| *bits);
+        if let Some((_, p)) = best {
+            let _ = p.dev.send(pkt);
+            self.stats.record_forwarded(1);
+            return;
         }
 
         if let Some(default_id) = *self.default_route.lock().unwrap() {
@@ -266,38 +283,71 @@ mod tests {
         assert_eq!(b_sink.inner.lock().unwrap().len(), 1);
     }
 
+    fn sink(prefix: &str) -> Sink {
+        let s = Sink::default();
+        s.set_addr(prefix.parse().unwrap()).unwrap();
+        s
+    }
+
+    fn count(s: &Sink) -> usize {
+        s.inner.lock().unwrap().len()
+    }
+
     #[test]
     fn default_route_catches_misses() {
         let hub = Arc::new(L3Hub::new());
-        let a = Arc::new(PipeL3::new("10.0.0.1/24".parse().unwrap()));
-        let gw = Sink::default();
-        gw.set_addr("172.16.0.1/16".parse().unwrap()).unwrap();
-
-        let _ha = hub.connect_arc(a.clone() as Arc<dyn L3Device>);
-        let _hg = hub.connect(gw.clone());
-
-        // Mark gw as default route.
+        let a = sink("10.0.0.1/24");
+        let ha = hub.connect(a.clone());
+        // Unconfigured: owns no prefix, so it must not look like a /0.
+        let unconfigured = Sink::default();
+        let _hu = hub.connect(unconfigured.clone());
+        let gw = sink("172.16.0.1/16");
         let gw_arc: Arc<dyn L3Device> = Arc::new(gw.clone());
-        // Need to add a third reference - but ptr_eq matches the one we passed.
-        // Simpler: register a fresh sink as default.
+        let _hg = hub.connect_arc(gw_arc.clone());
+        hub.set_default_route(&gw_arc);
 
-        let dr = Sink::default();
-        dr.set_addr("0.0.0.0/0".parse().unwrap()).unwrap();
-        let _hdr = hub.connect(dr.clone());
-        // We didn't expose set_default_route by arc-id, only by ptr — and the
-        // connect() impl wraps the device in a fresh Arc. So we look up via
-        // the actual Arc passed:
-        let dr_arc: Arc<dyn L3Device> = Arc::new(dr.clone());
-        let _hdr2 = hub.connect_arc(dr_arc.clone());
-        hub.set_default_route(&dr_arc);
-
-        // a sends to 8.8.8.8 which matches nobody's specific prefix... but
-        // dr's /0 prefix matches everything in the unicast loop, so the test
-        // would actually route to dr via the prefix path. Keep this test
-        // simple and just verify the default-route override doesn't crash.
-        let _ = (gw_arc,);
         let buf = v4([10, 0, 0, 1], [8, 8, 8, 8]);
+        hub.route(Packet::from_slice(&buf), ha.id);
+        assert_eq!(
+            count(&gw),
+            1,
+            "the default route takes what nothing else owns"
+        );
+        assert_eq!(count(&unconfigured), 0);
+    }
+
+    #[test]
+    fn the_longest_matching_prefix_wins() {
+        let hub = Arc::new(L3Hub::new());
+        let a = sink("192.168.0.1/24");
+        let wide = sink("10.0.0.1/8");
+        let narrow = sink("10.1.0.1/16");
+        let ha = hub.connect(a.clone());
+        let _hw = hub.connect(wide.clone());
+        let _hn = hub.connect(narrow.clone());
+
+        let buf = v4([192, 168, 0, 1], [10, 1, 0, 9]);
+        hub.route(Packet::from_slice(&buf), ha.id);
+        assert_eq!((count(&wide), count(&narrow)), (0, 1));
+
+        let buf = v4([192, 168, 0, 1], [10, 2, 0, 9]);
+        hub.route(Packet::from_slice(&buf), ha.id);
+        assert_eq!((count(&wide), count(&narrow)), (1, 1));
+    }
+
+    #[test]
+    fn a_detached_port_cannot_inject() {
+        let hub = Arc::new(L3Hub::new());
+        let a = Arc::new(PipeL3::new("10.0.0.1/24".parse().unwrap()));
+        let b = sink("10.0.1.1/24");
+        let ha = hub.connect_arc(a.clone() as Arc<dyn L3Device>);
+        let _hb = hub.connect(b.clone());
+        ha.close();
+
+        // The device still holds the handler the hub gave it.
+        let buf = v4([10, 0, 0, 1], [10, 0, 1, 5]);
         a.inject(Packet::from_slice(&buf)).unwrap();
+        assert_eq!(count(&b), 0);
     }
 
     #[test]
