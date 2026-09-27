@@ -213,7 +213,14 @@ pub struct Conn {
     ts_enabled: bool,
     ts_ok: bool,
     ts_recent: u32,
-    ts_offset_ms: u64, // wall-clock offset baseline
+    /// TSval is milliseconds since `ts_base` plus `ts_offset`: monotonic,
+    /// since a wall clock stepped back by NTP would have the peer's PAWS
+    /// drop everything we send, and offset per connection so TSvals do not
+    /// reveal the host's clock (RFC 7323 §7.1).
+    ts_base: Instant,
+    ts_offset: u32,
+    /// Last.ACK.sent (RFC 7323 §4.3): the ACK field we last sent.
+    last_ack_sent: Option<u32>,
 
     // SACK.
     sack_enabled: bool,
@@ -285,7 +292,14 @@ impl Conn {
 
         let mss = cfg.mss.max(1);
         let cc = make_cc(cfg.congestion, mss as u32);
-        let ts_offset_ms = wallclock_ms();
+        let ts_offset = super::secret::keyed_hash((
+            "tsval",
+            cfg.local_addr,
+            cfg.local_port,
+            cfg.remote_addr,
+            cfg.remote_port,
+            Instant::now(),
+        )) as u32;
 
         Self {
             cfg: cfg.clone(),
@@ -310,7 +324,9 @@ impl Conn {
             ts_enabled: cfg.enable_timestamps,
             ts_ok: false,
             ts_recent: 0,
-            ts_offset_ms,
+            ts_base: Instant::now(),
+            ts_offset,
+            last_ack_sent: None,
             sack_enabled: cfg.enable_sack,
             sack_ok: false,
             snd_wl: None,
@@ -491,17 +507,25 @@ impl Conn {
 
     // --- Options handling --------------------------------------------------
 
+    /// Options for our SYN, or for our SYN-ACK once the peer's SYN is in.
+    /// A SYN-ACK answers only what the SYN offered (RFC 7323 §2.2, §3.2;
+    /// RFC 2018 §2), and echoes the SYN's TSval.
     fn build_syn_options(&self) -> Vec<TcpOption> {
+        let synack = self.state != State::SynSent;
         let mut opts = Vec::with_capacity(4);
         // What we can receive, not the MSS we send with.
         opts.push(mss_option(self.cfg.mss.max(1)));
-        // Always offer wscale; shift=0 is valid and means "I support it".
-        opts.push(wscale_option(self.rcv_wnd_shift));
-        if self.sack_enabled {
+        // A SYN always offers wscale; shift=0 means "I support it".
+        if !synack || self.wscale_ok {
+            opts.push(wscale_option(self.rcv_wnd_shift));
+        }
+        if self.sack_enabled && (!synack || self.sack_ok) {
             opts.push(sack_perm_option());
         }
-        if self.ts_enabled {
+        if !synack && self.ts_enabled {
             opts.push(timestamp_option(self.ts_now(), 0));
+        } else if synack && self.ts_ok {
+            opts.push(timestamp_option(self.ts_now(), self.ts_recent));
         }
         opts
     }
@@ -555,21 +579,29 @@ impl Conn {
     }
 
     fn ts_now(&self) -> u32 {
-        wallclock_ms().wrapping_sub(self.ts_offset_ms) as u32
+        (self.ts_base.elapsed().as_millis() as u32).wrapping_add(self.ts_offset)
     }
 
     /// PAWS validation: drop segments with timestamps older than ts_recent.
-    fn update_timestamp(&mut self, opts: &[TcpOption]) -> bool {
+    fn update_timestamp(&mut self, seg: &Segment) -> bool {
         if !self.ts_ok {
             return true;
         }
-        let Some((ts_val, _)) = get_timestamp(opts) else {
+        let Some((ts_val, _)) = get_timestamp(&seg.options) else {
             return true;
         };
-        if self.ts_recent != 0 && (ts_val.wrapping_sub(self.ts_recent) as i32) < 0 {
+        if (ts_val.wrapping_sub(self.ts_recent) as i32) < 0 {
             return false;
         }
-        self.ts_recent = ts_val;
+        // RFC 7323 §4.3: only a segment at or before Last.ACK.sent, so an
+        // out-of-order one cannot put a TSval from beyond a hole in the
+        // echo; the hole's repair is what the peer should time.
+        if self
+            .last_ack_sent
+            .is_none_or(|last| seq_before_eq(seg.seq, last))
+        {
+            self.ts_recent = ts_val;
+        }
         true
     }
 
@@ -618,6 +650,7 @@ impl Conn {
 
     fn queue_seg(&mut self, seg: Segment) {
         if seg.has_flag(flags::ACK) && self.recv_buf.is_some() {
+            self.last_ack_sent = Some(seg.ack);
             let shift = if seg.has_flag(flags::SYN) || !self.wscale_ok {
                 0
             } else {
@@ -1016,7 +1049,7 @@ impl Conn {
     fn handle_data_state(&mut self, seg: &Segment) -> Vec<Vec<u8>> {
         let mut need_ack = false;
 
-        if !self.update_timestamp(&seg.options) {
+        if !self.update_timestamp(seg) {
             self.queue_ack();
             return self.take_outgoing();
         }
@@ -1836,10 +1869,6 @@ impl Conn {
 }
 
 // --- Helpers ---------------------------------------------------------------
-
-fn wallclock_ms() -> u64 {
-    crate::time::unix_now().as_millis() as u64
-}
 
 // Silence a noisy lint on `seq_in_range` not currently exercised; the helper
 // is part of the public seqspace surface and intentionally re-exported.
@@ -3060,6 +3089,89 @@ mod tests {
         client.keepalive_deadline = Some(Instant::now());
         client.tick();
         assert!(client.persist_deadline.is_some(), "persist cancelled");
+    }
+
+    fn ts_pair(port: u16) -> (Conn, Conn) {
+        let conf = |l, r| {
+            let mut c = cfg(l, r);
+            c.enable_timestamps = true;
+            c
+        };
+        let mut client = Conn::new(conf(port, 80));
+        let mut server = Conn::new(conf(80, port));
+        drive_handshake(&mut client, &mut server);
+        (client, server)
+    }
+
+    // RFC 7323 §3.2: the SYN-ACK echoes the SYN's TSval.
+    #[test]
+    fn syn_ack_echoes_syn_tsval() {
+        let mut conf = cfg(80, 40310);
+        conf.enable_timestamps = true;
+        let mut server = Conn::new(conf);
+        let syn = syn_with(vec![timestamp_option(123_456, 0)]);
+        let synack = parse(&server.accept_syn(&syn)[0]);
+        assert_eq!(get_timestamp(&synack.options).map(|t| t.1), Some(123_456));
+    }
+
+    // RFC 7323 §2.2, §3.2 and RFC 2018 §2: a SYN-ACK carries window scale,
+    // SACK-permitted and timestamps only in answer to a SYN that did.
+    #[test]
+    fn syn_ack_answers_only_offered_options() {
+        let mut conf = cfg(80, 40311);
+        conf.enable_timestamps = true;
+        let mut server = Conn::new(conf);
+        let synack = parse(&server.accept_syn(&syn_with(vec![mss_option(1460)]))[0]);
+        let kinds: Vec<u8> = synack.options.iter().map(|o| o.kind).collect();
+        assert_eq!(kinds, vec![options::kind::Mss], "{kinds:?}");
+
+        let mut conf = cfg(80, 40311);
+        conf.enable_timestamps = true;
+        let mut server = Conn::new(conf);
+        let offered = vec![
+            mss_option(1460),
+            wscale_option(7),
+            sack_perm_option(),
+            timestamp_option(1, 0),
+        ];
+        let synack = parse(&server.accept_syn(&syn_with(offered))[0]);
+        let o = &synack.options;
+        assert!(get_wscale(o).is_some() && has_sack_perm(o) && get_timestamp(o).is_some());
+    }
+
+    // RFC 7323 §4.3: TS.Recent follows only segments at or below the last
+    // ACK sent. An out-of-order one would have us echo a TSval from ahead
+    // of the hole, and its RTT sample would miss the repair.
+    #[test]
+    fn out_of_order_segment_does_not_update_ts_recent() {
+        let (mut client, server) = ts_pair(40312);
+        let before = client.ts_recent;
+        let mut seg = data_with_ack(
+            &client,
+            &server,
+            client.send_buf.as_ref().unwrap().una(),
+            b"x",
+            false,
+        );
+        seg.seq = seg.seq.wrapping_add(100);
+        seg.options = vec![timestamp_option(before.wrapping_add(1000), 0)];
+        client.handle_segment(&seg);
+        assert_eq!(client.ts_recent, before);
+
+        seg.seq = seg.seq.wrapping_sub(100);
+        client.handle_segment(&seg);
+        assert_eq!(client.ts_recent, before.wrapping_add(1000));
+    }
+
+    // Once negotiated, every segment but a RST carries a timestamp (RFC
+    // 7323 §3.2), zero-window probes included.
+    #[test]
+    fn persist_probe_carries_timestamp() {
+        let (mut client, _server) = ts_pair(40313);
+        client.snd_wnd = 0;
+        client.write(b"abc");
+        let probe = parse(&fire_persist(&mut client)[0]);
+        assert!(get_timestamp(&probe.options).is_some());
     }
 
     // RFC 6528: a new connection on the same 4-tuple starts just past the
