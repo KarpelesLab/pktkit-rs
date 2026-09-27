@@ -182,7 +182,7 @@ impl Server {
         if declined.len() >= MAX_LEASES && !declined.contains_key(&ip) {
             return;
         }
-        declined.insert(ip, now + self.cfg.lease_time);
+        declined.insert(ip, self.lease_end(now));
     }
 
     /// The table as of `now`: leases and offers that have run out are
@@ -301,7 +301,7 @@ impl Server {
     ) -> Answer {
         let lease = Lease {
             ip,
-            expiry: now + self.cfg.lease_time,
+            expiry: self.lease_end(now),
             bound: true,
         };
         let mask = u32::from(self.cfg.subnet_mask);
@@ -347,6 +347,26 @@ impl Server {
         }
         leases.insert(mac, lease);
         Answer::Ack(ip)
+    }
+
+    /// The lease time as option 51 carries it. Anything from 0xffffffff
+    /// seconds up is infinite (RFC 2131 §3.3), not a value to wrap.
+    fn lease_secs(&self) -> u32 {
+        u32::try_from(self.cfg.lease_time.as_secs()).unwrap_or(u32::MAX)
+    }
+
+    /// When a lease granted `now` runs out. A lease time too long for the
+    /// clock (`Duration::MAX` spells "forever" naturally enough) ends as far
+    /// out as the clock reaches, instead of panicking on a request from the
+    /// network.
+    fn lease_end(&self, now: Instant) -> Instant {
+        let mut d = self.cfg.lease_time;
+        loop {
+            if let Some(t) = now.checked_add(d) {
+                return t;
+            }
+            d /= 2;
+        }
     }
 
     /// Whether `ip` is one of the addresses this server hands out: in the
@@ -395,7 +415,7 @@ impl Server {
             b.ipv4_list_option(wire::OPT_DNS, &self.cfg.dns);
         }
         if yiaddr.is_some() {
-            b.u32_option(wire::OPT_LEASE_TIME, self.cfg.lease_time.as_secs() as u32);
+            b.u32_option(wire::OPT_LEASE_TIME, self.lease_secs());
             b.ipv4_option(wire::OPT_SERVER_ID, self.cfg.server_ip);
         }
         self.send_message(chaddr, &b.finish());
@@ -850,5 +870,24 @@ mod tests {
             s.handle_dhcp(&decline(mac, Some(Ipv4Addr::from(0x0a00_0000 + i)), us));
         }
         assert!(s.declined.lock().unwrap().len() <= MAX_LEASES);
+    }
+
+    #[test]
+    fn a_lease_time_beyond_32_bits_is_infinite_not_a_panic() {
+        for lease in [Duration::MAX, Duration::from_secs(1 << 33)] {
+            let (s, r) = recording(one_address_pool().lease_time(lease));
+            let mac = MacAddr([2, 0, 0, 0, 0, 1]);
+            s.handle_dhcp(&build_discover(1, mac));
+            let offer = replies(&r).remove(0);
+            assert_eq!(offer.lease_time, Some(u32::MAX), "wrapped, not saturated");
+            s.handle_dhcp(&request(1, mac, offer.yiaddr, Ipv4Addr::new(10, 0, 0, 1)));
+            assert_eq!(replies(&r)[0].msg_type, wire::MSG_ACK);
+            s.handle_dhcp(&decline(
+                mac,
+                Some(offer.yiaddr),
+                Some(Ipv4Addr::new(10, 0, 0, 1)),
+            ));
+            assert!(s.declined.lock().unwrap().contains_key(&offer.yiaddr));
+        }
     }
 }
