@@ -7,6 +7,7 @@
 //! `UdpConn` by 4-tuple. This is the building block the (tunnel-routed) DNS
 //! path uses and mirrors the Go `vclient` `udpConn`.
 
+use super::next_ipv4_id;
 use super::tcp::pick_port;
 use crate::time::Instant;
 use crate::{Packet, Protocol, checksum};
@@ -115,6 +116,19 @@ impl UdpConn {
     pub fn send(&self, buf: &[u8]) -> io::Result<usize> {
         if self.state.closed.load(Ordering::Acquire) {
             return Err(client_closed());
+        }
+        // The IPv4 total length and the UDP / IPv6 payload lengths are 16
+        // bits: past these, they would wrap and describe another datagram.
+        let max = if self.state.key.remote.is_ipv4() {
+            65535 - 20 - 8
+        } else {
+            65535 - 8
+        };
+        if buf.len() > max {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "datagram too large",
+            ));
         }
         let pkt = wrap_udp(
             self.state.local_ip,
@@ -322,6 +336,7 @@ fn wrap_udp_v4(src: Ipv4Addr, sp: u16, dst: Ipv4Addr, dp: u16, payload: &[u8]) -
     let mut ip = vec![0u8; total];
     ip[0] = 0x45;
     ip[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+    ip[4..6].copy_from_slice(&next_ipv4_id().to_be_bytes());
     ip[8] = 64;
     ip[9] = Protocol::UDP.as_u8();
     ip[12..16].copy_from_slice(&src.octets());
@@ -404,6 +419,42 @@ mod tests {
         let mut buf = [0u8; 16];
         let n = conn.recv(&mut buf).unwrap();
         assert_eq!(&buf[..n], b"answer");
+    }
+
+    #[test]
+    fn oversized_datagrams_are_refused_and_ids_vary() {
+        let sent: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
+        let s = sent.clone();
+        let sink: Arc<dyn Fn(&[u8]) + Send + Sync> =
+            Arc::new(move |b: &[u8]| s.lock().unwrap().push(b.to_vec()));
+        let stack = UdpStack::new(sink);
+        let v4 = stack
+            .dial(
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+                SocketAddr::from(([10, 0, 0, 1], 53)),
+            )
+            .unwrap();
+        let err = v4.send(&vec![0u8; 65508]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(sent.lock().unwrap().is_empty());
+        v4.send(&vec![0u8; 65507]).unwrap();
+        v4.send(b"x").unwrap();
+        {
+            let sent = sent.lock().unwrap();
+            assert_eq!(u16::from_be_bytes([sent[0][2], sent[0][3]]), 65535);
+            assert_eq!(sent[0].len(), 65535);
+            // Fragmentable datagrams, so each needs its own ID (RFC 6864).
+            assert_ne!(sent[0][4..6], sent[1][4..6]);
+        }
+
+        let v6 = stack
+            .dial(
+                IpAddr::V6("fd00::2".parse().unwrap()),
+                SocketAddr::from(("fd00::1".parse::<Ipv6Addr>().unwrap(), 53)),
+            )
+            .unwrap();
+        assert!(v6.send(&vec![0u8; 65528]).is_err());
+        v6.send(&vec![0u8; 65527]).unwrap();
     }
 
     #[test]

@@ -36,3 +36,13 @@ pub use dns::{RecordType, Resolver, ResolverConfig};
 pub use http::{DEFAULT_HTTP_TIMEOUT, Request, Response};
 pub use tcp::{Listener, TcpConn};
 pub use udp::UdpConn;
+
+/// Identification for the IPv4 datagrams the client sends. They go out
+/// without DF, so they may be fragmented on the way, and the ID is what
+/// tells one datagram's fragments from another's: it must differ between
+/// datagrams of one source, destination and protocol in flight together
+/// (RFC 6864 §4.1). One counter for every client covers that.
+fn next_ipv4_id() -> u16 {
+    static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}

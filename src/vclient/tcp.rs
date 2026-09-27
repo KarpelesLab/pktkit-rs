@@ -831,6 +831,7 @@ fn wrap_v4(src: Ipv4Addr, dst: Ipv4Addr, seg: &[u8]) -> Vec<u8> {
     let mut ip = vec![0u8; total];
     ip[0] = 0x45;
     ip[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+    ip[4..6].copy_from_slice(&super::next_ipv4_id().to_be_bytes());
     ip[8] = 64;
     ip[9] = Protocol::TCP.as_u8();
     ip[12..16].copy_from_slice(&src.octets());
