@@ -165,6 +165,10 @@ pub struct Nat {
     /// needs its sequence numbers looked at.
     seqadj_used: AtomicBool,
 
+    /// Networks behind a router on the inside, whose hosts may be
+    /// translated too (see [`set_inside_routes`](Self::set_inside_routes)).
+    inside_routes: std::sync::RwLock<Vec<IpPrefix>>,
+
     /// Inbound fragmented datagrams (when not reassembling): which inside
     /// host each one's first fragment went to, keyed by source, IP ID and
     /// protocol, so the rest can follow.
@@ -384,6 +388,7 @@ impl Nat {
             ns_sides: Mutex::new(HashMap::new()),
             self_ref: me.clone(),
             seqadj_used: AtomicBool::new(false),
+            inside_routes: std::sync::RwLock::new(Vec::new()),
             frags: Mutex::new(FragTable::default()),
             out_frags: Mutex::new(FragTable::default()),
             next_sweep: Mutex::new(Instant::now() + SWEEP_INTERVAL),
@@ -444,13 +449,36 @@ impl Nat {
     }
 
     /// Whether `ip` may be translated as the source of an inside host:
-    /// one on the inside network, and not the NAT itself nor a broadcast
-    /// address. Anything else is spoofed, or from a network the NAT was
-    /// not set up to serve.
+    /// one on the inside network (or a network routed behind it), and not
+    /// the NAT itself nor a broadcast address. Anything else is spoofed, or
+    /// from a network the NAT was not set up to serve.
     fn inside_source_ok(&self, ip: Ipv4Addr) -> bool {
-        self.inside.addr().contains(IpAddr::V4(ip))
-            && Some(ip) != self.inside_addr()
-            && !self.is_inside_broadcast(ip)
+        let ip_addr = IpAddr::V4(ip);
+        let known = self.inside.addr().contains(ip_addr)
+            || self
+                .inside_routes
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .any(|r| r.contains(ip_addr));
+        known && Some(ip) != self.inside_addr() && !self.is_inside_broadcast(ip)
+    }
+
+    /// Networks reached through a router on the inside, whose hosts the NAT
+    /// translates as well as those on the inside network itself.
+    ///
+    /// Outbound packets are translated only from sources the NAT serves;
+    /// any other source is spoofed, and is dropped. Hosts behind an inside
+    /// router -- a VPN's clients with addresses of their own, say -- have
+    /// sources outside the inside prefix: list their networks here. Replaces
+    /// any list set before; empty (the default) serves the inside network
+    /// alone. IPv6 prefixes are ignored.
+    pub fn set_inside_routes(&self, routes: Vec<IpPrefix>) {
+        let v4: Vec<IpPrefix> = routes.into_iter().filter(|r| r.is_v4()).collect();
+        *self
+            .inside_routes
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = v4;
     }
 
     /// Enable IPv4 defragmentation (off by default).
@@ -3603,6 +3631,23 @@ mod tests {
         }
         assert!(o.lock().unwrap().is_empty());
         assert_eq!(mapped(&nat), 0);
+    }
+
+    #[test]
+    fn hosts_on_a_routed_inside_network_are_translated() {
+        let (nat, _i, o) = setup();
+        let behind = Ipv4Addr::new(192, 168, 7, 7);
+        let p = build_udp(behind, 1000, REMOTE, 53, b"q");
+        nat.inside().send(Packet::from_slice(&p)).unwrap();
+        assert!(o.lock().unwrap().is_empty(), "not served until routed");
+
+        nat.set_inside_routes(vec![pfx("192.168.7.0/24")]);
+        nat.inside().send(Packet::from_slice(&p)).unwrap();
+        assert_eq!(o.lock().unwrap().len(), 1);
+        // Other networks are still refused.
+        let p = build_udp(Ipv4Addr::new(192, 168, 8, 7), 1000, REMOTE, 53, b"q");
+        nat.inside().send(Packet::from_slice(&p)).unwrap();
+        assert_eq!(o.lock().unwrap().len(), 1);
     }
 
     #[test]
