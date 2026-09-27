@@ -1871,6 +1871,60 @@ mod tests {
         );
     }
 
+    /// A SYN retransmitted just as the dial completes belongs to the
+    /// handshake under way: it must never meet the engine before the
+    /// handshake has started, which answers it with a RST.
+    #[test]
+    fn syn_retransmitted_as_the_dial_completes_is_not_reset() {
+        use std::net::TcpListener;
+        use std::sync::atomic::AtomicBool;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let mut held = Vec::new();
+            for s in listener.incoming() {
+                held.push(s);
+            }
+        });
+        let client = Ipv4Addr::new(10, 0, 0, 5);
+        let server = Ipv4Addr::new(127, 0, 0, 1);
+        for round in 0..50u16 {
+            let stack = Stack::new();
+            let resets = Arc::new(AtomicUsize::new(0));
+            let r = resets.clone();
+            stack.set_handler(Arc::new(move |p: &Packet| {
+                if Segment::parse(&p.as_bytes()[20..]).is_ok_and(|s| s.has_flag(tcp_flags::RST)) {
+                    r.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(())
+            }));
+            let mut vc = Conn::new(ConnConfig {
+                local_port: 40000 + round,
+                remote_port: port,
+                mss: 1460,
+                ..Default::default()
+            });
+            let syn = crate::slirp::packet::build_packet4(client, server, &vc.connect()[0]);
+            let done = Arc::new(AtomicBool::new(false));
+            let spammer = {
+                let (stack, syn, done) = (stack.clone(), syn.clone(), done.clone());
+                thread::spawn(move || {
+                    while !done.load(Ordering::SeqCst) {
+                        let _ = stack.send(Packet::from_slice(&syn));
+                    }
+                })
+            };
+            wait_for("the SYN-ACK", || {
+                let bridge = stack.inner.tcp.lock().unwrap().values().next().cloned();
+                bridge.is_some_and(|b| b.state().conn.lock().unwrap().state() != VtcpState::Closed)
+            });
+            done.store(true, Ordering::SeqCst);
+            spammer.join().unwrap();
+            assert_eq!(resets.load(Ordering::SeqCst), 0, "round {round}");
+        }
+    }
+
     #[test]
     fn client_reset_tears_the_whole_bridge_down() {
         use std::net::TcpListener;

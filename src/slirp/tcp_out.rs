@@ -156,10 +156,16 @@ impl TcpOutConn {
     }
 
     fn finish_dial(self: Arc<Self>, res: std::io::Result<(TcpStream, TcpStream)>) {
-        let Some(syn) = self.syn.lock().expect("poisoned").take() else {
+        // The SYN stays in place until the engine has taken it: while it is
+        // there, handle_segment holds back the client's segments, and a
+        // retransmitted SYN reaching the engine before accept_syn would draw
+        // a RST, as would a RST from the client go unheard.
+        let mut pending = self.syn.lock().expect("poisoned");
+        let Some(syn) = pending.as_ref() else {
             return;
         };
         if self.closed.load(Ordering::SeqCst) {
+            *pending = None;
             return; // torn down while dialing; dropping `res` closes the socket
         }
         let (remote, remote_read) = match res {
@@ -169,8 +175,11 @@ impl TcpOutConn {
                 // doesn't hang.
                 let (local_port, remote_port) = self.state.endpoints.ports();
                 let rst = build_refused_rst(remote_port, local_port, syn.seq);
-                self.state.wrap_and_send(vec![rst]);
                 self.closed.store(true, Ordering::SeqCst);
+                *pending = None;
+                // Not under the lock: the sink may answer synchronously.
+                drop(pending);
+                self.state.wrap_and_send(vec![rst]);
                 return;
             }
         };
@@ -178,10 +187,14 @@ impl TcpOutConn {
         // close() sets `closed` before it shuts the socket down, so either it
         // sees the socket stored above or this sees the flag.
         if self.closed.load(Ordering::SeqCst) {
+            *pending = None;
+            drop(pending);
             self.shutdown_remote(Shutdown::Both);
             return;
         }
-        let synack = self.state.conn.lock().expect("poisoned").accept_syn(&syn);
+        let synack = self.state.conn.lock().expect("poisoned").accept_syn(syn);
+        *pending = None;
+        drop(pending);
 
         // remote → client: real socket bytes become vtcp writes (→ segments).
         let b_r = self.clone();
