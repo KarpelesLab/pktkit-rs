@@ -345,10 +345,31 @@ impl Engine {
             let Some(_delivering) = self.delivering.acquire() else {
                 continue;
             };
-            for item in self.take_due() {
-                deliver(item.dir, &item.data);
+            // A handler that panics has already had the panic reported by
+            // the hook; there is nobody here to hand it to, and letting it
+            // end this thread would silently strand every later message.
+            let _ = self.deliver_due(&deliver);
+        }
+    }
+
+    /// Deliver everything that has come due, in release order. Each message
+    /// is delivered in isolation: one whose handler panics does not take the
+    /// rest of the batch with it. The first panic's payload is returned for
+    /// the caller to re-raise or drop.
+    fn deliver_due(
+        &self,
+        deliver: &dyn Fn(Direction, &[u8]),
+    ) -> Option<Box<dyn std::any::Any + Send>> {
+        let mut first_panic = None;
+        for item in self.take_due() {
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                deliver(item.dir, &item.data)
+            }));
+            if let Err(p) = r {
+                first_panic.get_or_insert(p);
             }
         }
+        first_panic
     }
 
     /// Apply the impairment to one message and either deliver it inline or
@@ -625,9 +646,15 @@ macro_rules! impaired_device {
             /// deadlock against a handler that wants a lock the caller holds.
             /// The delivery in progress picks up what has come due.
             pub fn poll(&self) -> Option<Duration> {
-                if let Some(_delivering) = self.engine.delivering.try_acquire() {
-                    for item in self.engine.take_due() {
-                        self.deliver(item.dir, &item.data);
+                if let Some(delivering) = self.engine.delivering.try_acquire() {
+                    let panicked = self
+                        .engine
+                        .deliver_due(&|dir, data| self.deliver(dir, data));
+                    drop(delivering);
+                    // The caller's own handler panicked: that is the caller's
+                    // to see, but only once the rest of the batch is out.
+                    if let Some(p) = panicked {
+                        std::panic::resume_unwind(p);
                     }
                 }
                 self.engine.until_next()
@@ -1243,6 +1270,43 @@ mod tests {
             done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
             "poll deadlocked against the release thread"
         );
+    }
+
+    /// Panics on a frame tagged 0xAA; records the rest.
+    struct Fussy(Mutex<Vec<u8>>);
+    impl L2Device for Fussy {
+        fn set_handler(&self, _h: L2Handler) {}
+        fn send(&self, f: &Frame) -> Result<()> {
+            let tag = f.as_bytes()[14];
+            assert_ne!(tag, 0xAA, "far side panics (expected by the test)");
+            self.0.lock().unwrap().push(tag);
+            Ok(())
+        }
+        fn hw_addr(&self) -> MacAddr {
+            MacAddr::zero()
+        }
+        fn close(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_panicking_handler_does_not_stop_the_release_thread() {
+        let wire = Arc::new(Fussy(Mutex::new(Vec::new())));
+        let link = ImpairL2::new(
+            wire.clone(),
+            Impairment::default().delay(Duration::from_millis(1)),
+        );
+        link.send(Frame::from_slice(&frame(0xAA))).unwrap();
+        // In the same batch as the panic, and in a later one.
+        link.send(Frame::from_slice(&frame(1))).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        link.send(Frame::from_slice(&frame(2))).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while wire.0.lock().unwrap().len() < 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(*wire.0.lock().unwrap(), vec![1, 2]);
     }
 
     #[test]
