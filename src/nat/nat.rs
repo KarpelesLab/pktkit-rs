@@ -896,11 +896,7 @@ impl Nat {
         whole: bool,
         fmax: Option<FragMax>,
     ) {
-        // A first fragment must at least hold the checksum field, which is
-        // patched here for the whole datagram (RFC 6146 §3.4 lets a
-        // translator insist on the header being in the first fragment).
-        let csum_end = ihl + if proto == PROTO_TCP { 18 } else { 8 };
-        if !whole && pkt.len() < csum_end {
+        if !whole && !l4_header_in(pkt, ihl, proto) {
             return;
         }
         let src_port = u16::from_be_bytes([pkt[ihl], pkt[ihl + 1]]);
@@ -981,7 +977,9 @@ impl Nat {
         } else {
             out
         };
-        if proto == PROTO_TCP && whole {
+        // A first fragment still carries the whole TCP header, so its
+        // sequence numbers shift with the rest of the stream.
+        if proto == PROTO_TCP {
             let peer =
                 SocketAddrV4::new(Ipv4Addr::new(out[16], out[17], out[18], out[19]), dst_port);
             self.tcp_seq_fixup(mapping_key, peer, true, before, &mut out, ihl);
@@ -1207,7 +1205,7 @@ impl Nat {
         whole: bool,
         fmax: Option<FragMax>,
     ) -> Option<(u64, Ipv4Addr)> {
-        if !whole && pkt.len() < ihl + if proto == PROTO_TCP { 18 } else { 8 } {
+        if !whole && !l4_header_in(pkt, ihl, proto) {
             return None;
         }
         let dst_port = u16::from_be_bytes([pkt[ihl + 2], pkt[ihl + 3]]);
@@ -1306,7 +1304,7 @@ impl Nat {
         } else {
             out
         };
-        if proto == PROTO_TCP && whole {
+        if proto == PROTO_TCP {
             let peer = SocketAddrV4::new(src_ip, src_port);
             self.tcp_seq_fixup(mapping_key, peer, false, before, &mut out, ihl);
         }
@@ -1716,6 +1714,23 @@ fn ipv4_datagram(pkt: &[u8]) -> Option<(&[u8], usize)> {
         return None;
     }
     Some((&pkt[..total], ihl))
+}
+
+/// Whether a first fragment holds its whole transport header. The NAT
+/// patches the ports and checksum there for the whole datagram, and for TCP
+/// the sequence numbers, acknowledgement and SACK blocks when an ALG has
+/// resized the stream; RFC 6146 §3.4 lets a translator insist on the header
+/// being in the first fragment, and one split across fragments is the tiny
+/// fragment attack of RFC 1858.
+fn l4_header_in(pkt: &[u8], ihl: usize, proto: u8) -> bool {
+    if proto != PROTO_TCP {
+        return pkt.len() >= ihl + 8;
+    }
+    let Some(&b) = pkt.get(ihl + 12) else {
+        return false;
+    };
+    let doff = (b >> 4) as usize * 4;
+    doff >= 20 && pkt.len() >= ihl + doff
 }
 
 /// Length of a TCP segment's payload, `None` if the header is malformed.
@@ -2816,6 +2831,69 @@ mod tests {
         assert_eq!(sack(44), 1000 + orig);
         assert_eq!(sack(48), 1000 + orig + 6);
         assert!(crate::nat::l4::v4_l4_checksum_ok(r, 20));
+    }
+
+    #[test]
+    fn first_fragments_get_the_sequence_adjustment_too() {
+        let (nat, i, o) = setup();
+        nat.add_packet_helper(Arc::new(crate::nat::FtpHelper::new()));
+        let cmd: &[u8] = b"PORT 10,0,0,5,4,210\r\n";
+        let seg = tcp_seg(INSIDE, 45000, REMOTE, 21, 0x18, 1000, 7000, &[], cmd);
+        nat.inside().send(Packet::from_slice(&seg)).unwrap();
+        let (mapped, grown) = {
+            let out = o.lock().unwrap();
+            (src_port(&out[0]), (out[0].len() - 40) as u32)
+        };
+        let orig = cmd.len() as u32;
+        o.lock().unwrap().clear();
+
+        // The next segment leaves in two fragments.
+        let next = tcp_seg(
+            INSIDE,
+            45000,
+            REMOTE,
+            21,
+            0x18,
+            1000 + orig,
+            7000,
+            &[],
+            b"STOR a-long-file-name\r\n",
+        );
+        let (f1, f2) = split(&next, 24, 0x3131);
+        nat.inside().send(Packet::from_slice(&f1)).unwrap();
+        nat.inside().send(Packet::from_slice(&f2)).unwrap();
+        {
+            let out = o.lock().unwrap();
+            assert_eq!(out.len(), 2);
+            assert_eq!(seq_of(&out[0]), 1000 + grown);
+            assert!(crate::nat::l4::v4_l4_checksum_ok(
+                &join(&out[0], &out[1]),
+                20
+            ));
+        }
+
+        // And so do the server's, the other way.
+        let reply = tcp_seg(
+            REMOTE,
+            21,
+            PUBLIC,
+            mapped,
+            0x18,
+            7000,
+            1000 + grown,
+            &[],
+            b"150 Opening data connection\r\n",
+        );
+        let (r1, r2) = split(&reply, 24, 0x3232);
+        nat.outside().send(Packet::from_slice(&r1)).unwrap();
+        nat.outside().send(Packet::from_slice(&r2)).unwrap();
+        let got = i.lock().unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(ack_of(&got[0]), 1000 + orig);
+        assert!(crate::nat::l4::v4_l4_checksum_ok(
+            &join(&got[0], &got[1]),
+            20
+        ));
     }
 
     #[test]
