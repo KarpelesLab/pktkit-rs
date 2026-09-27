@@ -1479,7 +1479,6 @@ impl Conn {
 
     fn start_keepalive(&mut self) {
         self.stop_keepalive();
-        self.stop_persist();
         self.keepalive_deadline = Some(Instant::now() + self.cfg.keepalive_idle);
     }
 
@@ -3044,6 +3043,23 @@ mod tests {
         c.handle_segment(&syn_with(vec![mss_option(536)]));
         assert_eq!(c.state(), State::SynReceived);
         assert_eq!(c.cc.send_window(), initial_cwnd, "simultaneous open");
+    }
+
+    // Keepalive and persist are independent timers: a keepalive that
+    // finds the peer active must not cancel zero-window probing.
+    #[test]
+    fn keepalive_keeps_persist_armed() {
+        let mut c = cfg(40300, 80);
+        c.keepalive = true;
+        let mut client = Conn::new(c);
+        let mut server = Conn::new(cfg(80, 40300));
+        drive_handshake(&mut client, &mut server);
+        client.snd_wnd = 0;
+        client.write(b"blocked");
+        assert!(client.persist_deadline.is_some());
+        client.keepalive_deadline = Some(Instant::now());
+        client.tick();
+        assert!(client.persist_deadline.is_some(), "persist cancelled");
     }
 
     // RFC 6528: a new connection on the same 4-tuple starts just past the
