@@ -158,6 +158,8 @@ struct CtrlConn {
     client_ip: Ipv4Addr,
     /// Accumulated request bytes read off the established stream.
     req: Vec<u8>,
+    /// How far `req` has been parsed.
+    framing: Framing,
     /// Set once we have parsed a complete request and written the response, so
     /// further inbound bytes on this connection are ignored (single
     /// request/response per connection — the common UPnP control flow).
@@ -415,6 +417,12 @@ EXT:\r\n\r\n",
                     remote_addr: Some(SocketAddr::new(IpAddr::V4(client_ip), client_port)),
                     local_port: self.cfg.control_port,
                     remote_port: client_port,
+                    // A request past MAX_REQUEST_BYTES is refused anyway,
+                    // and a response is a few KiB: the engine's 1 MiB
+                    // defaults would only let each of the connections any
+                    // SYN opens hold that much out-of-order data.
+                    recv_buf_size: MAX_REQUEST_BYTES,
+                    send_buf_size: MAX_REQUEST_BYTES,
                     ..Default::default()
                 };
                 table.insert(
@@ -423,6 +431,7 @@ EXT:\r\n\r\n",
                         conn: Conn::new(cfg),
                         client_ip,
                         req: Vec::new(),
+                        framing: Framing::default(),
                         responded: false,
                         last: now,
                     },
@@ -465,7 +474,7 @@ EXT:\r\n\r\n",
                     cc.req.extend_from_slice(&buf[..n]);
                 }
 
-                match parse_http_request(&cc.req) {
+                match cc.framing.poll(&cc.req) {
                     _ if remove => {}
                     Ok(Some(req)) => {
                         let resp = self.serve(nat, ns, &req, cc.client_ip, inside_ip);
@@ -925,6 +934,61 @@ struct HttpRequest {
     body: Vec<u8>,
 }
 
+/// A request's line and headers, parsed.
+#[derive(Debug)]
+struct HttpHead {
+    method: String,
+    target: String,
+    soap_action: String,
+    content_length: usize,
+}
+
+/// How far a connection's buffered request has been parsed, so that each
+/// segment costs only its own bytes: the end of the header block is looked
+/// for from where the last look stopped, and once found the headers are
+/// parsed once and the body waited on by length. Rescanning the whole
+/// buffer per segment would let a client sending 64 KiB a few bytes at a
+/// time cost the NAT quadratic work.
+#[derive(Debug, Default)]
+struct Framing {
+    /// Bytes already searched for the end of the header block.
+    scanned: usize,
+    /// The headers, and where the body starts, once they are in.
+    head: Option<(HttpHead, usize)>,
+}
+
+impl Framing {
+    /// The request in `buf`, which only ever grows between calls, once it
+    /// is complete; see [`parse_http_request`].
+    fn poll(&mut self, buf: &[u8]) -> Result<Option<HttpRequest>, ()> {
+        if self.head.is_none() {
+            // The terminator may straddle what was searched and what came.
+            let from = self.scanned.saturating_sub(3);
+            let Some(at) = find_subslice(&buf[from..], b"\r\n\r\n") else {
+                self.scanned = buf.len();
+                return Ok(None);
+            };
+            let hdr_end = from + at;
+            self.head = Some((parse_http_head(&buf[..hdr_end])?, hdr_end + 4));
+        }
+        let Some((head, body_start)) = &self.head else {
+            return Ok(None);
+        };
+        let body_end = body_start + head.content_length;
+        if buf.len() < body_end {
+            return Ok(None); // body not fully buffered yet
+        }
+        let body = buf[*body_start..body_end].to_vec();
+        let (head, _) = self.head.take().expect("checked above");
+        Ok(Some(HttpRequest {
+            method: head.method,
+            target: head.target,
+            soap_action: head.soap_action,
+            body,
+        }))
+    }
+}
+
 /// Parse a buffered HTTP/1.1 request. Returns `Ok(None)` if the request is not
 /// yet complete (headers not terminated, or body shorter than
 /// `Content-Length`), and `Err` if its framing is invalid (RFC 9112 §6.3) or
@@ -935,14 +999,15 @@ struct HttpRequest {
 /// honours `Content-Length`, and pulls out the `SOAPAction` header. Anything
 /// beyond that (chunked transfer-encoding, pipelining, trailers) is left as
 /// `// TODO(nat)`.
+#[cfg(test)]
 fn parse_http_request(buf: &[u8]) -> Result<Option<HttpRequest>, ()> {
-    // Find the end of the header block (CRLFCRLF).
-    let Some(hdr_end) = find_subslice(buf, b"\r\n\r\n") else {
-        return Ok(None);
-    };
-    let head = &buf[..hdr_end];
-    let body_start = hdr_end + 4;
+    Framing::default().poll(buf)
+}
 
+/// Parse a request's line and headers, `head` being the header block
+/// without its terminating blank line. `Err` as for
+/// [`parse_http_request`].
+fn parse_http_head(head: &[u8]) -> Result<HttpHead, ()> {
     let head_str = String::from_utf8_lossy(head);
     let mut lines = head_str.split("\r\n");
     // Request line: METHOD SP target SP version.
@@ -973,18 +1038,12 @@ fn parse_http_request(buf: &[u8]) -> Result<Option<HttpRequest>, ()> {
             // TODO(nat): chunked Transfer-Encoding is not handled.
         }
     }
-
-    let body_end = body_start + content_length.unwrap_or(0);
-    if buf.len() < body_end {
-        return Ok(None); // body not fully buffered yet
-    }
-    let body = buf[body_start..body_end].to_vec();
-    Ok(Some(HttpRequest {
+    Ok(HttpHead {
         method,
         target,
         soap_action,
-        body,
-    }))
+        content_length: content_length.unwrap_or(0),
+    })
 }
 
 /// The path of a request target, in origin form (`/x?q`) or absolute form
@@ -1641,6 +1700,104 @@ Content-Length: {len}\r\n\r\n",
             .for_each(|c| c.last = long_ago);
         h.handle_local(&nat, crate::Packet::from_slice(&syn(60000)));
         assert_eq!(h.ctrl.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_request_arriving_in_pieces_is_parsed_once() {
+        let req = b"POST /ctl HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello";
+        // Byte by byte, so that the terminator straddles every boundary.
+        let mut f = Framing::default();
+        for n in 1..req.len() {
+            assert!(f.poll(&req[..n]).unwrap().is_none(), "{n}");
+        }
+        let r = f.poll(req).unwrap().unwrap();
+        assert_eq!(
+            (r.method.as_str(), r.body.as_slice()),
+            ("POST", &b"hello"[..])
+        );
+    }
+
+    /// Open a control connection from `client` and return the client's end
+    /// of it once established, with the server's SYN-ACK.
+    fn establish(
+        h: &UPnPHelper,
+        nat: &Nat,
+        to_client: &StdMutex<Vec<Vec<u8>>>,
+        (client, port): (Ipv4Addr, u16),
+    ) -> (crate::vtcp::Conn, Segment) {
+        use crate::vtcp::{Conn, ConnConfig};
+        let inside_ip = Ipv4Addr::new(10, 0, 0, 1);
+        let mut conn = Conn::new(ConnConfig {
+            local_addr: Some(SocketAddr::new(IpAddr::V4(client), port)),
+            remote_addr: Some(SocketAddr::new(IpAddr::V4(inside_ip), 5000)),
+            local_port: port,
+            remote_port: 5000,
+            ..Default::default()
+        });
+        let mut pending = conn.connect();
+        let mut synack = None;
+        for _ in 0..8 {
+            for seg in pending.drain(..) {
+                let ip = wrap_tcp_v4(client, inside_ip, &seg);
+                h.handle_local(nat, crate::Packet::from_slice(&ip));
+            }
+            for pkt in std::mem::take(&mut *to_client.lock().unwrap()) {
+                let seg = Segment::parse(&pkt[20..]).unwrap();
+                if seg.has_flag(crate::vtcp::flags::SYN) {
+                    synack = Some(seg.clone());
+                }
+                pending.extend(conn.handle_segment(&seg));
+            }
+            if conn.is_established() && pending.is_empty() {
+                break;
+            }
+        }
+        assert!(conn.is_established());
+        (conn, synack.unwrap())
+    }
+
+    #[test]
+    fn control_connections_hold_little_and_parse_as_they_go() {
+        let nat = Nat::new(pfx("10.0.0.1/24"), pfx("203.0.113.1/24"));
+        let h = UPnPHelper::new(UPnPConfig::default());
+        let to_client = Arc::new(StdMutex::new(Vec::<Vec<u8>>::new()));
+        let tc = to_client.clone();
+        nat.inside().set_handler(Arc::new(move |p| {
+            tc.lock().unwrap().push(p.as_bytes().to_vec());
+            Ok(())
+        }));
+        let (client, inside_ip) = (Ipv4Addr::new(10, 0, 0, 9), Ipv4Addr::new(10, 0, 0, 1));
+        let (mut conn, synack) = establish(&h, &nat, &to_client, (client, 30000));
+        // The window offered is about what a request may be, not the 1 MiB
+        // the engine defaults to.
+        let scale = crate::vtcp::get_wscale(&synack.options).unwrap_or(0);
+        assert!(
+            65535usize << scale <= 2 * MAX_REQUEST_BYTES,
+            "scale {scale}"
+        );
+
+        // Just short of the request cap, a few bytes a segment, with no end
+        // to the header block. Each segment used to rescan all that came
+        // before. The bound is loose enough for a slow debug build.
+        let (_, segs) = conn.write(b"G");
+        let first = Segment::parse(&segs[0]).unwrap();
+        let mut seq = first.seq;
+        let chunk = 16;
+        let start = std::time::Instant::now();
+        for _ in 0..(MAX_REQUEST_BYTES - 100) / chunk {
+            let mut s = first.clone();
+            s.seq = seq;
+            s.payload = vec![b'a'; chunk];
+            seq = seq.wrapping_add(chunk as u32);
+            let ip = wrap_tcp_v4(client, inside_ip, &s.marshal());
+            h.handle_local(&nat, crate::Packet::from_slice(&ip));
+        }
+        let took = start.elapsed();
+        assert!(took < Duration::from_millis(500), "{took:?}");
+        let ctrl = h.ctrl.lock().unwrap();
+        let cc = ctrl.values().next().unwrap();
+        assert!(cc.req.len() > MAX_REQUEST_BYTES - 200);
+        assert!(!cc.responded);
     }
 
     fn del_body(ext: u16, proto: &str) -> Vec<u8> {
