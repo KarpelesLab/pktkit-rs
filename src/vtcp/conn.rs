@@ -49,6 +49,8 @@ pub const TIME_WAIT_DURATION: Duration = Duration::from_secs(2);
 pub const DEFAULT_KEEPALIVE_IDLE: Duration = Duration::from_secs(300);
 pub const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 pub const DEFAULT_KEEPALIVE_COUNT: u32 = 3;
+/// Linux's `tcp_fin_timeout` default.
+pub const DEFAULT_FIN_WAIT2_TIMEOUT: Duration = Duration::from_secs(60);
 
 // --- TCP state -------------------------------------------------------------
 
@@ -121,6 +123,12 @@ pub struct ConnConfig {
     pub keepalive_count: u32,
     pub send_buf_size: usize,
     pub recv_buf_size: usize,
+    /// How long FIN-WAIT-2 may go without hearing from the peer before the
+    /// connection is reset. RFC 9293 §3.10.7.4 allows a timeout here; a
+    /// peer that never sends its FIN would otherwise hold the connection
+    /// forever. Measured from the last segment received, so a peer still
+    /// sending after our half-close keeps it open. `None` waits forever.
+    pub fin_wait2_timeout: Option<Duration>,
 }
 
 setters! {
@@ -140,6 +148,7 @@ setters! {
         set keepalive_count: u32;
         set send_buf_size: usize;
         set recv_buf_size: usize;
+        set fin_wait2_timeout: Option<Duration>;
     }
 }
 
@@ -161,6 +170,7 @@ impl Default for ConnConfig {
             keepalive_count: DEFAULT_KEEPALIVE_COUNT,
             send_buf_size: DEFAULT_SEND_BUF,
             recv_buf_size: DEFAULT_RECV_BUF,
+            fin_wait2_timeout: Some(DEFAULT_FIN_WAIT2_TIMEOUT),
         }
     }
 }
@@ -1547,6 +1557,14 @@ impl Conn {
             self.time_wait_deadline = None;
             self.state = State::Closed;
             self.closed = true;
+        }
+        // FIN-WAIT-2: the peer has gone quiet without closing.
+        if self.state == State::FinWait2
+            && let Some(t) = self.cfg.fin_wait2_timeout
+            && self.last_recv.elapsed() >= t
+        {
+            let rst = self.abort();
+            self.outgoing.extend(rst);
         }
         // Keepalive.
         if let Some(d) = self.keepalive_deadline
@@ -3172,6 +3190,43 @@ mod tests {
         client.write(b"abc");
         let probe = parse(&fire_persist(&mut client)[0]);
         assert!(get_timestamp(&probe.options).is_some());
+    }
+
+    // Our FIN is ACKed but the peer never sends its own: without a
+    // FIN-WAIT-2 timeout the connection would never go away.
+    #[test]
+    fn fin_wait_2_times_out_once_the_peer_goes_quiet() {
+        let (mut client, mut server) = established(40320);
+        let fin = client.close();
+        let ack = deliver(&mut server, &fin);
+        deliver(&mut client, &ack);
+        assert_eq!(client.state(), State::FinWait2);
+
+        // A peer still sending keeps it open (a half-close is legitimate).
+        let half = client.cfg.fin_wait2_timeout.unwrap() / 2;
+        client.last_recv = Instant::now() - half;
+        assert!(client.tick().is_empty());
+        let (_, data) = server.write(b"still talking");
+        deliver(&mut client, &data);
+        assert_eq!(read_all(&mut client), b"still talking");
+
+        client.last_recv = Instant::now() - client.cfg.fin_wait2_timeout.unwrap();
+        let rst = client.tick();
+        assert!(client.is_closed());
+        assert!(parse(&rst[0]).has_flag(flags::RST));
+    }
+
+    #[test]
+    fn fin_wait_2_timeout_can_be_disabled() {
+        let mut client = Conn::new(cfg(40321, 80).fin_wait2_timeout(None));
+        let mut server = Conn::new(cfg(80, 40321));
+        drive_handshake(&mut client, &mut server);
+        let fin = client.close();
+        let ack = deliver(&mut server, &fin);
+        deliver(&mut client, &ack);
+        client.last_recv = Instant::now() - Duration::from_secs(3600);
+        client.tick();
+        assert_eq!(client.state(), State::FinWait2);
     }
 
     // RFC 6528: a new connection on the same 4-tuple starts just past the
