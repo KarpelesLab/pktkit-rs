@@ -25,7 +25,7 @@ use crate::slirp::icmpv6::build_icmpv6_echo_reply;
 use crate::slirp::ipv6::skip_extension_headers;
 use crate::slirp::listener::{Listener, ListenerKey, resolve_v4};
 use crate::slirp::listener6::{Listener6, ListenerKey6, resolve_v6};
-use crate::slirp::tcp_out::{TcpOutConn, build_refused_rst, build_rst_for_stray};
+use crate::slirp::tcp_out::{TcpOutConn, build_rst_for_stray};
 use crate::slirp::tcp_stream::{ConnState, Endpoints, is_closed as conn_is_closed, tick_conn};
 use crate::slirp::udp::{SendFn as UdpSendFn, UdpConn};
 use crate::slirp::udp6::{SendFn as UdpSendFn6, UdpConn6};
@@ -36,8 +36,8 @@ use crate::{IpPrefix, Result, connect_l3};
 use crate::time::Instant;
 use std::collections::HashMap;
 use std::io;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
@@ -64,6 +64,11 @@ struct Key6 {
 /// constant of the same name.
 const MAX_VIRT_TCP_CONNS: usize = 10_000;
 
+/// Cap on outbound TCP dials in flight at once. A dial to a destination that
+/// drops SYNs holds a thread for up to the connect timeout; SYNs past the cap
+/// are dropped, and the client's retransmissions try again later.
+const MAX_PENDING_DIALS: usize = 256;
+
 /// Time a UDP flow may sit idle before its socket is reaped.
 const UDP_IDLE: Duration = Duration::from_secs(60);
 
@@ -85,6 +90,9 @@ struct Inner {
     // Per-namespace sides (each device attached via ConnectL3).
     ns_sides: Mutex<HashMap<u64, Arc<NsSide>>>,
     ns_counter: AtomicU64,
+    /// Outbound dials still waiting on the real destination; each holds a
+    /// thread, so they are capped separately from established flows.
+    pending_dials: Arc<AtomicUsize>,
     closed: AtomicBool,
 }
 
@@ -167,6 +175,7 @@ impl Stack {
             listeners6: Mutex::new(HashMap::new()),
             ns_sides: Mutex::new(HashMap::new()),
             ns_counter: AtomicU64::new(0),
+            pending_dials: Arc::new(AtomicUsize::new(0)),
             closed: AtomicBool::new(false),
         });
 
@@ -489,7 +498,6 @@ impl Stack {
         let tcp = &pkt[ihl..];
         let src_port = u16::from_be_bytes([tcp[0], tcp[1]]);
         let dst_port = u16::from_be_bytes([tcp[2], tcp[3]]);
-        let seq = u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]);
         let flags = tcp[13];
 
         let key = Key {
@@ -535,22 +543,14 @@ impl Stack {
 
         // SYN → dial the real destination and bridge it to a server-side
         // vtcp::Conn terminating the virtual side.
-        if inner.tcp.lock().expect("poisoned").len() >= MAX_VIRT_TCP_CONNS {
+        if inner.tcp.lock().expect("poisoned").len() >= MAX_VIRT_TCP_CONNS
+            || inner.pending_dials.load(Ordering::Acquire) >= MAX_PENDING_DIALS
+        {
             return Ok(()); // silently drop; client will retransmit
         }
         let seg = match Segment::parse(tcp) {
             Ok(s) => s,
             Err(_) => return Ok(()),
-        };
-
-        let remote = match TcpStream::connect(SocketAddrV4::new(dst, dst_port)) {
-            Ok(s) => s,
-            Err(_) => {
-                // Refused/unreachable: RST+ACK so the client doesn't hang.
-                let rst = build_refused_rst(src_port, dst_port, seq);
-                let pkt = crate::slirp::packet::build_packet4(dst, src, &rst);
-                return Self::dispatch(inner, ns, &pkt);
-            }
         };
 
         let inner_for_send = inner.clone();
@@ -563,16 +563,30 @@ impl Stack {
             remote_ip: src,
             remote_port: src_port,
         };
-        let conn = TcpOutConn::accept_syn(endpoints, &seg, remote, sink)?;
-        // Register before emitting the SYN-ACK so the client's ACK resolves to
-        // this connection rather than triggering a spurious RST.
+        let conn = TcpOutConn::pending(endpoints, &seg, sink);
+        // Register before the dial can answer, so the client's ACK of the
+        // SYN-ACK resolves to this connection rather than drawing a RST.
         inner
             .tcp
             .lock()
             .expect("poisoned")
             .insert(key, conn.clone());
-        conn.send_synack();
+        Self::start_dial(
+            inner,
+            &conn,
+            SocketAddr::V4(SocketAddrV4::new(dst, dst_port)),
+        );
         Ok(())
+    }
+
+    /// Dial the real destination of an outbound bridge in the background,
+    /// counting it against [`MAX_PENDING_DIALS`] until it finishes.
+    fn start_dial(inner: &Arc<Inner>, conn: &Arc<TcpOutConn>, dest: SocketAddr) {
+        let pending = inner.pending_dials.clone();
+        pending.fetch_add(1, Ordering::AcqRel);
+        conn.start_dial(dest, move || {
+            pending.fetch_sub(1, Ordering::AcqRel);
+        });
     }
 
     /// Look up a registered IPv4 listener for `(dst, dst_port)`, falling back
@@ -822,7 +836,6 @@ impl Stack {
         }
         let src_port = u16::from_be_bytes([tcp[0], tcp[1]]);
         let dst_port = u16::from_be_bytes([tcp[2], tcp[3]]);
-        let seq = u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]);
         let flags = tcp[13];
 
         let key = Key6 {
@@ -864,21 +877,14 @@ impl Stack {
             return Ok(());
         }
 
-        if inner.tcp6.lock().expect("poisoned").len() >= MAX_VIRT_TCP_CONNS {
+        if inner.tcp6.lock().expect("poisoned").len() >= MAX_VIRT_TCP_CONNS
+            || inner.pending_dials.load(Ordering::Acquire) >= MAX_PENDING_DIALS
+        {
             return Ok(()); // silently drop; client will retransmit
         }
         let seg = match Segment::parse(tcp) {
             Ok(s) => s,
             Err(_) => return Ok(()),
-        };
-
-        let remote = match TcpStream::connect(SocketAddrV6::new(dst, dst_port, 0, 0)) {
-            Ok(s) => s,
-            Err(_) => {
-                let rst = build_refused_rst(src_port, dst_port, seq);
-                let pkt = crate::slirp::packet::build_packet6(dst, src, &rst);
-                return Self::dispatch(inner, ns, &pkt);
-            }
         };
 
         let inner_for_send = inner.clone();
@@ -891,14 +897,18 @@ impl Stack {
             remote_ip: src,
             remote_port: src_port,
         };
-        let conn = TcpOutConn::accept_syn(endpoints, &seg, remote, sink)?;
-        // Register before emitting the SYN-ACK (see the v4 path).
+        let conn = TcpOutConn::pending(endpoints, &seg, sink);
+        // Register before the dial can answer (see the v4 path).
         inner
             .tcp6
             .lock()
             .expect("poisoned")
             .insert(key, conn.clone());
-        conn.send_synack();
+        Self::start_dial(
+            inner,
+            &conn,
+            SocketAddr::V6(SocketAddrV6::new(dst, dst_port, 0, 0)),
+        );
         Ok(())
     }
 
@@ -1585,6 +1595,86 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         assert!(got_pong, "did not see pong payload come back");
+    }
+
+    /// Handler that records every packet the stack emits.
+    fn capture(stack: &Stack) -> Arc<Mutex<Vec<Vec<u8>>>> {
+        let captured: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        let c = captured.clone();
+        stack.set_handler(Arc::new(move |p: &Packet| {
+            c.lock().unwrap().push(p.as_bytes().to_vec());
+            Ok(())
+        }));
+        captured
+    }
+
+    fn wait_for(what: &str, mut f: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !f() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn syn_to_blackholed_destination_does_not_stall_packet_path() {
+        let stack = Stack::new();
+        stack
+            .set_addr(IpPrefix::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 24))
+            .unwrap();
+        let _captured = capture(&stack);
+        // TEST-NET-1 (RFC 5737): nothing answers, so a connect hangs until the
+        // OS gives up (or fails at once where there is no route at all).
+        let syn = build_tcp_v4_packet(
+            Ipv4Addr::new(10, 0, 0, 5),
+            40000,
+            Ipv4Addr::new(192, 0, 2, 1),
+            80,
+            1000,
+            0,
+            tcp_flags::SYN,
+            &[],
+        );
+        let start = Instant::now();
+        L3Device::send(&*stack, Packet::from_slice(&syn)).unwrap();
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "send blocked for {:?} dialing the destination",
+            start.elapsed()
+        );
+        let _ = stack.shutdown();
+    }
+
+    #[test]
+    fn syn_to_refused_port_draws_rst() {
+        // A port that was just free: nothing listens on it.
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let stack = Stack::new();
+        stack
+            .set_addr(IpPrefix::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 24))
+            .unwrap();
+        let captured = capture(&stack);
+        let syn = build_tcp_v4_packet(
+            Ipv4Addr::new(10, 0, 0, 5),
+            40001,
+            Ipv4Addr::new(127, 0, 0, 1),
+            port,
+            7000,
+            0,
+            tcp_flags::SYN,
+            &[],
+        );
+        L3Device::send(&*stack, Packet::from_slice(&syn)).unwrap();
+        wait_for("RST", || !captured.lock().unwrap().is_empty());
+        let got = captured.lock().unwrap();
+        let seg = Segment::parse(&got[0][20..]).unwrap();
+        assert_eq!(seg.flags, tcp_flags::RST | tcp_flags::ACK);
+        assert_eq!(seg.ack, 7001);
+        assert_eq!(seg.src_port, port);
+        assert_eq!(seg.dst_port, 40001);
     }
 
     /// Drive a real `vtcp::Conn` as the virtual client through the outbound NAT

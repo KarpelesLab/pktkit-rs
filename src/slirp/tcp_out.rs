@@ -1,9 +1,9 @@
 //! Outbound (virtual→real) TCP NAT, backed by [`vtcp::Conn`].
 //!
 //! When a virtual client opens a TCP connection to a *real* destination, the
-//! stack passively terminates the virtual side with a server-side
-//! [`vtcp::Conn`] (via `accept_syn`) and, in parallel, dials a real OS
-//! [`TcpStream`] to the destination. This mirrors Go's `tcpNATConn`, which
+//! stack dials a real OS [`TcpStream`] to the destination on a background
+//! thread and, once it connects, passively terminates the virtual side with a
+//! server-side [`vtcp::Conn`] (via `accept_syn`). This mirrors Go's `tcpNATConn`, which
 //! bridges a `vtcp.Conn` (facing the virtual client) to a real `net.Conn`
 //! (facing the server) with `io.Copy` in both directions.
 //!
@@ -40,6 +40,11 @@ use std::time::Duration;
 const MSS_V4: u16 = 1460;
 const MSS_V6: u16 = 1440;
 
+/// How long to wait for the real destination to accept. Well under the OS's
+/// own connect timeout (75 s to over two minutes), and still longer than a
+/// client usually keeps retransmitting its SYN.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// A live outbound TCP NAT bridge: a server-side `vtcp::Conn` facing the
 /// virtual client, glued to a real OS [`TcpStream`] facing the destination.
 pub(crate) struct TcpOutConn {
@@ -51,29 +56,25 @@ pub(crate) struct TcpOutConn {
     remote: Mutex<Option<TcpStream>>,
     /// Set once the bridge has been torn down (RST/abort or both-ways close).
     closed: Arc<AtomicBool>,
-    /// SYN-ACK produced at accept time, held until the caller has registered
-    /// the bridge and calls [`send_synack`](Self::send_synack). Emptied once sent.
-    synack: Mutex<Vec<Vec<u8>>>,
+    /// The client's SYN, kept while the real destination is being dialed and
+    /// taken once the dial finishes.
+    syn: Mutex<Option<Segment>>,
 }
 
 impl TcpOutConn {
-    /// Accept the virtual client's SYN and bridge it to an already-dialed real
-    /// socket, spawning the byte-pump threads. `sink` injects fully-framed IP
-    /// packets into the virtual net.
+    /// Take the virtual client's SYN for a real destination, without answering
+    /// it yet. The SYN-ACK goes out only once [`start_dial`](Self::start_dial)
+    /// has reached the destination, so the client sees the real outcome:
+    /// a handshake if the destination accepted, a RST if it refused.
     ///
-    /// The SYN-ACK is **not** transmitted here: it is held until the caller
-    /// calls [`send_synack`](Self::send_synack), so the caller can register the
-    /// bridge in its connection table *before* the SYN-ACK goes out. Otherwise
-    /// the client's immediate ACK could race back into the stack and find no
-    /// connection (yielding a spurious RST).
-    pub(crate) fn accept_syn(
+    /// The caller registers the bridge in its connection table before calling
+    /// `start_dial`, so that neither the client's retransmitted SYNs nor its
+    /// ACK of the SYN-ACK can miss it and draw a spurious RST.
+    pub(crate) fn pending(
         endpoints: Endpoints,
         syn: &Segment,
-        remote: TcpStream,
         sink: Arc<dyn Fn(&[u8]) + Send + Sync>,
-    ) -> Result<Arc<TcpOutConn>> {
-        let remote_read = remote.try_clone()?;
-
+    ) -> Arc<TcpOutConn> {
         let (local_addr, remote_addr, local_port, remote_port, mss) = match endpoints {
             Endpoints::V4 {
                 local_ip,
@@ -110,49 +111,95 @@ impl TcpOutConn {
             keepalive: true,
             ..Default::default()
         };
-        let mut conn = Conn::new(cfg);
-        let synack = conn.accept_syn(syn);
 
-        let state = Arc::new(ConnState {
-            endpoints,
-            conn: Mutex::new(conn),
-            signal: Condvar::new(),
-            sink,
-        });
-
-        let bridge = Arc::new(TcpOutConn {
-            state: state.clone(),
-            remote: Mutex::new(Some(remote)),
+        Arc::new(TcpOutConn {
+            state: Arc::new(ConnState {
+                endpoints,
+                conn: Mutex::new(Conn::new(cfg)),
+                signal: Condvar::new(),
+                sink,
+            }),
+            remote: Mutex::new(None),
             closed: Arc::new(AtomicBool::new(false)),
-            synack: Mutex::new(synack),
-        });
-
-        // remote → client: real socket bytes become vtcp writes (→ segments).
-        let b_r = bridge.clone();
-        thread::spawn(move || b_r.pump_remote_to_client(remote_read));
-        // client → remote: vtcp-delivered bytes are written to the real socket.
-        let b_w = bridge.clone();
-        thread::spawn(move || b_w.pump_client_to_remote());
-
-        Ok(bridge)
+            syn: Mutex::new(Some(syn.clone())),
+        })
     }
 
-    /// Transmit the SYN-ACK produced at accept time. The caller must register
-    /// the bridge in its connection table before calling this so a racing ACK
-    /// from the client resolves to this connection.
-    pub(crate) fn send_synack(&self) {
-        let synack = std::mem::take(&mut *self.synack.lock().expect("poisoned"));
-        if !synack.is_empty() {
-            self.state.wrap_and_send(synack);
+    /// Dial `dest` on a thread of its own and, once it answers, complete the
+    /// virtual handshake and start the byte pumps. `on_done` runs when the
+    /// dial has finished either way.
+    ///
+    /// The dial must not run on the caller's thread: that is the packet path,
+    /// and a destination that drops SYNs would stall every other flow of the
+    /// stack for as long as the OS keeps retrying the connect.
+    pub(crate) fn start_dial(
+        self: &Arc<Self>,
+        dest: SocketAddr,
+        on_done: impl FnOnce() + Send + 'static,
+    ) {
+        let bridge = self.clone();
+        thread::spawn(move || {
+            let res = TcpStream::connect_timeout(&dest, CONNECT_TIMEOUT)
+                .and_then(|s| s.try_clone().map(|r| (s, r)));
+            bridge.finish_dial(res);
+            on_done();
+        });
+    }
+
+    fn finish_dial(self: Arc<Self>, res: std::io::Result<(TcpStream, TcpStream)>) {
+        let Some(syn) = self.syn.lock().expect("poisoned").take() else {
+            return;
+        };
+        if self.closed.load(Ordering::SeqCst) {
+            return; // torn down while dialing; dropping `res` closes the socket
         }
+        let (remote, remote_read) = match res {
+            Ok(pair) => pair,
+            Err(_) => {
+                // Refused / unreachable / timed out: RST+ACK so the client
+                // doesn't hang.
+                let (local_port, remote_port) = self.state.endpoints.ports();
+                let rst = build_refused_rst(remote_port, local_port, syn.seq);
+                self.state.wrap_and_send(vec![rst]);
+                self.closed.store(true, Ordering::SeqCst);
+                return;
+            }
+        };
+        *self.remote.lock().expect("poisoned") = Some(remote);
+        // close() sets `closed` before it shuts the socket down, so either it
+        // sees the socket stored above or this sees the flag.
+        if self.closed.load(Ordering::SeqCst) {
+            self.shutdown_remote(Shutdown::Both);
+            return;
+        }
+        let synack = self.state.conn.lock().expect("poisoned").accept_syn(&syn);
+
+        // remote → client: real socket bytes become vtcp writes (→ segments).
+        let b_r = self.clone();
+        thread::spawn(move || b_r.pump_remote_to_client(remote_read));
+        // client → remote: vtcp-delivered bytes are written to the real socket.
+        let b_w = self.clone();
+        thread::spawn(move || b_w.pump_client_to_remote());
+
+        self.state.wrap_and_send(synack);
     }
 
     /// Feed an inbound TCP segment from the virtual client into the engine and
     /// transmit its replies. (Called from the stack's packet dispatch path.)
     pub(crate) fn handle_segment(&self, tcp: &[u8]) -> Result<()> {
-        if let Ok(seg) = Segment::parse(tcp) {
-            self.state.deliver(&seg);
+        let Ok(seg) = Segment::parse(tcp) else {
+            return Ok(());
+        };
+        let dialing = self.syn.lock().expect("poisoned").is_some();
+        if dialing {
+            // Nothing to answer yet: retransmitted SYNs wait for the dial. A
+            // RST means the client gave up, so the dial's result is moot.
+            if seg.has_flag(crate::vtcp::segment::flags::RST) {
+                self.closed.store(true, Ordering::SeqCst);
+            }
+            return Ok(());
         }
+        self.state.deliver(&seg);
         Ok(())
     }
 
@@ -169,7 +216,7 @@ impl TcpOutConn {
     /// Forcibly tear the bridge down: RST the virtual client and close the real
     /// socket. Called by `Stack::shutdown` and namespace cleanup.
     pub(crate) fn close(&self) {
-        if self.closed.swap(true, Ordering::AcqRel) {
+        if self.closed.swap(true, Ordering::SeqCst) {
             return;
         }
         let segs = self.state.conn.lock().expect("poisoned").abort();

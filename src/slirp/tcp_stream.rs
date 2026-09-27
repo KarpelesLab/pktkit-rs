@@ -55,6 +55,22 @@ impl Endpoints {
         }
     }
 
+    /// `(local_port, remote_port)`.
+    pub(crate) fn ports(&self) -> (u16, u16) {
+        match *self {
+            Endpoints::V4 {
+                local_port,
+                remote_port,
+                ..
+            }
+            | Endpoints::V6 {
+                local_port,
+                remote_port,
+                ..
+            } => (local_port, remote_port),
+        }
+    }
+
     fn local_addr(&self) -> SocketAddr {
         match self {
             Endpoints::V4 {
