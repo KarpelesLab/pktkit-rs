@@ -144,13 +144,9 @@ impl Client {
     pub fn http(&self, req: &Request) -> io::Result<Response> {
         // A request that cannot be sent is refused before any lookup or dial.
         let wire = req.serialize()?;
-        // Resolve host → IP.
-        let ip: IpAddr = match req.host.parse::<IpAddr>() {
-            Ok(ip) => ip,
-            Err(_) => *self
-                .resolve(&req.host)?
-                .first()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no address for host"))?,
+        let addrs = match req.host.parse::<IpAddr>() {
+            Ok(ip) => vec![ip],
+            Err(_) => self.resolve(&req.host)?,
         };
 
         let deadline = Instant::now() + req.timeout;
@@ -169,7 +165,7 @@ impl Client {
             }
         };
 
-        let mut conn = self.dial_tcp_timeout(SocketAddr::new(ip, req.port), remaining()?)?;
+        let mut conn = self.dial_any(&addrs, req.port, deadline)?;
         conn.set_write_timeout(Some(remaining()?));
         conn.write_all(&wire).map_err(timed_out)?;
 
@@ -187,6 +183,41 @@ impl Client {
                 return Ok(resp);
             }
         }
+    }
+
+    /// Connect to `port` on the first of `addrs` that accepts, in order,
+    /// skipping any in a family the client has no address in: a resolver
+    /// lists A before AAAA, and an IPv6-only client must still reach a
+    /// dual-stack host. Each attempt gets an even share of what is left
+    /// before `deadline`, so one blackholed address cannot use it all.
+    fn dial_any(
+        &self,
+        addrs: &[IpAddr],
+        port: u16,
+        deadline: Instant,
+    ) -> io::Result<super::TcpConn> {
+        let prefix = crate::L3Device::addr(self);
+        let usable: Vec<IpAddr> = addrs
+            .iter()
+            .copied()
+            .filter(|ip| super::tcp::local_ip_for(prefix, *ip).is_some())
+            .collect();
+        let mut last = io::Error::new(
+            io::ErrorKind::NotFound,
+            "no address for host in the client's address family",
+        );
+        for (i, ip) in usable.iter().enumerate() {
+            let left = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|d| !d.is_zero())
+                .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "HTTP request timed out"))?;
+            let share = left / (usable.len() - i) as u32;
+            match self.dial_tcp_timeout(SocketAddr::new(*ip, port), share) {
+                Ok(conn) => return Ok(conn),
+                Err(e) => last = e,
+            }
+        }
+        Err(last)
     }
 
     /// Convenience: GET `url`.
@@ -888,5 +919,88 @@ mod tests {
         let err = client.http(&req).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
         assert!(start.elapsed() < Duration::from_secs(3));
+    }
+
+    /// Servers listening at `open` complete handshakes; a SYN to any other
+    /// address is refused with a RST.
+    fn servers_at(client: &std::sync::Arc<Client>, open: Vec<IpAddr>) {
+        use crate::vtcp::{Conn, ConnConfig, segment::Segment, segment::flags};
+        use crate::{L3Device, Packet, Protocol};
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+
+        let servers: Arc<Mutex<HashMap<IpAddr, Conn>>> = Arc::default();
+        let weak = Arc::downgrade(client);
+        client.set_handler(Arc::new(move |pkt: &Packet| {
+            let (Some(src), Some(dst)) = (pkt.src_addr(), pkt.dst_addr()) else {
+                return Ok(());
+            };
+            let Ok(seg) = Segment::parse(pkt.payload()) else {
+                return Ok(());
+            };
+            let out = if open.contains(&dst) {
+                let mut s = servers.lock().unwrap();
+                match s.get_mut(&dst) {
+                    Some(c) => c.handle_segment(&seg),
+                    None => {
+                        let mut c = Conn::new(
+                            ConnConfig::default()
+                                .local_port(seg.dst_port)
+                                .remote_port(seg.src_port),
+                        );
+                        let out = c.accept_syn(&seg);
+                        s.insert(dst, c);
+                        out
+                    }
+                }
+            } else if seg.has_flag(flags::SYN) {
+                let rst = Segment {
+                    src_port: seg.dst_port,
+                    dst_port: seg.src_port,
+                    ack: seg.seq.wrapping_add(1),
+                    flags: flags::RST | flags::ACK,
+                    ..Default::default()
+                };
+                vec![rst.marshal()]
+            } else {
+                Vec::new()
+            };
+            if let Some(client) = weak.upgrade() {
+                for s in out {
+                    let ip = crate::build::build_ip(dst, src, Protocol::TCP, 64, &s).unwrap();
+                    let _ = client.send(Packet::from_slice(&ip));
+                }
+            }
+            Ok(())
+        }));
+    }
+
+    #[test]
+    fn dials_the_first_reachable_address_of_the_clients_family() {
+        let deadline = || Instant::now() + Duration::from_secs(2);
+        let v4: IpAddr = "10.0.0.1".parse().unwrap();
+        let v6: IpAddr = "fd00::1".parse().unwrap();
+
+        // An IPv6-only client skips the A record listed first.
+        let client = Client::new(
+            super::super::ClientConfig::default()
+                .prefix(crate::IpPrefix::new("fd00::2".parse().unwrap(), 64)),
+        );
+        servers_at(&client, vec![v4, v6]);
+        let conn = client.dial_any(&[v4, v6], 80, deadline()).unwrap();
+        assert_eq!(conn.peer_addr().ip(), v6);
+
+        // An address that refuses is followed by the next.
+        let client = Client::new(
+            super::super::ClientConfig::default()
+                .prefix(crate::IpPrefix::new("10.0.0.2".parse().unwrap(), 24)),
+        );
+        servers_at(&client, vec![v4]);
+        let closed: IpAddr = "10.0.0.7".parse().unwrap();
+        let conn = client.dial_any(&[closed, v4], 80, deadline()).unwrap();
+        assert_eq!(conn.peer_addr().ip(), v4);
+
+        // Nothing in the client's family at all.
+        assert!(client.dial_any(&[v6], 80, deadline()).is_err());
     }
 }
