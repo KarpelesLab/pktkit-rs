@@ -222,7 +222,7 @@ impl Server {
         let end = u32::from(self.cfg.range_end);
         let ip = (start..=end)
             .map(Ipv4Addr::from)
-            .find(|ip| !held.contains(ip) && !declined.contains_key(ip))?;
+            .find(|ip| self.in_pool(*ip) && !held.contains(ip) && !declined.contains_key(ip))?;
         leases.insert(
             mac,
             Lease {
@@ -325,12 +325,26 @@ impl Server {
         Answer::Ack(ip)
     }
 
-    /// Whether `ip` is one of the addresses this server hands out.
+    /// Whether `ip` is one of the addresses this server hands out: in the
+    /// configured range, and not one the subnet already uses for something
+    /// else, however the range was drawn.
     fn in_pool(&self, ip: Ipv4Addr) -> bool {
         let raw = u32::from(ip);
-        raw >= u32::from(self.cfg.range_start)
-            && raw <= u32::from(self.cfg.range_end)
-            && ip != self.cfg.server_ip
+        if raw < u32::from(self.cfg.range_start) || raw > u32::from(self.cfg.range_end) {
+            return false;
+        }
+        if ip == self.cfg.server_ip || Some(ip) == self.cfg.router {
+            return false;
+        }
+        // A /31 or /32 has no network or broadcast address (RFC 3021).
+        let mask = u32::from(self.cfg.subnet_mask);
+        if mask.leading_ones() < 31 {
+            let net = u32::from(self.cfg.server_ip) & mask;
+            if raw == net || raw == net | !mask {
+                return false;
+            }
+        }
+        true
     }
 
     /// DHCPNAK carries no address or configuration, only who refused
@@ -723,5 +737,39 @@ mod tests {
         m.message_type(wire::MSG_REQUEST).ciaddr(ip);
         s.handle_dhcp(&m.finish());
         assert_eq!(replies(&r)[0].msg_type, wire::MSG_NAK);
+    }
+
+    #[test]
+    fn pool_skips_the_server_router_network_and_broadcast_addresses() {
+        // A pool drawn carelessly over the whole subnet.
+        let cfg = ServerConfig::new(
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(10, 0, 0, 0),
+            Ipv4Addr::new(10, 0, 0, 2),
+        );
+        let (s, r) = recording(cfg);
+        s.handle_dhcp(&build_discover(1, MacAddr([2, 0, 0, 0, 0, 1])));
+        assert_eq!(replies(&r)[0].yiaddr, Ipv4Addr::new(10, 0, 0, 2));
+
+        let cfg = ServerConfig::new(
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(10, 0, 0, 254),
+            Ipv4Addr::new(10, 0, 0, 255),
+        )
+        .router(Ipv4Addr::new(10, 0, 0, 254));
+        let (s, r) = recording(cfg);
+        s.handle_dhcp(&build_discover(1, MacAddr([2, 0, 0, 0, 0, 1])));
+        assert!(replies(&r).is_empty(), "nothing usable in the pool");
+
+        // Nor can a client claim one of them.
+        let init_reboot = |ip: Ipv4Addr| {
+            let mut m = wire::Builder::new(1, 9, MacAddr([2, 0, 0, 0, 0, 2]));
+            m.message_type(wire::MSG_REQUEST)
+                .ipv4_option(wire::OPT_REQUESTED_IP, ip);
+            m.finish()
+        };
+        s.handle_dhcp(&init_reboot(Ipv4Addr::new(10, 0, 0, 255)));
+        s.handle_dhcp(&init_reboot(Ipv4Addr::new(10, 0, 0, 254)));
+        assert!(replies(&r).iter().all(|p| p.msg_type != wire::MSG_ACK));
     }
 }
