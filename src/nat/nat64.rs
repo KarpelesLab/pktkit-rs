@@ -6,8 +6,10 @@
 //! are translated; ICMPv4 errors about them are translated to ICMPv6 per
 //! RFC 7915 §4.2 (ICMPv6 errors from the inside are not translated).
 
+use crate::nat::frag::FragTable;
 use crate::nat::helper::{PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP};
 use crate::nat::l4::csum_replace;
+use crate::nat::nat::frag_info;
 use crate::nat::track::Peers;
 use crate::time::Instant;
 use crate::{
@@ -15,6 +17,7 @@ use crate::{
 };
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddrV4};
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 const IPV6_HEADER_LEN: usize = 40;
@@ -52,6 +55,11 @@ pub struct Nat64 {
 
     inner: Mutex<Nat64Inner>,
     self_ref: Mutex<Weak<Nat64>>,
+    /// IPv4 Identification for packets translated from unfragmented IPv6.
+    next_id: AtomicU16,
+    /// Inbound fragmented datagrams: the inside host each one's first
+    /// fragment went to, by source, IP ID and protocol.
+    frags: Mutex<FragTable<(Ipv4Addr, u16, u8), Ipv6Addr>>,
 }
 
 struct Nat64Inner {
@@ -87,6 +95,8 @@ impl Nat64 {
                 next_port: NAT_PORT_MIN,
             }),
             self_ref: Mutex::new(Weak::new()),
+            next_id: AtomicU16::new(crate::rand::u32() as u16),
+            frags: Mutex::new(FragTable::default()),
         });
         *nat.self_ref.lock().unwrap() = Arc::downgrade(&nat);
         inside.set_parent(Arc::downgrade(&nat));
@@ -118,6 +128,7 @@ impl Nat64 {
     }
 
     fn sweep_at(&self, now: Instant) {
+        self.frags.lock().unwrap().expire(now);
         let mut inner = self.inner.lock().unwrap();
         let inner = &mut *inner;
         inner.mappings.retain(|k, m| {
@@ -166,54 +177,105 @@ impl Nat64 {
         }
         let hop = hop - 1;
 
-        // Walk extension headers.
+        // Walk the extension headers (RFC 7915 §5.1), noting a Fragment
+        // Header: its fields carry over to the IPv4 header.
         let mut next_header = pkt[6];
-        let mut transport_off = IPV6_HEADER_LEN;
+        let mut off = IPV6_HEADER_LEN;
+        let mut frag: Option<V6Frag> = None;
         loop {
             match next_header {
                 0 | 43 | 60 => {
-                    if transport_off + 2 > pkt.len() {
+                    if off + 8 > pkt.len() {
                         return;
                     }
-                    let ext_len = (pkt[transport_off + 1] as usize + 1) * 8;
-                    next_header = pkt[transport_off];
-                    transport_off += ext_len;
-                    continue;
+                    // A routing header still naming hops to visit must not
+                    // be translated: IPv4 has no way to honour it.
+                    if next_header == 43 && pkt[off + 3] != 0 {
+                        return;
+                    }
+                    next_header = pkt[off];
+                    off += (pkt[off + 1] as usize + 1) * 8;
                 }
                 44 => {
-                    if transport_off + 8 > pkt.len() {
+                    if off + 8 > pkt.len() || frag.is_some() {
                         return;
                     }
-                    next_header = pkt[transport_off];
-                    transport_off += 8;
-                    continue;
+                    let fo = u16::from_be_bytes([pkt[off + 2], pkt[off + 3]]);
+                    frag = Some(V6Frag {
+                        offset: (fo & 0xFFF8) as usize,
+                        more: fo & 1 != 0,
+                        id: u32::from_be_bytes([
+                            pkt[off + 4],
+                            pkt[off + 5],
+                            pkt[off + 6],
+                            pkt[off + 7],
+                        ]),
+                    });
+                    next_header = pkt[off];
+                    off += 8;
                 }
                 _ => break,
             }
         }
-        if transport_off > pkt.len() {
+        if off > pkt.len() {
             return;
         }
-        let transport = &pkt[transport_off..];
+        let data = &pkt[off..];
+        let Some(outside_ip) = self.outside_ipv4() else {
+            return;
+        };
 
-        match next_header {
-            PROTO_TCP | PROTO_UDP => {
-                self.outbound_tcpudp(transport, next_header, src_v6, dst_v4, hop)
+        match (next_header, frag) {
+            // A non-first fragment carries no ports and needs no mapping:
+            // only its IP header is translated (RFC 7915 §5.1.1).
+            (PROTO_TCP | PROTO_UDP, Some(f)) if f.offset != 0 => {
+                let flags = (f.offset / 8) as u16 | if f.more { 0x2000 } else { 0 };
+                let mut out = v4_header(
+                    outside_ip,
+                    dst_v4,
+                    next_header,
+                    hop,
+                    data.len(),
+                    f.id as u16,
+                    flags,
+                );
+                out.extend_from_slice(data);
+                self.outside.deliver(Packet::from_slice(&out));
             }
-            PROTO_ICMPV6 => self.outbound_icmpv6(transport, src_v6, dst_v4, hop),
+            (PROTO_TCP | PROTO_UDP, _) => self.outbound_tcpudp(
+                data,
+                next_header,
+                (src_v6, dst_v6),
+                (outside_ip, dst_v4),
+                hop,
+                frag,
+            ),
+            // The ICMPv6 checksum covers a pseudo-header holding the whole
+            // message's length, which a first fragment does not know, so
+            // fragmented ICMP is not translated.
+            (PROTO_ICMPV6, None) => {
+                self.outbound_icmpv6(data, src_v6, dst_v6, (outside_ip, dst_v4), hop)
+            }
             _ => {}
         }
     }
 
+    /// Translate a TCP/UDP packet, or the first fragment of one, to IPv4.
     fn outbound_tcpudp(
         &self,
         transport: &[u8],
         proto: u8,
-        src_v6: Ipv6Addr,
-        dst_v4: Ipv4Addr,
-        hop_limit: u8,
+        (src_v6, dst_v6): (Ipv6Addr, Ipv6Addr),
+        (outside_ip, dst_v4): (Ipv4Addr, Ipv4Addr),
+        hop: u8,
+        frag: Option<V6Frag>,
     ) {
-        if transport.len() < 4 {
+        let field = if proto == PROTO_TCP { 16 } else { 6 };
+        if transport.len() < field + 2 {
+            return;
+        }
+        // IPv6 has no checksum-less UDP; such a datagram is invalid.
+        if proto == PROTO_UDP && transport[6..8] == [0, 0] {
             return;
         }
         let src_port = u16::from_be_bytes([transport[0], transport[1]]);
@@ -235,63 +297,69 @@ impl Nat64 {
             tcp_flags(transport, proto),
         );
 
-        let outside_ip = match self.outside_ipv4() {
-            Some(a) => a,
-            None => return,
-        };
-
-        let total_len = IPV4_MIN_HEADER + transport.len();
-        let mut out = vec![0u8; total_len];
-        out[0] = 0x45;
-        out[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
-        out[8] = hop_limit;
-        out[9] = proto;
-        out[12..16].copy_from_slice(&outside_ip.octets());
-        out[16..20].copy_from_slice(&dst_v4.octets());
-        out[IPV4_MIN_HEADER..].copy_from_slice(transport);
-
-        // Rewrite source port to mapped port.
-        out[IPV4_MIN_HEADER..IPV4_MIN_HEADER + 2].copy_from_slice(&outside_port.to_be_bytes());
-
-        let tslice_len = out.len() - IPV4_MIN_HEADER;
-        if proto == PROTO_TCP && tslice_len >= 18 {
-            let off = IPV4_MIN_HEADER + 16;
-            out[off..off + 2].copy_from_slice(&[0, 0]);
-            let cs = compute_transport_checksum(
-                Protocol(proto),
-                IpAddr::V4(outside_ip),
-                IpAddr::V4(dst_v4),
-                &out[IPV4_MIN_HEADER..],
-            );
-            out[off..off + 2].copy_from_slice(&cs.to_be_bytes());
-        } else if proto == PROTO_UDP && tslice_len >= 8 {
-            let off = IPV4_MIN_HEADER + 6;
-            out[off..off + 2].copy_from_slice(&[0, 0]);
-            let mut cs = compute_transport_checksum(
-                Protocol(proto),
-                IpAddr::V4(outside_ip),
-                IpAddr::V4(dst_v4),
-                &out[IPV4_MIN_HEADER..],
-            );
-            if cs == 0 {
-                cs = 0xFFFF;
-            }
-            out[off..off + 2].copy_from_slice(&cs.to_be_bytes());
+        let mut l4 = transport.to_vec();
+        l4[0..2].copy_from_slice(&outside_port.to_be_bytes());
+        // Patched rather than recomputed: the checksum covers the whole
+        // datagram, of which a first fragment holds only part, and a
+        // recompute would also hide corruption from the receiver.
+        let cs = u16::from_be_bytes([l4[field], l4[field + 1]]);
+        let mut cs = csum_replace(
+            cs,
+            &[&src_v6.octets(), &dst_v6.octets(), &src_port.to_be_bytes()],
+            &[
+                &outside_ip.octets(),
+                &dst_v4.octets(),
+                &outside_port.to_be_bytes(),
+            ],
+        );
+        if proto == PROTO_UDP && cs == 0 {
+            cs = 0xFFFF;
         }
+        l4[field..field + 2].copy_from_slice(&cs.to_be_bytes());
 
-        out[10..12].copy_from_slice(&[0, 0]);
-        let ic = checksum(&out[..IPV4_MIN_HEADER]);
-        out[10..12].copy_from_slice(&ic.to_be_bytes());
-
+        let (id, flags) = match frag {
+            Some(f) => (f.id as u16, if f.more { 0x2000 } else { 0 }),
+            None => self.unfragmented_v4_id(IPV4_MIN_HEADER + l4.len()),
+        };
+        let mut out = v4_header(outside_ip, dst_v4, proto, hop, l4.len(), id, flags);
+        out.extend_from_slice(&l4);
         self.outside.deliver(Packet::from_slice(&out));
     }
 
-    fn outbound_icmpv6(&self, icmp: &[u8], src_v6: Ipv6Addr, dst_v4: Ipv4Addr, hop: u8) {
+    /// Identification and flags for an IPv4 packet translated from an
+    /// unfragmented IPv6 one of `total` bytes (RFC 7915 §5.1): DF is set
+    /// once the packet exceeds 1260 bytes, beyond which IPv6's 1280-byte
+    /// minimum MTU no longer guarantees it fits; below that it may be
+    /// fragmented and needs an ID unique enough to reassemble (RFC 6864).
+    fn unfragmented_v4_id(&self, total: usize) -> (u16, u16) {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        (id, if total > 1260 { 0x4000 } else { 0 })
+    }
+
+    fn outbound_icmpv6(
+        &self,
+        icmp: &[u8],
+        src_v6: Ipv6Addr,
+        dst_v6: Ipv6Addr,
+        (outside_ip, dst_v4): (Ipv4Addr, Ipv4Addr),
+        hop: u8,
+    ) {
         if icmp.len() < 8 {
             return;
         }
         if icmp[0] != 128 {
             // Only Echo Request → Echo Request is translated outbound.
+            return;
+        }
+        // The ICMPv4 checksum is computed afresh; check the original first,
+        // so a corrupted message is not laundered into a valid one.
+        let sum = crate::checksum::raw_transport_sum(
+            Protocol::ICMPV6,
+            IpAddr::V6(src_v6),
+            IpAddr::V6(dst_v6),
+            icmp,
+        );
+        if sum != 0xFFFF {
             return;
         }
         let id = u16::from_be_bytes([icmp[4], icmp[5]]);
@@ -306,30 +374,17 @@ impl Nat64 {
         };
         self.note_peer(k, SocketAddrV4::new(dst_v4, 0), true, None);
 
-        let outside_ip = match self.outside_ipv4() {
-            Some(a) => a,
-            None => return,
-        };
-        let total = IPV4_MIN_HEADER + icmp.len();
-        let mut out = vec![0u8; total];
-        out[0] = 0x45;
-        out[2..4].copy_from_slice(&(total as u16).to_be_bytes());
-        out[8] = hop;
-        out[9] = PROTO_ICMP;
-        out[12..16].copy_from_slice(&outside_ip.octets());
-        out[16..20].copy_from_slice(&dst_v4.octets());
-        out[IPV4_MIN_HEADER..].copy_from_slice(icmp);
-        let icmp_off = IPV4_MIN_HEADER;
-        out[icmp_off] = 8; // ICMPv4 Echo Request
-        out[icmp_off + 1] = 0;
-        out[icmp_off + 4..icmp_off + 6].copy_from_slice(&outside_port.to_be_bytes());
-        out[icmp_off + 2..icmp_off + 4].copy_from_slice(&[0, 0]);
-        let cs = checksum(&out[icmp_off..]);
-        out[icmp_off + 2..icmp_off + 4].copy_from_slice(&cs.to_be_bytes());
+        let mut msg = icmp.to_vec();
+        msg[0] = 8; // ICMPv4 Echo Request
+        msg[1] = 0;
+        msg[4..6].copy_from_slice(&outside_port.to_be_bytes());
+        msg[2..4].copy_from_slice(&[0, 0]);
+        let cs = checksum(&msg);
+        msg[2..4].copy_from_slice(&cs.to_be_bytes());
 
-        out[10..12].copy_from_slice(&[0, 0]);
-        let ic = checksum(&out[..IPV4_MIN_HEADER]);
-        out[10..12].copy_from_slice(&ic.to_be_bytes());
+        let (ip_id, flags) = self.unfragmented_v4_id(IPV4_MIN_HEADER + msg.len());
+        let mut out = v4_header(outside_ip, dst_v4, PROTO_ICMP, hop, msg.len(), ip_id, flags);
+        out.extend_from_slice(&msg);
         self.outside.deliver(Packet::from_slice(&out));
     }
 
@@ -348,14 +403,14 @@ impl Nat64 {
         if total < ihl || pkt.len() < total {
             return;
         }
-        let transport = &pkt[ihl..total];
+        let pkt = &pkt[..total];
         // The translator is a router (RFC 7915 §4.1): it spends one hop, and
         // owes the sender a Time Exceeded when none is left.
         let ttl = pkt[8];
         if ttl <= 1 {
             if let Some(ip) = self.outside_ipv4()
                 && let Some(err) =
-                    crate::icmp::time_exceeded(Packet::from_slice(&pkt[..total]), IpAddr::V4(ip))
+                    crate::icmp::time_exceeded(Packet::from_slice(pkt), IpAddr::V4(ip))
             {
                 self.outside.deliver(Packet::from_slice(&err));
             }
@@ -363,17 +418,75 @@ impl Nat64 {
         }
         let ttl = ttl - 1;
         let src_v4 = Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]);
+        let transport = &pkt[ihl..];
+
+        // Fragments are translated one by one (RFC 7915 §4.1): only the first
+        // can be matched to a mapping, and the rest follow it to the same
+        // inside host.
+        let (more, offset) = frag_info(pkt);
+        let key = (src_v4, u16::from_be_bytes([pkt[4], pkt[5]]), proto);
+        if offset != 0 {
+            let target = self.frags.lock().unwrap().later(key, pkt, Instant::now());
+            if let Some(dst_v6) = target {
+                self.inbound_later_fragment(pkt, dst_v6);
+            }
+            return;
+        }
+        let frag_id = more.then_some(key.1);
 
         match proto {
-            PROTO_TCP | PROTO_UDP => self.inbound_tcpudp(transport, proto, src_v4, ttl),
-            PROTO_ICMP => self.inbound_icmp(transport, src_v4, ttl),
+            PROTO_TCP | PROTO_UDP => {
+                let Some(dst_v6) = self.inbound_tcpudp(transport, proto, src_v4, ttl, frag_id)
+                else {
+                    return;
+                };
+                if frag_id.is_some() {
+                    let held = self
+                        .frags
+                        .lock()
+                        .unwrap()
+                        .resolve(key, dst_v6, Instant::now());
+                    for f in held {
+                        self.inbound_later_fragment(&f, dst_v6);
+                    }
+                }
+            }
+            // See outbound: fragmented ICMP is not translated.
+            PROTO_ICMP if frag_id.is_none() => self.inbound_icmp(transport, src_v4, ttl),
             _ => {}
         }
     }
 
-    fn inbound_tcpudp(&self, transport: &[u8], proto: u8, src_v4: Ipv4Addr, ttl: u8) {
-        if transport.len() < 4 {
+    /// A non-first IPv4 fragment, sent as an IPv6 fragment to the host its
+    /// first fragment went to.
+    fn inbound_later_fragment(&self, pkt: &[u8], dst_v6: Ipv6Addr) {
+        let ihl = (pkt[0] & 0x0F) as usize * 4;
+        let src_v4 = Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]);
+        let Some(src_v6) = self.pref64().and_then(|p| p.embed(src_v4)) else {
             return;
+        };
+        let (more, offset) = frag_info(pkt);
+        let id = u16::from_be_bytes([pkt[4], pkt[5]]);
+        let data = &pkt[ihl..];
+        let mut out = v6_header(src_v6, dst_v6, 44, pkt[8].saturating_sub(1), 8 + data.len());
+        out.extend_from_slice(&v6_frag_header(pkt[9], offset, more, id));
+        out.extend_from_slice(data);
+        self.inside.deliver(Packet::from_slice(&out));
+    }
+
+    /// Translate an inbound TCP/UDP packet, or the first fragment of one
+    /// (IPv4 ID `frag_id`), to IPv6. Returns the inside host it went to.
+    fn inbound_tcpudp(
+        &self,
+        transport: &[u8],
+        proto: u8,
+        src_v4: Ipv4Addr,
+        hop: u8,
+        frag_id: Option<u16>,
+    ) -> Option<Ipv6Addr> {
+        let field = if proto == PROTO_TCP { 16 } else { 6 };
+        if transport.len() < field + 2 {
+            return None;
         }
         let dst_port = u16::from_be_bytes([transport[2], transport[3]]);
         let rk = Nat64RevKey {
@@ -382,10 +495,7 @@ impl Nat64 {
         };
         let mapping_key = {
             let mut inner = self.inner.lock().unwrap();
-            let k = match inner.reverse.get(&rk).copied() {
-                Some(k) => k,
-                None => return,
-            };
+            let k = inner.reverse.get(&rk).copied()?;
             if let Some(m) = inner.mappings.get_mut(&k) {
                 m.last_active = Instant::now();
                 let src_port = u16::from_be_bytes([transport[0], transport[1]]);
@@ -396,51 +506,55 @@ impl Nat64 {
             k
         };
 
-        let Some(src_v6) = self.pref64().and_then(|p| p.embed(src_v4)) else {
-            return;
-        };
+        let src_v6 = self.pref64().and_then(|p| p.embed(src_v4))?;
         let dst_v6 = mapping_key.ip;
-        let out_len = IPV6_HEADER_LEN + transport.len();
-        let mut out = vec![0u8; out_len];
-        out[0] = 0x60;
-        out[4..6].copy_from_slice(&(transport.len() as u16).to_be_bytes());
-        out[6] = proto;
-        out[7] = ttl;
-        out[8..24].copy_from_slice(&src_v6.octets());
-        out[24..40].copy_from_slice(&dst_v6.octets());
-        out[IPV6_HEADER_LEN..].copy_from_slice(transport);
+        let outside_ip = self.outside_ipv4()?;
 
-        // Restore original destination port.
-        out[IPV6_HEADER_LEN + 2..IPV6_HEADER_LEN + 4]
-            .copy_from_slice(&mapping_key.port.to_be_bytes());
-
-        let tslice_len = out.len() - IPV6_HEADER_LEN;
-        if proto == PROTO_TCP && tslice_len >= 18 {
-            let off = IPV6_HEADER_LEN + 16;
-            out[off..off + 2].copy_from_slice(&[0, 0]);
-            let cs = compute_transport_checksum(
-                Protocol(proto),
-                IpAddr::V6(src_v6),
-                IpAddr::V6(dst_v6),
-                &out[IPV6_HEADER_LEN..],
+        let mut l4 = transport.to_vec();
+        l4[2..4].copy_from_slice(&mapping_key.port.to_be_bytes());
+        if proto == PROTO_UDP && transport[6..8] == [0, 0] {
+            // IPv4 UDP may omit its checksum, IPv6 UDP may not: compute one
+            // (RFC 7915 §4.5), which takes the whole datagram.
+            if frag_id.is_some() {
+                return None;
+            }
+            fill_v6_checksum(&mut l4, field, proto, src_v6, dst_v6);
+        } else {
+            let cs = u16::from_be_bytes([l4[field], l4[field + 1]]);
+            let mut cs = csum_replace(
+                cs,
+                &[
+                    &src_v4.octets(),
+                    &outside_ip.octets(),
+                    &dst_port.to_be_bytes(),
+                ],
+                &[
+                    &src_v6.octets(),
+                    &dst_v6.octets(),
+                    &mapping_key.port.to_be_bytes(),
+                ],
             );
-            out[off..off + 2].copy_from_slice(&cs.to_be_bytes());
-        } else if proto == PROTO_UDP && tslice_len >= 8 {
-            let off = IPV6_HEADER_LEN + 6;
-            out[off..off + 2].copy_from_slice(&[0, 0]);
-            let mut cs = compute_transport_checksum(
-                Protocol(proto),
-                IpAddr::V6(src_v6),
-                IpAddr::V6(dst_v6),
-                &out[IPV6_HEADER_LEN..],
-            );
-            if cs == 0 {
+            if proto == PROTO_UDP && cs == 0 {
                 cs = 0xFFFF;
             }
-            out[off..off + 2].copy_from_slice(&cs.to_be_bytes());
+            l4[field..field + 2].copy_from_slice(&cs.to_be_bytes());
         }
 
+        let out = match frag_id {
+            Some(id) => {
+                let mut out = v6_header(src_v6, dst_v6, 44, hop, 8 + l4.len());
+                out.extend_from_slice(&v6_frag_header(proto, 0, true, id));
+                out.extend_from_slice(&l4);
+                out
+            }
+            None => {
+                let mut out = v6_header(src_v6, dst_v6, proto, hop, l4.len());
+                out.extend_from_slice(&l4);
+                out
+            }
+        };
         self.inside.deliver(Packet::from_slice(&out));
+        Some(dst_v6)
     }
 
     fn inbound_icmp(&self, icmp: &[u8], src_v4: Ipv4Addr, hop: u8) {
@@ -862,12 +976,64 @@ fn is_global_v4(a: Ipv4Addr) -> bool {
         || o[0] >= 240)
 }
 
-fn compute_transport_checksum(proto: Protocol, src: IpAddr, dst: IpAddr, segment: &[u8]) -> u16 {
-    transport_checksum(proto, src, dst, segment)
-}
-
 fn compute_icmpv6_checksum(src: Ipv6Addr, dst: Ipv6Addr, data: &[u8]) -> u16 {
     transport_checksum(Protocol::ICMPV6, IpAddr::V6(src), IpAddr::V6(dst), data)
+}
+
+/// The Fragment Header fields of an IPv6 packet.
+#[derive(Clone, Copy, Debug)]
+struct V6Frag {
+    /// In bytes.
+    offset: usize,
+    more: bool,
+    id: u32,
+}
+
+/// An IPv4 header (payload to follow) with the given fields and its
+/// checksum; `flags` holds the flags and fragment offset word.
+fn v4_header(
+    src: Ipv4Addr,
+    dst: Ipv4Addr,
+    proto: u8,
+    ttl: u8,
+    payload_len: usize,
+    id: u16,
+    flags: u16,
+) -> Vec<u8> {
+    let mut h = vec![0u8; IPV4_MIN_HEADER];
+    h[0] = 0x45;
+    h[2..4].copy_from_slice(&((IPV4_MIN_HEADER + payload_len) as u16).to_be_bytes());
+    h[4..6].copy_from_slice(&id.to_be_bytes());
+    h[6..8].copy_from_slice(&flags.to_be_bytes());
+    h[8] = ttl;
+    h[9] = proto;
+    h[12..16].copy_from_slice(&src.octets());
+    h[16..20].copy_from_slice(&dst.octets());
+    let cs = checksum(&h);
+    h[10..12].copy_from_slice(&cs.to_be_bytes());
+    h
+}
+
+/// An IPv6 Fragment Header for a translated IPv4 fragment (RFC 7915 §4.1.1):
+/// the IPv4 ID becomes the low half of the 32-bit identification.
+fn v6_frag_header(next: u8, offset: usize, more: bool, id: u16) -> [u8; 8] {
+    let fo = (offset as u16 & 0xFFF8) | u16::from(more);
+    let mut h = [0u8; 8];
+    h[0] = next;
+    h[2..4].copy_from_slice(&fo.to_be_bytes());
+    h[4..8].copy_from_slice(&u32::from(id).to_be_bytes());
+    h
+}
+
+/// Compute the checksum at `field` of a whole TCP/UDP segment under an
+/// IPv6 pseudo-header.
+fn fill_v6_checksum(l4: &mut [u8], field: usize, proto: u8, src: Ipv6Addr, dst: Ipv6Addr) {
+    l4[field..field + 2].copy_from_slice(&[0, 0]);
+    let mut cs = transport_checksum(Protocol(proto), IpAddr::V6(src), IpAddr::V6(dst), l4);
+    if cs == 0 {
+        cs = 0xFFFF;
+    }
+    l4[field..field + 2].copy_from_slice(&cs.to_be_bytes());
 }
 
 /// An IPv6 header (payload to follow) with the given fields, zero traffic
@@ -1023,7 +1189,7 @@ mod tests {
             .copy_from_slice(&(udp_len as u16).to_be_bytes());
         p[IPV6_HEADER_LEN + 8..].copy_from_slice(payload);
         // Compute UDP checksum.
-        let mut cs = compute_transport_checksum(
+        let mut cs = transport_checksum(
             Protocol::UDP,
             IpAddr::V6(src),
             IpAddr::V6(dst),
@@ -1383,5 +1549,157 @@ mod tests {
         let got = inside.lock().unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!((got[0][40], got[0][41]), (3, 0));
+    }
+
+    /// Split an IPv6 packet without extension headers into two fragments
+    /// (Fragment Header, identification `id`), the first carrying `first`
+    /// bytes of its payload.
+    fn split_v6(pkt: &[u8], first: usize, id: u32) -> (Vec<u8>, Vec<u8>) {
+        let mk = |data: &[u8], off: usize, more: bool| {
+            let mut p = pkt[..IPV6_HEADER_LEN].to_vec();
+            let len = (8 + data.len()) as u16;
+            p[4..6].copy_from_slice(&len.to_be_bytes());
+            p[6] = 44;
+            let fo = off as u16 | u16::from(more);
+            let mut fh = [0u8; 8];
+            fh[0] = pkt[6];
+            fh[2..4].copy_from_slice(&fo.to_be_bytes());
+            fh[4..8].copy_from_slice(&id.to_be_bytes());
+            p.extend_from_slice(&fh);
+            p.extend_from_slice(data);
+            p
+        };
+        let payload = &pkt[IPV6_HEADER_LEN..];
+        (
+            mk(&payload[..first], 0, true),
+            mk(&payload[first..], first, false),
+        )
+    }
+
+    fn v4_flags(p: &[u8]) -> (bool, usize) {
+        crate::nat::nat::frag_info(p)
+    }
+
+    #[test]
+    fn outbound_fragments_are_translated_per_rfc7915() {
+        let (nat, _inside, outside) = wired();
+        let mut data = vec![0x11; 8];
+        // Looks like a UDP header to anything that would misread it.
+        data.extend_from_slice(&[0x15, 0xB3, 0x00, 0x35, 0, 16, 0, 0]);
+        let pkt = build_v6_udp(CLIENT.parse().unwrap(), 5555, wkp(SERVER), 53, &data);
+        let (f1, f2) = split_v6(&pkt, 16, 0xDEAD_BEEF);
+        nat.inside().send(Packet::from_slice(&f1)).unwrap();
+        nat.inside().send(Packet::from_slice(&f2)).unwrap();
+
+        let out = outside.lock().unwrap();
+        assert_eq!(out.len(), 2);
+        let (a, b) = (&out[0], &out[1]);
+        for p in [a, b] {
+            assert_eq!(
+                u16::from_be_bytes([p[4], p[5]]),
+                0xBEEF,
+                "ID from the Fragment Header"
+            );
+            assert_eq!(p[9], PROTO_UDP);
+            assert_eq!(checksum(&p[..20]), 0);
+        }
+        assert_eq!(v4_flags(a), (true, 0));
+        assert_eq!(v4_flags(b), (false, 16));
+        assert_eq!(&b[20..], &f2[48..], "later fragment data untouched");
+        // Reassembled, the datagram's checksum holds.
+        let mut whole = a.clone();
+        whole.extend_from_slice(&b[20..]);
+        let total = whole.len() as u16;
+        whole[2..4].copy_from_slice(&total.to_be_bytes());
+        whole[6..8].copy_from_slice(&[0, 0]);
+        assert!(crate::nat::l4::v4_l4_checksum_ok(&whole, 20));
+    }
+
+    #[test]
+    fn outbound_later_fragment_creates_no_mapping() {
+        let (nat, _inside, _outside) = wired();
+        let pkt = build_v6_udp(CLIENT.parse().unwrap(), 5555, wkp(SERVER), 53, &[0x22; 24]);
+        let (_, f2) = split_v6(&pkt, 16, 7);
+        nat.inside().send(Packet::from_slice(&f2)).unwrap();
+        assert!(nat.inner.lock().unwrap().mappings.is_empty());
+    }
+
+    #[test]
+    fn inbound_fragments_reach_the_client_in_any_order() {
+        let (nat, inside, outside) = wired();
+        let sent = send_udp(&nat, &outside);
+        let port = u16::from_be_bytes([sent[20], sent[21]]);
+
+        // A 24-byte reply datagram, fragmented 16 + 16.
+        let payload = [0x33u8; 24];
+        let udp_len = 8 + payload.len();
+        let mut d = vec![0u8; 20 + udp_len];
+        d[0] = 0x45;
+        d[2..4].copy_from_slice(&((20 + udp_len) as u16).to_be_bytes());
+        d[8] = 64;
+        d[9] = PROTO_UDP;
+        d[12..16].copy_from_slice(&SERVER.octets());
+        d[16..20].copy_from_slice(&[198, 51, 100, 1]);
+        d[20..22].copy_from_slice(&53u16.to_be_bytes());
+        d[22..24].copy_from_slice(&port.to_be_bytes());
+        d[24..26].copy_from_slice(&(udp_len as u16).to_be_bytes());
+        d[28..].copy_from_slice(&payload);
+        crate::nat::l4::fill_v4_l4_checksum(&mut d, 20);
+        let frag = |data: &[u8], off: usize, more: bool| {
+            let mut p = d[..20].to_vec();
+            p.extend_from_slice(data);
+            let total = p.len() as u16;
+            p[2..4].copy_from_slice(&total.to_be_bytes());
+            p[4..6].copy_from_slice(&0x7777u16.to_be_bytes());
+            let fo = (off / 8) as u16 | if more { 0x2000 } else { 0 };
+            p[6..8].copy_from_slice(&fo.to_be_bytes());
+            p[10..12].copy_from_slice(&[0, 0]);
+            let ic = checksum(&p[..20]);
+            p[10..12].copy_from_slice(&ic.to_be_bytes());
+            p
+        };
+        let r1 = frag(&d[20..36], 0, true);
+        let r2 = frag(&d[36..], 16, false);
+        nat.outside().send(Packet::from_slice(&r2)).unwrap();
+        assert!(inside.lock().unwrap().is_empty());
+        nat.outside().send(Packet::from_slice(&r1)).unwrap();
+
+        let got = inside.lock().unwrap();
+        assert_eq!(got.len(), 2);
+        let client: Ipv6Addr = CLIENT.parse().unwrap();
+        let mut whole: Vec<u8> = Vec::new();
+        let mut firsts = got.iter().filter(|p| p[42..44] == [0, 1]);
+        let first = firsts.next().expect("first fragment");
+        let last = got
+            .iter()
+            .find(|p| p[42..44] == [0, 16])
+            .expect("last fragment");
+        for p in [first, last] {
+            assert_eq!(p[6], 44, "Fragment Header");
+            assert_eq!(p[40], PROTO_UDP);
+            assert_eq!(&p[44..48], &[0, 0, 0x77, 0x77]);
+            assert_eq!(&p[24..40], &client.octets());
+        }
+        // Reassembled, the IPv6 datagram's checksum holds.
+        whole.extend_from_slice(&first[..IPV6_HEADER_LEN]);
+        whole.extend_from_slice(&first[48..]);
+        whole.extend_from_slice(&last[48..]);
+        whole[6] = PROTO_UDP;
+        let len = (whole.len() - IPV6_HEADER_LEN) as u16;
+        whole[4..6].copy_from_slice(&len.to_be_bytes());
+        assert_eq!(u16::from_be_bytes([whole[42], whole[43]]), 5555);
+        assert!(v6_sum_ok(&whole));
+    }
+
+    #[test]
+    fn large_unfragmented_packets_get_df() {
+        let (nat, _inside, outside) = wired();
+        let small = build_v6_udp(CLIENT.parse().unwrap(), 1, wkp(SERVER), 53, &[0; 100]);
+        let big = build_v6_udp(CLIENT.parse().unwrap(), 1, wkp(SERVER), 53, &[0; 1300]);
+        nat.inside().send(Packet::from_slice(&small)).unwrap();
+        nat.inside().send(Packet::from_slice(&big)).unwrap();
+        let out = outside.lock().unwrap();
+        assert_eq!(out[0][6] & 0x40, 0);
+        assert_eq!(out[1][6] & 0x40, 0x40);
     }
 }
