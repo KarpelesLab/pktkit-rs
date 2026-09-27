@@ -204,3 +204,52 @@ impl L3Device for Client {
         Ok(())
     }
 }
+
+impl Drop for Client {
+    /// The last reference is gone, so nothing can deliver another packet to
+    /// a connection, listener or UDP socket: their handles outlive the
+    /// client, and a thread blocked on one without a timeout would wait for
+    /// ever. Closing wakes them with an error, resets the peers rather than
+    /// leaving them talking to no one, and stops the tick thread, as
+    /// `close` does.
+    fn drop(&mut self) {
+        let _ = L3Device::close(self);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    /// Handles outlive the client, and a thread blocked on one must not wait
+    /// for ever once nothing is left to wake it.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn dropping_the_client_wakes_blocked_handles() {
+        let client = Client::new(
+            ClientConfig::default()
+                .prefix(IpPrefix::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 24)),
+        );
+        let peer = SocketAddr::from(([10, 0, 0, 1], 53));
+        let listener = client.listen_tcp(80).unwrap();
+        let udp = client.dial_udp(peer).unwrap();
+        let tcp = client.dial_tcp_nonblocking(peer).unwrap();
+        tcp.set_nonblocking(false);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t = tx.clone();
+        std::thread::spawn(move || t.send(("accept", listener.accept().is_err())).unwrap());
+        let t = tx.clone();
+        std::thread::spawn(move || t.send(("recv", udp.recv(&mut [0; 16]).is_err())).unwrap());
+        std::thread::spawn(move || tx.send(("read", tcp.read(&mut [0; 16]).is_err())).unwrap());
+        std::thread::sleep(Duration::from_millis(50));
+        drop(client);
+        for _ in 0..3 {
+            let (what, failed) = rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("a handle stayed blocked");
+            assert!(failed, "{what} returned success");
+        }
+    }
+}
