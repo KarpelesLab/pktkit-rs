@@ -71,18 +71,9 @@ pub struct ServerConfig {
     pub max_peers: usize,
     /// Most TCP connections served at once; each has a thread. Default 256.
     pub max_tcp_connections: usize,
-    /// How long a client has to complete the TLS handshake and key
-    /// exchange (OpenVPN's `hand-window`). Default 60s.
-    pub handshake_window: Duration,
-    /// Keepalive ping interval (first argument of OpenVPN's `--keepalive`):
-    /// pushed to clients as `ping`, and the server pings an idle client this
-    /// often. Zero disables. Default 10s.
-    pub keepalive_interval: Duration,
-    /// Keepalive timeout (second argument of `--keepalive`): pushed to
-    /// clients as `ping-restart`; the server drops a client it has not heard
-    /// from for twice this, as OpenVPN's server does. Zero disables.
-    /// Default 60s.
-    pub keepalive_timeout: Duration,
+    /// Each peer's timers: handshake window, keepalive, renegotiation.
+    /// Defaults to OpenVPN's (see [`PeerTimers`]).
+    pub timers: PeerTimers,
 }
 
 setters! {
@@ -91,9 +82,7 @@ setters! {
         some on_disconnect: OnDisconnect;
         set max_peers: usize;
         set max_tcp_connections: usize;
-        set handshake_window: Duration;
-        set keepalive_interval: Duration;
-        set keepalive_timeout: Duration;
+        set timers: PeerTimers;
     }
 }
 
@@ -105,7 +94,6 @@ impl ServerConfig {
         on_auth: OnAuth,
         on_data: OnData,
     ) -> ServerConfig {
-        let timers = PeerTimers::default();
         ServerConfig {
             tls_config,
             listen_addr,
@@ -115,17 +103,7 @@ impl ServerConfig {
             on_disconnect: None,
             max_peers: 1024,
             max_tcp_connections: 256,
-            handshake_window: timers.handshake_window,
-            keepalive_interval: timers.keepalive_interval,
-            keepalive_timeout: timers.keepalive_timeout,
-        }
-    }
-
-    fn timers(&self) -> PeerTimers {
-        PeerTimers {
-            handshake_window: self.handshake_window,
-            keepalive_interval: self.keepalive_interval,
-            keepalive_timeout: self.keepalive_timeout,
+            timers: PeerTimers::default(),
         }
     }
 }
@@ -361,7 +339,7 @@ impl Server {
             self.cfg.on_auth.clone(),
         )
         .ok()?
-        .with_timers(self.cfg.timers());
+        .with_timers(self.cfg.timers);
         let entry = Arc::new(PeerEntry {
             peer: Mutex::new(peer),
             transport,
@@ -530,7 +508,7 @@ fn tcp_conn(server: &Weak<Server>, stream: TcpStream, addr: SocketAddr) {
     // The client must open with a hard reset within the handshake window;
     // after that, it pings at least every keepalive interval, so a read
     // blocked past the ping-restart timeout means it is gone.
-    let timers = s.cfg.timers();
+    let timers = s.cfg.timers;
     drop(s);
     let _ = stream.set_read_timeout(Some(timers.handshake_window));
     let mut reader = io::BufReader::new(stream);
@@ -754,7 +732,7 @@ mod tests {
             on_auth,
             on_data,
         )
-        .handshake_window(Duration::from_millis(500));
+        .timers(PeerTimers::default().handshake_window(Duration::from_millis(500)));
         let server = Server::new(cfg).unwrap();
         let mut c = tcp_client(&server);
         c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();

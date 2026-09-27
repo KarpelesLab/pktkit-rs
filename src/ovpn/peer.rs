@@ -134,16 +134,26 @@ pub struct PeerTimers {
     /// argument). The server itself gives up after twice this without
     /// hearing from the client, as OpenVPN's server does; zero disables.
     pub keepalive_timeout: Duration,
+    /// Renegotiate the data-channel key this long after it was negotiated
+    /// (OpenVPN's `reneg-sec`); zero disables time-based renegotiation. A
+    /// key is also renegotiated when its packet ids run low, whatever this
+    /// says.
+    pub renegotiate_interval: Duration,
+    /// How long the previous key keeps working after a renegotiation
+    /// (OpenVPN's `tran-window`).
+    pub transition_window: Duration,
 }
 
 impl Default for PeerTimers {
-    /// OpenVPN's defaults: `hand-window 60`, and the `keepalive 10 60` its
-    /// sample server configuration uses.
+    /// OpenVPN's defaults: `hand-window 60`, `reneg-sec 3600`, `tran-window
+    /// 3600`, and the `keepalive 10 60` its sample server configuration uses.
     fn default() -> PeerTimers {
         PeerTimers {
             handshake_window: Duration::from_secs(60),
             keepalive_interval: Duration::from_secs(10),
             keepalive_timeout: Duration::from_secs(60),
+            renegotiate_interval: Duration::from_secs(3600),
+            transition_window: Duration::from_secs(3600),
         }
     }
 }
@@ -153,8 +163,14 @@ setters! {
         set handshake_window: Duration;
         set keepalive_interval: Duration;
         set keepalive_timeout: Duration;
+        set renegotiate_interval: Duration;
+        set transition_window: Duration;
     }
 }
+
+/// Renegotiate a key once its outgoing packet id reaches this, well before
+/// the id space runs out (packet_id.h PACKET_ID_WRAP_TRIGGER).
+const PACKET_ID_WRAP_TRIGGER: u32 = 0xFF00_0000;
 
 /// How long a rejected session lingers to deliver AUTH_FAILED (OpenVPN's
 /// scheduled exit after send_auth_failed).
@@ -300,22 +316,47 @@ impl Peer {
             let Some(s) = self.session_mut(slot) else {
                 continue;
             };
-            let tick = s.ks.reliable.tick(now);
+            let tick = s.primary.reliable.tick(now);
             out.send.extend(tick.resend);
-            if tick.timed_out {
-                self.fail_session(slot, &mut out, None);
-            } else if let Some(at) = s.auth_failed {
+            if let Some(at) = s.auth_failed {
                 if now >= at {
                     let e =
                         io::Error::new(io::ErrorKind::PermissionDenied, "authentication failed");
                     self.fail_session(slot, &mut out, Some(e));
                 }
-            } else if !s.ks.kx_done && now >= s.ks.must_negotiate {
+                continue;
+            }
+            if s.lame
+                .as_ref()
+                .and_then(|k| k.must_die)
+                .is_some_and(|t| now >= t)
+            {
+                s.lame = None;
+            }
+            if s.primary.must_die.is_some_and(|t| now >= t) {
+                // A fallback key reached the end of its transition window
+                // with no successor.
+                let e = io::Error::new(io::ErrorKind::TimedOut, "data channel key expired");
+                self.fail_session(slot, &mut out, Some(e));
+            } else if tick.timed_out {
+                let e = io::Error::new(io::ErrorKind::TimedOut, "control packet never ACKed");
+                self.fail_key(slot, &mut out, e);
+            } else if !s.primary.kx_done && now >= s.primary.must_negotiate {
                 let e = io::Error::new(
                     io::ErrorKind::TimedOut,
                     "key negotiation did not complete within the handshake window",
                 );
-                self.fail_session(slot, &mut out, Some(e));
+                self.fail_key(slot, &mut out, e);
+            }
+        }
+
+        let timers = self.timers;
+        if let Some(s) = self.active.as_mut()
+            && s.should_renegotiate(now, &timers)
+        {
+            match s.soft_reset(&self.config, &timers, now) {
+                Ok(reset) => out.send.push(reset.to_bytes(&[])),
+                Err(e) => self.fail_session(Slot::Active, &mut out, Some(e)),
             }
         }
 
@@ -332,7 +373,7 @@ impl Peer {
             let interval = self.timers.keepalive_interval;
             if !interval.is_zero()
                 && now.saturating_duration_since(self.last_sent) >= interval
-                && let Ok(ping) = self.send_data(&OPENVPN_PING)
+                && let Ok(ping) = self.send_data_at(&OPENVPN_PING, now)
             {
                 out.send.push(ping);
             }
@@ -414,27 +455,57 @@ impl Peer {
         };
 
         let on_auth = self.on_auth.clone();
+        let config = self.config.clone();
+        let timers = self.timers;
         let session = self.session_mut(slot).expect("slot just resolved");
-        let tls_bytes = session.ks.recv(key_id, pkt)?;
+        // The client asks for a new key (ssl.c key_state_soft_reset): only
+        // once the current one is in use, and only for the next key id, so a
+        // retransmission of the soft reset that started the current key is
+        // just a duplicate.
+        if pkt.opcode == Opcode::CONTROL_SOFT_RESET_V1
+            && session.primary.data.is_some()
+            && session.auth_failed.is_none()
+            && key_id == session.next_key_id
+        {
+            reset = Some(session.soft_reset(&config, &timers, Instant::now())?);
+        }
+        let tls_bytes = session.primary.recv(key_id, pkt)?;
         if let Some(reset) = reset {
             // Our reset carries the ACK for theirs.
             out.send
-                .push(reset.to_bytes(&session.ks.reliable.take_pending_acks()));
+                .push(reset.to_bytes(&session.primary.reliable.take_pending_acks()));
         }
         if let Err(e) = session.process_tls(&tls_bytes, &on_auth, &mut out) {
-            self.fail_session(slot, &mut out, Some(e));
+            self.fail_key(slot, &mut out, e);
             return Ok(out);
         }
 
         // A session that has authenticated takes over the data channel.
-        if slot == Slot::Initial && self.initial.as_ref().is_some_and(|s| s.ks.kx_done) {
+        if slot == Slot::Initial && self.initial.as_ref().is_some_and(|s| s.primary.kx_done) {
             let session = self.initial.take();
             out.connected = session.as_ref().and_then(|s| s.peer_cfg.clone());
             out.replaced = self.active.is_some();
             self.active = session;
         }
-        out.authenticated = self.active.as_ref().is_some_and(|s| s.ks.kx_done);
+        // Mid-renegotiation the new key is not ready but the old one is.
+        out.authenticated = self.active.as_ref().is_some_and(|s| {
+            s.primary.data.is_some() || s.lame.as_ref().is_some_and(|k| k.data.is_some())
+        });
         Ok(out)
+    }
+
+    /// The session's newest key failed to negotiate (TLS error, timeout). A
+    /// renegotiation that fails falls back to the previous key for the rest
+    /// of its transition window (OpenVPN keeps its lame duck key the same
+    /// way); a session with nothing to fall back to fails.
+    fn fail_key(&mut self, slot: Slot, out: &mut PeerOutput, err: io::Error) {
+        if let Some(s) = self.session_mut(slot)
+            && let Some(lame) = s.lame.take()
+        {
+            s.primary = lame;
+            return;
+        }
+        self.fail_session(slot, out, Some(err));
     }
 
     /// A session hit a fatal error or timed out: drop it. The connection
@@ -458,12 +529,18 @@ impl Peer {
             .active
             .as_mut()
             .ok_or_else(|| invalid("stream not ready for data transmission"))?;
-        let (Some(opts), Some(dk)) = (session.opts.as_ref(), session.ks.data.as_mut()) else {
-            return Err(invalid("stream not ready for data transmission"));
-        };
-        if session.ks.key_id != key_id {
-            return Err(invalid("data packet for an unknown key id"));
-        }
+        let opts = session
+            .opts
+            .as_ref()
+            .ok_or_else(|| invalid("stream not ready for data transmission"))?;
+        // During a renegotiation both the new and the previous key are live;
+        // the packet's key id says which one it is under.
+        let dk = [Some(&mut session.primary), session.lame.as_mut()]
+            .into_iter()
+            .flatten()
+            .find(|k| k.key_id == key_id)
+            .and_then(|k| k.data.as_mut())
+            .ok_or_else(|| invalid("data packet for an unknown key id"))?;
 
         let mut buf = data.to_vec();
         let dec = data::decrypt(opts, &dk.keys, &mut buf)?
@@ -479,22 +556,45 @@ impl Peer {
 
     /// Encrypt and frame an outbound IP packet / Ethernet frame for the peer.
     pub fn send_data(&mut self, payload: &[u8]) -> io::Result<Vec<u8>> {
+        self.send_data_at(payload, Instant::now())
+    }
+
+    pub(super) fn send_data_at(&mut self, payload: &[u8], now: Instant) -> io::Result<Vec<u8>> {
         let session = self
             .active
             .as_mut()
             .ok_or_else(|| invalid("stream not ready for data transmission"))?;
-        let (Some(opts), Some(dk)) = (session.opts.as_ref(), session.ks.data.as_mut()) else {
-            return Err(invalid("stream not ready for data transmission"));
+        let opts = session
+            .opts
+            .as_ref()
+            .ok_or_else(|| invalid("stream not ready for data transmission"))?;
+        // A new key only takes over sending once the client has had time to
+        // install it (ssl.c tls_select_encryption_key and its
+        // auth_deferred_expire); until then the previous key, if any, is used.
+        let primary_ready = session.primary.data.is_some()
+            && (now >= session.primary.send_from
+                || !session.lame.as_ref().is_some_and(|k| k.data.is_some()));
+        let ks = if primary_ready {
+            &mut session.primary
+        } else {
+            session
+                .lame
+                .as_mut()
+                .filter(|k| k.data.is_some())
+                .ok_or_else(|| invalid("stream not ready for data transmission"))?
         };
+        let key_id = ks.key_id;
+        let dk = ks.data.as_mut().expect("checked above");
         // The packet id is the GCM nonce prefix: wrapping it would reuse a
         // nonce under the same key. OpenVPN (packet_id_send_update) refuses
-        // to send once the id space is spent; only a new key resets it.
+        // to send once the id space is spent; only a new key resets it, and
+        // one is negotiated well before (PACKET_ID_WRAP_TRIGGER).
         dk.out_pid = dk
             .out_pid
             .checked_add(1)
             .ok_or_else(|| invalid("data channel packet id exhausted; renegotiation required"))?;
-        self.last_sent = Instant::now();
-        data::encrypt(opts, &dk.keys, dk.out_pid, payload, fill_random)
+        self.last_sent = now;
+        data::encrypt(opts, &dk.keys, key_id, dk.out_pid, payload, fill_random)
     }
 }
 
@@ -503,7 +603,14 @@ impl Peer {
 struct Session {
     local_id: [u8; 8],
     remote_id: [u8; 8],
-    ks: KeyState,
+    /// The newest key: negotiating, or in use (OpenVPN's `KS_PRIMARY`).
+    primary: KeyState,
+    /// The previous key, still accepted until its transition window ends
+    /// (OpenVPN's `KS_LAME_DUCK`).
+    lame: Option<KeyState>,
+    /// Key id the next renegotiation uses: 1..=7, then back to 1 (0 is the
+    /// session's first key only).
+    next_key_id: u8,
 
     // Negotiated state, populated during the key exchange.
     opts: Option<Options>,
@@ -530,6 +637,12 @@ struct KeyState {
     kx_done: bool,
     /// The key exchange must complete by then.
     must_negotiate: Instant,
+    /// When the key exchange completed.
+    established: Option<Instant>,
+    /// Send with this key only from then on, if an older one is usable.
+    send_from: Instant,
+    /// The key stops being used then (set once it is superseded).
+    must_die: Option<Instant>,
     /// Server random material (r1||r2) generated for the key exchange and
     /// reused by [`Session::derive_keys`] so the PRF inputs match what was
     /// sent.
@@ -551,19 +664,30 @@ impl KeyState {
         key_id: u8,
         local_id: [u8; 8],
         remote_id: [u8; 8],
-        must_negotiate: Instant,
+        timers: &PeerTimers,
+        now: Instant,
     ) -> io::Result<KeyState> {
         let tls = TlsConnection::server(config)
             .map_err(|e| invalid(format!("TLS server connection: {e:?}")))?;
         let mut reliable = Reliable::new(local_id);
         reliable.peer_id = remote_id;
+        reliable.key_id = key_id;
+        // ssl.c auth_deferred_expire_window: the handshake window, or half
+        // the renegotiation interval if that is shorter.
+        let mut defer = timers.handshake_window;
+        if !timers.renegotiate_interval.is_zero() {
+            defer = defer.min(timers.renegotiate_interval / 2);
+        }
         Ok(KeyState {
             key_id,
             tls,
             reliable,
             ctrl_buf: Vec::new(),
             kx_done: false,
-            must_negotiate,
+            must_negotiate: now + timers.handshake_window,
+            established: None,
+            send_from: now + defer,
+            must_die: None,
             server_random: [0u8; 64],
             data: None,
         })
@@ -588,14 +712,15 @@ impl Session {
         remote_id: [u8; 8],
         timers: PeerTimers,
     ) -> io::Result<(Session, ControlPacket)> {
-        let must_negotiate = Instant::now() + timers.handshake_window;
-        let mut ks = KeyState::new(config, 0, local_id, remote_id, must_negotiate)?;
+        let mut ks = KeyState::new(config, 0, local_id, remote_id, &timers, Instant::now())?;
         let reset = ks.reliable.build_hard_reset();
         Ok((
             Session {
                 local_id,
                 remote_id,
-                ks,
+                primary: ks,
+                lame: None,
+                next_key_id: 1,
                 opts: None,
                 peer_cfg: None,
                 layer: 3,
@@ -605,6 +730,46 @@ impl Session {
             },
             reset,
         ))
+    }
+
+    /// Whether the server should start a renegotiation itself: the key in
+    /// use is due by age or by packet count, and none is under way.
+    fn should_renegotiate(&self, now: Instant, timers: &PeerTimers) -> bool {
+        let k = &self.primary;
+        let (Some(established), Some(data)) = (k.established, k.data.as_ref()) else {
+            return false;
+        };
+        // A key we fell back to after a failed renegotiation just runs out
+        // its transition window.
+        if k.must_die.is_some() || self.auth_failed.is_some() {
+            return false;
+        }
+        let by_age = !timers.renegotiate_interval.is_zero()
+            && now.saturating_duration_since(established) >= timers.renegotiate_interval;
+        by_age || data.out_pid >= PACKET_ID_WRAP_TRIGGER
+    }
+
+    /// Start negotiating the next key (ssl.c key_state_soft_reset): the
+    /// current key becomes the lame duck, kept for the transition window,
+    /// and a fresh TLS handshake runs on the next key id. Returns our
+    /// P_CONTROL_SOFT_RESET_V1, which opens the new key's reliable stream.
+    fn soft_reset(
+        &mut self,
+        config: &purecrypto::tls::Config,
+        timers: &PeerTimers,
+        now: Instant,
+    ) -> io::Result<ControlPacket> {
+        let key_id = self.next_key_id;
+        let mut ks = KeyState::new(config, key_id, self.local_id, self.remote_id, timers, now)?;
+        let reset = ks.reliable.build_soft_reset();
+        self.next_key_id = if key_id >= 7 { 1 } else { key_id + 1 };
+        let mut old = std::mem::replace(&mut self.primary, ks);
+        if old.data.is_some() {
+            let die = now + timers.transition_window;
+            old.must_die = Some(old.must_die.map_or(die, |t| t.min(die)));
+            self.lame = Some(old);
+        }
+        Ok(reset)
     }
 
     /// Feed in-order TLS bytes to the engine, run the control exchange on the
@@ -629,25 +794,25 @@ impl Session {
             return Ok(());
         }
         // `feed` consumes the whole slice.
-        self.ks
+        self.primary
             .tls
             .feed(tls_bytes)
             .map_err(|e| invalid(format!("tls feed: {e:?}")))?;
         // Drain decrypted plaintext into the control buffer. `recv` hands
         // back everything buffered in one call.
         let plain = self
-            .ks
+            .primary
             .tls
             .recv()
             .map_err(|e| invalid(format!("tls recv: {e:?}")))?;
         // A rejected session is only kept to deliver AUTH_FAILED; nothing
         // the client says on it is acted on any more.
         if self.auth_failed.is_none() {
-            self.ks.ctrl_buf.extend_from_slice(&plain);
+            self.primary.ctrl_buf.extend_from_slice(&plain);
             self.advance_control(on_auth)?;
             // Whatever is left is an incomplete message; bound how much of
             // one we are willing to hold.
-            if self.ks.ctrl_buf.len() > MAX_CONTROL_MESSAGE {
+            if self.primary.ctrl_buf.len() > MAX_CONTROL_MESSAGE {
                 return Err(invalid("control channel message too long"));
             }
         }
@@ -657,7 +822,7 @@ impl Session {
     /// Emit any pending TLS output as P_CONTROL_V1 packets, plus a standalone
     /// ACK if we owe acknowledgements but produced no control packet to ride on.
     fn pump_tls(&mut self, out: &mut PeerOutput) -> io::Result<()> {
-        let ks = &mut self.ks;
+        let ks = &mut self.primary;
         // `pop` returns the whole pending wire stream in one call.
         let tls_out = ks
             .tls
@@ -690,26 +855,26 @@ impl Session {
     /// are buffered. Runs at most once (after which the connection only carries
     /// PUSH_REQUEST and data). Writes the server reply into the TLS writer.
     fn advance_control(&mut self, on_auth: &OnAuth) -> io::Result<()> {
-        if self.ks.kx_done {
+        if self.primary.kx_done {
             return self.handle_post_auth_control();
         }
 
         // We need the full fixed prefix + four control strings before we can
         // respond. Parse non-destructively; bail (waiting for more) if short.
-        let (parsed, used) = match try_parse_key_exchange(&self.ks.ctrl_buf)? {
+        let (parsed, used) = match try_parse_key_exchange(&self.primary.ctrl_buf)? {
             Some(p) => p,
             None => return Ok(()), // not enough bytes yet
         };
         // What follows the key exchange is NUL-terminated control messages.
-        self.ks.ctrl_buf.drain(..used);
+        self.primary.ctrl_buf.drain(..used);
 
         // Generate the server random once; it's used both in the reply and in
         // the PRF key derivation.
-        fill_random(&mut self.ks.server_random)?;
+        fill_random(&mut self.primary.server_random)?;
 
         // Build the server reply onto the TLS stream.
-        let reply = build_kx_reply(&self.ks.server_random, &parsed);
-        self.ks
+        let reply = build_kx_reply(&self.primary.server_random, &parsed);
+        self.primary
             .tls
             .send(&reply)
             .map_err(|e| invalid(format!("tls write reply: {e:?}")))?;
@@ -721,13 +886,16 @@ impl Session {
             peer_info: parsed.peer_info.clone(),
             dev_type: parsed.opts.dev_type.clone(),
         };
+        // A renegotiation re-runs the check (OpenVPN re-verifies the
+        // credentials), but the session keeps the options and config it
+        // pushed: the client does not ask for them again.
         let cfg = match on_auth(&auth) {
             Ok(cfg) => cfg,
             Err(_) => {
                 // As OpenVPN's server does (send_auth_failed): tell the
                 // client, generate no keys, and end the session a few
                 // seconds later, once the message has had time to arrive.
-                self.ks
+                self.primary
                     .tls
                     .send(b"AUTH_FAILED\0")
                     .map_err(|e| invalid(format!("tls write AUTH_FAILED: {e:?}")))?;
@@ -735,16 +903,18 @@ impl Session {
                 return Ok(());
             }
         };
-        self.peer_cfg = Some(cfg);
         self.derive_keys(&parsed);
-
-        self.layer = match parsed.opts.dev_type.as_str() {
-            "tap" => 2,
-            _ => 3,
-        };
-        self.peer_info = parsed.peer_info;
-        self.opts = Some(parsed.opts);
-        self.ks.kx_done = true;
+        self.primary.kx_done = true;
+        self.primary.established = Some(Instant::now());
+        if self.opts.is_none() {
+            self.peer_cfg = Some(cfg);
+            self.layer = match parsed.opts.dev_type.as_str() {
+                "tap" => 2,
+                _ => 3,
+            };
+            self.peer_info = parsed.peer_info;
+            self.opts = Some(parsed.opts);
+        }
         Ok(())
     }
 
@@ -758,8 +928,8 @@ impl Session {
     /// - everything else (`PING`, `INFO`, additional `PUSH_*`, etc.) is
     ///   gracefully ignored: we consume the message and keep the channel open.
     fn handle_post_auth_control(&mut self) -> io::Result<()> {
-        while let Some(nul) = self.ks.ctrl_buf.iter().position(|&b| b == 0) {
-            let line: Vec<u8> = self.ks.ctrl_buf.drain(..=nul).collect();
+        while let Some(nul) = self.primary.ctrl_buf.iter().position(|&b| b == 0) {
+            let line: Vec<u8> = self.primary.ctrl_buf.drain(..=nul).collect();
             // Drop the trailing NUL; empty (bare-NUL) keepalives are ignored.
             let body = &line[..line.len() - 1];
             if body.is_empty() {
@@ -774,7 +944,7 @@ impl Session {
             let verb = s.split(',').next().unwrap_or("");
             if verb == "PUSH_REQUEST" {
                 let reply = self.build_push_reply();
-                self.ks
+                self.primary
                     .tls
                     .send(reply.as_bytes())
                     .map_err(|e| invalid(format!("tls push reply: {e:?}")))?;
@@ -807,7 +977,7 @@ impl Session {
     /// random generated in [`advance_control`](Self::advance_control) so the
     /// PRF inputs match what was sent to the client.
     fn derive_keys(&mut self, kx: &KeyExchange) {
-        let (sr1, sr2) = self.ks.server_random.split_at(32);
+        let (sr1, sr2) = self.primary.server_random.split_at(32);
 
         // master = PRF10(pre_master, "OpenVPN master secret", r1 || server_r1)
         let mut master = [0u8; 48];
@@ -828,7 +998,7 @@ impl Session {
         let label2 = format!("{} key expansion", KEY_EXPANSION_ID);
         prf10(&mut expansion, &master, label2.as_bytes(), &seed2);
 
-        self.ks.data = Some(DataKeys {
+        self.primary.data = Some(DataKeys {
             keys: PeerKeys::from_expansion(&expansion),
             replay: Window::new(),
             out_pid: 0,
@@ -1025,20 +1195,49 @@ mod tests {
             auth: super::super::options::AuthHash::None,
             ..Options::default()
         });
-        s.ks.data = Some(DataKeys {
+        s.primary.data = Some(DataKeys {
             keys: PeerKeys::from_expansion(&[7u8; 256]),
             replay: Window::new(),
             out_pid: 0,
         });
-        s.ks.kx_done = true;
+        s.primary.kx_done = true;
+        s.primary.established = Some(Instant::now());
         p.active = Some(s);
         p
+    }
+
+    /// Long before the packet ids run out, the server renegotiates
+    /// (PACKET_ID_WRAP_TRIGGER), whatever reneg-sec says.
+    #[test]
+    fn low_packet_ids_trigger_renegotiation() {
+        let mut p = keyed_peer().with_timers(
+            PeerTimers::default()
+                .renegotiate_interval(Duration::ZERO)
+                .keepalive_interval(Duration::ZERO),
+        );
+        let quiet = p.tick(Instant::now()).unwrap();
+        assert!(quiet.send.is_empty());
+        let dk = p.active.as_mut().unwrap().primary.data.as_mut().unwrap();
+        dk.out_pid = PACKET_ID_WRAP_TRIGGER;
+        let out = p.tick(Instant::now()).unwrap();
+        let pkt = ControlPacket::parse(&out.send[0]).unwrap();
+        assert_eq!(pkt.opcode, Opcode::CONTROL_SOFT_RESET_V1);
+        assert_eq!(pkt.key_id, 1);
+        // Meanwhile the old key keeps sending.
+        assert!(p.send_data(b"x").is_ok());
     }
 
     #[test]
     fn send_data_refuses_to_wrap_the_packet_id() {
         let mut p = keyed_peer();
-        p.active.as_mut().unwrap().ks.data.as_mut().unwrap().out_pid = u32::MAX - 1;
+        p.active
+            .as_mut()
+            .unwrap()
+            .primary
+            .data
+            .as_mut()
+            .unwrap()
+            .out_pid = u32::MAX - 1;
         // The last id OpenVPN allows is u32::MAX.
         let pkt = p.send_data(b"x").unwrap();
         assert_eq!(&pkt[1..5], &u32::MAX.to_be_bytes());

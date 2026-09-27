@@ -14,10 +14,14 @@ use purecrypto::tls::{Config as TlsConfig, Connection as TlsConnection, Protocol
 use super::data;
 use super::keys::PeerKeys;
 use super::options::Options;
+use super::packet_ctrl::ControlPacket;
+use super::peer::PeerTimers;
 use super::peer::{AuthInfo, OnAuth, Peer, PeerConfig};
 use super::prf::prf10;
 use super::reliable::Reliable;
 use super::{CipherBlockMethod, CipherCryptoAlg, Opcode};
+use crate::time::Instant;
+use std::time::Duration;
 
 const TEST_CERT: &str = "-----BEGIN CERTIFICATE-----
 MIIDCzCCAfOgAwIBAgIUIivmiQqCMO8WqOV9OJFs/D3JLRUwDQYJKoZIhvcNAQEL
@@ -243,6 +247,19 @@ impl TestClient {
         self.handle(data)
     }
 
+    /// Start renegotiating on `key_id` as an OpenVPN client does
+    /// (key_state_soft_reset): a fresh TLS session over a fresh reliable
+    /// stream, opened by a P_CONTROL_SOFT_RESET_V1, which is returned.
+    fn renegotiate(&mut self, key_id: u8) -> Vec<u8> {
+        self.tls = TlsConnection::client(&client_config()).unwrap();
+        let mut r = Reliable::new(self.reliable.local_id);
+        r.peer_id = self.reliable.peer_id;
+        r.key_id = key_id;
+        self.reliable = r;
+        self.ctrl_buf.clear();
+        self.reliable.build_soft_reset().to_bytes(&[])
+    }
+
     /// Control-channel plaintext received so far.
     pub(super) fn control_text(&self) -> &[u8] {
         &self.ctrl_buf
@@ -301,7 +318,13 @@ pub(super) fn connect_via(
 /// Run the reliable-layer pump until the TLS handshake completes on both
 /// sides, or give up. Returns whether it completed.
 fn drive_handshake(server: &mut Peer, client: &mut TestClient) -> bool {
-    let mut server_inbox: Vec<Vec<u8>> = vec![client.hard_reset()];
+    let first = vec![client.hard_reset()];
+    drive_from(server, client, first)
+}
+
+/// [`drive_handshake`] starting from the given client datagrams.
+fn drive_from(server: &mut Peer, client: &mut TestClient, first: Vec<Vec<u8>>) -> bool {
+    let mut server_inbox = first;
     let mut client_inbox: Vec<Vec<u8>> = Vec::new();
 
     for _round in 0..50 {
@@ -458,7 +481,7 @@ fn e2e_tls_handshake_and_key_exchange() {
     // own decrypt path against its own encrypt path, and that the server
     // accepts a packet the client sent (round-trips through the live server).
     let payload = b"hello over the data channel";
-    let pkt = data::encrypt(&opts, &client_keys.encrypt_side, 1, payload, |b| {
+    let pkt = data::encrypt(&opts, &client_keys.encrypt_side, 0, 1, payload, |b| {
         b.fill(0xAB);
         Ok(())
     })
@@ -832,6 +855,153 @@ fn insecure_data_channel_is_refused() {
     }
 }
 
+/// Key id of a data packet.
+fn key_id_of(pkt: &[u8]) -> u8 {
+    Opcode::from_byte(pkt[0]).1
+}
+
+/// Timers without keepalive, so ticks far in the future only exercise
+/// renegotiation.
+fn quiet_timers() -> PeerTimers {
+    PeerTimers::default()
+        .keepalive_interval(Duration::ZERO)
+        .keepalive_timeout(Duration::ZERO)
+}
+
+/// A client renegotiates (reneg-sec on its side): the server runs a new TLS
+/// handshake and key exchange on key id 1 alongside the working key 0,
+/// accepts both keys during the transition, and moves its own sending to the
+/// new key once the client has had time to install it.
+#[test]
+fn client_initiated_renegotiation() {
+    let mut server = Peer::new(server_config(), *b"SERVERID", auth_hook())
+        .unwrap()
+        .with_timers(quiet_timers());
+    let mut client = TestClient::new(*b"CLIENTID");
+    let k0 = connect(&mut server, &mut client);
+    assert_eq!(deliver(&mut server, &k0, 1, b"k0"), Some(b"k0".to_vec()));
+
+    let first = vec![client.renegotiate(1)];
+    let k1 = connect_from(&mut server, &mut client, first);
+    assert_eq!(
+        deliver_on(&mut server, &k1, 1, 1, b"k1"),
+        Some(b"k1".to_vec())
+    );
+    // The previous key still works during the transition window.
+    assert_eq!(
+        deliver_on(&mut server, &k0, 0, 2, b"old"),
+        Some(b"old".to_vec())
+    );
+
+    let now = Instant::now();
+    let early = server.send_data_at(b"x", now).unwrap();
+    assert_eq!(
+        key_id_of(&early),
+        0,
+        "new key used before the client has it"
+    );
+    let mut late = server
+        .send_data_at(b"y", now + Duration::from_secs(61))
+        .unwrap();
+    assert_eq!(key_id_of(&late), 1);
+    let d = data::decrypt(&gcm_opts(), &k1, &mut late).unwrap().unwrap();
+    assert_eq!(d.payload, b"y");
+
+    // After the transition window only the new key is accepted.
+    let out = server.tick(now + Duration::from_secs(3601)).unwrap();
+    assert!(!out.close);
+    assert_eq!(deliver_on(&mut server, &k0, 0, 3, b"gone"), None);
+    assert_eq!(
+        deliver_on(&mut server, &k1, 1, 2, b"k1"),
+        Some(b"k1".to_vec())
+    );
+}
+
+/// The server renegotiates on its own once the key is reneg-sec old, with a
+/// P_CONTROL_SOFT_RESET_V1 on the next key id; the client answers the way
+/// OpenVPN does and a new key results.
+#[test]
+fn server_initiated_renegotiation() {
+    let mut server = Peer::new(server_config(), *b"SERVERID", auth_hook())
+        .unwrap()
+        .with_timers(quiet_timers().transition_window(Duration::from_secs(7200)));
+    let mut client = TestClient::new(*b"CLIENTID");
+    let k0 = connect(&mut server, &mut client);
+
+    let out = server
+        .tick(Instant::now() + Duration::from_secs(3601))
+        .unwrap();
+    let soft: Vec<ControlPacket> = out
+        .send
+        .iter()
+        .map(|d| ControlPacket::parse(d).unwrap())
+        .filter(|p| p.opcode == Opcode::CONTROL_SOFT_RESET_V1)
+        .collect();
+    assert_eq!(soft.len(), 1, "one soft reset");
+    assert_eq!(soft[0].key_id, 1);
+    assert_eq!(soft[0].pid, Some(0));
+
+    let mut first = vec![client.renegotiate(1)];
+    first.extend(client.handle(&soft[0].to_bytes(&[])));
+    let k1 = connect_from(&mut server, &mut client, first);
+    assert_eq!(
+        deliver_on(&mut server, &k1, 1, 1, b"k1"),
+        Some(b"k1".to_vec())
+    );
+    assert_eq!(
+        deliver_on(&mut server, &k0, 0, 1, b"k0"),
+        Some(b"k0".to_vec())
+    );
+}
+
+/// A renegotiation the client never answers must not take the connection
+/// down with it: the working key carries on until its transition window
+/// ends (then the connection is over, as in OpenVPN).
+#[test]
+fn failed_renegotiation_falls_back_to_the_old_key() {
+    let mut server = Peer::new(server_config(), *b"SERVERID", auth_hook())
+        .unwrap()
+        .with_timers(quiet_timers());
+    let mut client = TestClient::new(*b"CLIENTID");
+    let k0 = connect(&mut server, &mut client);
+    let start = Instant::now();
+
+    let t_reneg = start + Duration::from_secs(3601);
+    assert!(!server.tick(t_reneg).unwrap().close);
+    let t_failed = t_reneg + Duration::from_secs(61);
+    assert!(!server.tick(t_failed).unwrap().close);
+    assert_eq!(
+        deliver(&mut server, &k0, 1, b"still"),
+        Some(b"still".to_vec())
+    );
+    let pkt = server.send_data_at(b"x", t_failed).unwrap();
+    assert_eq!(key_id_of(&pkt), 0);
+    // No automatic retry on a key we fell back to; it expires.
+    let out = server.tick(t_reneg + Duration::from_secs(3601)).unwrap();
+    assert!(out.close);
+}
+
+/// The client may start the next renegotiation itself after a failed one.
+#[test]
+fn client_may_renegotiate_after_a_failed_attempt() {
+    let mut server = Peer::new(server_config(), *b"SERVERID", auth_hook())
+        .unwrap()
+        .with_timers(quiet_timers());
+    let mut client = TestClient::new(*b"CLIENTID");
+    connect(&mut server, &mut client);
+    let t_reneg = Instant::now() + Duration::from_secs(3601);
+    server.tick(t_reneg).unwrap();
+    server.tick(t_reneg + Duration::from_secs(61)).unwrap();
+
+    // The server's attempt used key id 1; the client's next one is 2.
+    let first = vec![client.renegotiate(2)];
+    let k2 = connect_from(&mut server, &mut client, first);
+    assert_eq!(
+        deliver_on(&mut server, &k2, 2, 1, b"k2"),
+        Some(b"k2".to_vec())
+    );
+}
+
 // --- helpers ----------------------------------------------------------------
 
 /// Exchange what `client` has queued with `server` until both go quiet;
@@ -861,7 +1031,13 @@ fn pump(server: &mut Peer, client: &mut TestClient) -> bool {
 /// Drive a client through hard reset, TLS handshake and key exchange against
 /// `server`, returning the keys the client encrypts with.
 fn connect(server: &mut Peer, client: &mut TestClient) -> PeerKeys {
-    assert!(drive_handshake(server, client), "TLS handshake");
+    let first = vec![client.hard_reset()];
+    connect_from(server, client, first)
+}
+
+/// [`connect`] starting from the given client datagrams (a soft reset, say).
+fn connect_from(server: &mut Peer, client: &mut TestClient, first: Vec<Vec<u8>>) -> PeerKeys {
+    assert!(drive_from(server, client, first), "TLS handshake");
     let (pre_master, random1, random2) = send_client_key_material(client);
     let mut server_inbox = Vec::new();
     client.pump_tls(&mut server_inbox);
@@ -904,7 +1080,18 @@ pub(super) fn gcm_opts() -> Options {
 
 /// Encrypt `payload` as the client and return what the server delivers.
 fn deliver(server: &mut Peer, keys: &PeerKeys, pid: u32, payload: &[u8]) -> Option<Vec<u8>> {
-    let pkt = data::encrypt(&gcm_opts(), keys, pid, payload, |b| {
+    deliver_on(server, keys, 0, pid, payload)
+}
+
+/// [`deliver`] under the given key id.
+fn deliver_on(
+    server: &mut Peer,
+    keys: &PeerKeys,
+    key_id: u8,
+    pid: u32,
+    payload: &[u8],
+) -> Option<Vec<u8>> {
+    let pkt = data::encrypt(&gcm_opts(), keys, key_id, pid, payload, |b| {
         b.fill(0);
         Ok(())
     })

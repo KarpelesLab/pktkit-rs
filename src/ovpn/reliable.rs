@@ -65,6 +65,9 @@ pub struct TickOutcome {
 pub struct Reliable {
     pub local_id: [u8; 8],
     pub peer_id: [u8; 8],
+    /// Key id stamped on every packet built here: each key has its own
+    /// reliable stream.
+    pub key_id: u8,
 
     // Outgoing.
     out_counter: u32,
@@ -99,6 +102,7 @@ impl Reliable {
         Reliable {
             local_id,
             peer_id: [0u8; 8],
+            key_id: 0,
             out_counter: 0,
             unacked: HashMap::new(),
             in_counter: 0,
@@ -195,7 +199,8 @@ impl Reliable {
     /// already be sized within [`CONTROL_CHANNEL_MTU`]). Assigns the next pid,
     /// records it as unacknowledged, and attaches pending ACKs.
     pub fn build_control(&mut self, payload: &[u8]) -> ControlPacket {
-        let mut pkt = ControlPacket::new(Opcode::CONTROL_V1, 0, self.local_id, self.peer_id);
+        let mut pkt =
+            ControlPacket::new(Opcode::CONTROL_V1, self.key_id, self.local_id, self.peer_id);
         pkt.payload = payload.to_vec();
         let pid = self.out_counter;
         pkt.set_pid(pid);
@@ -236,6 +241,12 @@ impl Reliable {
         self.build_reset(Opcode::CONTROL_HARD_RESET_SERVER_V2)
     }
 
+    /// Build the P_CONTROL_SOFT_RESET_V1 that opens a renegotiated key's
+    /// stream.
+    pub fn build_soft_reset(&mut self) -> ControlPacket {
+        self.build_reset(Opcode::CONTROL_SOFT_RESET_V1)
+    }
+
     /// Build a client hard-reset packet (used by client-side drivers/tests).
     #[allow(dead_code)]
     pub fn build_client_hard_reset(&mut self) -> ControlPacket {
@@ -243,7 +254,7 @@ impl Reliable {
     }
 
     fn build_reset(&mut self, opcode: Opcode) -> ControlPacket {
-        let mut pkt = ControlPacket::new(opcode, 0, self.local_id, self.peer_id);
+        let mut pkt = ControlPacket::new(opcode, self.key_id, self.local_id, self.peer_id);
         let pid = self.out_counter;
         pkt.set_pid(pid);
         self.out_counter += 1;
@@ -254,7 +265,7 @@ impl Reliable {
     /// Build a standalone ACK packet (no pid of its own). The ACK pids are
     /// supplied at serialization time via [`ControlPacket::to_bytes`].
     pub fn build_ack(&self) -> ControlPacket {
-        ControlPacket::new(Opcode::ACK_V1, 0, self.local_id, self.peer_id)
+        ControlPacket::new(Opcode::ACK_V1, self.key_id, self.local_id, self.peer_id)
     }
 
     /// Packets still awaiting acknowledgement (for retransmission). Returns

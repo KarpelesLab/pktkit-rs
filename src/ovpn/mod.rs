@@ -1,19 +1,23 @@
 //! OpenVPN server.
 //!
-//! This module ports the Go `ovpn` subpackage. The control channel runs a
-//! `rustls::ServerConnection` *inside* OpenVPN's own reliable transport (no TCP
-//! socket under the TLS); the data channel uses RustCrypto AES-GCM / AES-CBC.
+//! The control channel runs a purecrypto TLS server connection *inside*
+//! OpenVPN's own reliable transport (no TCP socket under the TLS); the data
+//! channel uses purecrypto's AES-GCM / AES-CBC + HMAC.
 //!
 //! What works:
 //! - [`Options`] parse / `Display` (`V4,dev-type tun,…`).
-//! - TLS 1.2 control channel over the reliable layer (rustls in buffered mode).
+//! - TLS control channel over the reliable layer, with sessions routed by
+//!   session id as in OpenVPN's `ssl.c`.
 //! - Key-method 2 key exchange and TLS-1.0 PRF key derivation.
+//! - Renegotiation (soft reset) from either side, with the previous key kept
+//!   for the transition window.
 //! - Data channel: AES-256/128-GCM (AEAD) and AES-CBC + HMAC.
 //! - Replay window, PKCS#7 padding, control-packet framing.
 //! - UDP and TCP [`Server`]; per-peer [`Adapter`] over an `L3Connector` (tun)
 //!   or `L2Connector` (tap).
 //!
-//! Control-packet retransmission is driven by [`Peer::tick`] (wired into the
+//! Timers -- control-packet retransmission, handshake window, keepalive,
+//! renegotiation -- are driven by [`Peer::tick`] (wired into the
 //! [`Server`]'s maintenance loop), and peer-info / repeated `PUSH_REQUEST`
 //! control messages are handled after authentication.
 //!

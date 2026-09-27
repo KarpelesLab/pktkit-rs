@@ -25,7 +25,6 @@ use super::keys::PeerKeys;
 use super::options::{AuthHash, Options};
 use super::pkcs5;
 use super::{CipherBlockMethod, CipherCryptoAlg, Opcode};
-use crate::ovpn::consts::P_OPCODE_SHIFT;
 
 /// No-compression marker OpenVPN prepends to the plaintext when compression is
 /// framed but disabled.
@@ -57,15 +56,16 @@ fn cipher_key_bytes(opts: &Options) -> usize {
 pub fn encrypt(
     opts: &Options,
     keys: &PeerKeys,
+    key_id: u8,
     pid: u32,
     payload: &[u8],
     rng: impl FnOnce(&mut [u8]) -> io::Result<()>,
 ) -> io::Result<Vec<u8>> {
     check_supported(opts)?;
     if opts.cipher_block == CipherBlockMethod::Gcm {
-        return encrypt_gcm(opts, keys, pid, payload);
+        return encrypt_gcm(opts, keys, key_id, pid, payload);
     }
-    encrypt_cbc(opts, keys, pid, payload, rng)
+    encrypt_cbc(opts, keys, key_id, pid, payload, rng)
 }
 
 /// Refuse a data channel this implementation will not run: anything but
@@ -107,7 +107,13 @@ pub fn decrypt<'a>(
 const GCM_NONCE: usize = 12;
 const GCM_TAG: usize = 16;
 
-fn encrypt_gcm(opts: &Options, keys: &PeerKeys, pid: u32, payload: &[u8]) -> io::Result<Vec<u8>> {
+fn encrypt_gcm(
+    opts: &Options,
+    keys: &PeerKeys,
+    key_id: u8,
+    pid: u32,
+    payload: &[u8],
+) -> io::Result<Vec<u8>> {
     let nbytes = cipher_key_bytes(opts);
 
     // Build nonce = pid(4) || implicit_iv(8 from hmac_encrypt).
@@ -128,7 +134,7 @@ fn encrypt_gcm(opts: &Options, keys: &PeerKeys, pid: u32, payload: &[u8]) -> io:
 
     // Output: [opcode:1][pid:4][tag:16][ciphertext..].
     let mut out = Vec::with_capacity(1 + 4 + GCM_TAG + pt.len());
-    out.push(Opcode::DATA_V1.0 << P_OPCODE_SHIFT);
+    out.push(Opcode::DATA_V1.to_byte(key_id));
     out.extend_from_slice(&pid.to_be_bytes());
     out.extend_from_slice(&tag);
     out.extend_from_slice(&pt);
@@ -211,6 +217,7 @@ fn gcm_open_in_place(
 fn encrypt_cbc(
     opts: &Options,
     keys: &PeerKeys,
+    key_id: u8,
     pid: u32,
     payload: &[u8],
     rng: impl FnOnce(&mut [u8]) -> io::Result<()>,
@@ -239,7 +246,7 @@ fn encrypt_cbc(
     body.extend_from_slice(&iv);
     body.extend_from_slice(&padded);
 
-    let id = Opcode::DATA_V1.0 << P_OPCODE_SHIFT;
+    let id = Opcode::DATA_V1.to_byte(key_id);
     // check_supported guarantees an HMAC.
     let n = opts.auth.size();
     let mac = hmac_compute(opts.auth, &keys.hmac_encrypt[..n], &body);
@@ -381,6 +388,7 @@ fn finish_plaintext<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ovpn::consts::P_OPCODE_SHIFT;
 
     fn rng_zero(b: &mut [u8]) -> io::Result<()> {
         // Deterministic non-zero IV for tests that need a real IV.
@@ -439,7 +447,7 @@ mod tests {
         let (sk, rk) = key_pair();
         let opts = gcm_opts(256);
         let payload = b"Hello, OpenVPN GCM roundtrip test!";
-        let mut pkt = encrypt(&opts, &sk, 1, payload, rng_zero).unwrap();
+        let mut pkt = encrypt(&opts, &sk, 0, 1, payload, rng_zero).unwrap();
         let d = decrypt(&opts, &rk, &mut pkt).unwrap().unwrap();
         assert_eq!(d.pid, 1);
         assert_eq!(d.payload, payload);
@@ -451,7 +459,7 @@ mod tests {
         let (sk, rk) = key_pair();
         let opts = gcm_opts(128);
         let payload = b"smaller key";
-        let mut pkt = encrypt(&opts, &sk, 7, payload, rng_zero).unwrap();
+        let mut pkt = encrypt(&opts, &sk, 0, 7, payload, rng_zero).unwrap();
         let d = decrypt(&opts, &rk, &mut pkt).unwrap().unwrap();
         assert_eq!(d.payload, payload);
     }
@@ -460,7 +468,7 @@ mod tests {
     fn gcm_corrupted_tag_dropped() {
         let (sk, rk) = key_pair();
         let opts = gcm_opts(256);
-        let mut pkt = encrypt(&opts, &sk, 1, b"corrupt me", rng_zero).unwrap();
+        let mut pkt = encrypt(&opts, &sk, 0, 1, b"corrupt me", rng_zero).unwrap();
         pkt[10] ^= 0xff; // flip a tag byte
         assert!(decrypt(&opts, &rk, &mut pkt).unwrap().is_none());
     }
@@ -478,7 +486,7 @@ mod tests {
         let (sk, rk) = key_pair();
         let opts = gcm_opts(256);
         let payload: Vec<u8> = (0..1400).map(|i| i as u8).collect();
-        let mut pkt = encrypt(&opts, &sk, 99, &payload, rng_zero).unwrap();
+        let mut pkt = encrypt(&opts, &sk, 0, 99, &payload, rng_zero).unwrap();
         let d = decrypt(&opts, &rk, &mut pkt).unwrap().unwrap();
         assert_eq!(d.payload, &payload[..]);
     }
@@ -488,7 +496,7 @@ mod tests {
         let (sk, rk) = key_pair();
         let opts = cbc_opts(128);
         let payload = b"Hello, OpenVPN CBC!";
-        let mut pkt = encrypt(&opts, &sk, 5, payload, rng_zero).unwrap();
+        let mut pkt = encrypt(&opts, &sk, 0, 5, payload, rng_zero).unwrap();
         // Opcode check.
         assert_eq!(pkt[0] >> P_OPCODE_SHIFT, Opcode::DATA_V1.0);
         // [opcode:1][hmac:32][iv:16][ct..] => >= 65.
@@ -503,7 +511,7 @@ mod tests {
         let (sk, rk) = key_pair();
         let opts = cbc_opts(256);
         let payload = b"256-bit CBC payload";
-        let mut pkt = encrypt(&opts, &sk, 11, payload, rng_zero).unwrap();
+        let mut pkt = encrypt(&opts, &sk, 0, 11, payload, rng_zero).unwrap();
         let d = decrypt(&opts, &rk, &mut pkt).unwrap().unwrap();
         assert_eq!(d.payload, payload);
     }
@@ -512,7 +520,7 @@ mod tests {
     fn cbc_bad_hmac_dropped() {
         let (sk, rk) = key_pair();
         let opts = cbc_opts(128);
-        let mut pkt = encrypt(&opts, &sk, 1, b"tamper", rng_zero).unwrap();
+        let mut pkt = encrypt(&opts, &sk, 0, 1, b"tamper", rng_zero).unwrap();
         pkt[2] ^= 0x01; // corrupt the HMAC
         assert!(decrypt(&opts, &rk, &mut pkt).unwrap().is_none());
     }
@@ -522,12 +530,12 @@ mod tests {
         let (sk, _rk) = key_pair();
         let opts = cbc_opts(128);
         // Two distinct IVs => distinct ciphertext for the same payload.
-        let p1 = encrypt(&opts, &sk, 1, b"same", |b| {
+        let p1 = encrypt(&opts, &sk, 0, 1, b"same", |b| {
             b.fill(1);
             Ok(())
         })
         .unwrap();
-        let p2 = encrypt(&opts, &sk, 1, b"same", |b| {
+        let p2 = encrypt(&opts, &sk, 0, 1, b"same", |b| {
             b.fill(2);
             Ok(())
         })
@@ -542,7 +550,7 @@ mod tests {
     fn cbc_plaintext_layout_matches_openvpn() {
         let (sk, rk) = key_pair();
         let opts = cbc_opts(128);
-        let pkt = encrypt(&opts, &sk, 0x0102_0304, b"xyz", rng_zero).unwrap();
+        let pkt = encrypt(&opts, &sk, 0, 0x0102_0304, b"xyz", rng_zero).unwrap();
         // [opcode:1][hmac:32][iv:16][ct..]
         let iv: [u8; 16] = pkt[33..49].try_into().unwrap();
         let mut ct = pkt[49..].to_vec();
@@ -574,7 +582,7 @@ mod tests {
         let (sk, rk) = key_pair();
         for mut opts in [gcm_opts(256), cbc_opts(256)] {
             opts.compression = "none".into();
-            let mut pkt = encrypt(&opts, &sk, 3, b"no framing", rng_zero).unwrap();
+            let mut pkt = encrypt(&opts, &sk, 0, 3, b"no framing", rng_zero).unwrap();
             let d = decrypt(&opts, &rk, &mut pkt).unwrap().unwrap();
             assert_eq!(d.payload, b"no framing");
         }
@@ -586,8 +594,8 @@ mod tests {
         let (sk, rk) = key_pair();
         let mut opts = cbc_opts(256);
         opts.auth = AuthHash::None;
-        assert!(encrypt(&opts, &sk, 1, b"x", rng_zero).is_err());
-        let mut pkt = encrypt(&cbc_opts(256), &sk, 1, b"x", rng_zero).unwrap();
+        assert!(encrypt(&opts, &sk, 0, 1, b"x", rng_zero).is_err());
+        let mut pkt = encrypt(&cbc_opts(256), &sk, 0, 1, b"x", rng_zero).unwrap();
         // Strip the HMAC to make a packet an auth-less peer would send.
         pkt.drain(1..33);
         assert!(decrypt(&opts, &rk, &mut pkt).is_err());
@@ -601,8 +609,8 @@ mod tests {
             cipher_crypto: CipherCryptoAlg::None,
             ..cbc_opts(256)
         };
-        assert!(encrypt(&opts, &sk, 1, b"x", rng_zero).is_err());
-        let mut pkt = encrypt(&cbc_opts(256), &sk, 1, b"x", rng_zero).unwrap();
+        assert!(encrypt(&opts, &sk, 0, 1, b"x", rng_zero).is_err());
+        let mut pkt = encrypt(&cbc_opts(256), &sk, 0, 1, b"x", rng_zero).unwrap();
         assert!(decrypt(&opts, &rk, &mut pkt).is_err());
     }
 
@@ -635,7 +643,7 @@ mod tests {
             auth: AuthHash::Sha1,
             ..gcm_opts(256)
         };
-        let mut pkt = encrypt(&opts, &sk, 1, b"gcm", rng_zero).unwrap();
+        let mut pkt = encrypt(&opts, &sk, 0, 1, b"gcm", rng_zero).unwrap();
         let d = decrypt(&opts, &rk, &mut pkt).unwrap().unwrap();
         assert_eq!(d.payload, b"gcm");
     }
@@ -644,7 +652,7 @@ mod tests {
     fn gcm_ping_detected() {
         let (sk, rk) = key_pair();
         let opts = gcm_opts(256);
-        let mut pkt = encrypt(&opts, &sk, 1, &OPENVPN_PING, rng_zero).unwrap();
+        let mut pkt = encrypt(&opts, &sk, 0, 1, &OPENVPN_PING, rng_zero).unwrap();
         let d = decrypt(&opts, &rk, &mut pkt).unwrap().unwrap();
         assert!(d.is_ping);
     }
