@@ -927,6 +927,14 @@ impl Packet {
         } else {
             transport_checksum(proto, src, dst, payload)
         };
+        // A UDP checksum of zero means "not computed" (RFC 768), and IPv6
+        // forbids that outright (RFC 8200 §8.1), so a sum that really is
+        // zero goes out as its other one's-complement form, all ones.
+        let sum = if proto == Protocol::UDP && sum == 0 {
+            0xFFFF
+        } else {
+            sum
+        };
         let payload = self.transport_payload_mut();
         payload[field..field + 2].copy_from_slice(&sum.to_be_bytes());
         true
@@ -1426,5 +1434,34 @@ mod tests {
         let p = Packet::from_slice(&buf);
         assert_eq!(p.transport_protocol(), Protocol::ESP);
         assert!(p.tcp().is_none());
+    }
+
+    #[test]
+    fn udp_checksum_that_computes_to_zero_is_sent_as_all_ones() {
+        for v6 in [false, true] {
+            // UDP with a two-byte body, the body picked so the checksum
+            // computes to zero.
+            let mut p = if v6 { v6_min() } else { v4_min() };
+            let hl = p.len();
+            p.extend_from_slice(&[0, 1, 0, 2, 0, 10, 0, 0, 0, 0]);
+            if v6 {
+                p[4..6].copy_from_slice(&10u16.to_be_bytes());
+            } else {
+                p[9] = Protocol::UDP.0;
+                p[2..4].copy_from_slice(&((hl + 10) as u16).to_be_bytes());
+            }
+            assert!(Packet::from_mut(&mut p).recompute_transport_checksum());
+            let cs = [p[hl + 6], p[hl + 7]];
+            p[hl + 8..hl + 10].copy_from_slice(&cs);
+
+            let pkt = Packet::from_mut(&mut p);
+            assert!(pkt.recompute_transport_checksum());
+            // 0 on the wire would mean "no checksum", which IPv6 forbids.
+            assert_eq!(p[hl + 6..hl + 8], [0xFF, 0xFF], "v6={v6}");
+            assert_eq!(
+                Packet::from_slice(&p).verify_transport_checksum(),
+                Some(true)
+            );
+        }
     }
 }
