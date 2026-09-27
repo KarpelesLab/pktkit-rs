@@ -94,7 +94,20 @@ impl Request {
     }
 
     /// Serialize the request line + headers + body into wire bytes.
-    fn serialize(&self) -> Vec<u8> {
+    ///
+    /// Header names must be tokens and values free of CR, LF and NUL
+    /// (RFC 9110 §5.1, §5.5): a line break in either would end the field
+    /// early and let the rest pass as fields, or a request, of its own.
+    fn serialize(&self) -> io::Result<Vec<u8>> {
+        for (k, v) in &self.headers {
+            if k.is_empty() || !k.bytes().all(is_tchar) || v.bytes().any(|b| b"\r\n\0".contains(&b))
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("invalid header field {k:?}"),
+                ));
+            }
+        }
         let mut out = Vec::new();
         let _ = write!(out, "{} {} HTTP/1.1\r\n", self.method, self.path);
         let _ = write!(out, "Host: {}\r\n", host_header(&self.host, self.port));
@@ -117,7 +130,7 @@ impl Request {
         }
         out.extend_from_slice(b"\r\n");
         out.extend_from_slice(&self.body);
-        out
+        Ok(out)
     }
 }
 
@@ -129,6 +142,8 @@ impl Client {
     /// takes longer than the request's [`timeout`](Request::timeout), so a
     /// server that stalls cannot hold the caller forever.
     pub fn http(&self, req: &Request) -> io::Result<Response> {
+        // A request that cannot be sent is refused before any lookup or dial.
+        let wire = req.serialize()?;
         // Resolve host → IP.
         let ip: IpAddr = match req.host.parse::<IpAddr>() {
             Ok(ip) => ip,
@@ -156,7 +171,7 @@ impl Client {
 
         let mut conn = self.dial_tcp_timeout(SocketAddr::new(ip, req.port), remaining()?)?;
         conn.set_write_timeout(Some(remaining()?));
-        conn.write_all(&req.serialize()).map_err(timed_out)?;
+        conn.write_all(&wire).map_err(timed_out)?;
 
         // Read until the response's own framing says it is complete, or to
         // EOF when it has none (we ask for `Connection: close`).
@@ -190,6 +205,12 @@ fn parse_http_url(url: &str) -> io::Result<(String, u16, String)> {
         )
     })?;
     let bad = |what: &str| io::Error::new(io::ErrorKind::InvalidInput, format!("bad URL: {what}"));
+    // A URI has no spaces or control characters (RFC 3986 §2); here they
+    // would land in the request line and the Host field, where a line break
+    // starts a field, or a request, the caller never wrote.
+    if rest.bytes().any(|b| b <= b' ' || b == 0x7F) {
+        return Err(bad("space or control character"));
+    }
     // RFC 3986 §3.2: the authority ends at the first '/', '?' or '#'.
     let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let (authority, rest) = rest.split_at(end);
@@ -226,6 +247,12 @@ fn parse_http_url(url: &str) -> io::Result<(String, u16, String)> {
         p => p.parse().map_err(|_| bad("invalid port"))?,
     };
     Ok((host.to_string(), port, path))
+}
+
+/// A `tchar`, what a token (such as a header name) is made of (RFC 9110
+/// §5.6.2).
+fn is_tchar(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
 }
 
 /// The Host header for `host:port` (RFC 9112 §3.2): the port only when it is
@@ -600,7 +627,7 @@ mod tests {
     #[test]
     fn host_header_carries_port_and_brackets() {
         let host = |url: &str| {
-            let s = String::from_utf8(Request::get(url).unwrap().serialize()).unwrap();
+            let s = String::from_utf8(Request::get(url).unwrap().serialize().unwrap()).unwrap();
             s.lines()
                 .find_map(|l| l.strip_prefix("Host: ").map(str::to_string))
                 .unwrap()
@@ -612,9 +639,46 @@ mod tests {
     }
 
     #[test]
+    fn crlf_cannot_be_smuggled_into_the_request() {
+        for url in [
+            "http://h/a\r\nX-Evil: 1",
+            "http://h/a\nb",
+            "http://h/a b",
+            "http://h/\0",
+            "http://h?q\r\n",
+            "http://h\r\nX-Evil: 1/",
+        ] {
+            assert!(Request::get(url).is_err(), "{url:?}");
+        }
+        let req = |name: &str, value: &str| Request::get("http://h/").unwrap().header(name, value);
+        for (name, value) in [
+            ("X-Ok", "a\r\nX-Evil: 1"),
+            ("X-Ok", "a\nb"),
+            ("X-Ok", "a\rb"),
+            ("X-Ok", "a\0b"),
+            ("X-Evil: 1\r\nX", "v"),
+            ("Bad Name", "v"),
+            ("", "v"),
+        ] {
+            let err = req(name, value).serialize().unwrap_err();
+            assert_eq!(
+                err.kind(),
+                io::ErrorKind::InvalidInput,
+                "{name:?}: {value:?}"
+            );
+        }
+        let ok = req("X-Fine", "a\tb; c=\"d\"").serialize().unwrap();
+        assert!(
+            String::from_utf8(ok)
+                .unwrap()
+                .contains("X-Fine: a\tb; c=\"d\"\r\n")
+        );
+    }
+
+    #[test]
     fn request_serialize_includes_host_and_len() {
         let req = Request::post("http://h/p", b"abc".to_vec()).unwrap();
-        let s = String::from_utf8(req.serialize()).unwrap();
+        let s = String::from_utf8(req.serialize().unwrap()).unwrap();
         assert!(s.starts_with("POST /p HTTP/1.1\r\n"));
         assert!(s.contains("Host: h\r\n"));
         assert!(s.contains("Content-Length: 3\r\n"));
