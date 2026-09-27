@@ -73,6 +73,11 @@ impl PeerTimers {
     pub fn initiation_sent(&mut self, now: Instant) {
         self.attempt_started.get_or_insert(now);
         self.last_initiation = Some(now);
+        // An initiation is an authenticated packet like any other for
+        // persistent keepalive, which the reference re-arms on every one
+        // sent: with the peer unreachable, the next attempt then comes an
+        // interval after the last gave up, not immediately after.
+        self.last_sent = Some(now);
         self.want_handshake = false;
         self.jitter =
             Duration::from_millis((crate::rand::u32() % REKEY_TIMEOUT_JITTER_MAX_MS) as u64);
@@ -104,9 +109,13 @@ impl PeerTimers {
     pub fn handshake_due(&mut self, now: Instant) -> Option<bool> {
         if let Some(start) = self.attempt_started {
             if now.duration_since(start) >= REKEY_ATTEMPT_TIME {
+                // Giving up drops the pending keepalive as well, as the
+                // reference's wg_expired_retransmit_handshake deletes its
+                // timer: it would otherwise start the next attempt at once.
                 self.attempt_started = None;
                 self.want_handshake = false;
                 self.reply_due_since = None;
+                self.keepalive_due_since = None;
                 return None;
             }
             let last = self.last_initiation.unwrap_or(start);

@@ -85,6 +85,16 @@ const RESP_OFF_END: usize = RESP_OFF_MAC2 + BLAKE2S_128_SIZE;
 /// packet is the wire form ready to send; the handler retains an entry in its
 /// handshakes table keyed by the freshly-allocated `senderIdx`.
 pub(crate) fn initiate_handshake(h: &Handler, peer_key: &NoisePublicKey) -> Result<Vec<u8>> {
+    initiate_handshake_at(h, peer_key, Instant::now())
+}
+
+/// [`initiate_handshake`], recording the initiation in the peer's timers as
+/// sent at `now`, the time the timers that asked for it were polled at.
+pub(crate) fn initiate_handshake_at(
+    h: &Handler,
+    peer_key: &NoisePublicKey,
+    now: Instant,
+) -> Result<Vec<u8>> {
     if !h.is_authorized_peer(peer_key) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -186,7 +196,7 @@ pub(crate) fn initiate_handshake(h: &Handler, peer_key: &NoisePublicKey) -> Resu
     h.cookie_add_macs(peer_key, &mut pkt);
 
     zeroize(&mut key);
-    h.with_timers(peer_key, |t| t.initiation_sent(Instant::now()));
+    h.with_timers(peer_key, |t| t.initiation_sent(now));
     Ok(pkt)
 }
 

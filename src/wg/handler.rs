@@ -542,7 +542,10 @@ impl Handler {
     /// 100 ms or so. [`Server`](crate::wg::Server) does it for you; without
     /// one, the caller sends each packet to the peer's endpoint.
     pub fn poll_timers(&self) -> Vec<TimerAction> {
-        let now = Instant::now();
+        self.poll_timers_at(Instant::now())
+    }
+
+    pub(crate) fn poll_timers_at(&self, now: Instant) -> Vec<TimerAction> {
         let peers: Vec<NoisePublicKey> = self.peers().into_iter().collect();
         let mut out = Vec::new();
         for peer in peers {
@@ -562,7 +565,7 @@ impl Handler {
             };
             match due {
                 None => out.push(TimerAction::HandshakeFailed { peer }),
-                Some(true) => match self.initiate_handshake(&peer) {
+                Some(true) => match crate::wg::handshake::initiate_handshake_at(self, &peer, now) {
                     Ok(packet) => out.push(TimerAction::SendHandshake { peer, packet }),
                     // Nothing can answer an initiation that never went out,
                     // so what waits on this handshake would wait in vain.
@@ -576,8 +579,21 @@ impl Handler {
                         out.push(TimerAction::SendKeepalive { peer, packet });
                     }
                 } else {
-                    // A keepalive needs a keypair; get one.
-                    self.with_timers(&peer, |t| t.want_handshake = true);
+                    // A keepalive needs a keypair; get one. The passive
+                    // keepalive fires once, as the reference's one-shot
+                    // timer does: left pending, it asked for a new handshake
+                    // on every poll, each abandoned attempt was followed at
+                    // once by another, and an offline peer drew initiations
+                    // forever. A peer no longer authorized gets none at all:
+                    // its initiation cannot even be built, and asking would
+                    // only report the handshake failed on every poll.
+                    let authorized = self.is_authorized_peer(&peer);
+                    self.with_timers(&peer, |t| {
+                        t.keepalive_due_since = None;
+                        if authorized {
+                            t.want_handshake = true;
+                        }
+                    });
                 }
             }
         }
@@ -1677,6 +1693,73 @@ mod tests {
         }
         // Once per packet: the guard is released between them.
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// Tally what the timers of `h` do over `secs` seconds from `t0`,
+    /// polled every 100 ms: (initiations, failures, and when each
+    /// initiation went out).
+    fn run_timers(h: &Handler, t0: Instant, secs: u64) -> (usize, usize, Vec<Duration>) {
+        let (mut inits, mut failed, mut at) = (0, 0, Vec::new());
+        for i in 0..secs * 10 {
+            let off = Duration::from_millis(100 * i);
+            for act in h.poll_timers_at(t0 + off) {
+                match act {
+                    TimerAction::SendHandshake { .. } => {
+                        inits += 1;
+                        at.push(off);
+                    }
+                    TimerAction::HandshakeFailed { .. } => failed += 1,
+                    TimerAction::SendKeepalive { .. } => {}
+                }
+            }
+        }
+        (inits, failed, at)
+    }
+
+    /// A keepalive that comes due with no session starts one handshake
+    /// attempt, which gives up like any other. It stayed pending, so every
+    /// abandoned attempt was followed at once by the next: an offline peer
+    /// drew some 690 initiations an hour, for ever.
+    #[test]
+    fn a_keepalive_due_without_a_session_is_one_attempt() {
+        let (a, b) = pair();
+        let t0 = Instant::now();
+        a.with_timers(&b.public_key(), |t| t.keepalive_due_since = Some(t0));
+        let (inits, failed, _) = run_timers(&a, t0, 3600);
+        assert!((1..=20).contains(&inits), "{inits} initiations");
+        assert_eq!(failed, 1);
+    }
+
+    /// Nor does a keepalive due for a peer whose authorization lapsed ask
+    /// for a handshake, which could never be built: that reported
+    /// HandshakeFailed on every poll.
+    #[test]
+    fn a_keepalive_due_for_an_expired_peer_asks_for_nothing() {
+        let (a, b) = pair();
+        let t0 = Instant::now();
+        a.with_timers(&b.public_key(), |t| t.keepalive_due_since = Some(t0));
+        a.set_peer_expiry(&b.public_key(), t0 - Duration::from_secs(1));
+        assert_eq!(run_timers(&a, t0, 600), (0, 0, Vec::new()));
+    }
+
+    /// Persistent keepalive keeps trying an unreachable peer, as the
+    /// reference does, but each new attempt waits an interval after the
+    /// last initiation rather than following the one given up at once.
+    #[test]
+    fn persistent_keepalive_retries_an_unreachable_peer_an_interval_apart() {
+        let (a, b) = pair();
+        let every = Duration::from_secs(25);
+        a.set_persistent_keepalive(&b.public_key(), Some(every));
+        let (inits, failed, at) = run_timers(&a, Instant::now(), 600);
+        assert!(failed >= 2, "gave up {failed} times");
+        assert!(inits > 20, "stopped after {inits} initiations");
+        assert!(
+            at.windows(2)
+                .all(|w| w[1] - w[0] >= crate::wg::REKEY_TIMEOUT),
+            "{at:?}"
+        );
+        let gaps = at.windows(2).filter(|w| w[1] - w[0] >= every).count();
+        assert_eq!(gaps, failed, "{at:?}");
     }
 
     #[test]
