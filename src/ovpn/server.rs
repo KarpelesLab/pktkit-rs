@@ -447,7 +447,7 @@ impl Server {
             .collect();
         if let Some(cb) = &self.cfg.on_disconnect {
             for k in peers {
-                cb(k);
+                callback(|| cb(k));
             }
         }
     }
@@ -621,7 +621,7 @@ impl Server {
         if entry.mark_removed()
             && let Some(cb) = &self.cfg.on_disconnect
         {
-            cb(key);
+            callback(|| cb(key));
         }
     }
 
@@ -722,7 +722,7 @@ impl Server {
 
         if let Some(payload) = out.deliver {
             let layer = entry.peer.lock().unwrap().layer();
-            (self.cfg.on_data)(key, layer, &payload);
+            callback(|| (self.cfg.on_data)(key, layer, &payload));
         }
 
         if out.close {
@@ -748,10 +748,10 @@ impl Server {
             std::mem::replace(&mut l.connected, true)
         };
         if replaced && let Some(cb) = &self.cfg.on_disconnect {
-            cb(key);
+            callback(|| cb(key));
         }
         if let Some(cb) = &self.cfg.on_connect {
-            cb(key, cfg);
+            callback(|| cb(key, cfg));
         }
         // A removal while the callbacks ran left its on_disconnect to us.
         let gone = {
@@ -760,7 +760,7 @@ impl Server {
             l.removed && std::mem::take(&mut l.connected)
         };
         if gone && let Some(cb) = &self.cfg.on_disconnect {
-            cb(key);
+            callback(|| cb(key));
         }
     }
 
@@ -934,6 +934,14 @@ fn tcp_conn(server: &Weak<Server>, stream: TcpStream, addr: SocketAddr) {
     if let Some(s) = server.upgrade() {
         s.remove_entry(&entry);
     }
+}
+
+/// Run a caller's callback, containing a panic in it. The panic hook has
+/// reported it already; unwinding further would take down whichever thread
+/// ran it -- the UDP reader serves every client -- or leave the server's
+/// own bookkeeping half done.
+fn callback(f: impl FnOnce()) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
 }
 
 /// An auth worker: serve queued peers, one authentication at a time, until
@@ -1681,6 +1689,58 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(dec.payload, b"welcome");
+        server.close();
+    }
+
+    /// A callback that panics is contained: on_data runs on the UDP
+    /// reader, which serves every client, and must not take it down.
+    #[test]
+    fn a_panicking_callback_does_not_stop_the_server() {
+        let on_auth: OnAuth = Arc::new(|_| {
+            Ok(PeerConfig::new(
+                "10.8.0.2".parse().unwrap(),
+                "10.8.0.1".parse().unwrap(),
+                "255.255.255.0".parse().unwrap(),
+                24,
+            ))
+        });
+        let on_data: OnData = Arc::new(|_, _, payload| {
+            if payload == b"boom" {
+                panic!("on_data panics (expected by this test)");
+            }
+        });
+        let on_connect: OnConnect = Arc::new(|_, _| panic!("on_connect panics (expected)"));
+        let cfg = ServerConfig::new(
+            crate::ovpn::tests::server_config(),
+            "127.0.0.1:0".parse().unwrap(),
+            on_auth,
+            on_data,
+        )
+        .on_connect(on_connect);
+        let server = Server::new(cfg).unwrap();
+
+        let sock = udp_client(&server);
+        let mut client = TestClient::new(*b"CLIENTID");
+        let (keys, _) = connect_udp(&sock, &mut client);
+        let pkt = crate::ovpn::data::encrypt(
+            &crate::ovpn::tests::gcm_opts(),
+            &keys,
+            0,
+            1,
+            b"boom",
+            |b| {
+                b.fill(0);
+                Ok(())
+            },
+        )
+        .unwrap();
+        sock.send(&pkt).unwrap();
+
+        // Another client is still served.
+        let other = udp_client(&server);
+        let (_, held) = open_udp(&other, *b"OTHERCID");
+        assert!(held, "the UDP service died with the callback");
+        assert_eq!(server.peers.read().unwrap().len(), 2);
         server.close();
     }
 
