@@ -410,7 +410,7 @@ impl Nat {
         out
     }
 
-    fn helper_inbound(&self, pkt: Vec<u8>, m: &NatMapping, proto: u8, dst_port: u16) -> Vec<u8> {
+    fn helper_inbound(&self, pkt: Vec<u8>, m: &NatMapping, proto: u8, remote_port: u16) -> Vec<u8> {
         let helpers: Vec<_> = {
             let inner = self.inner.lock().unwrap();
             if inner.helpers.is_empty() {
@@ -421,7 +421,7 @@ impl Nat {
         let mut out = pkt;
         for h in helpers {
             if let Some(ph) = h.as_packet()
-                && ph.match_outbound(proto, dst_port)
+                && ph.match_outbound(proto, remote_port)
             {
                 out = ph.process_inbound(self, out, m);
             }
@@ -811,14 +811,15 @@ impl Nat {
             }
         }
 
-        // Helpers see the original (pre-NAT) destination port.
+        // Helpers are chosen by the service port, which on a reply to an
+        // outbound connection is the remote's source port.
         let nm = NatMapping {
             proto: mapping_key.proto,
             inside_ip: IpAddr::V4(mapping_key.ip),
             inside_port: mapping_key.port,
             outside_port,
         };
-        let out = self.helper_inbound(out, &nm, proto, dst_port);
+        let out = self.helper_inbound(out, &nm, proto, src_port);
         self.send_ns(mapping_key.ns, Packet::from_slice(&out));
     }
 
@@ -1438,6 +1439,62 @@ mod tests {
                 .unwrap();
             assert!((NAT_PORT_MIN..=NAT_PORT_MAX).contains(&port));
         }
+    }
+
+    /// Records which packets a helper was asked to process.
+    #[derive(Default)]
+    struct Recorder {
+        outbound: StdMutex<Vec<u16>>,
+        inbound: StdMutex<Vec<u16>>,
+    }
+
+    impl Helper for Recorder {
+        fn name(&self) -> &str {
+            "recorder"
+        }
+    }
+
+    impl PacketHelper for Recorder {
+        fn match_outbound(&self, proto: u8, dst_port: u16) -> bool {
+            proto == PROTO_TCP && dst_port == 21
+        }
+        fn process_outbound(&self, _nat: &Nat, pkt: Vec<u8>, m: &NatMapping) -> Vec<u8> {
+            self.outbound.lock().unwrap().push(m.outside_port);
+            pkt
+        }
+        fn process_inbound(&self, _nat: &Nat, pkt: Vec<u8>, m: &NatMapping) -> Vec<u8> {
+            self.inbound.lock().unwrap().push(m.outside_port);
+            pkt
+        }
+    }
+
+    #[test]
+    fn helpers_see_replies_from_the_service_port() {
+        let (nat, _i, o) = setup();
+        let rec = Arc::new(Recorder::default());
+        nat.add_packet_helper(rec.clone());
+        let p = build_tcp(
+            Ipv4Addr::new(10, 0, 0, 5),
+            40000,
+            Ipv4Addr::new(198, 51, 100, 9),
+            21,
+            0x02,
+        );
+        nat.inside().send(Packet::from_slice(&p)).unwrap();
+        let mapped = {
+            let o = o.lock().unwrap();
+            u16::from_be_bytes([o[0][20], o[0][21]])
+        };
+        let reply = build_tcp(
+            Ipv4Addr::new(198, 51, 100, 9),
+            21,
+            Ipv4Addr::new(203, 0, 113, 1),
+            mapped,
+            0x12,
+        );
+        nat.outside().send(Packet::from_slice(&reply)).unwrap();
+        assert_eq!(*rec.outbound.lock().unwrap(), vec![mapped]);
+        assert_eq!(*rec.inbound.lock().unwrap(), vec![mapped]);
     }
 
     #[test]

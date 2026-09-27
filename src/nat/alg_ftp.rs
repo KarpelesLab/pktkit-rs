@@ -1,13 +1,15 @@
 //! FTP Application Layer Gateway (RFC 959).
 //!
-//! Rewrites `PORT`/`EPRT` commands outbound and `227`/`229` responses inbound
-//! so active and passive mode data connections work through the NAT.
+//! Rewrites `PORT`/`EPRT` commands outbound so active-mode data connections
+//! work through the NAT. Passive mode (`227`/`229` replies) needs nothing: the
+//! inside client opens the data connection itself, and the ordinary outbound
+//! path maps it.
 
 use crate::nat::helper::{Expectation, Helper, NatMapping, PROTO_TCP, PacketHelper};
 use crate::nat::l4::replace_payload;
 use crate::nat::nat::Nat;
 use crate::time::Instant;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::Ipv4Addr;
 use std::time::Duration;
 
 const FTP_EXPECT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -53,26 +55,6 @@ impl PacketHelper for FtpHelper {
         }
         if upper.starts_with(b"EPRT ") {
             return rewrite_eprt(nat, &pkt, ihl, data_off, m);
-        }
-        pkt
-    }
-
-    fn process_inbound(&self, nat: &Nat, pkt: Vec<u8>, m: &NatMapping) -> Vec<u8> {
-        let ihl = (pkt[0] & 0x0F) as usize * 4;
-        if pkt.len() < ihl + 20 {
-            return pkt;
-        }
-        let data_off = (pkt[ihl + 12] >> 4) as usize * 4;
-        if data_off < 20 || pkt[ihl..].len() < data_off {
-            return pkt;
-        }
-        let payload = &pkt[ihl + data_off..];
-        if payload.starts_with(b"227 ") {
-            register_227(nat, &pkt, ihl, data_off, m);
-            // We don't rewrite addresses in 227 — passive mode is initiated by
-            // the inside client outbound, so the normal NAT path handles it.
-        } else if payload.starts_with(b"229 ") {
-            register_229(nat, &pkt, ihl, data_off, m);
         }
         pkt
     }
@@ -208,115 +190,6 @@ fn rewrite_eprt(nat: &Nat, pkt: &[u8], ihl: usize, data_off: usize, _m: &NatMapp
     replace_payload(pkt, ihl, data_off, &new_payload)
 }
 
-fn register_227(nat: &Nat, pkt: &[u8], ihl: usize, data_off: usize, m: &NatMapping) {
-    let payload = &pkt[ihl + data_off..];
-    let end = match find_crlf(payload) {
-        Some(p) => p,
-        None => return,
-    };
-    let line = &payload[..end];
-    let lp = match line.iter().position(|&b| b == b'(') {
-        Some(p) => p,
-        None => return,
-    };
-    let rp = match line.iter().position(|&b| b == b')') {
-        Some(p) => p,
-        None => return,
-    };
-    if rp <= lp {
-        return;
-    }
-    let inner = &line[lp + 1..rp];
-    let parts: Vec<&[u8]> = inner.split(|&b| b == b',').collect();
-    if parts.len() != 6 {
-        return;
-    }
-    let mut ip = [0u8; 4];
-    for i in 0..4 {
-        ip[i] = match std::str::from_utf8(parts[i])
-            .ok()
-            .and_then(|s| s.parse::<u16>().ok())
-        {
-            Some(v) if v <= 255 => v as u8,
-            _ => return,
-        };
-    }
-    let p1: u16 = match std::str::from_utf8(parts[4])
-        .ok()
-        .and_then(|s| s.parse().ok())
-    {
-        Some(v) => v,
-        None => return,
-    };
-    let p2: u16 = match std::str::from_utf8(parts[5])
-        .ok()
-        .and_then(|s| s.parse().ok())
-    {
-        Some(v) => v,
-        None => return,
-    };
-    let server_port = p1 * 256 + p2;
-    let server_ip = Ipv4Addr::from(ip);
-    let inside_ip = match m.inside_ip {
-        IpAddr::V4(a) => a,
-        _ => return,
-    };
-    nat.add_expectation(Expectation {
-        proto: PROTO_TCP,
-        remote_ip: server_ip,
-        remote_port: server_port,
-        inside_ip,
-        inside_port: 0,
-        expires: Instant::now() + FTP_EXPECT_TIMEOUT,
-    });
-}
-
-fn register_229(nat: &Nat, pkt: &[u8], ihl: usize, data_off: usize, m: &NatMapping) {
-    let payload = &pkt[ihl + data_off..];
-    let end = match find_crlf(payload) {
-        Some(p) => p,
-        None => return,
-    };
-    let line = &payload[..end];
-    let lp = match line.iter().position(|&b| b == b'(') {
-        Some(p) => p,
-        None => return,
-    };
-    let rp = match line.iter().position(|&b| b == b')') {
-        Some(p) => p,
-        None => return,
-    };
-    if rp <= lp {
-        return;
-    }
-    let inner = &line[lp + 1..rp];
-    if !inner.starts_with(b"|||") || !inner.ends_with(b"|") {
-        return;
-    }
-    let port_str = &inner[3..inner.len() - 1];
-    let port: u16 = match std::str::from_utf8(port_str)
-        .ok()
-        .and_then(|s| s.parse().ok())
-    {
-        Some(p) => p,
-        None => return,
-    };
-    // Server IP = source of the inbound packet.
-    let server_ip = Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]);
-    let inside_ip = match m.inside_ip {
-        IpAddr::V4(a) => a,
-        _ => return,
-    };
-    nat.add_expectation(Expectation {
-        proto: PROTO_TCP,
-        remote_ip: server_ip,
-        remote_port: port,
-        inside_ip,
-        inside_port: 0,
-        expires: Instant::now() + FTP_EXPECT_TIMEOUT,
-    });
-}
-
 fn find_crlf(b: &[u8]) -> Option<usize> {
     b.windows(2).position(|w| w == b"\r\n")
 }
@@ -396,5 +269,46 @@ mod tests {
             crate::nat::l4::v4_l4_checksum_ok(out, ihl),
             "rewritten PORT segment must carry a valid TCP checksum"
         );
+    }
+
+    #[test]
+    fn hostile_227_reply_is_harmless() {
+        let nat = Nat::new(pfx("10.0.0.1/24"), pfx("203.0.113.1/24"));
+        nat.add_packet_helper(Arc::new(FtpHelper::new()));
+        let outside = Arc::new(StdMutex::new(Vec::<Vec<u8>>::new()));
+        let c = outside.clone();
+        nat.outside().set_handler(Arc::new(move |p| {
+            c.lock().unwrap().push(p.as_bytes().to_vec());
+            Ok(())
+        }));
+        let inside = Arc::new(StdMutex::new(Vec::<Vec<u8>>::new()));
+        let c = inside.clone();
+        nat.inside().set_handler(Arc::new(move |p| {
+            c.lock().unwrap().push(p.as_bytes().to_vec());
+            Ok(())
+        }));
+
+        let client = Ipv4Addr::new(10, 0, 0, 5);
+        let server = Ipv4Addr::new(198, 51, 100, 9);
+        let pkt = build_ftp_port_pkt(client, 45000, server, 21, b"PASV\r\n");
+        nat.inside().send(Packet::from_slice(&pkt)).unwrap();
+        let mapped = {
+            let o = outside.lock().unwrap();
+            u16::from_be_bytes([o[0][20], o[0][21]])
+        };
+
+        // Port numbers out of range must not overflow the port arithmetic.
+        let reply = build_ftp_port_pkt(
+            server,
+            21,
+            Ipv4Addr::new(203, 0, 113, 1),
+            mapped,
+            b"227 Entering Passive Mode (1,2,3,4,65535,0)\r\n",
+        );
+        nat.outside().send(Packet::from_slice(&reply)).unwrap();
+        assert_eq!(inside.lock().unwrap().len(), 1);
+        // The passive data connection is opened by the inside client, so the
+        // reply must not have opened anything towards the inside.
+        assert!(nat.take_expectation(PROTO_TCP, client, 0).is_none());
     }
 }
