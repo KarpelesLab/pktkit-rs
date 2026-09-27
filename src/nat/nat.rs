@@ -200,6 +200,20 @@ impl Nat {
         }
     }
 
+    /// Whether `ip` is the inside network's directed broadcast address
+    /// (RFC 919), which like the limited one never leaves that network.
+    /// /31 and /32 have none (RFC 3021).
+    fn is_inside_broadcast(&self, ip: Ipv4Addr) -> bool {
+        let prefix = self.inside.addr();
+        match prefix.addr() {
+            IpAddr::V4(a) if (1..=30).contains(&prefix.bits()) => {
+                let host = u32::MAX >> prefix.bits();
+                u32::from(ip) == u32::from(a) | host
+            }
+            _ => false,
+        }
+    }
+
     /// IPv4 address bound to the outside interface.
     pub fn outside_addr(&self) -> Option<Ipv4Addr> {
         match self.outside.addr().addr() {
@@ -904,7 +918,8 @@ impl Nat {
         // The latter are scoped to the inside network and are never
         // translated out.
         let dst_ip = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
-        let group = dst_ip.is_multicast() || dst_ip.is_broadcast();
+        let group =
+            dst_ip.is_multicast() || dst_ip.is_broadcast() || self.is_inside_broadcast(dst_ip);
         let local = group || Some(dst_ip) == self.inside_addr();
         // Without reassembly each fragment is translated on its own. Only
         // the first carries the transport header; reading the others' data
@@ -3119,6 +3134,19 @@ mod tests {
         assert_eq!(&r[16..20], &INSIDE.octets());
         assert_eq!(r[20], 0, "echo reply");
         assert_eq!(checksum(&r[20..]), 0);
+    }
+
+    #[test]
+    fn a_directed_broadcast_stays_inside() {
+        let (nat, _i, o) = setup();
+        let p = build_udp(INSIDE, 5000, Ipv4Addr::new(10, 0, 0, 255), 137, b"nb");
+        nat.inside().send(Packet::from_slice(&p)).unwrap();
+        assert!(o.lock().unwrap().is_empty(), "broadcast sent upstream");
+        assert_eq!(mapped(&nat), 0);
+        // Another network's broadcast address is just an address.
+        let p = build_udp(INSIDE, 5000, Ipv4Addr::new(10, 0, 1, 255), 137, b"nb");
+        nat.inside().send(Packet::from_slice(&p)).unwrap();
+        assert_eq!(o.lock().unwrap().len(), 1);
     }
 
     #[test]
