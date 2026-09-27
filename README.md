@@ -173,13 +173,13 @@ use pktkit::slirp::Stack;
 let hub = Arc::new(L2Hub::new());
 
 // DHCP server handing out 192.168.0.10–100.
-let mut dcfg = DhcpConfig::new(
+let dcfg = DhcpConfig::new(
     Ipv4Addr::new(192, 168, 0, 1),
     Ipv4Addr::new(192, 168, 0, 10),
     Ipv4Addr::new(192, 168, 0, 100),
-);
-dcfg.router = Some(Ipv4Addr::new(192, 168, 0, 1));
-dcfg.dns = vec![Ipv4Addr::new(1, 1, 1, 1)];
+)
+.router(Ipv4Addr::new(192, 168, 0, 1))
+.dns(vec![Ipv4Addr::new(1, 1, 1, 1)]);
 let _dhcp_handle = hub.connect(DhcpServer::new(dcfg));
 
 // NAT gateway: a slirp stack routing to the real network, bridged onto L2.

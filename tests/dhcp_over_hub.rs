@@ -15,13 +15,13 @@ fn adapter_obtains_lease_from_server_over_hub() {
     let hub = Arc::new(L2Hub::new());
 
     // DHCP server: pool 192.168.50.10–20, router/DNS set.
-    let mut dcfg = DhcpConfig::new(
+    let dcfg = DhcpConfig::new(
         Ipv4Addr::new(192, 168, 50, 1),
         Ipv4Addr::new(192, 168, 50, 10),
         Ipv4Addr::new(192, 168, 50, 20),
-    );
-    dcfg.router = Some(Ipv4Addr::new(192, 168, 50, 1));
-    dcfg.dns = vec![Ipv4Addr::new(1, 1, 1, 1)];
+    )
+    .router(Ipv4Addr::new(192, 168, 50, 1))
+    .dns(vec![Ipv4Addr::new(1, 1, 1, 1)]);
     let _server_handle = hub.connect(DhcpServer::new(dcfg));
 
     // Client: an unconfigured L3 pipe wrapped in an L2Adapter, joined to the hub.
