@@ -57,6 +57,11 @@ impl MultiHandler {
         }))
     }
 
+    /// A snapshot of the members. Everything that calls into a handler
+    /// iterates over one rather than holding the lock: a handler may run
+    /// the unknown-peer callback, which may come back here (say, through
+    /// [`Adapter::accept_unknown_peer`](crate::wg::Adapter::accept_unknown_peer)),
+    /// and a second read lock taken while a writer waits deadlocks.
     pub fn handlers(&self) -> Vec<Arc<Handler>> {
         self.handlers.read().expect("multihandler lock").clone()
     }
@@ -116,15 +121,16 @@ impl MultiHandler {
     }
 
     fn route_handshake(&self, data: &[u8], remote_addr: &SocketAddr) -> Result<MultiPacketResult> {
-        let g = self.handlers.read().expect("multihandler lock");
-        for h in g.iter() {
-            if check_mac1(h.public_key().as_bytes(), data) {
-                let res = h.process_packet(data, remote_addr)?;
-                return Ok(MultiPacketResult {
-                    result: res,
-                    handler: h.clone(),
-                });
-            }
+        let found = self
+            .handlers()
+            .into_iter()
+            .find(|h| check_mac1(h.public_key().as_bytes(), data));
+        if let Some(h) = found {
+            let res = h.process_packet(data, remote_addr)?;
+            return Ok(MultiPacketResult {
+                result: res,
+                handler: h,
+            });
         }
         Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -140,15 +146,16 @@ impl MultiHandler {
             ));
         }
         let receiver_idx = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
-        let g = self.handlers.read().expect("multihandler lock");
-        for h in g.iter() {
-            if h.has_keypair_index(receiver_idx) {
-                let res = h.process_packet(data, remote_addr)?;
-                return Ok(MultiPacketResult {
-                    result: res,
-                    handler: h.clone(),
-                });
-            }
+        let found = self
+            .handlers()
+            .into_iter()
+            .find(|h| h.has_keypair_index(receiver_idx));
+        if let Some(h) = found {
+            let res = h.process_packet(data, remote_addr)?;
+            return Ok(MultiPacketResult {
+                result: res,
+                handler: h,
+            });
         }
         Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -180,15 +187,16 @@ impl MultiHandler {
             u32::from_le_bytes([data[4], data[5], data[6], data[7]])
         };
 
-        let g = self.handlers.read().expect("multihandler lock");
-        for h in g.iter() {
-            if h.has_handshake_index(receiver_idx) {
-                let res = h.process_packet(data, remote_addr)?;
-                return Ok(MultiPacketResult {
-                    result: res,
-                    handler: h.clone(),
-                });
-            }
+        let found = self
+            .handlers()
+            .into_iter()
+            .find(|h| h.has_handshake_index(receiver_idx));
+        if let Some(h) = found {
+            let res = h.process_packet(data, remote_addr)?;
+            return Ok(MultiPacketResult {
+                result: res,
+                handler: h,
+            });
         }
         Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -199,25 +207,23 @@ impl MultiHandler {
     /// Run [`Handler::poll_timers`] on every member, pairing each action
     /// with the identity it belongs to.
     pub fn poll_timers(&self) -> Vec<(Arc<Handler>, crate::wg::TimerAction)> {
-        let g = self.handlers.read().expect("multihandler lock");
-        g.iter()
-            .flat_map(|h| h.poll_timers().into_iter().map(|a| (h.clone(), a)))
+        self.handlers()
+            .into_iter()
+            .flat_map(|h| h.poll_timers().into_iter().map(move |a| (h.clone(), a)))
             .collect()
     }
 
     /// Run [`Handler::maintenance`] on every member.
     pub fn maintenance(&self) {
-        let g = self.handlers.read().expect("multihandler lock");
-        for h in g.iter() {
+        for h in self.handlers() {
             h.maintenance();
         }
     }
 
     /// Close every member; returns the first error encountered.
     pub fn close(&self) -> Result<()> {
-        let g = self.handlers.read().expect("multihandler lock");
         let mut first: Option<io::Error> = None;
-        for h in g.iter() {
+        for h in self.handlers() {
             if let Err(e) = h.close()
                 && first.is_none()
             {
@@ -252,5 +258,46 @@ mod tests {
         assert!(mh.handler(&h2.public_key()).is_some());
         let missing = NoisePublicKey([0xAB; 32]);
         assert!(mh.handler(&missing).is_none());
+    }
+
+    /// The unknown-peer callback runs while an initiation is being routed,
+    /// and what it is documented to do (accept the peer, which looks the
+    /// handlers up again) takes the handler list's lock. With a writer
+    /// queued in between, as add_handler on another thread, a read lock
+    /// held across the callback deadlocks.
+    #[test]
+    fn unknown_peer_callback_may_use_the_multihandler() {
+        use std::sync::{Mutex, Weak, mpsc};
+        use std::time::Duration;
+        let slot: Arc<Mutex<Option<Weak<MultiHandler>>>> = Arc::new(Mutex::new(None));
+        let s = slot.clone();
+        let on_unknown: crate::wg::UnknownPeerFn = Arc::new(move |_, _, _| {
+            let mh = s.lock().unwrap().as_ref().and_then(Weak::upgrade);
+            let Some(mh) = mh else { return };
+            let writer = mh.clone();
+            std::thread::spawn(move || {
+                let extra = Handler::new(Config::default()).unwrap();
+                writer.add_handler(extra).unwrap();
+            });
+            // Give the writer time to queue on the lock.
+            std::thread::sleep(Duration::from_millis(100));
+            let _ = mh.handlers();
+        });
+        let server = Handler::new(Config::default().on_unknown_peer(on_unknown)).unwrap();
+        let mh = MultiHandler::new(vec![server.clone()]).unwrap();
+        *slot.lock().unwrap() = Some(Arc::downgrade(&mh));
+
+        let client = Handler::new(Config::default()).unwrap();
+        client.add_peer(server.public_key());
+        let init = client.initiate_handshake(&server.public_key()).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let routed = mh.clone();
+        std::thread::spawn(move || {
+            let addr = "127.0.0.1:1".parse().unwrap();
+            let _ = routed.process_packet(&init, &addr);
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("deadlocked in the unknown-peer callback");
     }
 }
