@@ -389,6 +389,48 @@ impl Nat {
         Some(Self::get_or_create_mapping_locked(&mut inner, k)?.outside_port)
     }
 
+    /// Map two endpoints of one inside host to consecutive outside ports,
+    /// the first even, and return that first port: RTP and its RTCP, which
+    /// peers send to the RTP port + 1 unless told otherwise (RFC 3550 §11,
+    /// RFC 3605). An existing pair laid out that way is reused. `None` if
+    /// either endpoint already holds some other port, or no pair is free.
+    pub(crate) fn create_mapping_pair_in(
+        &self,
+        namespace: u64,
+        proto: u8,
+        inside_ip: Ipv4Addr,
+        (first, second): (u16, u16),
+    ) -> Option<u16> {
+        let key = |port| NatKey {
+            ns: namespace,
+            proto,
+            ip: inside_ip,
+            port,
+        };
+        let (k1, k2) = (key(first), key(second));
+        let mut inner = self.inner.lock().unwrap();
+        let now = Instant::now();
+        match (inner.mappings.get(&k1), inner.mappings.get(&k2)) {
+            (Some(a), Some(b))
+                if a.outside_port % 2 == 0 && b.outside_port == a.outside_port + 1 =>
+            {
+                let p = a.outside_port;
+                for k in [k1, k2] {
+                    inner.mappings.get_mut(&k).unwrap().last_active = now;
+                }
+                return Some(p);
+            }
+            (None, None) => {}
+            _ => return None,
+        }
+        let p = Self::alloc_pair_locked(&mut inner)?;
+        for (k, port) in [(k1, p), (k2, p + 1)] {
+            inner.reverse.insert(NatRevKey { proto, port }, k);
+            inner.mappings.insert(k, Mapping::new(k, port, now));
+        }
+        Some(p)
+    }
+
     /// Inject a packet onto the inside interface (used by helpers that
     /// synthesize traffic destined for an inside host).
     pub fn send_inside(&self, pkt: &Packet) {
@@ -476,22 +518,48 @@ impl Nat {
             } else {
                 inner.next_port + 1
             };
-            // Ports a forward or a pending expectation will receive traffic on
-            // are taken too, or that traffic would reach this new session.
-            let in_use = [PROTO_TCP, PROTO_UDP, PROTO_ICMP].iter().any(|&proto| {
-                let rk = NatRevKey { proto, port: p };
-                inner.reverse.contains_key(&rk) || inner.forwards.contains_key(&rk)
-            }) || inner
-                .expectations
-                .iter()
-                .any(|e| e.outside_port == p && now <= e.expires);
-            if !in_use {
+            if !Self::port_in_use_locked(inner, p, now) {
                 return Some(p);
             }
             if inner.next_port == start {
                 return None;
             }
         }
+    }
+
+    /// An even outside port that is free along with the next one.
+    fn alloc_pair_locked(inner: &mut NatInner) -> Option<u16> {
+        let now = Instant::now();
+        let pairs = (NAT_PORT_MAX - NAT_PORT_MIN).div_ceil(2);
+        // Start at the next even port; the range starts even, so a pair
+        // never straddles its end.
+        let mut p = inner.next_port.saturating_add(1) & !1;
+        for _ in 0..pairs {
+            if !(NAT_PORT_MIN..NAT_PORT_MAX).contains(&p) {
+                p = NAT_PORT_MIN;
+            }
+            if !Self::port_in_use_locked(inner, p, now)
+                && !Self::port_in_use_locked(inner, p + 1, now)
+            {
+                inner.next_port = p.checked_add(2).unwrap_or(NAT_PORT_MIN);
+                return Some(p);
+            }
+            p = p.saturating_add(2);
+        }
+        None
+    }
+
+    /// Whether outside port `p` is taken, for any protocol. Ports a forward
+    /// or a pending expectation will receive traffic on count too, or that
+    /// traffic would reach a new session.
+    fn port_in_use_locked(inner: &NatInner, p: u16, now: Instant) -> bool {
+        [PROTO_TCP, PROTO_UDP, PROTO_ICMP].iter().any(|&proto| {
+            let rk = NatRevKey { proto, port: p };
+            inner.reverse.contains_key(&rk) || inner.forwards.contains_key(&rk)
+        }) || inner
+            .expectations
+            .iter()
+            .any(|e| e.outside_port == p && now <= e.expires)
     }
 
     fn match_expectation_locked(
