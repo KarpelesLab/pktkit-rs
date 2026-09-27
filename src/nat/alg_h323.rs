@@ -13,7 +13,9 @@ use crate::nat::helper::{Expectation, Helper, NatMapping, PROTO_TCP, PROTO_UDP, 
 use crate::nat::l4::replace_payload;
 use crate::nat::nat::Nat;
 use crate::time::Instant;
-use std::net::IpAddr;
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr};
+use std::sync::Mutex;
 use std::time::Duration;
 
 const H323_PORT: u16 = 1720;
@@ -21,13 +23,50 @@ const H323_RTP_TIMEOUT: Duration = Duration::from_secs(120);
 /// H.245 dynamic port range lower bound; ports below this are not treated as
 /// signalled transport ports.
 const H245_PORT_MIN: u16 = 1024;
+/// Cap on transport addresses one segment may open ports for. The scan is a
+/// heuristic over bytes the inside host chooses, and every match opens a
+/// port to any remote; a real message carries a few (an H.245 address, a
+/// media and a media control channel per logical channel), not hundreds.
+const MAX_PORTS_PER_MESSAGE: usize = 8;
+/// Cap on the distinct ports one inside host may have opened within
+/// [`H323_RTP_TIMEOUT`], so that a stream of such segments cannot spread
+/// open mappings across the NAT's port pool either.
+const MAX_PORTS_PER_HOST: usize = 32;
 
 #[derive(Debug, Default)]
-pub struct H323Helper;
+pub struct H323Helper {
+    /// Per inside host (namespace, address): the inside ports opened, with
+    /// when each was last announced.
+    opened: Mutex<HashMap<(u64, Ipv4Addr), Vec<(u16, Instant)>>>,
+}
 
 impl H323Helper {
     pub fn new() -> H323Helper {
-        H323Helper
+        H323Helper::default()
+    }
+
+    /// Whether `host` may open inside port `port` now; if so, it is counted.
+    /// A port already open counts once however often it is announced.
+    fn admit(&self, host: (u64, Ipv4Addr), port: u16, now: Instant) -> bool {
+        let mut opened = self.opened.lock().unwrap();
+        let ports = opened.entry(host).or_default();
+        ports.retain(|&(_, t)| now.saturating_duration_since(t) < H323_RTP_TIMEOUT);
+        if let Some(p) = ports.iter_mut().find(|(p, _)| *p == port) {
+            p.1 = now;
+            return true;
+        }
+        if ports.len() >= MAX_PORTS_PER_HOST {
+            return false;
+        }
+        ports.push((port, now));
+        // Hosts that went quiet leave no record behind.
+        if opened.len() > 64 {
+            opened.retain(|_, ports| {
+                ports.retain(|&(_, t)| now.saturating_duration_since(t) < H323_RTP_TIMEOUT);
+                !ports.is_empty()
+            });
+        }
+        true
     }
 }
 
@@ -60,18 +99,33 @@ impl PacketHelper for H323Helper {
 
         let mut new_payload = payload.to_vec();
         let mut modified = false;
+        let mut opened: Vec<u16> = Vec::new();
+        let now = Instant::now();
         let mut i = 0usize;
         while i + 6 <= new_payload.len() {
             if new_payload[i..i + 4] == inside {
                 let port = u16::from_be_bytes([new_payload[i + 4], new_payload[i + 5]]);
                 if port >= H245_PORT_MIN {
+                    // Past either cap the address is rewritten but no port
+                    // opened, as when the pool is exhausted.
+                    let admitted = if opened.contains(&port) {
+                        true
+                    } else if opened.len() < MAX_PORTS_PER_MESSAGE
+                        && self.admit((m.namespace, inside_ip), port, now)
+                    {
+                        opened.push(port);
+                        true
+                    } else {
+                        false
+                    };
                     // Transport address: H.245 runs over TCP and media over UDP,
                     // and the heuristic cannot tell which this is, so both are
                     // expected on the one outside port written into the message.
-                    let outside_port =
-                        nat.create_mapping_in(m.namespace, PROTO_TCP, inside_ip, port);
+                    let outside_port = admitted
+                        .then(|| nat.create_mapping_in(m.namespace, PROTO_TCP, inside_ip, port))
+                        .flatten();
                     if let Some(op) = outside_port {
-                        let expires = Instant::now() + H323_RTP_TIMEOUT;
+                        let expires = now + H323_RTP_TIMEOUT;
                         let expect = |proto, inside_port, outside_port| {
                             nat.add_expectation(
                                 Expectation::new(
@@ -334,5 +388,56 @@ mod tests {
         let out = h.process_inbound(&nat, pkt, &m);
         let p = payload_of(&out);
         assert_eq!(&p[1..5], &[10, 0, 0, 5]);
+    }
+
+    /// Sends one H.225 segment from 10.0.0.5 announcing `ports`, and returns
+    /// how many of them came out mapped to another port.
+    fn announce(nat: &Nat, h: &H323Helper, ports: std::ops::Range<u16>) -> usize {
+        let inside = Ipv4Addr::new(10, 0, 0, 5);
+        let mut body = Vec::new();
+        for p in ports.clone() {
+            body.push(0x00);
+            body.extend_from_slice(&inside.octets());
+            body.extend_from_slice(&p.to_be_bytes());
+        }
+        let m = NatMapping::new(PROTO_TCP, IpAddr::V4(inside), 40000, 20000);
+        let pkt = build_h323(
+            inside,
+            40000,
+            Ipv4Addr::new(198, 51, 100, 9),
+            H323_PORT,
+            &body,
+        );
+        let out = h.process_outbound(nat, pkt, &m);
+        let p = payload_of(&out);
+        ports
+            .enumerate()
+            .filter(|&(i, port)| {
+                let at = i * 7 + 1;
+                assert_eq!(&p[at..at + 4], &[203, 0, 113, 1]);
+                u16::from_be_bytes([p[at + 4], p[at + 5]]) != port
+            })
+            .count()
+    }
+
+    #[test]
+    fn one_segment_opens_only_a_few_ports() {
+        let nat = Nat::new(pfx("10.0.0.1/24"), pfx("203.0.113.1/24"));
+        let h = H323Helper::new();
+        assert_eq!(announce(&nat, &h, 5000..5200), MAX_PORTS_PER_MESSAGE);
+    }
+
+    #[test]
+    fn one_host_opens_only_so_many_ports() {
+        let nat = Nat::new(pfx("10.0.0.1/24"), pfx("203.0.113.1/24"));
+        let h = H323Helper::new();
+        let mut total = 0;
+        for i in 0..10u16 {
+            let first = 5000 + i * 8;
+            total += announce(&nat, &h, first..first + 8);
+        }
+        assert_eq!(total, MAX_PORTS_PER_HOST);
+        // Announcing a port already open still maps it.
+        assert_eq!(announce(&nat, &h, 5000..5001), 1);
     }
 }
