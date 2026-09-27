@@ -117,6 +117,10 @@ pub(crate) struct ConnState {
     /// For a passively opened connection: hands it to its listener once the
     /// handshake completes, unless the deadline passes first.
     pending_accept: Mutex<Option<(Instant, AcceptFn)>>,
+    /// Why the connection ended, if not by an orderly close: a reset from
+    /// the peer, or our timers giving up. Reads report it instead of a clean
+    /// end of stream, so a truncated transfer is not mistaken for a whole one.
+    error: Mutex<Option<io::ErrorKind>>,
 }
 
 /// Offers an established connection to a listener; `false` means the
@@ -139,7 +143,17 @@ impl ConnState {
             signal: Condvar::new(),
             sink,
             pending_accept: Mutex::new(None),
+            error: Mutex::new(None),
         })
+    }
+
+    fn fail(&self, kind: io::ErrorKind) {
+        self.error.lock().expect("poisoned").get_or_insert(kind);
+    }
+
+    fn error(&self) -> Option<io::Error> {
+        let kind = (*self.error.lock().expect("poisoned"))?;
+        Some(io::Error::new(kind, "connection ended abnormally"))
     }
 
     /// Queue the connection on a listener, through `accept`, once its
@@ -196,7 +210,13 @@ impl ConnState {
     pub(crate) fn deliver(&self, seg: &Segment) {
         let segs = {
             let mut conn = self.conn.lock().expect("poisoned");
-            conn.handle_segment(seg)
+            // A FIN before the RST means the stream had already ended whole.
+            let ended = conn.fin_received();
+            let segs = conn.handle_segment(seg);
+            if seg.has_flag(crate::vtcp::segment::flags::RST) && conn.is_closed() && !ended {
+                self.fail(io::ErrorKind::ConnectionReset);
+            }
+            segs
         };
         self.wrap_and_send(segs);
         self.signal.notify_all();
@@ -211,6 +231,7 @@ impl ConnState {
 pub struct TcpStream {
     state: Arc<ConnState>,
     read_timeout: Mutex<Option<Duration>>,
+    write_timeout: Mutex<Option<Duration>>,
 }
 
 impl core::fmt::Debug for TcpStream {
@@ -227,6 +248,7 @@ impl TcpStream {
         TcpStream {
             state,
             read_timeout: Mutex::new(None),
+            write_timeout: Mutex::new(None),
         }
     }
 
@@ -245,17 +267,28 @@ impl TcpStream {
         *self.read_timeout.lock().expect("poisoned") = t;
     }
 
+    /// Set a write timeout: how long a blocking [`write`](Self::write) waits
+    /// for the peer to open its window. `None` waits indefinitely.
+    pub fn set_write_timeout(&self, t: Option<Duration>) {
+        *self.write_timeout.lock().expect("poisoned") = t;
+    }
+
     /// Write all of `buf`, blocking until the engine accepts it. Returns the
-    /// number of bytes queued (always `buf.len()` on success).
+    /// number of bytes queued: `buf.len()`, or what was written before the
+    /// [write timeout](Self::set_write_timeout) (`WouldBlock` if nothing).
     pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
+        let deadline = self
+            .write_timeout
+            .lock()
+            .expect("poisoned")
+            .map(|t| Instant::now() + t);
         let mut written = 0;
         while written < buf.len() {
             let mut conn = self.state.conn.lock().expect("poisoned");
             if conn.is_closed() {
-                return Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "connection closed",
-                ));
+                return Err(self.state.error().unwrap_or_else(|| {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "connection closed")
+                }));
             }
             let (n, segs) = conn.write(&buf[written..]);
             drop(conn);
@@ -265,6 +298,12 @@ impl TcpStream {
             } else {
                 // Send window full (or not yet established) — wait for an ACK
                 // to open it, or for a state transition.
+                if deadline.is_some_and(|d| Instant::now() >= d) {
+                    if written > 0 {
+                        break;
+                    }
+                    return Err(io::Error::new(io::ErrorKind::WouldBlock, "write timeout"));
+                }
                 let conn = self.state.conn.lock().expect("poisoned");
                 let _ = self
                     .state
@@ -291,7 +330,10 @@ impl TcpStream {
                 return Ok(n);
             }
             if conn.fin_received() || conn.is_closed() {
-                return Ok(0); // clean EOF
+                return match self.state.error() {
+                    Some(e) => Err(e),
+                    None => Ok(0), // clean EOF
+                };
             }
             match deadline {
                 Some(d) => {
@@ -362,12 +404,135 @@ pub(crate) fn tick_conn(state: &Arc<ConnState>) -> bool {
     }
     let (segs, closed) = {
         let mut conn = state.conn.lock().expect("poisoned");
+        let ended = conn.fin_received();
         let segs = conn.tick();
-        (segs, conn.is_closed())
+        let closed = conn.is_closed();
+        if closed && !ended {
+            // Retransmissions or keepalives went unanswered.
+            state.fail(io::ErrorKind::TimedOut);
+        }
+        (segs, closed)
     };
     if !segs.is_empty() {
         state.wrap_and_send(segs);
     }
     state.signal.notify_all();
     closed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vtcp::ConnConfig;
+
+    /// A slirp-side connection accepted from `peer`, with everything it
+    /// sends collected (as TCP segments, the 20-byte IPv4 header stripped).
+    fn accepted(peer: &mut Conn) -> (Arc<ConnState>, Arc<Mutex<Vec<Vec<u8>>>>) {
+        let out: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        let o = out.clone();
+        let state = ConnState::new(
+            Endpoints::V4 {
+                local_ip: Ipv4Addr::new(10, 0, 0, 1),
+                local_port: 80,
+                remote_ip: Ipv4Addr::new(10, 0, 0, 5),
+                remote_port: 5000,
+            },
+            Conn::new(ConnConfig::default().local_port(80).remote_port(5000)),
+            Arc::new(move |p: &[u8]| o.lock().unwrap().push(p[20..].to_vec())),
+        );
+        let syn = Segment::parse(&peer.connect()[0]).unwrap();
+        let synack = state.conn.lock().unwrap().accept_syn(&syn);
+        state.wrap_and_send(synack);
+        pump(&state, &out, peer);
+        (state, out)
+    }
+
+    fn pump(state: &ConnState, out: &Mutex<Vec<Vec<u8>>>, peer: &mut Conn) {
+        loop {
+            let sent = std::mem::take(&mut *out.lock().unwrap());
+            if sent.is_empty() {
+                return;
+            }
+            for seg in sent {
+                for r in peer.handle_segment(&Segment::parse(&seg).unwrap()) {
+                    state.deliver(&Segment::parse(&r).unwrap());
+                }
+            }
+        }
+    }
+
+    fn peer() -> Conn {
+        Conn::new(ConnConfig::default().local_port(5000).remote_port(80))
+    }
+
+    /// A reset cuts the stream short: reading reports it rather than a
+    /// clean end of stream, and so does writing.
+    #[test]
+    fn a_reset_reads_as_an_error() {
+        let mut peer = peer();
+        let (state, _out) = accepted(&mut peer);
+        let stream = TcpStream::new(state.clone());
+        for seg in peer.write(b"partial").1.into_iter().chain(peer.abort()) {
+            state.deliver(&Segment::parse(&seg).unwrap());
+        }
+        let mut buf = [0u8; 32];
+        let n = stream.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"partial");
+        assert_eq!(
+            stream.read(&mut buf).unwrap_err().kind(),
+            io::ErrorKind::ConnectionReset
+        );
+        assert_eq!(
+            stream.write(b"x").unwrap_err().kind(),
+            io::ErrorKind::ConnectionReset
+        );
+    }
+
+    /// An orderly close still reads as end of stream.
+    #[test]
+    fn a_fin_reads_as_end_of_stream() {
+        let mut peer = peer();
+        let (state, out) = accepted(&mut peer);
+        let stream = TcpStream::new(state.clone());
+        let mut segs = peer.write(b"whole").1;
+        segs.extend(peer.close());
+        for seg in segs {
+            state.deliver(&Segment::parse(&seg).unwrap());
+        }
+        pump(&state, &out, &mut peer);
+        let mut buf = [0u8; 32];
+        let n = stream.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"whole");
+        assert_eq!(stream.read(&mut buf).unwrap(), 0);
+    }
+
+    /// A write that the peer's closed window holds back gives up at the
+    /// write timeout instead of blocking forever.
+    #[test]
+    fn a_write_into_a_closed_window_times_out() {
+        let mut peer = Conn::new(
+            ConnConfig::default()
+                .local_port(5000)
+                .remote_port(80)
+                .recv_buf_size(1000),
+        );
+        let (state, out) = accepted(&mut peer);
+        let stream = TcpStream::new(state.clone());
+        stream.set_write_timeout(Some(Duration::from_millis(200)));
+        // The peer never reads: its 1000-byte window fills and stays shut.
+        // More than the stack's own 1 MiB send buffer can hold.
+        let big = vec![7u8; 2 << 20];
+        let started = Instant::now();
+        let n = std::thread::scope(|s| {
+            let w = s.spawn(|| stream.write(&big));
+            while !w.is_finished() {
+                pump(&state, &out, &mut peer);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            w.join().unwrap()
+        })
+        .unwrap();
+        assert!(n < big.len(), "wrote {n}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
 }
