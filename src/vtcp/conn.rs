@@ -53,6 +53,11 @@ const ER_MIN_DELAY: Duration = Duration::from_millis(2);
 /// Minimum spacing of challenge ACKs and out-of-window duplicate ACKs on one
 /// connection (RFC 5961 §7); Linux's `tcp_invalid_ratelimit` default.
 const OOW_ACK_INTERVAL: Duration = Duration::from_millis(500);
+/// How long TS.Recent stays valid without being updated (RFC 7323 §5.5).
+/// A peer's timestamp clock may tick as fast as once per millisecond, so
+/// after about 24.8 days an idle connection's TS.Recent can no longer be
+/// compared with the peer's TSvals: they may have wrapped past it.
+const PAWS_IDLE: Duration = Duration::from_secs(24 * 24 * 60 * 60);
 
 pub const DEFAULT_KEEPALIVE_IDLE: Duration = Duration::from_secs(300);
 pub const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
@@ -244,6 +249,8 @@ pub struct Conn {
     ts_enabled: bool,
     ts_ok: bool,
     ts_recent: u32,
+    /// When TS.Recent was last set, for the PAWS idle rule (RFC 7323 §5.5).
+    ts_recent_stamp: Instant,
     /// TSval is milliseconds since `ts_base` plus `ts_offset`: monotonic,
     /// since a wall clock stepped back by NTP would have the peer's PAWS
     /// drop everything we send, and offset per connection so TSvals do not
@@ -364,6 +371,7 @@ impl Conn {
             ts_enabled: cfg.enable_timestamps,
             ts_ok: false,
             ts_recent: 0,
+            ts_recent_stamp: Instant::now(),
             ts_base: Instant::now(),
             ts_offset,
             last_ack_sent: None,
@@ -596,6 +604,7 @@ impl Conn {
             && let Some((ts_val, _)) = get_timestamp(remote_opts)
         {
             self.ts_recent = ts_val;
+            self.ts_recent_stamp = Instant::now();
             self.ts_ok = true;
         }
     }
@@ -647,15 +656,21 @@ impl Conn {
         (self.ts_base.elapsed().as_millis() as u32).wrapping_add(self.ts_offset)
     }
 
-    /// PAWS validation: drop segments with timestamps older than ts_recent.
-    fn update_timestamp(&mut self, seg: &Segment) -> bool {
+    /// PAWS validation at time `now`: drop segments with timestamps older
+    /// than ts_recent.
+    fn update_timestamp(&mut self, seg: &Segment, now: Instant) -> bool {
         if !self.ts_ok {
             return true;
         }
         let Some((ts_val, _)) = get_timestamp(&seg.options) else {
             return true;
         };
-        if (ts_val.wrapping_sub(self.ts_recent) as i32) < 0 {
+        // RFC 7323 §5.5: after 24 days without an update TS.Recent is
+        // invalid, since the peer's clock may have wrapped past it; PAWS
+        // would otherwise reject every segment of a long-idle connection
+        // for good. Skip the test and take the new TSval as usual.
+        let stale = now.saturating_duration_since(self.ts_recent_stamp) > PAWS_IDLE;
+        if !stale && (ts_val.wrapping_sub(self.ts_recent) as i32) < 0 {
             return false;
         }
         // RFC 7323 §4.3: only a segment at or before Last.ACK.sent, so an
@@ -666,6 +681,7 @@ impl Conn {
             .is_none_or(|last| seq_before_eq(seg.seq, last))
         {
             self.ts_recent = ts_val;
+            self.ts_recent_stamp = now;
         }
         true
     }
@@ -1167,7 +1183,7 @@ impl Conn {
     /// PAWS (RFC 7323 §5), and TS.Recent for the echo. False if `seg`
     /// must be dropped.
     fn check_paws(&mut self, seg: &Segment) -> bool {
-        if self.update_timestamp(seg) {
+        if self.update_timestamp(seg, Instant::now()) {
             return true;
         }
         // RFC 7323 §5.3 answers with an ACK, but through the invalid-
@@ -3984,6 +4000,28 @@ mod tests {
     // RFC 7323 §4.3: TS.Recent follows only segments at or below the last
     // ACK sent. An out-of-order one would have us echo a TSval from ahead
     // of the hole, and its RTT sample would miss the repair.
+    #[test]
+    fn paws_skipped_after_24_days_idle() {
+        let (mut client, server) = ts_pair(40313);
+        let una = client.send_buf.as_ref().unwrap().una();
+        let mut seg = data_with_ack(&client, &server, una, b"", false);
+        // Older than TS.Recent: the peer's clock wrapped while we sat idle.
+        let old = client.ts_recent.wrapping_sub(1 << 30);
+        seg.options = vec![timestamp_option(old, 0)];
+        let now = Instant::now();
+        assert!(!client.update_timestamp(&seg, now), "PAWS while fresh");
+        assert!(!client.update_timestamp(&seg, now + Duration::from_secs(23 * 86400)));
+        let later = now + Duration::from_secs(25 * 86400);
+        assert!(
+            client.update_timestamp(&seg, later),
+            "rejected after 25 days idle"
+        );
+        assert_eq!(client.ts_recent, old, "the new TSval is adopted");
+        // And TS.Recent is fresh again: older ones are rejected once more.
+        seg.options = vec![timestamp_option(old.wrapping_sub(1), 0)];
+        assert!(!client.update_timestamp(&seg, later));
+    }
+
     #[test]
     fn out_of_order_segment_does_not_update_ts_recent() {
         let (mut client, server) = ts_pair(40312);
