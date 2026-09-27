@@ -156,6 +156,14 @@ setters! {
     }
 }
 
+/// How long a rejected session lingers to deliver AUTH_FAILED (OpenVPN's
+/// scheduled exit after send_auth_failed).
+const AUTH_FAILED_EXIT: Duration = Duration::from_secs(5);
+
+/// Longest control-channel plaintext message we buffer. The key exchange is
+/// the largest (OpenVPN reads it into a 2 KiB buffer); this is generous.
+const MAX_CONTROL_MESSAGE: usize = 64 * 1024;
+
 /// One OpenVPN peer (one client address).
 pub struct Peer {
     config: Arc<purecrypto::tls::Config>,
@@ -296,6 +304,12 @@ impl Peer {
             out.send.extend(tick.resend);
             if tick.timed_out {
                 self.fail_session(slot, &mut out, None);
+            } else if let Some(at) = s.auth_failed {
+                if now >= at {
+                    let e =
+                        io::Error::new(io::ErrorKind::PermissionDenied, "authentication failed");
+                    self.fail_session(slot, &mut out, Some(e));
+                }
             } else if !s.ks.kx_done && now >= s.ks.must_negotiate {
                 let e = io::Error::new(
                     io::ErrorKind::TimedOut,
@@ -500,6 +514,9 @@ struct Session {
     /// exchange, retained for post-auth queries / diagnostics.
     peer_info: HashMap<String, String>,
     timers: PeerTimers,
+    /// Set when the client's credentials were rejected: when to drop the
+    /// session, which lingers only to deliver AUTH_FAILED.
+    auth_failed: Option<Instant>,
 }
 
 /// One TLS handshake and what it produced (OpenVPN's `key_state`): its own
@@ -584,6 +601,7 @@ impl Session {
                 layer: 3,
                 peer_info: HashMap::new(),
                 timers,
+                auth_failed: None,
             },
             reset,
         ))
@@ -622,8 +640,18 @@ impl Session {
             .tls
             .recv()
             .map_err(|e| invalid(format!("tls recv: {e:?}")))?;
-        self.ks.ctrl_buf.extend_from_slice(&plain);
-        self.advance_control(on_auth)
+        // A rejected session is only kept to deliver AUTH_FAILED; nothing
+        // the client says on it is acted on any more.
+        if self.auth_failed.is_none() {
+            self.ks.ctrl_buf.extend_from_slice(&plain);
+            self.advance_control(on_auth)?;
+            // Whatever is left is an incomplete message; bound how much of
+            // one we are willing to hold.
+            if self.ks.ctrl_buf.len() > MAX_CONTROL_MESSAGE {
+                return Err(invalid("control channel message too long"));
+            }
+        }
+        Ok(())
     }
 
     /// Emit any pending TLS output as P_CONTROL_V1 packets, plus a standalone
@@ -668,10 +696,12 @@ impl Session {
 
         // We need the full fixed prefix + four control strings before we can
         // respond. Parse non-destructively; bail (waiting for more) if short.
-        let parsed = match try_parse_key_exchange(&self.ks.ctrl_buf)? {
+        let (parsed, used) = match try_parse_key_exchange(&self.ks.ctrl_buf)? {
             Some(p) => p,
             None => return Ok(()), // not enough bytes yet
         };
+        // What follows the key exchange is NUL-terminated control messages.
+        self.ks.ctrl_buf.drain(..used);
 
         // Generate the server random once; it's used both in the reply and in
         // the PRF key derivation.
@@ -684,9 +714,6 @@ impl Session {
             .send(&reply)
             .map_err(|e| invalid(format!("tls write reply: {e:?}")))?;
 
-        // Derive the data-channel keys.
-        self.derive_keys(&parsed);
-
         // Authenticate via the hook.
         let auth = AuthInfo {
             username: parsed.username.clone(),
@@ -694,8 +721,22 @@ impl Session {
             peer_info: parsed.peer_info.clone(),
             dev_type: parsed.opts.dev_type.clone(),
         };
-        let cfg = on_auth(&auth)?;
+        let cfg = match on_auth(&auth) {
+            Ok(cfg) => cfg,
+            Err(_) => {
+                // As OpenVPN's server does (send_auth_failed): tell the
+                // client, generate no keys, and end the session a few
+                // seconds later, once the message has had time to arrive.
+                self.ks
+                    .tls
+                    .send(b"AUTH_FAILED\0")
+                    .map_err(|e| invalid(format!("tls write AUTH_FAILED: {e:?}")))?;
+                self.auth_failed = Some(Instant::now() + AUTH_FAILED_EXIT);
+                return Ok(());
+            }
+        };
         self.peer_cfg = Some(cfg);
+        self.derive_keys(&parsed);
 
         self.layer = match parsed.opts.dev_type.as_str() {
             "tap" => 2,
@@ -797,7 +838,9 @@ impl Session {
 
 // --- key-method 2 parsing -----------------------------------------------------
 
-fn try_parse_key_exchange(buf: &[u8]) -> io::Result<Option<KeyExchange>> {
+/// Parse the client's key-method-2 message, returning it and the number of
+/// bytes it took, or `None` until the whole message has arrived.
+fn try_parse_key_exchange(buf: &[u8]) -> io::Result<Option<(KeyExchange, usize)>> {
     // Fixed prefix: 4 zero bytes, key_method, pre_master(48), r1(32), r2(32).
     let fixed = 4 + 1 + 48 + 32 + 32;
     if buf.len() < fixed {
@@ -835,7 +878,7 @@ fn try_parse_key_exchange(buf: &[u8]) -> io::Result<Option<KeyExchange>> {
         Some(v) => v,
         None => return Ok(None),
     };
-    let (peer_info_raw, _p4) = match read_control_string(buf, p3)? {
+    let (peer_info_raw, used) = match read_control_string(buf, p3)? {
         Some(v) => v,
         None => return Ok(None),
     };
@@ -855,7 +898,7 @@ fn try_parse_key_exchange(buf: &[u8]) -> io::Result<Option<KeyExchange>> {
         o.to_string()
     };
 
-    Ok(Some(KeyExchange {
+    let kx = KeyExchange {
         pre_master,
         random1,
         random2,
@@ -865,7 +908,8 @@ fn try_parse_key_exchange(buf: &[u8]) -> io::Result<Option<KeyExchange>> {
         password,
         peer_info,
         peer_info_raw,
-    }))
+    };
+    Ok(Some((kx, used)))
 }
 
 fn build_kx_reply(server_random: &[u8; 64], kx: &KeyExchange) -> Vec<u8> {

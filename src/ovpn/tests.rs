@@ -686,7 +686,75 @@ fn keepalive_pings_and_restarts() {
     assert!(out.close, "ping-restart should have fired");
 }
 
+/// A rejected client is told so -- OpenVPN sends `AUTH_FAILED` and closes the
+/// session a few seconds later -- and meanwhile nothing more it sends on that
+/// session is processed: in particular, not another round of credentials.
+#[test]
+fn auth_failure_sends_auth_failed_and_stops() {
+    use crate::time::Instant;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let hook: OnAuth = {
+        let calls = calls.clone();
+        Arc::new(move |_: &AuthInfo| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "bad password",
+            ))
+        })
+    };
+    let mut server = Peer::new(server_config(), *b"SERVERID", hook).unwrap();
+    let mut client = TestClient::new(*b"CLIENTID");
+    assert!(drive_handshake(&mut server, &mut client));
+    send_client_key_material(&mut client);
+    assert!(!pump(&mut server, &mut client), "closed before AUTH_FAILED");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let text = client.control_text();
+    assert!(
+        text.windows(12).any(|w| w == b"AUTH_FAILED\0"),
+        "client was not told"
+    );
+
+    // A second try on the same session is ignored.
+    send_client_key_material(&mut client);
+    assert!(!pump(&mut server, &mut client));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let out = server
+        .tick(Instant::now() + Duration::from_secs(6))
+        .unwrap();
+    assert!(out.close, "session should end after AUTH_FAILED");
+    assert!(server.peer_config().is_none());
+}
+
 // --- helpers ----------------------------------------------------------------
+
+/// Exchange what `client` has queued with `server` until both go quiet;
+/// returns whether the server asked to close.
+fn pump(server: &mut Peer, client: &mut TestClient) -> bool {
+    let mut server_inbox = Vec::new();
+    client.pump_tls(&mut server_inbox);
+    let mut client_inbox: Vec<Vec<u8>> = Vec::new();
+    let mut closed = false;
+    for _ in 0..30 {
+        for dg in server_inbox.drain(..) {
+            if let Ok(out) = server.handle_packet(&dg) {
+                closed |= out.close;
+                client_inbox.extend(out.send);
+            }
+        }
+        for dg in client_inbox.drain(..) {
+            server_inbox.extend(client.handle(&dg));
+        }
+        if server_inbox.is_empty() {
+            break;
+        }
+    }
+    closed
+}
 
 /// Drive a client through hard reset, TLS handshake and key exchange against
 /// `server`, returning the keys the client encrypts with.

@@ -332,7 +332,7 @@ impl Server {
         }
 
         // Connection closed: drop the peer.
-        self.remove_peer(key);
+        self.remove_entry(&entry);
     }
 
     /// Periodically drive each peer's control-channel retransmission timers.
@@ -357,23 +357,16 @@ impl Server {
             let entries: Vec<Arc<PeerEntry>> =
                 self.peers.read().unwrap().values().cloned().collect();
             for entry in entries {
-                let key = PeerKey::new(entry.addr, entry.transport);
-                let out = {
-                    let mut peer = entry.peer.lock().unwrap();
-                    match peer.tick(now) {
-                        Ok(o) => o,
-                        Err(_) => {
-                            drop(peer);
-                            self.remove_peer(key);
-                            continue;
-                        }
-                    }
+                let out = entry.peer.lock().unwrap().tick(now);
+                let Ok(out) = out else {
+                    self.remove_entry(&entry);
+                    continue;
                 };
                 for dgram in &out.send {
                     let _ = self.send_raw(&entry, dgram);
                 }
                 if out.close {
-                    self.remove_peer(key);
+                    self.remove_entry(&entry);
                 }
             }
         }
@@ -418,9 +411,23 @@ impl Server {
         Some(entry)
     }
 
-    fn remove_peer(&self, key: PeerKey) {
-        let removed = self.peers.write().unwrap().remove(&key).is_some();
-        if removed && let Some(cb) = &self.cfg.on_disconnect {
+    /// Drop `entry` from the peer table -- only if it is still the entry
+    /// for its key, as a caller may hold a stale one -- and close its TCP
+    /// connection, which ends the thread serving it.
+    fn remove_entry(&self, entry: &Arc<PeerEntry>) {
+        let key = PeerKey::new(entry.addr, entry.transport);
+        let removed = {
+            let mut peers = self.peers.write().unwrap();
+            let current = peers.get(&key).is_some_and(|e| Arc::ptr_eq(e, entry));
+            current && peers.remove(&key).is_some()
+        };
+        if !removed {
+            return;
+        }
+        if let Some(w) = &entry.tcp {
+            let _ = w.lock().unwrap().shutdown(std::net::Shutdown::Both);
+        }
+        if let Some(cb) = &self.cfg.on_disconnect {
             cb(key);
         }
     }
@@ -460,7 +467,7 @@ impl Server {
         }
 
         if out.close {
-            self.remove_peer(key);
+            self.remove_entry(entry);
         }
     }
 
@@ -658,6 +665,36 @@ mod tests {
         tcp_send(&mut c, &[Opcode::ACK_V1.to_byte(0); 20]);
         let mut b = [0u8; 1];
         assert_eq!(c.read(&mut b).unwrap(), 0, "server should close");
+        assert_eq!(server.peers.read().unwrap().len(), 0);
+        server.close();
+    }
+
+    /// When the server drops a TCP peer (here: its handshake window runs
+    /// out), it closes the connection instead of leaving a thread serving a
+    /// peer that no longer exists.
+    #[test]
+    fn removing_a_tcp_peer_closes_its_connection() {
+        let on_auth: OnAuth = Arc::new(|_| Err(io::Error::other("no auth in this test")));
+        let on_data: OnData = Arc::new(|_, _, _| {});
+        let cfg = ServerConfig::new(
+            crate::ovpn::tests::server_config(),
+            "127.0.0.1:0".parse().unwrap(),
+            on_auth,
+            on_data,
+        )
+        .handshake_window(Duration::from_millis(500));
+        let server = Server::new(cfg).unwrap();
+        let mut c = tcp_client(&server);
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        tcp_send(&mut c, &client_reset(*b"CLIENT01"));
+        loop {
+            match tcp_recv(&mut c) {
+                Ok(_) => continue, // the reset and its retransmissions
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) if e.kind() == io::ErrorKind::ConnectionReset => break,
+                Err(e) => panic!("connection was left open: {e}"),
+            }
+        }
         assert_eq!(server.peers.read().unwrap().len(), 0);
         server.close();
     }
