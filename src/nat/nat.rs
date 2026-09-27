@@ -12,20 +12,16 @@ use crate::nat::helper::{
     Expectation, Helper, LocalHelper, NatMapping, PROTO_ICMP, PROTO_TCP, PROTO_UDP, PacketHelper,
     PortForward,
 };
+use crate::nat::track::Peers;
 use crate::time::Instant;
 use crate::{IpPrefix, L3Connector, L3Device, L3Handler, Packet, Result, checksum, connect_l3};
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
 
 const NAT_PORT_MIN: u16 = 10000;
 const NAT_PORT_MAX: u16 = 65535;
-pub(crate) const NAT_TCP_TIMEOUT: Duration = Duration::from_secs(300);
-pub(crate) const NAT_UDP_TIMEOUT: Duration = Duration::from_secs(60);
-pub(crate) const NAT_ICMP_TIMEOUT: Duration = Duration::from_secs(30);
-pub(crate) const NAT_TCP_FIN_GRACE: Duration = Duration::from_secs(30);
 /// Cap on pending expectations. ALGs add them on packets remote peers
 /// control (TFTP requests, SDP offers), so the table must not grow unbounded.
 const MAX_EXPECTATIONS: usize = 1024;
@@ -50,8 +46,7 @@ struct Mapping {
     key: NatKey,
     outside_port: u16,
     last_active: Instant,
-    fin_seen: bool,
-    fin_time: Option<Instant>,
+    peers: Peers,
 }
 
 impl Mapping {
@@ -60,8 +55,7 @@ impl Mapping {
             key,
             outside_port,
             last_active: now,
-            fin_seen: false,
-            fin_time: None,
+            peers: Peers::default(),
         }
     }
 }
@@ -579,23 +573,14 @@ impl Nat {
     /// Sweep stale entries — call on a timer if you want strict TTL behaviour.
     /// (We omit the maintenance thread; callers can spawn one if needed.)
     pub fn sweep(&self) {
-        let now = Instant::now();
+        self.sweep_at(Instant::now());
+    }
+
+    fn sweep_at(&self, now: Instant) {
         let mut inner = self.inner.lock().unwrap();
         let inner = &mut *inner;
         inner.mappings.retain(|k, m| {
-            let timeout = match k.proto {
-                PROTO_TCP => {
-                    if m.fin_seen && m.fin_time.is_some_and(|t| now - t > NAT_TCP_FIN_GRACE) {
-                        Duration::from_secs(0)
-                    } else {
-                        NAT_TCP_TIMEOUT
-                    }
-                }
-                PROTO_UDP => NAT_UDP_TIMEOUT,
-                PROTO_ICMP => NAT_ICMP_TIMEOUT,
-                _ => NAT_UDP_TIMEOUT,
-            };
-            if timeout.is_zero() || now - m.last_active > timeout {
+            if m.peers.expire(k.proto, m.last_active, now) {
                 inner.reverse.remove(&NatRevKey {
                     proto: k.proto,
                     port: m.outside_port,
@@ -725,13 +710,12 @@ impl Nat {
                 Some(m) => m,
                 None => return,
             };
-            if proto == PROTO_TCP && pkt.len() >= ihl + 14 {
-                let flags = pkt[ihl + 13];
-                if flags & 0x05 != 0 && !m.fin_seen {
-                    m.fin_seen = true;
-                    m.fin_time = Some(Instant::now());
-                }
-            }
+            let peer = SocketAddrV4::new(
+                Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]),
+                u16::from_be_bytes([pkt[ihl + 2], pkt[ihl + 3]]),
+            );
+            let flags = tcp_flags(pkt, ihl, proto);
+            m.peers.note(peer, true, flags, m.last_active);
             (m.outside_port, m.key)
         };
 
@@ -803,7 +787,12 @@ impl Nat {
         let outside_port = {
             let mut inner = self.inner.lock().unwrap();
             match Self::get_or_create_mapping_locked(&mut inner, k) {
-                Some(m) => m.outside_port,
+                Some(m) => {
+                    let peer =
+                        SocketAddrV4::new(Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]), 0);
+                    m.peers.note(peer, true, None, m.last_active);
+                    m.outside_port
+                }
                 None => return,
             }
         };
@@ -881,11 +870,8 @@ impl Nat {
         let (mapping_key, outside_port) = {
             let mut inner = self.inner.lock().unwrap();
             // Existing mapping?
-            if let Some(k) = inner.reverse.get(&rk).copied() {
-                if let Some(m) = inner.mappings.get_mut(&k) {
-                    m.last_active = now;
-                }
-                (k, dst_port)
+            let k = if let Some(k) = inner.reverse.get(&rk).copied() {
+                k
             } else if let Some(e) =
                 Self::match_expectation_locked(&mut inner, proto, dst_port, src_ip, src_port)
             {
@@ -898,7 +884,7 @@ impl Nat {
                 if !Self::install_mapping_locked(&mut inner, k, rk, false) {
                     return;
                 }
-                (k, dst_port)
+                k
             } else if let Some(pf) = Self::match_forward(&mut inner, proto, dst_port) {
                 let k = NatKey {
                     ns: pf.namespace,
@@ -907,24 +893,17 @@ impl Nat {
                     port: pf.inside_port,
                 };
                 Self::install_mapping_locked(&mut inner, k, rk, true);
-                (k, dst_port)
+                k
             } else {
                 return;
+            };
+            if let Some(m) = inner.mappings.get_mut(&k) {
+                m.last_active = now;
+                let peer = SocketAddrV4::new(src_ip, src_port);
+                m.peers.note(peer, false, tcp_flags(pkt, ihl, proto), now);
             }
+            (k, dst_port)
         };
-
-        if proto == PROTO_TCP && pkt.len() >= ihl + 14 {
-            let flags = pkt[ihl + 13];
-            if flags & 0x05 != 0 {
-                let mut inner = self.inner.lock().unwrap();
-                if let Some(m) = inner.mappings.get_mut(&mapping_key)
-                    && !m.fin_seen
-                {
-                    m.fin_seen = true;
-                    m.fin_time = Some(Instant::now());
-                }
-            }
-        }
 
         let mut out = pkt.to_vec();
         let old_dst_ip: [u8; 4] = out[16..20].try_into().unwrap();
@@ -991,6 +970,9 @@ impl Nat {
                     };
                     if let Some(m) = inner.mappings.get_mut(&k) {
                         m.last_active = Instant::now();
+                        let peer =
+                            SocketAddrV4::new(Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]), 0);
+                        m.peers.note(peer, false, None, m.last_active);
                     }
                     k
                 };
@@ -1289,6 +1271,14 @@ pub(crate) fn update_l4_checksum(
     pkt[csum_off..csum_off + 2].copy_from_slice(&csum.to_be_bytes());
 }
 
+/// The TCP flags byte of a TCP packet, `None` for anything else (or a
+/// header too short to carry it).
+fn tcp_flags(pkt: &[u8], ihl: usize, proto: u8) -> Option<u8> {
+    (proto == PROTO_TCP)
+        .then(|| pkt.get(ihl + 13).copied())
+        .flatten()
+}
+
 /// RFC 768: a UDP checksum that computes to zero is sent as all ones, since a
 /// zero field means the sender did not compute one. An incremental update can
 /// land on zero like any other value, and must not silently switch the
@@ -1311,6 +1301,7 @@ mod tests {
     use super::*;
     use crate::{IpPrefix, L3Device, Packet};
     use std::sync::Mutex as StdMutex;
+    use std::time::Duration;
 
     fn pfx(s: &str) -> IpPrefix {
         s.parse().unwrap()
@@ -1965,5 +1956,73 @@ mod tests {
         assert!(inner.forwards.is_empty());
         // The session the lapsed forward carried is gone as well.
         assert!(inner.reverse.is_empty());
+    }
+
+    /// Open a TCP connection INSIDE:40000 -> REMOTE:80 and return the mapped port.
+    fn open_tcp(nat: &Nat, o: &StdMutex<Vec<Vec<u8>>>) -> u16 {
+        let syn = build_tcp(INSIDE, 40000, REMOTE, 80, 0x02);
+        nat.inside().send(Packet::from_slice(&syn)).unwrap();
+        let port = src_port(o.lock().unwrap().last().unwrap());
+        let synack = build_tcp(REMOTE, 80, PUBLIC, port, 0x12);
+        nat.outside().send(Packet::from_slice(&synack)).unwrap();
+        port
+    }
+
+    fn mapped(nat: &Nat) -> usize {
+        nat.inner.lock().unwrap().mappings.len()
+    }
+
+    #[test]
+    fn half_closed_tcp_keeps_its_mapping() {
+        let (nat, _i, o) = setup();
+        open_tcp(&nat, &o);
+        let fin = build_tcp(INSIDE, 40000, REMOTE, 80, 0x11);
+        nat.inside().send(Packet::from_slice(&fin)).unwrap();
+        // The remote may keep sending for as long as it likes.
+        nat.sweep_at(Instant::now() + Duration::from_secs(3600));
+        assert_eq!(mapped(&nat), 1);
+    }
+
+    #[test]
+    fn reset_from_another_host_does_not_end_the_session() {
+        let (nat, _i, o) = setup();
+        let port = open_tcp(&nat, &o);
+        let rst = build_tcp(Ipv4Addr::new(192, 0, 2, 66), 80, PUBLIC, port, 0x04);
+        nat.outside().send(Packet::from_slice(&rst)).unwrap();
+        nat.sweep_at(Instant::now() + Duration::from_secs(3600));
+        assert_eq!(mapped(&nat), 1);
+    }
+
+    #[test]
+    fn established_tcp_meets_rfc5382_timeout() {
+        let (nat, _i, o) = setup();
+        open_tcp(&nat, &o);
+        nat.sweep_at(Instant::now() + Duration::from_secs(2 * 3600));
+        assert_eq!(mapped(&nat), 1);
+        nat.sweep_at(Instant::now() + Duration::from_secs(2 * 3600 + 5 * 60));
+        assert_eq!(mapped(&nat), 0);
+    }
+
+    #[test]
+    fn udp_meets_rfc4787_timeout() {
+        let (nat, _i, _o) = setup();
+        let p = build_udp(INSIDE, 5000, REMOTE, 53, b"q");
+        nat.inside().send(Packet::from_slice(&p)).unwrap();
+        nat.sweep_at(Instant::now() + Duration::from_secs(4 * 60));
+        assert_eq!(mapped(&nat), 1);
+    }
+
+    #[test]
+    fn reopened_connection_is_tracked_afresh() {
+        let (nat, _i, o) = setup();
+        let port = open_tcp(&nat, &o);
+        let fin_out = build_tcp(INSIDE, 40000, REMOTE, 80, 0x11);
+        nat.inside().send(Packet::from_slice(&fin_out)).unwrap();
+        let fin_in = build_tcp(REMOTE, 80, PUBLIC, port, 0x11);
+        nat.outside().send(Packet::from_slice(&fin_in)).unwrap();
+        // Same endpoints, new connection.
+        open_tcp(&nat, &o);
+        nat.sweep_at(Instant::now() + Duration::from_secs(3600));
+        assert_eq!(mapped(&nat), 1);
     }
 }

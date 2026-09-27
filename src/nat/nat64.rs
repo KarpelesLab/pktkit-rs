@@ -7,15 +7,14 @@
 //! RFC 6145 §4.2). Fragment and extension-header handling is best-effort.
 
 use crate::nat::helper::{PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP};
-use crate::nat::nat::{NAT_ICMP_TIMEOUT, NAT_TCP_FIN_GRACE, NAT_TCP_TIMEOUT, NAT_UDP_TIMEOUT};
+use crate::nat::track::Peers;
 use crate::time::Instant;
 use crate::{
     IpPrefix, L3Device, L3Handler, Packet, Protocol, Result, checksum, transport_checksum,
 };
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddrV4};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
 
 const IPV6_HEADER_LEN: usize = 40;
 const IPV4_MIN_HEADER: usize = 20;
@@ -42,8 +41,7 @@ struct Mapping {
     key: Nat64Key,
     outside_port: u16,
     last_active: Instant,
-    fin_seen: bool,
-    fin_time: Option<Instant>,
+    peers: Peers,
 }
 
 /// NAT64 between an inside IPv6 network and an outside IPv4 network.
@@ -106,23 +104,14 @@ impl Nat64 {
 
     /// Sweep expired connections — called by the user on a timer.
     pub fn sweep(&self) {
-        let now = Instant::now();
+        self.sweep_at(Instant::now());
+    }
+
+    fn sweep_at(&self, now: Instant) {
         let mut inner = self.inner.lock().unwrap();
         let inner = &mut *inner;
         inner.mappings.retain(|k, m| {
-            let timeout = match k.proto {
-                PROTO_TCP => {
-                    if m.fin_seen && m.fin_time.is_some_and(|t| now - t > NAT_TCP_FIN_GRACE) {
-                        Duration::from_secs(0)
-                    } else {
-                        NAT_TCP_TIMEOUT
-                    }
-                }
-                PROTO_UDP => NAT_UDP_TIMEOUT,
-                PROTO_ICMP => NAT_ICMP_TIMEOUT,
-                _ => NAT_UDP_TIMEOUT,
-            };
-            if timeout.is_zero() || now - m.last_active > timeout {
+            if m.peers.expire(k.proto, m.last_active, now) {
                 inner.reverse.remove(&Nat64RevKey {
                     proto: k.proto,
                     port: m.outside_port,
@@ -214,19 +203,13 @@ impl Nat64 {
             None => return,
         };
 
-        // FIN/RST tracking.
-        if proto == PROTO_TCP && transport.len() >= 14 {
-            let flags = transport[13];
-            if flags & 0x05 != 0 {
-                let mut inner = self.inner.lock().unwrap();
-                if let Some(m) = inner.mappings.get_mut(&k)
-                    && !m.fin_seen
-                {
-                    m.fin_seen = true;
-                    m.fin_time = Some(Instant::now());
-                }
-            }
-        }
+        let dst_port = u16::from_be_bytes([transport[2], transport[3]]);
+        self.note_peer(
+            k,
+            SocketAddrV4::new(dst_v4, dst_port),
+            true,
+            tcp_flags(transport, proto),
+        );
 
         let outside_ip = match self.outside_ipv4() {
             Some(a) => a,
@@ -297,6 +280,7 @@ impl Nat64 {
             Some(v) => v,
             None => return,
         };
+        self.note_peer(k, SocketAddrV4::new(dst_v4, 0), true, None);
 
         let outside_ip = match self.outside_ipv4() {
             Some(a) => a,
@@ -368,22 +352,13 @@ impl Nat64 {
             };
             if let Some(m) = inner.mappings.get_mut(&k) {
                 m.last_active = Instant::now();
+                let src_port = u16::from_be_bytes([transport[0], transport[1]]);
+                let peer = SocketAddrV4::new(src_v4, src_port);
+                m.peers
+                    .note(peer, false, tcp_flags(transport, proto), m.last_active);
             }
             k
         };
-
-        if proto == PROTO_TCP && transport.len() >= 14 {
-            let flags = transport[13];
-            if flags & 0x05 != 0 {
-                let mut inner = self.inner.lock().unwrap();
-                if let Some(m) = inner.mappings.get_mut(&mapping_key)
-                    && !m.fin_seen
-                {
-                    m.fin_seen = true;
-                    m.fin_time = Some(Instant::now());
-                }
-            }
-        }
 
         let src_v6 = ipv4_to_mapped(src_v4);
         let dst_v6 = mapping_key.ip;
@@ -461,6 +436,8 @@ impl Nat64 {
             };
             if let Some(m) = inner.mappings.get_mut(&k) {
                 m.last_active = Instant::now();
+                let peer = SocketAddrV4::new(src_v4, 0);
+                m.peers.note(peer, false, None, m.last_active);
             }
             k
         };
@@ -611,8 +588,7 @@ impl Nat64 {
             key: k,
             outside_port: port,
             last_active: Instant::now(),
-            fin_seen: false,
-            fin_time: None,
+            peers: Peers::default(),
         };
         inner.reverse.insert(
             Nat64RevKey {
@@ -623,6 +599,13 @@ impl Nat64 {
         );
         inner.mappings.insert(k, m);
         Some((port, true))
+    }
+
+    fn note_peer(&self, k: Nat64Key, peer: SocketAddrV4, outbound: bool, flags: Option<u8>) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(m) = inner.mappings.get_mut(&k) {
+            m.peers.note(peer, outbound, flags, m.last_active);
+        }
     }
 
     fn alloc_port_locked(inner: &mut Nat64Inner) -> Option<u16> {
@@ -706,6 +689,13 @@ impl L3Device for Nat64Side {
 }
 
 // ===== Helpers =====
+
+/// The TCP flags byte of a TCP header, `None` for other protocols.
+fn tcp_flags(transport: &[u8], proto: u8) -> Option<u8> {
+    (proto == PROTO_TCP)
+        .then(|| transport.get(13).copied())
+        .flatten()
+}
 
 fn read_v6(b: &[u8]) -> Ipv6Addr {
     let mut a = [0u8; 16];
