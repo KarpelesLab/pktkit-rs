@@ -35,6 +35,8 @@ const DEFAULT_MAX_MAPPINGS_PER_HOST: usize = 16384;
 const DEFAULT_MAX_PEERS_PER_HOST: usize = 65536;
 /// Default for [`NatLimits::max_peers`].
 const DEFAULT_MAX_PEERS: usize = 262_144;
+/// Default for [`NatLimits::max_expectations_per_host`].
+const DEFAULT_MAX_EXPECTATIONS_PER_HOST: usize = 128;
 
 /// Caps on the state a [`Nat`](super::Nat) or [`Nat64`](super::Nat64)
 /// keeps, so that no inside host, nor the remotes it talks to, can grow it
@@ -60,6 +62,10 @@ pub struct NatLimits {
     pub max_peers_per_host: usize,
     /// Most remotes tracked in all. Default: 262144.
     pub max_peers: usize,
+    /// Most pending ALG expectations one inside host may have (NAT44
+    /// only); past it, a new one replaces that host's closest to lapsing.
+    /// The table holds 1024 in all. Default: 128.
+    pub max_expectations_per_host: usize,
 }
 
 setters! {
@@ -67,6 +73,7 @@ setters! {
         set max_mappings_per_host: usize;
         set max_peers_per_host: usize;
         set max_peers: usize;
+        set max_expectations_per_host: usize;
     }
 }
 
@@ -76,6 +83,7 @@ impl Default for NatLimits {
             max_mappings_per_host: DEFAULT_MAX_MAPPINGS_PER_HOST,
             max_peers_per_host: DEFAULT_MAX_PEERS_PER_HOST,
             max_peers: DEFAULT_MAX_PEERS,
+            max_expectations_per_host: DEFAULT_MAX_EXPECTATIONS_PER_HOST,
         }
     }
 }

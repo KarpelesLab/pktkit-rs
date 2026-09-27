@@ -544,17 +544,42 @@ impl Nat {
             inner.expectations.extend(old, e.expires);
             return;
         }
-        if inner.expectations.len() >= MAX_EXPECTATIONS {
+        // ALGs add expectations on what inside hosts send, so one host
+        // could otherwise fill the table and push everyone else's out. It
+        // makes room from its own when at its cap; only when the table
+        // itself is full does the busiest host give one up.
+        let host = (e.namespace, e.inside_ip);
+        let of_host = |x: &Expectation| (x.namespace, x.inside_ip) == host;
+        let per_host = inner.limits.max_expectations_per_host;
+        let full_for_host =
+            per_host != 0 && inner.expectations.iter().filter(|x| of_host(x)).count() >= per_host;
+        if full_for_host || inner.expectations.len() >= MAX_EXPECTATIONS {
             let now = Instant::now();
             inner.expectations.retain(|e| now <= e.expires);
-            // Still full: the one closest to lapsing is the least likely to
-            // be used, so it makes room.
-            if inner.expectations.len() >= MAX_EXPECTATIONS
-                && let Some(pos) =
-                    (0..inner.expectations.len()).min_by_key(|&i| inner.expectations[i].expires)
-            {
-                inner.expectations.swap_remove(pos);
+        }
+        let mine = inner.expectations.iter().filter(|x| of_host(x)).count();
+        let victim = if per_host != 0 && mine >= per_host {
+            Some(host)
+        } else if inner.expectations.len() >= MAX_EXPECTATIONS {
+            let mut counts: HashMap<(u64, Ipv4Addr), usize> = HashMap::new();
+            for x in inner.expectations.iter() {
+                *counts.entry((x.namespace, x.inside_ip)).or_default() += 1;
             }
+            counts.into_iter().max_by_key(|&(_, n)| n).map(|(h, _)| h)
+        } else {
+            None
+        };
+        // Of the victim's, the one closest to lapsing is the least likely
+        // to be used.
+        if let Some(victim) = victim
+            && let Some(pos) = (0..inner.expectations.len())
+                .filter(|&i| {
+                    let x = &inner.expectations[i];
+                    (x.namespace, x.inside_ip) == victim
+                })
+                .min_by_key(|&i| inner.expectations[i].expires)
+        {
+            inner.expectations.swap_remove(pos);
         }
         inner.expectations.push(e);
     }
@@ -3259,6 +3284,43 @@ mod tests {
             nat.add_expectation(Expectation::new(PROTO_UDP, INSIDE, i, 20000 + i, soon()));
         }
         assert!(nat.inner.lock().unwrap().expectations.len() <= MAX_EXPECTATIONS);
+    }
+
+    #[test]
+    fn one_host_cannot_push_out_others_expectations() {
+        let nat = Nat::new(pfx("10.0.0.1/24"), pfx("203.0.113.1/24"));
+        nat.set_limits(NatLimits::default().max_expectations_per_host(4));
+        let other = Ipv4Addr::new(10, 0, 0, 6);
+        nat.add_expectation(Expectation::new(PROTO_UDP, other, 1, 30000, soon()));
+        for i in 0..100 {
+            let e = Expectation::new(PROTO_UDP, INSIDE, i, 20000 + i, soon());
+            nat.add_expectation(e);
+        }
+        let inner = nat.inner.lock().unwrap();
+        let of = |ip| {
+            inner
+                .expectations
+                .iter()
+                .filter(|e| e.inside_ip == ip)
+                .count()
+        };
+        assert_eq!((of(INSIDE), of(other)), (4, 1));
+        // The newest were kept.
+        assert!(inner.expectations.iter().any(|e| e.inside_port == 99));
+        drop(inner);
+
+        // With no cap per host, the busiest host still pays for a full
+        // table.
+        let nat = Nat::new(pfx("10.0.0.1/24"), pfx("203.0.113.1/24"));
+        nat.set_limits(NatLimits::default().max_expectations_per_host(0));
+        nat.add_expectation(Expectation::new(PROTO_UDP, other, 1, 30000, soon()));
+        for i in 0..(MAX_EXPECTATIONS as u16 + 10) {
+            let e = Expectation::new(PROTO_UDP, INSIDE, i, 20000 + i, soon());
+            nat.add_expectation(e);
+        }
+        let inner = nat.inner.lock().unwrap();
+        assert_eq!(inner.expectations.len(), MAX_EXPECTATIONS);
+        assert!(inner.expectations.iter().any(|e| e.inside_ip == other));
     }
 
     #[test]
