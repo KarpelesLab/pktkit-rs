@@ -555,6 +555,14 @@ impl Nat64 {
             return;
         }
         let pkt = &pkt[..total];
+        // Mappings are found by port alone, so only traffic addressed to
+        // the NAT64 itself may use them.
+        if self
+            .outside_ipv4()
+            .is_none_or(|a| pkt[16..20] != a.octets())
+        {
+            return;
+        }
         // The translator is a router (RFC 7915 §4.1): it spends one hop, and
         // owes the sender a Time Exceeded when none is left.
         let ttl = pkt[8];
@@ -2060,6 +2068,24 @@ mod tests {
         set_tos(&mut r, 0xBB);
         nat.outside().send(Packet::from_slice(&r)).unwrap();
         assert_eq!(tc_of(&inside.lock().unwrap()[0]), 0xBB);
+    }
+
+    #[test]
+    fn inbound_traffic_must_be_addressed_to_the_nat64() {
+        let (nat, inside, outside) = wired();
+        let sent = send_udp(&nat, &outside);
+        let port = u16::from_be_bytes([sent[20], sent[21]]);
+        let mut r = v4_reply(SERVER, port);
+        r[16..20].copy_from_slice(&[198, 51, 100, 99]);
+        r[10..12].copy_from_slice(&[0, 0]);
+        let ic = checksum(&r[..20]);
+        r[10..12].copy_from_slice(&ic.to_be_bytes());
+        nat.outside().send(Packet::from_slice(&r)).unwrap();
+        assert!(inside.lock().unwrap().is_empty());
+        nat.outside()
+            .send(Packet::from_slice(&v4_reply(SERVER, port)))
+            .unwrap();
+        assert_eq!(inside.lock().unwrap().len(), 1);
     }
 
     #[test]

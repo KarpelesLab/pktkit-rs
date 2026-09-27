@@ -1162,6 +1162,16 @@ impl Nat {
         let Some((pkt, ihl)) = ipv4_datagram(pkt) else {
             return;
         };
+        // Mappings are found by port alone, so only traffic addressed to
+        // the NAT itself may use them; anything else on the outside link
+        // (another host's, or broadcast) is not for the inside to see.
+        // Hairpinned packets carry the public address too.
+        if self
+            .outside_addr()
+            .is_none_or(|a| pkt[16..20] != a.octets())
+        {
+            return;
+        }
         let (more, offset) = frag_info(pkt);
         if offset != 0 {
             let key = frag_key(pkt);
@@ -2853,6 +2863,22 @@ mod tests {
         assert_eq!(sack(44), 1000 + orig);
         assert_eq!(sack(48), 1000 + orig + 6);
         assert!(crate::nat::l4::v4_l4_checksum_ok(r, 20));
+    }
+
+    #[test]
+    fn inbound_traffic_must_be_addressed_to_the_nat() {
+        let (nat, i, o) = setup();
+        let p = build_udp(INSIDE, 5000, REMOTE, 53, b"q");
+        nat.inside().send(Packet::from_slice(&p)).unwrap();
+        let port = src_port(&o.lock().unwrap()[0]);
+        // Same port, another address on the outside network.
+        let elsewhere = Ipv4Addr::new(203, 0, 113, 99);
+        let r = build_udp(REMOTE, 53, elsewhere, port, b"a");
+        nat.outside().send(Packet::from_slice(&r)).unwrap();
+        assert!(i.lock().unwrap().is_empty());
+        let r = build_udp(REMOTE, 53, PUBLIC, port, b"a");
+        nat.outside().send(Packet::from_slice(&r)).unwrap();
+        assert_eq!(i.lock().unwrap().len(), 1);
     }
 
     #[test]
