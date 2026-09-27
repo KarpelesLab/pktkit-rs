@@ -606,6 +606,13 @@ fn tcp_conn(server: &Weak<Server>, stream: TcpStream, addr: SocketAddr) {
     let Some(s) = live(server) else {
         return;
     };
+    // Only one connection holds an address and port at a time, so an entry
+    // already there is left over from a dead one -- its thread not done
+    // yet, say. Answering through its socket would reach nobody: this
+    // connection gets a peer of its own.
+    if let Some(stale) = s.get_peer(&key) {
+        s.remove_entry(&stale);
+    }
     let Some(entry) = s.create_peer(key, Transport::Tcp, addr, Some(write_half)) else {
         return;
     };
@@ -938,6 +945,47 @@ mod tests {
         assert!(server.send_raw(&entry, &vec![0u8; 70_000]).is_err());
         server.send_raw(&entry, b"ok").unwrap();
         assert_eq!(tcp_recv(&mut client).unwrap(), b"ok");
+        server.close();
+    }
+
+    /// A TCP connection is its own peer: only one connection can hold an
+    /// address and port at a time, so a new one from the same address
+    /// means any entry still there belongs to a dead connection. It must
+    /// not answer through that connection's closed socket.
+    #[test]
+    fn new_tcp_connection_replaces_a_stale_entry() {
+        let server = test_server();
+        let mut c = tcp_client(&server);
+        let addr = c.local_addr().unwrap();
+
+        // What an earlier connection from the same address left behind.
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _old_client = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (old, _) = l.accept().unwrap();
+        old.shutdown(std::net::Shutdown::Both).unwrap();
+        let on_auth: OnAuth = Arc::new(|_| Err(io::Error::other("unused")));
+        let peer = Peer::new(crate::ovpn::tests::server_config(), [1; 8], on_auth).unwrap();
+        let stale = Arc::new(PeerEntry {
+            peer: Mutex::new(peer),
+            transport: Transport::Tcp,
+            addr,
+            tcp: Some(Mutex::new(old)),
+            connected: AtomicBool::new(false),
+        });
+        server
+            .peers
+            .write()
+            .unwrap()
+            .insert(PeerKey::new(addr, Transport::Tcp), stale.clone());
+
+        tcp_send(&mut c, &client_reset(*b"CLIENT01"));
+        let reply = tcp_recv(&mut c).expect("the new connection is answered");
+        let p = ControlPacket::parse(&reply).unwrap();
+        assert_eq!(p.opcode, Opcode::CONTROL_HARD_RESET_SERVER_V2);
+        let current = server
+            .get_peer(&PeerKey::new(addr, Transport::Tcp))
+            .unwrap();
+        assert!(!Arc::ptr_eq(&current, &stale));
         server.close();
     }
 
