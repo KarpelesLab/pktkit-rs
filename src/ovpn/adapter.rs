@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use super::addr::PeerKey;
 use super::peer::{OnAuth, PeerConfig, PeerTimers};
@@ -108,6 +108,15 @@ struct OvpnPeer {
     cleanup: Mutex<Option<Cleanup>>,
 }
 
+impl OvpnPeer {
+    fn take_cleanup(&self) -> Option<Cleanup> {
+        self.cleanup
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
+}
+
 /// Bridges OpenVPN peers to a pktkit network.
 pub struct Adapter {
     server: Mutex<Option<Arc<Server>>>,
@@ -184,12 +193,22 @@ impl Adapter {
         if let Some(s) = server {
             s.close();
         }
-        let mut peers = self.peers.lock().unwrap();
-        for (_, p) in peers.drain() {
-            if let Some(c) = p.cleanup.lock().unwrap().take() {
-                let _ = c();
+        // Cleanups run with no lock held: a connector's may call back into
+        // the adapter. One that panics must not stop the others, nor escape
+        // from Drop.
+        let peers: Vec<OvpnPeer> = self.peers().drain().map(|(_, p)| p).collect();
+        for p in peers {
+            if let Some(c) = p.take_cleanup() {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(c));
             }
         }
+    }
+
+    /// The peer table. Nothing that can panic runs under its lock, but a
+    /// poisoned one would leave every later call panicking -- close() from
+    /// Drop included -- so poison is shrugged off.
+    fn peers(&self) -> MutexGuard<'_, HashMap<PeerKey, OvpnPeer>> {
+        self.peers.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn server(&self) -> Option<Arc<Server>> {
@@ -198,7 +217,7 @@ impl Adapter {
 
     fn on_connect(&self, key: PeerKey, cfg: &PeerConfig) {
         // Avoid double-setup if we already wired this peer.
-        if self.peers.lock().unwrap().contains_key(&key) {
+        if self.peers().contains_key(&key) {
             return;
         }
         let prefix = IpPrefix::new(cfg.ip, cfg.prefix_len);
@@ -212,7 +231,7 @@ impl Adapter {
                     Ok(c) => c,
                     Err(_) => return,
                 };
-                self.peers.lock().unwrap().insert(
+                self.peers().insert(
                     key,
                     OvpnPeer {
                         l3: Some(dev),
@@ -227,7 +246,7 @@ impl Adapter {
                     Ok(c) => c,
                     Err(_) => return,
                 };
-                self.peers.lock().unwrap().insert(
+                self.peers().insert(
                     key,
                     OvpnPeer {
                         l3: None,
@@ -240,22 +259,26 @@ impl Adapter {
     }
 
     fn on_disconnect(&self, key: PeerKey) {
-        if let Some(p) = self.peers.lock().unwrap().remove(&key)
-            && let Some(c) = p.cleanup.lock().unwrap().take()
-        {
+        // The cleanup runs after the lock is released: it is the
+        // connector's code, which may call back into the adapter.
+        let peer = self.peers().remove(&key);
+        if let Some(c) = peer.and_then(|p| p.take_cleanup()) {
             let _ = c();
         }
     }
 
     /// Deliver a decrypted payload from the peer into its device handler.
     fn deliver(&self, key: PeerKey, _layer: u8, payload: &[u8]) {
-        let peers = self.peers.lock().unwrap();
-        if let Some(p) = peers.get(&key) {
-            if let Some(dev) = &p.l3 {
-                dev.deliver(payload);
-            } else if let Some(dev) = &p.l2 {
-                dev.deliver(payload);
-            }
+        // The handler runs with no lock held: it may send to a peer, which
+        // can remove one and so come back here for the lock.
+        let (l3, l2) = match self.peers().get(&key) {
+            Some(p) => (p.l3.clone(), p.l2.clone()),
+            None => return,
+        };
+        if let Some(dev) = l3 {
+            dev.deliver(payload);
+        } else if let Some(dev) = l2 {
+            dev.deliver(payload);
         }
     }
 }
@@ -289,6 +312,14 @@ impl PeerL3Device {
         })
     }
 
+    /// The handler, cloned out so it is called with no lock held.
+    fn handler(&self) -> Option<L3Handler> {
+        self.handler
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
     fn deliver(&self, data: &[u8]) {
         let packet = crate::Packet::from_slice(data);
         // A client may only speak for the address it was given (multi.c
@@ -300,7 +331,8 @@ impl PeerL3Device {
         if !packet.is_valid() || packet.src_addr() != Some(self.client_ip) {
             return;
         }
-        if let Some(h) = self.handler.lock().unwrap().clone() {
+        let h = self.handler();
+        if let Some(h) = h {
             let _ = h(packet);
         }
     }
@@ -308,7 +340,7 @@ impl PeerL3Device {
 
 impl L3Device for PeerL3Device {
     fn set_handler(&self, h: L3Handler) {
-        *self.handler.lock().unwrap() = Some(h);
+        *self.handler.lock().unwrap_or_else(PoisonError::into_inner) = Some(h);
     }
 
     fn send(&self, packet: &crate::Packet) -> Result<()> {
@@ -373,8 +405,17 @@ impl PeerL2Device {
         })
     }
 
+    /// The handler, cloned out so it is called with no lock held.
+    fn handler(&self) -> Option<L2Handler> {
+        self.handler
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
     fn deliver(&self, data: &[u8]) {
-        if let Some(h) = self.handler.lock().unwrap().clone() {
+        let h = self.handler();
+        if let Some(h) = h {
             let _ = h(crate::Frame::from_slice(data));
         }
     }
@@ -382,7 +423,7 @@ impl PeerL2Device {
 
 impl L2Device for PeerL2Device {
     fn set_handler(&self, h: L2Handler) {
-        *self.handler.lock().unwrap() = Some(h);
+        *self.handler.lock().unwrap_or_else(PoisonError::into_inner) = Some(h);
     }
 
     fn send(&self, frame: &crate::Frame) -> Result<()> {
@@ -529,5 +570,108 @@ mod tests {
         assert!(answers(&adapter, *b"CLIENT01"));
         assert!(!answers(&adapter, *b"CLIENT02"), "peer cap not applied");
         adapter.close();
+    }
+
+    fn test_key(n: u8) -> PeerKey {
+        PeerKey::new(
+            std::net::SocketAddr::from(([192, 0, 2, n], 1194)),
+            crate::ovpn::Transport::Udp,
+        )
+    }
+
+    fn test_config() -> PeerConfig {
+        PeerConfig::new(
+            "10.8.0.2".parse().unwrap(),
+            "10.8.0.1".parse().unwrap(),
+            "255.255.255.0".parse().unwrap(),
+            24,
+        )
+    }
+
+    fn packet_from(src: [u8; 4]) -> Vec<u8> {
+        let mut p = vec![0u8; 20];
+        p[0] = 0x45;
+        p[3] = 20;
+        p[12..16].copy_from_slice(&src);
+        p[16..20].copy_from_slice(&[10, 8, 0, 1]);
+        p
+    }
+
+    /// Gives every device a handler that runs `f`.
+    struct HandlerConnector<F>(F);
+
+    impl<F: Fn() + Send + Sync + Clone + 'static> L3Connector for HandlerConnector<F> {
+        fn connect_l3(&self, dev: Arc<dyn L3Device>) -> Result<Cleanup> {
+            let f = self.0.clone();
+            dev.set_handler(Arc::new(move |_: &crate::Packet| {
+                f();
+                Ok(())
+            }));
+            Ok(Box::new(|| Ok(())))
+        }
+    }
+
+    fn adapter_with(connector: Arc<dyn L3Connector + Send + Sync>) -> Arc<Adapter> {
+        let on_auth: OnAuth = Arc::new(|_| Err(io::Error::other("no auth in this test")));
+        Adapter::new(AdapterConfig::new(
+            crate::ovpn::tests::server_config(),
+            "127.0.0.1:0".parse().unwrap(),
+            Connector::L3(connector),
+            on_auth,
+        ))
+        .unwrap()
+    }
+
+    /// A connector handler that panics (the server catches it) must not
+    /// take the adapter down with it: other peers still connect, and
+    /// close() -- which Drop runs -- still works.
+    #[test]
+    fn a_panicking_handler_does_not_break_the_adapter() {
+        let adapter = adapter_with(Arc::new(HandlerConnector(|| {
+            panic!("connector handler panics (expected)")
+        })));
+        adapter.on_connect(test_key(1), &test_config());
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            adapter.deliver(test_key(1), 3, &packet_from([10, 8, 0, 2]))
+        }));
+        assert!(r.is_err());
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            adapter.on_connect(test_key(2), &test_config());
+            adapter.deliver(test_key(2), 3, &packet_from([10, 8, 0, 2]));
+        }));
+        assert!(r.is_err(), "the second peer's handler ran");
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            adapter.on_disconnect(test_key(2));
+            adapter.close();
+        }));
+        assert!(r.is_ok(), "adapter unusable after a handler panicked");
+    }
+
+    /// A handler may call back into the adapter -- sending to a peer can
+    /// remove it, which runs its cleanup -- without deadlocking.
+    #[test]
+    fn a_handler_may_reenter_the_adapter() {
+        let slot: Arc<std::sync::OnceLock<Weak<Adapter>>> = Arc::default();
+        let adapter = adapter_with(Arc::new(HandlerConnector({
+            let slot = slot.clone();
+            move || {
+                if let Some(a) = slot.get().and_then(Weak::upgrade) {
+                    a.on_disconnect(test_key(1));
+                }
+            }
+        })));
+        slot.set(Arc::downgrade(&adapter)).unwrap();
+        adapter.on_connect(test_key(1), &test_config());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let a = adapter.clone();
+        std::thread::spawn(move || {
+            a.deliver(test_key(1), 3, &packet_from([10, 8, 0, 2]));
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "deadlocked"
+        );
+        assert!(adapter.peers.lock().unwrap().is_empty());
     }
 }
