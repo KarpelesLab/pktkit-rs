@@ -1240,7 +1240,7 @@ fn poll_loop(sock: Arc<Socket>, mut rings: RxRings) {
                 // wrote a valid RX descriptor).
                 let slice =
                     unsafe { std::slice::from_raw_parts(sock.umem.ptr().add(addr as usize), len) };
-                let _ = h(Frame::from_slice(slice));
+                deliver(h, Frame::from_slice(slice));
             }
 
             fill_batch[fill_count] = addr;
@@ -1256,6 +1256,16 @@ fn poll_loop(sock: Arc<Socket>, mut rings: RxRings) {
             }
         }
     }
+}
+
+/// Hand `frame` to the handler, containing a panic in it.
+///
+/// This runs on the RX thread, which nothing joins or watches: a panic that
+/// unwound out of `poll_loop` would end receive for good, silently, and take
+/// the batch's chunks with it before they were put back on the FILL ring.
+/// One bad frame should cost that frame, not the device.
+fn deliver(h: &L2Handler, frame: &Frame) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h(frame)));
 }
 
 // --- syscall helpers -------------------------------------------------------
@@ -1583,6 +1593,22 @@ fn bind_first(candidates: Vec<u16>, mut bind: impl FnMut(u16) -> Result<()>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_panicking_handler_does_not_unwind_into_the_rx_loop() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let h: L2Handler = Arc::new(move |f: &Frame| {
+            if c.fetch_add(1, Ordering::Relaxed) == 0 {
+                panic!("handler bug on a {}-byte frame", f.len());
+            }
+            Ok(())
+        });
+        let frame = [0u8; 60];
+        deliver(&h, Frame::from_slice(&frame));
+        deliver(&h, Frame::from_slice(&frame));
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
 
     /// Fill an `MmapOffsets` from a flat list of u64s, the way the kernel's
     /// `copy_to_user` would.
