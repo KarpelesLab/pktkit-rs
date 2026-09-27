@@ -1930,7 +1930,28 @@ impl Conn {
     }
 
     fn on_keepalive(&mut self) {
-        if self.state != State::Established && self.state != State::CloseWait {
+        // Like Linux, through the close handshake as well: a half-closed
+        // application in FIN-WAIT-2 would otherwise wait forever on a peer
+        // that vanished. TIME-WAIT has nobody left to probe for.
+        if !self.state.is_synchronized() || self.state == State::TimeWait {
+            self.stop_keepalive();
+            return;
+        }
+        // With anything in flight or held back by the window, the RTO or
+        // persist timer is already watching the peer, and a probe at
+        // SND.NXT-1 may fall inside its window and draw no answer (Linux's
+        // tcp_keepalive_timer holds off too). Released in FIN-WAIT-2, the
+        // FIN-WAIT-2 timeout is in charge: answered probes would keep a
+        // peer that never closes around for good.
+        let busy = self
+            .send_buf
+            .as_ref()
+            .is_some_and(|s| s.unacked() > 0 || s.pending() > 0);
+        let orphaned = self.state == State::FinWait2
+            && self.released.is_some()
+            && self.cfg.fin_wait2_timeout.is_some();
+        if busy || orphaned {
+            self.start_keepalive();
             return;
         }
         if self.last_recv.elapsed() > self.cfg.keepalive_idle {
@@ -3712,6 +3733,68 @@ mod tests {
         client.keepalive_deadline = Some(Instant::now());
         client.tick();
         assert!(client.persist_deadline.is_some(), "persist cancelled");
+    }
+
+    fn keepalive_pair(port: u16) -> (Conn, Conn) {
+        let mut client = Conn::new(cfg(port, 80).keepalive(true));
+        let mut server = Conn::new(cfg(80, port));
+        drive_handshake(&mut client, &mut server);
+        (client, server)
+    }
+
+    /// Expire the keepalive timer with the peer idle for longer than the
+    /// keepalive idle time.
+    fn fire_keepalive(c: &mut Conn) -> Vec<Vec<u8>> {
+        assert!(c.keepalive_deadline.is_some(), "keepalive not armed");
+        c.last_recv = Instant::now() - c.cfg.keepalive_idle - Duration::from_secs(1);
+        c.keepalive_deadline = Some(Instant::now());
+        c.tick()
+    }
+
+    // Linux keeps probing through the close handshake: a half-closed
+    // application waiting in FIN-WAIT-2 for a peer that has vanished would
+    // otherwise wait forever. While our FIN is still in flight the RTO is
+    // watching the peer instead, but the timer must survive to take over.
+    #[test]
+    fn keepalive_runs_in_fin_wait_states() {
+        let (mut client, mut server) = keepalive_pair(40301);
+        let fin = client.close();
+        assert_eq!(client.state(), State::FinWait1);
+        assert!(
+            fire_keepalive(&mut client).is_empty(),
+            "probe beside the FIN"
+        );
+        let rearmed = client
+            .keepalive_deadline
+            .is_some_and(|d| d > Instant::now());
+        assert!(rearmed, "stopped in FIN-WAIT-1");
+
+        let ack = deliver(&mut server, &fin);
+        deliver(&mut client, &ack);
+        assert_eq!(client.state(), State::FinWait2);
+        let probe = fire_keepalive(&mut client);
+        assert_eq!(probe.len(), 1, "no probe in FIN-WAIT-2");
+        let seg = parse(&probe[0]);
+        assert_eq!(
+            seg.seq,
+            client.send_buf.as_ref().unwrap().nxt().wrapping_sub(1)
+        );
+        assert!(seg.payload.is_empty() && seg.flags == flags::ACK);
+        // The peer answers it, since it is below RCV.NXT.
+        assert_eq!(deliver(&mut server, &probe).len(), 1);
+    }
+
+    // Once released, FIN-WAIT-2 has its own timeout: answered probes would
+    // keep a peer that never closes around forever.
+    #[test]
+    fn released_fin_wait_2_leaves_it_to_the_timeout() {
+        let (mut client, mut server) = keepalive_pair(40302);
+        let fin = client.release();
+        let ack = deliver(&mut server, &fin);
+        deliver(&mut client, &ack);
+        assert_eq!(client.state(), State::FinWait2);
+        client.released = Some(Instant::now());
+        assert!(fire_keepalive(&mut client).is_empty());
     }
 
     fn ts_pair(port: u16) -> (Conn, Conn) {
