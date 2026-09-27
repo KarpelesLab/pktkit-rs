@@ -87,8 +87,8 @@ pub trait ClientTransport: Send + Sync + 'static {
         let _ = ip;
     }
 
-    /// The check under way ended without binding the address: the client
-    /// stopped or started over. Whatever was noted about the address being
+    /// The check under way ended without binding the address: it was
+    /// declined, or the client stopped or started over. Whatever was noted about the address being
     /// probed can be forgotten.
     fn end_probe(&self) {}
 
@@ -168,6 +168,13 @@ struct Inner {
     tries: u32,
     /// While PROBING: what to bind once the address proves free.
     pending: Option<(IpPrefix, Option<Ipv4Addr>, Option<LeaseTimers>)>,
+    /// Numbers each address check, so an answer about one is never taken
+    /// for another.
+    probe_check: u64,
+    /// Whether the transport has started check `probe_check`
+    /// ([`ClientTransport::begin_probe`]). Until then it may still hold a
+    /// conflict from an earlier check, which must not be believed.
+    probe_live: bool,
     /// When the first REQUEST of the current transaction went out. The
     /// lease runs from then, not from the ACK (RFC 2131 §4.4.1): the server
     /// started its clock when it got the request, and the client must not
@@ -228,10 +235,11 @@ enum Out {
         xid: u32,
         ip: Ipv4Addr,
     },
-    /// ARP probe for an address about to be bound; `first` starts a check.
+    /// ARP probe for an address about to be bound. `check` is set on the
+    /// first probe of a check, which starts it.
     Probe {
         ip: Ipv4Addr,
-        first: bool,
+        check: Option<u64>,
     },
     /// Give the lease back (RFC 2131 §4.4.6).
     Release {
@@ -304,6 +312,8 @@ impl Client {
                     next_tx: None,
                     tries: 0,
                     pending: None,
+                    probe_check: 0,
+                    probe_live: false,
                     requested_at: None,
                     run: 0,
                 }),
@@ -444,11 +454,13 @@ impl Client {
                         i.pending = Some((prefix, p.router, lease));
                         i.tries = 1;
                         i.next_tx = Some(now + PROBE_INTERVAL);
+                        i.probe_check += 1;
+                        i.probe_live = false;
                         (
                             None,
                             Some(Out::Probe {
                                 ip: p.yiaddr,
-                                first: true,
+                                check: Some(i.probe_check),
                             }),
                         )
                     } else {
@@ -507,16 +519,22 @@ impl Shared {
     }
 
     fn tick(&self, now: Instant) {
-        // Asked with no lock held, like every other transport call.
+        // Asked with no lock held, like every other transport call -- so
+        // only once the check has begun, and only believed if it is still
+        // the same check afterwards. Between the ACK and begin_probe the
+        // transport may still report a conflict from a check before.
         let probing = {
             let i = self.inner.lock().unwrap();
-            (i.state == State::Probing)
-                .then_some(i.offered_ip)
-                .flatten()
+            match (i.state, i.offered_ip) {
+                (State::Probing, Some(ip)) if i.probe_live => Some((ip, i.probe_check)),
+                _ => None,
+            }
         };
-        let conflict = probing.is_some_and(|ip| self.transport.probe_conflict(ip));
+        let conflict = probing.filter(|&(ip, _)| self.transport.probe_conflict(ip));
         let (event, out) = {
             let mut i = self.inner.lock().unwrap();
+            let conflict = conflict
+                .is_some_and(|(_, check)| i.state == State::Probing && i.probe_check == check);
             step(&mut i, now, conflict)
         };
         self.notify(event);
@@ -575,9 +593,13 @@ impl Shared {
                 let frame = wrap_unicast(mac, ip, Ipv4Addr::BROADCAST, &b.finish());
                 self.transport.send_broadcast(Frame::from_slice(&frame));
             }
-            Out::Probe { ip, first } => {
-                if first {
+            Out::Probe { ip, check } => {
+                if let Some(check) = check {
                     self.transport.begin_probe(ip);
+                    let mut i = self.inner.lock().unwrap();
+                    if i.state == State::Probing && i.probe_check == check {
+                        i.probe_live = true;
+                    }
                 }
                 self.transport.send_probe(ip)
             }
@@ -595,6 +617,7 @@ impl Shared {
             // RFC 2131 Table 5: the declined address and the server go in
             // options; ciaddr stays zero, since the client has no address.
             Out::Decline { xid, ip, server } => {
+                self.transport.end_probe();
                 let mut b = wire::Builder::new(1, xid, mac);
                 b.message_type(wire::MSG_DECLINE)
                     .ipv4_option(wire::OPT_REQUESTED_IP, ip);
@@ -635,7 +658,7 @@ fn step(i: &mut Inner, now: Instant, conflict: bool) -> (Option<Event>, Option<O
                     PROBE_INTERVAL
                 };
                 i.next_tx = Some(now + wait);
-                return (None, Some(Out::Probe { ip, first: false }));
+                return (None, Some(Out::Probe { ip, check: None }));
             }
             let Some((prefix, router, lease)) = i.pending else {
                 return (None, Some(i.restart(now)));
@@ -1363,6 +1386,64 @@ mod tests {
         assert_eq!(r.bound.lock().unwrap().unwrap().0.addr(), IpAddr::V4(ip));
         assert_eq!(state(&c), State::Bound);
         assert!(sent(&r).is_empty());
+    }
+
+    #[test]
+    fn a_conflict_left_from_an_earlier_check_is_not_believed() {
+        // The transport still reports the last check's conflict until
+        // begin_probe clears it, and a tick lands just before that.
+        struct Stale {
+            client: Mutex<std::sync::Weak<Client>>,
+            conflict: Mutex<bool>,
+            declined: Mutex<bool>,
+        }
+        struct T(Arc<Stale>);
+        impl ClientTransport for T {
+            fn mac(&self) -> MacAddr {
+                MacAddr([2, 0, 0, 0, 0, 1])
+            }
+            fn send_broadcast(&self, f: &Frame) {
+                let p = wire::Parsed::from_bytes(&f.as_bytes()[42..]).unwrap();
+                if p.msg_type == wire::MSG_DECLINE {
+                    *self.0.declined.lock().unwrap() = true;
+                }
+            }
+            fn send_unicast(&self, _: Ipv4Addr, _: &Frame) {}
+            fn on_bound(&self, _: IpPrefix, _: Option<Ipv4Addr>) {}
+            fn can_probe(&self) -> bool {
+                true
+            }
+            fn begin_probe(&self, _: Ipv4Addr) {
+                if let Some(c) = self.0.client.lock().unwrap().upgrade() {
+                    c.tick();
+                }
+                *self.0.conflict.lock().unwrap() = false;
+            }
+            fn probe_conflict(&self, _: Ipv4Addr) -> bool {
+                *self.0.conflict.lock().unwrap()
+            }
+        }
+        let st = Arc::new(Stale {
+            client: Mutex::new(std::sync::Weak::new()),
+            conflict: Mutex::new(true),
+            declined: Mutex::new(false),
+        });
+        let c = Arc::new(Client::new(T(st.clone()), ClientConfig::default()));
+        *st.client.lock().unwrap() = Arc::downgrade(&c);
+        let mac = MacAddr([2, 0, 0, 0, 0, 1]);
+        c.begin(false);
+        c.handle_packet(&make_offer(xid(&c), mac));
+        c.handle_packet(&make_ack(xid(&c), mac));
+        assert!(
+            !*st.declined.lock().unwrap(),
+            "declined on a stale conflict"
+        );
+        assert_eq!(state(&c), State::Probing);
+
+        // A conflict seen once the check is under way still counts.
+        *st.conflict.lock().unwrap() = true;
+        c.tick();
+        assert!(*st.declined.lock().unwrap());
     }
 
     #[test]
