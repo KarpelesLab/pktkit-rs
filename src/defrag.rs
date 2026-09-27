@@ -7,7 +7,7 @@
 //! memory:
 //!
 //! - at most [`MAX_DATAGRAMS`] datagrams in progress, the oldest evicted
-//!   first, each at most 64 KiB;
+//!   first, each at most 64 KiB in at most [`MAX_PIECES`] fragments;
 //! - a datagram not completed within [`REASSEMBLY_TIMEOUT`] is discarded;
 //! - fragments that overlap what is already held, other than an exact
 //!   repeat, discard the whole datagram (RFC 5722; for IPv4 it is the same
@@ -23,6 +23,15 @@ use std::time::Duration;
 
 /// Datagrams in progress at once, per stack.
 pub(crate) const MAX_DATAGRAMS: usize = 64;
+
+/// Fragments held for one datagram. Keeping them sorted costs an insertion
+/// into a `Vec` per fragment, which is quadratic in their number: without
+/// a cap, 8-byte fragments sent in reverse order could make one 64 KiB
+/// datagram 8192 pieces and ~33 million element moves. 256 is several
+/// times what real paths produce (a 64 KiB datagram over a 1280-byte IPv6
+/// minimum MTU is 52 fragments; over a 576-byte IPv4 path, 118), and keeps
+/// the worst case to ~32 thousand moves.
+pub(crate) const MAX_PIECES: usize = 256;
 
 /// How long a partial datagram is kept waiting for its missing fragments.
 pub(crate) const REASSEMBLY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -266,6 +275,9 @@ impl Partial {
         if p.data.is_empty() {
             // Zero-length last fragment: it only fixes the total.
             return true;
+        }
+        if self.pieces.len() >= MAX_PIECES {
+            return false;
         }
         if self.data.len() < end {
             self.data.resize(end, 0);
@@ -552,6 +564,20 @@ mod tests {
             r.push_v4(now, 0, &frags[0], 20);
         }
         assert_eq!(r.in_progress(), MAX_DATAGRAMS);
+    }
+
+    #[test]
+    fn fragments_per_datagram_are_bounded() {
+        let mut r = Reassembler::default();
+        let now = Instant::now();
+        // 8-byte fragments in reverse order: the worst case for keeping
+        // the pieces sorted.
+        let mut f = v4_datagram(8);
+        for unit in (0..MAX_PIECES as u16 + 1).rev() {
+            f[6..8].copy_from_slice(&(0x2000 | unit).to_be_bytes());
+            assert!(r.push_v4(now, 0, &f, 20).is_none());
+        }
+        assert_eq!(r.in_progress(), 0, "datagram past MAX_PIECES kept");
     }
 
     #[test]
