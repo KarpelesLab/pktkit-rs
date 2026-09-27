@@ -42,6 +42,63 @@ const RESET: u8 = 1 << 4;
 pub(crate) struct Peer {
     last: Instant,
     state: u8,
+    /// Sequence corrections for `[outbound, inbound]` once an ALG has
+    /// resized a TCP payload on this connection.
+    seqadj: Option<Box<[SeqAdj; 2]>>,
+}
+
+/// The sequence-number shift one direction of a TCP connection has taken
+/// since an ALG changed the length of its payload (the scheme of Linux's
+/// `nf_ct_seqadj`). Bytes up to `pos` in the sender's numbering moved by
+/// `before`, bytes after it by `after`.
+///
+/// Only the latest resize point is remembered, so a segment from before it
+/// that is retransmitted after a later resize gets the older shift; ALG
+/// commands are rare enough on one connection that this does not arise in
+/// practice.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SeqAdj {
+    pos: u32,
+    before: i32,
+    after: i32,
+}
+
+/// `a` comes after `b` in sequence space (RFC 793 modular comparison).
+fn seq_after(a: u32, b: u32) -> bool {
+    (a.wrapping_sub(b) as i32) > 0
+}
+
+impl SeqAdj {
+    fn record(&mut self, seq: u32, delta: i32) {
+        // A retransmission of the segment already accounted for is resized
+        // again by the ALG, but must not shift the stream a second time.
+        if self.before == self.after || seq_after(seq, self.pos) {
+            self.pos = seq;
+            self.before = self.after;
+            self.after = self.after.wrapping_add(delta);
+        }
+    }
+
+    /// Translate a sequence number sent in this direction.
+    pub(crate) fn seq(&self, seq: u32) -> u32 {
+        let off = if seq_after(seq, self.pos) {
+            self.after
+        } else {
+            self.before
+        };
+        seq.wrapping_add(off as u32)
+    }
+
+    /// Translate an acknowledgement (or SACK edge) of this direction's data,
+    /// sent by the other side in shifted numbering, back to the sender's.
+    pub(crate) fn ack(&self, ack: u32) -> u32 {
+        let off = if seq_after(ack.wrapping_sub(self.before as u32), self.pos) {
+            self.after
+        } else {
+            self.before
+        };
+        ack.wrapping_sub(off as u32)
+    }
 }
 
 impl Peer {
@@ -97,6 +154,7 @@ impl Peers {
                 Peer {
                     last: now,
                     state: 0,
+                    seqadj: None,
                 },
             );
         }
@@ -109,6 +167,7 @@ impl Peers {
         // the same endpoints (RFC 793 TIME-WAIT reuse): forget the old one.
         if flags & TCP_SYN != 0 && flags & TCP_ACK == 0 && p.closing() {
             p.state = 0;
+            p.seqadj = None;
         }
         p.state |= if outbound { SEEN_OUT } else { SEEN_IN };
         if flags & TCP_FIN != 0 {
@@ -117,6 +176,35 @@ impl Peers {
         if flags & TCP_RST != 0 {
             p.state |= RESET;
         }
+    }
+
+    /// Note that an ALG changed the payload length of the TCP segment with
+    /// sequence number `seq` sent in direction `outbound` by `delta` bytes.
+    pub(crate) fn record_resize(
+        &mut self,
+        peer: &SocketAddrV4,
+        outbound: bool,
+        seq: u32,
+        delta: i32,
+    ) {
+        if let Some(p) = self.map.get_mut(peer) {
+            let adj = p.seqadj.get_or_insert_with(Default::default);
+            adj[usize::from(!outbound)].record(seq, delta);
+        }
+    }
+
+    /// The corrections for a TCP segment sent in direction `outbound`: its
+    /// own direction's (for its sequence number) and the other one's (for
+    /// its acknowledgement and SACK blocks). `None` if no ALG has resized
+    /// anything on this connection.
+    pub(crate) fn seq_adjust(
+        &self,
+        peer: &SocketAddrV4,
+        outbound: bool,
+    ) -> Option<(SeqAdj, SeqAdj)> {
+        let adj = self.map.get(peer)?.seqadj.as_ref()?;
+        let this = usize::from(!outbound);
+        Some((adj[this], adj[1 - this]))
     }
 
     /// True if the mapping has exchanged traffic with `peer`.
@@ -212,6 +300,34 @@ mod tests {
         p.note(peer(80), true, Some(TCP_SYN), now);
         p.note(peer(80), false, Some(TCP_SYN | TCP_ACK), now);
         assert!(!p.expire(PROTO_TCP, now, now + Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn seqadj_shifts_later_data_only() {
+        let mut a = SeqAdj::default();
+        // A 21-byte command at 1000 became 24 bytes.
+        a.record(1000, 3);
+        assert_eq!(a.seq(1000), 1000);
+        assert_eq!(a.seq(1021), 1024);
+        // The peer acknowledging the rewritten command.
+        assert_eq!(a.ack(1024), 1021);
+        assert_eq!(a.ack(1000), 1000);
+        // A retransmission is not counted twice.
+        a.record(1000, 3);
+        assert_eq!(a.seq(1021), 1024);
+        // A second resize later on accumulates.
+        a.record(2000, -2);
+        assert_eq!(a.seq(2000), 2003);
+        assert_eq!(a.seq(2100), 2101);
+        assert_eq!(a.ack(2101), 2100);
+    }
+
+    #[test]
+    fn seqadj_handles_wraparound() {
+        let mut a = SeqAdj::default();
+        a.record(u32::MAX - 5, 10);
+        assert_eq!(a.seq(4), 14);
+        assert_eq!(a.ack(14), 4);
     }
 
     #[test]

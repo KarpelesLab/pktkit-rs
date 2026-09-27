@@ -12,12 +12,15 @@ use crate::nat::helper::{
     Expectation, Helper, LocalHelper, NatMapping, PROTO_ICMP, PROTO_TCP, PROTO_UDP, PacketHelper,
     PortForward,
 };
-use crate::nat::track::Peers;
+use crate::nat::track::{Peers, SeqAdj};
 use crate::time::Instant;
-use crate::{IpPrefix, L3Connector, L3Device, L3Handler, Packet, Result, checksum, connect_l3};
+use crate::{
+    IpPrefix, L3Connector, L3Device, L3Handler, Packet, Result, checksum, connect_l3,
+    incremental_update,
+};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 const NAT_PORT_MIN: u16 = 10000;
@@ -79,6 +82,10 @@ pub struct Nat {
     /// devices need to find their parent without taking an `Arc<Nat>`
     /// directly (avoids a reference cycle through `Arc<Self>`).
     self_ref: Mutex<Weak<Nat>>,
+
+    /// Set once an ALG has resized a TCP payload; until then no segment
+    /// needs its sequence numbers looked at.
+    seqadj_used: AtomicBool,
 }
 
 struct NatInner {
@@ -131,6 +138,7 @@ impl Nat {
             ns_counter: AtomicU64::new(0),
             ns_sides: Mutex::new(HashMap::new()),
             self_ref: Mutex::new(Weak::new()),
+            seqadj_used: AtomicBool::new(false),
         });
         *nat.self_ref.lock().unwrap() = Arc::downgrade(&nat);
         // Wire each side back to the NAT.
@@ -570,6 +578,47 @@ impl Nat {
         out
     }
 
+    /// Keep TCP sequence numbers consistent after a helper changed the
+    /// length of a segment's payload (`before` bytes on the way in).
+    ///
+    /// A resize shifts every later byte of that direction's stream, so the
+    /// NAT has to shift the sequence numbers of later segments to match, and
+    /// shift back the acknowledgements and SACK blocks the other side sends;
+    /// otherwise both ends lose sync and the connection stalls or corrupts
+    /// data.
+    fn tcp_seq_fixup(
+        &self,
+        k: NatKey,
+        peer: SocketAddrV4,
+        outbound: bool,
+        before: Option<usize>,
+        out: &mut [u8],
+        ihl: usize,
+    ) {
+        let (Some(before), Some(after)) = (before, tcp_payload_len(out, ihl)) else {
+            return;
+        };
+        let delta = after as i64 - before as i64;
+        if delta == 0 && !self.seqadj_used.load(Ordering::Relaxed) {
+            return;
+        }
+        let seq = u32::from_be_bytes([out[ihl + 4], out[ihl + 5], out[ihl + 6], out[ihl + 7]]);
+        let adj = {
+            let mut inner = self.inner.lock().unwrap();
+            let Some(m) = inner.mappings.get_mut(&k) else {
+                return;
+            };
+            if delta != 0 {
+                m.peers.record_resize(&peer, outbound, seq, delta as i32);
+                self.seqadj_used.store(true, Ordering::Relaxed);
+            }
+            m.peers.seq_adjust(&peer, outbound)
+        };
+        if let Some((this, other)) = adj {
+            adjust_tcp_seq(out, ihl, this, other);
+        }
+    }
+
     /// Sweep stale entries — call on a timer if you want strict TTL behaviour.
     /// (We omit the maintenance thread; callers can spawn one if needed.)
     pub fn sweep(&self) {
@@ -763,7 +812,13 @@ impl Nat {
             outside_port,
             namespace: mapping_key.ns,
         };
-        let out = self.helper_outbound(out, &nm, proto, dst_port);
+        let before = tcp_payload_len(&out, ihl);
+        let mut out = self.helper_outbound(out, &nm, proto, dst_port);
+        if proto == PROTO_TCP {
+            let peer =
+                SocketAddrV4::new(Ipv4Addr::new(out[16], out[17], out[18], out[19]), dst_port);
+            self.tcp_seq_fixup(mapping_key, peer, true, before, &mut out, ihl);
+        }
         self.outside.deliver(Packet::from_slice(&out));
     }
 
@@ -941,7 +996,12 @@ impl Nat {
             outside_port,
             namespace: mapping_key.ns,
         };
-        let out = self.helper_inbound(out, &nm, proto, src_port);
+        let before = tcp_payload_len(&out, ihl);
+        let mut out = self.helper_inbound(out, &nm, proto, src_port);
+        if proto == PROTO_TCP {
+            let peer = SocketAddrV4::new(src_ip, src_port);
+            self.tcp_seq_fixup(mapping_key, peer, false, before, &mut out, ihl);
+        }
         self.send_ns(mapping_key.ns, Packet::from_slice(&out));
     }
 
@@ -1311,6 +1371,68 @@ fn ipv4_datagram(pkt: &[u8]) -> Option<(&[u8], usize)> {
         return None;
     }
     Some((&pkt[..total], ihl))
+}
+
+/// Length of a TCP segment's payload, `None` if the header is malformed.
+fn tcp_payload_len(pkt: &[u8], ihl: usize) -> Option<usize> {
+    let doff = (*pkt.get(ihl + 12)? >> 4) as usize * 4;
+    if doff < 20 {
+        return None;
+    }
+    pkt.len().checked_sub(ihl + doff)
+}
+
+/// Overwrite `new.len()` bytes at `off` inside the TCP segment of `pkt` and
+/// patch its checksum to match.
+fn patch_tcp(pkt: &mut [u8], ihl: usize, off: usize, new: &[u8]) {
+    // The checksum runs over 16-bit words counted from the TCP header,
+    // which starts at an even offset, so widen the patch to even bounds.
+    let start = off & !1;
+    let end = (off + new.len() + 1) & !1;
+    let old = pkt[start..end].to_vec();
+    pkt[off..off + new.len()].copy_from_slice(new);
+    let csum = u16::from_be_bytes([pkt[ihl + 16], pkt[ihl + 17]]);
+    let csum = incremental_update(csum, &old, &pkt[start..end]);
+    pkt[ihl + 16..ihl + 18].copy_from_slice(&csum.to_be_bytes());
+}
+
+/// Apply sequence corrections to a TCP segment: `this` to its sequence
+/// number, `other` (the opposite direction's) to its acknowledgement and
+/// SACK blocks (RFC 2018), which count the other side's bytes.
+fn adjust_tcp_seq(pkt: &mut [u8], ihl: usize, this: SeqAdj, other: SeqAdj) {
+    let read = |pkt: &[u8], at: usize| {
+        u32::from_be_bytes([pkt[at], pkt[at + 1], pkt[at + 2], pkt[at + 3]])
+    };
+    let seq = read(pkt, ihl + 4);
+    patch_tcp(pkt, ihl, ihl + 4, &this.seq(seq).to_be_bytes());
+    if pkt[ihl + 13] & 0x10 != 0 {
+        let ack = read(pkt, ihl + 8);
+        patch_tcp(pkt, ihl, ihl + 8, &other.ack(ack).to_be_bytes());
+    }
+    let end = ihl + (pkt[ihl + 12] >> 4) as usize * 4;
+    let mut i = ihl + 20;
+    while i < end {
+        match pkt[i] {
+            0 => break,
+            1 => i += 1,
+            kind => {
+                let Some(&len) = pkt.get(i + 1) else { break };
+                let len = len as usize;
+                if len < 2 || i + len > end {
+                    break;
+                }
+                if kind == 5 {
+                    let mut edge = i + 2;
+                    while edge + 4 <= i + len {
+                        let v = read(pkt, edge);
+                        patch_tcp(pkt, ihl, edge, &other.ack(v).to_be_bytes());
+                        edge += 4;
+                    }
+                }
+                i += len;
+            }
+        }
+    }
 }
 
 /// The TCP flags byte of a TCP packet, `None` for anything else (or a
@@ -2138,5 +2260,111 @@ mod tests {
         bad[30] ^= 0xFF;
         nat.outside().send(Packet::from_slice(&bad)).unwrap();
         assert!(i.lock().unwrap().is_empty());
+    }
+
+    /// A TCP segment with explicit sequence numbers, options and payload.
+    #[allow(clippy::too_many_arguments)]
+    fn tcp_seg(
+        src: Ipv4Addr,
+        sport: u16,
+        dst: Ipv4Addr,
+        dport: u16,
+        flags: u8,
+        seq: u32,
+        ack: u32,
+        opts: &[u8],
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let doff = 20 + opts.len();
+        let total = 20 + doff + payload.len();
+        let mut p = vec![0u8; total];
+        p[0] = 0x45;
+        p[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+        p[8] = 64;
+        p[9] = PROTO_TCP;
+        p[12..16].copy_from_slice(&src.octets());
+        p[16..20].copy_from_slice(&dst.octets());
+        let ic = checksum(&p[..20]);
+        p[10..12].copy_from_slice(&ic.to_be_bytes());
+        p[20..22].copy_from_slice(&sport.to_be_bytes());
+        p[22..24].copy_from_slice(&dport.to_be_bytes());
+        p[24..28].copy_from_slice(&seq.to_be_bytes());
+        p[28..32].copy_from_slice(&ack.to_be_bytes());
+        p[32] = ((doff / 4) as u8) << 4;
+        p[33] = flags;
+        p[40..40 + opts.len()].copy_from_slice(opts);
+        p[20 + doff..].copy_from_slice(payload);
+        crate::nat::l4::fill_v4_l4_checksum(&mut p, 20);
+        p
+    }
+
+    fn seq_of(p: &[u8]) -> u32 {
+        u32::from_be_bytes([p[24], p[25], p[26], p[27]])
+    }
+
+    fn ack_of(p: &[u8]) -> u32 {
+        u32::from_be_bytes([p[28], p[29], p[30], p[31]])
+    }
+
+    #[test]
+    fn alg_resize_keeps_tcp_sequence_numbers_in_sync() {
+        let (nat, i, o) = setup();
+        nat.add_packet_helper(Arc::new(crate::nat::FtpHelper::new()));
+        let cmd: &[u8] = b"PORT 10,0,0,5,4,210\r\n";
+        let seg = tcp_seg(INSIDE, 45000, REMOTE, 21, 0x18, 1000, 7000, &[], cmd);
+        nat.inside().send(Packet::from_slice(&seg)).unwrap();
+        let (mapped, grown) = {
+            let out = o.lock().unwrap();
+            let rewritten = out[0].len() - 40;
+            assert_ne!(rewritten, cmd.len(), "test needs a length-changing rewrite");
+            (src_port(&out[0]), rewritten as u32)
+        };
+        let orig = cmd.len() as u32;
+
+        // The next segment from the client follows the rewritten command.
+        let next = tcp_seg(
+            INSIDE,
+            45000,
+            REMOTE,
+            21,
+            0x18,
+            1000 + orig,
+            7000,
+            &[],
+            b"LIST\r\n",
+        );
+        nat.inside().send(Packet::from_slice(&next)).unwrap();
+        {
+            let out = o.lock().unwrap();
+            assert_eq!(seq_of(&out[0]), 1000);
+            assert_eq!(seq_of(&out[1]), 1000 + grown);
+            assert!(crate::nat::l4::v4_l4_checksum_ok(&out[1], 20));
+        }
+
+        // The server acknowledges the rewritten stream, with a SACK block
+        // (NOP, NOP, SACK) covering the LIST segment.
+        let right = 1000 + grown + 6;
+        let mut opts = vec![1, 1, 5, 10];
+        opts.extend_from_slice(&(1000 + grown).to_be_bytes());
+        opts.extend_from_slice(&right.to_be_bytes());
+        let reply = tcp_seg(
+            REMOTE,
+            21,
+            PUBLIC,
+            mapped,
+            0x10,
+            7000,
+            1000 + grown,
+            &opts,
+            &[],
+        );
+        nat.outside().send(Packet::from_slice(&reply)).unwrap();
+        let got = i.lock().unwrap();
+        let r = &got[0];
+        assert_eq!(ack_of(r), 1000 + orig);
+        let sack = |at: usize| u32::from_be_bytes([r[at], r[at + 1], r[at + 2], r[at + 3]]);
+        assert_eq!(sack(44), 1000 + orig);
+        assert_eq!(sack(48), 1000 + orig + 6);
+        assert!(crate::nat::l4::v4_l4_checksum_ok(r, 20));
     }
 }
