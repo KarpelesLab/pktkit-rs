@@ -373,6 +373,9 @@ impl Stack {
     pub fn shutdown(&self) -> Result<()> {
         self.inner.closed.store(true, Ordering::Release);
         Self::close_flows(&self.inner, |_| true);
+        // Namespace sides point back at the stack; dropping them here breaks
+        // that cycle for peers whose cleanup never runs.
+        self.inner.ns_sides.lock().expect("poisoned").clear();
         Ok(())
     }
 
@@ -396,9 +399,29 @@ impl Stack {
         Ok(())
     }
 
+    /// The packet sink handed to a flow, injecting into namespace `ns`.
+    ///
+    /// It holds the stack weakly: the flows live in the stack's own tables,
+    /// so a strong reference would make a cycle that keeps the stack, its
+    /// sockets and its threads alive after the last handle is dropped.
+    fn sink(inner: &Arc<Inner>, ns: u64) -> Arc<dyn Fn(&[u8]) + Send + Sync> {
+        let weak = Arc::downgrade(inner);
+        Arc::new(move |p: &[u8]| {
+            if let Some(inner) = weak.upgrade() {
+                let _ = Self::dispatch(&inner, ns, p);
+            }
+        })
+    }
+
     /// Process an inbound IP packet from the virtual client. Public-facing
     /// entry point is `<Stack as L3Device>::send`.
     fn handle_packet(inner: &Arc<Inner>, ns: u64, pkt: &[u8]) -> Result<()> {
+        if inner.closed.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "stack is shut down",
+            ));
+        }
         if pkt.len() < 20 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -520,10 +543,7 @@ impl Stack {
             Err(_) => return Ok(()),
         };
 
-        let inner_for_send = inner.clone();
-        let sink: Arc<dyn Fn(&[u8]) + Send + Sync> = Arc::new(move |p: &[u8]| {
-            let _ = Self::dispatch(&inner_for_send, ns, p);
-        });
+        let sink = Self::sink(inner, ns);
         let endpoints = Endpoints::V4 {
             local_ip: dst,
             local_port: dst_port,
@@ -609,10 +629,7 @@ impl Stack {
         };
 
         // Sink: wrap engine segments (built by ConnState) and inject them.
-        let inner_for_send = inner.clone();
-        let sink: Arc<dyn Fn(&[u8]) + Send + Sync> = Arc::new(move |p: &[u8]| {
-            let _ = Self::dispatch(&inner_for_send, ns, p);
-        });
+        let sink = Self::sink(inner, ns);
 
         let cfg = ConnConfig {
             local_addr: Some(SocketAddr::new(std::net::IpAddr::V4(dst), dst_port)),
@@ -728,9 +745,11 @@ impl Stack {
             if let Some(c) = t.get(&key) {
                 c.clone()
             } else {
-                let inner_for_send = inner.clone();
-                let send_fn: UdpSendFn =
-                    Arc::new(move |p: &[u8]| Self::dispatch(&inner_for_send, ns, p));
+                let weak = Arc::downgrade(inner);
+                let send_fn: UdpSendFn = Arc::new(move |p: &[u8]| match weak.upgrade() {
+                    Some(inner) => Self::dispatch(&inner, ns, p),
+                    None => Ok(()),
+                });
                 let conn = UdpConn::new(src, src_port, dst, dst_port, send_fn)?;
                 t.insert(key, conn.clone());
                 conn
@@ -854,10 +873,7 @@ impl Stack {
             Err(_) => return Ok(()),
         };
 
-        let inner_for_send = inner.clone();
-        let sink: Arc<dyn Fn(&[u8]) + Send + Sync> = Arc::new(move |p: &[u8]| {
-            let _ = Self::dispatch(&inner_for_send, ns, p);
-        });
+        let sink = Self::sink(inner, ns);
         let endpoints = Endpoints::V6 {
             local_ip: dst,
             local_port: dst_port,
@@ -932,10 +948,7 @@ impl Stack {
         };
 
         // Sink: wrap engine segments (built by ConnState) and inject them.
-        let inner_for_send = inner.clone();
-        let sink: Arc<dyn Fn(&[u8]) + Send + Sync> = Arc::new(move |p: &[u8]| {
-            let _ = Self::dispatch(&inner_for_send, ns, p);
-        });
+        let sink = Self::sink(inner, ns);
 
         let cfg = ConnConfig {
             local_addr: Some(SocketAddr::new(std::net::IpAddr::V6(dst), dst_port)),
@@ -1048,9 +1061,11 @@ impl Stack {
             if let Some(c) = t.get(&key) {
                 c.clone()
             } else {
-                let inner_for_send = inner.clone();
-                let send_fn: UdpSendFn6 =
-                    Arc::new(move |p: &[u8]| Self::dispatch(&inner_for_send, ns, p));
+                let weak = Arc::downgrade(inner);
+                let send_fn: UdpSendFn6 = Arc::new(move |p: &[u8]| match weak.upgrade() {
+                    Some(inner) => Self::dispatch(&inner, ns, p),
+                    None => Ok(()),
+                });
                 let conn = UdpConn6::new(src, src_port, dst, dst_port, send_fn)?;
                 t.insert(key, conn.clone());
                 conn
@@ -1106,6 +1121,14 @@ impl Stack {
     }
 }
 
+impl Drop for Stack {
+    /// The last handle going away shuts the stack down: its flows are closed
+    /// and its background threads wind down.
+    fn drop(&mut self) {
+        let _ = self.shutdown();
+    }
+}
+
 impl L3Device for Stack {
     fn set_handler(&self, h: L3Handler) {
         *self.inner.handler.lock().expect("poisoned") = Some(h);
@@ -1145,10 +1168,12 @@ impl L3Connector for Stack {
             .expect("poisoned")
             .insert(ns, side);
 
-        let inner = self.inner.clone();
+        let weak = Arc::downgrade(&self.inner);
         Ok(Box::new(move || {
-            inner.ns_sides.lock().expect("poisoned").remove(&ns);
-            Stack::cleanup_namespace(&inner, ns);
+            if let Some(inner) = weak.upgrade() {
+                inner.ns_sides.lock().expect("poisoned").remove(&ns);
+                Stack::cleanup_namespace(&inner, ns);
+            }
             Ok(())
         }))
     }
@@ -1722,6 +1747,39 @@ mod tests {
             done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
             "shutdown deadlocked against the blocked writer"
         );
+    }
+
+    #[test]
+    fn dropping_the_stack_releases_it() {
+        use std::net::TcpListener;
+
+        let udp_server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let tcp_server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let tcp_port = tcp_server.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let _held = tcp_server.accept();
+            thread::sleep(Duration::from_secs(30));
+        });
+
+        let stack = Stack::new();
+        let captured = capture(&stack);
+        let client = Ipv4Addr::new(10, 0, 0, 5);
+        let lo = Ipv4Addr::new(127, 0, 0, 1);
+        let dgram = build_udp_v4_packet(
+            client,
+            40010,
+            lo,
+            udp_server.local_addr().unwrap().port(),
+            b"x",
+        );
+        L3Device::send(&*stack, Packet::from_slice(&dgram)).unwrap();
+        let syn = build_tcp_v4_packet(client, 40011, lo, tcp_port, 1, 0, tcp_flags::SYN, &[]);
+        L3Device::send(&*stack, Packet::from_slice(&syn)).unwrap();
+        wait_for("SYN-ACK", || !captured.lock().unwrap().is_empty());
+
+        let weak = Arc::downgrade(&stack.inner);
+        drop(stack);
+        wait_for("the stack to be freed", || weak.upgrade().is_none());
     }
 
     /// Drive a real `vtcp::Conn` as the virtual client through the outbound NAT
