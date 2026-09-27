@@ -184,7 +184,17 @@ fn live(server: &Weak<Server>) -> Option<Arc<Server>> {
 
 impl Server {
     /// Bind the UDP and TCP listeners and start the accept/read loops.
+    ///
+    /// Fails if a socket cannot be bound, or if `tls_config` cannot make a
+    /// TLS server connection (no identity, say) -- found out now rather than
+    /// when the first client arrives.
     pub fn new(cfg: ServerConfig) -> io::Result<Arc<Server>> {
+        purecrypto::tls::Connection::server(&cfg.tls_config).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("TLS config cannot make a server connection: {e:?}"),
+            )
+        })?;
         let udp = Arc::new(UdpSocket::bind(cfg.listen_addr)?);
         udp.set_read_timeout(Some(POLL))?;
         let tcp = TcpListener::bind(cfg.listen_addr)?;
@@ -343,12 +353,14 @@ impl Server {
         }
         let mut local_id = [0u8; 8];
         let _ = super::peer::fill_random(&mut local_id);
+        // Server::new checked the TLS config, so this does not fail in
+        // practice; if it does, the client is just not served.
         let peer = Peer::new(
             self.cfg.tls_config.clone(),
             local_id,
             self.cfg.on_auth.clone(),
         )
-        .expect("peer creation")
+        .ok()?
         .with_timers(self.cfg.timers());
         let entry = Arc::new(PeerEntry {
             peer: Mutex::new(peer),
@@ -476,7 +488,13 @@ fn udp_loop(server: Weak<Server>, udp: Arc<UdpSocket>) {
                     e.kind(),
                     io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                 ) => {}
-            Err(_) => return,
+            // Not fatal: Windows, for one, reports an ICMP port unreachable
+            // for an earlier send to any client as WSAECONNRESET here. Back
+            // off in case the error persists.
+            Err(_) => {
+                drop(server);
+                thread::sleep(POLL);
+            }
         }
     }
 }
@@ -830,6 +848,23 @@ mod tests {
         server.send_raw(&entry, b"ok").unwrap();
         assert_eq!(tcp_recv(&mut client).unwrap(), b"ok");
         server.close();
+    }
+
+    /// A TLS config that cannot make a server connection (here: no
+    /// identity) is reported by Server::new, rather than panicking the
+    /// reader thread when the first client arrives.
+    #[test]
+    fn unusable_tls_config_fails_server_creation() {
+        let tls = Arc::new(
+            purecrypto::tls::Config::builder()
+                .rng(Arc::new(purecrypto::rng::OsRng))
+                .build(),
+        );
+        let on_auth: OnAuth = Arc::new(|_| Err(io::Error::other("unused")));
+        let on_data: OnData = Arc::new(|_, _, _| {});
+        let cfg = ServerConfig::new(tls, "127.0.0.1:0".parse().unwrap(), on_auth, on_data);
+        let err = Server::new(cfg).expect_err("server without an identity");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
