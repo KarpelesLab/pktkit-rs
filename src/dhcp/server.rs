@@ -144,21 +144,45 @@ impl Server {
             wire::MSG_RELEASE => {
                 self.leases.lock().unwrap().remove(&p.chaddr);
             }
-            wire::MSG_DECLINE => {
-                let mut leases = self.leases.lock().unwrap();
-                leases.remove(&p.chaddr);
-                if let Some(ip) = p.requested_ip {
-                    self.declined
-                        .lock()
-                        .unwrap()
-                        .insert(ip, Instant::now() + self.cfg.lease_time);
-                }
-            }
+            wire::MSG_DECLINE => self.decline(&p),
             wire::MSG_INFORM => {
                 self.send_reply(wire::MSG_ACK, p.xid, p.chaddr, None);
             }
             _ => {}
         }
+    }
+
+    /// A client found the address we gave it already in use (RFC 2131
+    /// §4.3.3), so we stop handing it out for a while.
+    ///
+    /// A DECLINE is unauthenticated broadcast, so it is believed only as far
+    /// as it could be true: it must name us as the server (Table 5 makes the
+    /// server identifier and requested address MUSTs), and the address must
+    /// be the one this very client was offered or leased. Anything else
+    /// would let one station fence off the whole pool, or grow the declined
+    /// table without bound.
+    fn decline(&self, p: &wire::Parsed) {
+        if p.server_id != Some(self.cfg.server_ip) {
+            return;
+        }
+        let Some(ip) = p.requested_ip else {
+            return;
+        };
+        let now = Instant::now();
+        let mut leases = self.live_leases(now);
+        let ours = leases.get(&p.chaddr).is_some_and(|l| l.ip == ip)
+            || self.cfg.static_leases.get(&p.chaddr) == Some(&ip);
+        if !ours {
+            return;
+        }
+        leases.remove(&p.chaddr);
+        let mut declined = self.declined.lock().unwrap();
+        // Only addresses we gave out get here, so this bounds only what a
+        // pathological configuration (a pool larger than the table) allows.
+        if declined.len() >= MAX_LEASES && !declined.contains_key(&ip) {
+            return;
+        }
+        declined.insert(ip, now + self.cfg.lease_time);
     }
 
     /// The table as of `now`: leases and offers that have run out are
@@ -771,5 +795,60 @@ mod tests {
         s.handle_dhcp(&init_reboot(Ipv4Addr::new(10, 0, 0, 255)));
         s.handle_dhcp(&init_reboot(Ipv4Addr::new(10, 0, 0, 254)));
         assert!(replies(&r).iter().all(|p| p.msg_type != wire::MSG_ACK));
+    }
+
+    fn decline(mac: MacAddr, ip: Option<Ipv4Addr>, server: Option<Ipv4Addr>) -> Vec<u8> {
+        let mut b = wire::Builder::new(1, 5, mac);
+        b.message_type(wire::MSG_DECLINE);
+        if let Some(ip) = ip {
+            b.ipv4_option(wire::OPT_REQUESTED_IP, ip);
+        }
+        if let Some(s) = server {
+            b.ipv4_option(wire::OPT_SERVER_ID, s);
+        }
+        b.finish()
+    }
+
+    #[test]
+    fn decline_is_accepted_only_for_what_we_gave_that_client() {
+        let cfg = ServerConfig::new(
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(10, 0, 0, 10),
+            Ipv4Addr::new(10, 0, 0, 20),
+        );
+        let (s, r) = recording(cfg);
+        let us = Some(Ipv4Addr::new(10, 0, 0, 1));
+        let a = MacAddr([2, 0, 0, 0, 0, 0xa]);
+        let b = MacAddr([2, 0, 0, 0, 0, 0xb]);
+        let ip = bound_lease(&s, &r, a);
+
+        // Not addressed to us, or naming no server at all.
+        s.handle_dhcp(&decline(a, Some(ip), Some(Ipv4Addr::new(10, 0, 0, 2))));
+        s.handle_dhcp(&decline(a, Some(ip), None));
+        // A stranger declining A's address, or addresses nobody was given.
+        s.handle_dhcp(&decline(b, Some(ip), us));
+        s.handle_dhcp(&decline(a, Some(Ipv4Addr::new(10, 0, 0, 15)), us));
+        s.handle_dhcp(&decline(a, Some(Ipv4Addr::new(8, 8, 8, 8)), us));
+        assert!(
+            s.declined.lock().unwrap().is_empty(),
+            "accepted a bad DECLINE"
+        );
+        assert_eq!(s.leases.lock().unwrap()[&a].ip, ip, "lease lost");
+
+        // The real thing: A found the address in use.
+        s.handle_dhcp(&decline(a, Some(ip), us));
+        assert!(s.declined.lock().unwrap().contains_key(&ip));
+        assert!(!s.leases.lock().unwrap().contains_key(&a));
+    }
+
+    #[test]
+    fn forged_declines_cannot_grow_the_table_without_bound() {
+        let (s, _r) = recording(one_address_pool());
+        let us = Some(Ipv4Addr::new(10, 0, 0, 1));
+        for i in 0..5000u32 {
+            let mac = MacAddr([2, 9, 0, (i >> 16) as u8, (i >> 8) as u8, i as u8]);
+            s.handle_dhcp(&decline(mac, Some(Ipv4Addr::from(0x0a00_0000 + i)), us));
+        }
+        assert!(s.declined.lock().unwrap().len() <= MAX_LEASES);
     }
 }
