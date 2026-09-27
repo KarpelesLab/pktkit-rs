@@ -553,7 +553,8 @@ impl Nat {
     /// on another port, `displace` decides: a port forward is the endpoint's
     /// configured public identity and replaces it (old reverse entry
     /// included); an expectation must not break a live session and is
-    /// refused.
+    /// refused. (Mappings made while a forward exists already use its port,
+    /// so only one from before the forward was added gets displaced.)
     fn install_mapping_locked(
         inner: &mut NatInner,
         k: NatKey,
@@ -585,6 +586,25 @@ impl Nat {
             return Some(m);
         }
 
+        // A forward is the endpoint's public identity for all its traffic,
+        // not only what arrives: a host that speaks first (or again, after
+        // its forwarded session idled out) must leave from the forwarded
+        // port. From a dynamic one, the first packet in on the forward would
+        // move the mapping there and strand that dynamic session's replies.
+        if let Some(port) = Self::forward_port_for_locked(inner, k, now) {
+            let mut m = Mapping::new(k, port, now);
+            m.open = true;
+            inner.reverse.insert(
+                NatRevKey {
+                    proto: k.proto,
+                    port,
+                },
+                k,
+            );
+            inner.mappings.insert(k, m);
+            return inner.mappings.get_mut(&k);
+        }
+
         let port = Self::alloc_port_locked(inner)?;
         let m = Mapping::new(k, port, now);
         inner.reverse.insert(
@@ -596,6 +616,20 @@ impl Nat {
         );
         inner.mappings.insert(k, m);
         inner.mappings.get_mut(&k)
+    }
+
+    /// The outside port of a live forward to inside endpoint `k`, if that
+    /// port is free. There is at most one: `add_port_forward` refuses a
+    /// second forward to the same endpoint.
+    fn forward_port_for_locked(inner: &NatInner, k: NatKey, now: Instant) -> Option<u16> {
+        let (rk, _) = inner.forwards.iter().find(|(_, f)| {
+            f.proto == k.proto
+                && f.namespace == k.ns
+                && f.inside_ip == k.ip
+                && f.inside_port == k.port
+                && f.expires.is_none_or(|e| e >= now)
+        })?;
+        (!inner.reverse.contains_key(rk)).then_some(rk.port)
     }
 
     /// A free outside port. When none is left, idle mappings are reclaimed
@@ -3451,5 +3485,31 @@ mod tests {
         assert_eq!(&whole[16..20], &INSIDE.octets());
         assert_eq!(dst_port(&whole), 5000);
         assert!(crate::nat::l4::v4_l4_checksum_ok(&whole, 20));
+    }
+
+    #[test]
+    fn a_forwarded_host_speaking_first_leaves_from_the_forwarded_port() {
+        let (nat, i, o) = setup();
+        nat.add_port_forward(PortForward::new(PROTO_UDP, 20000, INSIDE, 5000))
+            .unwrap();
+        let p = build_udp(INSIDE, 5000, REMOTE, 7, b"x");
+        nat.inside().send(Packet::from_slice(&p)).unwrap();
+        assert_eq!(src_port(&o.lock().unwrap()[0]), 20000);
+
+        // Another remote reaching the forward, then the first one's reply:
+        // both arrive, as the session was never moved.
+        let q = build_udp(Ipv4Addr::new(192, 0, 2, 66), 9, PUBLIC, 20000, b"y");
+        nat.outside().send(Packet::from_slice(&q)).unwrap();
+        let r = build_udp(REMOTE, 7, PUBLIC, 20000, b"z");
+        nat.outside().send(Packet::from_slice(&r)).unwrap();
+        assert_eq!(i.lock().unwrap().len(), 2);
+
+        // Once the forwarded session idles out, the host comes back on the
+        // forwarded port too.
+        age_mappings(&nat, UDP_TIMEOUT + Duration::from_secs(1));
+        nat.sweep();
+        assert_eq!(mapped(&nat), 0);
+        nat.inside().send(Packet::from_slice(&p)).unwrap();
+        assert_eq!(src_port(&o.lock().unwrap()[1]), 20000);
     }
 }
