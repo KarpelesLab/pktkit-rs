@@ -2,13 +2,14 @@
 //!
 //! A [`Peer`] drives one OpenVPN client through:
 //!
-//! 1. **Hard reset** — the client's `P_CONTROL_HARD_RESET_CLIENT_V2` sets the
-//!    peer session id; we reply with our own server hard reset.
+//! 1. **Hard reset** — the client's `P_CONTROL_HARD_RESET_CLIENT_V2` opens a
+//!    session keyed by its session id; we reply with our own server hard
+//!    reset carrying a fresh session id of ours.
 //! 2. **TLS handshake** — a purecrypto TLS server connection runs *inside* the
 //!    reliable control channel. We feed it the TLS bytes carried by
-//!    `P_CONTROL_V1` packets (`read_tls` + `process_new_packets`) and pump its
-//!    output back out as more `P_CONTROL_V1` packets (`write_tls`). There is no
-//!    TCP socket under the TLS; the reliable layer is the transport.
+//!    `P_CONTROL_V1` packets and pump its output back out as more
+//!    `P_CONTROL_V1` packets. There is no TCP socket under the TLS; the
+//!    reliable layer is the transport.
 //! 3. **Key-method 2 exchange** — over the established TLS stream the client
 //!    sends `[0:4][key_method:1][pre_master:48][random1:32][random2:32]` plus
 //!    the options, username, password, and peer-info strings. We reply
@@ -17,11 +18,19 @@
 //!    or Ethernet frames (tap) and delivered to the adapter; outgoing packets
 //!    are encrypted and emitted.
 //!
-//! Ported from the Go `peer.go` + `peer-control.go` + `peerconn.go`. The Go
-//! version used blocking reads on a `tls.Conn` from a dedicated goroutine; the
-//! Rust port is single-threaded and event-driven — each inbound datagram is
-//! processed synchronously and any work that can make progress does so.
+//! The structure follows OpenVPN's `ssl.c`: a peer holds up to two
+//! [`Session`]s (`tls_session`) -- the *active* one carrying the data channel
+//! and an *initial* one a new hard reset is negotiating -- and every control
+//! packet is routed to a session by the sender's session id. A session that
+//! authenticates replaces the active one, so a client that restarts from the
+//! same address reconnects, while a stray hard reset cannot disturb a working
+//! session. Each session runs its TLS handshake in a [`KeyState`]
+//! (`key_state`).
+//!
+//! The Rust code is single-threaded and event-driven — each inbound datagram
+//! is processed synchronously and any work that can make progress does so.
 
+use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
 
@@ -32,6 +41,7 @@ use super::consts::{KEY_EXPANSION_ID, KEY_METHOD_MASK};
 use super::data;
 use super::keys::PeerKeys;
 use super::options::Options;
+use super::packet_ctrl::ControlPacket;
 use super::prf::prf10;
 use super::reliable::Reliable;
 use super::window::Window;
@@ -45,7 +55,7 @@ fn invalid(msg: impl Into<String>) -> io::Error {
 pub struct AuthInfo {
     pub username: String,
     pub password: String,
-    pub peer_info: std::collections::HashMap<String, String>,
+    pub peer_info: HashMap<String, String>,
     pub dev_type: String,
 }
 
@@ -101,92 +111,90 @@ pub struct PeerOutput {
     pub error: Option<io::Error>,
 }
 
-/// Phase of the control flow.
-#[derive(Debug, PartialEq, Eq)]
-enum Phase {
-    /// Waiting for the client hard reset.
-    Init,
-    /// TLS handshake / key exchange in progress.
-    Handshaking,
-    /// Authenticated; data channel active.
-    Established,
-}
-
-/// One OpenVPN peer.
+/// One OpenVPN peer (one client address).
 pub struct Peer {
-    tls: TlsConnection,
-    reliable: Reliable,
-    phase: Phase,
-
+    config: Arc<purecrypto::tls::Config>,
     on_auth: OnAuth,
-
-    // Negotiated state, populated during the key exchange.
-    opts: Option<Options>,
-    keys: Option<PeerKeys>,
-    replay: Window,
-    /// Layer: 2 = tap (frames), 3 = tun (packets).
-    layer: u8,
-    /// Outgoing data-channel packet id.
-    out_pid: u32,
-
-    // Key-method 2 exchange scratch (read incrementally from the TLS stream).
-    ctrl_buf: Vec<u8>,
-    kx_done: bool,
-    peer_cfg: Option<PeerConfig>,
-    /// Peer-info key/values (`IV_*`) the client advertised during the key
-    /// exchange, retained for post-auth queries / diagnostics.
-    peer_info: std::collections::HashMap<String, String>,
-    /// Server random material (r1||r2) generated for the key exchange and
-    /// reused by [`derive_keys`] so the PRF inputs match what was sent.
-    server_random: [u8; 64],
+    /// Local session id for the first session; later ones draw a random id.
+    first_local_id: Option<[u8; 8]>,
+    /// The session carrying the data channel (OpenVPN's `TM_ACTIVE`).
+    active: Option<Session>,
+    /// A session still negotiating (OpenVPN's `TM_INITIAL`). Every session
+    /// starts here and replaces `active` once it authenticates.
+    initial: Option<Session>,
 }
 
 impl std::fmt::Debug for Peer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Peer")
-            .field("phase", &self.phase)
-            .field("authenticated", &self.kx_done)
+            .field("active", &self.active.is_some())
+            .field("initial", &self.initial.is_some())
             .finish()
     }
 }
 
+/// Which of the peer's sessions a control packet belongs to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Slot {
+    Active,
+    Initial,
+}
+
 impl Peer {
     /// Create a peer with the given TLS config, local session id, and auth
-    /// hook. The local session id is typically random; the server uses it to
-    /// identify reliable-layer packets.
+    /// hook. The local session id identifies the peer's first session on the
+    /// wire (the server draws it at random); later sessions draw their own.
+    ///
+    /// Fails if `config` cannot make a TLS server connection.
     pub fn new(
         config: Arc<purecrypto::tls::Config>,
         local_id: [u8; 8],
         on_auth: OnAuth,
     ) -> io::Result<Peer> {
-        let tls = TlsConnection::server(&config)
+        // Sessions build their TLS connection on demand; surface a config
+        // that cannot make one now rather than on the first client packet.
+        TlsConnection::server(&config)
             .map_err(|e| invalid(format!("TLS server connection: {e:?}")))?;
         Ok(Peer {
-            tls,
-            reliable: Reliable::new(local_id),
-            phase: Phase::Init,
+            config,
             on_auth,
-            opts: None,
-            keys: None,
-            replay: Window::new(),
-            layer: 3,
-            out_pid: 0,
-            ctrl_buf: Vec::new(),
-            kx_done: false,
-            peer_cfg: None,
-            peer_info: std::collections::HashMap::new(),
-            server_random: [0u8; 64],
+            first_local_id: Some(local_id),
+            active: None,
+            initial: None,
         })
+    }
+
+    /// The session whose settings describe the connection: the active one,
+    /// or the one negotiating if nothing is active yet.
+    fn current(&self) -> Option<&Session> {
+        self.active.as_ref().or(self.initial.as_ref())
     }
 
     /// The peer config pushed to the client after authentication (if any).
     pub fn peer_config(&self) -> Option<&PeerConfig> {
-        self.peer_cfg.as_ref()
+        self.active.as_ref()?.peer_cfg.as_ref()
     }
 
     /// Layer (2 for tap, 3 for tun).
     pub fn layer(&self) -> u8 {
-        self.layer
+        self.current().map_or(3, |s| s.layer)
+    }
+
+    /// Peer-info (`IV_*`) key/values the client advertised during the key
+    /// exchange. Empty until the peer authenticates.
+    pub fn peer_info(&self) -> &HashMap<String, String> {
+        static EMPTY: std::sync::OnceLock<HashMap<String, String>> = std::sync::OnceLock::new();
+        match &self.active {
+            Some(s) => &s.peer_info,
+            None => EMPTY.get_or_init(HashMap::new),
+        }
+    }
+
+    fn session_mut(&mut self, slot: Slot) -> Option<&mut Session> {
+        match slot {
+            Slot::Active => self.active.as_mut(),
+            Slot::Initial => self.initial.as_mut(),
+        }
     }
 
     /// Drive periodic maintenance: retransmit any unacknowledged control
@@ -201,109 +209,312 @@ impl Peer {
     /// retries the connection is abandoned and `PeerOutput::close` is set.
     pub fn tick(&mut self, now: crate::time::Instant) -> io::Result<PeerOutput> {
         let mut out = PeerOutput::default();
-        let tick = self.reliable.tick(now);
-        out.send = tick.resend;
-        out.close = tick.timed_out;
+        for slot in [Slot::Active, Slot::Initial] {
+            let Some(s) = self.session_mut(slot) else {
+                continue;
+            };
+            let tick = s.ks.reliable.tick(now);
+            out.send.extend(tick.resend);
+            if tick.timed_out {
+                self.fail_session(slot, &mut out, None);
+            }
+        }
         Ok(out)
     }
 
     /// Process one inbound datagram from the peer.
     ///
     /// An `Err` means this one datagram was dropped (malformed, replayed,
-    /// out of window, undecryptable, ...) and the session is unaffected:
-    /// anyone can put a datagram on the peer's address, so none of those may
-    /// cost the peer its connection. A condition that is fatal to the session
-    /// is reported as `Ok` with [`PeerOutput::close`] set instead.
+    /// out of window, undecryptable, from an unknown session, ...) and the
+    /// peer is unaffected: anyone can put a datagram on the peer's address,
+    /// so none of those may cost the peer its connection. A condition that is
+    /// fatal to the connection is reported as `Ok` with
+    /// [`PeerOutput::close`] set instead.
     pub fn handle_packet(&mut self, data: &[u8]) -> io::Result<PeerOutput> {
-        if data.is_empty() {
-            return Ok(PeerOutput::default());
-        }
-        let (opcode, _kid) = Opcode::from_byte(data[0]);
-
-        if opcode.is_control() {
-            self.handle_control(data)
-        } else if opcode == Opcode::DATA_V1 || opcode == Opcode::DATA_V2 {
-            self.handle_data(data)
-        } else {
-            Ok(PeerOutput::default())
+        let Some(&first) = data.first() else {
+            return Err(invalid("empty packet"));
+        };
+        let (opcode, key_id) = Opcode::from_byte(first);
+        match opcode {
+            Opcode::DATA_V1 => self.handle_data(key_id, data),
+            // Only a client (key method 2) hard reset may open a session;
+            // P_DATA_V2 needs a peer-id we never push; the rest are unknown.
+            Opcode::CONTROL_HARD_RESET_CLIENT_V2
+            | Opcode::CONTROL_SOFT_RESET_V1
+            | Opcode::CONTROL_V1
+            | Opcode::ACK_V1 => self.handle_control(key_id, data),
+            _ => Err(invalid(format!("unexpected opcode {opcode}"))),
         }
     }
 
-    fn handle_control(&mut self, data: &[u8]) -> io::Result<PeerOutput> {
+    fn handle_control(&mut self, key_id: u8, data: &[u8]) -> io::Result<PeerOutput> {
+        let pkt = ControlPacket::parse(data)?;
+        let sid = pkt.session_id;
+        if sid == [0; 8] {
+            return Err(invalid("control packet without a session id"));
+        }
+
+        // Route by the sender's session id (ssl.c tls_pre_decrypt).
         let mut out = PeerOutput::default();
-
-        let recv = self.reliable.recv(data)?;
-
-        if recv.got_client_reset {
-            if self.phase == Phase::Init {
-                self.phase = Phase::Handshaking;
+        let mut reset = None;
+        let slot = if self.active.as_ref().is_some_and(|s| s.remote_id == sid) {
+            Slot::Active
+        } else if self.initial.as_ref().is_some_and(|s| s.remote_id == sid) {
+            Slot::Initial
+        } else if pkt.opcode == Opcode::CONTROL_HARD_RESET_CLIENT_V2 {
+            // A new session: it starts with packet 0 on key 0.
+            if pkt.pid != Some(0) || key_id != 0 {
+                return Err(invalid("hard reset must be packet 0 on key 0"));
             }
-            // Reply with a server hard reset, then ACK.
-            let reset = self.reliable.build_hard_reset();
-            let acks = self.reliable.take_pending_acks();
-            out.send.push(reset.to_bytes(&acks));
-            self.pump_tls(&mut out)?;
+            let local_id = match self.first_local_id.take() {
+                Some(id) => id,
+                None => {
+                    let mut id = [0u8; 8];
+                    fill_random(&mut id)?;
+                    id
+                }
+            };
+            let (session, server_reset) = Session::new(&self.config, local_id, sid)?;
+            // Replaces any session still negotiating: the client that sent
+            // it has given up on it.
+            self.initial = Some(session);
+            reset = Some(server_reset);
+            Slot::Initial
+        } else {
+            return Err(invalid("control packet for no known session"));
+        };
+
+        let on_auth = self.on_auth.clone();
+        let session = self.session_mut(slot).expect("slot just resolved");
+        let tls_bytes = session.ks.recv(key_id, pkt)?;
+        if let Some(reset) = reset {
+            // Our reset carries the ACK for theirs.
+            out.send
+                .push(reset.to_bytes(&session.ks.reliable.take_pending_acks()));
+        }
+        if let Err(e) = session.process_tls(&tls_bytes, &on_auth, &mut out) {
+            self.fail_session(slot, &mut out, Some(e));
             return Ok(out);
         }
 
-        // Past the reliable layer the bytes are part of this session's TLS
-        // stream, so a failure from here on is fatal to the session (as a TLS
-        // error is for an OpenVPN key state) rather than a packet to drop.
-        if let Err(e) = self.process_tls(&recv.tls_bytes, &mut out) {
-            // Still flush what the TLS engine queued (an alert, typically).
-            let _ = self.pump_tls(&mut out);
+        // A session that has authenticated takes over the data channel.
+        if slot == Slot::Initial && self.initial.as_ref().is_some_and(|s| s.ks.kx_done) {
+            self.active = self.initial.take();
+        }
+        out.authenticated = self.active.as_ref().is_some_and(|s| s.ks.kx_done);
+        Ok(out)
+    }
+
+    /// A session hit a fatal error or timed out: drop it. The connection
+    /// only ends when no session is left.
+    fn fail_session(&mut self, slot: Slot, out: &mut PeerOutput, err: Option<io::Error>) {
+        match slot {
+            Slot::Active => self.active = None,
+            Slot::Initial => self.initial = None,
+        }
+        if self.active.is_none() && self.initial.is_none() {
             out.close = true;
-            out.error = Some(e);
-            return Ok(out);
+            out.error = err;
+        }
+    }
+
+    // --- data channel ---------------------------------------------------------
+
+    fn handle_data(&mut self, key_id: u8, data: &[u8]) -> io::Result<PeerOutput> {
+        let mut out = PeerOutput::default();
+        let session = self
+            .active
+            .as_mut()
+            .ok_or_else(|| invalid("stream not ready for data transmission"))?;
+        let (Some(opts), Some(dk)) = (session.opts.as_ref(), session.ks.data.as_mut()) else {
+            return Err(invalid("stream not ready for data transmission"));
+        };
+        if session.ks.key_id != key_id {
+            return Err(invalid("data packet for an unknown key id"));
         }
 
-        if self.kx_done {
-            out.authenticated = true;
+        let mut buf = data.to_vec();
+        let dec = data::decrypt(opts, &dk.keys, &mut buf)?
+            .ok_or_else(|| invalid("data packet failed authentication"))?;
+        if !dk.replay.check(dec.pid) {
+            return Err(invalid("replayed data packet"));
+        }
+        if !dec.is_ping {
+            out.deliver = Some(dec.payload.to_vec());
         }
         Ok(out)
     }
 
-    /// Feed in-order TLS bytes to the engine, run the control exchange on the
-    /// plaintext, and queue the TLS output.
-    fn process_tls(&mut self, tls_bytes: &[u8], out: &mut PeerOutput) -> io::Result<()> {
-        if !tls_bytes.is_empty() {
-            // `feed` consumes the whole slice.
-            self.tls
-                .feed(tls_bytes)
-                .map_err(|e| invalid(format!("tls feed: {e:?}")))?;
+    /// Encrypt and frame an outbound IP packet / Ethernet frame for the peer.
+    pub fn send_data(&mut self, payload: &[u8]) -> io::Result<Vec<u8>> {
+        let session = self
+            .active
+            .as_mut()
+            .ok_or_else(|| invalid("stream not ready for data transmission"))?;
+        let (Some(opts), Some(dk)) = (session.opts.as_ref(), session.ks.data.as_mut()) else {
+            return Err(invalid("stream not ready for data transmission"));
+        };
+        // The packet id is the GCM nonce prefix: wrapping it would reuse a
+        // nonce under the same key. OpenVPN (packet_id_send_update) refuses
+        // to send once the id space is spent; only a new key resets it.
+        dk.out_pid = dk
+            .out_pid
+            .checked_add(1)
+            .ok_or_else(|| invalid("data channel packet id exhausted; renegotiation required"))?;
+        data::encrypt(opts, &dk.keys, dk.out_pid, payload, fill_random)
+    }
+}
 
-            // Drain decrypted plaintext into the control buffer. `recv`
-            // hands back everything buffered in one call.
-            let plain = self
-                .tls
-                .recv()
-                .map_err(|e| invalid(format!("tls recv: {e:?}")))?;
-            self.ctrl_buf.extend_from_slice(&plain);
+/// One TLS session with the client (OpenVPN's `tls_session`), named on the
+/// wire by the pair of session ids the two hard resets carry.
+struct Session {
+    local_id: [u8; 8],
+    remote_id: [u8; 8],
+    ks: KeyState,
 
-            // Try to advance the key-method-2 exchange / push handling.
-            self.advance_control()?;
+    // Negotiated state, populated during the key exchange.
+    opts: Option<Options>,
+    peer_cfg: Option<PeerConfig>,
+    /// Layer: 2 = tap (frames), 3 = tun (packets).
+    layer: u8,
+    /// Peer-info key/values (`IV_*`) the client advertised during the key
+    /// exchange, retained for post-auth queries / diagnostics.
+    peer_info: HashMap<String, String>,
+}
+
+/// One TLS handshake and what it produced (OpenVPN's `key_state`): its own
+/// reliable transport, the key-method-2 exchange, and the data-channel keys.
+struct KeyState {
+    key_id: u8,
+    tls: TlsConnection,
+    reliable: Reliable,
+    /// Key-method-2 exchange scratch (read incrementally from the TLS stream).
+    ctrl_buf: Vec<u8>,
+    kx_done: bool,
+    /// Server random material (r1||r2) generated for the key exchange and
+    /// reused by [`Session::derive_keys`] so the PRF inputs match what was
+    /// sent.
+    server_random: [u8; 64],
+    data: Option<DataKeys>,
+}
+
+/// Data-channel keys and packet-id state for one key.
+struct DataKeys {
+    keys: PeerKeys,
+    replay: Window,
+    /// Outgoing data-channel packet id (the last one used).
+    out_pid: u32,
+}
+
+impl KeyState {
+    fn new(
+        config: &purecrypto::tls::Config,
+        key_id: u8,
+        local_id: [u8; 8],
+        remote_id: [u8; 8],
+    ) -> io::Result<KeyState> {
+        let tls = TlsConnection::server(config)
+            .map_err(|e| invalid(format!("TLS server connection: {e:?}")))?;
+        let mut reliable = Reliable::new(local_id);
+        reliable.peer_id = remote_id;
+        Ok(KeyState {
+            key_id,
+            tls,
+            reliable,
+            ctrl_buf: Vec::new(),
+            kx_done: false,
+            server_random: [0u8; 64],
+            data: None,
+        })
+    }
+
+    /// Run a control packet through this key's reliable layer, returning the
+    /// TLS bytes it made available in order. `Err` drops the packet.
+    fn recv(&mut self, key_id: u8, pkt: ControlPacket) -> io::Result<Vec<u8>> {
+        if key_id != self.key_id {
+            return Err(invalid("control packet for another key id"));
         }
+        Ok(self.reliable.recv_packet(pkt)?.tls_bytes)
+    }
+}
 
-        // Pump any TLS output (handshake records or our control replies) back
-        // onto the reliable layer, then attach pending ACKs.
-        self.pump_tls(out)
+impl Session {
+    /// Open a session for a client hard reset from `remote_id`, returning it
+    /// with the server hard reset to send back.
+    fn new(
+        config: &purecrypto::tls::Config,
+        local_id: [u8; 8],
+        remote_id: [u8; 8],
+    ) -> io::Result<(Session, ControlPacket)> {
+        let mut ks = KeyState::new(config, 0, local_id, remote_id)?;
+        let reset = ks.reliable.build_hard_reset();
+        Ok((
+            Session {
+                local_id,
+                remote_id,
+                ks,
+                opts: None,
+                peer_cfg: None,
+                layer: 3,
+                peer_info: HashMap::new(),
+            },
+            reset,
+        ))
+    }
+
+    /// Feed in-order TLS bytes to the engine, run the control exchange on the
+    /// plaintext, and queue the TLS output. An error is fatal to the session:
+    /// past the reliable layer the bytes are part of its TLS stream, and a
+    /// TLS error ends an OpenVPN key state too.
+    fn process_tls(
+        &mut self,
+        tls_bytes: &[u8],
+        on_auth: &OnAuth,
+        out: &mut PeerOutput,
+    ) -> io::Result<()> {
+        let res = self.advance_tls(tls_bytes, on_auth);
+        // Flush what the TLS engine queued even on failure (an alert,
+        // typically), along with the ACKs we owe.
+        let pumped = self.pump_tls(out);
+        res.and(pumped)
+    }
+
+    fn advance_tls(&mut self, tls_bytes: &[u8], on_auth: &OnAuth) -> io::Result<()> {
+        if tls_bytes.is_empty() {
+            return Ok(());
+        }
+        // `feed` consumes the whole slice.
+        self.ks
+            .tls
+            .feed(tls_bytes)
+            .map_err(|e| invalid(format!("tls feed: {e:?}")))?;
+        // Drain decrypted plaintext into the control buffer. `recv` hands
+        // back everything buffered in one call.
+        let plain = self
+            .ks
+            .tls
+            .recv()
+            .map_err(|e| invalid(format!("tls recv: {e:?}")))?;
+        self.ks.ctrl_buf.extend_from_slice(&plain);
+        self.advance_control(on_auth)
     }
 
     /// Emit any pending TLS output as P_CONTROL_V1 packets, plus a standalone
     /// ACK if we owe acknowledgements but produced no control packet to ride on.
     fn pump_tls(&mut self, out: &mut PeerOutput) -> io::Result<()> {
+        let ks = &mut self.ks;
         // `pop` returns the whole pending wire stream in one call.
-        let tls_out = self
+        let tls_out = ks
             .tls
             .pop()
             .map_err(|e| invalid(format!("tls pop: {e:?}")))?;
 
         if !tls_out.is_empty() {
-            let chunks = self.reliable.chunk_tls_stream(&tls_out);
+            let chunks = ks.reliable.chunk_tls_stream(&tls_out);
             for (i, pkt) in chunks.iter().enumerate() {
                 // Attach pending acks only to the first packet of the burst.
                 let acks = if i == 0 {
-                    self.reliable.take_pending_acks()
+                    ks.reliable.take_pending_acks()
                 } else {
                     Vec::new()
                 };
@@ -312,9 +523,9 @@ impl Peer {
         }
 
         // If we still owe acks (no control packet carried them), send a plain ACK.
-        if self.reliable.has_pending_acks() {
-            let acks = self.reliable.take_pending_acks();
-            let ack = self.reliable.build_ack();
+        if ks.reliable.has_pending_acks() {
+            let acks = ks.reliable.take_pending_acks();
+            let ack = ks.reliable.build_ack();
             out.send.push(ack.to_bytes(&acks));
         }
         Ok(())
@@ -323,31 +534,31 @@ impl Peer {
     /// Advance the key-method-2 control exchange using whatever plaintext bytes
     /// are buffered. Runs at most once (after which the connection only carries
     /// PUSH_REQUEST and data). Writes the server reply into the TLS writer.
-    fn advance_control(&mut self) -> io::Result<()> {
-        if self.kx_done {
-            self.handle_post_auth_control()?;
-            return Ok(());
+    fn advance_control(&mut self, on_auth: &OnAuth) -> io::Result<()> {
+        if self.ks.kx_done {
+            return self.handle_post_auth_control();
         }
 
         // We need the full fixed prefix + four control strings before we can
         // respond. Parse non-destructively; bail (waiting for more) if short.
-        let parsed = match self.try_parse_key_exchange()? {
+        let parsed = match try_parse_key_exchange(&self.ks.ctrl_buf)? {
             Some(p) => p,
             None => return Ok(()), // not enough bytes yet
         };
 
         // Generate the server random once; it's used both in the reply and in
         // the PRF key derivation.
-        fill_random(&mut self.server_random)?;
+        fill_random(&mut self.ks.server_random)?;
 
         // Build the server reply onto the TLS stream.
-        let reply = self.build_kx_reply(&parsed)?;
-        self.tls
+        let reply = build_kx_reply(&self.ks.server_random, &parsed);
+        self.ks
+            .tls
             .send(&reply)
             .map_err(|e| invalid(format!("tls write reply: {e:?}")))?;
 
         // Derive the data-channel keys.
-        self.derive_keys(&parsed)?;
+        self.derive_keys(&parsed);
 
         // Authenticate via the hook.
         let auth = AuthInfo {
@@ -356,7 +567,7 @@ impl Peer {
             peer_info: parsed.peer_info.clone(),
             dev_type: parsed.opts.dev_type.clone(),
         };
-        let cfg = (self.on_auth)(&auth)?;
+        let cfg = on_auth(&auth)?;
         self.peer_cfg = Some(cfg);
 
         self.layer = match parsed.opts.dev_type.as_str() {
@@ -365,8 +576,7 @@ impl Peer {
         };
         self.peer_info = parsed.peer_info;
         self.opts = Some(parsed.opts);
-        self.kx_done = true;
-        self.phase = Phase::Established;
+        self.ks.kx_done = true;
         Ok(())
     }
 
@@ -380,8 +590,8 @@ impl Peer {
     /// - everything else (`PING`, `INFO`, additional `PUSH_*`, etc.) is
     ///   gracefully ignored: we consume the message and keep the channel open.
     fn handle_post_auth_control(&mut self) -> io::Result<()> {
-        while let Some(nul) = self.ctrl_buf.iter().position(|&b| b == 0) {
-            let line: Vec<u8> = self.ctrl_buf.drain(..=nul).collect();
+        while let Some(nul) = self.ks.ctrl_buf.iter().position(|&b| b == 0) {
+            let line: Vec<u8> = self.ks.ctrl_buf.drain(..=nul).collect();
             // Drop the trailing NUL; empty (bare-NUL) keepalives are ignored.
             let body = &line[..line.len() - 1];
             if body.is_empty() {
@@ -396,18 +606,13 @@ impl Peer {
             let verb = s.split(',').next().unwrap_or("");
             if verb == "PUSH_REQUEST" {
                 let reply = self.build_push_reply();
-                self.tls
+                self.ks
+                    .tls
                     .send(reply.as_bytes())
                     .map_err(|e| invalid(format!("tls push reply: {e:?}")))?;
             }
         }
         Ok(())
-    }
-
-    /// Peer-info (`IV_*`) key/values the client advertised during the key
-    /// exchange. Empty until the peer authenticates.
-    pub fn peer_info(&self) -> &std::collections::HashMap<String, String> {
-        &self.peer_info
     }
 
     fn build_push_reply(&self) -> String {
@@ -423,104 +628,12 @@ impl Peer {
         )
     }
 
-    // --- key-method 2 parsing -------------------------------------------------
-
-    fn try_parse_key_exchange(&self) -> io::Result<Option<KeyExchange>> {
-        let buf = &self.ctrl_buf;
-
-        // Fixed prefix: 4 zero bytes, key_method, pre_master(48), r1(32), r2(32).
-        let fixed = 4 + 1 + 48 + 32 + 32;
-        if buf.len() < fixed {
-            return Ok(None);
-        }
-        let zero = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
-        if zero != 0 {
-            return Err(invalid("control channel: expected 4 zero bytes"));
-        }
-        let key_method = buf[4];
-        if key_method & KEY_METHOD_MASK != 2 {
-            return Err(invalid("invalid key method, expected method 2"));
-        }
-        let mut pos = 5;
-        let mut pre_master = [0u8; 48];
-        pre_master.copy_from_slice(&buf[pos..pos + 48]);
-        pos += 48;
-        let mut random1 = [0u8; 32];
-        random1.copy_from_slice(&buf[pos..pos + 32]);
-        pos += 32;
-        let mut random2 = [0u8; 32];
-        random2.copy_from_slice(&buf[pos..pos + 32]);
-        pos += 32;
-
-        // Four NUL-terminated, length-prefixed control strings.
-        let (options_string, p1) = match read_control_string(buf, pos)? {
-            Some(v) => v,
-            None => return Ok(None),
-        };
-        let (username, p2) = match read_control_string(buf, p1)? {
-            Some(v) => v,
-            None => return Ok(None),
-        };
-        let (password, p3) = match read_control_string(buf, p2)? {
-            Some(v) => v,
-            None => return Ok(None),
-        };
-        let (peer_info_raw, _p4) = match read_control_string(buf, p3)? {
-            Some(v) => v,
-            None => return Ok(None),
-        };
-
-        // Validate the options string round-trips (as the Go upstream does).
-        let mut opts = Options::parse(&options_string).map_err(invalid)?;
-        opts.is_server = false;
-        if opts.to_string() != options_string {
-            return Err(invalid("invalid options provided"));
-        }
-
-        let peer_info = parse_peer_info(&peer_info_raw)?;
-
-        let options_server = {
-            let mut o = opts.clone();
-            o.is_server = true;
-            o.to_string()
-        };
-        // options_string was validated above (round-trip check); not retained.
-        let _ = options_string;
-
-        Ok(Some(KeyExchange {
-            pre_master,
-            random1,
-            random2,
-            options_server,
-            opts,
-            username,
-            password,
-            peer_info,
-            peer_info_raw,
-        }))
-    }
-
-    fn build_kx_reply(&self, kx: &KeyExchange) -> io::Result<Vec<u8>> {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&0u32.to_be_bytes());
-        buf.push(2u8); // key_method
-
-        // Server random material (generated in advance_control).
-        buf.extend_from_slice(&self.server_random); // r1(32)||r2(32)
-
-        write_control_string(&mut buf, &kx.options_server);
-        write_control_string(&mut buf, ""); // username
-        write_control_string(&mut buf, ""); // password
-        write_control_string(&mut buf, &kx.peer_info_raw);
-        Ok(buf)
-    }
-
     /// Derive the 256-byte key expansion via the TLS-1.0 PRF and split it into
-    /// per-direction keys, exactly as the Go `ovpnControl` does. Uses the
-    /// server random generated in [`advance_control`] so the PRF inputs match
-    /// what was sent to the client.
-    fn derive_keys(&mut self, kx: &KeyExchange) -> io::Result<()> {
-        let (sr1, sr2) = self.server_random.split_at(32);
+    /// per-direction keys (ssl.c generate_key_expansion). Uses the server
+    /// random generated in [`advance_control`](Self::advance_control) so the
+    /// PRF inputs match what was sent to the client.
+    fn derive_keys(&mut self, kx: &KeyExchange) {
+        let (sr1, sr2) = self.ks.server_random.split_at(32);
 
         // master = PRF10(pre_master, "OpenVPN master secret", r1 || server_r1)
         let mut master = [0u8; 48];
@@ -531,56 +644,110 @@ impl Peer {
         prf10(&mut master, &kx.pre_master, label.as_bytes(), &seed);
 
         // expansion = PRF10(master, "OpenVPN key expansion",
-        //                   r2 || server_r2 || peer_id || local_id)
+        //                   r2 || server_r2 || client_sid || server_sid)
         let mut expansion = [0u8; 256];
         let mut seed2 = Vec::with_capacity(32 + 32 + 8 + 8);
         seed2.extend_from_slice(&kx.random2);
         seed2.extend_from_slice(sr2);
-        seed2.extend_from_slice(&self.reliable.peer_id);
-        seed2.extend_from_slice(&self.reliable.local_id);
+        seed2.extend_from_slice(&self.remote_id);
+        seed2.extend_from_slice(&self.local_id);
         let label2 = format!("{} key expansion", KEY_EXPANSION_ID);
         prf10(&mut expansion, &master, label2.as_bytes(), &seed2);
 
-        self.keys = Some(PeerKeys::from_expansion(&expansion));
-        Ok(())
+        self.ks.data = Some(DataKeys {
+            keys: PeerKeys::from_expansion(&expansion),
+            replay: Window::new(),
+            out_pid: 0,
+        });
+    }
+}
+
+// --- key-method 2 parsing -----------------------------------------------------
+
+fn try_parse_key_exchange(buf: &[u8]) -> io::Result<Option<KeyExchange>> {
+    // Fixed prefix: 4 zero bytes, key_method, pre_master(48), r1(32), r2(32).
+    let fixed = 4 + 1 + 48 + 32 + 32;
+    if buf.len() < fixed {
+        return Ok(None);
+    }
+    let zero = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    if zero != 0 {
+        return Err(invalid("control channel: expected 4 zero bytes"));
+    }
+    let key_method = buf[4];
+    if key_method & KEY_METHOD_MASK != 2 {
+        return Err(invalid("invalid key method, expected method 2"));
+    }
+    let mut pos = 5;
+    let mut pre_master = [0u8; 48];
+    pre_master.copy_from_slice(&buf[pos..pos + 48]);
+    pos += 48;
+    let mut random1 = [0u8; 32];
+    random1.copy_from_slice(&buf[pos..pos + 32]);
+    pos += 32;
+    let mut random2 = [0u8; 32];
+    random2.copy_from_slice(&buf[pos..pos + 32]);
+    pos += 32;
+
+    // Four NUL-terminated, length-prefixed control strings.
+    let (options_string, p1) = match read_control_string(buf, pos)? {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    let (username, p2) = match read_control_string(buf, p1)? {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    let (password, p3) = match read_control_string(buf, p2)? {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    let (peer_info_raw, _p4) = match read_control_string(buf, p3)? {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+
+    // Validate the options string round-trips (as the Go upstream does).
+    let mut opts = Options::parse(&options_string).map_err(invalid)?;
+    opts.is_server = false;
+    if opts.to_string() != options_string {
+        return Err(invalid("invalid options provided"));
     }
 
-    // --- data channel ---------------------------------------------------------
+    let peer_info = parse_peer_info(&peer_info_raw)?;
 
-    fn handle_data(&mut self, data: &[u8]) -> io::Result<PeerOutput> {
-        let mut out = PeerOutput::default();
-        let (Some(opts), Some(keys)) = (self.opts.as_ref(), self.keys.as_ref()) else {
-            return Err(invalid("stream not ready for data transmission"));
-        };
+    let options_server = {
+        let mut o = opts.clone();
+        o.is_server = true;
+        o.to_string()
+    };
 
-        let mut buf = data.to_vec();
-        // `None` = auth failure; drop silently.
-        if let Some(dec) = data::decrypt(opts, keys, &mut buf)? {
-            if !self.replay.check(dec.pid) {
-                return Ok(out); // replay — drop
-            }
-            if dec.is_ping {
-                return Ok(out);
-            }
-            out.deliver = Some(dec.payload.to_vec());
-        }
-        Ok(out)
-    }
+    Ok(Some(KeyExchange {
+        pre_master,
+        random1,
+        random2,
+        options_server,
+        opts,
+        username,
+        password,
+        peer_info,
+        peer_info_raw,
+    }))
+}
 
-    /// Encrypt and frame an outbound IP packet / Ethernet frame for the peer.
-    pub fn send_data(&mut self, payload: &[u8]) -> io::Result<Vec<u8>> {
-        let (Some(opts), Some(keys)) = (self.opts.as_ref(), self.keys.as_ref()) else {
-            return Err(invalid("stream not ready for data transmission"));
-        };
-        // The packet id is the GCM nonce prefix: wrapping it would reuse a
-        // nonce under the same key. OpenVPN (packet_id_send_update) refuses
-        // to send once the id space is spent; only a new key resets it.
-        self.out_pid = self
-            .out_pid
-            .checked_add(1)
-            .ok_or_else(|| invalid("data channel packet id exhausted; renegotiation required"))?;
-        data::encrypt(opts, keys, self.out_pid, payload, fill_random)
-    }
+fn build_kx_reply(server_random: &[u8; 64], kx: &KeyExchange) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&0u32.to_be_bytes());
+    buf.push(2u8); // key_method
+
+    // Server random material (generated in advance_control).
+    buf.extend_from_slice(server_random); // r1(32)||r2(32)
+
+    write_control_string(&mut buf, &kx.options_server);
+    write_control_string(&mut buf, ""); // username
+    write_control_string(&mut buf, ""); // password
+    write_control_string(&mut buf, &kx.peer_info_raw);
+    buf
 }
 
 /// Parsed key-method 2 client exchange.
@@ -664,21 +831,28 @@ mod tests {
     fn keyed_peer() -> Peer {
         let tls = crate::ovpn::tests::server_config();
         let on_auth: OnAuth = Arc::new(|_: &AuthInfo| Err(invalid("unused")));
-        let mut p = Peer::new(tls, *b"SERVERID", on_auth).unwrap();
-        p.opts = Some(Options {
+        let mut p = Peer::new(tls.clone(), *b"SERVERID", on_auth).unwrap();
+        let (mut s, _) = Session::new(&tls, *b"SERVERID", *b"CLIENTID").unwrap();
+        s.opts = Some(Options {
             cipher_block: super::super::GCM,
             cipher_size: 256,
             auth: super::super::options::AuthHash::None,
             ..Options::default()
         });
-        p.keys = Some(PeerKeys::from_expansion(&[7u8; 256]));
+        s.ks.data = Some(DataKeys {
+            keys: PeerKeys::from_expansion(&[7u8; 256]),
+            replay: Window::new(),
+            out_pid: 0,
+        });
+        s.ks.kx_done = true;
+        p.active = Some(s);
         p
     }
 
     #[test]
     fn send_data_refuses_to_wrap_the_packet_id() {
         let mut p = keyed_peer();
-        p.out_pid = u32::MAX - 1;
+        p.active.as_mut().unwrap().ks.data.as_mut().unwrap().out_pid = u32::MAX - 1;
         // The last id OpenVPN allows is u32::MAX.
         let pkt = p.send_data(b"x").unwrap();
         assert_eq!(&pkt[1..5], &u32::MAX.to_be_bytes());

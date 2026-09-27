@@ -36,9 +36,6 @@ pub struct RecvOutcome {
     /// In-order TLS-stream bytes newly available (concatenated payloads of
     /// `P_CONTROL_V1` packets delivered in order).
     pub tls_bytes: Vec<u8>,
-    /// True if a `P_CONTROL_HARD_RESET_CLIENT_V2` was received and the server
-    /// should respond with its own hard reset.
-    pub got_client_reset: bool,
 }
 
 /// An outgoing control packet awaiting acknowledgement, with the retransmit
@@ -110,72 +107,73 @@ impl Reliable {
         }
     }
 
-    /// Process an inbound control packet (full datagram including opcode byte).
+    /// Process an inbound control packet (full datagram including opcode
+    /// byte). The server routes packets to a session first and uses
+    /// [`recv_packet`](Self::recv_packet); the test client uses this.
+    #[cfg(test)]
     pub fn recv(&mut self, data: &[u8]) -> io::Result<RecvOutcome> {
-        let pkt = ControlPacket::parse(data)?;
+        self.recv_packet(ControlPacket::parse(data)?)
+    }
+
+    /// Process an inbound control packet already routed to this transport.
+    /// `Err` means the packet was dropped; nothing in it was applied.
+    pub fn recv_packet(&mut self, pkt: ControlPacket) -> io::Result<RecvOutcome> {
+        // An ACK names the session it acknowledges (reliable_ack_read): one
+        // for another session must not release our unacknowledged packets.
+        if !pkt.acked_pids.is_empty() && pkt.remote_id != self.local_id {
+            return Err(invalid("ACK for another session"));
+        }
+
+        let mut outcome = RecvOutcome::default();
+        let is_reset = pkt.opcode == Opcode::CONTROL_HARD_RESET_CLIENT_V2
+            || pkt.opcode == Opcode::CONTROL_HARD_RESET_SERVER_V2;
+        let pid = match pkt.pid {
+            // ACK packets carry no pid and need no further processing.
+            _ if pkt.opcode == Opcode::ACK_V1 => None,
+            Some(pid) => Some(pid),
+            None => return Err(invalid("control packet missing packet id")),
+        };
+        // A hard reset is always packet 0 of its session; OpenVPN ignores one
+        // claiming another id (a stale replay, in practice).
+        if is_reset && pid != Some(0) {
+            return Err(invalid("hard reset with a non-zero packet id"));
+        }
+        // Refuse a packet that would not fit the receive window before
+        // touching any state, so it is neither applied nor ACKed.
+        if let Some(pid) = pid
+            && pid >= self.in_counter + TLS_RELIABLE_N_REC_BUFFERS as u32
+        {
+            return Err(invalid("rejecting packet because pid looks invalid"));
+        }
 
         // Apply ACKs the peer reported.
         for pid in &pkt.acked_pids {
             self.unacked.remove(pid);
         }
-
-        let mut outcome = RecvOutcome::default();
-
-        // ACK packets carry no pid and need no further processing.
-        if pkt.opcode == Opcode::ACK_V1 {
+        let Some(pid) = pid else {
             return Ok(outcome);
-        }
+        };
 
-        let pid = pkt
-            .pid
-            .ok_or_else(|| invalid("control packet missing packet id"))?;
-
-        // We owe an ACK for this received packet.
+        // We owe an ACK for this received packet, even for a duplicate: our
+        // earlier ACK may have been lost.
         self.pending_ack.push(pid);
 
-        // A hard reset (client- or server-side) establishes the peer session
-        // id and occupies a slot in the ordered control stream. The server acts
-        // on a *client* reset; either side advances its in-order counter past
-        // the reset so the first real CONTROL_V1 (pid 1) is delivered.
-        if pkt.opcode == Opcode::CONTROL_HARD_RESET_CLIENT_V2
-            || pkt.opcode == Opcode::CONTROL_HARD_RESET_SERVER_V2
-        {
+        // The client learns the server's session id from its hard reset; a
+        // server's is fixed when the session is opened.
+        if pkt.opcode == Opcode::CONTROL_HARD_RESET_SERVER_V2 && self.peer_id == [0; 8] {
             self.peer_id = pkt.session_id;
-            if pkt.opcode == Opcode::CONTROL_HARD_RESET_CLIENT_V2 {
-                outcome.got_client_reset = true;
-            }
-            if pid == self.in_counter {
-                self.in_counter += 1;
-            }
-            return Ok(outcome);
         }
 
-        if pkt.opcode != Opcode::CONTROL_V1 {
-            // Soft resets are not driven by the happy path; ack but ignore.
-            return Ok(outcome);
-        }
-
-        // Reorder buffer (mirrors handleControlPacket in peer.go).
+        // Reorder buffer. Resets occupy a slot in the ordered stream but carry
+        // no TLS bytes.
         if pid < self.in_counter {
             return Ok(outcome); // already processed
         }
-        if pid > self.in_counter + TLS_RELIABLE_N_REC_BUFFERS as u32 {
-            return Err(invalid("rejecting packet because pid looks invalid"));
-        }
         self.in_buf.entry(pid).or_insert(pkt);
-
-        loop {
-            match self.in_buf.remove(&self.in_counter) {
-                Some(p) => {
-                    self.in_counter += 1;
-                    outcome.tls_bytes.extend_from_slice(&p.payload);
-                }
-                None => {
-                    if self.in_buf.len() > TLS_RELIABLE_N_REC_BUFFERS {
-                        return Err(invalid("received too many packets, dropping connection"));
-                    }
-                    break;
-                }
+        while let Some(p) = self.in_buf.remove(&self.in_counter) {
+            self.in_counter += 1;
+            if p.opcode == Opcode::CONTROL_V1 {
+                outcome.tls_bytes.extend_from_slice(&p.payload);
             }
         }
 
@@ -336,17 +334,34 @@ mod tests {
     }
 
     #[test]
-    fn hard_reset_sets_peer_id() {
+    fn server_hard_reset_sets_peer_id_on_the_client() {
         let mut r = Reliable::new(local());
-        let client_sid = [9u8, 9, 9, 9, 9, 9, 9, 9];
+        let server_sid = [9u8, 9, 9, 9, 9, 9, 9, 9];
         let mut reset =
-            ControlPacket::new(Opcode::CONTROL_HARD_RESET_CLIENT_V2, 0, client_sid, [0; 8]);
+            ControlPacket::new(Opcode::CONTROL_HARD_RESET_SERVER_V2, 0, server_sid, [0; 8]);
         reset.set_pid(0);
-        let out = r.recv(&reset.to_bytes(&[])).unwrap();
-        assert!(out.got_client_reset);
-        assert_eq!(r.peer_id, client_sid);
+        r.recv(&reset.to_bytes(&[])).unwrap();
+        assert_eq!(r.peer_id, server_sid);
         // We owe an ACK for pid 0.
         assert_eq!(r.take_pending_acks(), vec![0]);
+    }
+
+    #[test]
+    fn hard_reset_with_nonzero_pid_is_dropped() {
+        let mut r = Reliable::new(local());
+        let mut reset = ControlPacket::new(Opcode::CONTROL_HARD_RESET_CLIENT_V2, 0, [9; 8], [0; 8]);
+        reset.set_pid(3);
+        assert!(r.recv(&reset.to_bytes(&[])).is_err());
+        assert!(!r.has_pending_acks());
+    }
+
+    #[test]
+    fn ack_naming_another_session_is_dropped() {
+        let mut r = Reliable::new(local());
+        let _p0 = r.build_control(b"x");
+        let ack = ControlPacket::new(Opcode::ACK_V1, 0, [9; 8], [7; 8]);
+        assert!(r.recv(&ack.to_bytes(&[0])).is_err());
+        assert_eq!(r.unacked_count(), 1);
     }
 
     #[test]

@@ -151,10 +151,6 @@ impl TestClient {
         let mut send = Vec::new();
         let recv = self.reliable.recv(data).expect("client recv");
 
-        if recv.got_client_reset {
-            // Shouldn't happen on the client.
-        }
-
         if !recv.tls_bytes.is_empty() {
             let mut fed = 0usize;
             while fed < recv.tls_bytes.len() {
@@ -459,7 +455,173 @@ fn tls_garbage_closes_the_session() {
     assert!(out.error.is_some());
 }
 
+/// A client that restarts and reconnects from the same address starts a new
+/// session (new session id). The server must run it from scratch alongside
+/// the old one, rather than mixing it into the old session's reliable state,
+/// and switch the data channel over once it is up.
+#[test]
+fn client_restart_from_same_address_gets_a_fresh_session() {
+    let mut server = Peer::new(server_config(), *b"SERVERID", auth_hook()).unwrap();
+    let mut first = TestClient::new(*b"CLIENT-1");
+    let k1 = connect(&mut server, &mut first);
+    assert_eq!(deliver(&mut server, &k1, 1, b"one"), Some(b"one".to_vec()));
+
+    let mut second = TestClient::new(*b"CLIENT-2");
+    let k2 = connect(&mut server, &mut second);
+    assert_ne!(
+        second.reliable.peer_id, first.reliable.peer_id,
+        "a new session gets a new server session id"
+    );
+    assert_eq!(deliver(&mut server, &k2, 1, b"two"), Some(b"two".to_vec()));
+    // The old session is gone with the old client.
+    assert_eq!(deliver(&mut server, &k1, 2, b"old"), None);
+}
+
+/// A hard reset carrying a new session id must not disturb an established
+/// session until the new one has authenticated: without tls-auth, anyone can
+/// send one.
+#[test]
+fn stray_hard_reset_does_not_disturb_the_active_session() {
+    let mut server = Peer::new(server_config(), *b"SERVERID", auth_hook()).unwrap();
+    let mut client = TestClient::new(*b"CLIENTID");
+    let keys = connect(&mut server, &mut client);
+
+    let mut spoofer = TestClient::new(*b"SPOOFER!");
+    let out = server.handle_packet(&spoofer.hard_reset()).unwrap();
+    assert!(!out.close);
+    assert_eq!(
+        deliver(&mut server, &keys, 1, b"still"),
+        Some(b"still".to_vec())
+    );
+}
+
+/// A retransmitted hard reset is a duplicate of the session's packet 0: it is
+/// ACKed again, not answered with another server reset.
+#[test]
+fn repeated_hard_reset_is_only_acked() {
+    use super::Opcode;
+    use super::packet_ctrl::ControlPacket;
+
+    let mut server = Peer::new(server_config(), *b"SERVERID", auth_hook()).unwrap();
+    let mut client = TestClient::new(*b"CLIENTID");
+    let reset = client.hard_reset();
+    server.handle_packet(&reset).unwrap();
+    let out = server.handle_packet(&reset).unwrap();
+    let pkts: Vec<ControlPacket> = out
+        .send
+        .iter()
+        .map(|d| ControlPacket::parse(d).unwrap())
+        .collect();
+    assert_eq!(pkts.len(), 1);
+    assert_eq!(pkts[0].opcode, Opcode::ACK_V1);
+    assert_eq!(pkts[0].acked_pids, vec![0]);
+    assert_eq!(pkts[0].session_id, *b"SERVERID");
+    assert_eq!(pkts[0].remote_id, *b"CLIENTID");
+}
+
+/// Control packets are routed by the sender's session id: one that matches
+/// no session (and is not a hard reset starting one) is dropped unread.
+#[test]
+fn control_packet_from_unknown_session_is_dropped() {
+    use super::Opcode;
+    use super::packet_ctrl::ControlPacket;
+
+    let mut server = Peer::new(server_config(), *b"SERVERID", auth_hook()).unwrap();
+    let mut client = TestClient::new(*b"CLIENTID");
+    server.handle_packet(&client.hard_reset()).unwrap();
+
+    // Garbage TLS would be fatal to the session it belongs to; it belongs to
+    // none, so nothing happens.
+    let mut p = ControlPacket::new(Opcode::CONTROL_V1, 0, *b"STRANGER", [0; 8]);
+    p.set_pid(1);
+    p.payload = vec![0x99, 0x03, 0x03, 0x00, 0x01, 0x00];
+    assert!(server.handle_packet(&p.to_bytes(&[])).is_err());
+}
+
+/// An ACK names the session it acknowledges. One naming another session must
+/// not release our unacknowledged packets, or a forged ACK could stop our
+/// retransmissions.
+#[test]
+fn ack_for_another_session_is_ignored() {
+    use super::Opcode;
+    use super::packet_ctrl::ControlPacket;
+    use super::reliable::RETRANSMIT_INITIAL;
+    use crate::time::Instant;
+    use std::time::Duration;
+
+    let mut server = Peer::new(server_config(), *b"SERVERID", auth_hook()).unwrap();
+    let mut client = TestClient::new(*b"CLIENTID");
+    let start = Instant::now();
+    server.handle_packet(&client.hard_reset()).unwrap();
+
+    let forged = ControlPacket::new(Opcode::ACK_V1, 0, *b"CLIENTID", *b"NOTUS!!!");
+    let _ = server.handle_packet(&forged.to_bytes(&[0]));
+
+    let late = server
+        .tick(start + RETRANSMIT_INITIAL + Duration::from_millis(50))
+        .unwrap();
+    assert_eq!(
+        late.send.len(),
+        1,
+        "server reset must still be retransmitted"
+    );
+}
+
 // --- helpers ----------------------------------------------------------------
+
+/// Drive a client through hard reset, TLS handshake and key exchange against
+/// `server`, returning the keys the client encrypts with.
+fn connect(server: &mut Peer, client: &mut TestClient) -> PeerKeys {
+    assert!(drive_handshake(server, client), "TLS handshake");
+    let (pre_master, random1, random2) = send_client_key_material(client);
+    let mut server_inbox = Vec::new();
+    client.pump_tls(&mut server_inbox);
+    let mut client_inbox: Vec<Vec<u8>> = Vec::new();
+    for _ in 0..30 {
+        for dg in server_inbox.drain(..) {
+            let out = server.handle_packet(&dg).expect("server handle kx");
+            assert!(!out.close, "server closed: {:?}", out.error);
+            client_inbox.extend(out.send);
+        }
+        for dg in client_inbox.drain(..) {
+            server_inbox.extend(client.handle(&dg));
+        }
+        if client.ctrl_buf.len() >= 69 && server_inbox.is_empty() {
+            break;
+        }
+    }
+    let server_random = read_server_key_reply(client);
+    derive_client_keys(
+        &pre_master,
+        &random1,
+        &random2,
+        &server_random,
+        client.reliable.local_id,
+        client.reliable.peer_id,
+    )
+    .encrypt_side
+}
+
+fn gcm_opts() -> Options {
+    Options {
+        cipher_crypto: CipherCryptoAlg::Aes,
+        cipher_size: 256,
+        cipher_block: CipherBlockMethod::Gcm,
+        auth: super::options::AuthHash::None,
+        compression: "lzo".into(),
+        ..Default::default()
+    }
+}
+
+/// Encrypt `payload` as the client and return what the server delivers.
+fn deliver(server: &mut Peer, keys: &PeerKeys, pid: u32, payload: &[u8]) -> Option<Vec<u8>> {
+    let pkt = data::encrypt(&gcm_opts(), keys, pid, payload, |b| {
+        b.fill(0);
+        Ok(())
+    })
+    .unwrap();
+    server.handle_packet(&pkt).ok()?.deliver
+}
 
 fn auth_hook() -> OnAuth {
     Arc::new(|_info: &AuthInfo| {
