@@ -137,6 +137,7 @@ fn would_block(what: &str) -> io::Error {
 pub struct TcpConn {
     state: Arc<ConnState>,
     read_timeout: Mutex<Option<Duration>>,
+    write_timeout: Mutex<Option<Duration>>,
     nonblocking: AtomicBool,
 }
 
@@ -153,6 +154,7 @@ impl TcpConn {
         TcpConn {
             state,
             read_timeout: Mutex::new(None),
+            write_timeout: Mutex::new(None),
             nonblocking: AtomicBool::new(false),
         }
     }
@@ -170,6 +172,12 @@ impl TcpConn {
     /// Set a read timeout. `None` blocks indefinitely.
     pub fn set_read_timeout(&self, t: Option<Duration>) {
         *self.read_timeout.lock().unwrap() = t;
+    }
+
+    /// Set a write timeout: how long a blocking [`write`](Self::write) waits
+    /// for the peer to open its window. `None` waits indefinitely.
+    pub fn set_write_timeout(&self, t: Option<Duration>) {
+        *self.write_timeout.lock().unwrap() = t;
     }
 
     /// Switch between blocking and non-blocking mode, as
@@ -202,8 +210,15 @@ impl TcpConn {
     /// all of it and returns `buf.len()`; in non-blocking mode it takes what
     /// the send buffer has room for, and returns
     /// [`WouldBlock`](io::ErrorKind::WouldBlock) if that is nothing (including
-    /// while the handshake is still in progress).
+    /// while the handshake is still in progress). A blocking write that hits
+    /// the [write timeout](Self::set_write_timeout) returns what it had
+    /// written, or `WouldBlock` if nothing.
     pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
+        let deadline = self
+            .write_timeout
+            .lock()
+            .unwrap()
+            .map(|t| Instant::now() + t);
         let mut written = 0;
         while written < buf.len() {
             let mut conn = self.state.conn.lock().unwrap();
@@ -218,7 +233,8 @@ impl TcpConn {
             if n > 0 {
                 self.state.wrap_and_send(segs);
                 written += n;
-            } else if !may_block(&self.nonblocking) {
+            } else if !may_block(&self.nonblocking) || deadline.is_some_and(|d| Instant::now() >= d)
+            {
                 break;
             } else {
                 // Send window full — wait for an ACK to open it.

@@ -7,9 +7,11 @@
 //! services reachable through the tunnel.
 
 use super::Client;
+use crate::time::Instant;
 use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::net::{IpAddr, SocketAddr};
+use std::time::Duration;
 
 /// A parsed HTTP response.
 #[derive(Debug, Clone)]
@@ -42,7 +44,12 @@ pub struct Request {
     path: String,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
+    timeout: Duration,
 }
+
+/// How long [`Client::http`] waits by default for the connection, the
+/// request to go out, and the whole response to arrive.
+pub const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl Request {
     /// Start a GET request to `url` (form: `http://host[:port]/path`).
@@ -66,7 +73,16 @@ impl Request {
             path,
             headers: Vec::new(),
             body: Vec::new(),
+            timeout: DEFAULT_HTTP_TIMEOUT,
         })
+    }
+
+    /// Bound the whole exchange, from connecting to the last byte of the
+    /// response ([`DEFAULT_HTTP_TIMEOUT`] unless set). Name resolution is
+    /// bounded separately, by the resolver's own timeout.
+    pub fn timeout(mut self, timeout: Duration) -> Request {
+        self.timeout = timeout;
+        self
     }
 
     /// Add a request header.
@@ -106,6 +122,10 @@ impl Request {
 impl Client {
     /// Perform an HTTP request over the virtual network, resolving the host
     /// via the configured DNS servers (or using a literal IP).
+    ///
+    /// Fails with [`TimedOut`](io::ErrorKind::TimedOut) if the exchange
+    /// takes longer than the request's [`timeout`](Request::timeout), so a
+    /// server that stalls cannot hold the caller forever.
     pub fn http(&self, req: &Request) -> io::Result<Response> {
         // Resolve host → IP.
         let ip: IpAddr = match req.host.parse::<IpAddr>() {
@@ -116,15 +136,33 @@ impl Client {
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no address for host"))?,
         };
 
-        let mut conn = self.dial_tcp(SocketAddr::new(ip, req.port))?;
-        conn.write_all(&req.serialize())?;
+        let deadline = Instant::now() + req.timeout;
+        let remaining = || {
+            deadline
+                .checked_duration_since(Instant::now())
+                .filter(|d| !d.is_zero())
+                .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "HTTP request timed out"))
+        };
+        // A timed-out read or write reports WouldBlock, as std's do.
+        let timed_out = |e: io::Error| {
+            if e.kind() == io::ErrorKind::WouldBlock {
+                io::Error::new(io::ErrorKind::TimedOut, "HTTP request timed out")
+            } else {
+                e
+            }
+        };
+
+        let mut conn = self.dial_tcp_timeout(SocketAddr::new(ip, req.port), remaining()?)?;
+        conn.set_write_timeout(Some(remaining()?));
+        conn.write_all(&req.serialize()).map_err(timed_out)?;
 
         // Read until the response's own framing says it is complete, or to
         // EOF when it has none (we ask for `Connection: close`).
         let mut reader = ResponseReader::new(req.method.eq_ignore_ascii_case("HEAD"));
         let mut buf = [0u8; 16 * 1024];
         loop {
-            let n = conn.read(&mut buf)?;
+            conn.set_read_timeout(Some(remaining()?));
+            let n = conn.read(&mut buf).map_err(timed_out)?;
             if n == 0 {
                 return reader.finish();
             }
@@ -648,5 +686,65 @@ mod tests {
         let r = read_response(&raw, 4096).unwrap();
         assert_eq!(r.body.len(), 8_000_000);
         assert!(start.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    /// A server that completes the handshake and then never answers.
+    fn silent_server(client: &std::sync::Arc<Client>) {
+        use crate::vtcp::{Conn, ConnConfig, segment::Segment};
+        use crate::{L3Device, Packet, Protocol};
+        use std::net::Ipv4Addr;
+        use std::sync::{Arc, Mutex};
+
+        let server: Arc<Mutex<Option<Conn>>> = Arc::new(Mutex::new(None));
+        let weak = Arc::downgrade(client);
+        client.set_handler(Arc::new(move |pkt: &Packet| {
+            let Ok(seg) = Segment::parse(pkt.payload()) else {
+                return Ok(());
+            };
+            let out = {
+                let mut srv = server.lock().unwrap();
+                match srv.as_mut() {
+                    Some(c) => c.handle_segment(&seg),
+                    None => {
+                        let mut c = Conn::new(
+                            ConnConfig::default()
+                                .local_port(seg.dst_port)
+                                .remote_port(seg.src_port),
+                        );
+                        let out = c.accept_syn(&seg);
+                        *srv = Some(c);
+                        out
+                    }
+                }
+            };
+            if let Some(client) = weak.upgrade() {
+                for s in out {
+                    let ip = crate::build::build_ipv4(
+                        Ipv4Addr::new(10, 0, 0, 1),
+                        Ipv4Addr::new(10, 0, 0, 2),
+                        Protocol::TCP,
+                        64,
+                        &s,
+                    );
+                    let _ = client.send(Packet::from_slice(&ip));
+                }
+            }
+            Ok(())
+        }));
+    }
+
+    #[test]
+    fn stalled_server_times_out() {
+        let client = Client::new(super::super::ClientConfig::default().prefix(
+            crate::IpPrefix::new(IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 2)), 24),
+        ));
+        silent_server(&client);
+        let req = Request::get("http://10.0.0.1/")
+            .unwrap()
+            .timeout(Duration::from_millis(300));
+        let start = std::time::Instant::now();
+        let err = client.http(&req).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(start.elapsed() < Duration::from_secs(3));
     }
 }

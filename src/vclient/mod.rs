@@ -33,6 +33,6 @@ pub use client::{Client, ClientConfig};
 #[cfg(not(target_family = "wasm"))]
 pub use dns::{RecordType, Resolver, ResolverConfig};
 #[cfg(not(target_family = "wasm"))]
-pub use http::{Request, Response};
+pub use http::{DEFAULT_HTTP_TIMEOUT, Request, Response};
 pub use tcp::{Listener, TcpConn};
 pub use udp::UdpConn;
