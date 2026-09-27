@@ -45,7 +45,11 @@ pub const MIN_PACKET_LEN: usize = 240;
 pub const MAGIC_COOKIE: [u8; 4] = [99, 130, 83, 99];
 
 /// Fields parsed out of a received DHCP message.
+///
+/// Only the parser builds it, so fields may be added as more options are
+/// understood.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Parsed {
     pub op: u8,
     pub xid: u32,
