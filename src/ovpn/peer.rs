@@ -432,6 +432,8 @@ impl Peer {
         // Route by the sender's session id (ssl.c tls_pre_decrypt).
         let mut out = PeerOutput::default();
         let mut reset = None;
+        // For a new session: what its reliable layer made of the hard reset.
+        let mut opened = None;
         let slot = if self.active.as_ref().is_some_and(|s| s.remote_id == sid) {
             Slot::Active
         } else if self.initial.as_ref().is_some_and(|s| s.remote_id == sid) {
@@ -441,7 +443,7 @@ impl Peer {
             if pkt.pid != Some(0) || key_id != 0 {
                 return Err(invalid("hard reset must be packet 0 on key 0"));
             }
-            let local_id = match self.first_local_id.take() {
+            let local_id = match self.first_local_id {
                 Some(id) => id,
                 None => {
                     let mut id = [0u8; 8];
@@ -449,7 +451,15 @@ impl Peer {
                     id
                 }
             };
-            let (session, server_reset) = Session::new(&self.config, local_id, sid, self.timers)?;
+            let (mut session, server_reset) =
+                Session::new(&self.config, local_id, sid, self.timers)?;
+            // The packet has to pass the new session's checks before the
+            // session displaces anything (tls_pre_decrypt validates first):
+            // otherwise a reset it would refuse -- one ACKing packets of a
+            // session nobody knows, say -- still wipes out a handshake in
+            // progress.
+            opened = Some(session.primary.recv(key_id, pkt.clone())?);
+            self.first_local_id = None;
             // Replaces any session still negotiating: the client that sent
             // it has given up on it.
             self.initial = Some(session);
@@ -474,7 +484,10 @@ impl Peer {
         {
             reset = Some(session.soft_reset(&config, &timers, Instant::now())?);
         }
-        let tls_bytes = session.primary.recv(key_id, pkt)?;
+        let tls_bytes = match opened {
+            Some(bytes) => bytes,
+            None => session.primary.recv(key_id, pkt)?,
+        };
         if let Some(reset) = reset {
             // Our reset carries the ACK for theirs.
             out.send

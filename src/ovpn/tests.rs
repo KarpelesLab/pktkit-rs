@@ -644,6 +644,40 @@ fn repeated_hard_reset_is_only_acked() {
     assert_eq!(pkts[0].remote_id, *b"CLIENTID");
 }
 
+/// A hard reset opening a new session is validated before the session
+/// takes the negotiating slot (ssl.c tls_pre_decrypt): one the new session
+/// would refuse -- here, with an ACK record for a session it cannot know --
+/// must not displace a legitimate handshake in progress.
+#[test]
+fn invalid_hard_reset_does_not_displace_a_negotiating_session() {
+    use super::packet_ctrl::ControlPacket;
+
+    let mut server = Peer::new(server_config(), *b"SERVERID", auth_hook()).unwrap();
+    let mut client = TestClient::new(*b"CLIENTID");
+    let reset = client.hard_reset();
+    server.handle_packet(&reset).unwrap();
+
+    let mut bogus = ControlPacket::new(
+        Opcode::CONTROL_HARD_RESET_CLIENT_V2,
+        0,
+        *b"SPOOFER!",
+        *b"GUESSED!",
+    );
+    bogus.set_pid(0);
+    assert!(server.handle_packet(&bogus.to_bytes(&[0])).is_err());
+
+    // The client's retransmitted reset still reaches its own session.
+    let out = server.handle_packet(&reset).unwrap();
+    let pkts: Vec<ControlPacket> = out
+        .send
+        .iter()
+        .map(|d| ControlPacket::parse(d).unwrap())
+        .collect();
+    assert_eq!(pkts.len(), 1);
+    assert_eq!(pkts[0].opcode, Opcode::ACK_V1);
+    assert_eq!(pkts[0].session_id, *b"SERVERID");
+}
+
 /// Control packets are routed by the sender's session id: one that matches
 /// no session (and is not a hard reset starting one) is dropped unread.
 #[test]
