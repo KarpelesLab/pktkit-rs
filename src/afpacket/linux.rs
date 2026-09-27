@@ -235,12 +235,22 @@ fn spawn_reader(sock: &Arc<Socket>, inbound_only: bool) {
             stats.record_rx(frame.len());
             let h = handler.lock().unwrap().clone();
             if let Some(h) = h {
-                let _ = h(Frame::from_slice(frame));
+                deliver(&h, Frame::from_slice(frame));
             } else {
                 stats.record_rx_drop();
             }
         }
     });
+}
+
+/// Hand `frame` to the handler, containing a panic in it.
+///
+/// This runs on the reader thread, which nothing joins or watches: a panic
+/// that unwound out of it would end receive for good, silently, while the
+/// socket still looked open and `send` still worked. One bad frame should
+/// cost that frame, not the device.
+fn deliver(h: &L2Handler, frame: &Frame) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h(frame)));
 }
 
 /// Whether `errno` from `recvmsg` can mean the bound interface went away.
@@ -566,6 +576,20 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn deliver_contains_a_panicking_handler() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let s = seen.clone();
+        let h: L2Handler = Arc::new(move |f: &Frame| {
+            assert_ne!(f.as_bytes()[0], 0xbb, "handler panics");
+            s.lock().unwrap().push(f.as_bytes().to_vec());
+            Ok(())
+        });
+        deliver(&h, Frame::from_slice(&[0xbb; 14]));
+        deliver(&h, Frame::from_slice(&[0x11; 14]));
+        assert_eq!(*seen.lock().unwrap(), [vec![0x11; 14]]);
     }
 
     #[test]
