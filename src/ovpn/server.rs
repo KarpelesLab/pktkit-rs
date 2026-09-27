@@ -28,6 +28,8 @@ use super::peer::{OnAuth, Peer, PeerConfig, PeerTimers};
 pub type OnData = Arc<dyn Fn(PeerKey, u8, &[u8]) + Send + Sync>;
 
 /// Callback fired once a peer completes authentication, with its pushed config.
+/// A client that reconnects from the same address is reported as a
+/// disconnect followed by a new connect.
 pub type OnConnect = Arc<dyn Fn(PeerKey, &PeerConfig) + Send + Sync>;
 
 /// Callback fired when a peer disconnects / is reaped.
@@ -439,11 +441,15 @@ impl Server {
             let _ = self.send_raw(entry, dgram);
         }
 
-        if out.authenticated
-            && let Some(cb) = &self.cfg.on_connect
-        {
-            let peer = entry.peer.lock().unwrap();
-            if let Some(cfg) = peer.peer_config() {
+        // Callbacks run without the peer's lock held: they may well call
+        // back into the server for this peer (send_to_peer, say).
+        if let Some(cfg) = &out.connected {
+            if out.replaced
+                && let Some(cb) = &self.cfg.on_disconnect
+            {
+                cb(key);
+            }
+            if let Some(cb) = &self.cfg.on_connect {
                 cb(key, cfg);
             }
         }
@@ -513,7 +519,9 @@ impl Drop for Server {
 mod tests {
     use super::*;
     use crate::ovpn::Opcode;
+    use crate::ovpn::keys::PeerKeys;
     use crate::ovpn::packet_ctrl::ControlPacket;
+    use crate::ovpn::tests::{TestClient, connect_via};
     use std::time::Duration;
 
     fn test_server() -> Arc<Server> {
@@ -681,6 +689,115 @@ mod tests {
                 ) => {}
             other => panic!("second connection must be refused, got {other:?}"),
         }
+        server.close();
+    }
+
+    /// Connect a test client to `server` over UDP from `sock`.
+    fn connect_udp(sock: &UdpSocket, client: &mut TestClient) -> (PeerKeys, Vec<Vec<u8>>) {
+        sock.set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let s2 = sock.try_clone().unwrap();
+        let r = connect_via(
+            client,
+            &mut |d| {
+                sock.send(d).unwrap();
+            },
+            &mut || {
+                let mut buf = [0u8; 4096];
+                s2.recv(&mut buf).ok().map(|n| buf[..n].to_vec())
+            },
+        );
+        sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        r
+    }
+
+    /// Pump `client` until `done` holds or the server goes quiet, returning
+    /// the data-channel packets that arrived meanwhile.
+    fn pump_udp(
+        sock: &UdpSocket,
+        client: &mut TestClient,
+        done: impl Fn(&TestClient) -> bool,
+    ) -> Vec<Vec<u8>> {
+        sock.set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        let mut buf = [0u8; 4096];
+        let mut data = Vec::new();
+        while !done(client) {
+            let Ok(n) = sock.recv(&mut buf) else {
+                break;
+            };
+            if Opcode::from_byte(buf[0]).0 == Opcode::DATA_V1 {
+                data.push(buf[..n].to_vec());
+                continue;
+            }
+            for d in client.handle_any(&buf[..n]) {
+                sock.send(&d).unwrap();
+            }
+        }
+        data
+    }
+
+    /// on_connect fires once per session, and outside the peer's lock: a
+    /// callback that sends to the peer straight away must not deadlock.
+    #[test]
+    fn on_connect_fires_once_and_may_send() {
+        let server_slot: Arc<Mutex<Option<std::sync::Weak<Server>>>> = Arc::default();
+        let connects = Arc::new(AtomicUsize::new(0));
+        let on_auth: OnAuth = Arc::new(|_| {
+            Ok(PeerConfig::new(
+                "10.8.0.2".parse().unwrap(),
+                "10.8.0.1".parse().unwrap(),
+                "255.255.255.0".parse().unwrap(),
+                24,
+            ))
+        });
+        let on_data: OnData = Arc::new(|_, _, _| {});
+        let on_connect: OnConnect = {
+            let slot = server_slot.clone();
+            let connects = connects.clone();
+            Arc::new(move |key, _cfg| {
+                connects.fetch_add(1, Ordering::SeqCst);
+                let server = slot.lock().unwrap().as_ref().and_then(|w| w.upgrade());
+                if let Some(s) = server {
+                    s.send_to_peer(&key, b"welcome").unwrap();
+                }
+            })
+        };
+        let cfg = ServerConfig::new(
+            crate::ovpn::tests::server_config(),
+            "127.0.0.1:0".parse().unwrap(),
+            on_auth,
+            on_data,
+        )
+        .on_connect(on_connect);
+        let server = Server::new(cfg).unwrap();
+        *server_slot.lock().unwrap() = Some(Arc::downgrade(&server));
+
+        let sock = udp_client(&server);
+        let mut client = TestClient::new(*b"CLIENTID");
+        let (keys, mut data) = connect_udp(&sock, &mut client);
+
+        // The client asks for its config; more control traffic after the
+        // session is up must not count as another connect.
+        for d in client.send_control(b"PUSH_REQUEST\0") {
+            sock.send(&d).unwrap();
+        }
+        data.extend(pump_udp(&sock, &mut client, |c| {
+            c.control_text().windows(10).any(|w| w == b"PUSH_REPLY")
+        }));
+        assert_eq!(connects.load(Ordering::SeqCst), 1);
+
+        // The callback's packet arrives.
+        if data.is_empty() {
+            let mut buf = [0u8; 4096];
+            let n = sock.recv(&mut buf).expect("welcome packet");
+            data.push(buf[..n].to_vec());
+        }
+        let mut pkt = data.remove(0);
+        let dec = crate::ovpn::data::decrypt(&crate::ovpn::tests::gcm_opts(), &keys, &mut pkt)
+            .unwrap()
+            .unwrap();
+        assert_eq!(dec.payload, b"welcome");
         server.close();
     }
 

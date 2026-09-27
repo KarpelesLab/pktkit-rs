@@ -17,7 +17,7 @@ use super::options::Options;
 use super::peer::{AuthInfo, OnAuth, Peer, PeerConfig};
 use super::prf::prf10;
 use super::reliable::Reliable;
-use super::{CipherBlockMethod, CipherCryptoAlg};
+use super::{CipherBlockMethod, CipherCryptoAlg, Opcode};
 
 const TEST_CERT: &str = "-----BEGIN CERTIFICATE-----
 MIIDCzCCAfOgAwIBAgIUIivmiQqCMO8WqOV9OJFs/D3JLRUwDQYJKoZIhvcNAQEL
@@ -120,14 +120,14 @@ fn client_config() -> Arc<TlsConfig> {
 
 /// A minimal OpenVPN client that mirrors the server's reliable+TLS plumbing,
 /// used only to drive the e2e test.
-struct TestClient {
+pub(super) struct TestClient {
     tls: TlsConnection,
     reliable: Reliable,
     ctrl_buf: Vec<u8>,
 }
 
 impl TestClient {
-    fn new(local_id: [u8; 8]) -> TestClient {
+    pub(super) fn new(local_id: [u8; 8]) -> TestClient {
         Self::with_config(local_id, client_config())
     }
 
@@ -191,6 +191,79 @@ impl TestClient {
     fn handshake_done(&self) -> bool {
         self.tls.is_handshake_complete()
     }
+
+    /// Send a control-channel message (e.g. `PUSH_REQUEST\0`) over TLS,
+    /// returning the datagrams that carry it.
+    pub(super) fn send_control(&mut self, msg: &[u8]) -> Vec<Vec<u8>> {
+        self.tls.send(msg).unwrap();
+        let mut out = Vec::new();
+        self.pump_tls(&mut out);
+        out
+    }
+
+    /// Process a datagram from the server, returning the control-channel
+    /// plaintext it completed (data-channel packets are ignored) and the
+    /// datagrams to send back.
+    pub(super) fn handle_any(&mut self, data: &[u8]) -> Vec<Vec<u8>> {
+        if Opcode::from_byte(data[0]).0 == Opcode::DATA_V1 {
+            return Vec::new();
+        }
+        self.handle(data)
+    }
+
+    /// Control-channel plaintext received so far.
+    pub(super) fn control_text(&self) -> &[u8] {
+        &self.ctrl_buf
+    }
+}
+
+/// Drive `client` through hard reset, TLS handshake and key exchange over a
+/// real transport, returning the keys it encrypts with (which also decrypt
+/// what the server sends) and any data-channel packets that arrived.
+pub(super) fn connect_via(
+    client: &mut TestClient,
+    send: &mut dyn FnMut(&[u8]),
+    recv: &mut dyn FnMut() -> Option<Vec<u8>>,
+) -> (PeerKeys, Vec<Vec<u8>>) {
+    send(&client.hard_reset());
+    let mut kx = None;
+    let mut data = Vec::new();
+    for _ in 0..200 {
+        let mut out = Vec::new();
+        client.pump_tls(&mut out);
+        for d in out {
+            send(&d);
+        }
+        if client.handshake_done() && kx.is_none() {
+            kx = Some(send_client_key_material(client));
+            continue;
+        }
+        if kx.is_some() && client.ctrl_buf.len() >= 69 {
+            break;
+        }
+        let Some(d) = recv() else {
+            continue;
+        };
+        if Opcode::from_byte(d[0]).0 == Opcode::DATA_V1 {
+            data.push(d);
+            continue;
+        }
+        for o in client.handle(&d) {
+            send(&o);
+        }
+    }
+    let (pre_master, random1, random2) = kx.expect("TLS handshake");
+    let server_random = read_server_key_reply(client);
+    let keys = derive_client_keys(
+        &pre_master,
+        &random1,
+        &random2,
+        &server_random,
+        client.reliable.local_id,
+        client.reliable.peer_id,
+    )
+    .encrypt_side;
+    (keys, data)
 }
 
 /// Run the reliable-layer pump until the TLS handshake completes on both
@@ -373,7 +446,6 @@ fn e2e_tls_handshake_and_key_exchange() {
 /// the client finally ACKs it, the retransmit stops.
 #[test]
 fn retransmit_fires_when_ack_withheld() {
-    use super::Opcode;
     use super::packet_ctrl::ControlPacket;
     use super::reliable::RETRANSMIT_INITIAL;
     use crate::time::Instant;
@@ -440,7 +512,6 @@ fn retransmit_fires_when_ack_withheld() {
 /// says so through `close`, not through an `Err` (which means "dropped").
 #[test]
 fn tls_garbage_closes_the_session() {
-    use super::Opcode;
     use super::packet_ctrl::ControlPacket;
 
     let mut server = Peer::new(server_config(), *b"SERVERID", auth_hook()).unwrap();
@@ -499,7 +570,6 @@ fn stray_hard_reset_does_not_disturb_the_active_session() {
 /// ACKed again, not answered with another server reset.
 #[test]
 fn repeated_hard_reset_is_only_acked() {
-    use super::Opcode;
     use super::packet_ctrl::ControlPacket;
 
     let mut server = Peer::new(server_config(), *b"SERVERID", auth_hook()).unwrap();
@@ -523,7 +593,6 @@ fn repeated_hard_reset_is_only_acked() {
 /// no session (and is not a hard reset starting one) is dropped unread.
 #[test]
 fn control_packet_from_unknown_session_is_dropped() {
-    use super::Opcode;
     use super::packet_ctrl::ControlPacket;
 
     let mut server = Peer::new(server_config(), *b"SERVERID", auth_hook()).unwrap();
@@ -543,7 +612,6 @@ fn control_packet_from_unknown_session_is_dropped() {
 /// retransmissions.
 #[test]
 fn ack_for_another_session_is_ignored() {
-    use super::Opcode;
     use super::packet_ctrl::ControlPacket;
     use super::reliable::RETRANSMIT_INITIAL;
     use crate::time::Instant;
@@ -589,7 +657,6 @@ fn handshake_window_expires_a_stalled_session() {
 /// (OpenVPN's `--keepalive 10 60` on a server).
 #[test]
 fn keepalive_pings_and_restarts() {
-    use super::Opcode;
     use crate::time::Instant;
     use std::time::Duration;
 
@@ -654,7 +721,7 @@ fn connect(server: &mut Peer, client: &mut TestClient) -> PeerKeys {
     .encrypt_side
 }
 
-fn gcm_opts() -> Options {
+pub(super) fn gcm_opts() -> Options {
     Options {
         cipher_crypto: CipherCryptoAlg::Aes,
         cipher_size: 256,

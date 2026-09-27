@@ -106,6 +106,13 @@ pub struct PeerOutput {
     pub deliver: Option<Vec<u8>>,
     /// True once the peer has authenticated and the data channel is active.
     pub authenticated: bool,
+    /// Set exactly once per session, by the datagram that completed its
+    /// authentication: the config pushed to the client.
+    pub connected: Option<PeerConfig>,
+    /// With `connected`: the new session replaced an established one (the
+    /// client reconnected from the same address), so the old connection is
+    /// gone.
+    pub replaced: bool,
     /// True if the connection should be torn down.
     pub close: bool,
     /// Why the connection is being torn down, when `close` is set and the
@@ -407,7 +414,10 @@ impl Peer {
 
         // A session that has authenticated takes over the data channel.
         if slot == Slot::Initial && self.initial.as_ref().is_some_and(|s| s.ks.kx_done) {
-            self.active = self.initial.take();
+            let session = self.initial.take();
+            out.connected = session.as_ref().and_then(|s| s.peer_cfg.clone());
+            out.replaced = self.active.is_some();
+            self.active = session;
         }
         out.authenticated = self.active.as_ref().is_some_and(|s| s.ks.kx_done);
         Ok(out)
