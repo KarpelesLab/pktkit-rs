@@ -120,6 +120,14 @@ pub(crate) fn build_packet6(src_ip: Ipv6Addr, dst_ip: Ipv6Addr, tcp_seg: &[u8]) 
     pkt
 }
 
+/// A computed UDP checksum of zero goes on the wire as 0xFFFF (RFC 768):
+/// zero means "no checksum" over IPv4, and is invalid over IPv6 (RFC 8200),
+/// where the receiver drops the datagram.
+#[inline]
+fn nonzero_udp_checksum(cs: u16) -> u16 {
+    if cs == 0 { 0xFFFF } else { cs }
+}
+
 /// Build an IPv4+UDP packet from the response payload.
 pub(crate) fn build_udp_packet4(
     src_ip: Ipv4Addr,
@@ -156,7 +164,7 @@ pub(crate) fn build_udp_packet4(
 
         // Compute UDP checksum over pseudo-header + (udp + payload).
         let cs = crate::slirp::checksum::udp_v4_checksum(src_ip, dst_ip, udp, payload);
-        udp[6..8].copy_from_slice(&cs.to_be_bytes());
+        udp[6..8].copy_from_slice(&nonzero_udp_checksum(cs).to_be_bytes());
     }
     pkt
 }
@@ -194,7 +202,7 @@ pub(crate) fn build_udp_packet6(
     udp_full.extend_from_slice(udp);
     udp_full.extend_from_slice(payload);
     let cs = ipv6_pseudo_checksum(src_ip, dst_ip, 17, payload_len as u32, &udp_full);
-    udp[6..8].copy_from_slice(&cs.to_be_bytes());
+    udp[6..8].copy_from_slice(&nonzero_udp_checksum(cs).to_be_bytes());
 
     pkt
 }
@@ -265,6 +273,24 @@ mod tests {
         let frags = fit_link(pkt);
         assert_eq!(frags.len(), 3);
         assert!(frags.iter().all(|f| f.len() <= LINK_MTU));
+    }
+
+    #[test]
+    fn zero_udp_checksum_is_sent_as_all_ones() {
+        // Choose the payload so the checksum computes to zero: a word equal
+        // to the checksum of the same datagram with that word zeroed.
+        let (s4, d4) = (Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 5));
+        let probe = build_udp_packet4(s4, 53, d4, 4000, &[0, 0]);
+        let word = [probe[26], probe[27]];
+        let pkt = build_udp_packet4(s4, 53, d4, 4000, &word);
+        assert_eq!(&pkt[26..28], &[0xFF, 0xFF]);
+
+        let (s6, d6): (Ipv6Addr, Ipv6Addr) =
+            ("fd00::1".parse().unwrap(), "fd00::5".parse().unwrap());
+        let probe = build_udp_packet6(s6, 53, d6, 4000, &[0, 0]);
+        let word = [probe[46], probe[47]];
+        let pkt = build_udp_packet6(s6, 53, d6, 4000, &word);
+        assert_eq!(&pkt[46..48], &[0xFF, 0xFF]);
     }
 
     #[test]
