@@ -16,8 +16,8 @@ use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock, Weak};
-use std::thread;
+use std::sync::{Arc, Mutex, RwLock, Weak, mpsc};
+use std::thread::{self, ThreadId};
 use std::time::Duration;
 
 use super::addr::{PeerKey, Transport};
@@ -141,7 +141,9 @@ struct PeerEntry {
 /// `Arc<Server>` shuts it down just as [`close`](Self::close) does.
 pub struct Server {
     cfg: ServerConfig,
-    udp: Arc<UdpSocket>,
+    /// Taken by close(), which releases the port. The reader borrows the
+    /// socket one read at a time, so it does not keep it open either.
+    udp: RwLock<Option<Arc<UdpSocket>>>,
     tcp_addr: SocketAddr,
     peers: RwLock<HashMap<PeerKey, Arc<PeerEntry>>>,
     /// Every open TCP connection by id, so close() can shut them down --
@@ -149,6 +151,31 @@ pub struct Server {
     tcp_streams: Mutex<HashMap<u64, TcpStream>>,
     next_tcp_id: AtomicU64,
     closed: AtomicBool,
+    /// The UDP reader and the TCP acceptor, which close() waits for: the
+    /// listening sockets are released by the time they exit.
+    loops: Mutex<Vec<SocketLoop>>,
+}
+
+/// A thread serving a listening socket.
+struct SocketLoop {
+    thread: ThreadId,
+    /// Disconnects when the thread exits.
+    done: mpsc::Receiver<()>,
+}
+
+impl SocketLoop {
+    fn spawn(f: impl FnOnce() + Send + 'static) -> SocketLoop {
+        let (tx, done) = mpsc::channel::<()>();
+        let handle = thread::spawn(move || {
+            let _signal = tx;
+            // `f` and everything it owns are dropped before `_signal`.
+            f();
+        });
+        SocketLoop {
+            thread: handle.thread().id(),
+            done,
+        }
+    }
 }
 
 impl std::fmt::Debug for Server {
@@ -162,6 +189,11 @@ impl std::fmt::Debug for Server {
 /// How often the socket threads look up from a blocking read or an idle
 /// accept to notice that the server was closed or dropped.
 const POLL: Duration = Duration::from_millis(100);
+
+/// How long close() waits for a socket thread to exit. It normally takes at
+/// most one POLL; this only bounds the wait when a callback running on the
+/// UDP reader is itself stuck -- on a lock close()'s caller holds, say.
+const LOOP_EXIT_WAIT: Duration = Duration::from_secs(1);
 
 /// The server, if it still exists and is not closed.
 fn live(server: &Weak<Server>) -> Option<Arc<Server>> {
@@ -183,7 +215,7 @@ impl Server {
                 format!("TLS config cannot make a server connection: {e:?}"),
             )
         })?;
-        let udp = Arc::new(UdpSocket::bind(cfg.listen_addr)?);
+        let udp = UdpSocket::bind(cfg.listen_addr)?;
         udp.set_read_timeout(Some(POLL))?;
         let tcp = TcpListener::bind(cfg.listen_addr)?;
         let tcp_addr = tcp.local_addr()?;
@@ -192,23 +224,24 @@ impl Server {
 
         let server = Arc::new(Server {
             cfg,
-            udp: udp.clone(),
+            udp: RwLock::new(Some(Arc::new(udp))),
             tcp_addr,
             peers: RwLock::new(HashMap::new()),
             tcp_streams: Mutex::new(HashMap::new()),
             next_tcp_id: AtomicU64::new(0),
             closed: AtomicBool::new(false),
+            loops: Mutex::new(Vec::new()),
         });
 
         let weak = Arc::downgrade(&server);
-        {
-            let weak = weak.clone();
-            thread::spawn(move || udp_loop(weak, udp));
-        }
-        {
-            let weak = weak.clone();
-            thread::spawn(move || tcp_loop(weak, tcp));
-        }
+        let loops = {
+            let (w1, w2) = (weak.clone(), weak.clone());
+            vec![
+                SocketLoop::spawn(move || udp_loop(w1)),
+                SocketLoop::spawn(move || tcp_loop(w2, tcp)),
+            ]
+        };
+        *server.loops.lock().unwrap() = loops;
         thread::spawn(move || maintenance_loop(weak));
 
         Ok(server)
@@ -216,7 +249,12 @@ impl Server {
 
     /// Local UDP address the server is bound to.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.udp.local_addr()
+        self.udp
+            .read()
+            .unwrap()
+            .as_ref()
+            .ok_or_else(closed_error)?
+            .local_addr()
     }
 
     /// Local TCP address the server listens on. The same as
@@ -227,16 +265,32 @@ impl Server {
     }
 
     /// Shut the server down: stop the loops, close every TCP connection and
-    /// the listener, and drop all peers. The threads exit within a short poll
-    /// interval; the UDP port is released when the `Server` is dropped.
+    /// both listening sockets, and drop all peers. The UDP and TCP ports are
+    /// free for reuse once this returns.
+    ///
+    /// It waits for the UDP reader to finish what it is doing, callbacks
+    /// included, so do not call it holding a lock a callback takes: the
+    /// wait then gives up after a second, and the ports are only released
+    /// once the callback returns.
     pub fn close(&self) {
         if self.closed.swap(true, Ordering::SeqCst) {
             return;
         }
+        // The reader only borrows the socket for a read, so this leaves it
+        // open until that read returns, within a poll interval.
+        self.udp.write().unwrap().take();
         // A thread blocked reading a TCP connection wakes up to the shutdown
         // and exits; the socket loops notice `closed` on their next poll.
         for (_, s) in self.tcp_streams.lock().unwrap().drain() {
             let _ = s.shutdown(std::net::Shutdown::Both);
+        }
+        // The loop calling close() -- from a callback, or dropping the last
+        // handle -- lets go of its socket as soon as it returns.
+        let me = thread::current().id();
+        for l in std::mem::take(&mut *self.loops.lock().unwrap()) {
+            if l.thread != me {
+                let _ = l.done.recv_timeout(LOOP_EXIT_WAIT);
+            }
         }
         // Callbacks run after the table lock is released: they may call
         // back into the server.
@@ -445,7 +499,10 @@ impl Server {
     fn send_raw(&self, entry: &Arc<PeerEntry>, dgram: &[u8]) -> io::Result<()> {
         match entry.transport {
             Transport::Udp => {
-                self.udp.send_to(dgram, entry.addr)?;
+                let udp = self.udp.read().unwrap();
+                udp.as_ref()
+                    .ok_or_else(closed_error)?
+                    .send_to(dgram, entry.addr)?;
                 Ok(())
             }
             Transport::Tcp => {
@@ -470,10 +527,20 @@ impl Server {
     }
 }
 
-fn udp_loop(server: Weak<Server>, udp: Arc<UdpSocket>) {
+fn closed_error() -> io::Error {
+    io::Error::new(io::ErrorKind::NotConnected, "server closed")
+}
+
+fn udp_loop(server: Weak<Server>) {
     let mut buf = vec![0u8; 65536];
     loop {
+        // Hold the socket for one read only, so that once close() has
+        // taken it the port is released as soon as the read returns.
+        let Some(udp) = live(&server).and_then(|s| s.udp.read().unwrap().clone()) else {
+            return;
+        };
         let res = udp.recv_from(&mut buf);
+        drop(udp);
         let Some(server) = live(&server) else {
             return;
         };
@@ -798,6 +865,27 @@ mod tests {
         if let Ok(mut late) = TcpStream::connect(server.tcp_local_addr()) {
             expect_eof(&mut late);
         }
+    }
+
+    /// close() gives the UDP port back, so a new server can bind it right
+    /// away, even while the old `Server` is still held.
+    #[test]
+    fn close_releases_the_udp_port() {
+        let server = test_server();
+        let addr = server.local_addr().unwrap();
+        // A client in flight, so the reader has had work to do.
+        let c = udp_client(&server);
+        c.send(&client_reset(*b"CLIENT01")).unwrap();
+        recv_ctrl(&c);
+
+        server.close();
+        UdpSocket::bind(addr).expect("UDP port still bound after close()");
+        assert!(server.local_addr().is_err());
+        assert!(
+            server
+                .send_to_peer(&PeerKey::new(c.local_addr().unwrap(), Transport::Udp), b"x")
+                .is_err()
+        );
     }
 
     /// The server's threads must not keep it alive: dropping the last

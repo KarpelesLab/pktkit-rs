@@ -178,7 +178,10 @@ impl Adapter {
 
     /// Shut down the adapter and its server.
     pub fn close(&self) {
-        if let Some(s) = self.server.lock().unwrap().take() {
+        // Not under the lock: Server::close waits for the UDP reader, whose
+        // callbacks may send to a peer, which takes it (see `server()`).
+        let server = self.server.lock().unwrap().take();
+        if let Some(s) = server {
             s.close();
         }
         let mut peers = self.peers.lock().unwrap();
