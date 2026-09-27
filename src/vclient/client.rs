@@ -30,12 +30,21 @@ pub struct ClientConfig {
     /// DNS servers [`Client::resolve`] queries, from the host's own sockets.
     /// The client learns none by itself; empty means `resolve` fails.
     pub dns: Vec<IpAddr>,
+    /// The MTU of the link the client sends on, 1500 when unset. TCP sizes
+    /// its segments for it: the MSS a connection advertises, and the most
+    /// it sends with, is this less 40 bytes of IPv4 and TCP headers (60
+    /// over IPv6). Set it for a narrower link, such as a tunnel, so that
+    /// full-size segments are not fragmented or dropped on the way. Path
+    /// MTU discovery can lower it further for one connection (ICMP
+    /// Fragmentation Needed / Packet Too Big), never raise it.
+    pub mtu: Option<u32>,
 }
 
 setters! {
     ClientConfig {
         some prefix: IpPrefix;
         set dns: Vec<IpAddr>;
+        some mtu: u32;
     }
 }
 
@@ -89,7 +98,7 @@ impl Client {
                 }));
             }
         });
-        let tcp = TcpStack::new(sink.clone());
+        let tcp = TcpStack::with_mtu(sink.clone(), cfg.mtu.unwrap_or(tcp::DEFAULT_MTU));
         let udp = UdpStack::new(sink);
 
         Arc::new(Client {
@@ -202,8 +211,9 @@ impl L3Device for Client {
         };
         let pkt = Packet::from_slice(&whole);
         // Inbound from the L3 network: demux to a TCP connection, then a UDP
-        // socket. Unmatched packets (e.g. ICMP) are dropped.
-        if self.tcp.handle_inbound(pkt, self.addr().addr()) {
+        // socket. ICMP is only read for path MTU discovery; the rest is
+        // dropped.
+        if self.tcp.handle_inbound(pkt, self.addr().addr()) || self.tcp.handle_icmp(pkt) {
             return Ok(());
         }
         let _ = self.udp.handle_inbound(pkt);

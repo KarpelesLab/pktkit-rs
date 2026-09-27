@@ -761,3 +761,115 @@ fn bulk_transfer_over_a_synchronous_hub_stays_in_order() {
         "8 MiB took {took:?} over a lossless link"
     );
 }
+
+/// Wire `a` and `b` back to back through a router whose link carries at
+/// most `mtu` bytes: anything larger is dropped and answered with an ICMP
+/// Packet Too Big (or Fragmentation Needed) from `router`. Returns the
+/// count of those sent, and the largest packet that got through.
+fn narrow_link(
+    a: &Arc<pktkit::vclient::Client>,
+    b: &Arc<pktkit::vclient::Client>,
+    router: IpAddr,
+    mtu: usize,
+) -> (
+    Arc<std::sync::atomic::AtomicUsize>,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (too_big, largest) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    for (from, to) in [(a, b), (b, a)] {
+        let (from_w, to_w) = (Arc::downgrade(from), Arc::downgrade(to));
+        let (too_big, largest) = (too_big.clone(), largest.clone());
+        from.set_handler(Arc::new(move |p: &Packet| {
+            if p.len() <= mtu {
+                largest.fetch_max(p.len(), Ordering::Relaxed);
+                if let Some(to) = to_w.upgrade() {
+                    let _ = to.send(p);
+                }
+            } else if let (Some(ptb), Some(from)) = (
+                pktkit::icmp::packet_too_big(p, router, mtu as u32),
+                from_w.upgrade(),
+            ) {
+                too_big.fetch_add(1, Ordering::Relaxed);
+                let _ = from.send(Packet::from_slice(&ptb));
+            }
+            Ok(())
+        }));
+    }
+    (too_big, largest)
+}
+
+/// Path MTU discovery (RFC 8201): across a 1400-byte link that drops what
+/// is larger and says so, both directions of an IPv6 bulk transfer shrink
+/// their segments to fit and complete, where they used to stall on
+/// full-size segments that could never get through.
+#[test]
+fn ipv6_bulk_transfer_discovers_the_path_mtu() {
+    use std::io::Read;
+    use std::sync::atomic::Ordering;
+
+    const SIZE: usize = 2 << 20;
+    let v6 = |ip: &str| {
+        pktkit::vclient::Client::new(
+            pktkit::vclient::ClientConfig::default().prefix(IpPrefix::new(ip.parse().unwrap(), 64)),
+        )
+    };
+    let (a, b) = (v6("fd00::2"), v6("fd00::3"));
+    let (too_big, largest) = narrow_link(&a, &b, "fd00::fe".parse().unwrap(), 1400);
+    let listener = b.listen_tcp(LISTEN_PORT).unwrap();
+    let data: Vec<u8> = (0..SIZE).map(|i| (i * 13 + i / 1000) as u8).collect();
+    let sent = data.clone();
+    let server = std::thread::spawn(move || {
+        let mut s = listener.accept().unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(30)));
+        s.write_all(&sent).unwrap();
+        let mut back = vec![0; SIZE];
+        s.read_exact(&mut back).unwrap();
+        back
+    });
+    let dst = SocketAddr::new("fd00::3".parse().unwrap(), LISTEN_PORT);
+    let mut conn = a.dial_tcp(dst).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(30)));
+    conn.set_write_timeout(Some(Duration::from_secs(30)));
+    let mut got = vec![0u8; SIZE];
+    conn.read_exact(&mut got).expect("download stalled");
+    assert!(got == data, "download corrupted");
+    conn.write_all(&data).expect("upload stalled");
+    assert!(server.join().unwrap() == data, "upload corrupted");
+    assert!(too_big.load(Ordering::Relaxed) > 0, "nothing was too big");
+    assert_eq!(largest.load(Ordering::Relaxed), 1400);
+}
+
+/// A client configured for a narrower link never sends past it, and
+/// tells the peer, through its MSS, not to either.
+#[test]
+fn a_configured_mtu_bounds_both_directions() {
+    use std::io::Read;
+    use std::sync::atomic::Ordering;
+
+    let a = pktkit::vclient::Client::new(
+        pktkit::vclient::ClientConfig::default()
+            .prefix(IpPrefix::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 24))
+            .mtu(1280),
+    );
+    let b = client(3);
+    let (too_big, largest) = narrow_link(&a, &b, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 254)), 1280);
+    let listener = b.listen_tcp(LISTEN_PORT).unwrap();
+    let server = std::thread::spawn(move || {
+        let mut s = listener.accept().unwrap();
+        s.write_all(&[5; 100_000]).unwrap();
+        // Read to the end: unread data would have the drop reset.
+        let mut v = Vec::new();
+        s.read_to_end(&mut v).unwrap();
+        assert_eq!(v.len(), 100_000);
+    });
+    let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3)), LISTEN_PORT);
+    let mut conn = a.dial_tcp(dst).unwrap();
+    conn.write_all(&[6; 100_000]).unwrap();
+    conn.close().unwrap();
+    let mut got = vec![0; 100_000];
+    conn.read_exact(&mut got).unwrap();
+    server.join().unwrap();
+    assert_eq!(too_big.load(Ordering::Relaxed), 0);
+    assert_eq!(largest.load(Ordering::Relaxed), 1280);
+}

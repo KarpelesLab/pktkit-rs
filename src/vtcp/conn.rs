@@ -73,6 +73,20 @@ pub const DEFAULT_KEEPALIVE_COUNT: u32 = 3;
 /// Linux's `tcp_fin_timeout` default.
 pub const DEFAULT_FIN_WAIT2_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// The smallest IPv4 path MTU a Fragmentation Needed message can bring the
+/// connection down to: Linux's `ip_rt_min_pmtu`, room for 512 bytes of
+/// data. RFC 1191 §3 only forbids going below 68, but no real path is that
+/// narrow, and anyone able to send an ICMP message could otherwise have
+/// the connection spend 40 bytes of headers on every few bytes of data.
+pub const IPV4_MIN_PATH_MTU: u32 = 552;
+/// IPv6's minimum link MTU (RFC 8200 §5), below which a Packet Too Big
+/// never takes the path MTU (RFC 8201 §4).
+pub const IPV6_MIN_PATH_MTU: u32 = 1280;
+/// RFC 1191 §7's plateau table: where to go from a Fragmentation Needed
+/// message that reports no next-hop MTU, as a router older than RFC 1191
+/// sends.
+const MTU_PLATEAUS: [u32; 10] = [32000, 17914, 8166, 4352, 2002, 1492, 1006, 508, 296, 68];
+
 // --- TCP state -------------------------------------------------------------
 
 /// TCP state per RFC 9293 §3.3.
@@ -231,6 +245,10 @@ pub struct Conn {
     /// which bounds how far below SND.UNA a genuine ACK can be.
     max_snd_wnd: u32,
     mss: u16,
+    /// The most the path lets us send with, from Packet Too Big messages
+    /// (see [`Conn::set_path_mtu`]): caps `mss` from then on, the
+    /// handshake's included.
+    path_mss: u16,
     cc: Box<dyn CongestionController>,
 
     // RTO management.
@@ -389,6 +407,7 @@ impl Conn {
             snd_wnd: DEFAULT_WINDOW_SIZE as u32,
             max_snd_wnd: 0,
             mss,
+            path_mss: u16::MAX,
             cc,
             rto: RtoState::new(),
             rto_deadline: None,
@@ -466,6 +485,128 @@ impl Conn {
     #[inline]
     pub fn remote_addr(&self) -> std::option::Option<SocketAddr> {
         self.cfg.remote_addr
+    }
+
+    /// The MSS the connection sends with: the peer's, capped by our own
+    /// ([`ConnConfig::mss`]) and by the path MTU. Options in a segment come
+    /// out of it, so a segment's payload may be a little less.
+    #[inline]
+    pub fn mss(&self) -> u16 {
+        self.mss
+    }
+
+    /// The path MTU the connection sends for: [`mss`](Self::mss) plus the
+    /// IP and TCP headers. The address family comes from
+    /// [`ConnConfig::remote_addr`] (or `local_addr`); without either it is
+    /// taken as IPv4.
+    pub fn path_mtu(&self) -> u32 {
+        self.mss as u32 + self.header_overhead()
+    }
+
+    /// Lower the path MTU to `mtu` bytes: from then on no segment, with its
+    /// IP and TCP headers and options, is larger. What was in flight at the
+    /// old size is sent again at the new one, the way Linux's
+    /// `tcp_simple_retransmit` does: most of it went no further than the
+    /// router that could not forward it. That is not congestion, so the
+    /// window and the RTO stay as they are. Returns the segments to send.
+    ///
+    /// The path MTU only ever goes down (RFC 1191 §6.3, RFC 8201 §4): an
+    /// `mtu` at or above [`path_mtu`](Self::path_mtu) changes nothing. Nor
+    /// does it go below the family's floor: 1280 for IPv6, the minimum link
+    /// MTU (RFC 8201 §4), and [`IPV4_MIN_PATH_MTU`] for IPv4. An IPv4 `mtu`
+    /// below 68, such as the 0 that a router predating RFC 1191 reports, is
+    /// no MTU at all; the next plateau below the current path MTU (RFC 1191
+    /// §7) is taken instead.
+    ///
+    /// For a Packet Too Big that came in off the network, use
+    /// [`on_icmp_too_big`](Self::on_icmp_too_big), which checks it first.
+    pub fn set_path_mtu(&mut self, mtu: u32) -> Vec<Vec<u8>> {
+        let ipv6 = self.is_ipv6();
+        let current = self.path_mtu();
+        let mut mtu = mtu;
+        if !ipv6 && mtu < 68 {
+            mtu = MTU_PLATEAUS
+                .iter()
+                .copied()
+                .find(|&p| p < current)
+                .unwrap_or(0);
+        }
+        let floor = if ipv6 {
+            IPV6_MIN_PATH_MTU
+        } else {
+            IPV4_MIN_PATH_MTU
+        };
+        let mss = (mtu.max(floor) - self.header_overhead()).min(u16::MAX as u32) as u16;
+        if mss >= self.path_mss {
+            return self.take_outgoing();
+        }
+        self.path_mss = mss;
+        if mss < self.mss {
+            self.mss = mss;
+            self.cc.set_mss(mss as u32);
+            self.resend_after_mtu_drop();
+        }
+        self.take_outgoing()
+    }
+
+    /// Take an ICMP Packet Too Big (ICMPv6 type 2) or Fragmentation Needed
+    /// (ICMPv4 type 3 code 4) reporting a next-hop MTU of `mtu`, about the
+    /// segment whose SEQ it quotes as `seq`, and act on it as
+    /// [`set_path_mtu`](Self::set_path_mtu) does. Returns the segments to
+    /// send.
+    ///
+    /// The caller must have matched the quoted IP and TCP headers to this
+    /// connection's addresses and ports. What is checked here is RFC 5927
+    /// §4.1's defence against a forged message: `seq` has to be one we
+    /// sent and have not had acknowledged (between SND.UNA and SND.NXT, as
+    /// Linux's `tcp_v4_err` has it). Anything else is ignored.
+    pub fn on_icmp_too_big(&mut self, mtu: u32, seq: u32) -> Vec<Vec<u8>> {
+        if self.closed || matches!(self.state, State::Closed | State::Listen | State::TimeWait) {
+            return Vec::new();
+        }
+        let Some(sb) = self.send_buf.as_ref() else {
+            return Vec::new();
+        };
+        if !seq_in_range_inclusive(seq, sb.una(), sb.nxt()) {
+            return Vec::new();
+        }
+        self.set_path_mtu(mtu)
+    }
+
+    /// Everything in flight was sent at an MSS the path cannot carry: mark
+    /// it lost and let the timeout-recovery loop resend it, cut to the new
+    /// size, from SND.UNA on as cwnd allows. What the peer SACKed got
+    /// through and stays. Unlike a timeout, no congestion is inferred, so
+    /// ssthresh and the RTO are left alone, and cwnd too outside fast
+    /// recovery; `timeout_recover` keeps
+    /// the duplicate ACKs the resends draw from starting fast retransmit.
+    fn resend_after_mtu_drop(&mut self) {
+        if !self.state.is_synchronized() {
+            return;
+        }
+        let Some(sb) = self.send_buf.as_ref() else {
+            return;
+        };
+        // A FIN alone is never too big. A zero window is the persist
+        // timer's to probe, with segments already cut to the new size.
+        if sb.retransmit_data(1).is_none() || self.snd_wnd == 0 {
+            return;
+        }
+        let (una, nxt) = (sb.una(), sb.nxt());
+        // Fast recovery gives way, as Linux's CA_Loss replaces CA_Recovery:
+        // its repairs would run from HighRxt past `recover` and at the old
+        // size. The loss it was recovering from has cut the window
+        // already; ending it just deflates cwnd to that.
+        if self.cc.in_recovery() {
+            self.cc.exit_recovery();
+        }
+        self.rto_recover = Some(nxt);
+        self.timeout_recover = Some(nxt);
+        self.high_rxt = una;
+        self.dup_acks = 0;
+        self.er_deadline = None;
+        self.limited_transmit = 0;
+        self.flush_send_queue();
     }
 
     /// Drain any queued outgoing segments.
@@ -651,16 +792,25 @@ impl Conn {
     /// counts in segments, to match: a SYN's MSS applies only after `new`
     /// made one.
     fn set_mss(&mut self, mss: u16) {
-        self.mss = mss.min(self.cfg.mss.max(1));
+        self.mss = mss.min(self.cfg.mss.max(1)).min(self.path_mss);
         self.cc = make_cc(self.cfg.congestion, self.mss as u32);
     }
 
-    fn negotiate_options(&mut self, remote_opts: &[TcpOption]) {
-        let ipv6 = self
-            .cfg
+    fn is_ipv6(&self) -> bool {
+        self.cfg
             .remote_addr
             .or(self.cfg.local_addr)
-            .is_some_and(|a| a.is_ipv6());
+            .is_some_and(|a| a.is_ipv6())
+    }
+
+    /// IP and TCP headers, options aside: what separates the MSS from the
+    /// MTU (RFC 9293 §3.7.1).
+    fn header_overhead(&self) -> u32 {
+        if self.is_ipv6() { 40 + 20 } else { 20 + 20 }
+    }
+
+    fn negotiate_options(&mut self, remote_opts: &[TcpOption]) {
+        let ipv6 = self.is_ipv6();
         self.set_mss(options::peer_mss(remote_opts, ipv6));
         if let Some(ws) = get_wscale(remote_opts) {
             self.snd_wnd_shift = ws.min(14);
@@ -5087,6 +5237,104 @@ mod tests {
         assert_eq!(read_all(&mut c), b"hi");
     }
 
+    fn v6_pair(port: u16) -> (Conn, Conn) {
+        let cfg = |local: u16, remote: u16| {
+            let mut c = big(local, remote);
+            c.mss = 1440;
+            c.send_buf_size = 1 << 20;
+            c.recv_buf_size = 1 << 20;
+            let ip = |port: u16| if port == 80 { "fd00::1" } else { "fd00::2" };
+            c.local_addr = Some(format!("[{}]:{local}", ip(local)).parse().unwrap());
+            c.remote_addr = Some(format!("[{}]:{remote}", ip(remote)).parse().unwrap());
+            c
+        };
+        let mut client = Conn::new(cfg(port, 80));
+        let mut server = Conn::new(cfg(80, port));
+        drive_handshake(&mut client, &mut server);
+        (client, server)
+    }
+
+    /// Wire bytes of a segment as sent over IPv6.
+    fn v6_len(p: &[u8]) -> u32 {
+        40 + p.len() as u32
+    }
+
+    // RFC 8201: a Packet Too Big lowers the MSS to what fits the reported
+    // MTU, and what was in flight at the old size goes again, cut to fit,
+    // without costing the window.
+    #[test]
+    fn packet_too_big_resends_the_flight_at_the_new_size() {
+        let (mut client, mut server) = v6_pair(40402);
+        assert_eq!((client.mss(), client.path_mtu()), (1440, 1500));
+        let (_, flight) = client.write(&[7; 5000]);
+        assert!(flight.iter().all(|p| v6_len(p) == 1500));
+        let cwnd = client.cc.send_window();
+        let rto = client.rto_deadline;
+
+        let first = parse(&flight[0]);
+        // A forged message quoting a SEQ we never sent is ignored.
+        assert!(
+            client
+                .on_icmp_too_big(1400, first.seq.wrapping_sub(1))
+                .is_empty()
+        );
+        assert_eq!(client.mss(), 1440);
+        let resent = client.on_icmp_too_big(1400, first.seq);
+        assert_eq!((client.mss(), client.path_mtu()), (1340, 1400));
+        assert_eq!(client.cc.send_window(), cwnd, "cwnd cut for a MTU drop");
+        assert!(!resent.is_empty());
+        assert!(resent.iter().all(|p| v6_len(p) <= 1400), "still too big");
+        assert_eq!(parse(&resent[0]).seq, first.seq, "not from SND.UNA");
+        assert_eq!(client.rto_deadline.is_some(), rto.is_some());
+
+        // Over a 1400-byte path everything arrives.
+        let mut to_server = resent;
+        let mut got = Vec::new();
+        for _ in 0..50 {
+            let fits: Vec<_> = to_server.drain(..).filter(|p| v6_len(p) <= 1400).collect();
+            let acks = deliver(&mut server, &fits);
+            got.extend(read_all(&mut server));
+            let mut acks = acks;
+            acks.extend(server.take_outgoing());
+            to_server = deliver(&mut client, &acks);
+            if got.len() == 5000 {
+                break;
+            }
+        }
+        assert_eq!(got, [7; 5000]);
+    }
+
+    // The path MTU goes only down, and not below the family's floor; an
+    // IPv4 message without an MTU steps down RFC 1191's plateaus.
+    #[test]
+    fn path_mtu_floors_and_plateaus() {
+        let (mut v6, _) = v6_pair(40403);
+        v6.set_path_mtu(1000);
+        assert_eq!(v6.path_mtu(), 1280, "below IPv6's minimum MTU");
+        v6.set_path_mtu(1400);
+        assert_eq!(v6.path_mtu(), 1280, "went back up");
+
+        let (mut v4, _) = established(40404);
+        assert_eq!(v4.path_mtu(), 1500);
+        v4.set_path_mtu(0);
+        assert_eq!(v4.path_mtu(), 1492);
+        v4.set_path_mtu(0);
+        assert_eq!(v4.path_mtu(), 1006);
+        v4.set_path_mtu(0);
+        assert_eq!(v4.path_mtu(), IPV4_MIN_PATH_MTU);
+        v4.set_path_mtu(100);
+        assert_eq!(v4.path_mtu(), IPV4_MIN_PATH_MTU);
+
+        // Learned before the handshake, it caps what the peer's MSS allows.
+        let mut client = Conn::new(cfg(40405, 80));
+        let mut server = Conn::new(cfg(80, 40405));
+        let syn = client.connect();
+        client.set_path_mtu(1200);
+        let synack = server.accept_syn(&parse(&syn[0]));
+        client.handle_segment(&parse(&synack[0]));
+        assert_eq!(client.mss(), 1160);
+    }
+
     // A cookie connection put back in SYN-RECEIVED resends the cookie's
     // SYN-ACK, and a later segment of the peer's completes it.
     #[test]
@@ -5331,6 +5579,10 @@ mod tests {
             })
         };
         let mut blackout = [0u32; 2];
+        // Each direction's path MTU, which now and then narrows: what no
+        // longer fits is dropped, and its sender told (always: a lost
+        // Packet Too Big is a black hole no TCP gets out of).
+        let mut path_mtu = [u32::MAX; 2];
         let mut step = 0;
         while !done(&sides) {
             step += 1;
@@ -5381,6 +5633,17 @@ mod tests {
                         0
                     };
                     let pkt = links[i].remove(k);
+                    if rng.below(20_000) == 0 {
+                        let now = path_mtu[i].min(sc.mss as u32 + 40);
+                        path_mtu[i] = IPV4_MIN_PATH_MTU + rng.below(now as u64) as u32 / 2;
+                    }
+                    if 20 + pkt.len() as u32 > path_mtu[i] {
+                        let seg = parse(&pkt);
+                        let c = &mut sides[i].conn;
+                        links[i].extend(c.on_icmp_too_big(path_mtu[i], seg.seq));
+                        check_invariants(c, &ctx);
+                        continue;
+                    }
                     // As in lossy_run, the link stops losing while either end
                     // is halfway to giving up, so giving up is the engine's
                     // fault, not the dice's.

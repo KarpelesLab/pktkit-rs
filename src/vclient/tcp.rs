@@ -765,17 +765,28 @@ pub(crate) struct TcpStack {
     listeners: Mutex<HashMap<u16, Arc<ListenerState>>>,
     sink: Arc<dyn Fn(&[u8]) + Send + Sync>,
     next_port: Mutex<u16>,
+    /// The link MTU connections size their segments for (see
+    /// [`ClientConfig::mtu`](super::ClientConfig::mtu)).
+    mtu: u32,
     /// Set by `shutdown`: stops the tick thread and refuses new work.
     stop: Arc<Mutex<bool>>,
 }
 
 impl TcpStack {
+    #[cfg(test)]
     pub fn new(sink: Arc<dyn Fn(&[u8]) + Send + Sync>) -> Arc<TcpStack> {
+        Self::with_mtu(sink, DEFAULT_MTU)
+    }
+
+    /// A stack whose connections size their segments for a link MTU of
+    /// `mtu` bytes.
+    pub fn with_mtu(sink: Arc<dyn Fn(&[u8]) + Send + Sync>, mtu: u32) -> Arc<TcpStack> {
         let stack = Arc::new(TcpStack {
             conns: Mutex::new(HashMap::new()),
             listeners: Mutex::new(HashMap::new()),
             sink,
             next_port: Mutex::new(0),
+            mtu,
             stop: Arc::new(Mutex::new(false)),
         });
         // Tick thread: drive timers for all connections every 100ms. Without
@@ -891,7 +902,7 @@ impl TcpStack {
             remote_addr: Some(remote),
             local_port,
             remote_port: remote.port(),
-            mss: mss_for(remote.ip()),
+            mss: self.mss_for(remote.ip()),
             keepalive: true,
             ..Default::default()
         };
@@ -1112,9 +1123,10 @@ impl TcpStack {
                     // flood cannot lock out peers that really connect. A
                     // full accept queue drops the SYN instead, as Linux
                     // does: a cookie would only lead to a reset.
-                    let synack = listener
-                        .cookies
-                        .generate_syn_ack(&seg, dst, src, mss_for(src));
+                    let synack =
+                        listener
+                            .cookies
+                            .generate_syn_ack(&seg, dst, src, self.mss_for(src));
                     *listener.cookie_sent.lock().unwrap() = Some(Instant::now());
                     (self.sink)(&wrap_segment(dst, src, &synack.marshal()));
                 }
@@ -1191,7 +1203,7 @@ impl TcpStack {
         remote: IpAddr,
         syn: &Segment,
     ) {
-        let mut conn = Conn::new(passive_config(local_ip, remote, syn));
+        let mut conn = Conn::new(passive_config(local_ip, remote, syn, self.mss_for(remote)));
         let synack = conn.accept_syn(syn);
         let key = passive_key(remote, syn);
         let state = ConnState::new(key, local_ip, conn, self.sink.clone(), Some(pending));
@@ -1211,7 +1223,7 @@ impl TcpStack {
         ack: &Segment,
         mss: u16,
     ) {
-        let mut conn = Conn::new(passive_config(local_ip, remote, ack));
+        let mut conn = Conn::new(passive_config(local_ip, remote, ack, self.mss_for(remote)));
         let segs = conn.accept_cookie(ack, ack.ack.wrapping_sub(1), mss);
         let key = passive_key(remote, ack);
         let pending = PendingAccept {
@@ -1241,7 +1253,7 @@ impl TcpStack {
         ack: &Segment,
         mss: u16,
     ) {
-        let mut conn = Conn::new(passive_config(local_ip, remote, ack));
+        let mut conn = Conn::new(passive_config(local_ip, remote, ack, self.mss_for(remote)));
         conn.accept_cookie_syn_received(ack, ack.ack.wrapping_sub(1), mss);
         let key = passive_key(remote, ack);
         let state = ConnState::new(key, local_ip, conn, self.sink.clone(), Some(pending));
@@ -1275,6 +1287,71 @@ impl TcpStack {
         }
     }
 
+    /// The MSS connections to `remote` advertise, and send with at most.
+    fn mss_for(&self, remote: IpAddr) -> u16 {
+        mss_for_mtu(self.mtu, remote)
+    }
+
+    /// Take an ICMP message about a packet we sent. A Fragmentation Needed
+    /// (ICMPv4 type 3 code 4) or Packet Too Big (ICMPv6 type 2) quoting one
+    /// of our TCP segments lowers that connection's path MTU, and what no
+    /// longer fits is sent again cut to size (RFC 1191, RFC 8201). Returns
+    /// `true` if the message was one of those, whether or not it was acted
+    /// on.
+    ///
+    /// Nothing on the path is authenticated, so the quote has to match (RFC
+    /// 5927 §4.1): our address and a connection's ports and peer, and a
+    /// SEQ the connection has sent and not had acknowledged, which vtcp
+    /// checks.
+    pub fn handle_icmp(&self, pkt: &Packet) -> bool {
+        let v6 = match (pkt.version(), pkt.ip_protocol()) {
+            (4, Protocol::ICMP) => false,
+            (6, Protocol::ICMPV6) => true,
+            _ => return false,
+        };
+        let msg = pkt.payload();
+        if msg.len() < 8 {
+            return false;
+        }
+        let mtu = match (v6, msg[0], msg[1]) {
+            (false, 3, 4) => u32::from(u16::from_be_bytes([msg[6], msg[7]])),
+            (true, 2, _) => u32::from_be_bytes([msg[4], msg[5], msg[6], msg[7]]),
+            _ => return false,
+        };
+        if pkt.verify_transport_checksum() != Some(true) {
+            return true;
+        }
+        let inner = Packet::from_slice(&msg[8..]);
+        if inner.version() != pkt.version() || inner.ip_protocol() != Protocol::TCP {
+            return true;
+        }
+        let off = inner.transport_offset();
+        let (Some(ours), Some(remote), Some(tcp)) = (
+            inner.src_addr(),
+            inner.dst_addr(),
+            inner.as_bytes().get(off..off + 8),
+        ) else {
+            return true;
+        };
+        let key = ConnKey {
+            local_port: u16::from_be_bytes([tcp[0], tcp[1]]),
+            remote,
+            remote_port: u16::from_be_bytes([tcp[2], tcp[3]]),
+        };
+        let seq = u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]);
+        let Some(state) = self.conns.lock().unwrap().get(&key).cloned() else {
+            return true;
+        };
+        if state.local_ip != ours || pkt.dst_addr() != Some(ours) {
+            return true;
+        }
+        let mut conn = state.conn.lock().unwrap();
+        state.queue(conn.on_icmp_too_big(mtu, seq));
+        drop(conn);
+        state.flush();
+        true
+    }
+
     fn check_open(&self) -> io::Result<()> {
         if *self.stop.lock().unwrap() {
             return Err(io::Error::new(
@@ -1286,20 +1363,28 @@ impl TcpStack {
     }
 }
 
-/// The MSS we advertise to `remote`: what fits a 1500-byte MTU.
-fn mss_for(remote: IpAddr) -> u16 {
-    if remote.is_ipv6() { 1440 } else { 1460 }
+/// The link MTU when [`ClientConfig::mtu`](super::ClientConfig::mtu) is unset.
+pub(crate) const DEFAULT_MTU: u32 = 1500;
+
+/// The MSS for a link MTU of `mtu` to `remote`: the MTU less the IP and TCP
+/// headers (RFC 9293 §3.7.1), never below vtcp's floor.
+fn mss_for_mtu(mtu: u32, remote: IpAddr) -> u16 {
+    let headers = if remote.is_ipv6() { 60 } else { 40 };
+    mtu.saturating_sub(headers).clamp(
+        u32::from(crate::vtcp::options::MIN_MSS),
+        u32::from(u16::MAX),
+    ) as u16
 }
 
 /// Configuration for a connection opened by `seg`, the peer's SYN or the
 /// ACK completing a cookie handshake.
-fn passive_config(local_ip: IpAddr, remote: IpAddr, seg: &Segment) -> ConnConfig {
+fn passive_config(local_ip: IpAddr, remote: IpAddr, seg: &Segment, mss: u16) -> ConnConfig {
     ConnConfig {
         local_addr: Some(SocketAddr::new(local_ip, seg.dst_port)),
         remote_addr: Some(SocketAddr::new(remote, seg.src_port)),
         local_port: seg.dst_port,
         remote_port: seg.src_port,
-        mss: mss_for(remote),
+        mss,
         keepalive: true,
         ..Default::default()
     }
@@ -1771,6 +1856,45 @@ mod tests {
         let tail = &got[got.len() - 2..];
         assert_eq!(tail[0], (20001, b"x".to_vec()));
         assert_eq!(tail[1], (30000, b"abcd".to_vec()));
+    }
+
+    /// A Fragmentation Needed lowers the MSS of the connection it quotes,
+    /// and only if the quote is of a segment that connection sent.
+    #[test]
+    fn frag_needed_must_quote_one_of_our_segments() {
+        let (stack, out) = capturing_stack();
+        let state = stack
+            .start_dial(IpAddr::V4(US), SocketAddr::from((PEER, 80)))
+            .unwrap();
+        let syn = out.lock().unwrap().remove(0);
+        let router = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 254));
+        let mss = || state.conn.lock().unwrap().mss();
+        let ptb = |quoted: &[u8], mtu: u32| {
+            crate::icmp::packet_too_big(Packet::from_slice(quoted), router, mtu).unwrap()
+        };
+        let handled = |icmp: &[u8]| stack.handle_icmp(Packet::from_slice(icmp));
+
+        // Another port, another peer, another SEQ, a bad checksum, another
+        // source address: all ignored.
+        let mut other = syn.clone();
+        other[20] ^= 1;
+        assert!(handled(&ptb(&other, 1300)));
+        let mut other = syn.clone();
+        other[19] ^= 1;
+        assert!(handled(&ptb(&other, 1300)));
+        let mut other = syn.clone();
+        other[20 + 4] ^= 0x80;
+        assert!(handled(&ptb(&other, 1300)));
+        let mut bad = ptb(&syn, 1300);
+        bad[20 + 6] ^= 1;
+        assert!(handled(&bad));
+        let mut other = syn.clone();
+        other[15] ^= 1;
+        assert!(handled(&ptb(&other, 1300)));
+        assert_eq!(mss(), 1460);
+
+        assert!(handled(&ptb(&syn, 1300)));
+        assert_eq!(mss(), 1260);
     }
 
     /// A SYN-RECEIVED connection gives up after Linux's five SYN-ACK

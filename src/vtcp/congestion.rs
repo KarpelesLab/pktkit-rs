@@ -49,6 +49,13 @@ pub trait CongestionController: Send {
     }
     /// Recovery has completed (cumulative ACK passed `recovery_seq`).
     fn exit_recovery(&mut self);
+    /// The connection now sends segments of `mss` bytes: the path MTU
+    /// turned out smaller than the handshake's MSS allowed. Not a loss
+    /// signal, so the window stays; only the per-segment steps change. The
+    /// default ignores it.
+    fn set_mss(&mut self, mss: u32) {
+        let _ = mss;
+    }
     /// Current congestion window in bytes.
     fn send_window(&self) -> u32;
     /// True while in fast recovery.
@@ -95,6 +102,10 @@ impl NewReno {
 impl CongestionController for NewReno {
     fn on_ack(&mut self, bytes_acked: u32) {
         self.on_new_ack(bytes_acked, u32::MAX);
+    }
+
+    fn set_mss(&mut self, mss: u32) {
+        self.mss = mss.max(1);
     }
 
     fn on_new_ack(&mut self, bytes_acked: u32, flight_size: u32) {
@@ -273,6 +284,10 @@ impl HighSpeed {
 impl CongestionController for HighSpeed {
     fn on_ack(&mut self, bytes_acked: u32) {
         self.on_new_ack(bytes_acked, u32::MAX);
+    }
+
+    fn set_mss(&mut self, mss: u32) {
+        self.mss = mss.max(1);
     }
 
     fn on_new_ack(&mut self, bytes_acked: u32, flight_size: u32) {
