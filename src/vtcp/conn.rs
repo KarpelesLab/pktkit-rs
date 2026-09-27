@@ -47,6 +47,9 @@ pub const MAX_RETRIES: u32 = 8;
 pub const TIME_WAIT_DURATION: Duration = Duration::from_secs(2);
 /// Floor for the Early Retransmit delay, as in Linux's delayed ER.
 const ER_MIN_DELAY: Duration = Duration::from_millis(2);
+/// Minimum spacing of challenge ACKs and out-of-window duplicate ACKs on one
+/// connection (RFC 5961 §7); Linux's `tcp_invalid_ratelimit` default.
+const OOW_ACK_INTERVAL: Duration = Duration::from_millis(500);
 
 pub const DEFAULT_KEEPALIVE_IDLE: Duration = Duration::from_secs(300);
 pub const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
@@ -207,6 +210,9 @@ pub struct Conn {
     /// next hole (RFC 6582 §3.2 applied to timeout recovery), where the
     /// cumulative ACK alone would leave every hole to its own timeout.
     rto_recover: std::option::Option<u32>,
+    /// When we last answered an invalid segment (a challenge ACK or an
+    /// out-of-window duplicate), for the RFC 5961 §7 throttle.
+    last_oow_ack: std::option::Option<Instant>,
     /// Duplicate ACKs since the last new one.
     dup_acks: u32,
     /// HighRxt (RFC 6675): the end of the highest range retransmitted in the
@@ -335,6 +341,7 @@ impl Conn {
             rto_deadline: None,
             retries: 0,
             rto_recover: None,
+            last_oow_ack: None,
             dup_acks: 0,
             high_rxt: 0,
             limited_transmit: 0,
@@ -487,14 +494,13 @@ impl Conn {
 
     /// Skip SYN-RECEIVED and jump straight to ESTABLISHED via a validated
     /// SYN cookie. The handshake is already complete (the SYN-ACK was sent
-    /// statelessly by the cookie engine).
-    pub fn accept_cookie(
-        &mut self,
-        remote_seq: u32,
-        our_iss: u32,
-        mss: u16,
-        initial_data: &[u8],
-    ) -> Vec<Vec<u8>> {
+    /// statelessly by the cookie engine); `ack` is the segment that
+    /// completed it, which [`SynCookies::validate_ack`](super::SynCookies::validate_ack)
+    /// accepted with `mss`. Its payload, if any, is taken as data, and its
+    /// window as the peer's (unscaled: a cookie cannot carry window scaling).
+    pub fn accept_cookie(&mut self, ack: &Segment, our_iss: u32, mss: u16) -> Vec<Vec<u8>> {
+        let remote_seq = ack.seq;
+        let initial_data = &ack.payload[..];
         if self.state != State::Closed && self.state != State::Listen {
             return Vec::new();
         }
@@ -504,11 +510,10 @@ impl Conn {
             our_iss.wrapping_add(1),
         ));
         self.recv_buf = Some(RecvBuf::new(remote_seq, self.cfg.recv_buf_size));
-        // The completing ACK's window is not passed in; without a seed,
-        // MAX.SND.WND of zero would drop every reordered older ACK until
-        // the next window update.
-        let wnd = self.snd_wnd;
-        self.set_snd_wnd(wnd);
+        // Seeds MAX.SND.WND too: at zero, every reordered older ACK would be
+        // dropped until the next window update.
+        self.set_snd_wnd(ack.window as u32);
+        self.snd_wl = Some((ack.seq, ack.ack));
         self.state = State::Established;
         self.signal_established();
 
@@ -686,6 +691,28 @@ impl Conn {
         self.outgoing.push(seg.marshal());
     }
 
+    /// Answer an invalid segment (a challenge ACK, RFC 5961, or the
+    /// duplicate ACK owed to an out-of-window one), throttled as RFC 5961
+    /// §7 asks: at most one per 500 ms per connection, like Linux's
+    /// `tcp_invalid_ratelimit`. Otherwise a blind attacker gets an ACK for
+    /// every guess, and two ends that disagree about the sequence space can
+    /// ACK each other forever. Segments carrying data are exempt, as in
+    /// Linux: they are not part of an ACK loop, and the peer's
+    /// retransmission may be waiting on exactly this ACK.
+    fn queue_oow_ack(&mut self, seg: &Segment) {
+        let carries_data = !seg.payload.is_empty() && !seg.has_flag(flags::SYN);
+        let now = Instant::now();
+        if !carries_data
+            && self
+                .last_oow_ack
+                .is_some_and(|t| now.duration_since(t) < OOW_ACK_INTERVAL)
+        {
+            return;
+        }
+        self.last_oow_ack = Some(now);
+        self.queue_ack();
+    }
+
     fn queue_ack(&mut self) {
         let snd_nxt = self.send_buf.as_ref().map(|s| s.nxt()).unwrap_or(0);
         let rcv_nxt = self.recv_buf.as_ref().map(|r| r.nxt()).unwrap_or(0);
@@ -830,8 +857,13 @@ impl Conn {
                 if seg.seq == rcv_nxt {
                     return (true, false);
                 }
-                let rcv_wnd = rb.window();
-                if seq_in_range(seg.seq, rcv_nxt, rcv_nxt.wrapping_add(rcv_wnd)) {
+                // RFC 5961 §3.2 checks against the window we advertised,
+                // not whatever the buffer could take now, which may be more.
+                let edge = self
+                    .rcv_adv
+                    .filter(|&adv| seq_after(adv, rcv_nxt))
+                    .unwrap_or_else(|| rcv_nxt.wrapping_add(rb.window()));
+                if seq_in_range(seg.seq, rcv_nxt, edge) {
                     (false, true)
                 } else {
                     (false, false)
@@ -884,9 +916,12 @@ impl Conn {
             if !syn_rcvd_simopen {
                 if !seg.has_flag(flags::RST) {
                     if self.state == State::TimeWait && seg.has_flag(flags::FIN) {
+                        // The peer lost our last ACK: always answer.
                         self.restart_time_wait();
+                        self.queue_ack();
+                    } else {
+                        self.queue_oow_ack(seg);
                     }
-                    self.queue_ack();
                 }
                 return self.take_outgoing();
             }
@@ -896,7 +931,7 @@ impl Conn {
         if seg.has_flag(flags::RST) {
             let (accept, challenge) = self.validate_rst(seg);
             if challenge {
-                self.queue_ack();
+                self.queue_oow_ack(seg);
                 return self.take_outgoing();
             }
             if !accept {
@@ -908,7 +943,7 @@ impl Conn {
 
         // 4) SYN in a synchronized state ≠ SYN-RECEIVED → challenge ACK.
         if seg.has_flag(flags::SYN) && self.state != State::SynReceived {
-            self.queue_ack();
+            self.queue_oow_ack(seg);
             return self.take_outgoing();
         }
 
@@ -1225,7 +1260,7 @@ impl Conn {
         // blind attacker who guessed only the SEQ would get its payload in.
         let oldest = una.wrapping_sub(self.max_snd_wnd.min(1 << 30));
         if seq_after(ack, snd_nxt) || seq_before(ack, oldest) {
-            self.queue_ack();
+            self.queue_oow_ack(seg);
             return false;
         }
         // The window comes first: the flush below must see this segment's.
@@ -3158,6 +3193,68 @@ mod tests {
         assert_eq!(get_mss(&synack.options), 1460);
     }
 
+    /// The ACK completing a cookie handshake whose SYN had sequence 1000 and
+    /// whose cookie was 5000.
+    fn cookie_ack() -> Segment {
+        Segment {
+            src_port: 40290,
+            dst_port: 80,
+            seq: 1001,
+            ack: 5001,
+            flags: flags::ACK,
+            window: 29200,
+            ..Default::default()
+        }
+    }
+
+    /// RFC 5961 §7: invalid segments without data draw at most one ACK per
+    /// OOW_ACK_INTERVAL, so a blind attacker gets no oracle per guess.
+    #[test]
+    fn challenge_acks_are_throttled() {
+        let (mut client, server) = established(40360);
+        let nxt = client.recv_buf.as_ref().unwrap().nxt();
+        let (sport, dport) = (server.cfg.local_port, client.cfg.local_port);
+        let rst = move |seq: u32| Segment {
+            src_port: sport,
+            dst_port: dport,
+            seq,
+            flags: flags::RST,
+            ..Default::default()
+        };
+        // In the window but not exact: challenge ACK, once.
+        assert_eq!(client.handle_segment(&rst(nxt.wrapping_add(10))).len(), 1);
+        assert!(client.handle_segment(&rst(nxt.wrapping_add(20))).is_empty());
+        assert_eq!(client.state(), State::Established);
+        client.last_oow_ack = client.last_oow_ack.map(|t| t - OOW_ACK_INTERVAL);
+        assert_eq!(client.handle_segment(&rst(nxt.wrapping_add(30))).len(), 1);
+
+        // A data segment outside the window is always answered: the peer
+        // may be retransmitting because it lost our ACK.
+        let old = Segment {
+            src_port: server.cfg.local_port,
+            dst_port: client.cfg.local_port,
+            seq: nxt.wrapping_sub(100),
+            ack: client.send_buf.as_ref().unwrap().nxt(),
+            flags: flags::ACK,
+            window: 4096,
+            payload: vec![1; 50],
+            ..Default::default()
+        };
+        assert_eq!(client.handle_segment(&old).len(), 1);
+        assert_eq!(client.handle_segment(&old).len(), 1);
+    }
+
+    /// A cookie connection takes the completing ACK's window, and its data.
+    #[test]
+    fn cookie_connection_takes_the_ack_window() {
+        let mut c = Conn::new(cfg(80, 40290));
+        let mut ack = cookie_ack();
+        ack.payload = b"hi".to_vec();
+        c.accept_cookie(&ack, 5000, 1460);
+        assert_eq!(c.snd_wnd, 29200);
+        assert_eq!(read_all(&mut c), b"hi");
+    }
+
     // The congestion controller counts in segments of the negotiated MSS,
     // however the connection was opened.
     #[test]
@@ -3168,7 +3265,7 @@ mod tests {
         assert_eq!(c.cc.send_window(), initial_cwnd, "passive open");
 
         let mut c = Conn::new(cfg(80, 40290));
-        c.accept_cookie(1001, 5000, 536, b"");
+        c.accept_cookie(&cookie_ack(), 5000, 536);
         assert_eq!(c.cc.send_window(), initial_cwnd, "SYN cookie");
 
         let mut c = Conn::new(cfg(80, 40290));
@@ -3354,7 +3451,7 @@ mod tests {
     #[test]
     fn cookie_connection_accepts_slightly_old_ack() {
         let mut c = Conn::new(cfg(80, 40350));
-        c.accept_cookie(1001, 5000, 1460, b"");
+        c.accept_cookie(&cookie_ack(), 5000, 1460);
         let una = c.send_buf.as_ref().unwrap().una();
         let seg = Segment {
             src_port: 40350,
