@@ -552,8 +552,13 @@ impl Stack {
             dst_port,
         };
 
-        // 1) Existing inbound virtual TCP connection (vtcp-backed)?
-        let virt = inner.virt_tcp.lock().expect("poisoned").get(&key).cloned();
+        // 1) Existing inbound virtual TCP connection (vtcp-backed)? One in
+        //    TIME-WAIT gives way to a new connection's SYN on its 4-tuple.
+        let mut virt = inner.virt_tcp.lock().expect("poisoned").get(&key).cloned();
+        if virt.as_ref().is_some_and(|st| takes_new_syn(&st.conn, tcp)) {
+            inner.virt_tcp.lock().expect("poisoned").remove(&key);
+            virt = None;
+        }
         if let Some(state) = virt {
             if let Ok(seg) = Segment::parse(tcp) {
                 state.deliver(&seg);
@@ -573,8 +578,16 @@ impl Stack {
             }
         }
 
-        // 3) Existing outbound NAT connection?
-        let existing = inner.tcp.lock().expect("poisoned").get(&key).cloned();
+        // 3) Existing outbound NAT connection? A new SYN may take over one in
+        //    TIME-WAIT, as above.
+        let mut existing = inner.tcp.lock().expect("poisoned").get(&key).cloned();
+        if existing
+            .as_ref()
+            .is_some_and(|c| takes_new_syn(&c.state().conn, tcp))
+        {
+            inner.tcp.lock().expect("poisoned").remove(&key);
+            existing = None;
+        }
         if let Some(c) = existing {
             return c.handle_segment(tcp);
         }
@@ -861,8 +874,13 @@ impl Stack {
             dst_port,
         };
 
-        // 1) Existing inbound virtual TCP connection (vtcp-backed)?
-        let virt = inner.virt_tcp6.lock().expect("poisoned").get(&key).cloned();
+        // 1) Existing inbound virtual TCP connection (vtcp-backed)? One in
+        //    TIME-WAIT gives way to a new connection's SYN on its 4-tuple.
+        let mut virt = inner.virt_tcp6.lock().expect("poisoned").get(&key).cloned();
+        if virt.as_ref().is_some_and(|st| takes_new_syn(&st.conn, tcp)) {
+            inner.virt_tcp6.lock().expect("poisoned").remove(&key);
+            virt = None;
+        }
         if let Some(state) = virt {
             if let Ok(seg) = Segment::parse(tcp) {
                 state.deliver(&seg);
@@ -882,7 +900,14 @@ impl Stack {
             }
         }
 
-        let existing = inner.tcp6.lock().expect("poisoned").get(&key).cloned();
+        let mut existing = inner.tcp6.lock().expect("poisoned").get(&key).cloned();
+        if existing
+            .as_ref()
+            .is_some_and(|c| takes_new_syn(&c.state().conn, tcp))
+        {
+            inner.tcp6.lock().expect("poisoned").remove(&key);
+            existing = None;
+        }
         if let Some(c) = existing {
             return c.handle_segment(tcp);
         }
@@ -1166,6 +1191,13 @@ impl L3Connector for Stack {
             Ok(())
         }))
     }
+}
+
+/// Whether `tcp` is a new connection's SYN that may take over `conn`'s
+/// 4-tuple, the old connection being in TIME-WAIT (see
+/// [`Conn::accepts_new_syn`](crate::vtcp::Conn::accepts_new_syn)).
+fn takes_new_syn(conn: &Mutex<crate::vtcp::Conn>, tcp: &[u8]) -> bool {
+    Segment::parse(tcp).is_ok_and(|seg| conn.lock().expect("poisoned").accepts_new_syn(&seg))
 }
 
 #[cfg(test)]

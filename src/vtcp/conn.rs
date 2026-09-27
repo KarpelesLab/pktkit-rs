@@ -43,8 +43,11 @@ pub const DEFAULT_RECV_BUF: usize = 1 << 20;
 
 /// Maximum retransmission attempts before declaring the connection dead.
 pub const MAX_RETRIES: u32 = 8;
-/// 2*MSL — shortened from RFC default for virtual environments.
-pub const TIME_WAIT_DURATION: Duration = Duration::from_secs(2);
+/// Default TIME-WAIT length. RFC 9293 asks for 2*MSL (4 minutes); this is
+/// Linux's 60 s, long enough for a delayed segment of the old connection to
+/// die out before a new one can take its 4-tuple. A new connection that
+/// needs the 4-tuple sooner can have it (see [`Conn::accepts_new_syn`]).
+pub const TIME_WAIT_DURATION: Duration = Duration::from_secs(60);
 /// Floor for the Early Retransmit delay, as in Linux's delayed ER.
 const ER_MIN_DELAY: Duration = Duration::from_millis(2);
 /// Minimum spacing of challenge ACKs and out-of-window duplicate ACKs on one
@@ -134,6 +137,8 @@ pub struct ConnConfig {
     /// forever. Measured from the last segment received, so a peer still
     /// sending after our half-close keeps it open. `None` waits forever.
     pub fin_wait2_timeout: Option<Duration>,
+    /// How long TIME-WAIT lasts ([`TIME_WAIT_DURATION`] by default).
+    pub time_wait: Duration,
 }
 
 setters! {
@@ -154,6 +159,7 @@ setters! {
         set send_buf_size: usize;
         set recv_buf_size: usize;
         set fin_wait2_timeout: Option<Duration>;
+        set time_wait: Duration;
     }
 }
 
@@ -176,6 +182,7 @@ impl Default for ConnConfig {
             send_buf_size: DEFAULT_SEND_BUF,
             recv_buf_size: DEFAULT_RECV_BUF,
             fin_wait2_timeout: Some(DEFAULT_FIN_WAIT2_TIMEOUT),
+            time_wait: TIME_WAIT_DURATION,
         }
     }
 }
@@ -1592,13 +1599,30 @@ impl Conn {
     fn start_time_wait(&mut self) {
         self.stop_keepalive();
         self.stop_persist();
-        self.time_wait_deadline = Some(Instant::now() + TIME_WAIT_DURATION);
+        self.time_wait_deadline = Some(Instant::now() + self.cfg.time_wait);
     }
 
     fn restart_time_wait(&mut self) {
         if self.time_wait_deadline.is_some() {
-            self.time_wait_deadline = Some(Instant::now() + TIME_WAIT_DURATION);
+            self.time_wait_deadline = Some(Instant::now() + self.cfg.time_wait);
         }
+    }
+
+    /// Whether `seg`, arriving at this connection, is a new connection's SYN
+    /// that may take over its 4-tuple. True only in TIME-WAIT, for a bare SYN
+    /// numbered beyond anything the old connection used (RFC 9293 §3.10.7.4
+    /// and RFC 6191; Linux's `tcp_timewait_state_process`): nothing of the
+    /// old connection can then be mistaken for the new one's. The caller
+    /// drops this `Conn` and handles the SYN as for a fresh connection.
+    pub fn accepts_new_syn(&self, seg: &Segment) -> bool {
+        self.state == State::TimeWait
+            && seg.has_flag(flags::SYN)
+            && !seg.has_flag(flags::ACK)
+            && !seg.has_flag(flags::RST)
+            && self
+                .recv_buf
+                .as_ref()
+                .is_some_and(|rb| seq_after(seg.seq, rb.nxt()))
     }
 
     fn start_keepalive(&mut self) {
@@ -3205,6 +3229,35 @@ mod tests {
             window: 29200,
             ..Default::default()
         }
+    }
+
+    /// A SYN numbered beyond the old connection may take over a 4-tuple in
+    /// TIME-WAIT (RFC 6191); anything else may not.
+    #[test]
+    fn time_wait_gives_way_only_to_a_newer_syn() {
+        let (mut client, mut server) = established(40370);
+        assert_eq!(client.cfg.time_wait, TIME_WAIT_DURATION);
+        let fin = client.close();
+        let out = deliver(&mut server, &fin);
+        deliver(&mut client, &out);
+        let fin = server.close();
+        deliver(&mut client, &fin);
+        assert_eq!(client.state(), State::TimeWait);
+
+        let rcv_nxt = client.recv_buf.as_ref().unwrap().nxt();
+        let syn = |seq: u32, flags: u8| Segment {
+            src_port: 80,
+            dst_port: 40370,
+            seq,
+            flags,
+            window: 4096,
+            ..Default::default()
+        };
+        assert!(client.accepts_new_syn(&syn(rcv_nxt.wrapping_add(1000), flags::SYN)));
+        assert!(!client.accepts_new_syn(&syn(rcv_nxt.wrapping_sub(1), flags::SYN)));
+        assert!(!client.accepts_new_syn(&syn(rcv_nxt, flags::SYN)));
+        assert!(!client.accepts_new_syn(&syn(rcv_nxt.wrapping_add(1000), flags::SYN | flags::ACK)));
+        assert!(!server.accepts_new_syn(&syn(rcv_nxt.wrapping_add(1000), flags::SYN)));
     }
 
     /// RFC 5961 §7: invalid segments without data draw at most one ACK per

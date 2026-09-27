@@ -639,8 +639,16 @@ impl TcpStack {
             remote_port: seg.src_port,
         };
 
-        // Existing connection (dialed or previously accepted)?
-        let existing = self.conns.lock().unwrap().get(&key).cloned();
+        // Existing connection (dialed or previously accepted)? One in
+        // TIME-WAIT gives way to a new connection's SYN on its 4-tuple.
+        let mut existing = self.conns.lock().unwrap().get(&key).cloned();
+        if existing
+            .as_ref()
+            .is_some_and(|st| st.conn.lock().unwrap().accepts_new_syn(&seg))
+        {
+            self.conns.lock().unwrap().remove(&key);
+            existing = None;
+        }
         if let Some(state) = existing {
             let segs = {
                 let mut conn = state.conn.lock().unwrap();

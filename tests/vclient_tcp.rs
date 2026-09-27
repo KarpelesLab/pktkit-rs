@@ -465,3 +465,64 @@ fn dial_succeeds_when_the_server_closes_straight_away() {
     std::io::Read::read_to_end(&mut conn, &mut got).unwrap();
     assert_eq!(got, b"bye");
 }
+
+/// The listening side closes first and so holds TIME-WAIT, which now lasts
+/// long enough (60 s) that a client reusing its port will meet it. A SYN
+/// numbered beyond the old connection takes the 4-tuple over, as in Linux
+/// (RFC 6191), instead of being refused for a minute.
+#[test]
+fn a_new_syn_takes_over_a_4_tuple_in_time_wait() {
+    let client = pktkit::vclient::Client::new(
+        pktkit::vclient::ClientConfig::default().prefix(IpPrefix::new(IpAddr::V4(CLIENT_IP), 24)),
+    );
+    let new_peer = || {
+        Conn::new(
+            ConnConfig::default()
+                .local_port(PEER_PORT)
+                .remote_port(LISTEN_PORT)
+                .local_addr(SocketAddr::new(IpAddr::V4(PEER_IP), PEER_PORT))
+                .remote_addr(SocketAddr::new(IpAddr::V4(CLIENT_IP), LISTEN_PORT)),
+        )
+    };
+    let peer = Arc::new(Mutex::new(new_peer()));
+    let (c, p) = (client.clone(), peer.clone());
+    client.set_handler(Arc::new(move |pkt: &Packet| {
+        let seg = Segment::parse(pkt.payload()).expect("valid segment");
+        let resp = p.lock().unwrap().handle_segment(&seg);
+        for s in resp {
+            let _ = c.send(Packet::from_slice(&wrap(PEER_IP, CLIENT_IP, &s)));
+        }
+        Ok(())
+    }));
+    let listener = client.listen_tcp(LISTEN_PORT).unwrap();
+    listener.set_nonblocking(true);
+    let send = |segs: Vec<Vec<u8>>| {
+        for s in segs {
+            client
+                .send(Packet::from_slice(&wrap(PEER_IP, CLIENT_IP, &s)))
+                .unwrap();
+        }
+    };
+
+    // Each lock is dropped before sending: the handler takes it again as
+    // the reply loops back through the synchronous link.
+    let syn = peer.lock().unwrap().connect();
+    send(syn);
+    let first = listener.accept().expect("first connection");
+    first.close().unwrap(); // the listening side's FIN goes first
+    let fin = peer.lock().unwrap().close();
+    send(fin);
+    drop(first);
+
+    // RFC 6528 ISNs advance with a 4 µs clock; let it move past the old
+    // connection's sequence space, as any real reuse would.
+    std::thread::sleep(Duration::from_millis(2));
+    *peer.lock().unwrap() = new_peer();
+    let syn = peer.lock().unwrap().connect();
+    send(syn);
+    let second = listener.accept().expect("the new SYN was refused");
+    assert_eq!(
+        second.peer_addr(),
+        SocketAddr::new(IpAddr::V4(PEER_IP), PEER_PORT)
+    );
+}
