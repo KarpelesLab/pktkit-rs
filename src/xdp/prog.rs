@@ -5,7 +5,10 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use super::insn::{Insn, encode};
 use super::netlink;
-use super::sys::{self, LinkCreateAttr, ProgLoadAttr, ProgTestRunAttr, bpf_cmd, ctx_err};
+use super::sys::{
+    self, GetFdByIdAttr, LinkCreateAttr, ObjInfoAttr, ProgInfo, ProgLoadAttr, ProgTestRunAttr,
+    bpf_cmd, ctx_err,
+};
 use crate::Result;
 
 /// The verdict an XDP program returns for a packet.
@@ -212,7 +215,9 @@ impl Program {
         )
         .map_err(|e| ctx_err(&format!("attach {} mode", mode.name()), e))?;
         Ok(Link {
-            kind: LinkKind::Netlink,
+            kind: LinkKind::Netlink {
+                prog_id: prog_id(self.fd.as_raw_fd()).ok(),
+            },
             ifindex,
             mode,
         })
@@ -293,8 +298,9 @@ enum LinkKind {
     /// Held by an fd: the kernel detaches when it closes, so the fd is never
     /// read — only kept.
     Bpf { _link: OwnedFd },
-    /// Attached through `RTM_SETLINK`; must be cleared explicitly.
-    Netlink,
+    /// Attached through `RTM_SETLINK`; must be cleared explicitly, and only
+    /// while the program there is still ours: `prog_id`, if it could be read.
+    Netlink { prog_id: Option<u32> },
 }
 
 /// A live attachment of a [`Program`] to an interface. Detaches on drop.
@@ -321,11 +327,66 @@ impl Link {
 
 impl Drop for Link {
     fn drop(&mut self) {
-        if matches!(self.kind, LinkKind::Netlink) {
-            // The bpf_link case detaches itself when the fd closes.
-            let _ = netlink::set_xdp(self.ifindex, -1, self.mode.0);
+        // The bpf_link case detaches itself when the fd closes.
+        if let LinkKind::Netlink { prog_id } = self.kind {
+            detach_own(self.ifindex, self.mode, prog_id);
         }
     }
+}
+
+/// Detach the netlink attachment in `mode` on `ifindex`, but only if the
+/// program there is still `prog_id`: somebody may have replaced ours since
+/// (`xdp-loader`, `ip link set xdp`, a restarted copy of this process), and a
+/// plain detach would take theirs off.
+fn detach_own(ifindex: u32, mode: Mode, prog_id: Option<u32>) {
+    let Some(id) = prog_id else {
+        // Nothing to compare against; the old, unconditional detach.
+        let _ = netlink::set_xdp(ifindex, -1, mode.0);
+        return;
+    };
+    // The kernel does the comparison itself (5.7+) given a fd for our
+    // program. The `Program` may be closed by now, so the fd is fetched
+    // again by id; if that id no longer exists, it cannot be attached.
+    match prog_fd_by_id(id) {
+        Err(e) if e.raw_os_error() == Some(crate::syscall::ENOENT) => return,
+        Ok(fd) => match netlink::set_xdp_expected(ifindex, -1, mode.0, fd.as_raw_fd()) {
+            // EINVAL: a kernel without XDP_FLAGS_REPLACE. Anything else,
+            // EEXIST above all, means it is not ours to remove.
+            Err(e) if e.raw_os_error() == Some(crate::syscall::EINVAL) => {}
+            _ => return,
+        },
+        Err(_) => {}
+    }
+    // Compare by hand. Not atomic, but the window is one netlink round trip.
+    if netlink::attached_prog_id(ifindex, mode.0).map_or(true, |cur| cur == id) {
+        let _ = netlink::set_xdp(ifindex, -1, mode.0);
+    }
+}
+
+/// The kernel's id for the program behind `fd`.
+fn prog_id(fd: RawFd) -> Result<u32> {
+    let mut info = ProgInfo::default();
+    let mut attr = ObjInfoAttr {
+        bpf_fd: fd as u32,
+        info_len: std::mem::size_of::<ProgInfo>() as u32,
+        info: &mut info as *mut ProgInfo as u64,
+    };
+    // SAFETY: `info` is writable for `info_len` bytes, which caps what the
+    // kernel copies out, and outlives the call.
+    unsafe { bpf_cmd(sys::BPF_OBJ_GET_INFO_BY_FD, &mut attr) }?;
+    Ok(info.id)
+}
+
+/// A new fd for the program with id `id`.
+fn prog_fd_by_id(id: u32) -> Result<OwnedFd> {
+    let mut attr = GetFdByIdAttr {
+        id,
+        ..Default::default()
+    };
+    // SAFETY: attr matches BPF_PROG_GET_FD_BY_ID and holds no pointers.
+    let fd = unsafe { bpf_cmd(sys::BPF_PROG_GET_FD_BY_ID, &mut attr) }?;
+    // SAFETY: fresh owned fd on success.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 /// Force-detach whatever XDP program is on `ifindex`.

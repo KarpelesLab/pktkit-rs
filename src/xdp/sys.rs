@@ -21,6 +21,7 @@ pub const BPF_MAP_UPDATE_ELEM: i32 = 2;
 pub const BPF_MAP_DELETE_ELEM: i32 = 3;
 pub const BPF_PROG_LOAD: i32 = 5;
 pub const BPF_PROG_TEST_RUN: i32 = 10;
+pub const BPF_PROG_GET_FD_BY_ID: i32 = 13;
 pub const BPF_OBJ_GET_INFO_BY_FD: i32 = 15;
 pub const BPF_LINK_CREATE: i32 = 28;
 
@@ -77,6 +78,23 @@ pub struct MapInfo {
     pub map_flags: u32,
 }
 
+/// The leading fields of `struct bpf_prog_info`, as for [`MapInfo`].
+#[repr(C)]
+#[derive(Default)]
+pub struct ProgInfo {
+    pub prog_type: u32,
+    pub id: u32,
+}
+
+/// `bpf_attr` for `BPF_PROG_GET_FD_BY_ID`.
+#[repr(C)]
+#[derive(Default)]
+pub struct GetFdByIdAttr {
+    pub id: u32,
+    pub next_id: u32,
+    pub open_flags: u32,
+}
+
 /// `bpf_attr` for `BPF_PROG_LOAD`.
 #[repr(C)]
 #[derive(Default)]
@@ -131,6 +149,8 @@ const _: () = {
     assert!(std::mem::size_of::<LinkCreateAttr>() == 4 * 4);
     assert!(std::mem::size_of::<ObjInfoAttr>() == 2 * 4 + 8);
     assert!(std::mem::size_of::<MapInfo>() == 6 * 4);
+    assert!(std::mem::size_of::<ProgInfo>() == 2 * 4);
+    assert!(std::mem::size_of::<GetFdByIdAttr>() == 3 * 4);
 };
 
 /// `bpf_attr` for `BPF_LINK_CREATE` against an XDP target.

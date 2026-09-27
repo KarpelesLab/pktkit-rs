@@ -59,7 +59,7 @@ mod nr {
 
 #[cfg(target_os = "linux")]
 pub(crate) use libc::{
-    AF_INET, AF_NETLINK, AF_UNSPEC, AF_XDP, ENODEV, ENOENT, MAP_ANONYMOUS, MAP_HUGETLB,
+    AF_INET, AF_NETLINK, AF_UNSPEC, AF_XDP, EINVAL, ENODEV, ENOENT, MAP_ANONYMOUS, MAP_HUGETLB,
     MAP_POPULATE, MAP_PRIVATE, MAP_SHARED, MSG_DONTWAIT, POLLIN, PROT_READ, PROT_WRITE, SOCK_DGRAM,
     SOCK_RAW, SOL_SOCKET,
 };
@@ -84,6 +84,7 @@ mod consts {
     pub(crate) const MAP_HUGETLB: i32 = 0x40000;
     pub(crate) const ENOENT: i32 = 2;
     pub(crate) const ENODEV: i32 = 19;
+    pub(crate) const EINVAL: i32 = 22;
 }
 #[cfg(target_os = "fullrust")]
 pub(crate) use consts::*;
