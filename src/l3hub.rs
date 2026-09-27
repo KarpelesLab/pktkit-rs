@@ -1,5 +1,5 @@
 use crate::icmp::{self, RateLimiter};
-use crate::l2hub::{DEFAULT_MAX_FORWARD_DEPTH, DepthGuard};
+use crate::l2hub::DepthGuard;
 use crate::{Cleanup, HubCounters, HubStats, L3Device, L3Handler, Packet, Result};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -157,8 +157,10 @@ impl L3Hub {
 
         // Forwarding is a synchronous call chain, so a routing loop between
         // hubs is recursion. The TTL bounds it too, but only at up to 255
-        // frames deep, which is enough to overflow a small thread stack.
-        let _depth = match DepthGuard::enter(DEFAULT_MAX_FORWARD_DEPTH) {
+        // frames deep, which is enough to overflow a small thread stack. The
+        // hub has no limit of its own: it lets a chain run as deep as any
+        // L2Hub on it was allowed to.
+        let _depth = match DepthGuard::enter_shared() {
             Some(g) => g,
             None => {
                 self.stats.record_dropped();
@@ -734,6 +736,24 @@ mod tests {
 
         let hops = e1.sent.load(Ordering::Relaxed) + e2.sent.load(Ordering::Relaxed);
         assert!(hops < 64, "the packet bounced {hops} times");
+    }
+
+    /// A chain an L2Hub was allowed to run deeper than 16 is not cut off
+    /// where it crosses an L3Hub, which used to hold to 16.
+    #[test]
+    fn routing_honours_a_raised_hub_depth() {
+        crate::L2Hub::new().set_max_forward_depth(24);
+        let hub = Arc::new(L3Hub::new());
+        let a = sink("10.0.0.1/24");
+        let b = sink("10.0.1.1/24");
+        let ha = hub.connect(a.clone());
+        let _hb = hub.connect(b.clone());
+        // As if 20 hubs deep already.
+        let _deep: Vec<_> = (0..20)
+            .map(|_| DepthGuard::enter(u32::MAX).unwrap())
+            .collect();
+        hub.route(Packet::from_slice(&v4([10, 0, 0, 1], [10, 0, 1, 9])), ha.id);
+        assert_eq!(count(&b), 1);
     }
 
     #[test]

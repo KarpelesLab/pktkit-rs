@@ -1,4 +1,4 @@
-use crate::l2hub::{DEFAULT_MAX_FORWARD_DEPTH, DepthGuard};
+use crate::l2hub::DepthGuard;
 use crate::{Frame, L2Device, L3Device, Packet};
 use std::sync::Arc;
 
@@ -11,10 +11,11 @@ use std::sync::Arc;
 /// shared elsewhere. Keep `a` for as long as the two should stay connected.
 ///
 /// Delivery is a synchronous call from one device into the other, so a loop
-/// in the topology is recursion. It is cut off, and the frame dropped, at
-/// the same depth as in [`L2Hub`](crate::L2Hub). Two devices that hand what
-/// they are sent straight back to their handler, such as two
-/// [`PipeL2`](crate::PipeL2)s, are such a loop.
+/// in the topology is recursion. It is cut off, and the frame dropped, 16
+/// hops deep on the thread, or as deep as the deepest
+/// [`L2Hub::set_max_forward_depth`](crate::L2Hub::set_max_forward_depth)
+/// allows. Two devices that hand what they are sent straight back to their
+/// handler, such as two [`PipeL2`](crate::PipeL2)s, are such a loop.
 ///
 /// ```
 /// # #[cfg(feature = "l2adapter")] {
@@ -34,7 +35,7 @@ where
 {
     let weak_a = Arc::downgrade(&a);
     b.set_handler(Arc::new(move |f: &Frame| {
-        let Some(_depth) = DepthGuard::enter(DEFAULT_MAX_FORWARD_DEPTH) else {
+        let Some(_depth) = DepthGuard::enter_shared() else {
             return Ok(());
         };
         match weak_a.upgrade() {
@@ -43,7 +44,7 @@ where
         }
     }));
     a.set_handler(Arc::new(move |f: &Frame| {
-        let Some(_depth) = DepthGuard::enter(DEFAULT_MAX_FORWARD_DEPTH) else {
+        let Some(_depth) = DepthGuard::enter_shared() else {
             return Ok(());
         };
         b.send(f)
@@ -61,7 +62,7 @@ where
 {
     let weak_a = Arc::downgrade(&a);
     b.set_handler(Arc::new(move |p: &Packet| {
-        let Some(_depth) = DepthGuard::enter(DEFAULT_MAX_FORWARD_DEPTH) else {
+        let Some(_depth) = DepthGuard::enter_shared() else {
             return Ok(());
         };
         match weak_a.upgrade() {
@@ -70,7 +71,7 @@ where
         }
     }));
     a.set_handler(Arc::new(move |p: &Packet| {
-        let Some(_depth) = DepthGuard::enter(DEFAULT_MAX_FORWARD_DEPTH) else {
+        let Some(_depth) = DepthGuard::enter_shared() else {
             return Ok(());
         };
         b.send(p)
@@ -194,6 +195,33 @@ mod tests {
             .unwrap()
             .join()
             .expect("recursed without bound");
+    }
+
+    /// A chain an L2Hub was allowed to run deeper than 16 is not cut off
+    /// where it crosses a point-to-point link, which used to hold to 16.
+    #[test]
+    fn a_link_honours_a_raised_hub_depth() {
+        crate::L2Hub::new().set_max_forward_depth(24);
+        let m1: MacAddr = "02:00:00:00:00:01".parse().unwrap();
+        let pipe = Arc::new(PipeL2::new(m1));
+        let rec = L2Recorder::default();
+        connect_l2(pipe.clone(), rec.clone());
+        let p3 = Arc::new(PipeL3::new("10.0.0.1/24".parse().unwrap()));
+        let rec3 = L3Recorder::default();
+        connect_l3(p3.clone(), rec3.clone());
+
+        // As if 20 hubs deep already.
+        let _deep: Vec<_> = (0..20)
+            .map(|_| DepthGuard::enter(u32::MAX).unwrap())
+            .collect();
+        let buf = build_frame(m1, m1, EtherType::IPV4, &[1]);
+        pipe.inject(Frame::from_slice(&buf)).unwrap();
+        assert_eq!(rec.inner.lock().unwrap().len(), 1);
+        let mut p = vec![0u8; 20];
+        p[0] = 0x45;
+        p[2..4].copy_from_slice(&20u16.to_be_bytes());
+        p3.inject(Packet::from_slice(&p)).unwrap();
+        assert_eq!(rec3.inner.lock().unwrap().len(), 1);
     }
 
     #[test]

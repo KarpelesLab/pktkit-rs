@@ -2,7 +2,7 @@ use crate::time::Instant;
 use crate::{Frame, HubCounters, HubStats, L2Device, Result};
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -27,6 +27,16 @@ const DEFAULT_PORT_MAC_LIMIT: usize = 1024;
 /// overflows the stack and aborts the process rather than merely wasting
 /// bandwidth. This bounds the chain instead.
 pub(crate) const DEFAULT_MAX_FORWARD_DEPTH: u32 = 16;
+
+/// The deepest any [`L2Hub`] has been allowed to forward, and never less
+/// than the default.
+///
+/// The depth is counted across every hop on the thread, but only `L2Hub`
+/// has a limit of its own. The hops without one (`L3Hub`, `connect_l2`,
+/// `connect_l3`) check against this: a fixed 16 there cut off a chain that
+/// an `L2Hub` had been told to let run deeper, while this still bounds a
+/// loop made of those hops alone.
+static SHARED_MAX_FORWARD_DEPTH: AtomicU32 = AtomicU32::new(DEFAULT_MAX_FORWARD_DEPTH);
 
 static PORT_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -59,6 +69,14 @@ impl DepthGuard {
                 Some(DepthGuard)
             }
         })
+    }
+}
+
+impl DepthGuard {
+    /// [`enter`](Self::enter) for a hop with no limit of its own; see
+    /// [`SHARED_MAX_FORWARD_DEPTH`].
+    pub(crate) fn enter_shared() -> Option<DepthGuard> {
+        Self::enter(SHARED_MAX_FORWARD_DEPTH.load(Ordering::Relaxed))
     }
 }
 
@@ -551,9 +569,18 @@ impl L2Hub {
     ///
     /// Raise this only if a legitimate topology is genuinely deeper than the
     /// default of 16 switches.
+    ///
+    /// The depth is counted per thread across every hop, whatever hub or
+    /// wiring it is: [`L3Hub`](crate::L3Hub)s and
+    /// [`connect_l2`](crate::connect_l2) / [`connect_l3`](crate::connect_l3)
+    /// links count too. Those have no limit of their own and let a chain run
+    /// as deep as the largest this has been set to on any hub in the
+    /// process (16 until then), so raising it here is not undone by them.
+    /// Lowering it binds only this hub.
     pub fn set_max_forward_depth(&self, depth: u32) {
-        self.max_depth
-            .store(depth.max(1) as usize, Ordering::Relaxed);
+        let depth = depth.max(1);
+        self.max_depth.store(depth as usize, Ordering::Relaxed);
+        SHARED_MAX_FORWARD_DEPTH.fetch_max(depth, Ordering::Relaxed);
     }
 
     /// Cap how many addresses may be learned on one port; `None` lifts the cap.
