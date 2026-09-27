@@ -111,6 +111,9 @@ pub struct ConnConfig {
     pub mss: u16,
     pub no_window_scaling: bool,
     pub enable_timestamps: bool,
+    /// Offer SACK (RFC 2018); used only if the peer offers it too. On by
+    /// default: without it a receiver can only report the first hole in the
+    /// stream, and a sender repairs one hole per round trip.
     pub enable_sack: bool,
     pub congestion: CongestionKind,
     pub keepalive: bool,
@@ -151,7 +154,7 @@ impl Default for ConnConfig {
             mss: DEFAULT_MSS,
             no_window_scaling: false,
             enable_timestamps: false,
-            enable_sack: false,
+            enable_sack: true,
             congestion: CongestionKind::default(),
             keepalive: false,
             keepalive_idle: DEFAULT_KEEPALIVE_IDLE,
@@ -1180,19 +1183,20 @@ impl Conn {
     /// Resend the oldest unacknowledged data. Returns false when there is
     /// none (at most the FIN is outstanding).
     fn retransmit(&mut self) -> bool {
-        let data: Vec<u8> = {
-            let s = self.send_buf.as_ref().unwrap();
-            s.retransmit_data(self.mss as usize).to_vec()
-        };
-        if data.is_empty() {
+        let Some((seq, data)) = self
+            .send_buf
+            .as_ref()
+            .unwrap()
+            .retransmit_data(self.mss as usize)
+            .map(|(seq, d)| (seq, d.to_vec()))
+        else {
             return false;
-        }
-        let una = self.send_buf.as_ref().unwrap().una();
+        };
         let rcv_nxt = self.recv_buf.as_ref().unwrap().nxt();
         let mut seg = Segment {
             src_port: self.cfg.local_port,
             dst_port: self.cfg.remote_port,
-            seq: una,
+            seq,
             ack: rcv_nxt,
             flags: flags::ACK | flags::PSH,
             window: self.rcv_window(),
@@ -1399,6 +1403,9 @@ impl Conn {
         self.rto.backoff();
         self.rto.invalidate_timing();
         self.cc.on_timeout();
+        if let Some(sb) = self.send_buf.as_mut() {
+            sb.clear_sacked();
+        }
 
         match self.state {
             State::SynSent => {

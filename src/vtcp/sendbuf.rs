@@ -1,7 +1,11 @@
 //! Sender-side byte buffer with SACK scoreboard.
 
 use super::options::SackBlock;
-use super::seqspace::{seq_after, seq_after_eq, seq_before};
+use super::seqspace::{seq_after, seq_after_eq, seq_before, seq_before_eq};
+
+/// Cap on the SACK scoreboard. Each entry is a range the receiver reported
+/// separately, so this bounds how many holes a peer can make us track.
+const MAX_SACKED: usize = 128;
 
 /// Tracks application data through the TCP send pipeline:
 ///
@@ -19,6 +23,8 @@ pub struct SendBuf {
     cap: usize,
     una: u32,
     nxt: u32,
+    /// Ranges the receiver has SACKed: sorted, disjoint, non-adjacent, and
+    /// all within `una..nxt`.
     sacked: Vec<SackBlock>,
 }
 
@@ -90,23 +96,77 @@ impl SendBuf {
         n
     }
 
-    /// Record the latest SACK scoreboard from the receiver.
+    /// Add the receiver's SACK blocks to the scoreboard.
+    ///
+    /// Blocks accumulate: an ACK carries at most three or four, newest first
+    /// (RFC 2018 §4), so ranges reported earlier are not repeated once more
+    /// recent ones fill the option.
     pub fn mark_sacked(&mut self, blocks: &[SackBlock]) {
-        if blocks.is_empty() {
-            return;
-        }
-        self.sacked.clear();
-        self.sacked.reserve(blocks.len());
         for b in blocks {
-            if seq_after(b.right, self.una) && seq_before(b.left, self.nxt) {
-                self.sacked.push(*b);
+            // Clip to what is actually in flight. D-SACKs (RFC 2883) report
+            // data below UNA and so clip to nothing.
+            let left = if seq_before(b.left, self.una) {
+                self.una
+            } else {
+                b.left
+            };
+            let right = if seq_after(b.right, self.nxt) {
+                self.nxt
+            } else {
+                b.right
+            };
+            if seq_after(right, left) {
+                self.add_sacked(left, right);
             }
         }
+    }
+
+    fn add_sacked(&mut self, mut left: u32, mut right: u32) {
+        let mut merged = Vec::with_capacity(self.sacked.len() + 1);
+        let mut placed = false;
+        for &b in &self.sacked {
+            if seq_before(b.right, left) {
+                merged.push(b);
+            } else if seq_before(right, b.left) {
+                if !placed {
+                    merged.push(SackBlock { left, right });
+                    placed = true;
+                }
+                merged.push(b);
+            } else {
+                // Overlapping or touching: absorb it.
+                if seq_before(b.left, left) {
+                    left = b.left;
+                }
+                if seq_after(b.right, right) {
+                    right = b.right;
+                }
+            }
+        }
+        if !placed {
+            merged.push(SackBlock { left, right });
+        }
+        // Forget the highest range first: it is the last one retransmission
+        // would reach.
+        merged.truncate(MAX_SACKED);
+        self.sacked = merged;
+    }
+
+    /// Forget every SACK. After a retransmission timeout the receiver may
+    /// have discarded what it SACKed, so RFC 2018 §8 has the sender stop
+    /// relying on it.
+    pub fn clear_sacked(&mut self) {
+        self.sacked.clear();
     }
 
     fn prune_sack(&mut self) {
         let una = self.una;
         self.sacked.retain(|b| seq_after(b.right, una));
+        if let Some(first) = self.sacked.first_mut()
+            && seq_before(first.left, una)
+        {
+            first.left = una;
+        }
     }
 
     /// True iff `seq` lies within any SACK block.
@@ -116,37 +176,36 @@ impl SendBuf {
             .any(|b| seq_after_eq(seq, b.left) && seq_before(seq, b.right))
     }
 
-    /// Up to `n` bytes for retransmission starting at UNA, skipping any SACK'd
-    /// ranges (RFC 6675-ish — we won't retransmit data the receiver has).
-    pub fn retransmit_data(&self, n: usize) -> &[u8] {
+    /// The first hole in the in-flight data, for retransmission: its
+    /// sequence number and up to `n` bytes of it. The hole ends where the
+    /// next SACKed range begins, so data the receiver already holds is not
+    /// sent again. `None` when nothing unacknowledged is missing.
+    pub fn retransmit_data(&self, n: usize) -> Option<(u32, &[u8])> {
         let unacked = (self.nxt.wrapping_sub(self.una) as usize).min(self.buf.len());
-
-        if self.sacked.is_empty() {
-            let data = &self.buf[..unacked];
-            return if data.len() > n { &data[..n] } else { data };
-        }
-
-        // Skip over any SACK blocks starting from UNA.
+        let end = self.una.wrapping_add(unacked as u32);
+        // The scoreboard is sorted and never covers UNA itself (that would
+        // be a cumulative ACK), but a range may start right at it.
         let mut seq = self.una;
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for b in &self.sacked {
-                if seq_after_eq(seq, b.left) && seq_before(seq, b.right) {
+        let mut hole_end = end;
+        for b in &self.sacked {
+            if seq_before_eq(b.left, seq) {
+                if seq_after(b.right, seq) {
                     seq = b.right;
-                    changed = true;
                 }
+            } else {
+                hole_end = b.left;
+                break;
             }
         }
-        if seq_after_eq(seq, self.nxt) {
-            return &[];
+        if !seq_before(seq, end) {
+            return None;
         }
-        let offset = seq.wrapping_sub(self.una) as usize;
-        if offset >= unacked {
-            return &[];
+        if seq_after(hole_end, end) {
+            hole_end = end;
         }
-        let data = &self.buf[offset..unacked];
-        if data.len() > n { &data[..n] } else { data }
+        let from = seq.wrapping_sub(self.una) as usize;
+        let len = (hole_end.wrapping_sub(seq) as usize).min(n);
+        Some((seq, &self.buf[from..from + len]))
     }
 
     #[inline]
@@ -229,13 +288,13 @@ mod tests {
             left: 1000,
             right: 1003,
         }]);
-        let data = s.retransmit_data(10);
-        assert_eq!(data, b"3456789");
+        assert_eq!(s.retransmit_data(10), Some((1003, &b"3456789"[..])));
     }
 
     #[test]
-    fn sack_with_hole_at_una_retransmits_from_una() {
-        // UNA=1000, SACK is past UNA — there's a hole at UNA so retransmit from UNA.
+    fn sack_with_hole_at_una_retransmits_only_the_hole() {
+        // UNA=1000, SACK is past UNA — there's a hole at UNA so retransmit
+        // from UNA, stopping where the receiver's data starts.
         let mut s = SendBuf::new(100, 1000);
         s.write(b"0123456789");
         s.advance_sent(10);
@@ -243,7 +302,47 @@ mod tests {
             left: 1003,
             right: 1006,
         }]);
-        let data = s.retransmit_data(10);
-        assert_eq!(data, b"0123456789");
+        assert_eq!(s.retransmit_data(10), Some((1000, &b"012"[..])));
+        assert_eq!(s.retransmit_data(2), Some((1000, &b"01"[..])));
+    }
+
+    #[test]
+    fn sack_blocks_accumulate_and_merge() {
+        let mut s = SendBuf::new(100, 0);
+        s.write(&[7; 50]);
+        s.advance_sent(50);
+        let b = |left, right| SackBlock { left, right };
+        s.mark_sacked(&[b(30, 35)]);
+        s.mark_sacked(&[b(10, 15)]);
+        assert!(s.is_sacked(30), "an earlier report is not forgotten");
+        s.mark_sacked(&[b(15, 20), b(40, 60)]);
+        assert_eq!(s.sacked, vec![b(10, 20), b(30, 35), b(40, 50)]);
+        // A cumulative ACK into a range trims it.
+        s.acknowledge(12);
+        assert_eq!(s.sacked[0], b(12, 20));
+        assert_eq!(s.retransmit_data(100), Some((20, &[7u8; 10][..])));
+        s.clear_sacked();
+        assert_eq!(s.retransmit_data(100), Some((12, &[7u8; 38][..])));
+    }
+
+    #[test]
+    fn dsack_below_una_is_ignored() {
+        let mut s = SendBuf::new(100, 100);
+        s.write(&[1; 10]);
+        s.advance_sent(10);
+        s.mark_sacked(&[SackBlock {
+            left: 90,
+            right: 95,
+        }]);
+        assert_eq!(s.retransmit_data(100), Some((100, &[1u8; 10][..])));
+    }
+
+    #[test]
+    fn nothing_to_retransmit_once_all_is_sacked() {
+        let mut s = SendBuf::new(100, 0);
+        s.write(&[1; 10]);
+        s.advance_sent(10);
+        s.mark_sacked(&[SackBlock { left: 0, right: 10 }]);
+        assert_eq!(s.retransmit_data(100), None);
     }
 }
