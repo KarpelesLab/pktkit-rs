@@ -819,6 +819,83 @@ fn auth_failure_sends_auth_failed_and_stops() {
     assert!(server.peer_config().is_none());
 }
 
+/// With deferred authentication the peer never calls on_auth: it hands the
+/// credentials out and holds the key exchange (and whatever the client says
+/// meanwhile) until complete_auth brings the verdict.
+#[test]
+fn deferred_auth_waits_for_the_verdict() {
+    let hook: OnAuth = Arc::new(|_: &AuthInfo| panic!("on_auth called inline"));
+    let mut server = Peer::new(server_config(), *b"SERVERID", hook)
+        .unwrap()
+        .deferred_auth();
+    let mut client = TestClient::new(*b"CLIENTID");
+    assert!(drive_handshake(&mut server, &mut client));
+    send_client_key_material(&mut client);
+    client.tls.send(b"PUSH_REQUEST\0").unwrap();
+
+    let mut to_server = Vec::new();
+    client.pump_tls(&mut to_server);
+    let reqs = exchange_deferred(&mut server, &mut client, to_server);
+    assert_eq!(reqs.len(), 1, "one request per key exchange");
+    let req = reqs.into_iter().next().unwrap();
+    assert!(server.peer_config().is_none(), "not authenticated yet");
+    assert!(
+        !client
+            .control_text()
+            .windows(10)
+            .any(|w| w == b"PUSH_REPLY"),
+        "PUSH_REQUEST answered before the verdict"
+    );
+
+    let out = server.complete_auth(&req, auth_hook()(&req.info));
+    assert!(out.connected.is_some());
+    assert!(server.peer_config().is_some());
+    let mut to_server = Vec::new();
+    for dg in out.send {
+        to_server.extend(client.handle(&dg));
+    }
+    assert!(exchange_deferred(&mut server, &mut client, to_server).is_empty());
+    assert!(
+        client
+            .control_text()
+            .windows(10)
+            .any(|w| w == b"PUSH_REPLY"),
+        "the waiting PUSH_REQUEST is answered"
+    );
+
+    // A verdict for a key exchange no longer waiting does nothing.
+    let again = server.complete_auth(&req, Err(std::io::Error::other("late")));
+    assert!(again.send.is_empty() && !again.close && again.connected.is_none());
+    assert!(server.peer_config().is_some());
+}
+
+/// Exchange datagrams between a deferred-auth `server` and `client`,
+/// starting from `to_server`, until quiet; returns the auth requests the
+/// server handed out.
+fn exchange_deferred(
+    server: &mut Peer,
+    client: &mut TestClient,
+    mut to_server: Vec<Vec<u8>>,
+) -> Vec<super::peer::AuthRequest> {
+    let mut reqs = Vec::new();
+    for _ in 0..30 {
+        let mut to_client = Vec::new();
+        for dg in to_server.drain(..) {
+            let out = server.handle_packet(&dg).unwrap();
+            assert!(out.connected.is_none(), "connected without a verdict");
+            reqs.extend(out.auth);
+            to_client.extend(out.send);
+        }
+        for dg in to_client {
+            to_server.extend(client.handle(&dg));
+        }
+        if to_server.is_empty() {
+            break;
+        }
+    }
+    reqs
+}
+
 /// A client without auth-user-pass sends its username and password as
 /// OpenVPN's write_empty_string does -- a zero length, not even a NUL -- and
 /// may send no peer info the same way. That is a valid key exchange.

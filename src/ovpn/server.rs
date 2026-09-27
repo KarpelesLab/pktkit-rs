@@ -22,7 +22,7 @@ use std::thread::{self, ThreadId};
 use std::time::Duration;
 
 use super::addr::{PeerKey, Transport};
-use super::peer::{OnAuth, Peer, PeerConfig, PeerTimers};
+use super::peer::{AuthRequest, OnAuth, Peer, PeerConfig, PeerOutput, PeerTimers};
 
 /// Callback fired for each decrypted data-channel payload. Receives the peer
 /// key, the peer's layer (2=tap, 3=tun), and the payload bytes.
@@ -197,6 +197,8 @@ pub struct Server {
     /// The UDP reader and the TCP acceptor, which close() waits for: the
     /// listening sockets are released by the time they exit.
     loops: Mutex<Vec<SocketLoop>>,
+    /// The server itself, for the threads it starts along the way.
+    me: Weak<Server>,
 }
 
 /// A thread serving a listening socket.
@@ -265,7 +267,8 @@ impl Server {
         // A blocking accept cannot be interrupted portably; poll instead.
         tcp.set_nonblocking(true)?;
 
-        let server = Arc::new(Server {
+        let server = Arc::new_cyclic(|me| Server {
+            me: me.clone(),
             cfg,
             udp: RwLock::new(Some(Arc::new(udp))),
             tcp_addr,
@@ -447,7 +450,9 @@ impl Server {
             self.cfg.on_auth.clone(),
         )
         .ok()?
-        .with_timers(self.cfg.timers);
+        .with_timers(self.cfg.timers)
+        // on_auth runs on a thread of its own: see dispatch.
+        .deferred_auth();
         let entry = Arc::new(PeerEntry {
             peer: Mutex::new(peer),
             transport,
@@ -484,7 +489,6 @@ impl Server {
 
     /// Run one inbound datagram through the peer and act on the output.
     fn dispatch(&self, entry: &Arc<PeerEntry>, data: &[u8]) {
-        let key = PeerKey::new(entry.addr, entry.transport);
         let out = {
             let mut peer = entry.peer.lock().unwrap();
             match peer.handle_packet(data) {
@@ -493,7 +497,40 @@ impl Server {
                 Err(_) => return,
             }
         };
+        self.apply(entry, out);
+    }
 
+    /// Check credentials the peer handed out, then complete its
+    /// authentication.
+    ///
+    /// on_auth may be slow (an auth backend round trip) and may call back
+    /// into the server, so it runs on a thread of its own, without the
+    /// peer's lock: on the thread that read the packet it would hold up
+    /// every client behind it, and under the lock it would deadlock
+    /// calling send_to_peer. OpenVPN defers authentication the same way
+    /// (KS_AUTH_DEFERRED).
+    fn start_auth(&self, entry: &Arc<PeerEntry>, req: AuthRequest) {
+        let on_auth = self.cfg.on_auth.clone();
+        let server = self.me.clone();
+        let entry = entry.clone();
+        thread::spawn(move || {
+            let verdict = on_auth(&req.info);
+            let Some(s) = live(&server) else {
+                return;
+            };
+            // A peer dropped meanwhile stays dropped.
+            let key = PeerKey::new(entry.addr, entry.transport);
+            if !s.get_peer(&key).is_some_and(|e| Arc::ptr_eq(&e, &entry)) {
+                return;
+            }
+            let out = entry.peer.lock().unwrap().complete_auth(&req, verdict);
+            s.apply(&entry, out);
+        });
+    }
+
+    /// Act on what the peer produced: send, report, deliver, close.
+    fn apply(&self, entry: &Arc<PeerEntry>, mut out: PeerOutput) {
+        let key = PeerKey::new(entry.addr, entry.transport);
         for dgram in &out.send {
             let _ = self.send_raw(entry, dgram);
         }
@@ -522,6 +559,8 @@ impl Server {
 
         if out.close {
             self.remove_entry(entry);
+        } else if let Some(req) = out.auth.take() {
+            self.start_auth(entry, req);
         }
     }
 
@@ -1232,6 +1271,67 @@ mod tests {
             .unwrap();
         assert_eq!(dec.payload, b"welcome");
         server.close();
+    }
+
+    /// on_auth may be slow -- an auth backend round trip -- and may call
+    /// back into the server: it runs without the peer's lock and off the
+    /// UDP reader, so neither deadlocks nor stalls other clients (OpenVPN
+    /// defers authentication the same way, KS_AUTH_DEFERRED).
+    #[test]
+    fn slow_on_auth_does_not_stall_the_server() {
+        type Slot = Arc<Mutex<Option<(std::sync::Weak<Server>, PeerKey)>>>;
+        let slot: Slot = Arc::default();
+        let (entered_tx, entered) = mpsc::channel::<()>();
+        let (release, release_rx) = mpsc::channel::<()>();
+        let entered_tx = Mutex::new(entered_tx);
+        let release_rx = Mutex::new(release_rx);
+        let on_auth: OnAuth = {
+            let slot = slot.clone();
+            let ok = auth_ok();
+            Arc::new(move |info| {
+                let target = slot.lock().unwrap().clone();
+                if let Some((w, key)) = target
+                    && let Some(s) = w.upgrade()
+                {
+                    // Not ready to carry data yet, but it must not hang.
+                    let _ = s.send_to_peer(&key, b"hello");
+                }
+                let _ = entered_tx.lock().unwrap().send(());
+                let _ = release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10));
+                ok(info)
+            })
+        };
+        let on_data: OnData = Arc::new(|_, _, _| {});
+        let cfg = ServerConfig::new(
+            crate::ovpn::tests::server_config(),
+            "127.0.0.1:0".parse().unwrap(),
+            on_auth,
+            on_data,
+        );
+        let server = Server::new(cfg).unwrap();
+
+        let sock = udp_client(&server);
+        let key = PeerKey::new(sock.local_addr().unwrap(), Transport::Udp);
+        *slot.lock().unwrap() = Some((Arc::downgrade(&server), key));
+        let a = thread::spawn(move || {
+            let mut client = TestClient::new(*b"CLIENT-A");
+            connect_udp(&sock, &mut client);
+        });
+        let in_auth = entered.recv_timeout(Duration::from_secs(10));
+
+        // While A's authentication is under way, B is served.
+        let b = udp_client(&server);
+        b.send(&client_reset(*b"CLIENT-B")).unwrap();
+        let mut buf = [0u8; 2048];
+        let answered = b.recv(&mut buf);
+        let _ = release.send(());
+        let _ = a.join();
+        server.close();
+        assert!(in_auth.is_ok(), "on_auth deadlocked calling send_to_peer");
+        assert!(answered.is_ok(), "server stalled while on_auth ran");
     }
 
     /// on_disconnect pairs with on_connect: a peer that never authenticated

@@ -50,6 +50,6 @@ pub use addr::{PeerKey, Transport};
 pub use consts::{AES, CBC, CipherBlockMethod, CipherCryptoAlg, GCM};
 pub use opcode::Opcode;
 pub use options::Options;
-pub use peer::{AuthInfo, OnAuth, Peer, PeerConfig, PeerOutput, PeerTimers};
+pub use peer::{AuthInfo, AuthRequest, OnAuth, Peer, PeerConfig, PeerOutput, PeerTimers};
 #[cfg(not(target_family = "wasm"))]
 pub use server::{OnConnect, OnData, OnDisconnect, Server, ServerConfig};

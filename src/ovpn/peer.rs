@@ -94,7 +94,40 @@ impl PeerConfig {
 
 /// Authentication callback: given the credentials, return the IP config to push
 /// or an error to reject the connection.
+///
+/// Threading: the [`Server`](super::Server) calls it on a thread of its
+/// own, one per authentication, with no lock held -- the way OpenVPN defers
+/// authentication to a plugin or script (`KS_AUTH_DEFERRED`). It may take
+/// its time (asking an auth backend, say) without holding up other
+/// clients, and may call back into the server, `send_to_peer` included. The
+/// client's handshake window bounds how long it has: a verdict that comes
+/// later is discarded, along with the session. It can still be running when
+/// [`Server::close`](super::Server::close) returns.
+///
+/// A [`Peer`] used on its own calls it inline, from
+/// [`handle_packet`](Peer::handle_packet), unless
+/// [`deferred_auth`](Peer::deferred_auth) hands that job to the caller.
 pub type OnAuth = Arc<dyn Fn(&AuthInfo) -> io::Result<PeerConfig> + Send + Sync>;
+
+/// A client's credentials awaiting a verdict, from a [`Peer`] with
+/// [`deferred_auth`](Peer::deferred_auth): pass it back to
+/// [`Peer::complete_auth`] with the result.
+#[derive(Debug, Clone)]
+pub struct AuthRequest {
+    /// What the client presented.
+    pub info: AuthInfo,
+    /// Names the key exchange awaiting the verdict.
+    token: u64,
+}
+
+/// How a session gets its authentication verdict.
+enum AuthMode {
+    /// From the callback, called there and then.
+    Inline(OnAuth),
+    /// Later, from [`Peer::complete_auth`]; the key exchange is tagged with
+    /// this token meanwhile.
+    Deferred(u64),
+}
 
 /// Effects produced by processing one inbound datagram: raw datagrams to send
 /// back to the peer, and an optional decrypted data-channel payload to deliver.
@@ -113,6 +146,9 @@ pub struct PeerOutput {
     /// client reconnected from the same address), so the old connection is
     /// gone.
     pub replaced: bool,
+    /// With [`Peer::deferred_auth`]: credentials to check, the verdict to
+    /// be passed to [`Peer::complete_auth`].
+    pub auth: Option<AuthRequest>,
     /// True if the connection should be torn down.
     pub close: bool,
     /// Why the connection is being torn down, when `close` is set and the
@@ -200,6 +236,10 @@ pub struct Peer {
     /// starts here and replaces `active` once it authenticates.
     initial: Option<Session>,
     timers: PeerTimers,
+    /// Hand authentication to the caller rather than calling `on_auth`.
+    defer_auth: bool,
+    /// The last [`AuthRequest`] token handed out.
+    next_auth_token: u64,
     /// Last time an accepted packet arrived from the client.
     last_recv: Instant,
     /// Last time we produced a datagram for the client.
@@ -244,6 +284,8 @@ impl Peer {
             active: None,
             initial: None,
             timers: PeerTimers::default(),
+            defer_auth: false,
+            next_auth_token: 0,
             last_recv: Instant::now(),
             last_sent: Instant::now(),
         })
@@ -267,6 +309,15 @@ impl Peer {
     /// Replace the default timers.
     pub fn with_timers(mut self, timers: PeerTimers) -> Peer {
         self.timers = timers;
+        self
+    }
+
+    /// Do not call `on_auth` from [`handle_packet`](Self::handle_packet):
+    /// hand the credentials out as [`PeerOutput::auth`] instead, for the
+    /// caller to check wherever suits it -- without the peer locked, say --
+    /// and report back through [`complete_auth`](Self::complete_auth).
+    pub fn deferred_auth(mut self) -> Peer {
+        self.defer_auth = true;
         self
     }
 
@@ -469,7 +520,12 @@ impl Peer {
             return Err(invalid("control packet for no known session"));
         };
 
-        let on_auth = self.on_auth.clone();
+        let auth = if self.defer_auth {
+            self.next_auth_token += 1;
+            AuthMode::Deferred(self.next_auth_token)
+        } else {
+            AuthMode::Inline(self.on_auth.clone())
+        };
         let config = self.config.clone();
         let timers = self.timers;
         let session = self.session_mut(slot).expect("slot just resolved");
@@ -493,12 +549,17 @@ impl Peer {
             out.send
                 .push(reset.to_bytes(&session.primary.reliable.take_pending_acks()));
         }
-        if let Err(e) = session.process_tls(&tls_bytes, &on_auth, &mut out) {
+        if let Err(e) = session.process_tls(&tls_bytes, &auth, &mut out) {
             self.fail_key(slot, &mut out, e);
             return Ok(out);
         }
+        self.settle(slot, &mut out);
+        Ok(out)
+    }
 
-        // A session that has authenticated takes over the data channel.
+    /// After a session made progress: a session that has authenticated
+    /// takes over the data channel.
+    fn settle(&mut self, slot: Slot, out: &mut PeerOutput) {
         if slot == Slot::Initial && self.initial.as_ref().is_some_and(|s| s.primary.kx_done) {
             let session = self.initial.take();
             out.connected = session.as_ref().and_then(|s| s.peer_cfg.clone());
@@ -509,7 +570,51 @@ impl Peer {
         out.authenticated = self.active.as_ref().is_some_and(|s| {
             s.primary.data.is_some() || s.lame.as_ref().is_some_and(|k| k.data.is_some())
         });
-        Ok(out)
+    }
+
+    /// Finish an authentication handed out as [`PeerOutput::auth`], with
+    /// what [`OnAuth`] -- or whatever stands in for it -- decided.
+    ///
+    /// A request whose key is gone by now (its handshake window ran out,
+    /// the client started over, ...) is ignored, and so is one completed
+    /// twice: the output is then empty.
+    pub fn complete_auth(
+        &mut self,
+        req: &AuthRequest,
+        result: io::Result<PeerConfig>,
+    ) -> PeerOutput {
+        let mut out = PeerOutput::default();
+        let pending = |s: &Option<Session>| {
+            s.as_ref().is_some_and(|s| {
+                s.primary
+                    .auth_pending
+                    .as_ref()
+                    .is_some_and(|(t, _)| *t == req.token)
+            })
+        };
+        let slot = if pending(&self.active) {
+            Slot::Active
+        } else if pending(&self.initial) {
+            Slot::Initial
+        } else {
+            return out;
+        };
+        let session = self.session_mut(slot).expect("slot just resolved");
+        let (_, kx) = session.primary.auth_pending.take().expect("checked above");
+        let res = session.apply_auth(
+            kx,
+            result.map_err(|e| format!("authentication failed: {e}")),
+        );
+        let pumped = session.pump_tls(&mut out);
+        if let Err(e) = res.and(pumped) {
+            self.fail_key(slot, &mut out, e);
+            return out;
+        }
+        self.settle(slot, &mut out);
+        if !out.send.is_empty() {
+            self.last_sent = Instant::now();
+        }
+        out
     }
 
     /// The session's newest key failed to negotiate (TLS error, timeout). A
@@ -671,6 +776,9 @@ struct KeyState {
     /// reused by [`Session::derive_keys`] so the PRF inputs match what was
     /// sent.
     server_random: [u8; 64],
+    /// A key exchange awaiting its authentication verdict, with the token
+    /// of the [`AuthRequest`] handed out for it.
+    auth_pending: Option<(u64, KeyExchange)>,
     data: Option<DataKeys>,
 }
 
@@ -750,6 +858,7 @@ impl KeyState {
             send_from: now + defer,
             must_die: None,
             server_random: [0u8; 64],
+            auth_pending: None,
             data: None,
         })
     }
@@ -845,17 +954,22 @@ impl Session {
     fn process_tls(
         &mut self,
         tls_bytes: &[u8],
-        on_auth: &OnAuth,
+        auth: &AuthMode,
         out: &mut PeerOutput,
     ) -> io::Result<()> {
-        let res = self.advance_tls(tls_bytes, on_auth);
+        let res = self.advance_tls(tls_bytes, auth, &mut out.auth);
         // Flush what the TLS engine queued even on failure (an alert,
         // typically), along with the ACKs we owe.
         let pumped = self.pump_tls(out);
         res.and(pumped)
     }
 
-    fn advance_tls(&mut self, tls_bytes: &[u8], on_auth: &OnAuth) -> io::Result<()> {
+    fn advance_tls(
+        &mut self,
+        tls_bytes: &[u8],
+        auth: &AuthMode,
+        request: &mut Option<AuthRequest>,
+    ) -> io::Result<()> {
         if tls_bytes.is_empty() {
             return Ok(());
         }
@@ -875,7 +989,7 @@ impl Session {
         // the client says on it is acted on any more.
         if self.auth_failed.is_none() {
             self.primary.ctrl_buf.extend_from_slice(&plain);
-            self.advance_control(on_auth)?;
+            self.advance_control(auth, request)?;
             // Whatever is left is an incomplete message; bound how much of
             // one we are willing to hold.
             if self.primary.ctrl_buf.len() > MAX_CONTROL_MESSAGE {
@@ -920,9 +1034,18 @@ impl Session {
     /// Advance the key-method-2 control exchange using whatever plaintext bytes
     /// are buffered. Runs at most once (after which the connection only carries
     /// PUSH_REQUEST and data). Writes the server reply into the TLS writer.
-    fn advance_control(&mut self, on_auth: &OnAuth) -> io::Result<()> {
+    fn advance_control(
+        &mut self,
+        auth: &AuthMode,
+        request: &mut Option<AuthRequest>,
+    ) -> io::Result<()> {
         if self.primary.kx_done {
             return self.handle_post_auth_control();
+        }
+        // Whatever the client sends while its credentials are being checked
+        // (a PUSH_REQUEST, typically) waits for the verdict.
+        if self.primary.auth_pending.is_some() {
+            return Ok(());
         }
 
         // We need the full fixed prefix + four control strings before we can
@@ -945,21 +1068,45 @@ impl Session {
             .send(&reply)
             .map_err(|e| invalid(format!("tls write reply: {e:?}")))?;
 
-        // Authenticate via the hook.
-        let auth = AuthInfo {
+        // A renegotiation re-runs the check (OpenVPN re-verifies the
+        // credentials), but the session keeps the options and config it
+        // pushed: the client does not ask for them again.
+        if let Some(why) = parsed.cipher_refused.clone() {
+            return self.apply_auth(parsed, Err(why));
+        }
+        let info = AuthInfo {
             username: parsed.username.clone(),
             password: parsed.password.clone(),
             peer_info: parsed.peer_info.clone(),
             dev_type: parsed.opts.dev_type.clone(),
         };
-        // A renegotiation re-runs the check (OpenVPN re-verifies the
-        // credentials), but the session keeps the options and config it
-        // pushed: the client does not ask for them again.
-        let cfg = match &parsed.cipher_refused {
-            Some(why) => Err(why.clone()),
-            None => on_auth(&auth).map_err(|e| format!("authentication failed: {e}")),
-        };
-        let cfg = match cfg {
+        match auth {
+            AuthMode::Inline(on_auth) => {
+                let res = on_auth(&info).map_err(|e| format!("authentication failed: {e}"));
+                self.apply_auth(parsed, res)
+            }
+            // The key waits (OpenVPN's KS_AUTH_DEFERRED) until the caller
+            // hands the verdict to Peer::complete_auth; the handshake
+            // window bounds how long.
+            AuthMode::Deferred(token) => {
+                self.primary.auth_pending = Some((*token, parsed));
+                *request = Some(AuthRequest {
+                    info,
+                    token: *token,
+                });
+                Ok(())
+            }
+        }
+    }
+
+    /// Act on the authentication verdict for the key exchange `kx`: refuse
+    /// the client, or generate the key and start the data channel.
+    fn apply_auth(
+        &mut self,
+        kx: KeyExchange,
+        verdict: Result<PeerConfig, String>,
+    ) -> io::Result<()> {
+        let cfg = match verdict {
             Ok(cfg) => cfg,
             Err(why) => {
                 // As OpenVPN's server does (send_auth_failed): tell the
@@ -973,20 +1120,22 @@ impl Session {
                 return Ok(());
             }
         };
-        self.derive_keys(&parsed);
+        self.derive_keys(&kx);
         self.primary.kx_done = true;
         self.primary.established = Some(Instant::now());
         if self.opts.is_none() {
             self.peer_cfg = Some(cfg);
-            self.layer = match parsed.opts.dev_type.as_str() {
+            self.layer = match kx.opts.dev_type.as_str() {
                 "tap" => 2,
                 _ => 3,
             };
-            self.peer_info = parsed.peer_info;
-            self.opts = Some(parsed.opts);
-            self.pushed_cipher = parsed.ncp_cipher;
+            self.peer_info = kx.peer_info;
+            self.opts = Some(kx.opts);
+            self.pushed_cipher = kx.ncp_cipher;
         }
-        Ok(())
+        // Control messages that arrived with the key exchange, or while it
+        // was being checked, are answered now.
+        self.handle_post_auth_control()
     }
 
     /// After authentication the client keeps sending NUL-terminated control
