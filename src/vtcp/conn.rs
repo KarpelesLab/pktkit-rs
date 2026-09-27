@@ -16,8 +16,6 @@ use crate::time::Instant;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use crate::rand;
-
 use super::congestion::{CongestionController, HighSpeed, NewReno};
 use super::options::{
     self, TcpOption, get_mss, get_sack_blocks, get_timestamp, get_wscale, has_sack_perm,
@@ -372,12 +370,22 @@ impl Conn {
 
     // --- Active / passive open --------------------------------------------
 
+    fn new_iss(&self) -> u32 {
+        let c = &self.cfg;
+        super::secret::isn(
+            c.local_addr.map(|a| a.ip()),
+            c.local_port,
+            c.remote_addr.map(|a| a.ip()),
+            c.remote_port,
+        )
+    }
+
     /// Initiate active open (send the initial SYN). Returns the SYN segment.
     pub fn connect(&mut self) -> Vec<Vec<u8>> {
         if self.state != State::Closed {
             return Vec::new();
         }
-        let iss = rand::u32();
+        let iss = self.new_iss();
         self.send_buf = Some(SendBuf::new(self.cfg.send_buf_size, iss));
         self.recv_buf = Some(RecvBuf::new(0, self.cfg.recv_buf_size));
         self.state = State::SynSent;
@@ -412,7 +420,7 @@ impl Conn {
         }
         self.negotiate_options(&syn.options);
 
-        let iss = rand::u32();
+        let iss = self.new_iss();
         self.send_buf = Some(SendBuf::new(self.cfg.send_buf_size, iss));
         self.recv_buf = Some(RecvBuf::new(
             syn.seq.wrapping_add(1),
@@ -2891,6 +2899,19 @@ mod tests {
         let seg = data_with_ack(&client, &server, una.wrapping_sub(1000), b"good", false);
         client.handle_segment(&seg);
         assert_eq!(read_all(&mut client), b"good");
+    }
+
+    // RFC 6528: a new connection on the same 4-tuple starts just past the
+    // last one in sequence space, and only the clock moved in between.
+    #[test]
+    fn isn_follows_rfc6528_clock() {
+        let iss = |_| {
+            let mut c = Conn::new(cfg(40260, 80));
+            c.connect();
+            c.send_buf.as_ref().unwrap().una()
+        };
+        let (first, second) = (iss(0), iss(1));
+        assert!(second.wrapping_sub(first) < 1 << 20, "{first} {second}");
     }
 
     #[test]

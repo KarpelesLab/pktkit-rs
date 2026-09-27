@@ -14,6 +14,7 @@
 //! - RFC 3649: HighSpeed TCP (default controller).
 //! - RFC 7323: window scaling, timestamps (PAWS).
 //! - RFC 2018: SACK.
+//! - RFC 6528: initial sequence numbers from a keyed hash and a clock.
 //! - SYN-cookie engine for stateless half-open completion.
 //!
 //! # Layering: blocking I/O and accept live above this engine
@@ -39,6 +40,7 @@ pub mod conn;
 pub mod options;
 pub mod recvbuf;
 pub mod rto;
+mod secret;
 pub mod segment;
 pub mod sendbuf;
 pub mod seqspace;
