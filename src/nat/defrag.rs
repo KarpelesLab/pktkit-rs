@@ -140,6 +140,10 @@ impl Defragger {
     /// [`process`](Self::process), also returning, for a datagram put
     /// together from fragments, the size they came in.
     pub(crate) fn reassemble(&self, pkt: &[u8]) -> Option<(Vec<u8>, Option<FragMax>)> {
+        self.reassemble_at(pkt, Instant::now())
+    }
+
+    fn reassemble_at(&self, pkt: &[u8], now: Instant) -> Option<(Vec<u8>, Option<FragMax>)> {
         if pkt.len() < 20 {
             return Some((pkt.to_vec(), None));
         }
@@ -181,14 +185,29 @@ impl Defragger {
 
         let mut inner = self.inner.lock().expect("Defragger poisoned");
 
-        // Cap the table; over-budget reassemblies are silently dropped.
-        if !inner.entries.contains_key(&k) && inner.entries.len() >= DEFRAG_MAX_ENTRIES {
-            return None;
+        // Nothing else runs on a timer (the NAT has no maintenance thread,
+        // and there are no threads on wasm), so lapsed reassemblies go here:
+        // left in place, datagrams that never completed would fill the table
+        // and block every later fragmented datagram.
+        inner
+            .entries
+            .retain(|_, e| now.saturating_duration_since(e.created) < DEFRAG_TIMEOUT);
+        // Still full: the oldest reassembly is the least likely to complete,
+        // and makes room, as Linux evicts the oldest queue under pressure.
+        if !inner.entries.contains_key(&k)
+            && inner.entries.len() >= DEFRAG_MAX_ENTRIES
+            && let Some(oldest) = inner
+                .entries
+                .iter()
+                .min_by_key(|(_, e)| e.created)
+                .map(|(k, _)| *k)
+        {
+            inner.entries.remove(&oldest);
         }
 
         let entry = inner.entries.entry(k).or_insert_with(|| FragEntry {
             frags: Vec::new(),
-            created: Instant::now(),
+            created: now,
             total: None,
             max_size: 0,
             max_df_size: 0,
@@ -301,14 +320,15 @@ impl Defragger {
         Some((result, Some(max)))
     }
 
-    /// Drop entries older than the defrag timeout. Call this periodically;
-    /// the NAT's maintenance thread invokes it on its own cadence.
+    /// Drop entries older than the defrag timeout, releasing their memory.
+    /// Optional: [`process`](Self::process) expires lapsed entries itself
+    /// whenever a fragment arrives.
     pub fn sweep(&self) {
         let now = Instant::now();
         let mut inner = self.inner.lock().expect("Defragger poisoned");
         inner
             .entries
-            .retain(|_, e| now.duration_since(e.created) < DEFRAG_TIMEOUT);
+            .retain(|_, e| now.saturating_duration_since(e.created) < DEFRAG_TIMEOUT);
     }
 }
 
@@ -460,5 +480,28 @@ mod tests {
             assert!(d.process(&f).is_none());
         }
         assert!(buffered(&d) <= DEFRAG_MAX_FRAGS);
+    }
+
+    #[test]
+    fn stale_and_surplus_reassemblies_make_room() {
+        let d = Defragger::new();
+        let t0 = Instant::now();
+        // Lone first fragments whose datagrams never complete fill the table.
+        for id in 0..DEFRAG_MAX_ENTRIES as u16 {
+            let f = build_ipv4(id, true, 0, &[1u8; 8]);
+            assert!(d.reassemble_at(&f, t0).is_none());
+        }
+        // A new datagram still gets through, at once and after they lapse.
+        for (id, now) in [
+            (1000, t0),
+            (1001, t0 + DEFRAG_TIMEOUT + Duration::from_secs(1)),
+        ] {
+            let f1 = build_ipv4(id, true, 0, &[1u8; 8]);
+            let f2 = build_ipv4(id, false, 8, &[2u8; 4]);
+            assert!(d.reassemble_at(&f1, now).is_none());
+            assert!(d.reassemble_at(&f2, now).is_some(), "datagram {id}");
+        }
+        // The lapsed ones are gone without anyone calling sweep().
+        assert!(d.inner.lock().unwrap().entries.len() <= 1);
     }
 }
