@@ -1385,6 +1385,15 @@ impl Conn {
             }
             return;
         }
+        if self.rto_recover.is_some() {
+            // SND.UNA is still below `recover` from the last timeout, so these
+            // duplicates report losses that timeout recovery is already
+            // repairing, one partial ACK at a time. Fast retransmit now
+            // would cut ssthresh twice for one loss event and inflate cwnd
+            // far past the single segment slow start restarted from (RFC
+            // 6582 §3.2 step 1, §4.1).
+            return;
+        }
         let sb = self.send_buf.as_ref().unwrap();
         let flight = sb.unacked() as u32;
         let mss = self.mss as u32;
@@ -3003,6 +3012,38 @@ mod tests {
         assert_eq!(seqs(&out), vec![parse(&segs[0]).seq]);
         deliver(&mut server, &out);
         assert_eq!(read_all(&mut server).len(), 3000);
+    }
+
+    /// The first segment is lost and the duplicate ACKs for the rest are
+    /// held up until after the RTO has fired. They report the same loss the
+    /// timeout already handled, so they must not start fast recovery on top
+    /// of it (RFC 6582 §3.2 step 1, §4.1): that would cut ssthresh a second
+    /// time and inflate cwnd from one segment to half the old flight.
+    #[test]
+    fn duplicate_acks_below_rto_recover_do_not_fast_retransmit() {
+        let mut client = Conn::new(big(40225, 80));
+        let mut server = Conn::new(big(80, 40225));
+        drive_handshake(&mut client, &mut server);
+        warm_up(&mut client, &mut server);
+        let (_, segs) = client.write(&[3; 10_000]);
+        assert_eq!(segs.len(), 10);
+        let late_dups = deliver(&mut server, &segs[1..]);
+        assert!(late_dups.len() >= 3);
+
+        let rexmit = fire_rto(&mut client);
+        assert_eq!(seqs(&rexmit), vec![parse(&segs[0]).seq]);
+        let cwnd = client.cc.send_window();
+        let out = deliver(&mut client, &late_dups);
+        assert!(
+            !client.cc.in_recovery(),
+            "fast recovery during RTO recovery"
+        );
+        assert_eq!(client.cc.send_window(), cwnd);
+        assert!(
+            !seqs(&out).contains(&parse(&segs[0]).seq),
+            "resent again, sent {:?}",
+            seqs(&out)
+        );
     }
 
     fn fire_er(c: &mut Conn) -> Vec<Vec<u8>> {
