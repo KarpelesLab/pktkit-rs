@@ -78,10 +78,39 @@ impl ServerConfig {
     }
 }
 
+/// A client's MAC (for an Ethernet client) and the address reserved for
+/// it in [`ServerConfig::static_leases`], if any.
+#[derive(Clone, Copy)]
+struct Reservation {
+    mac: Option<MacAddr>,
+    ip: Option<Ipv4Addr>,
+}
+
 enum Answer {
     Ack(Ipv4Addr),
     Nak,
     Silent,
+}
+
+/// Whom a lease is for. RFC 2131 §4.2: the client identifier (option 61)
+/// when the client sends one, which "MUST" then be the key, and otherwise
+/// the hardware address, taken with its type and length since `chaddr` is
+/// 16 bytes of which only `hlen` are the address.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+enum ClientKey {
+    Id(Vec<u8>),
+    Hw(u8, Vec<u8>),
+}
+
+impl ClientKey {
+    /// `None` for a message whose `hlen` overruns `chaddr`.
+    fn of(p: &wire::Parsed) -> Option<ClientKey> {
+        if let Some(id) = &p.client_id {
+            return Some(ClientKey::Id(id.clone()));
+        }
+        let hw = p.chaddr_field.get(..p.hlen as usize)?;
+        Some(ClientKey::Hw(p.htype, hw.to_vec()))
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -96,7 +125,7 @@ struct Lease {
 pub struct Server {
     cfg: ServerConfig,
     handler: Mutex<Option<L2Handler>>,
-    leases: Mutex<HashMap<MacAddr, Lease>>,
+    leases: Mutex<HashMap<ClientKey, Lease>>,
     declined: Mutex<HashMap<Ipv4Addr, Instant>>,
 }
 
@@ -141,6 +170,10 @@ impl Server {
         if p.op != 1 {
             return; // not a BOOTREQUEST
         }
+        // A hardware address longer than chaddr's 16 bytes is malformed.
+        let Some(key) = ClientKey::of(&p) else {
+            return;
+        };
         // RFC 2131 §4.3.1: a relayed request is for the subnet the relay
         // sits on. This server has one pool; for a relay on any other
         // subnet it has nothing that would work there, so it stays out.
@@ -149,17 +182,17 @@ impl Server {
         }
         match p.msg_type {
             wire::MSG_DISCOVER => {
-                if let Some(ip) = self.allocate(p.chaddr) {
+                if let Some(ip) = self.allocate(&key, self.reservation(&p)) {
                     self.send_reply(&p, from, wire::MSG_OFFER, Some(ip));
                 }
             }
-            wire::MSG_REQUEST => match self.request(&p) {
+            wire::MSG_REQUEST => match self.request(&p, &key) {
                 Answer::Ack(ip) => self.send_reply(&p, from, wire::MSG_ACK, Some(ip)),
                 Answer::Nak => self.send_nak(&p, from),
                 Answer::Silent => {}
             },
-            wire::MSG_RELEASE => self.release(&p),
-            wire::MSG_DECLINE => self.decline(&p),
+            wire::MSG_RELEASE => self.release(&p, &key),
+            wire::MSG_DECLINE => self.decline(&p, &key),
             wire::MSG_INFORM => {
                 self.send_reply(&p, from, wire::MSG_ACK, None);
             }
@@ -174,13 +207,23 @@ impl Server {
     /// naming us as the server and carrying in ciaddr the address it holds
     /// (Table 5). Otherwise anyone could free a client's address for
     /// someone else to be given while the client still uses it.
-    fn release(&self, p: &wire::Parsed) {
+    fn release(&self, p: &wire::Parsed, key: &ClientKey) {
         if p.server_id != Some(self.cfg.server_ip) {
             return;
         }
         let mut leases = self.leases.lock().unwrap();
-        if leases.get(&p.chaddr).is_some_and(|l| l.ip == p.ciaddr) {
-            leases.remove(&p.chaddr);
+        if leases.get(key).is_some_and(|l| l.ip == p.ciaddr) {
+            leases.remove(key);
+        }
+    }
+
+    /// The address reserved for the client that sent `p`, if any.
+    /// Reservations are by MAC, so only an Ethernet client can have one.
+    fn reservation(&self, p: &wire::Parsed) -> Reservation {
+        let mac = (p.htype == 1 && p.hlen == 6).then_some(p.chaddr);
+        Reservation {
+            mac,
+            ip: mac.and_then(|m| self.cfg.static_leases.get(&m).copied()),
         }
     }
 
@@ -193,7 +236,7 @@ impl Server {
     /// be the one this very client was offered or leased. Anything else
     /// would let one station fence off the whole pool, or grow the declined
     /// table without bound.
-    fn decline(&self, p: &wire::Parsed) {
+    fn decline(&self, p: &wire::Parsed, key: &ClientKey) {
         if p.server_id != Some(self.cfg.server_ip) {
             return;
         }
@@ -202,12 +245,12 @@ impl Server {
         };
         let now = Instant::now();
         let mut leases = self.live_leases(now);
-        let ours = leases.get(&p.chaddr).is_some_and(|l| l.ip == ip)
-            || self.cfg.static_leases.get(&p.chaddr) == Some(&ip);
+        let ours =
+            leases.get(key).is_some_and(|l| l.ip == ip) || self.reservation(p).ip == Some(ip);
         if !ours {
             return;
         }
-        leases.remove(&p.chaddr);
+        leases.remove(key);
         let mut declined = self.declined.lock().unwrap();
         // Only addresses we gave out get here, so this bounds only what a
         // pathological configuration (a pool larger than the table) allows.
@@ -220,27 +263,29 @@ impl Server {
     /// The table as of `now`: leases and offers that have run out are
     /// dropped, so they neither keep their address from anyone else nor
     /// count toward [`MAX_LEASES`].
-    fn live_leases(&self, now: Instant) -> std::sync::MutexGuard<'_, HashMap<MacAddr, Lease>> {
+    fn live_leases(&self, now: Instant) -> std::sync::MutexGuard<'_, HashMap<ClientKey, Lease>> {
         let mut leases = self.leases.lock().unwrap();
         leases.retain(|_, l| l.expiry > now);
         self.declined.lock().unwrap().retain(|_, exp| *exp > now);
         leases
     }
 
-    /// Addresses that `mac` cannot have because another client holds them.
+    /// Addresses that client `key` (with reservation `res`) cannot have
+    /// because another client holds or has them reserved.
     fn held_by_others(
         &self,
-        leases: &HashMap<MacAddr, Lease>,
-        mac: MacAddr,
+        leases: &HashMap<ClientKey, Lease>,
+        key: &ClientKey,
+        res: Reservation,
     ) -> std::collections::HashSet<Ipv4Addr> {
         let mut held = std::collections::HashSet::new();
-        for (m, l) in leases {
-            if *m != mac {
+        for (k, l) in leases {
+            if k != key {
                 held.insert(l.ip);
             }
         }
         for (m, ip) in &self.cfg.static_leases {
-            if *m != mac {
+            if Some(*m) != res.mac {
                 held.insert(*ip);
             }
         }
@@ -251,24 +296,24 @@ impl Server {
     /// [`OFFER_HOLD`]: a DISCOVER is unauthenticated and cheap to forge, and
     /// holding the address for a whole lease would let a flood of made-up
     /// client addresses drain the pool.
-    fn allocate(&self, mac: MacAddr) -> Option<Ipv4Addr> {
+    fn allocate(&self, key: &ClientKey, res: Reservation) -> Option<Ipv4Addr> {
         let now = Instant::now();
-        if let Some(ip) = self.cfg.static_leases.get(&mac).copied() {
+        if let Some(ip) = res.ip {
             // A reservation off our subnet could never be ACKed (see
             // `commit`); offering it would only start the same loop.
             return self.on_our_subnet(ip).then_some(ip);
         }
         let mut leases = self.live_leases(now);
-        let held = self.held_by_others(&leases, mac);
+        let held = self.held_by_others(&leases, key, res);
 
-        if let Some(l) = leases.get_mut(&mac) {
+        if let Some(l) = leases.get_mut(key) {
             if !held.contains(&l.ip) {
                 if !l.bound {
                     l.expiry = now + OFFER_HOLD;
                 }
                 return Some(l.ip);
             }
-            leases.remove(&mac);
+            leases.remove(key);
         }
 
         if leases.len() >= MAX_LEASES {
@@ -282,7 +327,7 @@ impl Server {
             .map(Ipv4Addr::from)
             .find(|ip| self.in_pool(*ip) && !held.contains(ip) && !declined.contains_key(ip))?;
         leases.insert(
-            mac,
+            key.clone(),
             Lease {
                 ip,
                 expiry: now + OFFER_HOLD,
@@ -295,23 +340,22 @@ impl Server {
     /// Answer a DHCPREQUEST, telling apart the client states of RFC 2131
     /// §4.3.2 by which of server identifier, requested address and ciaddr
     /// it carries.
-    fn request(&self, p: &wire::Parsed) -> Answer {
+    fn request(&self, p: &wire::Parsed, key: &ClientKey) -> Answer {
         let now = Instant::now();
-        let mac = p.chaddr;
         let mut leases = self.live_leases(now);
         let ip = match (p.server_id, p.requested_ip) {
             // SELECTING, but the client took another server's offer: ours is
             // free again.
             (Some(sid), _) if sid != self.cfg.server_ip => {
-                if leases.get(&mac).is_some_and(|l| !l.bound) {
-                    leases.remove(&mac);
+                if leases.get(key).is_some_and(|l| !l.bound) {
+                    leases.remove(key);
                 }
                 return Answer::Silent;
             }
             // SELECTING our offer, which must be for the address it names.
             (Some(_), Some(ip)) => {
-                if leases.get(&mac).is_some_and(|l| !l.bound && l.ip != ip) {
-                    leases.remove(&mac);
+                if leases.get(key).is_some_and(|l| !l.bound && l.ip != ip) {
+                    leases.remove(key);
                     return Answer::Nak;
                 }
                 ip
@@ -322,14 +366,15 @@ impl Server {
             (None, None) if !p.ciaddr.is_unspecified() => p.ciaddr,
             _ => return Answer::Silent,
         };
-        self.commit(&mut leases, mac, ip, now)
+        self.commit(&mut leases, (key, self.reservation(p)), ip, now)
     }
 
-    /// Bind `ip` to `mac` if the server agrees that is the client's address.
+    /// Bind `ip` to client `key` (with reservation `res`) if the server
+    /// agrees that is the client's address.
     fn commit(
         &self,
-        leases: &mut HashMap<MacAddr, Lease>,
-        mac: MacAddr,
+        leases: &mut HashMap<ClientKey, Lease>,
+        (key, res): (&ClientKey, Reservation),
         ip: Ipv4Addr,
         now: Instant,
     ) -> Answer {
@@ -341,18 +386,18 @@ impl Server {
         if !self.on_our_subnet(ip) {
             return Answer::Nak; // the client moved here from another network
         }
-        if let Some(static_ip) = self.cfg.static_leases.get(&mac).copied() {
+        if let Some(static_ip) = res.ip {
             if ip != static_ip {
                 return Answer::Nak;
             }
-            leases.insert(mac, lease);
+            leases.insert(key.clone(), lease);
             return Answer::Ack(ip);
         }
 
-        let held = self.held_by_others(leases, mac);
-        match leases.get(&mac) {
+        let held = self.held_by_others(leases, key, res);
+        match leases.get(key) {
             Some(l) if l.ip == ip && !held.contains(&ip) => {
-                leases.insert(mac, lease);
+                leases.insert(key.clone(), lease);
                 return Answer::Ack(ip);
             }
             Some(l) if l.bound => return Answer::Nak,
@@ -360,7 +405,7 @@ impl Server {
             // and treat the request like one from a client we have no record
             // of.
             Some(_) => {
-                leases.remove(&mac);
+                leases.remove(key);
             }
             None => {}
         }
@@ -378,7 +423,7 @@ impl Server {
         if leases.len() >= MAX_LEASES {
             return Answer::Silent;
         }
-        leases.insert(mac, lease);
+        leases.insert(key.clone(), lease);
         Answer::Ack(ip)
     }
 
@@ -436,6 +481,7 @@ impl Server {
     /// usable address.
     fn send_nak(&self, p: &wire::Parsed, from: Option<MacAddr>) {
         let mut b = wire::Builder::new(2, p.xid, p.chaddr);
+        b.hardware(p.htype, p.hlen, &p.chaddr_field);
         // Through a relay, the BROADCAST bit tells it to broadcast the NAK
         // on the client's subnet (RFC 2131 §4.1).
         let mut flags = p.flags;
@@ -458,8 +504,11 @@ impl Server {
         yiaddr: Option<Ipv4Addr>,
     ) {
         let mut b = wire::Builder::new(2, p.xid, p.chaddr);
-        // Table 3: flags and giaddr are the client's, echoed back.
-        b.flags(p.flags).giaddr(p.giaddr);
+        // Table 3: htype, hlen, chaddr, flags and giaddr are the client's,
+        // echoed back.
+        b.hardware(p.htype, p.hlen, &p.chaddr_field)
+            .flags(p.flags)
+            .giaddr(p.giaddr);
         if let Some(ip) = yiaddr {
             b.yiaddr(ip);
         }
@@ -592,6 +641,11 @@ impl L2Device for Server {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The lease key of an Ethernet client that sends no client identifier.
+    fn hw(mac: MacAddr) -> ClientKey {
+        ClientKey::Hw(1, mac.octets().to_vec())
+    }
     use crate::dhcp::wire;
     use std::sync::Arc;
 
@@ -701,13 +755,13 @@ mod tests {
         s.handle_dhcp(&release(a, ip, Some(Ipv4Addr::new(10, 0, 0, 2))));
         s.handle_dhcp(&release(a, Ipv4Addr::new(10, 0, 0, 11), us));
         assert_eq!(
-            s.leases.lock().unwrap().get(&a).map(|l| l.ip),
+            s.leases.lock().unwrap().get(&hw(a)).map(|l| l.ip),
             Some(ip),
             "a forged RELEASE freed the lease"
         );
 
         s.handle_dhcp(&release(a, ip, us));
-        assert!(!s.leases.lock().unwrap().contains_key(&a));
+        assert!(!s.leases.lock().unwrap().contains_key(&hw(a)));
     }
 
     type Sent = Arc<Mutex<Vec<Vec<u8>>>>;
@@ -761,7 +815,7 @@ mod tests {
         assert_eq!(replies(&r).last().unwrap().msg_type, wire::MSG_ACK);
 
         // A's lease runs out and B takes the address.
-        s.leases.lock().unwrap().get_mut(&a).unwrap().expiry = Instant::now();
+        s.leases.lock().unwrap().get_mut(&hw(a)).unwrap().expiry = Instant::now();
         s.handle_dhcp(&build_discover(2, b));
         s.handle_dhcp(&request(2, b, ip, server));
         let got = replies(&r);
@@ -782,7 +836,7 @@ mod tests {
         let (s, r) = recording(one_address_pool());
         s.handle_dhcp(&build_discover(1, MacAddr([2, 0, 0, 0, 0, 1])));
         assert_eq!(replies(&r).len(), 1);
-        let held = s.leases.lock().unwrap()[&MacAddr([2, 0, 0, 0, 0, 1])].expiry;
+        let held = s.leases.lock().unwrap()[&hw(MacAddr([2, 0, 0, 0, 0, 1]))].expiry;
         assert!(
             held <= Instant::now() + OFFER_HOLD,
             "a DISCOVER must not reserve the address for a whole lease"
@@ -798,7 +852,7 @@ mod tests {
             for i in 0..MAX_LEASES {
                 let n = i as u32;
                 leases.insert(
-                    MacAddr([2, 1, 0, (n >> 16) as u8, (n >> 8) as u8, n as u8]),
+                    hw(MacAddr([2, 1, 0, (n >> 16) as u8, (n >> 8) as u8, n as u8])),
                     Lease {
                         ip: Ipv4Addr::new(10, 0, 0, 10),
                         expiry: gone,
@@ -887,7 +941,7 @@ mod tests {
         let (s, r) = recording(one_address_pool());
         let mac = MacAddr([2, 0, 0, 0, 0, 1]);
         let ip = bound_lease(&s, &r, mac);
-        s.leases.lock().unwrap().get_mut(&mac).unwrap().expiry =
+        s.leases.lock().unwrap().get_mut(&hw(mac)).unwrap().expiry =
             Instant::now() + Duration::from_secs(5);
 
         let mut m = wire::Builder::new(1, 7, mac);
@@ -898,7 +952,7 @@ mod tests {
         assert_eq!(got[0].msg_type, wire::MSG_ACK);
         assert_eq!(got[0].yiaddr, ip);
         assert!(
-            s.leases.lock().unwrap()[&mac].expiry > Instant::now() + Duration::from_secs(60),
+            s.leases.lock().unwrap()[&hw(mac)].expiry > Instant::now() + Duration::from_secs(60),
             "renewal extends the lease"
         );
 
@@ -1004,12 +1058,12 @@ mod tests {
             s.declined.lock().unwrap().is_empty(),
             "accepted a bad DECLINE"
         );
-        assert_eq!(s.leases.lock().unwrap()[&a].ip, ip, "lease lost");
+        assert_eq!(s.leases.lock().unwrap()[&hw(a)].ip, ip, "lease lost");
 
         // The real thing: A found the address in use.
         s.handle_dhcp(&decline(a, Some(ip), us));
         assert!(s.declined.lock().unwrap().contains_key(&ip));
-        assert!(!s.leases.lock().unwrap().contains_key(&a));
+        assert!(!s.leases.lock().unwrap().contains_key(&hw(a)));
     }
 
     #[test]
@@ -1165,5 +1219,57 @@ mod tests {
         assert_eq!(got[0].server_id, Some(Ipv4Addr::new(10, 0, 0, 1)));
         assert_eq!(got[0].lease_time, None);
         assert!(got[0].yiaddr.is_unspecified());
+    }
+
+    fn two_address_pool() -> ServerConfig {
+        ServerConfig::new(
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(10, 0, 0, 10),
+            Ipv4Addr::new(10, 0, 0, 11),
+        )
+    }
+
+    /// DISCOVER then REQUEST from `mac` with client identifier `id`;
+    /// returns the address ACKed.
+    fn lease_with_id(s: &Server, r: &Sent, mac: MacAddr, id: &[u8]) -> Ipv4Addr {
+        let mut b = wire::Builder::new(1, 1, mac);
+        b.message_type(wire::MSG_DISCOVER)
+            .option(wire::OPT_CLIENT_ID, id);
+        s.handle_dhcp(&b.finish());
+        let ip = replies(r)[0].yiaddr;
+        let mut b = wire::Builder::new(1, 2, mac);
+        b.message_type(wire::MSG_REQUEST)
+            .ipv4_option(wire::OPT_REQUESTED_IP, ip)
+            .ipv4_option(wire::OPT_SERVER_ID, Ipv4Addr::new(10, 0, 0, 1))
+            .option(wire::OPT_CLIENT_ID, id);
+        s.handle_dhcp(&b.finish());
+        let ack = &replies(r)[0];
+        assert_eq!(ack.msg_type, wire::MSG_ACK);
+        ack.yiaddr
+    }
+
+    #[test]
+    fn leases_are_keyed_by_client_identifier_when_given() {
+        let (s, r) = recording(two_address_pool());
+        let mac = MacAddr([2, 0, 0, 0, 0, 1]);
+        // Two clients behind one hardware address (virtual machines on a
+        // shared NIC, or one host's two interfaces), told apart by id.
+        let a = lease_with_id(&s, &r, mac, b"\x00vm-a");
+        let b = lease_with_id(&s, &r, mac, b"\x00vm-b");
+        assert_ne!(a, b, "two clients were given one address");
+
+        // The same client keeps its address when its hardware changes.
+        let again = lease_with_id(&s, &r, MacAddr([2, 0, 0, 0, 0, 9]), b"\x00vm-a");
+        assert_eq!(again, a);
+    }
+
+    #[test]
+    fn an_overlong_hardware_address_is_ignored() {
+        let (s, r) = recording(one_address_pool());
+        let mut msg = build_discover(1, MacAddr([2, 0, 0, 0, 0, 1]));
+        msg[2] = 17; // hlen past the 16-byte chaddr field
+        s.handle_dhcp(&msg);
+        assert!(replies(&r).is_empty());
+        assert!(s.leases.lock().unwrap().is_empty());
     }
 }

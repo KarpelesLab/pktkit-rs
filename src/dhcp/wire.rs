@@ -35,6 +35,7 @@ pub const OPT_MESSAGE_TYPE: u8 = 53;
 pub const OPT_SERVER_ID: u8 = 54;
 pub const OPT_PARAM_REQUEST: u8 = 55;
 pub const OPT_OVERLOAD: u8 = 52;
+pub const OPT_CLIENT_ID: u8 = 61;
 pub const OPT_END: u8 = 255;
 
 /// BOOTP minimum size (header + cookie + a few bytes of options).
@@ -58,7 +59,14 @@ pub struct Parsed {
     /// Relay agent address: non-zero when a BOOTP relay forwarded the
     /// message from another subnet.
     pub giaddr: Ipv4Addr,
+    /// The first six bytes of `chaddr`: the client's MAC on Ethernet.
     pub chaddr: MacAddr,
+    /// Hardware address type (`htype`, 1 for Ethernet) and length (`hlen`).
+    pub htype: u8,
+    pub hlen: u8,
+    /// The whole 16-byte `chaddr` field, of which the first `hlen` bytes
+    /// are the hardware address.
+    pub chaddr_field: [u8; 16],
     pub msg_type: u8,
     pub subnet_mask: Option<Ipv4Addr>,
     pub server_id: Option<Ipv4Addr>,
@@ -72,6 +80,10 @@ pub struct Parsed {
     pub renewal_time: Option<u32>,
     pub rebinding_time: Option<u32>,
     pub requested_ip: Option<Ipv4Addr>,
+    /// Client identifier (option 61): type byte and identifier (RFC 2132
+    /// §9.14). A server keys the client's lease on it when present (RFC
+    /// 2131 §4.2).
+    pub client_id: Option<Vec<u8>>,
 }
 
 impl Default for Parsed {
@@ -84,6 +96,9 @@ impl Default for Parsed {
             yiaddr: Ipv4Addr::UNSPECIFIED,
             giaddr: Ipv4Addr::UNSPECIFIED,
             chaddr: MacAddr::zero(),
+            htype: 0,
+            hlen: 0,
+            chaddr_field: [0; 16],
             msg_type: 0,
             subnet_mask: None,
             server_id: None,
@@ -93,6 +108,7 @@ impl Default for Parsed {
             renewal_time: None,
             rebinding_time: None,
             requested_ip: None,
+            client_id: None,
         }
     }
 }
@@ -120,6 +136,9 @@ impl Parsed {
                 o.copy_from_slice(&b[28..34]);
                 MacAddr(o)
             },
+            htype: b[1],
+            hlen: b[2],
+            chaddr_field: b[28..44].try_into().unwrap(),
             ..Default::default()
         };
         // RFC 3396: an option may come as several instances, which are one
@@ -170,6 +189,7 @@ impl Parsed {
                 OPT_REQUESTED_IP if len == 4 => {
                     p.requested_ip = Some(Ipv4Addr::new(data[0], data[1], data[2], data[3]));
                 }
+                OPT_CLIENT_ID if len >= 2 => p.client_id = Some(data.to_vec()),
                 _ => {}
             }
         }
@@ -222,6 +242,15 @@ impl Builder {
         buf[28..34].copy_from_slice(&chaddr.octets());
         buf[236..240].copy_from_slice(&MAGIC_COOKIE);
         Builder { buf, off: 240 }
+    }
+
+    /// Set the hardware type, length and whole `chaddr` field, for a reply
+    /// that must echo a client's that is not a plain Ethernet MAC.
+    pub fn hardware(&mut self, htype: u8, hlen: u8, chaddr: &[u8; 16]) -> &mut Self {
+        self.buf[1] = htype;
+        self.buf[2] = hlen;
+        self.buf[28..44].copy_from_slice(chaddr);
+        self
     }
 
     /// Set the `yiaddr` ("your address") field — the IP the server is
