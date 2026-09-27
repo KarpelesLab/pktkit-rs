@@ -24,16 +24,31 @@ fn next_port_id() -> u64 {
 
 /// A routing hub that forwards IP packets between connected devices.
 ///
-/// `L3Hub` looks at each packet's destination address: the connected device
-/// owning the longest prefix containing the destination gets the packet, and
-/// no other device does; when that is the sending device itself, the
-/// destination is on its own network and the packet is dropped. Broadcast
-/// and multicast are flooded to every port except the source. A default
-/// route may be configured to absorb packets that don't match any connected
-/// prefix.
+/// Each device's [`addr`](L3Device::addr) is both its own address and the
+/// network it is on. A unicast packet goes to exactly one device, chosen by
+/// its destination:
 ///
-/// A packet that matches no prefix and has no default route is dropped, and
-/// [`stats`](Self::stats) is where that shows up.
+/// 1. The device whose own address it is gets it, whatever prefixes other
+///    devices have. Several hosts can share one subnet this way, each
+///    reached at its own address.
+/// 2. Otherwise the device with the longest prefix containing the
+///    destination, so a narrower network inside a wider one is reachable
+///    whatever order the devices were attached in. Between equally long
+///    prefixes, the device attached first.
+/// 3. If that longest prefix is the sender's own network (or one as long),
+///    the destination is on the sender's side, and no other device on it
+///    owns the address. Handing the packet to a device with a wider network
+///    would leak it there, so it goes to the default route, the gateway
+///    for what nobody here owns.
+/// 4. If no prefix contains the destination, the default route.
+///
+/// A device with no address owns nothing: its unspecified `0.0.0.0/0`
+/// would otherwise match every destination. A packet is never sent back to
+/// the device it came from: one that would be, or that has nowhere to go
+/// (no default route set), is dropped, and [`stats`](Self::stats) is where
+/// that shows up.
+///
+/// Broadcast and multicast are flooded to every port except the source.
 ///
 /// Like a router, the hub decrements the TTL / hop limit of every packet it
 /// routes to one port and drops those that run out, answering with ICMP Time
@@ -194,37 +209,19 @@ impl L3Hub {
             return;
         }
 
-        // Longest prefix wins, so a narrower network inside a wider one is
-        // reachable whatever order the ports were attached in. A device with
-        // no address owns nothing: its unspecified 0.0.0.0/0 would otherwise
-        // match every destination. Catch-alls go through the default route.
-        //
-        // The source port takes part: if its own network is the best match,
-        // the destination is on the sender's side, and handing the packet to
-        // a wider network elsewhere (or the default route) would leak it
-        // there. It is dropped instead of sent back where it came from. On a
-        // tie another port wins, as when several hosts share one subnet.
-        let best = ports
-            .iter()
-            .filter_map(|p| {
-                let prefix = p.dev.addr();
-                (prefix.is_valid() && prefix.contains(dst))
-                    .then_some(((prefix.bits(), p.id != source_id), p))
-            })
-            .max_by_key(|(key, _)| *key);
-        let out = match best {
-            Some((_, p)) if p.id == source_id => None,
-            Some((_, p)) => Some(p),
-            None => {
+        let out = match Self::select(&ports, source_id, dst) {
+            Route::Port(p) => Some(p),
+            Route::Default => {
                 // Copied out rather than matched on the guard: the send below
                 // may re-enter this hub, which would then deadlock on the lock.
                 let default_route = *self.default_route.lock().unwrap();
-                default_route.and_then(|d| ports.iter().find(|p| p.id == d && p.id != source_id))
+                default_route.and_then(|d| ports.iter().find(|p| p.id == d))
             }
         };
-        let Some(out) = out else {
-            // Nowhere to send it: the sender's own network, or no matching
-            // prefix and no usable default route.
+        // Never back where it came from, the default route included.
+        let Some(out) = out.filter(|p| p.id != source_id) else {
+            // Nowhere to send it: the sender itself, or no usable default
+            // route.
             self.stats.record_dropped();
             return;
         };
@@ -241,6 +238,41 @@ impl L3Hub {
         }
         let _ = out.dev.send(fwd);
         self.stats.record_forwarded(1);
+    }
+
+    /// Where a unicast packet to `dst` from `source_id` goes; the rules are
+    /// in the type's documentation.
+    fn select(ports: &[Arc<Port>], source_id: u64, dst: IpAddr) -> Route<'_> {
+        let mut best: Option<(u8, &Arc<Port>)> = None;
+        let mut sender_side = false;
+        for p in ports {
+            let prefix = p.dev.addr();
+            if !prefix.is_valid() || !prefix.contains(dst) {
+                continue;
+            }
+            if prefix.addr() == dst {
+                // The sender's own address included: that is dropped, not
+                // sent on to some network that also contains it.
+                return Route::Port(p);
+            }
+            let bits = prefix.bits();
+            match best {
+                Some((b, _)) if b > bits => continue,
+                Some((b, _)) if b == bits => {}
+                _ => {
+                    best = Some((bits, p));
+                    sender_side = false;
+                }
+            }
+            // Strictly first attached wins a tie, but the sender being one
+            // of the best makes the destination its side's.
+            sender_side |= p.id == source_id;
+        }
+        match best {
+            Some(_) if sender_side => Route::Default,
+            Some((_, p)) => Route::Port(p),
+            None => Route::Default,
+        }
     }
 
     /// Tell the sender of an expired packet, if the hub has an address to
@@ -276,6 +308,11 @@ impl L3Hub {
             *dr = None;
         }
     }
+}
+
+enum Route<'a> {
+    Port(&'a Arc<Port>),
+    Default,
 }
 
 /// `L3Connector` impl: every device is added to the hub; cleanup detaches it.
@@ -434,19 +471,23 @@ mod tests {
         let hub = Arc::new(L3Hub::new());
         let narrow = sink("10.1.0.1/16");
         let wide = sink("10.0.0.1/8");
-        let gw = sink("172.16.0.1/16");
         let hn = hub.connect(narrow.clone());
         let _hw = hub.connect(wide.clone());
+
+        // 10.1.0.9 is on the sender's own /16: not the /8's, and not
+        // echoed back either. With no default route it has nowhere to go.
+        let buf = v4([10, 1, 0, 1], [10, 1, 0, 9]);
+        hub.route(Packet::from_slice(&buf), hn.id);
+        assert_eq!((count(&narrow), count(&wide)), (0, 0));
+        assert_eq!(hub.stats().dropped, 1);
+
+        // With one, it goes there: the gateway for what nobody here owns.
+        let gw = sink("172.16.0.1/16");
         let gw_arc: Arc<dyn L3Device> = Arc::new(gw.clone());
         let _hg = hub.connect_arc(gw_arc.clone());
         hub.set_default_route(&gw_arc);
-
-        // 10.1.0.9 is on the sender's own /16: not the /8's, nor the
-        // default route's, and not echoed back either.
-        let buf = v4([10, 1, 0, 1], [10, 1, 0, 9]);
         hub.route(Packet::from_slice(&buf), hn.id);
-        assert_eq!((count(&narrow), count(&wide), count(&gw)), (0, 0, 0));
-        assert_eq!(hub.stats().dropped, 1);
+        assert_eq!((count(&narrow), count(&wide), count(&gw)), (0, 0, 1));
 
         // Elsewhere in the /8 still goes to the /8.
         let buf = v4([10, 1, 0, 1], [10, 2, 0, 9]);
@@ -459,6 +500,85 @@ mod tests {
         let buf = v4([10, 1, 0, 1], [10, 1, 0, 2]);
         hub.route(Packet::from_slice(&buf), hn.id);
         assert_eq!(count(&peer), 1);
+
+        // And the /8's own address is the /8's, though the /16 is longer.
+        let buf = v4([10, 1, 0, 2], [10, 0, 0, 1]);
+        hub.route(Packet::from_slice(&buf), _hp.id);
+        assert_eq!(count(&wide), 2);
+    }
+
+    /// Several hosts on one subnet: each gets what is addressed to it. The
+    /// longest-prefix tie used to go to the last host attached, whoever the
+    /// packet was for.
+    #[test]
+    fn hosts_sharing_a_subnet_get_their_own_packets() {
+        let hub = Arc::new(L3Hub::new());
+        let hosts: Vec<Sink> = (1..=3).map(|i| sink(&format!("10.0.0.{i}/24"))).collect();
+        let handles: Vec<_> = hosts.iter().map(|h| hub.connect(h.clone())).collect();
+        for (from, h) in handles.iter().enumerate() {
+            for to in 0..3 {
+                let buf = v4([10, 0, 0, from as u8 + 1], [10, 0, 0, to as u8 + 1]);
+                hub.route(Packet::from_slice(&buf), h.id);
+            }
+        }
+        // Each got one from each other host; none its own.
+        for h in &hosts {
+            assert_eq!(count(h), 2);
+        }
+        // Nobody's address, on everyone's subnet, no default route: dropped.
+        let before = hub.stats().dropped;
+        let buf = v4([10, 0, 0, 1], [10, 0, 0, 77]);
+        hub.route(Packet::from_slice(&buf), handles[0].id);
+        assert_eq!(hub.stats().dropped, before + 1);
+        assert!(hosts.iter().all(|h| count(h) == 2));
+    }
+
+    /// A host on a /24 and a default route through a device with a /32:
+    /// what the host sends to its own subnet that nobody here owns goes to
+    /// the default route, as it did before routing by longest prefix, and
+    /// the gateway's own address still reaches the gateway.
+    #[test]
+    fn the_default_route_serves_the_senders_own_subnet() {
+        let hub = Arc::new(L3Hub::new());
+        let a = sink("10.0.0.1/24");
+        let ha = hub.connect(a.clone());
+        let gw = sink("10.0.0.254/32");
+        let gw_arc: Arc<dyn L3Device> = Arc::new(gw.clone());
+        let hg = hub.connect_arc(gw_arc.clone());
+        hub.set_default_route(&gw_arc);
+
+        for dst in [[10, 0, 0, 77], [10, 0, 0, 254], [8, 8, 8, 8]] {
+            let buf = v4([10, 0, 0, 1], dst);
+            hub.route(Packet::from_slice(&buf), ha.id);
+        }
+        assert_eq!((count(&a), count(&gw)), (0, 3));
+
+        // The other way the host's /24 is the only match.
+        let buf = v4([8, 8, 8, 8], [10, 0, 0, 1]);
+        hub.route(Packet::from_slice(&buf), hg.id);
+        let buf = v4([8, 8, 8, 8], [10, 0, 0, 77]);
+        hub.route(Packet::from_slice(&buf), hg.id);
+        assert_eq!(count(&a), 2);
+        // Nor does the default route get its own packets back.
+        let buf = v4([8, 8, 8, 8], [1, 1, 1, 1]);
+        hub.route(Packet::from_slice(&buf), hg.id);
+        assert_eq!(count(&gw), 3);
+    }
+
+    /// Between equally long prefixes on other ports, the first attached
+    /// wins, not whichever was attached last.
+    #[test]
+    fn an_equal_prefix_tie_goes_to_the_first_attached() {
+        let hub = Arc::new(L3Hub::new());
+        let src = sink("192.168.0.1/24");
+        let first = sink("10.0.0.2/24");
+        let second = sink("10.0.0.3/24");
+        let hs = hub.connect(src.clone());
+        let _h1 = hub.connect(first.clone());
+        let _h2 = hub.connect(second.clone());
+        let buf = v4([192, 168, 0, 1], [10, 0, 0, 77]);
+        hub.route(Packet::from_slice(&buf), hs.id);
+        assert_eq!((count(&first), count(&second)), (1, 0));
     }
 
     #[test]
