@@ -106,12 +106,7 @@ impl ConnState {
         let Some(listener) = c.listener.upgrade() else {
             return true;
         };
-        let taken = listener
-            .unaccepted_bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n + len <= UNACCEPTED_BYTES).then_some(n + len)
-            })
-            .is_ok();
+        let taken = crate::stats::add_within(&listener.unaccepted_bytes, len, UNACCEPTED_BYTES);
         if taken {
             c.bytes += len;
         }
@@ -533,11 +528,9 @@ impl ListenerState {
     /// Checked and taken in one step, so SYNs racing on several threads
     /// cannot overrun the cap between them.
     fn reserve_half_open(self: &Arc<Self>) -> Option<PendingAccept> {
-        self.half_open
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < HALF_OPEN_CAP).then_some(n + 1)
-            })
-            .ok()?;
+        if !crate::stats::add_within(&self.half_open, 1, HALF_OPEN_CAP) {
+            return None;
+        }
         Some(PendingAccept {
             listener: self.clone(),
             half_open: true,

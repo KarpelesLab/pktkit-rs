@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// A snapshot of a device's counters, taken at one instant.
 ///
@@ -227,6 +227,26 @@ fn bump(counter: &AtomicU64, by: u64) {
         }
         match counter.compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => return,
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
+/// Add `by` to `counter` unless that would take it past `max`; whether it
+/// was added. For slots and budgets taken from several threads at once:
+/// checked and taken in one step, so racing takers cannot overrun the cap.
+///
+/// A compare-exchange loop rather than `fetch_update`, which newer
+/// toolchains deprecate for a `try_update` missing at this crate's MSRV.
+#[allow(dead_code)] // Only some feature sets take slots.
+pub(crate) fn add_within(counter: &AtomicUsize, by: usize, max: usize) -> bool {
+    let mut cur = counter.load(Ordering::Acquire);
+    loop {
+        let Some(next) = cur.checked_add(by).filter(|&n| n <= max) else {
+            return false;
+        };
+        match counter.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
             Err(actual) => cur = actual,
         }
     }

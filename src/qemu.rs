@@ -563,12 +563,8 @@ impl Listener {
 
     /// Take a peer slot, if one is free.
     fn reserve(&self) -> Option<PeerSlot> {
-        self.peers
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < self.cfg.max_peers).then_some(n + 1)
-            })
-            .ok()?;
-        Some(PeerSlot(self.peers.clone()))
+        crate::stats::add_within(&self.peers, 1, self.cfg.max_peers)
+            .then(|| PeerSlot(self.peers.clone()))
     }
 
     /// Bind a Unix-domain listener. Any stale socket file at `path` is
