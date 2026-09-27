@@ -337,8 +337,18 @@ impl Nat {
             ));
         }
         // An updated forward may point somewhere else: drop the session the
-        // old one set up, and let the next packet build the new one.
-        Self::remove_mapping_at_locked(inner, rk);
+        // old one set up, and let the next packet build the new one. The
+        // same forward again (a UPnP lease renewal) only moves its expiry;
+        // dropping the session would move the host's replies to a fresh
+        // port and lose its connections.
+        let same = inner.forwards.get(&rk).is_some_and(|old| {
+            old.namespace == pf.namespace
+                && old.inside_ip == pf.inside_ip
+                && old.inside_port == pf.inside_port
+        });
+        if !same {
+            Self::remove_mapping_at_locked(inner, rk);
+        }
         inner.forwards.insert(rk, pf);
         Ok(())
     }
@@ -2331,6 +2341,24 @@ mod tests {
         nat.remove_port_forward(PROTO_TCP, 8080);
         nat.outside().send(Packet::from_slice(&syn)).unwrap();
         assert_eq!(i.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn renewing_a_forward_keeps_its_session() {
+        let (nat, i, o) = setup();
+        let server = Ipv4Addr::new(10, 0, 0, 50);
+        let pf = PortForward::new(PROTO_TCP, 8080, server, 80);
+        nat.add_port_forward(pf.clone().expires(soon())).unwrap();
+        let syn = build_tcp(REMOTE, 4444, PUBLIC, 8080, 0x02);
+        nat.outside().send(Packet::from_slice(&syn)).unwrap();
+        assert_eq!(i.lock().unwrap().len(), 1);
+
+        // A UPnP client renews its lease with the same mapping.
+        nat.add_port_forward(pf.expires(soon() + Duration::from_secs(60)))
+            .unwrap();
+        let synack = build_tcp(server, 80, REMOTE, 4444, 0x12);
+        nat.inside().send(Packet::from_slice(&synack)).unwrap();
+        assert_eq!(src_port(&o.lock().unwrap()[0]), 8080);
     }
 
     /// A stand-in for a namespace-attached device: records what the NAT
