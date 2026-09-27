@@ -157,10 +157,74 @@ struct NatInner {
     reverse: HashMap<NatRevKey, NatKey>,
     next_port: u16,
     helpers: Vec<Arc<dyn HelperKind>>,
-    forwards: HashMap<NatRevKey, PortForward>,
+    forwards: Forwards,
     /// The last [`PortForward::id`] handed out.
     forward_id: u64,
     expectations: Vec<Expectation>,
+}
+
+/// Port forwards, by outside port and by the inside endpoint each leads to
+/// (one per endpoint: see [`Nat::add_port_forward`]). The outbound path asks
+/// for every new mapping whether its endpoint is forwarded, and UPnP lets
+/// inside hosts add forwards by the hundred, so that must not be a scan.
+#[derive(Default)]
+struct Forwards {
+    by_port: HashMap<NatRevKey, PortForward>,
+    by_endpoint: HashMap<NatKey, NatRevKey>,
+}
+
+impl Forwards {
+    fn endpoint(pf: &PortForward) -> NatKey {
+        NatKey {
+            ns: pf.namespace,
+            proto: pf.proto,
+            ip: pf.inside_ip,
+            port: pf.inside_port,
+        }
+    }
+
+    fn get(&self, rk: &NatRevKey) -> Option<&PortForward> {
+        self.by_port.get(rk)
+    }
+
+    fn contains_key(&self, rk: &NatRevKey) -> bool {
+        self.by_port.contains_key(rk)
+    }
+
+    /// The forward leading to inside endpoint `k`, if any.
+    fn for_endpoint(&self, k: &NatKey) -> Option<(NatRevKey, &PortForward)> {
+        let rk = *self.by_endpoint.get(k)?;
+        Some((rk, self.by_port.get(&rk)?))
+    }
+
+    fn insert(&mut self, rk: NatRevKey, pf: PortForward) {
+        self.remove(&rk);
+        self.by_endpoint.insert(Self::endpoint(&pf), rk);
+        self.by_port.insert(rk, pf);
+    }
+
+    fn remove(&mut self, rk: &NatRevKey) -> Option<PortForward> {
+        let pf = self.by_port.remove(rk)?;
+        let ep = Self::endpoint(&pf);
+        if self.by_endpoint.get(&ep) == Some(rk) {
+            self.by_endpoint.remove(&ep);
+        }
+        Some(pf)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&NatRevKey, &PortForward)> {
+        self.by_port.iter()
+    }
+
+    fn values(&self) -> impl Iterator<Item = &PortForward> {
+        self.by_port.values()
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&PortForward) -> bool) {
+        self.by_port.retain(|_, pf| keep(pf));
+        let by_port = &self.by_port;
+        self.by_endpoint.retain(|_, rk| by_port.contains_key(rk));
+    }
 }
 
 /// Object-safe enum-like trait so the helper vector can hold both packet and
@@ -197,7 +261,7 @@ impl Nat {
                 reverse: HashMap::new(),
                 next_port: NAT_PORT_MIN,
                 helpers: Vec::new(),
-                forwards: HashMap::new(),
+                forwards: Forwards::default(),
                 forward_id: 0,
                 expectations: Vec::new(),
             }),
@@ -409,18 +473,14 @@ impl Nat {
         let mut inner = self.inner.lock().unwrap();
         let inner = &mut *inner;
         let now = Instant::now();
-        // Lapsed forwards are purged first, so they hold no port or endpoint.
-        let lapsed: Vec<NatRevKey> = inner
-            .forwards
-            .iter()
-            .filter(|(_, f)| f.expires.is_some_and(|e| e < now))
-            .map(|(k, _)| *k)
-            .collect();
-        for k in lapsed {
-            inner.forwards.remove(&k);
-            Self::remove_mapping_at_locked(inner, k);
-        }
+        // A lapsed forward holds neither its port nor its endpoint.
         Self::expire_port_locked(inner, rk, now);
+        if let Some((other, f)) = inner.forwards.for_endpoint(&Forwards::endpoint(&pf))
+            && f.expires.is_some_and(|e| e < now)
+        {
+            inner.forwards.remove(&other);
+            Self::remove_mapping_at_locked(inner, other);
+        }
         if let Some(existing) = inner.forwards.get(&rk)
             && (existing.inside_ip != pf.inside_ip || existing.namespace != pf.namespace)
         {
@@ -438,13 +498,10 @@ impl Nat {
         // REQ-1: endpoint-independent mapping). A second forward to it
         // would move that mapping to whichever port saw traffic last,
         // resetting its sessions and sending every reply from that port.
-        let taken = inner.forwards.iter().any(|(k, f)| {
-            *k != rk
-                && f.proto == pf.proto
-                && f.namespace == pf.namespace
-                && f.inside_ip == pf.inside_ip
-                && f.inside_port == pf.inside_port
-        });
+        let taken = inner
+            .forwards
+            .for_endpoint(&Forwards::endpoint(&pf))
+            .is_some_and(|(k, _)| k != rk);
         if reserved || dynamic || taken {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AddrInUse,
@@ -493,6 +550,22 @@ impl Nat {
             .filter(|pf| pf.expires.is_none_or(|e| e > now))
             .cloned()
             .collect()
+    }
+
+    /// The live forward on `(proto, outside_port)`, if any: what
+    /// [`list_port_forwards`](Self::list_port_forwards) would find there,
+    /// without copying out the whole table.
+    pub(crate) fn port_forward(&self, proto: u8, outside_port: u16) -> Option<PortForward> {
+        let now = Instant::now();
+        let inner = self.inner.lock().unwrap();
+        inner
+            .forwards
+            .get(&NatRevKey {
+                proto,
+                port: outside_port,
+            })
+            .filter(|pf| pf.expires.is_none_or(|e| e > now))
+            .cloned()
     }
 
     /// Create (or reuse) a mapping for a helper-managed connection on the
@@ -771,14 +844,8 @@ impl Nat {
     /// port is free. There is at most one: `add_port_forward` refuses a
     /// second forward to the same endpoint.
     fn forward_port_for_locked(inner: &NatInner, k: NatKey, now: Instant) -> Option<u16> {
-        let (rk, _) = inner.forwards.iter().find(|(_, f)| {
-            f.proto == k.proto
-                && f.namespace == k.ns
-                && f.inside_ip == k.ip
-                && f.inside_port == k.port
-                && f.expires.is_none_or(|e| e >= now)
-        })?;
-        (!inner.reverse.contains_key(rk)).then_some(rk.port)
+        let (rk, f) = inner.forwards.for_endpoint(&k)?;
+        (f.expires.is_none_or(|e| e >= now) && !inner.reverse.contains_key(&rk)).then_some(rk.port)
     }
 
     /// A free outside port. When none is left, idle mappings are reclaimed
@@ -1051,7 +1118,7 @@ impl Nat {
         // Namespace IDs are never reused, so anything aimed at this one is
         // dead weight from now on.
         inner.expectations.retain(|e| e.namespace != ns);
-        inner.forwards.retain(|_, pf| pf.namespace != ns);
+        inner.forwards.retain(|pf| pf.namespace != ns);
         inner.mappings.retain(|k, m| {
             if k.ns == ns {
                 inner.reverse.remove(&NatRevKey {
@@ -2931,13 +2998,15 @@ mod tests {
             .lock()
             .unwrap()
             .forwards
+            .by_port
             .values_mut()
             .for_each(|pf| pf.expires = Some(past));
 
         nat.sweep();
         let inner = nat.inner.lock().unwrap();
         assert!(inner.expectations.is_empty());
-        assert!(inner.forwards.is_empty());
+        assert!(inner.forwards.by_port.is_empty());
+        assert!(inner.forwards.by_endpoint.is_empty());
         // The session the lapsed forward carried is gone as well.
         assert!(inner.reverse.is_empty());
     }
@@ -3841,5 +3910,49 @@ mod tests {
             .find(|m| m.key.port == 6000)
             .unwrap();
         assert!(m.open);
+    }
+
+    #[test]
+    fn the_endpoint_index_follows_forwards() {
+        let (nat, _i, o) = setup();
+        let first_port = |nat: &Nat, o: &StdMutex<Vec<Vec<u8>>>| {
+            let p = build_udp(INSIDE, 53, REMOTE, 9, b"x");
+            nat.inside().send(Packet::from_slice(&p)).unwrap();
+            src_port(&o.lock().unwrap().pop().unwrap())
+        };
+        nat.add_port_forward(PortForward::new(PROTO_UDP, 20000, INSIDE, 53))
+            .unwrap();
+        assert_eq!(first_port(&nat, &o), 20000);
+
+        // Moved to another port: the endpoint follows.
+        nat.remove_port_forward(PROTO_UDP, 20000);
+        nat.add_port_forward(PortForward::new(PROTO_UDP, 20001, INSIDE, 53))
+            .unwrap();
+        assert_eq!(first_port(&nat, &o), 20001);
+
+        // A lapsed forward no longer claims the endpoint.
+        nat.remove_port_forward(PROTO_UDP, 20001);
+        let past = Instant::now() - Duration::from_secs(1);
+        nat.add_port_forward(PortForward::new(PROTO_UDP, 20002, INSIDE, 53).expires(past))
+            .unwrap();
+        nat.add_port_forward(PortForward::new(PROTO_UDP, 20003, INSIDE, 53))
+            .unwrap();
+        assert_eq!(first_port(&nat, &o), 20003);
+
+        // Handed to another endpoint: this one is free again.
+        nat.remove_port_forward(PROTO_UDP, 20003);
+        let other = Ipv4Addr::new(10, 0, 0, 9);
+        nat.add_port_forward(PortForward::new(PROTO_UDP, 20004, INSIDE, 53))
+            .unwrap();
+        nat.remove_port_forward(PROTO_UDP, 20004);
+        nat.add_port_forward(PortForward::new(PROTO_UDP, 20004, other, 53))
+            .unwrap();
+        nat.add_port_forward(PortForward::new(PROTO_UDP, 20005, INSIDE, 53))
+            .unwrap();
+        let inner = nat.inner.lock().unwrap();
+        assert_eq!(
+            inner.forwards.by_endpoint.len(),
+            inner.forwards.by_port.len()
+        );
     }
 }

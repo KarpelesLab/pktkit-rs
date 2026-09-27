@@ -31,7 +31,7 @@ use crate::time::Instant;
 use crate::vtcp::segment::Segment;
 use crate::vtcp::{Conn, ConnConfig};
 use crate::{Packet, Protocol, checksum, combine_checksums, pseudo_header_checksum};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -51,19 +51,41 @@ const MAX_CTRL_CONNS: usize = 64;
 /// exchange takes milliseconds, and nothing else drives the engine's timers.
 const CTRL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Default [`UPnPConfig::max_mappings`].
+const DEFAULT_MAX_MAPPINGS: usize = 1024;
+/// Default [`UPnPConfig::max_per_client`].
+const DEFAULT_MAX_PER_CLIENT: usize = 128;
+/// Default [`UPnPConfig::lease_duration`]: 7 days, the longest lease
+/// WANIPConnection:2 allows.
+const DEFAULT_MAX_LEASE: Duration = Duration::from_secs(604_800);
+
 /// Configuration knobs for the UPnP IGD helper.
+///
+/// Any inside host may ask for mappings, so the defaults bound what one can
+/// take. Forwards hold outside ports, most of them in the range the NAT
+/// hands out to its own sessions, and a host that took them all would leave
+/// none for anyone else's traffic. By default there are at most 1024
+/// mappings in all (under 2% of that range) and 128 per host, on
+/// unprivileged ports only (1024-65535, as in miniupnpd's sample
+/// configuration), each for at most 7 days.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct UPnPConfig {
     /// TCP port for the SOAP control server (default 5000).
     pub control_port: u16,
-    /// Allowed outside port ranges `(low, high)` inclusive. Empty = allow all.
+    /// Allowed outside port ranges `(low, high)` inclusive. Empty = allow
+    /// all. Default: 1024-65535.
     pub allowed_ports: Vec<(u16, u16)>,
-    /// Maximum total port forwards (0 = unlimited).
+    /// Maximum mappings made through UPnP, in all (0 = unlimited). Static
+    /// forwards do not count. Default: 1024.
     pub max_mappings: usize,
-    /// Maximum port forwards per inside IP (0 = unlimited).
+    /// Maximum mappings made through UPnP per inside host (0 = unlimited).
+    /// Default: 128.
     pub max_per_client: usize,
-    /// Maximum lease duration (`None` = permanent allowed).
+    /// Longest lease granted; a longer request is cut to it, and a request
+    /// for 0 (permanent, in IGD:1) gets it. `None` grants permanent
+    /// mappings. Default: 7 days, the longest lease WANIPConnection:2
+    /// allows.
     pub lease_duration: Option<Duration>,
 }
 
@@ -81,10 +103,10 @@ impl Default for UPnPConfig {
     fn default() -> Self {
         UPnPConfig {
             control_port: 5000,
-            allowed_ports: Vec::new(),
-            max_mappings: 0,
-            max_per_client: 0,
-            lease_duration: None,
+            allowed_ports: vec![(1024, 65535)],
+            max_mappings: DEFAULT_MAX_MAPPINGS,
+            max_per_client: DEFAULT_MAX_PER_CLIENT,
+            lease_duration: Some(DEFAULT_MAX_LEASE),
         }
     }
 }
@@ -133,6 +155,98 @@ struct Owned {
     id: u64,
 }
 
+/// The forwards UPnP made, by `(proto, outside port)` and by client, so that
+/// neither a request nor the caps need a scan of every forward. A record
+/// counts only while its very forward is in place; one whose forward lapsed
+/// or was removed or replaced behind UPnP's back is dropped when found.
+#[derive(Debug, Default)]
+struct OwnedTable {
+    by_port: HashMap<(u8, u16), Owned>,
+    by_client: HashMap<(u64, Ipv4Addr), HashSet<(u8, u16)>>,
+}
+
+impl OwnedTable {
+    fn live(nat: &Nat, (proto, port): (u8, u16), rec: &Owned) -> bool {
+        nat.port_forward(proto, port)
+            .is_some_and(|pf| pf.id == rec.id)
+    }
+
+    fn insert(&mut self, key: (u8, u16), rec: Owned) {
+        self.remove(key);
+        self.by_client
+            .entry((rec.ns, rec.ip))
+            .or_default()
+            .insert(key);
+        self.by_port.insert(key, rec);
+    }
+
+    fn remove(&mut self, key: (u8, u16)) {
+        let Some(rec) = self.by_port.remove(&key) else {
+            return;
+        };
+        let client = (rec.ns, rec.ip);
+        if let Some(keys) = self.by_client.get_mut(&client) {
+            keys.remove(&key);
+            if keys.is_empty() {
+                self.by_client.remove(&client);
+            }
+        }
+    }
+
+    /// Who owns the forward on `(proto, port)`: `None` if there is none,
+    /// `Some(None)` for one UPnP did not create, `Some(Some(owner))` for one
+    /// it did.
+    fn owner(&mut self, nat: &Nat, proto: u8, port: u16) -> Option<Option<(u64, Ipv4Addr)>> {
+        let key = (proto, port);
+        let rec = self.by_port.get(&key).copied();
+        let Some(pf) = nat.port_forward(proto, port) else {
+            self.remove(key);
+            return None;
+        };
+        match rec {
+            Some(rec) if rec.id == pf.id => Some(Some((rec.ns, rec.ip))),
+            Some(_) => {
+                self.remove(key);
+                Some(None)
+            }
+            None => Some(None),
+        }
+    }
+
+    /// How many live mappings `client` has.
+    fn count_for(&mut self, nat: &Nat, client: (u64, Ipv4Addr)) -> usize {
+        let Some(keys) = self.by_client.get(&client) else {
+            return 0;
+        };
+        let stale: Vec<(u8, u16)> = keys
+            .iter()
+            .filter(|k| !Self::live(nat, **k, &self.by_port[*k]))
+            .copied()
+            .collect();
+        for k in stale {
+            self.remove(k);
+        }
+        self.by_client.get(&client).map_or(0, HashSet::len)
+    }
+
+    /// How many live mappings there are, counted exactly only once the
+    /// records reach `cap`: below it, stale ones cannot push a request over.
+    fn count_up_to(&mut self, nat: &Nat, cap: usize) -> usize {
+        if self.by_port.len() >= cap {
+            let stale: Vec<(u8, u16)> = self
+                .by_port
+                .iter()
+                .filter(|(k, rec)| !Self::live(nat, **k, rec))
+                .map(|(k, _)| *k)
+                .collect();
+            for k in stale {
+                self.remove(k);
+            }
+        }
+        self.by_port.len()
+    }
+}
+
 /// UPnP IGD helper. Register via
 /// [`Nat::add_local_helper`](crate::nat::Nat::add_local_helper).
 #[derive(Debug)]
@@ -144,7 +258,7 @@ pub struct UPnPHelper {
     /// namespace and address of the client that asked. A control point may
     /// only delete its own mappings, and statically configured forwards are
     /// not UPnP's to touch at all.
-    owned: Mutex<HashMap<(u8, u16), Owned>>,
+    owned: Mutex<OwnedTable>,
 }
 
 impl UPnPHelper {
@@ -156,7 +270,7 @@ impl UPnPHelper {
         UPnPHelper {
             cfg,
             ctrl: Mutex::new(HashMap::new()),
-            owned: Mutex::new(HashMap::new()),
+            owned: Mutex::new(OwnedTable::default()),
         }
     }
 
@@ -494,7 +608,7 @@ EXT:\r\n\r\n",
             return soap_fault(718, "External port not in allowed range");
         }
         let mut owned = self.owned.lock().unwrap();
-        let existing = Self::owner_locked(&mut owned, nat, proto, ext_port);
+        let existing = owned.owner(nat, proto, ext_port);
         if existing.is_some_and(|o| o != Some((ns, inside_ip))) {
             return soap_fault(718, "ConflictInMappingEntry");
         }
@@ -504,19 +618,15 @@ EXT:\r\n\r\n",
         let renewal = existing.is_some();
         if !renewal
             && self.cfg.max_mappings > 0
-            && nat.list_port_forwards().len() >= self.cfg.max_mappings
+            && owned.count_up_to(nat, self.cfg.max_mappings) >= self.cfg.max_mappings
         {
             return soap_fault(728, "Too many port mappings");
         }
-        if !renewal && self.cfg.max_per_client > 0 {
-            let count = nat
-                .list_port_forwards()
-                .iter()
-                .filter(|pf| pf.inside_ip == inside_ip)
-                .count();
-            if count >= self.cfg.max_per_client {
-                return soap_fault(728, "Too many port mappings for this client");
-            }
+        if !renewal
+            && self.cfg.max_per_client > 0
+            && owned.count_for(nat, (ns, inside_ip)) >= self.cfg.max_per_client
+        {
+            return soap_fault(728, "Too many port mappings for this client");
         }
 
         let lease_secs: u32 = xml_field(&xml, "NewLeaseDuration")
@@ -547,28 +657,6 @@ EXT:\r\n\r\n",
         )
     }
 
-    /// Who owns the forward on `(proto, port)`: `None` if there is none,
-    /// `Some(None)` for one UPnP did not create, `Some(Some(owner))` for one it
-    /// did. Ownership records whose forward has lapsed or been replaced are
-    /// dropped on the way.
-    fn owner_locked(
-        owned: &mut HashMap<(u8, u16), Owned>,
-        nat: &Nat,
-        proto: u8,
-        port: u16,
-    ) -> Option<Option<(u64, Ipv4Addr)>> {
-        let forwards = nat.list_port_forwards();
-        owned.retain(|&(p, o), rec| {
-            forwards
-                .iter()
-                .any(|pf| pf.proto == p && pf.outside_port == o && pf.id == rec.id)
-        });
-        forwards
-            .iter()
-            .find(|pf| pf.proto == proto && pf.outside_port == port)?;
-        Some(owned.get(&(proto, port)).map(|o| (o.ns, o.ip)))
-    }
-
     fn action_delete_port_mapping(
         &self,
         nat: &Nat,
@@ -585,7 +673,7 @@ EXT:\r\n\r\n",
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(0);
         let mut owned = self.owned.lock().unwrap();
-        let allowed = match Self::owner_locked(&mut owned, nat, proto, ext_port) {
+        let allowed = match owned.owner(nat, proto, ext_port) {
             None => return soap_fault(714, "NoSuchEntryInArray"),
             // Without a requesting host (a direct API call) any mapping UPnP
             // made may go, but never a static one.
@@ -596,7 +684,7 @@ EXT:\r\n\r\n",
             return soap_fault(606, "Action not authorized");
         }
         nat.remove_port_forward(proto, ext_port);
-        owned.remove(&(proto, ext_port));
+        owned.remove((proto, ext_port));
         drop(owned);
         soap_response(
             "<u:DeletePortMappingResponse xmlns:u=\"urn:schemas-upnp-org:service:WANIPConnection:1\"></u:DeletePortMappingResponse>",
@@ -1551,5 +1639,64 @@ MAN: \"ssdp:discover\"\r\nST: upnp:rootdevice\r\n\r\n";
         let res = h.handle_soap(&nat, "DeletePortMapping", &del_body(9000, "UDP"), owner);
         assert_eq!(res.status, 200, "body: {}", res.body);
         assert!(nat.list_port_forwards().is_empty());
+    }
+
+    #[test]
+    fn defaults_bound_what_one_client_can_take() {
+        let nat = Nat::new(pfx("10.0.0.1/24"), pfx("203.0.113.1/24"));
+        let h = UPnPHelper::new(UPnPConfig::default());
+        let add = |ext: u16, client: &str, lease| {
+            h.handle_soap(
+                &nat,
+                "AddPortMapping",
+                &add_body(ext, ext, client, "UDP", lease),
+                Some(client.parse().unwrap()),
+            )
+        };
+
+        // A "permanent" request gets the longest lease instead.
+        assert_eq!(add(20000, "10.0.0.42", 0).status, 200);
+        let pf = nat.list_port_forwards().pop().unwrap();
+        let left = pf.expires.expect("lease must be finite");
+        assert!(left <= Instant::now() + Duration::from_secs(7 * 86400));
+        assert!(left > Instant::now() + Duration::from_secs(6 * 86400));
+
+        // Privileged ports stay out of reach.
+        assert_eq!(add(80, "10.0.0.42", 60).status, 500);
+
+        // One host gets its share of the pool, and no more.
+        let mut ok = 1;
+        for ext in 20001..20300 {
+            if add(ext, "10.0.0.42", 60).status == 200 {
+                ok += 1;
+            }
+        }
+        assert_eq!(ok, 128);
+        assert_eq!(add(30000, "10.0.0.43", 60).status, 200);
+    }
+
+    #[test]
+    fn caps_count_only_live_mappings() {
+        let nat = Nat::new(pfx("10.0.0.1/24"), pfx("203.0.113.1/24"));
+        let h = UPnPHelper::new(UPnPConfig::default().max_per_client(2).max_mappings(3));
+        let add = |ext: u16, client: &str| {
+            h.handle_soap(
+                &nat,
+                "AddPortMapping",
+                &add_body(ext, ext, client, "TCP", 60),
+                Some(client.parse().unwrap()),
+            )
+            .status
+        };
+        assert_eq!(add(20000, "10.0.0.42"), 200);
+        assert_eq!(add(20001, "10.0.0.42"), 200);
+        assert_eq!(add(20002, "10.0.0.42"), 500);
+        // Removed behind UPnP's back: no longer counts.
+        nat.remove_port_forward(PROTO_TCP, 20000);
+        assert_eq!(add(20002, "10.0.0.42"), 200);
+        assert_eq!(add(20003, "10.0.0.43"), 200);
+        assert_eq!(add(20004, "10.0.0.44"), 500);
+        nat.remove_port_forward(PROTO_TCP, 20003);
+        assert_eq!(add(20004, "10.0.0.44"), 200);
     }
 }
