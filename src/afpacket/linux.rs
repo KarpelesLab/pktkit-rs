@@ -55,8 +55,11 @@ impl Socket {
         // ETH_P_ALL in network byte order: the kernel compares the protocol
         // field of the frame against it, and that field is big-endian.
         let proto = (libc::ETH_P_ALL as u16).to_be() as libc::c_int;
-        let raw =
-            unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW | libc::SOCK_CLOEXEC, proto) };
+        // Protocol 0 at creation, ETH_P_ALL only at bind, as libpcap does: a
+        // socket created with a protocol starts receiving from *every*
+        // interface at once, and whatever arrives before `bind` narrows it
+        // would be handed to us as if it came from this one.
+        let raw = unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW | libc::SOCK_CLOEXEC, 0) };
         if raw < 0 {
             return Err(io::Error::last_os_error());
         }
