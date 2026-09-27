@@ -296,6 +296,10 @@ pub struct Conn {
     // Persist (zero-window probing).
     persist_deadline: std::option::Option<Instant>,
     persist_backoff: Duration,
+    /// Zero-window probes sent since the peer was last heard from, which
+    /// is what tells a receiver that is only slow to read from a dead one
+    /// (Linux's `icsk_probes_out`).
+    probes_out: u32,
 
     // TIME-WAIT.
     time_wait_deadline: std::option::Option<Instant>,
@@ -393,6 +397,7 @@ impl Conn {
             released: None,
             persist_deadline: None,
             persist_backoff: Duration::ZERO,
+            probes_out: 0,
             time_wait_deadline: None,
             keepalive_deadline: None,
             keepalive_sent: 0,
@@ -857,6 +862,7 @@ impl Conn {
     fn note_alive(&mut self) {
         self.last_recv = Instant::now();
         self.keepalive_sent = 0;
+        self.probes_out = 0;
     }
 
     /// The handshake is complete. Whatever a lost SYN or SYN-ACK left in
@@ -905,17 +911,22 @@ impl Conn {
         self.take_outgoing()
     }
 
-    fn segment_acceptable(&self, seg: &Segment) -> bool {
-        let Some(rb) = self.recv_buf.as_ref() else {
-            return true;
-        };
+    /// RCV.NXT and the RCV.WND segments are checked against: what we
+    /// advertised, or more if a read has freed room since.
+    fn rcv_space(&self) -> Option<(u32, u32)> {
+        let rb = self.recv_buf.as_ref()?;
         let rcv_nxt = rb.nxt();
-        // What we advertised, or more if a read has freed room since.
         let advertised = self
             .rcv_adv
             .filter(|&adv| seq_after(adv, rcv_nxt))
             .map_or(0, |adv| adv.wrapping_sub(rcv_nxt));
-        let rcv_wnd = advertised.max(rb.window());
+        Some((rcv_nxt, advertised.max(rb.window())))
+    }
+
+    fn segment_acceptable(&self, seg: &Segment) -> bool {
+        let Some((rcv_nxt, rcv_wnd)) = self.rcv_space() else {
+            return true;
+        };
         let seg_len = seg.seg_len();
         if seg_len == 0 {
             // RFC 9293 wants SEG.SEQ < RCV.NXT+RCV.WND, but a peer that has
@@ -939,6 +950,45 @@ impl Conn {
         let seg_end = seg.seq.wrapping_add(seg_len.wrapping_sub(1));
         seq_in_range(seg.seq, rcv_nxt, rcv_nxt.wrapping_add(rcv_wnd))
             || seq_in_range(seg_end, rcv_nxt, rcv_nxt.wrapping_add(rcv_wnd))
+    }
+
+    /// An otherwise unacceptable segment whose ACK field still counts. RFC
+    /// 9293 §3.10.7.4: with RCV.WND zero "no segments will be acceptable,
+    /// but special allowance should be made to accept valid ACKs". A peer
+    /// that sent one octet past our closed window, a window probe or its
+    /// FIN, puts every later segment at RCV.NXT+1. Ignoring their ACK
+    /// fields would stall our own sending until that octet gets in, which
+    /// it cannot while our application is not reading. Only one past: a
+    /// blind attacker gains a single SEQ value, and the ACK itself still
+    /// has to pass RFC 5961's check in process_ack. RSTs and SYNs keep
+    /// their own rules.
+    fn acks_past_closed_window(&self, seg: &Segment) -> bool {
+        if !matches!(
+            self.state,
+            State::Established | State::FinWait1 | State::FinWait2
+        ) || seg.flags & (flags::ACK | flags::SYN | flags::RST) != flags::ACK
+        {
+            return false;
+        }
+        self.rcv_space()
+            .is_some_and(|(rcv_nxt, wnd)| wnd == 0 && seg.seq == rcv_nxt.wrapping_add(1))
+    }
+
+    /// Take the ACK field of a segment [one past our closed
+    /// window](Self::acks_past_closed_window), and answer for the octet
+    /// that did not fit, so the peer sees the window is still shut.
+    fn handle_ack_past_closed_window(&mut self, seg: &Segment) -> Vec<Vec<u8>> {
+        if !self.check_paws(seg) {
+            return self.take_outgoing();
+        }
+        if self.process_ack(seg) {
+            self.note_alive();
+            if self.state == State::FinWait1 && self.fin_acked() {
+                self.state = State::FinWait2;
+            }
+        }
+        self.queue_oow_ack(seg);
+        self.take_outgoing()
     }
 
     /// Validate RST per RFC 9293 §3.10.7.4 + RFC 5961.
@@ -1018,6 +1068,9 @@ impl Conn {
                     .map(|s| s.nxt() == seg.ack)
                     .unwrap_or(false);
             if !syn_rcvd_simopen {
+                if self.acks_past_closed_window(seg) {
+                    return self.handle_ack_past_closed_window(seg);
+                }
                 if !seg.has_flag(flags::RST) {
                     if self.state == State::TimeWait && seg.has_flag(flags::FIN) {
                         // The peer lost our last ACK: always answer.
@@ -2094,39 +2147,45 @@ impl Conn {
             }
             return;
         }
-        // A 1-byte window probe. Once one is out, later probes resend that
-        // byte (RFC 9293 §3.8.6.1) rather than a new one each time: every
-        // new byte would sit further past a window the receiver never
-        // opened. Bytes in flight from before the window closed are probed
-        // the same way, from SND.UNA.
-        let sb = self.send_buf.as_ref().unwrap();
-        let (seq, data, new) = match sb.retransmit_data(1) {
-            Some((seq, d)) => (seq, d.to_vec(), false),
-            None => (sb.nxt(), sb.peek_unsent(1).to_vec(), true),
-        };
-        if !data.is_empty() {
-            let rcv_nxt = self.recv_buf.as_ref().unwrap().nxt();
-            let mut seg = Segment {
-                src_port: self.cfg.local_port,
-                dst_port: self.cfg.remote_port,
-                seq,
-                ack: rcv_nxt,
-                flags: flags::ACK,
-                window: self.rcv_window(),
-                payload: data,
-                ..Default::default()
-            };
-            self.add_options(&mut seg);
-            self.queue_seg(seg);
-            if new {
-                self.send_buf.as_mut().unwrap().advance_sent(1);
-            }
-            // The probe byte is real data: if it or its ACK is lost after
-            // the last probe, only the RTO will send it again.
-            if self.rto_deadline.is_none() {
-                self.start_rto();
-            }
+        // Linux's tcp_probe_timer: as many unanswered probes as the RTO
+        // allows unanswered retransmissions. An answer, even one that still
+        // shuts the window, resets the count, so a peer that is merely not
+        // reading is probed for as long as it takes.
+        if self.probes_out >= MAX_RETRIES {
+            self.tear_down(State::Closed);
+            return;
         }
+        self.probes_out += 1;
+        // Bytes in flight from before the window closed are probed with
+        // one of them, from SND.UNA (RFC 9293 §3.8.6.1); the RTO repairs
+        // them as well.
+        //
+        // Otherwise the probe carries no data: SEQ = SND.UNA-1, which the
+        // peer answers with an ACK showing its window, as Linux does
+        // (tcp_xmit_probe_skb). RFC 9293 would send the next new byte, but
+        // that lies past the peer's right edge. Counted as sent, it moves
+        // the SEQ of every later segment out of a window that stays shut,
+        // and the peer ignores their ACK fields. Held back, it leaves
+        // SND.NXT behind a peer that took it but whose ACK was lost, and
+        // our segments look stale to that peer.
+        let sb = self.send_buf.as_ref().unwrap();
+        let (seq, payload) = match sb.retransmit_data(1) {
+            Some((seq, d)) => (seq, d.to_vec()),
+            None => (sb.una().wrapping_sub(1), Vec::new()),
+        };
+        let rcv_nxt = self.recv_buf.as_ref().unwrap().nxt();
+        let mut seg = Segment {
+            src_port: self.cfg.local_port,
+            dst_port: self.cfg.remote_port,
+            seq,
+            ack: rcv_nxt,
+            flags: flags::ACK,
+            window: self.rcv_window(),
+            payload,
+            ..Default::default()
+        };
+        self.add_options(&mut seg);
+        self.queue_seg(seg);
         self.persist_backoff = self.persist_backoff.saturating_mul(2);
         if self.persist_backoff > MAX_RTO {
             self.persist_backoff = MAX_RTO;
@@ -2738,33 +2797,29 @@ mod tests {
         assert_eq!(&got_b[100..], b"a-tail");
     }
 
-    // A zero-window probe carries the last byte before the FIN. If the
-    // probe's ACK is lost, the RTO has to resend it: the persist timer has
-    // no unsent data left to probe with.
+    // The reply to a window probe is lost. The next probe draws another,
+    // which shows the window open, and the data and FIN go out.
     #[test]
-    fn lost_ack_of_last_probe_byte_is_recovered() {
+    fn lost_reply_to_a_window_probe_is_recovered() {
         let (mut client, mut server) = established(40016);
         client.snd_wnd = 0;
         let (_, none) = client.write(b"x");
         assert!(none.is_empty());
         assert!(client.close().is_empty());
 
-        client.persist_deadline = Some(Instant::now());
-        let probe = client.tick();
+        let probe = fire_persist(&mut client);
         assert_eq!(probe.len(), 1);
-        assert_eq!(parse(&probe[0]).payload, b"x");
         let _lost_ack = deliver(&mut server, &probe);
 
-        // Persist has nothing left to send; the RTO resends the byte.
-        client.persist_deadline = client.persist_deadline.map(|_| Instant::now());
-        assert!(client.tick().is_empty());
-        let re = fire_rto(&mut client);
-        assert_eq!(parse(&re[0]).payload, b"x");
-
+        // Time passes: the probes are further apart than the throttle on
+        // the replies they draw.
+        server.last_oow_ack = None;
+        let re = fire_persist(&mut client);
         let ack = deliver(&mut server, &re);
-        let fin = deliver(&mut client, &ack);
-        assert!(parse(&fin[0]).has_flag(flags::FIN));
-        deliver(&mut server, &fin);
+        let out = deliver(&mut client, &ack);
+        assert_eq!(parse(&out[0]).payload, b"x");
+        assert!(parse(out.last().unwrap()).has_flag(flags::FIN));
+        deliver(&mut server, &out);
         assert!(server.fin_received());
         assert_eq!(read_all(&mut server), b"x");
     }
@@ -3078,6 +3133,14 @@ mod tests {
         }
     }
 
+    impl Conn {
+        /// Timeouts in a row without an answer, whether retransmissions or
+        /// zero-window probes: how close the connection is to giving up.
+        fn unanswered(&self) -> u32 {
+            self.retries.max(self.probes_out)
+        }
+    }
+
     struct Side {
         conn: Conn,
         to_send: Vec<u8>,
@@ -3178,7 +3241,7 @@ mod tests {
                     // MAX_RETRIES, which is correct but would make the run's
                     // outcome luck. The link stops losing while either end
                     // is halfway there, so giving up is the engine's fault.
-                    let struggling = sides.iter().any(|s| s.conn.retries >= MAX_RETRIES / 2);
+                    let struggling = sides.iter().any(|s| s.conn.unanswered() >= MAX_RETRIES / 2);
                     if fate < 2 && !struggling {
                         continue;
                     }
@@ -3202,6 +3265,12 @@ mod tests {
                 _ => {
                     if !links[0].is_empty() || !links[1].is_empty() {
                         continue;
+                    }
+                    // The clock does not really move, so neither would the
+                    // challenge-ACK throttle's; a timer firing stands for
+                    // more time than its interval, on both ends.
+                    for s in sides.iter_mut() {
+                        s.conn.last_oow_ack = None;
                     }
                     let c = &mut sides[i].conn;
                     let now = Instant::now();
@@ -3886,11 +3955,11 @@ mod tests {
         }
     }
 
-    // RFC 9293 §3.8.6.1: while the window stays shut, every probe carries
-    // the same byte. A new one each time would push data past a window the
-    // receiver never opened.
+    // A window probe carries no data, at SND.UNA-1 (Linux's
+    // tcp_xmit_probe_skb): a byte of new data would lie past a window the
+    // receiver never opened, and SND.NXT does not move.
     #[test]
-    fn persist_probes_resend_the_same_byte() {
+    fn persist_probes_take_no_sequence_space() {
         let (mut client, server) = established(40270);
         client.snd_wnd = 0;
         client.write(b"abcdef");
@@ -3899,11 +3968,12 @@ mod tests {
             let probe = fire_persist(&mut client);
             assert_eq!(probe.len(), 1);
             let seg = parse(&probe[0]);
-            assert_eq!((seg.seq, &seg.payload[..]), (una, &b"a"[..]));
+            assert_eq!((seg.seq, seg.seg_len()), (una.wrapping_sub(1), 0));
             // The receiver still has no room.
             client.handle_segment(&bare_ack(&client, &server, una, 0));
         }
-        assert_eq!(client.send_buf.as_ref().unwrap().nxt(), una.wrapping_add(1));
+        assert_eq!(client.send_buf.as_ref().unwrap().nxt(), una);
+        assert!(client.rto_deadline.is_none(), "nothing sent to time out");
     }
 
     // The zero-window ACK a probe draws matches SND.UNA and the last window,
@@ -3922,6 +3992,108 @@ mod tests {
         }
         assert!(!client.cc.in_recovery());
         assert_eq!(client.cc.send_window(), cwnd);
+    }
+
+    /// B fills A's receive window and A's application stops reading, and
+    /// B's persist timer probes it. A's own data to B must still be
+    /// acknowledged: B's ACKs have to stay inside A's closed window.
+    #[test]
+    fn window_probe_does_not_blind_the_zero_window_peer() {
+        let (mut a, mut b) = established(40272);
+        let (_, mut pkts) = b.write(&[7u8; 4096]);
+        while !pkts.is_empty() {
+            let acks = deliver(&mut a, &pkts);
+            pkts = deliver(&mut b, &acks);
+        }
+        assert_eq!(a.rcv_wnd_bytes(), 0);
+        assert_eq!(b.snd_wnd, 0);
+        b.write(&[8u8; 100]);
+        let probe = fire_persist(&mut b);
+        let replies = deliver(&mut a, &probe);
+        assert_eq!(parse(&replies[0]).ack, a.recv_buf.as_ref().unwrap().nxt());
+        assert_eq!(parse(&replies[0]).window, 0);
+        deliver(&mut b, &replies);
+
+        let (_, data) = a.write(b"request");
+        let una = a.send_buf.as_ref().unwrap().una();
+        let acks = deliver(&mut b, &data);
+        assert_eq!(parse(&acks[0]).ack, una.wrapping_add(7));
+        deliver(&mut a, &acks);
+        assert_eq!(
+            a.send_buf.as_ref().unwrap().una(),
+            una.wrapping_add(7),
+            "A ignored B's ACK"
+        );
+    }
+
+    /// With nothing in flight only the persist timer watches a zero-window
+    /// peer. It keeps probing for as long as the peer answers, and gives up
+    /// once as many probes as the RTO would retransmit go unanswered.
+    #[test]
+    fn persist_gives_up_only_on_a_silent_peer() {
+        let (mut client, server) = established(40276);
+        client.snd_wnd = 0;
+        client.write(b"abcdef");
+        let una = client.send_buf.as_ref().unwrap().una();
+        for _ in 0..MAX_RETRIES * 3 {
+            assert_eq!(fire_persist(&mut client).len(), 1);
+            client.handle_segment(&bare_ack(&client, &server, una, 0));
+        }
+        for _ in 0..MAX_RETRIES {
+            assert_eq!(fire_persist(&mut client).len(), 1);
+        }
+        assert!(!client.is_closed());
+        fire_persist(&mut client);
+        assert!(client.is_closed());
+    }
+
+    /// RFC 9293 §3.10.7.4: with a zero receive window no segment is
+    /// acceptable, "but special allowance should be made to accept valid
+    /// ACKs". A peer that sent a probe byte or a FIN past our closed window
+    /// sends its later ACKs one past RCV.NXT; their ACK fields count, the
+    /// rest does not.
+    #[test]
+    fn ack_one_past_a_closed_window_is_processed() {
+        let (mut client, mut server) = established(40274);
+        let (_, mut pkts) = client.write(&[6u8; 4096]);
+        while !pkts.is_empty() {
+            let acks = deliver(&mut server, &pkts);
+            pkts = deliver(&mut client, &acks);
+        }
+        assert_eq!(server.rcv_wnd_bytes(), 0);
+        let (_, reply) = server.write(b"reply");
+        assert_eq!(reply.len(), 1);
+        let reply_end = server.send_buf.as_ref().unwrap().nxt();
+        let rcv_nxt = server.recv_buf.as_ref().unwrap().nxt();
+
+        // Two past the edge is still out of bounds.
+        let mut seg = data_with_ack(&server, &client, reply_end, b"x", false);
+        seg.seq = rcv_nxt.wrapping_add(2);
+        server.handle_segment(&seg);
+        assert_ne!(server.send_buf.as_ref().unwrap().una(), reply_end);
+
+        seg.seq = rcv_nxt.wrapping_add(1);
+        let out = server.handle_segment(&seg);
+        assert_eq!(
+            server.send_buf.as_ref().unwrap().una(),
+            reply_end,
+            "ACK ignored"
+        );
+        let ack = parse(&out[0]);
+        assert_eq!(
+            (ack.ack, ack.window),
+            (rcv_nxt, 0),
+            "the byte must not be taken"
+        );
+
+        // Nor does a FIN there count.
+        let fin = Segment {
+            seq: rcv_nxt.wrapping_add(1),
+            ..data_with_ack(&server, &client, reply_end, b"", true)
+        };
+        server.handle_segment(&fin);
+        assert!(!server.fin_received() && !server.fin_pending);
+        assert_eq!(read_all(&mut server), vec![6u8; 4096]);
     }
 
     // A sender that never fills its window has not shown the network can
