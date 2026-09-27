@@ -22,7 +22,8 @@ pub(crate) const ICMP_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Cap on remotes tracked per mapping. A forwarded server can have many
 /// clients; past the cap, new remotes still get through but are not tracked,
-/// and the mapping's own idle timer covers them.
+/// and the mapping's own idle timer covers them. With no record to hold a
+/// sequence adjustment, ALGs may not change the length of their TCP payloads.
 const MAX_PEERS: usize = 1024;
 
 const TCP_FIN: u8 = 0x01;

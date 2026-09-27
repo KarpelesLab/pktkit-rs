@@ -907,7 +907,7 @@ impl Nat {
             ip: src_ip,
             port: src_port,
         };
-        let (outside_port, mapping_key) = {
+        let (outside_port, mapping_key, tracked) = {
             let mut inner = self.inner.lock().unwrap();
             let m = match Self::get_or_create_mapping_locked(&mut inner, k) {
                 Some(m) => m,
@@ -919,7 +919,7 @@ impl Nat {
             );
             let flags = tcp_flags(pkt, ihl, proto);
             m.peers.note(peer, true, flags, m.last_active);
-            (m.outside_port, m.key)
+            (m.outside_port, m.key, m.peers.contains(&peer))
         };
 
         let outside_ip = match self.outside_addr() {
@@ -972,11 +972,17 @@ impl Nat {
         };
         // ALGs rewrite whole messages; a fragment is only part of one.
         let before = tcp_payload_len(&out, ihl);
+        let orig = untracked_original(&out, proto, whole, tracked);
         let mut out = if whole {
             self.helper_outbound(out, &nm, proto, dst_port)
         } else {
             out
         };
+        if let Some(orig) = orig
+            && tcp_payload_len(&out, ihl) != before
+        {
+            out = orig;
+        }
         // A first fragment still carries the whole TCP header, so its
         // sequence numbers shift with the rest of the stream.
         if proto == PROTO_TCP {
@@ -1217,7 +1223,7 @@ impl Nat {
             port: dst_port,
         };
         let now = Instant::now();
-        let (mapping_key, outside_port) = {
+        let (mapping_key, outside_port, tracked) = {
             let mut inner = self.inner.lock().unwrap();
             // Existing mapping?
             let k = if let Some(k) = inner.reverse.get(&rk).copied() {
@@ -1246,12 +1252,13 @@ impl Nat {
                 Self::install_mapping_locked(&mut inner, k, rk, true);
                 k
             };
-            if let Some(m) = inner.mappings.get_mut(&k) {
+            let peer = SocketAddrV4::new(src_ip, src_port);
+            let tracked = inner.mappings.get_mut(&k).is_some_and(|m| {
                 m.last_active = now;
-                let peer = SocketAddrV4::new(src_ip, src_port);
                 m.peers.note(peer, false, tcp_flags(pkt, ihl, proto), now);
-            }
-            (k, dst_port)
+                m.peers.contains(&peer)
+            });
+            (k, dst_port, tracked)
         };
 
         let mut out = pkt.to_vec();
@@ -1299,11 +1306,17 @@ impl Nat {
             namespace: mapping_key.ns,
         };
         let before = tcp_payload_len(&out, ihl);
+        let orig = untracked_original(&out, proto, whole, tracked);
         let mut out = if whole {
             self.helper_inbound(out, &nm, proto, src_port)
         } else {
             out
         };
+        if let Some(orig) = orig
+            && tcp_payload_len(&out, ihl) != before
+        {
+            out = orig;
+        }
         if proto == PROTO_TCP {
             let peer = SocketAddrV4::new(src_ip, src_port);
             self.tcp_seq_fixup(mapping_key, peer, false, before, &mut out, ihl);
@@ -1714,6 +1727,15 @@ fn ipv4_datagram(pkt: &[u8]) -> Option<(&[u8], usize)> {
         return None;
     }
     Some((&pkt[..total], ihl))
+}
+
+/// A copy of a TCP datagram to fall back on if an ALG changes its payload
+/// length on a connection the mapping could not track (its table of
+/// remotes being full): the sequence adjustment every later segment needs
+/// would have nowhere to be recorded, and the two ends would fall out of
+/// step. Better the ALG's rewrite be lost than the connection.
+fn untracked_original(pkt: &[u8], proto: u8, whole: bool, tracked: bool) -> Option<Vec<u8>> {
+    (proto == PROTO_TCP && whole && !tracked).then(|| pkt.to_vec())
 }
 
 /// Whether a first fragment holds its whole transport header. The NAT
@@ -2831,6 +2853,28 @@ mod tests {
         assert_eq!(sack(44), 1000 + orig);
         assert_eq!(sack(48), 1000 + orig + 6);
         assert!(crate::nat::l4::v4_l4_checksum_ok(r, 20));
+    }
+
+    #[test]
+    fn no_resizing_rewrite_without_room_to_track_it() {
+        let (nat, _i, o) = setup();
+        nat.add_packet_helper(Arc::new(crate::nat::FtpHelper::new()));
+        // The mapping already tracks as many remotes as it may.
+        for n in 0..1024u32 {
+            let [_, _, a, b] = n.to_be_bytes();
+            let server = Ipv4Addr::new(198, 18, a, b);
+            let syn = tcp_seg(INSIDE, 45000, server, 21, 0x02, 1, 0, &[], &[]);
+            nat.inside().send(Packet::from_slice(&syn)).unwrap();
+        }
+        o.lock().unwrap().clear();
+        let cmd: &[u8] = b"PORT 10,0,0,5,4,210\r\n";
+        let seg = tcp_seg(INSIDE, 45000, REMOTE, 21, 0x18, 1000, 7000, &[], cmd);
+        nat.inside().send(Packet::from_slice(&seg)).unwrap();
+        // No sequence adjustment could be recorded for this connection, so
+        // the command must not change length: it goes out as it was.
+        let out = o.lock().unwrap();
+        assert_eq!(&out[0][40..], cmd);
+        assert!(crate::nat::l4::v4_l4_checksum_ok(&out[0], 20));
     }
 
     #[test]
