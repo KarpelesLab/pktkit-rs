@@ -853,6 +853,17 @@ impl Conn {
         self.keepalive_sent = 0;
     }
 
+    /// The handshake is complete. Whatever a lost SYN or SYN-ACK left in
+    /// the loss-recovery state belongs to the handshake, not to the data
+    /// that follows.
+    fn handshake_done(&mut self) {
+        self.rto_recover = None;
+        self.dup_acks = 0;
+        if let Some(sb) = self.send_buf.as_ref() {
+            self.high_rxt = sb.una();
+        }
+    }
+
     fn handle_closed(&mut self, seg: &Segment) -> Vec<Vec<u8>> {
         if seg.has_flag(flags::RST) {
             return Vec::new();
@@ -1100,6 +1111,7 @@ impl Conn {
             self.set_snd_wnd(seg.window as u32);
             self.rto.ack_received(seg.ack);
             self.state = State::Established;
+            self.handshake_done();
 
             if !seg.payload.is_empty() {
                 self.recv_buf
@@ -1165,6 +1177,7 @@ impl Conn {
         self.stop_rto();
         self.set_snd_wnd((seg.window as u32) << self.snd_wnd_shift);
         self.state = State::Established;
+        self.handshake_done();
         if !self.syn_data.is_empty() {
             // Nothing else has been taken in yet, so RCV.NXT is still just
             // past the SYN, where this text belongs.
@@ -1891,9 +1904,13 @@ impl Conn {
         self.dup_acks = 0;
         self.er_deadline = None;
         self.limited_transmit = 0;
+        let synchronized = self.state.is_synchronized();
         if let Some(sb) = self.send_buf.as_mut() {
             sb.clear_sacked();
-            if sb.unacked() > 0 {
+            // A SYN or SYN-ACK alone is not a loss the data's repair has to
+            // track: left set, `recover` would outlive the handshake and
+            // have the first real loss's duplicate ACKs ignored.
+            if synchronized && sb.unacked() > 0 {
                 self.rto_recover = Some(sb.nxt());
             }
             // A new repair episode: everything from SND.UNA is due again,
@@ -3228,6 +3245,32 @@ mod tests {
         let got = read_all(&mut server);
         assert_eq!(got.len(), data.len(), "stalled waiting for another RTO");
         assert_eq!(got, data);
+    }
+
+    /// A lost SYN is repaired by the RTO, but that timeout says nothing
+    /// about the data that follows: the first data loss must still be
+    /// repaired by fast retransmit, not left to another timeout.
+    #[test]
+    fn lost_syn_does_not_disable_fast_retransmit() {
+        let mut client = Conn::new(big(40230, 80));
+        let mut server = Conn::new(big(80, 40230));
+        let _lost = client.connect();
+        let syn = fire_rto(&mut client);
+        let synack = server.accept_syn(&parse(&syn[0]));
+        let ack = deliver(&mut client, &synack);
+        deliver(&mut server, &ack);
+        assert_eq!(server.state(), State::Established);
+        assert!(
+            client.rto_recover.is_none(),
+            "timeout recovery outlived the SYN"
+        );
+
+        let (_, segs) = client.write(&[4; 10_000]);
+        assert_eq!(segs.len(), 10);
+        let dups = deliver(&mut server, &segs[1..]);
+        let out = deliver(&mut client, &dups);
+        assert!(client.cc.in_recovery(), "no fast retransmit");
+        assert!(seqs(&out).contains(&parse(&segs[0]).seq));
     }
 
     fn big(local: u16, remote: u16) -> ConnConfig {
