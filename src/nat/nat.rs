@@ -34,6 +34,11 @@ pub(crate) const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 /// Cap on pending expectations. ALGs add them on packets remote peers
 /// control (TFTP requests, SDP offers), so the table must not grow unbounded.
 const MAX_EXPECTATIONS: usize = 1024;
+/// How long an ALG's [`Nat::create_mapping`] keeps an existing outbound
+/// mapping open to any remote: as long as the longest expectation an ALG
+/// registers alongside it (SIP and H.323 media), by which time the remote
+/// it announced the port to has connected, and is tracked, or never will.
+const ALG_OPEN_WINDOW: Duration = Duration::from_secs(120);
 
 /// Key into the forward connection table.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -64,6 +69,9 @@ struct Mapping {
     /// and with them the whole port pool, open forever by spraying packets
     /// at it.
     open: bool,
+    /// Until when an ALG opened a plain outbound mapping as `open` would
+    /// (see [`ALG_OPEN_WINDOW`]).
+    open_until: Option<Instant>,
 }
 
 impl Mapping {
@@ -74,13 +82,33 @@ impl Mapping {
             last_active: now,
             peers: Peers::default(),
             open: false,
+            open_until: None,
+        }
+    }
+
+    /// Whether any remote's traffic keeps the mapping alive (see `open`).
+    fn is_open(&self, now: Instant) -> bool {
+        self.open || self.open_until.is_some_and(|t| now <= t)
+    }
+
+    /// Open the mapping for a remote an ALG announced it to. One made for
+    /// that is open for good, like a forward's; one the inside host was
+    /// already using for its own traffic only for [`ALG_OPEN_WINDOW`], so
+    /// that a single ALG message does not leave it open to anyone for as
+    /// long as it lives.
+    fn alg_open(&mut self, created: bool, now: Instant) {
+        if created {
+            self.open = true;
+        } else if !self.open {
+            let until = now + ALG_OPEN_WINDOW;
+            self.open_until = Some(self.open_until.map_or(until, |t| t.max(until)));
         }
     }
 
     /// Account for an inbound packet from `peer`. Returns whether the
     /// remote is tracked.
     fn note_inbound(&mut self, peer: SocketAddrV4, tcp_flags: Option<u8>, now: Instant) -> bool {
-        if self.open || self.peers.contains(&peer) {
+        if self.is_open(now) || self.peers.contains(&peer) {
             self.last_active = now;
             self.peers.note(peer, false, tcp_flags, now);
         }
@@ -454,6 +482,12 @@ impl Nat {
     /// Create (or reuse) a mapping for a helper-managed connection on the
     /// NAT's own inside interface. Returns the outside port, or `None` if the
     /// port pool is exhausted.
+    ///
+    /// The mapping is made for a remote to connect to, which the inside host
+    /// may not have contacted, so any remote's traffic keeps it alive and is
+    /// tracked. A new mapping stays that way; an existing one the host was
+    /// already using for its own traffic only for the next two minutes,
+    /// after which only remotes it has exchanged traffic with count again.
     pub fn create_mapping(&self, proto: u8, inside_ip: Ipv4Addr, inside_port: u16) -> Option<u16> {
         self.create_mapping_in(0, proto, inside_ip, inside_port)
     }
@@ -474,10 +508,11 @@ impl Nat {
             port: inside_port,
         };
         let mut inner = self.inner.lock().unwrap();
+        let now = Instant::now();
+        Self::expire_mapping_locked(&mut inner, k, now);
+        let created = !inner.mappings.contains_key(&k);
         let m = Self::get_or_create_mapping_locked(&mut inner, k)?;
-        // Made for a remote to connect to, which may not have been
-        // contacted from here.
-        m.open = true;
+        m.alg_open(created, now);
         Some(m.outside_port)
     }
 
@@ -510,7 +545,7 @@ impl Nat {
                 for k in [k1, k2] {
                     let m = inner.mappings.get_mut(&k).unwrap();
                     m.last_active = now;
-                    m.open = true;
+                    m.alg_open(false, now);
                 }
                 return Some(p);
             }
@@ -3683,5 +3718,46 @@ mod tests {
             (&got[1][16..20], dst_port(&got[1])),
             (&INSIDE.octets()[..], 5000)
         );
+    }
+
+    #[test]
+    fn an_alg_opens_an_existing_outbound_mapping_only_for_a_while() {
+        let (nat, _i, o) = setup();
+        let p = build_udp(INSIDE, 5000, REMOTE, 53, b"q");
+        nat.inside().send(Packet::from_slice(&p)).unwrap();
+        let port = src_port(&o.lock().unwrap()[0]);
+        assert_eq!(nat.create_mapping(PROTO_UDP, INSIDE, 5000), Some(port));
+
+        // The remote the ALG announced the port to is tracked.
+        let callee = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 10), 4000);
+        let r = build_udp(*callee.ip(), callee.port(), PUBLIC, port, b"m");
+        nat.outside().send(Packet::from_slice(&r)).unwrap();
+        let k = |nat: &Nat, a: &SocketAddrV4| {
+            let inner = nat.inner.lock().unwrap();
+            inner.mappings.values().next().unwrap().peers.contains(a)
+        };
+        assert!(k(&nat, &callee));
+
+        // Past the window, a stranger no longer is.
+        nat.inner
+            .lock()
+            .unwrap()
+            .mappings
+            .values_mut()
+            .for_each(|m| m.open_until = Some(Instant::now() - Duration::from_secs(1)));
+        let stranger = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 66), 4444);
+        let r = build_udp(*stranger.ip(), stranger.port(), PUBLIC, port, b"x");
+        nat.outside().send(Packet::from_slice(&r)).unwrap();
+        assert!(!k(&nat, &stranger), "mapping left open for good");
+
+        // A mapping the ALG made itself is open for good, as before.
+        nat.create_mapping(PROTO_UDP, INSIDE, 6000).unwrap();
+        let inner = nat.inner.lock().unwrap();
+        let m = inner
+            .mappings
+            .values()
+            .find(|m| m.key.port == 6000)
+            .unwrap();
+        assert!(m.open);
     }
 }
