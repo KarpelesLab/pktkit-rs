@@ -424,7 +424,7 @@ impl L2Device for Server {
             return Ok(());
         }
         let ihl = (payload[0] & 0x0F) as usize * 4;
-        if payload.len() < ihl + 8 {
+        if ihl < 20 || payload.len() < ihl + 8 {
             return Ok(());
         }
         let udp = &payload[ihl..];

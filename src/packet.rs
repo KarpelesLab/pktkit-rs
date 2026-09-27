@@ -168,10 +168,14 @@ impl Packet {
         self.0.is_empty()
     }
 
-    /// True if the packet is long enough to host its declared header.
+    /// True if the packet is long enough to host its declared header, and
+    /// for IPv4, the header length it declares is a possible one.
     pub fn is_valid(&self) -> bool {
         match self.version() {
-            4 => self.0.len() >= 20,
+            4 => {
+                let hl = self.ipv4_header_len();
+                self.0.len() >= 20 && hl >= 20 && hl <= self.0.len()
+            }
             6 => self.0.len() >= 40,
             _ => false,
         }
@@ -316,7 +320,8 @@ impl Packet {
     pub fn ipv4_payload(&self) -> &[u8] {
         let hl = self.ipv4_header_len();
         let tl = self.ipv4_total_len() as usize;
-        if hl == 0 || tl < hl || self.0.len() < tl {
+        // IHL under 5 would put the payload inside the fixed header.
+        if hl < 20 || tl < hl || self.0.len() < tl {
             return &[];
         }
         &self.0[hl..tl]
@@ -697,7 +702,16 @@ impl Packet {
     /// Offset at which the upper-layer protocol header begins.
     pub fn transport_offset(&self) -> usize {
         match self.version() {
-            4 => self.ipv4_header_len().min(self.0.len()),
+            4 => {
+                // An impossible IHL has no transport header: point past the
+                // end rather than into the IPv4 header.
+                let hl = self.ipv4_header_len();
+                if hl < 20 {
+                    self.0.len()
+                } else {
+                    hl.min(self.0.len())
+                }
+            }
             6 => self.ipv6_transport().1,
             _ => 0,
         }
@@ -726,7 +740,7 @@ impl Packet {
             4 => {
                 let hl = self.ipv4_header_len();
                 let tl = self.ipv4_total_len() as usize;
-                if hl == 0 || tl < hl || self.0.len() < tl {
+                if hl < 20 || tl < hl || self.0.len() < tl {
                     return &mut [];
                 }
                 &mut self.0[hl..tl]
@@ -1463,5 +1477,32 @@ mod tests {
                 Some(true)
             );
         }
+    }
+
+    #[test]
+    fn ipv4_header_length_below_twenty_bytes_is_rejected() {
+        for ihl in 0..5u8 {
+            let mut p = v4_min();
+            p[0] = 0x40 | ihl;
+            p[9] = Protocol::ICMP.0;
+            p.extend_from_slice(&[8, 0, 0, 0, 0, 0, 0, 0]);
+            p[2..4].copy_from_slice(&28u16.to_be_bytes());
+            let before = p.clone();
+
+            let pkt = Packet::from_mut(&mut p);
+            assert!(!pkt.is_valid(), "IHL {ihl}");
+            assert!(pkt.ipv4_payload().is_empty(), "IHL {ihl}");
+            assert!(pkt.transport_payload_mut().is_empty(), "IHL {ihl}");
+            // The ICMP checksum field would land on the IPv4 header's own.
+            assert!(!pkt.recompute_transport_checksum(), "IHL {ihl}");
+            assert_eq!(p, before, "IHL {ihl}: header overwritten");
+        }
+    }
+
+    #[test]
+    fn ipv4_header_longer_than_the_packet_is_rejected() {
+        let mut p = v4_min();
+        p[0] = 0x46; // 24 bytes of header in a 20-byte packet
+        assert!(!Packet::from_slice(&p).is_valid());
     }
 }
