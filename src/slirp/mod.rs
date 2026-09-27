@@ -15,8 +15,9 @@
 //!   wired through the in-tree `vtcp` engine: inbound SYNs destined for a
 //!   registered listener mint a server-side [`vtcp::Conn`](crate::vtcp::Conn)
 //!   and, on ESTABLISHED, surface a [`TcpStream`] to the application.
-//! - SYN-cookie defense (`vtcp::SynCookies`) for the accept-queue overflow
-//!   case is not yet wired in — see `TODO(slirp)` in `usernat`.
+//! - SYN-cookie defense (`vtcp::SynCookies`) for a listener whose backlog
+//!   of handshakes is full is not yet wired in — see `TODO(slirp)` in
+//!   `usernat`.
 //! - The *outbound* (virtual→real) NAT path is also wired through the in-tree
 //!   `vtcp` engine (see `tcp_out`): a virtual client's SYN passively opens a
 //!   server-side [`vtcp::Conn`](crate::vtcp::Conn) terminating the virtual

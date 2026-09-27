@@ -9,12 +9,12 @@
 
 use crate::Result;
 use crate::slirp::listener::{ACCEPT_QUEUE_CAP, HalfOpenSlot};
-use crate::slirp::tcp_stream::{ConnState, TcpStream};
+use crate::slirp::tcp_stream::{ConnState, Offer, TcpStream};
 use std::collections::VecDeque;
 use std::io;
 use std::net::{Ipv6Addr, SocketAddrV6};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 
 /// Key used to find a listener by (IP, port). Wildcard IP is `::`.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
@@ -32,6 +32,9 @@ pub struct Listener6 {
     queue: Mutex<VecDeque<Arc<ConnState>>>,
     /// Signalled when a connection is enqueued or the listener is closed.
     signal: Condvar,
+    /// Established connections the full queue had no room for, offered
+    /// again as `accept` makes room (see `ConnState::complete_accept`).
+    waiting: Mutex<VecDeque<Weak<ConnState>>>,
     /// Removes this listener from the stack's table; taken by the first close.
     unregister: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Connections still in their handshake; see [`HalfOpenSlot`].
@@ -54,6 +57,7 @@ impl Listener6 {
             closed: Arc::new(AtomicBool::new(false)),
             queue: Mutex::new(VecDeque::new()),
             signal: Condvar::new(),
+            waiting: Mutex::new(VecDeque::new()),
             unregister: Mutex::new(None),
             half_open: Arc::new(AtomicUsize::new(0)),
         }
@@ -70,21 +74,30 @@ impl Listener6 {
         self.addr
     }
 
-    /// Enqueue a freshly-established connection. Returns `false` if the queue
-    /// is full or the listener is closed (the caller should abort the conn).
-    pub(crate) fn enqueue(&self, state: Arc<ConnState>) -> bool {
+    /// Enqueue a freshly-established connection, unless the queue is full or
+    /// the listener closed.
+    pub(crate) fn enqueue(&self, state: &Arc<ConnState>) -> Offer {
         // Checked under the queue lock, which `close` also takes to set the
         // flag and drain the queue: checked before it, a close could slip in
         // between and leave this connection queued where nobody will ever
         // accept or reset it.
         let mut q = self.queue.lock().expect("poisoned");
-        if self.closed.load(Ordering::Acquire) || q.len() >= ACCEPT_QUEUE_CAP {
-            return false;
+        if self.closed.load(Ordering::Acquire) {
+            return Offer::Refused;
         }
-        q.push_back(state);
+        if q.len() >= ACCEPT_QUEUE_CAP {
+            let mut w = self.waiting.lock().expect("poisoned");
+            // Offered again on every tick until room appears: listed once.
+            let weak = Arc::downgrade(state);
+            if !w.iter().any(|x| x.ptr_eq(&weak)) {
+                w.push_back(weak);
+            }
+            return Offer::Full;
+        }
+        q.push_back(state.clone());
         drop(q);
         self.signal.notify_one();
-        true
+        Offer::Taken
     }
 
     /// A half-open slot for a new connection, or `None` when the listener
@@ -94,24 +107,33 @@ impl Listener6 {
         HalfOpenSlot::take(&self.half_open)
     }
 
-    /// How close the accept queue is to full; used by the stack to decide
-    /// whether to fall back to a stateless SYN-cookie response.
-    pub(crate) fn queue_full(&self) -> bool {
-        self.queue.lock().expect("poisoned").len() >= ACCEPT_QUEUE_CAP.saturating_sub(1)
-    }
-
     /// Block until a connection is available, returning the accepted stream.
     /// Errors if the listener is closed.
     pub fn accept(&self) -> Result<TcpStream> {
         let mut q = self.queue.lock().expect("poisoned");
         loop {
             if let Some(state) = q.pop_front() {
+                drop(q);
+                self.offer_waiting();
                 return Ok(TcpStream::new(state));
             }
             if self.closed.load(Ordering::Acquire) {
                 return Err(io::Error::other("listener closed"));
             }
             q = self.signal.wait(q).expect("poisoned");
+        }
+    }
+
+    /// Offer the room `accept` has just made to the connection that has
+    /// waited longest for it, rather than leave it to the next tick.
+    fn offer_waiting(&self) {
+        loop {
+            let next = self.waiting.lock().expect("poisoned").pop_front();
+            let Some(weak) = next else { return };
+            if let Some(state) = weak.upgrade() {
+                state.complete_accept();
+                return;
+            }
         }
     }
 
@@ -181,7 +203,7 @@ mod tests {
     #[test]
     fn enqueue_then_accept_returns_stream() {
         let l = Listener6::new("[fd00::1]:80".parse().unwrap());
-        assert!(l.enqueue(dummy_state()));
+        assert_eq!(l.enqueue(&dummy_state()), Offer::Taken);
         let s = l.accept().expect("accept should yield the queued conn");
         assert_eq!(s.local_addr().port(), 80);
         assert_eq!(s.peer_addr().port(), 5000);
@@ -191,10 +213,10 @@ mod tests {
     fn queue_respects_capacity() {
         let l = Listener6::new("[fd00::1]:80".parse().unwrap());
         for _ in 0..ACCEPT_QUEUE_CAP {
-            assert!(l.enqueue(dummy_state()));
+            assert_eq!(l.enqueue(&dummy_state()), Offer::Taken);
         }
-        // One past capacity is rejected.
-        assert!(!l.enqueue(dummy_state()));
+        // One past capacity waits for room.
+        assert_eq!(l.enqueue(&dummy_state()), Offer::Full);
     }
 
     #[test]
@@ -210,11 +232,15 @@ mod tests {
         let l = Arc::new(Listener6::new("[fd00::1]:80".parse().unwrap()));
         let held = l.queue.lock().unwrap();
         let l2 = l.clone();
-        let t = std::thread::spawn(move || l2.enqueue(dummy_state()));
+        let t = std::thread::spawn(move || l2.enqueue(&dummy_state()));
         std::thread::sleep(std::time::Duration::from_millis(50));
         l.closed.store(true, Ordering::Release);
         drop(held);
-        assert!(!t.join().unwrap(), "queued on a closed listener");
+        assert_eq!(
+            t.join().unwrap(),
+            Offer::Refused,
+            "queued on a closed listener"
+        );
         assert!(l.queue.lock().unwrap().is_empty());
     }
 }

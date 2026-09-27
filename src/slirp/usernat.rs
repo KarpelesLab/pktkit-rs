@@ -31,7 +31,7 @@ use crate::slirp::listener6::{Listener6, ListenerKey6, resolve_v6};
 use crate::slirp::ns_table::{NsKey, NsTable};
 use crate::slirp::packet::fit_link;
 use crate::slirp::tcp_out::{TcpOutConn, build_refused_rst, build_rst_for_stray};
-use crate::slirp::tcp_stream::{ConnState, Endpoints, tick_conn};
+use crate::slirp::tcp_stream::{ConnState, Endpoints, Offer, tick_conn};
 use crate::slirp::udp::{SendFn as UdpSendFn, UdpConn};
 use crate::slirp::udp6::{SendFn as UdpSendFn6, UdpConn6};
 use crate::vtcp::segment::{Segment, flags as tcp_flags};
@@ -861,13 +861,15 @@ impl Stack {
         if full(&inner.virt_tcp.lock().expect("poisoned")) {
             return Ok(()); // silently drop; client will retransmit
         }
-        // TODO(slirp): when the accept queue is near-full, fall back to a
-        // stateless SYN-cookie (vtcp::SynCookies) SYN-ACK instead of dropping.
-        if listener.queue_full() {
-            return Ok(());
-        }
         // A full backlog drops the SYN, as Linux does: the peer retransmits,
-        // and by then a slot may have freed up.
+        // and by then a slot may have freed up. The accept queue being full
+        // is no reason to: a connection that completes its handshake then
+        // waits, holding its half-open slot, for `accept` to make room.
+        // Dropping SYNs on a full queue as well would, with a queue this
+        // short, let through only a queue's worth of each synchronized wave
+        // of retransmitted SYNs from a burst of clients.
+        // TODO(slirp): past the backlog, answer with a stateless SYN-cookie
+        // (vtcp::SynCookies) SYN-ACK instead of dropping.
         let Some(slot) = listener.half_open_slot() else {
             return Ok(());
         };
@@ -903,9 +905,10 @@ impl Stack {
         );
         let listener = Arc::downgrade(&listener);
         state.set_pending_accept(Box::new(move |s| {
-            // Whatever becomes of the handshake, it is no longer half open.
-            drop(slot);
-            listener.upgrade().is_some_and(|l| l.enqueue(s))
+            // The half-open slot goes with the closure, once the listener
+            // has taken or refused the connection.
+            let _held = &slot;
+            listener.upgrade().map_or(Offer::Refused, |l| l.enqueue(s))
         }));
         inner
             .virt_tcp
@@ -1210,13 +1213,15 @@ impl Stack {
         if full(&inner.virt_tcp6.lock().expect("poisoned")) {
             return Ok(()); // silently drop; client will retransmit
         }
-        // TODO(slirp): when the accept queue is near-full, fall back to a
-        // stateless SYN-cookie (vtcp::SynCookies) SYN-ACK instead of dropping.
-        if listener.queue_full() {
-            return Ok(());
-        }
         // A full backlog drops the SYN, as Linux does: the peer retransmits,
-        // and by then a slot may have freed up.
+        // and by then a slot may have freed up. The accept queue being full
+        // is no reason to: a connection that completes its handshake then
+        // waits, holding its half-open slot, for `accept` to make room.
+        // Dropping SYNs on a full queue as well would, with a queue this
+        // short, let through only a queue's worth of each synchronized wave
+        // of retransmitted SYNs from a burst of clients.
+        // TODO(slirp): past the backlog, answer with a stateless SYN-cookie
+        // (vtcp::SynCookies) SYN-ACK instead of dropping.
         let Some(slot) = listener.half_open_slot() else {
             return Ok(());
         };
@@ -1252,9 +1257,10 @@ impl Stack {
         );
         let listener = Arc::downgrade(&listener);
         state.set_pending_accept(Box::new(move |s| {
-            // Whatever becomes of the handshake, it is no longer half open.
-            drop(slot);
-            listener.upgrade().is_some_and(|l| l.enqueue(s))
+            // The half-open slot goes with the closure, once the listener
+            // has taken or refused the connection.
+            let _held = &slot;
+            listener.upgrade().map_or(Offer::Refused, |l| l.enqueue(s))
         }));
         inner
             .virt_tcp6

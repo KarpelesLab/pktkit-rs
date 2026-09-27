@@ -134,12 +134,25 @@ struct Outbox {
     emitting: bool,
 }
 
-/// Offers an established connection to a listener; `false` means the
-/// listener refused it (closed, or its queue is full).
-pub(crate) type AcceptFn = Box<dyn FnOnce(Arc<ConnState>) -> bool + Send>;
+/// What a listener made of a connection offered to its accept queue.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Offer {
+    /// Queued for `accept`.
+    Taken,
+    /// No room yet: offer it again once the application has accepted more.
+    Full,
+    /// Closed: the connection will never be accepted.
+    Refused,
+}
+
+/// Offers an established connection to a listener. Dropped once the
+/// listener has taken or refused it (freeing what it holds, such as a
+/// half-open slot), or when the handshake runs out of time.
+pub(crate) type AcceptFn = Box<dyn FnMut(&Arc<ConnState>) -> Offer + Send>;
 
 /// How long a passively opened connection may take to complete its
-/// handshake before it is dropped.
+/// handshake, and to find room in the listener's accept queue, before it is
+/// dropped.
 const ACCEPT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl ConnState {
@@ -176,30 +189,50 @@ impl ConnState {
     }
 
     /// Hand a passively opened connection to its listener if its handshake
-    /// has just completed. Call it after every inbound segment.
+    /// has completed. Call it after every inbound segment, and on every
+    /// tick: a connection the full accept queue had no room for waits,
+    /// established, to be offered again.
+    ///
+    /// Waiting is what Linux does by default (`tcp_abort_on_overflow` = 0),
+    /// not resetting: a queue that is full now is usually drained a moment
+    /// later, and a burst of clients that all completed their handshakes
+    /// would otherwise see every connection past the queue's depth reset.
+    /// The half-open slot the connection keeps meanwhile bounds how many
+    /// can wait, and the handshake deadline how long.
     ///
     /// Returns `false` when the connection is finished with: the listener
     /// refused it, so it has been aborted and the caller should drop it from
     /// its table.
     pub(crate) fn complete_accept(self: &Arc<Self>) -> bool {
+        // The offer is made under the lock, which the tick also takes to
+        // expire the handshake, so the listener never gets a connection that
+        // is being reset for running out of time.
         let mut pending = self.pending_accept.lock().expect("poisoned");
-        if pending.is_none()
-            || !self
-                .conn
-                .lock()
-                .expect("poisoned")
-                .state()
-                .is_synchronized()
+        let Some((_, accept)) = pending.as_mut() else {
+            return true;
+        };
+        if !self
+            .conn
+            .lock()
+            .expect("poisoned")
+            .state()
+            .is_synchronized()
         {
             return true;
         }
-        let (_, accept) = pending.take().expect("checked above");
-        drop(pending);
-        if accept(self.clone()) {
-            return true;
+        match accept(self) {
+            Offer::Full => true,
+            Offer::Taken => {
+                pending.take();
+                true
+            }
+            Offer::Refused => {
+                pending.take();
+                drop(pending);
+                self.abort();
+                false
+            }
         }
-        self.abort();
-        false
     }
 
     /// Send a RST and close.
@@ -476,9 +509,12 @@ pub(crate) fn tick_conn(state: &Arc<ConnState>) -> bool {
         }
     };
     if let Some((_, accept)) = expired {
-        // Dropped unrun, which gives the listener's backlog slot back.
+        // Dropped, which gives the listener's backlog slot back.
         drop(accept);
         state.abort();
+    } else {
+        // Offer again a connection the accept queue had no room for.
+        state.complete_accept();
     }
     let mut conn = state.conn.lock().expect("poisoned");
     let ended = conn.fin_received();
@@ -572,7 +608,7 @@ mod tests {
                 Instant::now(),
                 Box::new(move |_| {
                     a.store(true, Ordering::SeqCst);
-                    true
+                    Offer::Taken
                 }),
             ));
             let barrier = Arc::new(Barrier::new(2));
