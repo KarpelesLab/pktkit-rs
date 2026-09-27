@@ -45,8 +45,10 @@ pub struct L2AdapterConfig {
     /// lease replaces it with the lease's router, or clears it if the lease
     /// names none, and a lost lease clears it.
     pub gateway_v4: Option<Ipv4Addr>,
-    /// Initial IPv6 gateway, the next hop for off-link destinations. DHCP,
-    /// being IPv4 only, leaves it alone.
+    /// Initial IPv6 gateway, the next hop for off-link destinations: those
+    /// outside the L3 device's IPv6 prefix, other than link-local. Without
+    /// one they are dropped (RFC 4943). DHCP, being IPv4 only, leaves it
+    /// alone.
     pub gateway_v6: Option<Ipv6Addr>,
 }
 
@@ -432,17 +434,20 @@ impl L2Adapter {
                     )
                 } else {
                     let dst = pkt.ipv6_dst_addr().unwrap();
-                    let prefix = self.l3.addr();
                     // Link-local addresses are on-link whatever the prefix
                     // (RFC 4861 §5.2); a router would not forward them.
-                    let target = if prefix.is_valid()
-                        && prefix.is_v6()
-                        && !prefix.contains(IpAddr::V6(dst))
-                        && !dst.is_unicast_link_local()
-                    {
-                        self.gateway_v6.lock().unwrap().unwrap_or(dst)
-                    } else {
+                    // Anything else outside our prefix goes to the router,
+                    // and with none there is no route: RFC 4943 withdrew
+                    // the old rule that took such a destination for
+                    // on-link, since soliciting it only delays the failure
+                    // (or finds a host that should not have answered).
+                    let target = if self.on_link_v6(dst) {
                         dst
+                    } else {
+                        match *self.gateway_v6.lock().unwrap() {
+                            Some(gw) => gw,
+                            None => return,
+                        }
                     };
                     match self.ndp.resolve_at(target, now) {
                         Resolved::Hit(m) => (m, EtherType::IPV6),
@@ -1381,6 +1386,32 @@ mod tests {
         let ns = Packet::from_slice(f.payload()).ipv6_payload();
         assert_eq!(ns[0], ndp::NS_TYPE);
         assert_eq!(ns[8..24], peer.octets(), "solicited the gateway instead");
+    }
+
+    #[test]
+    fn off_link_destinations_without_a_router_are_not_solicited() {
+        let off: Ipv6Addr = "2001:db9::66".parse().unwrap();
+        let (pipe, _adapter, out) = rig("2001:db8::5/64");
+        pipe.inject(Packet::from_slice(&v6_packet(our_ip(), off)))
+            .unwrap();
+        assert!(take(&out).is_empty(), "solicited an off-link address");
+
+        // With no IPv6 prefix at all, only link-local is on-link.
+        let (pipe, adapter, out) = rig("10.0.0.5/24");
+        pipe.inject(Packet::from_slice(&v6_packet(our_ip(), our_ip())))
+            .unwrap();
+        assert!(take(&out).is_empty(), "solicited an off-link address");
+        let ll: Ipv6Addr = "fe80::66".parse().unwrap();
+        pipe.inject(Packet::from_slice(&v6_packet(our_ip(), ll)))
+            .unwrap();
+        assert_eq!(solicited(&take(&out)), [IpAddr::V6(ll)]);
+
+        // A router, once there is one, is where it goes.
+        let gw: Ipv6Addr = "fe80::1".parse().unwrap();
+        adapter.set_gateway_v6(gw);
+        pipe.inject(Packet::from_slice(&v6_packet(our_ip(), off)))
+            .unwrap();
+        assert_eq!(solicited(&take(&out)), [IpAddr::V6(gw)]);
     }
 
     #[test]
