@@ -118,6 +118,12 @@ pub struct ServerConfig {
     /// Most TCP connections served at once; each has two threads, a reader
     /// and a writer. Default 256.
     pub max_tcp_connections: usize,
+    /// Most TCP connections served at once from one source (an IPv4
+    /// address or an IPv6 /64, as for
+    /// [`max_unauthenticated_peers_per_source`](Self::max_unauthenticated_peers_per_source)),
+    /// authenticated or not, so that one source cannot take them all.
+    /// Default 16.
+    pub max_tcp_connections_per_source: usize,
     /// Each peer's timers: handshake window, keepalive, renegotiation.
     /// Defaults to OpenVPN's (see [`PeerTimers`]).
     pub timers: PeerTimers,
@@ -142,6 +148,8 @@ pub(super) const DEFAULT_MAX_UNAUTHENTICATED_PER_SOURCE: usize = 16;
 pub(super) const DEFAULT_CONNECT_FREQ: (u32, Duration) = (100, Duration::from_secs(10));
 /// Default [`ServerConfig::max_tcp_connections`].
 pub(super) const DEFAULT_MAX_TCP_CONNECTIONS: usize = 256;
+/// Default [`ServerConfig::max_tcp_connections_per_source`].
+pub(super) const DEFAULT_MAX_TCP_CONNECTIONS_PER_SOURCE: usize = 16;
 /// Default [`ServerConfig::connect_freq_initial`].
 pub(super) const DEFAULT_CONNECT_FREQ_INITIAL: (u32, Duration) = (100, Duration::from_secs(10));
 /// Default [`ServerConfig::max_auth_threads`].
@@ -156,6 +164,7 @@ setters! {
         set max_unauthenticated_peers_per_source: usize;
         set connect_freq: (u32, Duration);
         set max_tcp_connections: usize;
+        set max_tcp_connections_per_source: usize;
         set timers: PeerTimers;
         set connect_freq_initial: (u32, Duration);
         set max_auth_threads: usize;
@@ -182,6 +191,7 @@ impl ServerConfig {
             max_unauthenticated_peers_per_source: DEFAULT_MAX_UNAUTHENTICATED_PER_SOURCE,
             connect_freq: DEFAULT_CONNECT_FREQ,
             max_tcp_connections: DEFAULT_MAX_TCP_CONNECTIONS,
+            max_tcp_connections_per_source: DEFAULT_MAX_TCP_CONNECTIONS_PER_SOURCE,
             timers: PeerTimers::default(),
             connect_freq_initial: DEFAULT_CONNECT_FREQ_INITIAL,
             max_auth_threads: DEFAULT_MAX_AUTH_THREADS,
@@ -408,7 +418,8 @@ pub struct Server {
     peers: RwLock<HashMap<PeerKey, Arc<PeerEntry>>>,
     /// Every open TCP connection by id, so close() can shut them down --
     /// including those that have not sent a hard reset yet.
-    tcp_streams: Mutex<HashMap<u64, TcpStream>>,
+    /// With the source each connection counts against.
+    tcp_streams: Mutex<HashMap<u64, (std::net::IpAddr, TcpStream)>>,
     next_tcp_id: AtomicU64,
     closed: AtomicBool,
     /// The UDP reader and the TCP acceptor, which close() waits for: the
@@ -597,7 +608,7 @@ impl Server {
         self.udp.write().unwrap().take();
         // A thread blocked reading a TCP connection wakes up to the shutdown
         // and exits; the socket loops notice `closed` on their next poll.
-        for (_, s) in self.tcp_streams.lock().unwrap().drain() {
+        for (_, (_, s)) in self.tcp_streams.lock().unwrap().drain() {
             let _ = s.shutdown(std::net::Shutdown::Both);
         }
         // The loop calling close() -- from a callback, or dropping the last
@@ -681,13 +692,18 @@ impl Server {
             return;
         };
         let id = {
-            // Each connection costs a thread: refuse (close) past the cap.
+            // Each connection costs two threads: refuse (close) past the
+            // caps.
             let mut streams = self.tcp_streams.lock().unwrap();
-            if streams.len() >= self.cfg.max_tcp_connections {
+            let source = source_of(addr.ip());
+            let here = streams.values().filter(|(s, _)| *s == source).count();
+            if streams.len() >= self.cfg.max_tcp_connections
+                || here >= self.cfg.max_tcp_connections_per_source
+            {
                 return;
             }
             let id = self.next_tcp_id.fetch_add(1, Ordering::Relaxed);
-            streams.insert(id, handle);
+            streams.insert(id, (source, handle));
             id
         };
         // The slot is given back however the connection ends: the thread
@@ -1209,14 +1225,17 @@ fn tcp_conn(server: &Weak<Server>, stream: TcpStream, addr: SocketAddr) {
     let Ok(write_half) = stream.try_clone() else {
         return;
     };
-    // The client must open with a hard reset within the handshake window;
-    // after that, it pings at least every keepalive interval, so a read
-    // blocked past the ping-restart timeout means it is gone.
+    // The client must open with a hard reset within the handshake window
+    // -- all of it, not just some byte of it: a client dripping a byte at a
+    // time would otherwise hold its connection, and its two threads, for
+    // good. After that, it pings at least every keepalive interval, so a
+    // read blocked past the ping-restart timeout means it is gone.
     let timers = s.cfg.timers;
     drop(s);
+    let deadline = crate::time::Instant::now().checked_add(timers.handshake_window);
     let _ = stream.set_read_timeout(Some(timers.handshake_window));
     let mut reader = io::BufReader::new(stream);
-    let Some(first) = read_frame(&mut reader) else {
+    let Some(first) = read_frame_by(&mut reader, deadline) else {
         return;
     };
     if !Peer::is_session_start(&first) {
@@ -1391,6 +1410,39 @@ fn maintenance_loop(server: Weak<Server>) {
         };
         s.tick_peers();
     }
+}
+
+/// [`read_frame`], all of it by `deadline` (none: a read timeout already
+/// set on the stream bounds each read, as for `read_frame`).
+fn read_frame_by(
+    reader: &mut io::BufReader<TcpStream>,
+    deadline: Option<crate::time::Instant>,
+) -> Option<Vec<u8>> {
+    let Some(deadline) = deadline else {
+        return read_frame(reader);
+    };
+    let mut read_exact = |buf: &mut [u8]| -> Option<()> {
+        let mut done = 0;
+        while done < buf.len() {
+            let left = deadline.saturating_duration_since(crate::time::Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            reader.get_ref().set_read_timeout(Some(left)).ok()?;
+            match reader.read(&mut buf[done..]) {
+                Ok(0) => return None,
+                Ok(n) => done += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => return None,
+            }
+        }
+        Some(())
+    };
+    let mut len_buf = [0u8; 2];
+    read_exact(&mut len_buf)?;
+    let mut data = vec![0u8; u16::from_be_bytes(len_buf) as usize];
+    read_exact(&mut data)?;
+    Some(data)
 }
 
 /// Read one length-prefixed OpenVPN-over-TCP frame. `None` on EOF, error or
@@ -1919,6 +1971,76 @@ mod tests {
                     io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                 ) => {}
             other => panic!("second connection must be refused, got {other:?}"),
+        }
+        server.close();
+    }
+
+    /// A client that drips its first frame a byte at a time, each well
+    /// within the handshake window of the last, still has only the window
+    /// to send it all: then its connection is closed, and its place goes
+    /// to someone else.
+    #[test]
+    fn a_slow_first_frame_does_not_hold_a_tcp_connection() {
+        let server = server_configured(auth_ok(), |c| {
+            c.timers(PeerTimers::default().handshake_window(Duration::from_secs(1)))
+                .max_tcp_connections(2)
+        });
+        let mut drips: Vec<TcpStream> = (0..2).map(|_| tcp_client(&server)).collect();
+        for c in &mut drips {
+            // The first byte of a length of 0x40xx.
+            c.write_all(&[0x40]).unwrap();
+        }
+        // Drip on, well past the window, noting when the server hangs up.
+        let is_closed = |c: &mut TcpStream| {
+            // Fails on a socket already shut down, on some platforms.
+            if c.set_read_timeout(Some(Duration::from_millis(10))).is_err() {
+                return true;
+            }
+            match c.read(&mut [0u8; 1]) {
+                Ok(0) => true,
+                Ok(_) => false,
+                Err(e) => !matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ),
+            }
+        };
+        let start = std::time::Instant::now();
+        let mut closed = [false; 2];
+        while start.elapsed() < Duration::from_secs(4) && closed.contains(&false) {
+            thread::sleep(Duration::from_millis(300));
+            for (c, closed) in drips.iter_mut().zip(&mut closed) {
+                *closed = *closed || c.write_all(&[0]).is_err() || is_closed(c);
+            }
+        }
+        assert_eq!(closed, [true; 2], "a dripping connection was kept");
+        assert!(wait_for(|| server.tcp_streams.lock().unwrap().is_empty()));
+        let mut late = tcp_client(&server);
+        tcp_send(&mut late, &client_reset(*b"LATECOME"));
+        tcp_recv(&mut late).expect("a place freed up");
+        server.close();
+    }
+
+    /// One source gets at most max_tcp_connections_per_source of the TCP
+    /// connections.
+    #[test]
+    fn tcp_connections_are_capped_per_source() {
+        let server = server_configured(auth_ok(), |c| c.max_tcp_connections_per_source(2));
+        // All kept open for the whole test.
+        let mut conns: Vec<TcpStream> = (0..3).map(|_| tcp_client(&server)).collect();
+        for (i, c) in conns.iter_mut().take(2).enumerate() {
+            tcp_send(c, &client_reset([b'A' + i as u8; 8]));
+            tcp_recv(c).expect("served");
+        }
+        let mut b = [0u8; 1];
+        match conns[2].read(&mut b) {
+            Ok(0) => {}
+            Err(e)
+                if !matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) => {}
+            other => panic!("third connection must be refused, got {other:?}"),
         }
         server.close();
     }

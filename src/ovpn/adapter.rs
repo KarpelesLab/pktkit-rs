@@ -73,6 +73,9 @@ pub struct AdapterConfig {
     /// Most TCP connections served at once; see
     /// [`ServerConfig::max_tcp_connections`].
     pub max_tcp_connections: usize,
+    /// Most of those from one source; see
+    /// [`ServerConfig::max_tcp_connections_per_source`].
+    pub max_tcp_connections_per_source: usize,
     /// Each peer's timers; see [`ServerConfig::timers`].
     pub timers: PeerTimers,
     /// Answers to UDP clients' first packets per period; see
@@ -90,6 +93,7 @@ setters! {
         set max_unauthenticated_peers_per_source: usize;
         set connect_freq: (u32, Duration);
         set max_tcp_connections: usize;
+        set max_tcp_connections_per_source: usize;
         set timers: PeerTimers;
         set connect_freq_initial: (u32, Duration);
         set max_auth_threads: usize;
@@ -116,6 +120,7 @@ impl AdapterConfig {
                 super::server::DEFAULT_MAX_UNAUTHENTICATED_PER_SOURCE,
             connect_freq: super::server::DEFAULT_CONNECT_FREQ,
             max_tcp_connections: super::server::DEFAULT_MAX_TCP_CONNECTIONS,
+            max_tcp_connections_per_source: super::server::DEFAULT_MAX_TCP_CONNECTIONS_PER_SOURCE,
             timers: PeerTimers::default(),
             connect_freq_initial: super::server::DEFAULT_CONNECT_FREQ_INITIAL,
             max_auth_threads: super::server::DEFAULT_MAX_AUTH_THREADS,
@@ -136,6 +141,10 @@ impl std::fmt::Debug for AdapterConfig {
             )
             .field("connect_freq", &self.connect_freq)
             .field("max_tcp_connections", &self.max_tcp_connections)
+            .field(
+                "max_tcp_connections_per_source",
+                &self.max_tcp_connections_per_source,
+            )
             .field("timers", &self.timers)
             .field("connect_freq_initial", &self.connect_freq_initial)
             .field("max_auth_threads", &self.max_auth_threads)
@@ -204,6 +213,7 @@ impl Adapter {
                 .max_unauthenticated_peers_per_source(cfg.max_unauthenticated_peers_per_source)
                 .connect_freq(cfg.connect_freq)
                 .max_tcp_connections(cfg.max_tcp_connections)
+                .max_tcp_connections_per_source(cfg.max_tcp_connections_per_source)
                 .timers(cfg.timers)
                 .connect_freq_initial(cfg.connect_freq_initial)
                 .max_auth_threads(cfg.max_auth_threads)
