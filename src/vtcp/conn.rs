@@ -193,6 +193,11 @@ pub struct Conn {
     /// next hole (RFC 6582 §3.2 applied to timeout recovery), where the
     /// cumulative ACK alone would leave every hole to its own timeout.
     rto_recover: std::option::Option<u32>,
+    /// Duplicate ACKs since the last new one.
+    dup_acks: u32,
+    /// Extra room beyond cwnd for Limited Transmit (RFC 3042): one segment
+    /// per duplicate ACK, for the first two.
+    limited_transmit: u32,
 
     // Window scaling (RFC 7323).
     snd_wnd_shift: u8,
@@ -290,6 +295,8 @@ impl Conn {
             rto_deadline: None,
             retries: 0,
             rto_recover: None,
+            dup_acks: 0,
+            limited_transmit: 0,
             snd_wnd_shift: 0,
             rcv_wnd_shift: rcv_shift,
             wscale_ok: false,
@@ -1131,6 +1138,14 @@ impl Conn {
         // The window comes first: the flush below must see this segment's.
         let wnd_changed = self.update_send_window(seg);
         if !seq_after(ack, una) {
+            // The scoreboard first: a retransmission below must see what
+            // this ACK reports.
+            if self.sack_ok {
+                let blocks = get_sack_blocks(opts);
+                if !blocks.is_empty() {
+                    self.send_buf.as_mut().unwrap().mark_sacked(&blocks);
+                }
+            }
             // RFC 5681 §2: only an ACK of SND.UNA with data outstanding, no
             // payload or FIN, and the same window is a duplicate. A window
             // update is not a loss signal, and its window must be used.
@@ -1139,17 +1154,8 @@ impl Conn {
                 && !wnd_changed
                 && seg.payload.is_empty()
                 && !seg.has_flag(flags::FIN)
-                && self.cc.on_dup_ack()
             {
-                let flight = self.send_buf.as_ref().unwrap().unacked() as u32;
-                self.cc.on_fast_retransmit(flight, snd_nxt);
-                let _ = self.retransmit();
-            }
-            if self.sack_ok {
-                let blocks = get_sack_blocks(opts);
-                if !blocks.is_empty() {
-                    self.send_buf.as_mut().unwrap().mark_sacked(&blocks);
-                }
+                self.on_dup_ack(snd_nxt);
             }
             if wnd_changed {
                 if self.snd_wnd > 0 && self.persist_deadline.is_some() {
@@ -1162,6 +1168,8 @@ impl Conn {
 
         let acked = self.send_buf.as_mut().unwrap().acknowledge(ack);
         self.retries = 0;
+        self.dup_acks = 0;
+        self.limited_transmit = 0;
         // An ACK short of the recovery point means the segment after it was
         // lost too. Resend it now; waiting would cost an RTO per hole.
         let fast_partial = self.cc.in_recovery() && seq_before(ack, self.cc.recovery_seq());
@@ -1210,6 +1218,38 @@ impl Conn {
         self.flush_send_queue();
     }
 
+    fn on_dup_ack(&mut self, snd_nxt: u32) {
+        self.dup_acks += 1;
+        let threshold_reached = self.cc.on_dup_ack();
+        if self.cc.in_recovery() {
+            // RFC 5681 §3.2 step 4: each duplicate ACK inflated cwnd because
+            // a segment left the network; send new data into the room.
+            self.flush_send_queue();
+            return;
+        }
+        let sb = self.send_buf.as_ref().unwrap();
+        let flight = sb.unacked() as u32;
+        let mss = self.mss as u32;
+        // Early Retransmit (RFC 5827 §3.1): with fewer than four segments
+        // out and nothing new that may be sent, three duplicates can never
+        // arrive, and the loss would wait for the RTO. Retransmit after one
+        // fewer than there are segments outstanding.
+        let oseg = flight.div_ceil(mss);
+        let can_send_new = sb.pending() > 0 && self.snd_wnd > flight;
+        let early = oseg < 4 && !can_send_new && self.dup_acks >= oseg.saturating_sub(1).max(1);
+        if threshold_reached || early {
+            self.limited_transmit = 0;
+            self.cc.on_fast_retransmit(flight, snd_nxt);
+            let _ = self.retransmit();
+        } else if self.dup_acks <= 2 {
+            // Limited Transmit (RFC 3042): a new segment for each of the
+            // first two duplicates keeps ACKs coming, so a small window can
+            // still reach the three that fast retransmit needs.
+            self.limited_transmit = self.dup_acks * mss;
+            self.flush_send_queue();
+        }
+    }
+
     /// Resend the oldest unacknowledged data. Returns false when there is
     /// none (at most the FIN is outstanding).
     fn retransmit(&mut self) -> bool {
@@ -1247,7 +1287,7 @@ impl Conn {
                 break;
             }
             let mut eff_wnd = self.snd_wnd;
-            let cc_wnd = self.cc.send_window();
+            let cc_wnd = self.cc.send_window().saturating_add(self.limited_transmit);
             if cc_wnd < eff_wnd {
                 eff_wnd = cc_wnd;
             }
@@ -1433,6 +1473,8 @@ impl Conn {
         self.rto.backoff();
         self.rto.invalidate_timing();
         self.cc.on_timeout();
+        self.dup_acks = 0;
+        self.limited_transmit = 0;
         if let Some(sb) = self.send_buf.as_mut() {
             sb.clear_sacked();
             if sb.unacked() > 0 {
@@ -2630,6 +2672,91 @@ mod tests {
         let got = read_all(&mut server);
         assert_eq!(got.len(), data.len(), "stalled waiting for another RTO");
         assert_eq!(got, data);
+    }
+
+    fn big(local: u16, remote: u16) -> ConnConfig {
+        let mut c = cfg(local, remote);
+        c.mss = 1000;
+        c.send_buf_size = 1 << 16;
+        c.recv_buf_size = 1 << 16;
+        c
+    }
+
+    /// One round trip of data, so the sender has seen a scaled window. The
+    /// SYN-ACK's is unscaled and rounds differently, which would make the
+    /// first ACK after it a window update rather than a duplicate.
+    fn warm_up(client: &mut Conn, server: &mut Conn) {
+        let (_, data) = client.write(&[0; 100]);
+        let mut acks = deliver(server, &data);
+        read_all(server);
+        acks.extend(server.take_outgoing());
+        deliver(client, &acks);
+    }
+
+    fn seqs(pkts: &[Vec<u8>]) -> Vec<u32> {
+        pkts.iter().map(|p| parse(p).seq).collect()
+    }
+
+    /// Three segments out, the first lost: only two duplicates can come
+    /// back, never the three fast retransmit waits for. RFC 5827 retransmits
+    /// on the second instead of leaving it to the RTO.
+    #[test]
+    fn early_retransmit_with_a_small_flight() {
+        let mut client = Conn::new(big(40220, 80));
+        let mut server = Conn::new(big(80, 40220));
+        drive_handshake(&mut client, &mut server);
+        warm_up(&mut client, &mut server);
+        let (_, segs) = client.write(&[5; 3000]);
+        assert_eq!(segs.len(), 3);
+        let dups = deliver(&mut server, &segs[1..]);
+        assert_eq!(dups.len(), 2);
+        let out = deliver(&mut client, &dups);
+        assert_eq!(seqs(&out), vec![parse(&segs[0]).seq]);
+        deliver(&mut server, &out);
+        assert_eq!(read_all(&mut server).len(), 3000);
+    }
+
+    /// With the window full and more to send, the first two duplicates
+    /// each release one new segment (RFC 3042), and once in recovery the
+    /// inflated window keeps new data flowing (RFC 5681 §3.2 step 4).
+    #[test]
+    fn duplicate_acks_keep_new_data_flowing() {
+        let mut client = Conn::new(big(40230, 80));
+        let mut server = Conn::new(big(80, 40230));
+        drive_handshake(&mut client, &mut server);
+        warm_up(&mut client, &mut server);
+        let (n, segs) = client.write(&[9; 30_000]);
+        assert_eq!((n, segs.len()), (30_000, 10), "cwnd holds back the rest");
+        let first_unsent = parse(&segs[9]).seq + 1000;
+
+        let dups = deliver(&mut server, &segs[1..2]);
+        let out = deliver(&mut client, &dups);
+        assert_eq!(
+            seqs(&out),
+            vec![first_unsent],
+            "limited transmit, first dup"
+        );
+        let dups = deliver(&mut server, &segs[2..3]);
+        let out = deliver(&mut client, &dups);
+        assert_eq!(
+            seqs(&out),
+            vec![first_unsent + 1000],
+            "limited transmit, second dup"
+        );
+
+        let dups = deliver(&mut server, &segs[3..]);
+        let out = deliver(&mut client, &dups);
+        let lost = parse(&segs[0]).seq;
+        assert_eq!(
+            out.first().map(|p| parse(p).seq),
+            Some(lost),
+            "fast retransmit"
+        );
+        assert!(
+            seqs(&out).iter().any(|&s| s >= first_unsent + 2000),
+            "new data once inflation passes the flight, sent {:?}",
+            seqs(&out)
+        );
     }
 
     #[test]
