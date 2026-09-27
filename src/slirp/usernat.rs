@@ -1178,8 +1178,10 @@ impl L3Connector for Stack {
         let weak = Arc::downgrade(&self.inner);
         Ok(Box::new(move || {
             if let Some(inner) = weak.upgrade() {
-                inner.ns_sides.lock().expect("poisoned").remove(&ns);
+                // Flows first: the RSTs that closing them sends reach the
+                // peer through its side, which must still be there.
                 Stack::cleanup_namespace(&inner, ns);
+                inner.ns_sides.lock().expect("poisoned").remove(&ns);
             }
             Ok(())
         }))
@@ -1536,6 +1538,67 @@ mod tests {
         c1().unwrap();
         c2().unwrap();
         assert_eq!(inner.ns_sides.lock().unwrap().len(), 0);
+    }
+
+    /// A peer device that records what the stack sends it.
+    #[derive(Default)]
+    struct Recorder {
+        handler: Mutex<Option<L3Handler>>,
+        got: Mutex<Vec<Vec<u8>>>,
+    }
+
+    impl core::fmt::Debug for Recorder {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.write_str("Recorder")
+        }
+    }
+
+    impl L3Device for Recorder {
+        fn set_handler(&self, h: L3Handler) {
+            *self.handler.lock().unwrap() = Some(h);
+        }
+        fn send(&self, p: &Packet) -> Result<()> {
+            self.got.lock().unwrap().push(p.as_bytes().to_vec());
+            Ok(())
+        }
+        fn addr(&self) -> IpPrefix {
+            IpPrefix::default()
+        }
+        fn set_addr(&self, _: IpPrefix) -> Result<()> {
+            Ok(())
+        }
+        fn close(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn detaching_a_peer_resets_its_connections() {
+        let s = Stack::new();
+        let _listener = s.listen("tcp", "10.0.0.1:80").unwrap();
+        let peer = Arc::new(Recorder::default());
+        let cleanup = L3Connector::connect_l3(&*s, peer.clone()).unwrap();
+        let syn = Segment {
+            src_port: 40000,
+            dst_port: 80,
+            seq: 1000,
+            flags: tcp_flags::SYN,
+            window: 65535,
+            ..Default::default()
+        };
+        let pkt = crate::slirp::packet::build_packet4(
+            Ipv4Addr::new(10, 0, 0, 5),
+            Ipv4Addr::new(10, 0, 0, 1),
+            &syn.marshal(),
+        );
+        let inject = peer.handler.lock().unwrap().clone().unwrap();
+        inject(Packet::from_slice(&pkt)).unwrap();
+        assert_eq!(peer.got.lock().unwrap().len(), 1, "SYN-ACK");
+
+        cleanup().unwrap();
+        let got = peer.got.lock().unwrap();
+        let last = Segment::parse(&got.last().unwrap()[20..]).unwrap();
+        assert!(last.has_flag(tcp_flags::RST), "no RST reached the peer");
     }
 
     /// Assemble an IPv4+TCP packet from the supplied fields. Computes both
