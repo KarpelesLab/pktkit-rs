@@ -1028,6 +1028,9 @@ impl Capture {
     pub fn remove(&self, prefix: IpPrefix) -> Result<bool> {
         let prefix = prefix.masked();
         let mut held = self.entries.lock().unwrap();
+        // The kernel first: if the delete fails the prefix is still being
+        // captured, and the record has to go on saying so.
+        let removed = self.map_for(prefix).delete(lpm_key(prefix).as_bytes())?;
         let had = match held.iter().position(|e| e.prefix == prefix) {
             Some(i) => {
                 held.remove(i);
@@ -1035,7 +1038,6 @@ impl Capture {
             }
             None => false,
         };
-        let removed = self.map_for(prefix).delete(lpm_key(prefix).as_bytes())?;
         Ok(had || removed)
     }
 
