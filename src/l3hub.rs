@@ -125,9 +125,17 @@ impl L3Hub {
         }
     }
 
-    /// Designate `dev` as the default route. Packets that don't match any
-    /// connected prefix are sent to this device. The device must already be
-    /// attached via [`connect`](Self::connect) or [`connect_arc`](Self::connect_arc).
+    /// Designate `dev` as the default route: the gateway for unicast that no
+    /// other device here owns. Following the rules in the [type's
+    /// documentation](L3Hub), that is a destination no device's prefix
+    /// contains, and one whose longest matching prefix is the sender's own
+    /// network (or as long as it), since no device on the sender's side has
+    /// the address. A packet the default route sent itself is never handed
+    /// back to it, but dropped.
+    ///
+    /// `dev` must already be attached via [`connect`](Self::connect) or
+    /// [`connect_arc`](Self::connect_arc); otherwise nothing changes. A later
+    /// call replaces the default route, and detaching the device clears it.
     pub fn set_default_route(&self, dev: &Arc<dyn L3Device>) {
         let ports = self.ports.read().unwrap();
         for p in ports.iter() {
@@ -343,6 +351,8 @@ impl core::fmt::Debug for L3HubHandle {
 }
 
 impl L3HubHandle {
+    /// Detach the device from the hub (and clear the default route, if it
+    /// was the one). Idempotent; dropping the handle does the same.
     pub fn close(&self) {
         let mut closed = self.closed.lock().unwrap();
         if *closed {
