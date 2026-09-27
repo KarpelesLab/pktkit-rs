@@ -26,6 +26,8 @@ pub const OPT_ROUTER: u8 = 3;
 pub const OPT_DNS: u8 = 6;
 pub const OPT_REQUESTED_IP: u8 = 50;
 pub const OPT_LEASE_TIME: u8 = 51;
+pub const OPT_RENEWAL_TIME: u8 = 58;
+pub const OPT_REBINDING_TIME: u8 = 59;
 pub const OPT_MESSAGE_TYPE: u8 = 53;
 pub const OPT_SERVER_ID: u8 = 54;
 pub const OPT_PARAM_REQUEST: u8 = 55;
@@ -52,7 +54,13 @@ pub struct Parsed {
     pub server_id: Option<Ipv4Addr>,
     pub router: Option<Ipv4Addr>,
     pub dns: Vec<Ipv4Addr>,
-    pub lease_time: u32,
+    /// IP address lease time (option 51), in seconds; `u32::MAX` is
+    /// infinite. `None` when absent, which RFC 2131 Table 3 does not allow
+    /// in an OFFER or in an ACK to a REQUEST.
+    pub lease_time: Option<u32>,
+    /// Renewal (T1) and rebinding (T2) times, options 58 and 59.
+    pub renewal_time: Option<u32>,
+    pub rebinding_time: Option<u32>,
     pub requested_ip: Option<Ipv4Addr>,
 }
 
@@ -69,7 +77,9 @@ impl Default for Parsed {
             server_id: None,
             router: None,
             dns: Vec::new(),
-            lease_time: 0,
+            lease_time: None,
+            renewal_time: None,
+            rebinding_time: None,
             requested_ip: None,
         }
     }
@@ -134,7 +144,14 @@ impl Parsed {
                     }
                 }
                 OPT_LEASE_TIME if len == 4 => {
-                    p.lease_time = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+                    p.lease_time = Some(u32::from_be_bytes([data[0], data[1], data[2], data[3]]));
+                }
+                OPT_RENEWAL_TIME if len == 4 => {
+                    p.renewal_time = Some(u32::from_be_bytes([data[0], data[1], data[2], data[3]]));
+                }
+                OPT_REBINDING_TIME if len == 4 => {
+                    p.rebinding_time =
+                        Some(u32::from_be_bytes([data[0], data[1], data[2], data[3]]));
                 }
                 OPT_REQUESTED_IP if len == 4 => {
                     p.requested_ip = Some(Ipv4Addr::new(data[0], data[1], data[2], data[3]));
@@ -274,7 +291,7 @@ mod tests {
             p.dns,
             vec![Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(8, 8, 8, 8)]
         );
-        assert_eq!(p.lease_time, 3600);
+        assert_eq!(p.lease_time, Some(3600));
         assert_eq!(p.server_id, Some(Ipv4Addr::new(10, 0, 0, 1)));
     }
 

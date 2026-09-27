@@ -153,6 +153,11 @@ struct Inner {
     tries: u32,
     /// While PROBING: what to bind once the address proves free.
     pending: Option<(IpPrefix, Option<Ipv4Addr>, Option<LeaseTimers>)>,
+    /// When the first REQUEST of the current transaction went out. The
+    /// lease runs from then, not from the ACK (RFC 2131 §4.4.1): the server
+    /// started its clock when it got the request, and the client must not
+    /// think its lease lasts longer than the server does.
+    requested_at: Option<Instant>,
     /// Bumped by every start and stop, so the timer thread of an earlier run
     /// knows to exit.
     run: u64,
@@ -275,6 +280,7 @@ impl Client {
                     next_tx: None,
                     tries: 0,
                     pending: None,
+                    requested_at: None,
                     run: 0,
                 }),
             }),
@@ -333,7 +339,14 @@ impl Client {
                 return;
             }
             match (i.state, p.msg_type) {
+                // RFC 2131 Table 3: an OFFER and an ACK carry the address
+                // in yiaddr and a lease time. One without either grants
+                // nothing usable, and binding it would configure 0.0.0.0 or
+                // loop on a lease that has already run out.
+                (State::Selecting, wire::MSG_OFFER) if !grants_a_lease(&p) => (None, None),
+                (_, wire::MSG_ACK) if !grants_a_lease(&p) => (None, None),
                 (State::Selecting, wire::MSG_OFFER) => {
+                    i.requested_at = Some(now);
                     i.offered_ip = Some(p.yiaddr);
                     i.server_ip = p.server_id;
                     i.state = State::Requesting;
@@ -354,7 +367,12 @@ impl Client {
                     if p.server_id.is_some() {
                         i.server_ip = p.server_id;
                     }
-                    let lease = lease_timers(now, p.lease_time);
+                    let lease = lease_timers(
+                        i.requested_at.unwrap_or(now),
+                        p.lease_time.unwrap_or(0),
+                        p.renewal_time,
+                        p.rebinding_time,
+                    );
                     // A newly granted address is checked before use (RFC
                     // 2131 §4.4.1); one being renewed is ours already.
                     if fresh && self.shared.can_probe {
@@ -551,6 +569,13 @@ fn step(i: &mut Inner, now: Instant, conflict: bool) -> (Option<Event>, Option<O
             // may extend the lease.
             if lease.t2 <= now || (lease.t1 <= now && i.server_ip.is_none()) {
                 if i.state != State::Rebinding {
+                    // Straight from BOUND (no server to renew with) this is a
+                    // new transaction; from RENEWING it carries on the same
+                    // one, so a late answer to a renewal still counts.
+                    if i.state == State::Bound {
+                        i.xid = crate::rand::u32();
+                        i.requested_at = Some(now);
+                    }
                     i.state = State::Rebinding;
                     i.next_tx = Some(now);
                 }
@@ -564,6 +589,7 @@ fn step(i: &mut Inner, now: Instant, conflict: bool) -> (Option<Event>, Option<O
                 if i.state == State::Bound {
                     i.state = State::Renewing;
                     i.xid = crate::rand::u32();
+                    i.requested_at = Some(now);
                     i.next_tx = Some(now);
                 }
                 if !due(i.next_tx) {
@@ -585,20 +611,54 @@ fn step(i: &mut Inner, now: Instant, conflict: bool) -> (Option<Event>, Option<O
     }
 }
 
-/// Timers for a lease of `secs` seconds granted at `now`: T1 at half the
-/// lease and T2 at seven eighths (RFC 2131 §4.4.5). A lease of 0xffffffff
-/// is infinite (§3.3), and one without a lease time is treated the same,
-/// since there is nothing to renew against.
-fn lease_timers(now: Instant, secs: u32) -> Option<LeaseTimers> {
-    if secs == 0 || secs == u32::MAX {
+/// Whether an OFFER or ACK grants something the client can use: a unicast
+/// address and a lease time (RFC 2131 Table 3 makes both MUSTs). A lease
+/// time of zero is no lease at all.
+fn grants_a_lease(p: &wire::Parsed) -> bool {
+    let a = p.yiaddr;
+    let unicast = !(a.is_unspecified()
+        || a.is_broadcast()
+        || a.is_multicast()
+        || a.is_loopback()
+        || a.octets()[0] == 0
+        || a.octets()[0] >= 240);
+    unicast && p.lease_time.is_some_and(|l| l != 0)
+}
+
+/// Timers for a lease of `secs` seconds that started at `start`.
+///
+/// T1 and T2 come from options 58 and 59 when the server sent sensible ones
+/// (T1 < T2 < lease), and otherwise default to half and seven eighths of
+/// the lease (RFC 2131 §4.4.5). Each is fuzzed by up to a second either
+/// way, as §4.4.5 asks, so that clients leased together do not all renew
+/// in the same instant. A lease of 0xffffffff is infinite (§3.3), as is one
+/// too long for the clock to represent.
+fn lease_timers(
+    start: Instant,
+    secs: u32,
+    t1: Option<u32>,
+    t2: Option<u32>,
+) -> Option<LeaseTimers> {
+    if secs == u32::MAX {
         return None;
     }
     let lease = Duration::from_secs(secs as u64);
-    Some(LeaseTimers {
-        t1: now + lease / 2,
-        t2: now + lease * 7 / 8,
-        expiry: now + lease,
-    })
+    let t2 = t2
+        .map(|s| Duration::from_secs(s as u64))
+        .filter(|&t| t < lease)
+        .unwrap_or(lease * 7 / 8);
+    let t1 = t1
+        .map(|s| Duration::from_secs(s as u64))
+        .filter(|&t| t < t2)
+        .unwrap_or((lease / 2).min(t2));
+    let fuzz = |d: Duration| {
+        let up = Duration::from_millis((crate::rand::u32() % 2001) as u64);
+        (d + up).saturating_sub(Duration::from_secs(1))
+    };
+    let expiry = start.checked_add(lease)?;
+    let t2 = start.checked_add(fuzz(t2))?.min(expiry);
+    let t1 = start.checked_add(fuzz(t1))?.min(t2);
+    Some(LeaseTimers { t1, t2, expiry })
 }
 
 /// Delay before the next DISCOVER or REQUEST after `tries` retransmissions
@@ -741,6 +801,28 @@ mod tests {
         b.finish()
     }
 
+    /// A reply built by hand, for the malformed cases.
+    fn custom(
+        msg_type: u8,
+        xid: u32,
+        mac: MacAddr,
+        yiaddr: Ipv4Addr,
+        lease: Option<u32>,
+        extra: &[(u8, u32)],
+    ) -> Vec<u8> {
+        let mut b = wire::Builder::new(2, xid, mac);
+        b.yiaddr(yiaddr)
+            .message_type(msg_type)
+            .ipv4_option(wire::OPT_SERVER_ID, Ipv4Addr::new(192, 168, 1, 1));
+        if let Some(l) = lease {
+            b.u32_option(wire::OPT_LEASE_TIME, l);
+        }
+        for (code, v) in extra {
+            b.u32_option(*code, *v);
+        }
+        b.finish()
+    }
+
     fn make_offer(xid: u32, client_mac: MacAddr) -> Vec<u8> {
         reply(wire::MSG_OFFER, xid, client_mac)
     }
@@ -865,16 +947,104 @@ mod tests {
         assert_eq!(state(&c), State::Selecting);
     }
 
+    const IP: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 100);
+
+    #[test]
+    fn offers_and_acks_without_a_usable_address_or_lease_are_ignored() {
+        let (r, c) = setup();
+        c.begin(false);
+        let x = xid(&c);
+        for bad in [Ipv4Addr::UNSPECIFIED, Ipv4Addr::BROADCAST] {
+            c.handle_packet(&custom(wire::MSG_OFFER, x, r.mac, bad, Some(3600), &[]));
+            assert_eq!(state(&c), State::Selecting, "took an offer of {bad}");
+        }
+        // RFC 2131 Table 3: an OFFER MUST carry a lease time.
+        c.handle_packet(&custom(wire::MSG_OFFER, x, r.mac, IP, None, &[]));
+        assert_eq!(state(&c), State::Selecting);
+
+        c.handle_packet(&make_offer(x, r.mac));
+        assert_eq!(state(&c), State::Requesting);
+        c.handle_packet(&custom(
+            wire::MSG_ACK,
+            x,
+            r.mac,
+            Ipv4Addr::UNSPECIFIED,
+            Some(3600),
+            &[],
+        ));
+        c.handle_packet(&custom(wire::MSG_ACK, x, r.mac, IP, None, &[]));
+        c.handle_packet(&custom(wire::MSG_ACK, x, r.mac, IP, Some(0), &[]));
+        assert!(r.bound.lock().unwrap().is_none(), "bound a bad ACK");
+        assert_eq!(state(&c), State::Requesting);
+    }
+
+    #[test]
+    fn lease_is_timed_from_the_request_and_honours_t1_t2() {
+        let (r, c) = setup();
+        c.begin(false);
+        c.handle_packet(&make_offer(xid(&c), r.mac));
+        // The REQUEST went out 100 s before the ACK arrives.
+        {
+            let mut i = c.shared.inner.lock().unwrap();
+            i.requested_at = i
+                .requested_at
+                .and_then(|t| t.checked_sub(Duration::from_secs(100)));
+        }
+        let ack = custom(
+            wire::MSG_ACK,
+            xid(&c),
+            r.mac,
+            IP,
+            Some(3600),
+            &[
+                (wire::OPT_RENEWAL_TIME, 1000),
+                (wire::OPT_REBINDING_TIME, 2000),
+            ],
+        );
+        let now = Instant::now();
+        c.handle_packet(&ack);
+        let l = c.shared.inner.lock().unwrap().lease.unwrap();
+        let near = |t: Instant, secs: u64| {
+            let want = now + Duration::from_secs(secs) - Duration::from_secs(100);
+            let d = if t > want { t - want } else { want - t };
+            d <= Duration::from_secs(2)
+        };
+        assert!(near(l.expiry, 3600), "expiry not counted from the request");
+        assert!(near(l.t1, 1000), "T1 option ignored");
+        assert!(near(l.t2, 2000), "T2 option ignored");
+
+        // Options that make no sense fall back to the defaults.
+        let t = lease_timers(now, 3600, Some(3000), Some(2000));
+        let t = t.unwrap();
+        assert!(t.t1 <= t.t2 && t.t2 <= t.expiry);
+        assert!(t.t1 < now + Duration::from_secs(1802));
+    }
+
+    #[test]
+    fn rebinding_without_a_server_identifier_starts_a_new_transaction() {
+        let (r, c) = bound();
+        c.shared.inner.lock().unwrap().server_ip = None;
+        let old = xid(&c);
+        tick_after(&c, Duration::from_secs(1802));
+        assert_eq!(state(&c), State::Rebinding);
+        let got = sent(&r);
+        assert_eq!(got.len(), 1);
+        assert_ne!(got[0].2.xid, old, "rebinding reused the old xid");
+    }
+
     #[test]
     fn lease_is_renewed_then_rebound_then_given_up() {
         let (r, c) = bound();
         let ip = Ipv4Addr::new(192, 168, 1, 100);
 
-        tick_after(&c, Duration::from_secs(1799));
-        assert!(sent(&r).is_empty(), "T1 is half of the one-hour lease");
+        tick_after(&c, Duration::from_secs(1798));
+        assert!(
+            sent(&r).is_empty(),
+            "T1 is half of the one-hour lease, give or take a second"
+        );
 
         // T1: unicast to the server, the address in ciaddr.
-        tick_after(&c, Duration::from_secs(1800));
+        tick_after(&c, Duration::from_secs(1801));
         let got = sent(&r);
         assert_eq!(got.len(), 1);
         assert!(got[0].0, "renewal is unicast");
@@ -883,20 +1053,20 @@ mod tests {
         assert_eq!(got[0].2.requested_ip, None);
         assert_eq!(state(&c), State::Renewing);
 
-        // No answer: again after half the time left to T2 (3150 s).
-        tick_after(&c, Duration::from_secs(1800 + 600));
+        // No answer: again after half the time left to T2 (3150 s ± 1 s).
+        tick_after(&c, Duration::from_secs(2400));
         assert!(sent(&r).is_empty());
-        tick_after(&c, Duration::from_secs(1800 + 675));
+        tick_after(&c, Duration::from_secs(2477));
         assert_eq!(sent(&r).len(), 1, "renewal retried");
 
         // T2: broadcast to any server.
-        tick_after(&c, Duration::from_secs(3150));
+        tick_after(&c, Duration::from_secs(3151));
         let got = sent(&r);
         assert_eq!(got.len(), 1);
         assert!(!got[0].0, "rebinding is broadcast");
         assert_eq!(got[0].1, ip);
         assert_eq!(state(&c), State::Rebinding);
-        tick_after(&c, Duration::from_secs(3150 + 225));
+        tick_after(&c, Duration::from_secs(3377));
         assert_eq!(sent(&r).len(), 1, "rebinding retried");
 
         // Expiry: the address goes, and discovery starts over.
@@ -912,7 +1082,7 @@ mod tests {
     #[test]
     fn ack_while_rebinding_extends_the_lease() {
         let (r, c) = bound();
-        tick_after(&c, Duration::from_secs(3150));
+        tick_after(&c, Duration::from_secs(3151));
         assert_eq!(state(&c), State::Rebinding);
         c.handle_packet(&make_ack(xid(&c), r.mac));
         assert_eq!(state(&c), State::Bound);
@@ -924,7 +1094,7 @@ mod tests {
     #[test]
     fn nak_while_renewing_gives_the_address_up() {
         let (r, c) = bound();
-        tick_after(&c, Duration::from_secs(1800));
+        tick_after(&c, Duration::from_secs(1801));
         sent(&r);
         c.handle_packet(&reply(wire::MSG_NAK, xid(&c), r.mac));
         assert_eq!(*r.lost.lock().unwrap(), 1);
