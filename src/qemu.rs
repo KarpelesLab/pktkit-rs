@@ -72,6 +72,16 @@ impl HandlerSlot {
     }
 }
 
+/// Signals a [`DoneSignal`] when dropped, so the reader thread signals it
+/// however it ends, a panic included.
+struct SignalOnDrop(Arc<DoneSignal>);
+
+impl Drop for SignalOnDrop {
+    fn drop(&mut self) {
+        self.0.signal();
+    }
+}
+
 /// Set once, by the writer thread as it exits; waited on with a timeout.
 struct Latch {
     set: Mutex<bool>,
@@ -173,6 +183,9 @@ impl Conn {
         let handler_t = handler.clone();
         let done_t = done.clone();
         std::thread::spawn(move || {
+            // Signals done however the thread ends: whatever else fails,
+            // `wait_done` and `serve`'s cleanup must still learn of it.
+            let _done = SignalOnDrop(done_t.clone());
             let mut read = read;
             let mut hdr = [0u8; 4];
             let mut buf = vec![0u8; MAX_FRAME_SIZE];
@@ -191,11 +204,15 @@ impl Conn {
                 // hangs up: a socket closed with unread data answers with a
                 // RST, which could cost the peer the frames still being
                 // flushed to it.
+                //
+                // A panicking handler costs the frame, not the reader: ended
+                // by it, the reader would no longer notice the peer hang up.
                 if let Some(h) = handler_t.get(&done_t) {
-                    let _ = h(Frame::from_slice(&buf[..len]));
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        h(Frame::from_slice(&buf[..len]))
+                    }));
                 }
             }
-            done_t.signal();
         });
 
         let (out, rx) = mpsc::sync_channel::<Vec<u8>>(OUT_QUEUE_LIMIT);
@@ -541,6 +558,42 @@ mod tests {
         // Closing is idempotent, and dropping after it is fine.
         client.close().unwrap();
         drop(client);
+    }
+
+    /// A handler that panics costs its frame, not the reader: the next frame
+    /// is still delivered, and a hangup still noticed.
+    #[test]
+    fn a_panicking_handler_does_not_stop_the_reader() {
+        let ln = Listener::bind_tcp("127.0.0.1:0").unwrap();
+        let addr = tcp_addr(&ln);
+        let client = dial_tcp(addr).unwrap();
+        let server = ln.accept().unwrap();
+
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        let tx = Mutex::new(tx);
+        server.set_handler(Arc::new(move |f: &Frame| {
+            if f.as_bytes().ends_with(b"boom") {
+                panic!("handler panics");
+            }
+            let _ = tx.lock().unwrap().send(f.as_bytes().to_vec());
+            Ok(())
+        }));
+        let m = MacAddr([2, 0, 0, 0, 0, 1]);
+        for payload in [&b"boom"[..], b"after"] {
+            let frame = build_frame(m, m, EtherType::IPV4, payload);
+            client.send(Frame::from_slice(&frame)).unwrap();
+        }
+        let got = rx.recv_timeout(ECHO_TIMEOUT).expect("reader stopped");
+        assert!(got.ends_with(b"after"));
+
+        let (tx, rx) = mpsc::channel();
+        let s = server.clone();
+        std::thread::spawn(move || {
+            s.wait_done();
+            let _ = tx.send(());
+        });
+        client.close().unwrap();
+        rx.recv_timeout(ECHO_TIMEOUT).expect("hangup never noticed");
     }
 
     /// `serve` detaches a peer once it hangs up, rather than keeping its
