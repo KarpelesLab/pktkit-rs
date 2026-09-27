@@ -15,11 +15,15 @@ const MAX_SACKED: usize = 128;
 ///         una                nxt               tail
 /// ```
 ///
-/// `buf[0]` corresponds to sequence `una`. `buf[0..nxt-una)` is in flight;
-/// `buf[nxt-una..]` is queued for sending.
+/// `buf[head]` corresponds to sequence `una`. `buf[head..head+nxt-una)` is
+/// in flight; the rest is queued for sending.
 #[derive(Debug)]
 pub struct SendBuf {
+    /// Acknowledged bytes before `head` are dropped lazily (see
+    /// [`acknowledge`](Self::acknowledge)), keeping the data contiguous for
+    /// the slices handed out without shifting it on every ACK.
     buf: Vec<u8>,
+    head: usize,
     cap: usize,
     una: u32,
     nxt: u32,
@@ -32,6 +36,7 @@ impl SendBuf {
     pub fn new(capacity: usize, initial_seq: u32) -> Self {
         Self {
             buf: Vec::new(),
+            head: 0,
             cap: capacity,
             una: initial_seq,
             nxt: initial_seq,
@@ -39,9 +44,15 @@ impl SendBuf {
         }
     }
 
+    /// The unacknowledged and unsent data, from SND.UNA on.
+    #[inline]
+    fn data(&self) -> &[u8] {
+        &self.buf[self.head..]
+    }
+
     /// Append data, returning the number of bytes accepted.
     pub fn write(&mut self, p: &[u8]) -> usize {
-        let avail = self.cap.saturating_sub(self.buf.len());
+        let avail = self.available();
         if avail == 0 {
             return 0;
         }
@@ -53,7 +64,7 @@ impl SendBuf {
     /// Bytes queued but not yet sent.
     pub fn pending(&self) -> usize {
         let sent = self.nxt.wrapping_sub(self.una) as usize;
-        self.buf.len().saturating_sub(sent)
+        self.data().len().saturating_sub(sent)
     }
 
     /// Sent-but-unacknowledged bytes.
@@ -64,7 +75,8 @@ impl SendBuf {
     /// Read at most `n` bytes of unsent data without consuming them.
     pub fn peek_unsent(&self, n: usize) -> &[u8] {
         let offset = self.nxt.wrapping_sub(self.una) as usize;
-        let unsent = &self.buf[offset.min(self.buf.len())..];
+        let data = self.data();
+        let unsent = &data[offset.min(data.len())..];
         if unsent.len() > n {
             &unsent[..n]
         } else {
@@ -86,11 +98,20 @@ impl SendBuf {
             ack = self.nxt;
         }
         let mut n = ack.wrapping_sub(self.una);
-        if n as usize > self.buf.len() {
-            n = self.buf.len() as u32;
+        if n as usize > self.data().len() {
+            n = self.data().len() as u32;
         }
-        // O(n) shift; fine for the small payloads we handle, matches Go semantics.
-        self.buf.drain(..n as usize);
+        self.head += n as usize;
+        // Shifting the rest down on every ACK would cost the whole buffer
+        // per ACK. Do it only once the dropped bytes outnumber what is
+        // left, or reach a quarter of the capacity: each shift then moves
+        // at most four bytes per byte acknowledged since the last, and the
+        // dead space stays bounded.
+        let live = self.buf.len() - self.head;
+        if self.head >= live || self.head >= self.cap / 4 {
+            self.buf.drain(..self.head);
+            self.head = 0;
+        }
         self.una = ack;
         self.prune_sack();
         n
@@ -181,7 +202,7 @@ impl SendBuf {
     /// next SACKed range begins, so data the receiver already holds is not
     /// sent again. `None` when nothing unacknowledged is missing.
     pub fn retransmit_data(&self, n: usize) -> Option<(u32, &[u8])> {
-        let unacked = (self.nxt.wrapping_sub(self.una) as usize).min(self.buf.len());
+        let unacked = (self.nxt.wrapping_sub(self.una) as usize).min(self.data().len());
         let end = self.una.wrapping_add(unacked as u32);
         // The scoreboard is sorted and never covers UNA itself (that would
         // be a cumulative ACK), but a range may start right at it.
@@ -205,7 +226,7 @@ impl SendBuf {
         }
         let from = seq.wrapping_sub(self.una) as usize;
         let len = (hole_end.wrapping_sub(seq) as usize).min(n);
-        Some((seq, &self.buf[from..from + len]))
+        Some((seq, &self.data()[from..from + len]))
     }
 
     /// The first hole at or after `from` that counts as lost, and up to `n`
@@ -217,7 +238,7 @@ impl SendBuf {
     /// Holes above the highest SACKed byte are never candidates: nothing yet
     /// says that data is missing rather than still in flight.
     pub fn lost_hole_from(&self, from: u32, n: usize, lost_after: u32) -> Option<(u32, &[u8])> {
-        let unacked = (self.nxt.wrapping_sub(self.una) as usize).min(self.buf.len());
+        let unacked = (self.nxt.wrapping_sub(self.una) as usize).min(self.data().len());
         let end = self.una.wrapping_add(unacked as u32);
         let from = if seq_before(from, self.una) {
             self.una
@@ -242,7 +263,7 @@ impl SendBuf {
             if seq_before(start, hole_end) && sacked_above > lost_after {
                 let off = start.wrapping_sub(self.una) as usize;
                 let len = (hole_end.wrapping_sub(start) as usize).min(n);
-                return Some((start, &self.buf[off..off + len]));
+                return Some((start, &self.data()[off..off + len]));
             }
             sacked_above -= b.right.wrapping_sub(b.left);
             hole_start = b.right;
@@ -252,7 +273,7 @@ impl SendBuf {
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.buf.is_empty()
+        self.data().is_empty()
     }
 
     #[inline]
@@ -272,7 +293,7 @@ impl SendBuf {
 
     #[inline]
     pub fn available(&self) -> usize {
-        self.cap.saturating_sub(self.buf.len())
+        self.cap.saturating_sub(self.data().len())
     }
 }
 
@@ -389,6 +410,38 @@ mod tests {
         assert_eq!(s.lost_hole_from(30, 8, 5), Some((40, &[3u8; 8][..])));
         // Past the highest SACK nothing is known to be lost.
         assert_eq!(s.lost_hole_from(70, 100, 0), None);
+    }
+
+    /// A megabyte in flight, ACKed a few bytes at a time: each ACK must
+    /// cost what it frees, not a shift of everything still in flight.
+    #[test]
+    fn small_acks_of_a_full_buffer_are_linear() {
+        const CAP: usize = 1 << 20;
+        let start = std::time::Instant::now();
+        let mut s = SendBuf::new(CAP, 7);
+        let data: Vec<u8> = (0..CAP).map(|i| i as u8).collect();
+        assert_eq!(s.write(&data), CAP);
+        s.advance_sent(CAP);
+        let (mut acked, mut refilled) = (0, 0);
+        while acked < CAP {
+            acked = (acked + 3).min(CAP);
+            s.acknowledge(7 + acked as u32);
+            // Refill as the ACKs free room, like a busy writer.
+            if acked < CAP / 2 {
+                assert_eq!(s.write(&[acked as u8; 3]), 3);
+                refilled += 3;
+            }
+            if acked % 3072 == 0 {
+                assert!(
+                    start.elapsed() < std::time::Duration::from_secs(3),
+                    "quadratic"
+                );
+            }
+        }
+        assert_eq!(s.unacked(), 0);
+        assert_eq!(s.pending(), refilled);
+        assert_eq!(s.peek_unsent(3), &[3, 3, 3][..]);
+        assert_eq!(s.available(), CAP - refilled);
     }
 
     #[test]

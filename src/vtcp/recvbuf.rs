@@ -1,5 +1,7 @@
 //! Receiver-side reassembly buffer with SACK reporting.
 
+use std::collections::VecDeque;
+
 use super::options::SackBlock;
 use super::seqspace::{seq_after, seq_after_eq, seq_before, seq_before_eq};
 
@@ -12,17 +14,40 @@ const MAX_OOO_ENTRIES: usize = 128;
 /// beside a timestamp option (RFC 2018 §3).
 const MAX_SACK_BLOCKS: usize = 4;
 
+/// An out-of-order range. A deque, so that a range can grow at either end
+/// for the cost of what is added: segments arriving back to front would
+/// otherwise copy the whole range each time.
 #[derive(Debug, Clone)]
 struct OooEntry {
     seq: u32,
-    data: Vec<u8>,
+    data: VecDeque<u8>,
+}
+
+impl OooEntry {
+    #[inline]
+    fn end(&self) -> u32 {
+        self.seq.wrapping_add(self.data.len() as u32)
+    }
+}
+
+/// Append `src[skip..]` to `dst`.
+fn extend_from_deque(dst: &mut VecDeque<u8>, src: &VecDeque<u8>, skip: usize) {
+    let (a, b) = src.as_slices();
+    if skip < a.len() {
+        dst.extend(&a[skip..]);
+        dst.extend(b);
+    } else {
+        dst.extend(&b[skip - a.len()..]);
+    }
 }
 
 /// Reassembles an incoming TCP byte stream, handling in-order and
 /// out-of-order segments. Maintains a SACK scoreboard for reporting.
 #[derive(Debug)]
 pub struct RecvBuf {
-    buf: Vec<u8>,
+    /// In-order data not yet read. A ring, so reads and arrivals each cost
+    /// only the bytes they move.
+    buf: VecDeque<u8>,
     nxt: u32,
     ooo: Vec<OooEntry>,
     /// A sequence number inside each of the most recently extended
@@ -35,7 +60,7 @@ impl RecvBuf {
     /// `window_size = 0` disables the receive window entirely.
     pub fn new(initial_nxt: u32, window_size: usize) -> Self {
         Self {
-            buf: Vec::new(),
+            buf: VecDeque::new(),
             nxt: initial_nxt,
             ooo: Vec::new(),
             recent: Vec::new(),
@@ -97,7 +122,7 @@ impl RecvBuf {
         let slice = &data[start..end];
 
         if seq == self.nxt {
-            self.buf.extend_from_slice(slice);
+            self.buf.extend(slice);
             self.nxt = end_seq;
             self.merge_ooo();
             return slice.len();
@@ -118,9 +143,9 @@ impl RecvBuf {
 
     /// The out-of-order range holding `seq`, if any.
     fn range_of(&self, seq: u32) -> Option<&OooEntry> {
-        self.ooo.iter().find(|e| {
-            seq_before_eq(e.seq, seq) && seq_before(seq, e.seq.wrapping_add(e.data.len() as u32))
-        })
+        self.ooo
+            .iter()
+            .find(|e| seq_before_eq(e.seq, seq) && seq_before(seq, e.end()))
     }
 
     /// Record that the range holding `seq` was just extended, displacing any
@@ -129,89 +154,115 @@ impl RecvBuf {
         let Some(range) = self.range_of(seq) else {
             return; // pruned as soon as it arrived
         };
-        let (left, right) = (range.seq, range.seq.wrapping_add(range.data.len() as u32));
+        let (left, right) = (range.seq, range.end());
         self.recent
             .retain(|&s| !(seq_before_eq(left, s) && seq_before(s, right)));
         self.recent.insert(0, seq);
         self.recent.truncate(MAX_SACK_BLOCKS);
     }
 
-    fn insert_ooo(&mut self, mut seq: u32, data: &[u8]) {
-        let mut data: Vec<u8> = data.to_vec();
-        let mut end_seq = seq.wrapping_add(data.len() as u32);
-        let mut merged: Vec<OooEntry> = Vec::with_capacity(self.ooo.len() + 1);
-        let mut inserted = false;
-        let existing = std::mem::take(&mut self.ooo);
-        for e in existing {
-            let e_end = e.seq.wrapping_add(e.data.len() as u32);
-            // Ranges that merely touch are merged as well as overlapping
-            // ones. Kept apart, every segment arriving behind a single loss
-            // would take an entry of its own.
-            if seq_after(e.seq, end_seq) {
-                if !inserted {
-                    merged.push(OooEntry {
-                        seq,
-                        data: data.clone(),
-                    });
-                    inserted = true;
-                }
-                merged.push(e);
-            } else if seq_after(seq, e_end) {
-                merged.push(e);
-            } else {
-                // Overlap or adjacency — extend our range to cover e.
-                if seq_before(e.seq, seq) {
-                    let prefix_len = seq.wrapping_sub(e.seq) as usize;
-                    let mut prefix = e.data[..prefix_len].to_vec();
-                    prefix.extend_from_slice(&data);
-                    data = prefix;
-                    seq = e.seq;
-                }
-                if seq_after(e_end, end_seq) {
-                    let extra_start = end_seq.wrapping_sub(e.seq) as usize;
-                    data.extend_from_slice(&e.data[extra_start..]);
-                    end_seq = e_end;
-                }
+    /// Add `data` at `seq` to the out-of-order ranges, merging it with any
+    /// it overlaps or touches. Ranges that merely touch are merged as well
+    /// as overlapping ones: kept apart, every segment arriving behind a
+    /// single loss would take an entry of its own.
+    ///
+    /// The largest range involved absorbs the rest, so each byte already
+    /// held is moved only when it joins a larger range, and a segment
+    /// extending a range costs its own size, not the range's.
+    fn insert_ooo(&mut self, seq: u32, data: &[u8]) {
+        let end = seq.wrapping_add(data.len() as u32);
+        // Ranges i..j touch [seq, end): sorted and disjoint, so they are
+        // consecutive, and the gaps between them lie inside [seq, end).
+        let i = self.ooo.partition_point(|e| seq_before(e.end(), seq));
+        let mut j = i;
+        while j < self.ooo.len() && seq_before_eq(self.ooo[j].seq, end) {
+            j += 1;
+        }
+        if i == j {
+            self.ooo.insert(
+                i,
+                OooEntry {
+                    seq,
+                    data: data.iter().copied().collect(),
+                },
+            );
+            return;
+        }
+        let k = (i..j).max_by_key(|&k| self.ooo[k].data.len()).unwrap();
+        let mut others: Vec<OooEntry> = self.ooo.drain(i..j).collect();
+        let mut base = others.remove(k - i);
+        let new_part = |from: u32, to: u32| {
+            &data[from.wrapping_sub(seq) as usize..to.wrapping_sub(seq) as usize]
+        };
+
+        // Everything left of the base range, gathered in order and then
+        // pushed onto its front.
+        let (left, right): (Vec<OooEntry>, Vec<OooEntry>) = others
+            .into_iter()
+            .partition(|e| seq_before(e.seq, base.seq));
+        let mut front: VecDeque<u8> = VecDeque::new();
+        let mut cursor = if seq_before(seq, base.seq) {
+            left.first()
+                .map_or(seq, |e| if seq_before(seq, e.seq) { seq } else { e.seq })
+        } else {
+            base.seq
+        };
+        let front_start = cursor;
+        for e in &left {
+            if seq_before(cursor, e.seq) {
+                front.extend(new_part(cursor, e.seq));
             }
+            front.extend(&e.data);
+            cursor = e.end();
         }
-        if !inserted {
-            merged.push(OooEntry { seq, data });
+        if seq_before(cursor, base.seq) {
+            front.extend(new_part(cursor, base.seq));
         }
-        self.ooo = merged;
+        for &b in front.iter().rev() {
+            base.data.push_front(b);
+        }
+        base.seq = front_start;
+
+        // Everything right of it, appended.
+        let mut cursor = base.end();
+        for e in &right {
+            if seq_before(cursor, e.seq) {
+                base.data.extend(new_part(cursor, e.seq));
+            }
+            base.data.extend(&e.data);
+            cursor = e.end();
+        }
+        if seq_before(cursor, end) {
+            base.data.extend(new_part(cursor, end));
+        }
+        self.ooo.insert(i, base);
     }
 
+    /// Move whatever out-of-order data now continues the stream into it.
     fn merge_ooo(&mut self) {
-        loop {
-            let mut found = false;
-            let existing = std::mem::take(&mut self.ooo);
-            let mut remaining: Vec<OooEntry> = Vec::with_capacity(existing.len());
-            for e in existing {
-                let e_end = e.seq.wrapping_add(e.data.len() as u32);
-                if seq_before_eq(e.seq, self.nxt) && seq_after(e_end, self.nxt) {
-                    let offset = self.nxt.wrapping_sub(e.seq) as usize;
-                    self.buf.extend_from_slice(&e.data[offset..]);
-                    self.nxt = e_end;
-                    found = true;
-                } else if seq_after(e.seq, self.nxt) {
-                    remaining.push(e);
-                }
-                // else: entirely before nxt, discard
-            }
-            self.ooo = remaining;
-            let nxt = self.nxt;
-            self.recent.retain(|&s| seq_after_eq(s, nxt));
-            if !found {
+        // Sorted, so only the leading ranges can join.
+        let mut done = 0;
+        while let Some(e) = self.ooo.get(done) {
+            if seq_after(e.seq, self.nxt) {
                 break;
             }
+            if seq_after(e.end(), self.nxt) {
+                let offset = self.nxt.wrapping_sub(e.seq) as usize;
+                extend_from_deque(&mut self.buf, &e.data, offset);
+                self.nxt = e.end();
+            }
+            // else: entirely before nxt, discard
+            done += 1;
         }
+        self.ooo.drain(..done);
+        let nxt = self.nxt;
+        self.recent.retain(|&s| seq_after_eq(s, nxt));
     }
 
     /// Copy contiguous bytes into `p`, returning the count moved.
     pub fn read(&mut self, p: &mut [u8]) -> usize {
-        let n = p.len().min(self.buf.len());
-        p[..n].copy_from_slice(&self.buf[..n]);
-        self.buf.drain(..n);
-        n
+        // VecDeque's Read copies from its two halves and frees the front.
+        std::io::Read::read(&mut self.buf, p).unwrap_or(0)
     }
 
     #[inline]
@@ -245,7 +296,7 @@ impl RecvBuf {
         let max = max.min(MAX_SACK_BLOCKS);
         let block = |e: &OooEntry| SackBlock {
             left: e.seq,
-            right: e.seq.wrapping_add(e.data.len() as u32),
+            right: e.end(),
         };
         let mut out: Vec<SackBlock> = Vec::with_capacity(max);
         let recent = self.recent.iter().filter_map(|&s| self.range_of(s));
@@ -406,6 +457,99 @@ mod tests {
         r.insert(0, &[0; 10]);
         assert_eq!(r.nxt(), 20);
         assert_eq!(lefts(&r), vec![70, 50, 30]);
+    }
+
+    /// Random segments of one stream, overlapping, reordered and
+    /// duplicated: the ranges stay sorted, disjoint and apart, hold the
+    /// right bytes, and the stream comes out whole.
+    #[test]
+    fn random_segments_reassemble() {
+        let byte = |seq: u32| (seq.wrapping_mul(31) >> 3) as u8;
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut rng = |n: u32| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x % n as u64) as u32
+        };
+        for round in 0..60 {
+            let base = (u32::MAX - 3000).wrapping_add(round * 17); // wraps mid-stream
+            let mut r = RecvBuf::new(base, 4096);
+            let mut out = Vec::new();
+            for _ in 0..300 {
+                let seq = r.nxt().wrapping_add(rng(5000)).wrapping_sub(200);
+                let len = 1 + rng(300);
+                let seg: Vec<u8> = (0..len).map(|i| byte(seq.wrapping_add(i))).collect();
+                r.insert(seq, &seg);
+                if rng(4) == 0 {
+                    let mut buf = vec![0; rng(2000) as usize];
+                    let n = r.read(&mut buf);
+                    out.extend_from_slice(&buf[..n]);
+                }
+                let mut prev_end: Option<u32> = None;
+                for e in &r.ooo {
+                    assert!(seq_after(e.seq, r.nxt()));
+                    assert!(prev_end.is_none_or(|p| seq_after(e.seq, p)), "{round}");
+                    for (i, &b) in e.data.iter().enumerate() {
+                        assert_eq!(b, byte(e.seq.wrapping_add(i as u32)), "{round}");
+                    }
+                    prev_end = Some(e.end());
+                }
+            }
+            let mut buf = vec![0; 1 << 16];
+            let n = r.read(&mut buf);
+            out.extend_from_slice(&buf[..n]);
+            let want: Vec<u8> = (0..out.len() as u32)
+                .map(|i| byte(base.wrapping_add(i)))
+                .collect();
+            assert_eq!(out, want, "round {round}");
+        }
+    }
+
+    /// Fails as soon as `start` is more than `LIMIT` ago. The work below
+    /// takes milliseconds when each segment costs its own size; copying a
+    /// whole buffer per segment takes minutes, so the bound is loose.
+    fn within_budget(start: std::time::Instant) {
+        const LIMIT: std::time::Duration = std::time::Duration::from_secs(3);
+        assert!(start.elapsed() < LIMIT, "quadratic: over {LIMIT:?}");
+    }
+
+    /// 1-byte segments behind a hole, in order and in reverse: each must
+    /// cost about its own size, not a copy of the range it joins.
+    #[test]
+    fn many_tiny_out_of_order_segments_are_linear() {
+        const N: u32 = 500_000;
+        let start = std::time::Instant::now();
+        let mut r = RecvBuf::new(0, 1 << 20);
+        for i in 1..=N {
+            r.insert(i, &[i as u8]);
+            if i % 1024 == 0 {
+                within_budget(start);
+            }
+        }
+        // A second range, arriving back to front.
+        for i in (N + 2..=2 * N).rev() {
+            r.insert(i, &[i as u8]);
+            if i % 1024 == 0 {
+                within_budget(start);
+            }
+        }
+        assert_eq!(r.sack_blocks().len(), 2);
+        assert_eq!(r.insert(N + 1, &[(N + 1) as u8]), 0);
+        assert_eq!(r.insert(0, &[0]), 1);
+        assert_eq!(r.nxt(), 2 * N + 1);
+        let mut out = vec![0; 2 * N as usize + 1];
+        let mut got = 0;
+        // Tiny reads too: each must not shift what is left.
+        while got < out.len() {
+            let n = r.read(&mut out[got..(got + 3).min(2 * N as usize + 1)]);
+            assert!(n > 0);
+            got += n;
+            if got % 3072 == 0 {
+                within_budget(start);
+            }
+        }
+        assert!(out.iter().enumerate().all(|(i, &b)| b == i as u8));
     }
 
     #[test]
