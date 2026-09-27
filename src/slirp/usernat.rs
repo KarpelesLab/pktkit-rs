@@ -1826,6 +1826,43 @@ mod tests {
     }
 
     #[test]
+    fn large_udp_reply_arrives_whole_in_fragments() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let sport = server.local_addr().unwrap().port();
+        let stack = Stack::new();
+        let captured = capture(&stack);
+        let dgram = build_udp_v4_packet(
+            Ipv4Addr::new(10, 0, 0, 5),
+            41700,
+            Ipv4Addr::new(127, 0, 0, 1),
+            sport,
+            b"q",
+        );
+        L3Device::send(&*stack, Packet::from_slice(&dgram)).unwrap();
+        let mut buf = [0u8; 16];
+        let (_, from) = server.recv_from(&mut buf).unwrap();
+        let reply: Vec<u8> = (0..5000u32).map(|i| (i % 253) as u8).collect();
+        server.send_to(&reply, from).unwrap();
+
+        let mut r = crate::slirp::defrag::Reassembler::default();
+        let mut whole = None;
+        wait_for("the whole reply", || {
+            for p in captured.lock().unwrap().drain(..) {
+                assert!(p.len() <= crate::slirp::packet::LINK_MTU);
+                whole = whole
+                    .take()
+                    .or_else(|| r.push_v4(Instant::now(), 0, &p, 20));
+            }
+            whole.is_some()
+        });
+        let whole = whole.unwrap();
+        assert_eq!(&whole[28..], &reply[..]);
+    }
+
+    #[test]
     fn udp_flows_are_capped() {
         let server = UdpSocket::bind("127.0.0.1:0").unwrap();
         let sport = server.local_addr().unwrap().port();

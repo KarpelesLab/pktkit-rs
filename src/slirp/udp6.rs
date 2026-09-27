@@ -1,7 +1,7 @@
 //! IPv6 UDP NAT, mirroring [`udp`](super::udp) for IPv6.
 
 use crate::Result;
-use crate::slirp::packet::build_udp_packet6;
+use crate::slirp::packet::{build_udp_packet6, fit_link};
 use crate::slirp::udp::is_transient;
 use crate::time::Instant;
 use std::net::{Ipv6Addr, UdpSocket};
@@ -53,7 +53,8 @@ impl UdpConn6 {
 
         let weak = Arc::downgrade(&conn);
         std::thread::spawn(move || {
-            let mut buf = [0u8; 2048];
+            // Room for the largest datagram, so none is silently cut short.
+            let mut buf = vec![0u8; 65535];
             loop {
                 if closed.load(Ordering::Relaxed) {
                     return;
@@ -82,7 +83,9 @@ impl UdpConn6 {
                     conn.c_src_port,
                     &buf[..n],
                 );
-                let _ = send(&pkt);
+                for p in fit_link(pkt) {
+                    let _ = send(&p);
+                }
                 {
                     if let Ok(mut t) = conn.last_act.lock() {
                         *t = Instant::now();

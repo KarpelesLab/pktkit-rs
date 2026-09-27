@@ -3,8 +3,66 @@
 //! These mirror Go's `buildPacket4` / `buildPacket6` — they wrap a raw
 //! transport-layer segment (TCP) in an IP header with checksums filled in.
 
+use crate::Packet;
+use crate::fragment::{Fragmentation, fragment_ipv4};
 use crate::slirp::checksum::{ipv4_header_checksum, ipv6_pseudo_checksum, tcp_v4_checksum};
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::sync::atomic::{AtomicU32, Ordering};
+
+/// MTU of the virtual link, which the TCP MSS (1460 / 1440) also assumes.
+/// Datagrams the stack originates are fragmented to fit it.
+pub(crate) const LINK_MTU: usize = 1500;
+
+/// Identification for the datagrams the stack originates. Fragments of one
+/// datagram share it, so it must differ between datagrams in flight.
+static NEXT_IP_ID: AtomicU32 = AtomicU32::new(1);
+
+fn next_ip_id() -> u32 {
+    NEXT_IP_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Split a packet the stack built into pieces that fit [`LINK_MTU`].
+///
+/// IPv4 is fragmented as a router would; for IPv6 the stack is the source
+/// host, which is the one node RFC 8200 lets fragment.
+pub(crate) fn fit_link(pkt: Vec<u8>) -> Vec<Vec<u8>> {
+    if pkt.len() <= LINK_MTU {
+        return vec![pkt];
+    }
+    match pkt[0] >> 4 {
+        4 => match fragment_ipv4(Packet::from_slice(&pkt), LINK_MTU) {
+            Fragmentation::Fragments(f) => f,
+            _ => vec![pkt],
+        },
+        6 => fragment_ipv6(&pkt, LINK_MTU),
+        _ => vec![pkt],
+    }
+}
+
+/// Fragment an IPv6 packet whose only unfragmentable part is the fixed
+/// header (which is all the stack builds).
+fn fragment_ipv6(pkt: &[u8], mtu: usize) -> Vec<Vec<u8>> {
+    let id = next_ip_id();
+    let next = pkt[6];
+    let body = &pkt[40..];
+    // Every fragment but the last carries a multiple of 8 bytes.
+    let chunk = (mtu - 48) & !7;
+    let mut out = Vec::with_capacity(body.len().div_ceil(chunk));
+    for (i, part) in body.chunks(chunk).enumerate() {
+        let offset = i * chunk;
+        let more = offset + part.len() < body.len();
+        let mut f = Vec::with_capacity(48 + part.len());
+        f.extend_from_slice(&pkt[..40]);
+        f[4..6].copy_from_slice(&((8 + part.len()) as u16).to_be_bytes());
+        f[6] = 44; // Fragment
+        f.extend_from_slice(&[next, 0]);
+        f.extend_from_slice(&((offset as u16) | more as u16).to_be_bytes());
+        f.extend_from_slice(&id.to_be_bytes());
+        f.extend_from_slice(part);
+        out.push(f);
+    }
+    out
+}
 
 /// Wrap a TCP segment in an IPv4 header (no Ethernet). Computes the IP and
 /// TCP checksums in-place. Returns the full packet bytes.
@@ -79,6 +137,8 @@ pub(crate) fn build_udp_packet4(
         let (ip, rest) = pkt.split_at_mut(ihl);
         ip[0] = (4 << 4) | 5;
         ip[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+        // Needed should the datagram be fragmented for the link.
+        ip[4..6].copy_from_slice(&(next_ip_id() as u16).to_be_bytes());
         ip[8] = 64;
         ip[9] = 17;
         ip[12..16].copy_from_slice(&src_ip.octets());
@@ -173,6 +233,38 @@ mod tests {
         // src/dst port at start of UDP
         assert_eq!(u16::from_be_bytes([pkt[20], pkt[21]]), 5353);
         assert_eq!(u16::from_be_bytes([pkt[22], pkt[23]]), 33333);
+    }
+
+    #[test]
+    fn large_v6_datagram_is_fragmented_to_the_link() {
+        let src: Ipv6Addr = "fd00::1".parse().unwrap();
+        let dst: Ipv6Addr = "fd00::5".parse().unwrap();
+        let body: Vec<u8> = (0..4000u32).map(|i| i as u8).collect();
+        let pkt = build_udp_packet6(src, 53, dst, 4000, &body);
+        let frags = fit_link(pkt.clone());
+        assert_eq!(frags.len(), 3);
+        let mut r = crate::slirp::defrag::Reassembler::default();
+        let mut whole = None;
+        for f in &frags {
+            assert!(f.len() <= LINK_MTU);
+            whole = r.push_v6(crate::time::Instant::now(), 0, f, 40);
+        }
+        assert_eq!(whole.unwrap(), pkt);
+    }
+
+    #[test]
+    fn large_v4_datagram_is_fragmented_to_the_link() {
+        let body = vec![7u8; 3000];
+        let pkt = build_udp_packet4(
+            Ipv4Addr::new(1, 1, 1, 1),
+            53,
+            Ipv4Addr::new(10, 0, 0, 5),
+            9,
+            &body,
+        );
+        let frags = fit_link(pkt);
+        assert_eq!(frags.len(), 3);
+        assert!(frags.iter().all(|f| f.len() <= LINK_MTU));
     }
 
     #[test]
