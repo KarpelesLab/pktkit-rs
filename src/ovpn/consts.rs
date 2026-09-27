@@ -49,15 +49,20 @@ impl fmt::Display for CipherBlockMethod {
     }
 }
 
-// Wire-level magic numbers (matched against the Go const.go).
+// Wire-level magic numbers.
 
 pub const KEY_EXPANSION_ID: &str = "OpenVPN";
 pub const P_KEY_ID_MASK: u8 = 0x07;
 pub const P_OPCODE_SHIFT: u8 = 3;
 
+/// Most ACKs one control packet carries (ssl.h CONTROL_SEND_ACK_MAX).
 pub const CONTROL_SEND_ACK_MAX: usize = 4;
-pub const TLS_RELIABLE_N_SEND_BUFFERS: usize = 4;
-pub const TLS_RELIABLE_N_REC_BUFFERS: usize = 8;
+/// Control packets in flight at once, per key: the send window
+/// (ssl_pkt.h TLS_RELIABLE_N_SEND_BUFFERS in OpenVPN 2.6).
+pub const TLS_RELIABLE_N_SEND_BUFFERS: usize = 6;
+/// How far past the next control packet due one may be and still be
+/// taken: the receive window (ssl_pkt.h TLS_RELIABLE_N_REC_BUFFERS).
+pub const TLS_RELIABLE_N_REC_BUFFERS: usize = 12;
 
 /// Largest datagram a control packet makes, IP and UDP headers included
 /// (OpenVPN 2.6's default `tls-mtu`): small enough to cross a path with a

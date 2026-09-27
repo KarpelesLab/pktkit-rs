@@ -523,11 +523,12 @@ mod tests {
     /// of the TLS output waits until ACKs open the window, oldest first.
     #[test]
     fn send_window_holds_back_output_until_acked() {
+        const N: usize = TLS_RELIABLE_N_SEND_BUFFERS;
         let mut r = Reliable::new(local());
-        r.queue_tls(&vec![7u8; CONTROL_CHANNEL_MTU * 6]);
+        r.queue_tls(&vec![7u8; CONTROL_CHANNEL_MTU * (N + 2)]);
         let first = r.flush_tls();
-        assert_eq!(first.len(), TLS_RELIABLE_N_SEND_BUFFERS);
-        assert_eq!(r.unacked_count(), TLS_RELIABLE_N_SEND_BUFFERS);
+        assert_eq!(first.len(), N);
+        assert_eq!(r.unacked_count(), N);
         assert_eq!(r.held_len(), CONTROL_CHANNEL_MTU * 2);
         assert!(r.flush_tls().is_empty(), "window is full");
 
@@ -539,12 +540,29 @@ mod tests {
         r.recv(&ack.to_bytes(&[0])).unwrap();
         let next = r.flush_tls();
         assert_eq!(next.len(), 1);
-        assert_eq!(next[0].pid, Some(4));
+        assert_eq!(next[0].pid, Some(N as u32));
         r.recv(&ack.to_bytes(&[1, 2])).unwrap();
         let last = r.flush_tls();
         assert_eq!(last.len(), 1);
-        assert_eq!(last[0].pid, Some(5));
+        assert_eq!(last[0].pid, Some(N as u32 + 1));
         assert_eq!(r.held_len(), 0);
+    }
+
+    /// The windows are OpenVPN's (ssl_pkt.h): six packets in flight, and
+    /// twelve received ahead of the next one due. A smaller receive window
+    /// drops packets an OpenVPN peer is entitled to send, costing it
+    /// retransmissions.
+    #[test]
+    fn windows_are_openvpns() {
+        assert_eq!(TLS_RELIABLE_N_SEND_BUFFERS, 6);
+        let sid = [9u8; 8];
+        let mut r = Reliable::new(local());
+        let mut reset = ControlPacket::new(Opcode::CONTROL_HARD_RESET_CLIENT_V2, 0, sid, [0; 8]);
+        reset.set_pid(0);
+        r.recv(&reset.to_bytes(&[])).unwrap();
+        // Packet 1 is next; 1 + 11 still fits, 1 + 12 does not.
+        assert!(r.recv(&client_control(12, sid, b"x")).is_ok());
+        assert!(r.recv(&client_control(13, sid, b"x")).is_err());
     }
 
     /// ACKs are read before the packet's own id is checked (ssl.c
