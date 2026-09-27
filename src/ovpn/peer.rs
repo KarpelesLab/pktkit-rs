@@ -136,7 +136,8 @@ pub struct PeerTimers {
     pub keepalive_timeout: Duration,
     /// Renegotiate the data-channel key this long after it was negotiated
     /// (OpenVPN's `reneg-sec`); zero disables time-based renegotiation. A
-    /// key is also renegotiated when its packet ids run low, whatever this
+    /// key is also renegotiated when its packet ids run low, or when an
+    /// AES-GCM key has protected as much data as is safe, whatever this
     /// says.
     pub renegotiate_interval: Duration,
     /// How long the previous key keeps working after a renegotiation
@@ -171,6 +172,13 @@ setters! {
 /// Renegotiate a key once its outgoing packet id reaches this, well before
 /// the id space runs out (packet_id.h PACKET_ID_WRAP_TRIGGER).
 const PACKET_ID_WRAP_TRIGGER: u32 = 0xFF00_0000;
+
+/// Renegotiate an AES-GCM key once the AES blocks it protected plus the
+/// packets it protected pass this. It is OpenVPN's: 7/8 of `2^36 - 1`
+/// (crypto.c cipher_get_aead_limits, ssl.c tls_get_limit_aead), the bound
+/// that keeps the forgery probability under 2^-57, with room for the
+/// renegotiation to finish before the bound itself is reached.
+const AEAD_USAGE_LIMIT: u64 = ((1 << 36) - 1) / 8 * 7;
 
 /// How long a rejected session lingers to deliver AUTH_FAILED (OpenVPN's
 /// scheduled exit after send_auth_failed).
@@ -547,6 +555,8 @@ impl Peer {
         if !dk.replay.check(dec.pid) {
             return Err(invalid("replayed data packet"));
         }
+        dk.in_pid = dk.in_pid.max(dec.pid);
+        dk.dec_blocks += aead_blocks(opts, data.len());
         if !dec.is_ping {
             out.deliver = Some(dec.payload.to_vec());
         }
@@ -593,7 +603,9 @@ impl Peer {
             .checked_add(1)
             .ok_or_else(|| invalid("data channel packet id exhausted; renegotiation required"))?;
         self.last_sent = now;
-        data::encrypt(opts, &dk.keys, key_id, dk.out_pid, payload, fill_random)
+        let pkt = data::encrypt(opts, &dk.keys, key_id, dk.out_pid, payload, fill_random)?;
+        dk.enc_blocks += aead_blocks(opts, pkt.len());
+        Ok(pkt)
     }
 }
 
@@ -657,6 +669,43 @@ struct DataKeys {
     replay: Window,
     /// Outgoing data-channel packet id (the last one used).
     out_pid: u32,
+    /// Highest packet id accepted from the client.
+    in_pid: u32,
+    /// AES blocks of plaintext encrypted / decrypted under this key, for
+    /// the AEAD usage limit.
+    enc_blocks: u64,
+    dec_blocks: u64,
+}
+
+impl DataKeys {
+    fn new(keys: PeerKeys) -> DataKeys {
+        DataKeys {
+            keys,
+            replay: Window::new(),
+            out_pid: 0,
+            in_pid: 0,
+            enc_blocks: 0,
+            dec_blocks: 0,
+        }
+    }
+
+    /// Whether the key has protected as much as AES-GCM safely allows
+    /// (crypto.h aead_usage_limit_reached): blocks plus packets, in
+    /// either direction.
+    fn aead_limit_reached(&self) -> bool {
+        self.enc_blocks + u64::from(self.out_pid) > AEAD_USAGE_LIMIT
+            || self.dec_blocks + u64::from(self.in_pid) > AEAD_USAGE_LIMIT
+    }
+}
+
+/// AES blocks a data packet of `len` bytes carried, if it is AES-GCM
+/// (`[opcode][pid][tag][ciphertext]`, the ciphertext as long as the
+/// plaintext); 0 otherwise, as only AEAD ciphers have a usage limit.
+fn aead_blocks(opts: &Options, len: usize) -> u64 {
+    if opts.cipher_block != super::GCM {
+        return 0;
+    }
+    (len.saturating_sub(1 + 4 + 16) as u64).div_ceil(16)
 }
 
 impl KeyState {
@@ -735,7 +784,7 @@ impl Session {
     }
 
     /// Whether the server should start a renegotiation itself: the key in
-    /// use is due by age or by packet count, and none is under way.
+    /// use is due by age, packet count or AEAD usage, and none is under way.
     fn should_renegotiate(&self, now: Instant, timers: &PeerTimers) -> bool {
         let k = &self.primary;
         let (Some(established), Some(data)) = (k.established, k.data.as_ref()) else {
@@ -748,7 +797,11 @@ impl Session {
         }
         let by_age = !timers.renegotiate_interval.is_zero()
             && now.saturating_duration_since(established) >= timers.renegotiate_interval;
-        by_age || data.out_pid >= PACKET_ID_WRAP_TRIGGER
+        let aead = self
+            .opts
+            .as_ref()
+            .is_some_and(|o| o.cipher_block == super::GCM);
+        by_age || data.out_pid >= PACKET_ID_WRAP_TRIGGER || (aead && data.aead_limit_reached())
     }
 
     /// Start negotiating the next key (ssl.c key_state_soft_reset): the
@@ -1008,11 +1061,7 @@ impl Session {
         let label2 = format!("{} key expansion", KEY_EXPANSION_ID);
         prf10(&mut expansion, &master, label2.as_bytes(), &seed2);
 
-        self.primary.data = Some(DataKeys {
-            keys: PeerKeys::from_expansion(&expansion),
-            replay: Window::new(),
-            out_pid: 0,
-        });
+        self.primary.data = Some(DataKeys::new(PeerKeys::from_expansion(&expansion)));
     }
 }
 
@@ -1295,11 +1344,7 @@ mod tests {
             auth: super::super::options::AuthHash::None,
             ..Options::default()
         });
-        s.primary.data = Some(DataKeys {
-            keys: PeerKeys::from_expansion(&[7u8; 256]),
-            replay: Window::new(),
-            out_pid: 0,
-        });
+        s.primary.data = Some(DataKeys::new(PeerKeys::from_expansion(&[7u8; 256])));
         s.primary.kx_done = true;
         s.primary.established = Some(Instant::now());
         p.active = Some(s);
@@ -1345,6 +1390,40 @@ mod tests {
         assert_eq!(pkt.key_id, 1);
         // Meanwhile the old key keeps sending.
         assert!(p.send_data(b"x").is_ok());
+    }
+
+    /// An AES-GCM key is renegotiated before it has protected too much
+    /// (ssl.c tls_get_limit_aead): once the blocks it encrypted, plus
+    /// the packets, pass the limit -- in either direction.
+    #[test]
+    fn aead_usage_limit_triggers_renegotiation() {
+        let quiet = PeerTimers::default()
+            .renegotiate_interval(Duration::ZERO)
+            .keepalive_interval(Duration::ZERO);
+        let soft_reset = |out: &PeerOutput| {
+            out.send.iter().any(|d| {
+                ControlPacket::parse(d).is_ok_and(|p| p.opcode == Opcode::CONTROL_SOFT_RESET_V1)
+            })
+        };
+
+        // Sending: one more packet goes over.
+        let mut p = keyed_peer().with_timers(quiet);
+        let dk = p.active.as_mut().unwrap().primary.data.as_mut().unwrap();
+        dk.enc_blocks = AEAD_USAGE_LIMIT - 1;
+        assert!(!soft_reset(&p.tick(Instant::now()).unwrap()));
+        p.send_data(b"x").unwrap();
+        assert!(soft_reset(&p.tick(Instant::now()).unwrap()));
+
+        // Receiving: the same, for what the client encrypted.
+        let mut p = keyed_peer().with_timers(quiet);
+        let dk = p.active.as_mut().unwrap().primary.data.as_mut().unwrap();
+        dk.dec_blocks = AEAD_USAGE_LIMIT - 1;
+        assert!(!soft_reset(&p.tick(Instant::now()).unwrap()));
+        let opts = p.active.as_ref().unwrap().opts.clone().unwrap();
+        let keys = PeerKeys::from_expansion(&[7u8; 256]);
+        let pkt = data::encrypt(&opts, &keys, 0, 1, b"x", fill_random).unwrap();
+        assert!(p.handle_packet(&pkt).unwrap().deliver.is_some());
+        assert!(soft_reset(&p.tick(Instant::now()).unwrap()));
     }
 
     #[test]
