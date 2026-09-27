@@ -76,7 +76,9 @@ pub struct Impairment {
     /// would on a real link.
     pub rate_bps: u64,
     /// Maximum messages held in the delay queue per direction. Further
-    /// messages are dropped, modelling a finite transmit buffer.
+    /// messages that way are dropped, modelling a finite transmit buffer.
+    /// Each direction has a buffer of its own, as each end of a real link
+    /// does, so a backlog one way never costs the other way a message.
     pub queue_limit: usize,
     /// Seed for the impairment RNG. Zero picks an arbitrary seed; any other
     /// value makes the run reproducible.
@@ -203,11 +205,18 @@ struct Queue {
     in_flight: usize,
     /// When each direction's link finishes serializing what it already has.
     free_at: [Option<Instant>; 2],
+    /// How many of `heap`'s messages travel each way, for `queue_limit`.
+    queued: [usize; 2],
 }
 
 impl Queue {
     fn len(&self) -> usize {
         self.heap.len()
+    }
+
+    /// Whether `dir`'s buffer has no room for another message.
+    fn full(&self, dir: Direction, limit: usize) -> bool {
+        self.queued[dir as usize] >= limit
     }
 }
 
@@ -413,7 +422,7 @@ impl Engine {
                 .map(|Reverse(m)| m.at)
                 .max()
                 .map_or(now, |last| last.max(now));
-            if q.len() >= cfg.queue_limit.max(1) {
+            if q.full(dir, cfg.queue_limit.max(1)) {
                 drop(q);
                 self.record_drop(dir);
                 return None;
@@ -453,7 +462,7 @@ impl Engine {
             return None;
         }
         let limit = cfg.queue_limit.max(1);
-        if q.len() >= limit {
+        if q.full(dir, limit) {
             drop(q);
             self.record_drop(dir);
             return None;
@@ -489,7 +498,7 @@ impl Engine {
         // A duplicate arrives just behind the original, not on top of it,
         // and only if the buffer has room for it too.
         if duplicate
-            && q.len() < limit
+            && !q.full(dir, limit)
             && let Some(dup_at) = at.checked_add(Duration::from_micros(1))
         {
             push(&mut q, dup_at, dir, buf);
@@ -511,6 +520,7 @@ impl Engine {
         let mut q = self.queue.lock().unwrap();
         q.running = false;
         q.heap.clear();
+        q.queued = [0; 2];
         drop(q);
         self.wake.notify_all();
     }
@@ -532,7 +542,9 @@ impl Engine {
         let mut q = self.queue.lock().unwrap();
         let mut due = Vec::new();
         while matches!(q.heap.peek(), Some(Reverse(h)) if h.at <= now) {
-            due.push(q.heap.pop().unwrap().0);
+            let item = q.heap.pop().unwrap().0;
+            q.queued[item.dir as usize] -= 1;
+            due.push(item);
         }
         q.in_flight += due.len();
         due
@@ -550,6 +562,7 @@ impl Engine {
 fn push(q: &mut Queue, at: Instant, dir: Direction, data: Vec<u8>) {
     q.seq += 1;
     let seq = q.seq;
+    q.queued[dir as usize] += 1;
     q.heap.push(Reverse(Queued { at, seq, dir, data }));
 }
 
@@ -1108,6 +1121,50 @@ mod tests {
         assert_eq!(wire.count(), 0);
         // Dropping the link must not block on the 30-second deadline.
         drop(link);
+    }
+
+    /// Each direction has a buffer of its own: a full one does not drop
+    /// traffic the other way, and each drop is charged to its own side.
+    #[test]
+    fn queue_limit_is_per_direction() {
+        let (wire, link) = wrap(
+            Impairment::default()
+                .delay(Duration::from_secs(30))
+                .queue_limit(4),
+        );
+        link.set_handler(Arc::new(|_: &Frame| Ok(())));
+        for i in 0..6 {
+            link.send(Frame::from_slice(&frame(i))).unwrap();
+        }
+        for i in 0..3 {
+            wire.deliver(Frame::from_slice(&frame(i)));
+        }
+        assert_eq!(link.queued(), 4 + 3);
+        let stats = link.stats().unwrap().snapshot();
+        assert_eq!((stats.tx_dropped, stats.rx_dropped), (2, 0));
+
+        wire.deliver(Frame::from_slice(&frame(3)));
+        wire.deliver(Frame::from_slice(&frame(4)));
+        assert_eq!(link.queued(), 4 + 4);
+        let stats = link.stats().unwrap().snapshot();
+        assert_eq!((stats.tx_dropped, stats.rx_dropped), (2, 1));
+    }
+
+    /// A slot is given back when its message leaves, not only when the link
+    /// is closed.
+    #[test]
+    fn a_released_message_frees_its_directions_slot() {
+        let (wire, link) = wrap(
+            Impairment::default()
+                .delay(Duration::from_millis(20))
+                .queue_limit(1),
+        );
+        link.send(Frame::from_slice(&frame(0))).unwrap();
+        assert!(link.wait_idle(Duration::from_secs(5)));
+        link.send(Frame::from_slice(&frame(1))).unwrap();
+        assert!(link.wait_idle(Duration::from_secs(5)));
+        assert_eq!(wire.count(), 2);
+        assert_eq!(link.stats().unwrap().snapshot().tx_dropped, 0);
     }
 
     #[test]
