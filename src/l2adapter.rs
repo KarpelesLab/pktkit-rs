@@ -233,7 +233,7 @@ impl L2Adapter {
         }
         let (dst_mac, ether_type) = match pkt.version() {
             4 => {
-                if pkt.is_broadcast() {
+                if pkt.is_broadcast() || self.is_subnet_broadcast(pkt.ipv4_dst_addr().unwrap()) {
                     (MacAddr::broadcast(), EtherType::IPV4)
                 } else if pkt.is_multicast() {
                     let d = pkt.ipv4_dst_addr().unwrap().octets();
@@ -273,13 +273,17 @@ impl L2Adapter {
                 } else {
                     let dst = pkt.ipv6_dst_addr().unwrap();
                     let prefix = self.l3.addr();
-                    let target =
-                        if prefix.is_valid() && prefix.is_v6() && !prefix.contains(IpAddr::V6(dst))
-                        {
-                            self.gateway_v6.lock().unwrap().unwrap_or(dst)
-                        } else {
-                            dst
-                        };
+                    // Link-local addresses are on-link whatever the prefix
+                    // (RFC 4861 §5.2); a router would not forward them.
+                    let target = if prefix.is_valid()
+                        && prefix.is_v6()
+                        && !prefix.contains(IpAddr::V6(dst))
+                        && !dst.is_unicast_link_local()
+                    {
+                        self.gateway_v6.lock().unwrap().unwrap_or(dst)
+                    } else {
+                        dst
+                    };
                     match self.ndp.lookup(target) {
                         Some(m) => (m, EtherType::IPV6),
                         None => {
@@ -296,6 +300,20 @@ impl L2Adapter {
 
         let frame = build_frame(dst_mac, self.mac, ether_type, pkt.as_bytes());
         self.send_l2(Frame::from_slice(&frame));
+    }
+
+    /// The directed broadcast of our own IPv4 subnet, e.g. 10.0.0.255 in
+    /// 10.0.0.0/24: nobody answers ARP for it, it goes to every station.
+    fn is_subnet_broadcast(&self, dst: Ipv4Addr) -> bool {
+        let prefix = self.l3.addr();
+        match prefix.addr() {
+            // A /31 or /32 has no broadcast address (RFC 3021).
+            IpAddr::V4(a) if prefix.is_valid() && prefix.bits() < 31 => {
+                let host = u32::MAX >> prefix.bits();
+                u32::from(dst) == u32::from(a) | host
+            }
+            _ => false,
+        }
     }
 
     fn handle_arp(&self, f: &Frame) {
@@ -685,5 +703,59 @@ mod tests {
         done_rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("deadlocked flushing the neighbour queue");
+    }
+
+    fn v4_packet(src: [u8; 4], dst: [u8; 4]) -> Vec<u8> {
+        let mut p = vec![0u8; 20];
+        p[0] = 0x45;
+        p[2..4].copy_from_slice(&20u16.to_be_bytes());
+        p[8] = 64;
+        p[12..16].copy_from_slice(&src);
+        p[16..20].copy_from_slice(&dst);
+        p
+    }
+
+    #[test]
+    fn link_local_destinations_are_resolved_on_link() {
+        let (pipe, adapter, out) = rig("2001:db8::5/64");
+        adapter.set_gateway_v6("2001:db8::1".parse().unwrap());
+        let peer: Ipv6Addr = "fe80::99".parse().unwrap();
+        pipe.inject(Packet::from_slice(&v6_packet(our_ip(), peer)))
+            .unwrap();
+        let sent = take(&out);
+        assert_eq!(sent.len(), 1);
+        let f = Frame::from_slice(&sent[0]);
+        let ns = Packet::from_slice(f.payload()).ipv6_payload();
+        assert_eq!(ns[0], ndp::NS_TYPE);
+        assert_eq!(ns[8..24], peer.octets(), "solicited the gateway instead");
+    }
+
+    #[test]
+    fn subnet_directed_broadcast_goes_to_the_broadcast_mac() {
+        let (pipe, _adapter, out) = rig("10.0.0.5/24");
+        pipe.inject(Packet::from_slice(&v4_packet(
+            [10, 0, 0, 5],
+            [10, 0, 0, 255],
+        )))
+        .unwrap();
+        let sent = take(&out);
+        assert_eq!(sent.len(), 1);
+        let f = Frame::from_slice(&sent[0]);
+        assert_eq!(f.ether_type(), EtherType::IPV4, "tried to ARP for it");
+        assert_eq!(f.dst_mac(), Some(MacAddr::broadcast()));
+    }
+
+    #[test]
+    fn ipv4_multicast_maps_to_its_mac() {
+        let (pipe, _adapter, out) = rig("10.0.0.5/24");
+        pipe.inject(Packet::from_slice(&v4_packet(
+            [10, 0, 0, 5],
+            [239, 129, 2, 3],
+        )))
+        .unwrap();
+        let sent = take(&out);
+        let f = Frame::from_slice(&sent[0]);
+        // RFC 1112 §6.4: the low 23 bits into 01:00:5e:00:00:00.
+        assert_eq!(f.dst_mac(), Some(MacAddr([0x01, 0x00, 0x5e, 0x01, 2, 3])));
     }
 }
