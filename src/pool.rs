@@ -4,11 +4,17 @@ use std::sync::Mutex;
 /// headroom for tunnel overlays.
 pub const DEFAULT_MTU: usize = 1536;
 
+/// Buffers a pool made with [`BufferPool::new`] keeps for reuse: about
+/// 1.5 MiB at [`DEFAULT_MTU`], enough to absorb bursts without letting one
+/// spike pin its peak memory forever.
+pub const DEFAULT_MAX_POOLED: usize = 1024;
+
 /// A thread-safe buffer pool for packet/frame storage.
 ///
 /// Buffers are recycled to minimise allocator pressure on the data plane.
-/// The pool grows on demand and never shrinks — keep a single shared pool
-/// per process so all subsystems amortise allocations.
+/// The pool grows on demand up to its cap ([`DEFAULT_MAX_POOLED`] unless
+/// made [`with_cap`](Self::with_cap)) — keep a single shared pool per process
+/// so all subsystems amortise allocations.
 ///
 /// ```
 /// # use pktkit::BufferPool;
@@ -43,12 +49,9 @@ impl Default for BufferPool {
 }
 
 impl BufferPool {
-    /// Create an unbounded pool (pool size grows with peak concurrency).
+    /// Create a pool retaining up to [`DEFAULT_MAX_POOLED`] buffers.
     pub fn new() -> BufferPool {
-        BufferPool {
-            free: Mutex::new(Vec::new()),
-            max_pooled: usize::MAX,
-        }
+        Self::with_cap(DEFAULT_MAX_POOLED)
     }
 
     /// Create a pool capped at `max_pooled` retained buffers. Buffers freed
@@ -67,28 +70,17 @@ impl BufferPool {
         let mut free = self.free.lock().unwrap();
         let mut buf = free.pop().unwrap_or_default();
         drop(free);
-        if buf.capacity() < n {
-            buf.resize(n, 0);
-        } else {
-            // Safety: we know capacity ≥ n; resize_with avoids reinitialising
-            // bytes we don't need to touch, but for predictability we just
-            // truncate-or-extend with zeros.
-            buf.clear();
-            buf.resize(n, 0);
-        }
+        // Zeroed, so a recycled buffer never leaks its last packet.
+        buf.clear();
+        buf.resize(n, 0);
         buf
     }
 
     /// Return a buffer obtained from [`alloc`](Self::alloc) to the pool.
-    /// Buffers are cleared back to capacity before being recycled.
+    /// Only its storage is kept: the length goes back to zero, since the
+    /// bytes past it may never have been initialised.
     pub fn free(&self, mut buf: Vec<u8>) {
-        // Reset the logical length to capacity (matching the Go contract).
-        let cap = buf.capacity();
-        // Safety: clearing zeros isn't required by Rust, but mirror Go's
-        // intent of recycling the storage with its full capacity available.
-        unsafe {
-            buf.set_len(cap);
-        }
+        buf.clear();
         let mut free = self.free.lock().unwrap();
         if free.len() < self.max_pooled {
             free.push(buf);
@@ -130,5 +122,25 @@ mod tests {
         p.free(b2);
         p.free(b3); // dropped
         assert_eq!(p.free.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn free_never_exposes_uninitialised_bytes() {
+        let p = BufferPool::new();
+        // Capacity nobody ever wrote to.
+        let mut b = Vec::with_capacity(4096);
+        b.push(1u8);
+        p.free(b);
+        let pooled = p.free.lock().unwrap();
+        assert!(pooled[0].len() <= 1, "length covers uninitialised memory");
+    }
+
+    #[test]
+    fn the_default_pool_is_bounded() {
+        let p = BufferPool::new();
+        for _ in 0..DEFAULT_MAX_POOLED + 10 {
+            p.free(Vec::with_capacity(8));
+        }
+        assert_eq!(p.free.lock().unwrap().len(), DEFAULT_MAX_POOLED);
     }
 }
