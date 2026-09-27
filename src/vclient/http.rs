@@ -79,7 +79,7 @@ impl Request {
     fn serialize(&self) -> Vec<u8> {
         let mut out = Vec::new();
         let _ = write!(out, "{} {} HTTP/1.1\r\n", self.method, self.path);
-        let _ = write!(out, "Host: {}\r\n", self.host);
+        let _ = write!(out, "Host: {}\r\n", host_header(&self.host, self.port));
         let mut have_len = false;
         let mut have_conn = false;
         for (k, v) in &self.headers {
@@ -151,19 +151,58 @@ fn parse_http_url(url: &str) -> io::Result<(String, u16, String)> {
             "only http:// URLs are supported",
         )
     })?;
-    let (authority, path) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, "/"),
+    let bad = |what: &str| io::Error::new(io::ErrorKind::InvalidInput, format!("bad URL: {what}"));
+    // RFC 3986 §3.2: the authority ends at the first '/', '?' or '#'.
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, rest) = rest.split_at(end);
+    // The fragment is for the client alone and never goes on the wire.
+    let target = rest.split('#').next().unwrap_or("");
+    let path = match target {
+        "" => "/".to_string(),
+        t if t.starts_with('?') => format!("/{t}"),
+        t => t.to_string(),
     };
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) => (
-            h.to_string(),
-            p.parse()
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "bad port"))?,
-        ),
-        None => (authority.to_string(), 80),
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, a)| a);
+    let (host, port) = if let Some(v6) = authority.strip_prefix('[') {
+        // An IPv6 literal is bracketed so its colons are not read as the port.
+        let (host, after) = v6.split_once(']').ok_or_else(|| bad("unclosed '['"))?;
+        host.parse::<std::net::Ipv6Addr>()
+            .map_err(|_| bad("invalid IPv6 literal"))?;
+        let port = match after {
+            "" => "",
+            p => p.strip_prefix(':').ok_or_else(|| bad("junk after ']'"))?,
+        };
+        (host, port)
+    } else {
+        match authority.split_once(':') {
+            Some((h, p)) => (h, p),
+            None => (authority, ""),
+        }
     };
-    Ok((host, port, path.to_string()))
+    if host.is_empty() {
+        return Err(bad("no host"));
+    }
+    // An empty port means the default (RFC 3986 §3.2.3).
+    let port = match port {
+        "" => 80,
+        p => p.parse().map_err(|_| bad("invalid port"))?,
+    };
+    Ok((host.to_string(), port, path))
+}
+
+/// The Host header for `host:port` (RFC 9112 §3.2): the port only when it is
+/// not the default, and an IPv6 literal in brackets.
+fn host_header(host: &str, port: u16) -> String {
+    let host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    if port == 80 {
+        host
+    } else {
+        format!("{host}:{port}")
+    }
 }
 
 /// If `raw` contains a complete response (headers + full body per
@@ -299,6 +338,52 @@ mod tests {
             ("10.0.0.1".into(), 8080, "/".into())
         );
         assert!(parse_http_url("https://x/").is_err());
+    }
+
+    #[test]
+    fn url_parsing_ipv6_literals() {
+        assert_eq!(
+            parse_http_url("http://[::1]/").unwrap(),
+            ("::1".into(), 80, "/".into())
+        );
+        assert_eq!(
+            parse_http_url("http://[fd00::1]:8080/x?y=1#frag").unwrap(),
+            ("fd00::1".into(), 8080, "/x?y=1".into())
+        );
+        assert_eq!(
+            parse_http_url("http://[::1]").unwrap(),
+            ("::1".into(), 80, "/".into())
+        );
+        assert!(parse_http_url("http://[::1/").is_err());
+        assert!(parse_http_url("http://[nope]/").is_err());
+        assert!(parse_http_url("http://::1/").is_err());
+    }
+
+    #[test]
+    fn url_parsing_query_fragment_and_empty_port() {
+        assert_eq!(
+            parse_http_url("http://h?q").unwrap(),
+            ("h".into(), 80, "/?q".into())
+        );
+        assert_eq!(
+            parse_http_url("http://h:/p#f").unwrap(),
+            ("h".into(), 80, "/p".into())
+        );
+        assert!(parse_http_url("http:///p").is_err());
+    }
+
+    #[test]
+    fn host_header_carries_port_and_brackets() {
+        let host = |url: &str| {
+            let s = String::from_utf8(Request::get(url).unwrap().serialize()).unwrap();
+            s.lines()
+                .find_map(|l| l.strip_prefix("Host: ").map(str::to_string))
+                .unwrap()
+        };
+        assert_eq!(host("http://h/"), "h");
+        assert_eq!(host("http://h:8080/"), "h:8080");
+        assert_eq!(host("http://[::1]/"), "[::1]");
+        assert_eq!(host("http://[::1]:8080/"), "[::1]:8080");
     }
 
     #[test]
