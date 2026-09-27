@@ -894,7 +894,10 @@ impl Conn {
                 seg.seq.wrapping_add(1),
                 self.cfg.recv_buf_size,
             ));
-            self.snd_wnd = (seg.window as u32) << self.snd_wnd_shift;
+            // RFC 7323 §2.2: the window in a SYN or SYN-ACK is never
+            // scaled. Scaling it made the first real ACK look like a window
+            // change, so it could not count as a duplicate.
+            self.snd_wnd = seg.window as u32;
             self.cc = make_cc(self.cfg.congestion, self.mss as u32);
             self.rto.ack_received(seg.ack);
             self.state = State::Established;
@@ -919,7 +922,8 @@ impl Conn {
             seg.seq.wrapping_add(1),
             self.cfg.recv_buf_size,
         ));
-        self.snd_wnd = (seg.window as u32) << self.snd_wnd_shift;
+        // A SYN's window is never scaled (RFC 7323 §2.2).
+        self.snd_wnd = seg.window as u32;
         self.state = State::SynReceived;
         self.retries = 0;
         self.stop_rto();
@@ -2356,6 +2360,9 @@ mod tests {
         let synack = parse(&server.accept_syn(&syn)[0]);
         assert!(server.wscale_ok);
         assert_eq!(synack.window, 65535);
+        // Nor does the receiving end scale it.
+        client.handle_segment(&synack);
+        assert_eq!(client.snd_wnd, 65535);
     }
 
     struct Rng(u64);
