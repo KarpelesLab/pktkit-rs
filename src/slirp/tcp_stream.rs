@@ -114,9 +114,75 @@ pub(crate) struct ConnState {
     /// Sink for fully-framed IP packets the engine wants to transmit back into
     /// the virtual network. Provided by the stack (wraps `Stack::dispatch`).
     pub(crate) sink: Arc<dyn Fn(&[u8]) + Send + Sync>,
+    /// For a passively opened connection: hands it to its listener once the
+    /// handshake completes, unless the deadline passes first.
+    pending_accept: Mutex<Option<(Instant, AcceptFn)>>,
 }
 
+/// Offers an established connection to a listener; `false` means the
+/// listener refused it (closed, or its queue is full).
+pub(crate) type AcceptFn = Box<dyn FnOnce(Arc<ConnState>) -> bool + Send>;
+
+/// How long a passively opened connection may take to complete its
+/// handshake before it is dropped.
+const ACCEPT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
 impl ConnState {
+    pub(crate) fn new(
+        endpoints: Endpoints,
+        conn: Conn,
+        sink: Arc<dyn Fn(&[u8]) + Send + Sync>,
+    ) -> Arc<ConnState> {
+        Arc::new(ConnState {
+            endpoints,
+            conn: Mutex::new(conn),
+            signal: Condvar::new(),
+            sink,
+            pending_accept: Mutex::new(None),
+        })
+    }
+
+    /// Queue the connection on a listener, through `accept`, once its
+    /// handshake completes (see [`complete_accept`](Self::complete_accept)).
+    pub(crate) fn set_pending_accept(&self, accept: AcceptFn) {
+        *self.pending_accept.lock().expect("poisoned") =
+            Some((Instant::now() + ACCEPT_HANDSHAKE_TIMEOUT, accept));
+    }
+
+    /// Hand a passively opened connection to its listener if its handshake
+    /// has just completed. Call it after every inbound segment.
+    ///
+    /// Returns `false` when the connection is finished with: the listener
+    /// refused it, so it has been aborted and the caller should drop it from
+    /// its table.
+    pub(crate) fn complete_accept(self: &Arc<Self>) -> bool {
+        let mut pending = self.pending_accept.lock().expect("poisoned");
+        if pending.is_none()
+            || !self
+                .conn
+                .lock()
+                .expect("poisoned")
+                .state()
+                .is_synchronized()
+        {
+            return true;
+        }
+        let (_, accept) = pending.take().expect("checked above");
+        drop(pending);
+        if accept(self.clone()) {
+            return true;
+        }
+        self.abort();
+        false
+    }
+
+    /// Send a RST and close.
+    fn abort(&self) {
+        let segs = self.conn.lock().expect("poisoned").abort();
+        self.wrap_and_send(segs);
+        self.signal.notify_all();
+    }
+
     /// Wrap each segment in IP and push it into the virtual network.
     pub(crate) fn wrap_and_send(&self, segments: Vec<Vec<u8>>) {
         for seg in segments {
@@ -284,6 +350,16 @@ impl Drop for TcpStream {
 /// wake any waiters. Returns `true` if the connection is now closed (so the
 /// caller can drop it from the table).
 pub(crate) fn tick_conn(state: &Arc<ConnState>) -> bool {
+    // A handshake that has not completed in time is abandoned, as a listen
+    // queue would drop a stale embryonic connection.
+    let expired = matches!(
+        &*state.pending_accept.lock().expect("poisoned"),
+        Some((deadline, _)) if Instant::now() >= *deadline
+    );
+    if expired {
+        state.pending_accept.lock().expect("poisoned").take();
+        state.abort();
+    }
     let (segs, closed) = {
         let mut conn = state.conn.lock().expect("poisoned");
         let segs = conn.tick();
@@ -294,9 +370,4 @@ pub(crate) fn tick_conn(state: &Arc<ConnState>) -> bool {
     }
     state.signal.notify_all();
     closed
-}
-
-/// True once the connection has reached the terminal CLOSED state.
-pub(crate) fn is_closed(state: &Arc<ConnState>) -> bool {
-    state.conn.lock().expect("poisoned").is_closed()
 }

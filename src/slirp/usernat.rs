@@ -26,11 +26,11 @@ use crate::slirp::ipv6::skip_extension_headers;
 use crate::slirp::listener::{Listener, ListenerKey, resolve_v4};
 use crate::slirp::listener6::{Listener6, ListenerKey6, resolve_v6};
 use crate::slirp::tcp_out::{TcpOutConn, build_rst_for_stray};
-use crate::slirp::tcp_stream::{ConnState, Endpoints, is_closed as conn_is_closed, tick_conn};
+use crate::slirp::tcp_stream::{ConnState, Endpoints, tick_conn};
 use crate::slirp::udp::{SendFn as UdpSendFn, UdpConn};
 use crate::slirp::udp6::{SendFn as UdpSendFn6, UdpConn6};
 use crate::vtcp::segment::{Segment, flags as tcp_flags};
-use crate::vtcp::{Conn, ConnConfig, State as VtcpState};
+use crate::vtcp::{Conn, ConnConfig};
 use crate::{IpPrefix, Result, connect_l3};
 
 use crate::time::Instant;
@@ -38,7 +38,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 
@@ -68,6 +68,11 @@ const MAX_VIRT_TCP_CONNS: usize = 10_000;
 /// drops SYNs holds a thread for up to the connect timeout; SYNs past the cap
 /// are dropped, and the client's retransmissions try again later.
 const MAX_PENDING_DIALS: usize = 256;
+
+/// Cap on UDP flows per address family. Each one holds a real socket and a
+/// reader thread, and any new 4-tuple from the virtual network opens one.
+/// Small under test so the cap itself can be exercised.
+const MAX_UDP_FLOWS: usize = if cfg!(test) { 8 } else { 4096 };
 
 /// Time a UDP flow may sit idle before its socket is reaped.
 const UDP_IDLE: Duration = Duration::from_secs(60);
@@ -504,6 +509,9 @@ impl Stack {
             if let Ok(seg) = Segment::parse(tcp) {
                 state.deliver(&seg);
             }
+            if !state.complete_accept() {
+                inner.virt_tcp.lock().expect("poisoned").remove(&key);
+            }
             return Ok(());
         }
 
@@ -643,76 +651,26 @@ impl Stack {
         let mut conn = Conn::new(cfg);
         let synack = conn.accept_syn(&seg);
 
-        let state = Arc::new(ConnState {
-            endpoints: Endpoints::V4 {
+        let state = ConnState::new(
+            Endpoints::V4 {
                 local_ip: dst,
                 local_port: dst_port,
                 remote_ip: src,
                 remote_port: src_port,
             },
-            conn: Mutex::new(conn),
-            signal: Condvar::new(),
+            conn,
             sink,
-        });
+        );
+        state.set_pending_accept(Box::new(move |s| listener.enqueue(s)));
         inner
             .virt_tcp
             .lock()
             .expect("poisoned")
             .insert(key, state.clone());
-        // Emit the SYN-ACK.
+        // Emit the SYN-ACK. The connection joins the listener's queue when an
+        // inbound segment completes the handshake (see `complete_accept`).
         state.wrap_and_send(synack);
-
-        // Wait (off the dispatch path) for ESTABLISHED, then enqueue.
-        Self::spawn_accept_waiter(inner.clone(), key, state, listener);
         Ok(())
-    }
-
-    /// Background helper: block until the handshake completes (or the conn
-    /// dies), then hand the connection to the listener's accept queue.
-    fn spawn_accept_waiter(
-        inner: Arc<Inner>,
-        key: Key,
-        state: Arc<ConnState>,
-        listener: Arc<Listener>,
-    ) {
-        thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(10);
-            loop {
-                let st = state.conn.lock().expect("poisoned").state();
-                match st {
-                    VtcpState::Established
-                    | VtcpState::FinWait1
-                    | VtcpState::FinWait2
-                    | VtcpState::CloseWait
-                    | VtcpState::Closing
-                    | VtcpState::LastAck
-                    | VtcpState::TimeWait => {
-                        if !listener.enqueue(state.clone()) {
-                            // Listener closed or queue full: abort and drop.
-                            let segs = state.conn.lock().expect("poisoned").abort();
-                            state.wrap_and_send(segs);
-                            inner.virt_tcp.lock().expect("poisoned").remove(&key);
-                        }
-                        return;
-                    }
-                    VtcpState::Closed => {
-                        inner.virt_tcp.lock().expect("poisoned").remove(&key);
-                        return;
-                    }
-                    _ => {}
-                }
-                if conn_is_closed(&state) || Instant::now() >= deadline {
-                    inner.virt_tcp.lock().expect("poisoned").remove(&key);
-                    return;
-                }
-                // Wait for an inbound segment / tick to advance the handshake.
-                let guard = state.conn.lock().expect("poisoned");
-                let _ = state
-                    .signal
-                    .wait_timeout(guard, Duration::from_millis(50))
-                    .expect("poisoned");
-            }
-        });
     }
 
     fn handle_ipv4_udp(
@@ -744,6 +702,8 @@ impl Stack {
             let mut t = inner.udp.lock().expect("poisoned");
             if let Some(c) = t.get(&key) {
                 c.clone()
+            } else if t.len() >= MAX_UDP_FLOWS {
+                return Ok(()); // table full: drop, as a full conntrack table would
             } else {
                 let weak = Arc::downgrade(inner);
                 let send_fn: UdpSendFn = Arc::new(move |p: &[u8]| match weak.upgrade() {
@@ -837,6 +797,9 @@ impl Stack {
         if let Some(state) = virt {
             if let Ok(seg) = Segment::parse(tcp) {
                 state.deliver(&seg);
+            }
+            if !state.complete_accept() {
+                inner.virt_tcp6.lock().expect("poisoned").remove(&key);
             }
             return Ok(());
         }
@@ -962,75 +925,26 @@ impl Stack {
         let mut conn = Conn::new(cfg);
         let synack = conn.accept_syn(&seg);
 
-        let state = Arc::new(ConnState {
-            endpoints: Endpoints::V6 {
+        let state = ConnState::new(
+            Endpoints::V6 {
                 local_ip: dst,
                 local_port: dst_port,
                 remote_ip: src,
                 remote_port: src_port,
             },
-            conn: Mutex::new(conn),
-            signal: Condvar::new(),
+            conn,
             sink,
-        });
+        );
+        state.set_pending_accept(Box::new(move |s| listener.enqueue(s)));
         inner
             .virt_tcp6
             .lock()
             .expect("poisoned")
             .insert(key, state.clone());
-        // Emit the SYN-ACK.
+        // Emit the SYN-ACK. The connection joins the listener's queue when an
+        // inbound segment completes the handshake (see `complete_accept`).
         state.wrap_and_send(synack);
-
-        // Wait (off the dispatch path) for ESTABLISHED, then enqueue.
-        Self::spawn_accept_waiter6(inner.clone(), key, state, listener);
         Ok(())
-    }
-
-    /// IPv6 analogue of [`spawn_accept_waiter`](Self::spawn_accept_waiter).
-    fn spawn_accept_waiter6(
-        inner: Arc<Inner>,
-        key: Key6,
-        state: Arc<ConnState>,
-        listener: Arc<Listener6>,
-    ) {
-        thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(10);
-            loop {
-                let st = state.conn.lock().expect("poisoned").state();
-                match st {
-                    VtcpState::Established
-                    | VtcpState::FinWait1
-                    | VtcpState::FinWait2
-                    | VtcpState::CloseWait
-                    | VtcpState::Closing
-                    | VtcpState::LastAck
-                    | VtcpState::TimeWait => {
-                        if !listener.enqueue(state.clone()) {
-                            // Listener closed or queue full: abort and drop.
-                            let segs = state.conn.lock().expect("poisoned").abort();
-                            state.wrap_and_send(segs);
-                            inner.virt_tcp6.lock().expect("poisoned").remove(&key);
-                        }
-                        return;
-                    }
-                    VtcpState::Closed => {
-                        inner.virt_tcp6.lock().expect("poisoned").remove(&key);
-                        return;
-                    }
-                    _ => {}
-                }
-                if conn_is_closed(&state) || Instant::now() >= deadline {
-                    inner.virt_tcp6.lock().expect("poisoned").remove(&key);
-                    return;
-                }
-                // Wait for an inbound segment / tick to advance the handshake.
-                let guard = state.conn.lock().expect("poisoned");
-                let _ = state
-                    .signal
-                    .wait_timeout(guard, Duration::from_millis(50))
-                    .expect("poisoned");
-            }
-        });
     }
 
     fn handle_ipv6_udp(
@@ -1060,6 +974,8 @@ impl Stack {
             let mut t = inner.udp6.lock().expect("poisoned");
             if let Some(c) = t.get(&key) {
                 c.clone()
+            } else if t.len() >= MAX_UDP_FLOWS {
+                return Ok(()); // table full: drop, as a full conntrack table would
             } else {
                 let weak = Arc::downgrade(inner);
                 let send_fn: UdpSendFn6 = Arc::new(move |p: &[u8]| match weak.upgrade() {
@@ -1184,6 +1100,7 @@ mod tests {
     use super::*;
     use crate::Protocol;
     use crate::slirp::checksum::{ipv4_header_checksum, udp_v4_checksum};
+    use crate::vtcp::State as VtcpState;
     use crate::vtcp::segment::flags as tcp_flags;
     use std::net::{IpAddr, UdpSocket};
     use std::sync::atomic::AtomicUsize;
@@ -1747,6 +1664,62 @@ mod tests {
             done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
             "shutdown deadlocked against the blocked writer"
         );
+    }
+
+    #[test]
+    fn udp_flows_are_capped() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let sport = server.local_addr().unwrap().port();
+        let stack = Stack::new();
+        let _captured = capture(&stack);
+        for i in 0..(MAX_UDP_FLOWS as u16 + 5) {
+            let dgram = build_udp_v4_packet(
+                Ipv4Addr::new(10, 0, 0, 5),
+                41000 + i,
+                Ipv4Addr::new(127, 0, 0, 1),
+                sport,
+                b"x",
+            );
+            L3Device::send(&*stack, Packet::from_slice(&dgram)).unwrap();
+        }
+        assert_eq!(stack.inner.udp.lock().unwrap().len(), MAX_UDP_FLOWS);
+    }
+
+    #[test]
+    fn handshake_to_closed_listener_is_reset() {
+        let stack = Stack::new();
+        let captured = capture(&stack);
+        let listener = stack.listen("tcp", "10.0.0.1:8080").unwrap();
+        let client = Ipv4Addr::new(10, 0, 0, 5);
+        let server = Ipv4Addr::new(10, 0, 0, 1);
+        let syn = build_tcp_v4_packet(client, 40020, server, 8080, 500, 0, tcp_flags::SYN, &[]);
+        L3Device::send(&*stack, Packet::from_slice(&syn)).unwrap();
+        let synack = Segment::parse(&captured.lock().unwrap()[0][20..]).unwrap();
+        assert_eq!(synack.flags, tcp_flags::SYN | tcp_flags::ACK);
+
+        // The listener goes away while the handshake is in flight.
+        listener.close().unwrap();
+        let ack = build_tcp_v4_packet(
+            client,
+            40020,
+            server,
+            8080,
+            501,
+            synack.seq.wrapping_add(1),
+            tcp_flags::ACK,
+            &[],
+        );
+        L3Device::send(&*stack, Packet::from_slice(&ack)).unwrap();
+        wait_for("RST", || {
+            captured
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|p| Segment::parse(&p[20..]).is_ok_and(|s| s.flags & tcp_flags::RST != 0))
+        });
+        wait_for("the connection to be dropped", || {
+            stack.inner.virt_tcp.lock().unwrap().is_empty()
+        });
     }
 
     #[test]

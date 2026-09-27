@@ -136,17 +136,16 @@ mod tests {
     use crate::vtcp::{Conn, ConnConfig};
 
     fn dummy_state() -> Arc<ConnState> {
-        Arc::new(ConnState {
-            endpoints: crate::slirp::tcp_stream::Endpoints::V4 {
+        ConnState::new(
+            crate::slirp::tcp_stream::Endpoints::V4 {
                 local_ip: Ipv4Addr::new(10, 0, 0, 1),
                 local_port: 80,
                 remote_ip: Ipv4Addr::new(10, 0, 0, 5),
                 remote_port: 5000,
             },
-            conn: Mutex::new(Conn::new(ConnConfig::default())),
-            signal: Condvar::new(),
-            sink: Arc::new(|_p: &[u8]| {}),
-        })
+            Conn::new(ConnConfig::default()),
+            Arc::new(|_p: &[u8]| {}),
+        )
     }
 
     #[test]

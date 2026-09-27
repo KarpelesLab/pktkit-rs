@@ -32,7 +32,7 @@ use crate::vtcp::{Conn, ConnConfig};
 use std::io::{Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -116,12 +116,7 @@ impl TcpOutConn {
         };
 
         Arc::new(TcpOutConn {
-            state: Arc::new(ConnState {
-                endpoints,
-                conn: Mutex::new(Conn::new(cfg)),
-                signal: Condvar::new(),
-                sink,
-            }),
+            state: ConnState::new(endpoints, Conn::new(cfg), sink),
             remote: OnceLock::new(),
             closed: Arc::new(AtomicBool::new(false)),
             syn: Mutex::new(Some(syn.clone())),
