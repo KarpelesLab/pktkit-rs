@@ -26,6 +26,10 @@ const IPV4_MIN_HEADER: usize = 20;
 const NAT_PORT_MIN: u16 = 10000;
 const NAT_PORT_MAX: u16 = 65535;
 
+/// The minimum IPv6 MTU (RFC 8200 §5), which translated packets that may be
+/// fragmented are cut to fit unless told the inside links carry more.
+const IPV6_MIN_MTU: u16 = 1280;
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct Nat64Key {
     proto: u8,
@@ -83,6 +87,9 @@ pub struct Nat64 {
     /// IPv4 address the prefix cannot stand for (see
     /// [`set_icmp_source`](Nat64::set_icmp_source)).
     icmp_source: Mutex<Option<Ipv6Addr>>,
+    /// Largest IPv6 packet sent inside from an IPv4 one that may be
+    /// fragmented (see [`set_ipv6_mtu`](Nat64::set_ipv6_mtu)).
+    ipv6_mtu: AtomicU16,
 }
 
 struct Nat64Inner {
@@ -124,7 +131,18 @@ impl Nat64 {
             out_frags: Mutex::new(FragTable::default()),
             next_sweep: Mutex::new(Instant::now() + SWEEP_INTERVAL),
             icmp_source: Mutex::new(None),
+            ipv6_mtu: AtomicU16::new(IPV6_MIN_MTU),
         })
+    }
+
+    /// Set the size IPv6 packets translated from IPv4 ones without Don't
+    /// Fragment are cut down to, with IPv6 Fragment Headers (RFC 7915 §4).
+    /// The default, and the least accepted, is 1280, the minimum IPv6 MTU,
+    /// which every IPv6 path carries; raise it only when every inside path
+    /// is known to carry more.
+    pub fn set_ipv6_mtu(&self, mtu: u16) {
+        self.ipv6_mtu
+            .store(mtu.max(IPV6_MIN_MTU), Ordering::Relaxed);
     }
 
     /// Set the IPv6 address ICMPv6 errors come from when the IPv4 address
@@ -750,15 +768,19 @@ impl Nat64 {
             }
             return;
         }
-        let frag_id = more.then_some(key.1);
+        let frag = V4Frag {
+            id: key.1,
+            offset: 0,
+            more,
+            df: pkt[6] & 0x40 != 0,
+        };
 
         match proto {
             PROTO_TCP | PROTO_UDP => {
-                let Some(dst_v6) = self.inbound_tcpudp(transport, proto, src_v4, hop, frag_id)
-                else {
+                let Some(dst_v6) = self.inbound_tcpudp(transport, proto, src_v4, hop, frag) else {
                     return;
                 };
-                if frag_id.is_some() {
+                if more {
                     let held = self
                         .frags
                         .lock()
@@ -770,7 +792,7 @@ impl Nat64 {
                 }
             }
             // See outbound: fragmented ICMP is not translated.
-            PROTO_ICMP if frag_id.is_none() => self.inbound_icmp(transport, src_v4, hop),
+            PROTO_ICMP if !more => self.inbound_icmp(transport, src_v4, hop, frag),
             _ => {}
         }
     }
@@ -784,24 +806,69 @@ impl Nat64 {
             return;
         };
         let (more, offset) = frag_info(pkt);
-        let id = u16::from_be_bytes([pkt[4], pkt[5]]);
-        let data = &pkt[ihl..];
+        let frag = V4Frag {
+            id: u16::from_be_bytes([pkt[4], pkt[5]]),
+            offset,
+            more,
+            df: false,
+        };
         let hop = (pkt[8].saturating_sub(1), pkt[1]);
-        let mut out = v6_header(src_v6, dst_v6, 44, hop, 8 + data.len());
-        out.extend_from_slice(&v6_frag_header(pkt[9], offset, more, id));
-        out.extend_from_slice(data);
-        self.inside.deliver(Packet::from_slice(&out));
+        self.deliver_v6((src_v6, dst_v6), pkt[9], hop, &pkt[ihl..], frag);
+    }
+
+    /// Send the inside an IPv6 packet from `src` to `dst` carrying `data`
+    /// (of protocol `proto`), translated from an IPv4 packet `frag`
+    /// describes: with a Fragment Header if that was a fragment, and cut
+    /// into fragments no larger than the IPv6 MTU if it was larger and
+    /// could be fragmented (RFC 7915 §4). Otherwise the IPv6 path's own
+    /// Packet Too Big, translated back, tells the IPv4 sender to shrink.
+    fn deliver_v6(
+        &self,
+        (src, dst): (Ipv6Addr, Ipv6Addr),
+        proto: u8,
+        hop: Hop,
+        data: &[u8],
+        frag: V4Frag,
+    ) {
+        let fragment = frag.more || frag.offset != 0;
+        let hdr = IPV6_HEADER_LEN + if fragment { 8 } else { 0 };
+        let mtu = usize::from(self.ipv6_mtu.load(Ordering::Relaxed));
+        if frag.df || hdr + data.len() <= mtu {
+            let mut out = if fragment {
+                let mut out = v6_header(src, dst, 44, hop, 8 + data.len());
+                out.extend_from_slice(&v6_frag_header(proto, frag.offset, frag.more, frag.id));
+                out
+            } else {
+                v6_header(src, dst, proto, hop, data.len())
+            };
+            out.extend_from_slice(data);
+            self.inside.deliver(Packet::from_slice(&out));
+            return;
+        }
+        // Every piece but the last carries a multiple of 8 bytes, as
+        // fragment offsets count in eighths.
+        let chunk = (mtu - IPV6_HEADER_LEN - 8) & !7;
+        let mut at = 0;
+        while at < data.len() {
+            let end = (at + chunk).min(data.len());
+            let more = end < data.len() || frag.more;
+            let mut out = v6_header(src, dst, 44, hop, 8 + end - at);
+            out.extend_from_slice(&v6_frag_header(proto, frag.offset + at, more, frag.id));
+            out.extend_from_slice(&data[at..end]);
+            self.inside.deliver(Packet::from_slice(&out));
+            at = end;
+        }
     }
 
     /// Translate an inbound TCP/UDP packet, or the first fragment of one
-    /// (IPv4 ID `frag_id`), to IPv6. Returns the inside host it went to.
+    /// (`frag.more`), to IPv6. Returns the inside host it went to.
     fn inbound_tcpudp(
         &self,
         transport: &[u8],
         proto: u8,
         src_v4: Ipv4Addr,
         hop: Hop,
-        frag_id: Option<u16>,
+        frag: V4Frag,
     ) -> Option<Ipv6Addr> {
         let field = if proto == PROTO_TCP { 16 } else { 6 };
         if transport.len() < field + 2 {
@@ -832,7 +899,7 @@ impl Nat64 {
         if proto == PROTO_UDP && transport[6..8] == [0, 0] {
             // IPv4 UDP may omit its checksum, IPv6 UDP may not: compute one
             // (RFC 7915 §4.5), which takes the whole datagram.
-            if frag_id.is_some() {
+            if frag.more {
                 return None;
             }
             fill_v6_checksum(&mut l4, field, proto, src_v6, dst_v6);
@@ -857,24 +924,11 @@ impl Nat64 {
             l4[field..field + 2].copy_from_slice(&cs.to_be_bytes());
         }
 
-        let out = match frag_id {
-            Some(id) => {
-                let mut out = v6_header(src_v6, dst_v6, 44, hop, 8 + l4.len());
-                out.extend_from_slice(&v6_frag_header(proto, 0, true, id));
-                out.extend_from_slice(&l4);
-                out
-            }
-            None => {
-                let mut out = v6_header(src_v6, dst_v6, proto, hop, l4.len());
-                out.extend_from_slice(&l4);
-                out
-            }
-        };
-        self.inside.deliver(Packet::from_slice(&out));
+        self.deliver_v6((src_v6, dst_v6), proto, hop, &l4, frag);
         Some(dst_v6)
     }
 
-    fn inbound_icmp(&self, icmp: &[u8], src_v4: Ipv4Addr, hop: Hop) {
+    fn inbound_icmp(&self, icmp: &[u8], src_v4: Ipv4Addr, hop: Hop, frag: V4Frag) {
         // Every ICMP message is rebuilt with a fresh checksum below, so a
         // corrupted one must be caught here rather than laundered.
         if icmp.len() < 8 || checksum(icmp) != 0 {
@@ -884,7 +938,7 @@ impl Nat64 {
         // RFC 7915 §4.2: the ICMPv6 type, code and 32-bit field for each
         // ICMPv4 message; anything without a counterpart is dropped.
         let (v6_type, v6_code, word) = match (icmp[0], icmp[1]) {
-            (0, 0) => return self.inbound_echo_reply(icmp, src_v4, hop),
+            (0, 0) => return self.inbound_echo_reply(icmp, src_v4, hop, frag),
             (3, 0 | 1 | 5 | 6 | 7 | 8 | 11 | 12) => (1, 0, 0),
             (3, 9 | 10 | 13 | 15) => (1, 1, 0),
             (3, 3) => (1, 4, 0),
@@ -910,7 +964,7 @@ impl Nat64 {
         self.inbound_icmp_error(icmp, src_v4, hop, v6_type, v6_code, word);
     }
 
-    fn inbound_echo_reply(&self, icmp: &[u8], src_v4: Ipv4Addr, hop: Hop) {
+    fn inbound_echo_reply(&self, icmp: &[u8], src_v4: Ipv4Addr, hop: Hop, frag: V4Frag) {
         let id = u16::from_be_bytes([icmp[4], icmp[5]]);
         let rk = Nat64RevKey {
             proto: PROTO_ICMP,
@@ -931,16 +985,14 @@ impl Nat64 {
             return;
         };
         let dst_v6 = mapping_key.ip;
-        let mut out = v6_header(src_v6, dst_v6, PROTO_ICMPV6, hop, icmp.len());
-        out.extend_from_slice(icmp);
-        let icmp_off = IPV6_HEADER_LEN;
-        out[icmp_off] = 129; // ICMPv6 Echo Reply
-        out[icmp_off + 1] = 0;
-        out[icmp_off + 4..icmp_off + 6].copy_from_slice(&mapping_key.port.to_be_bytes());
-        out[icmp_off + 2..icmp_off + 4].copy_from_slice(&[0, 0]);
-        let cs = compute_icmpv6_checksum(src_v6, dst_v6, &out[icmp_off..]);
-        out[icmp_off + 2..icmp_off + 4].copy_from_slice(&cs.to_be_bytes());
-        self.inside.deliver(Packet::from_slice(&out));
+        let mut msg = icmp.to_vec();
+        msg[0] = 129; // ICMPv6 Echo Reply
+        msg[1] = 0;
+        msg[4..6].copy_from_slice(&mapping_key.port.to_be_bytes());
+        msg[2..4].copy_from_slice(&[0, 0]);
+        let cs = compute_icmpv6_checksum(src_v6, dst_v6, &msg);
+        msg[2..4].copy_from_slice(&cs.to_be_bytes());
+        self.deliver_v6((src_v6, dst_v6), PROTO_ICMPV6, hop, &msg, frag);
     }
 
     /// Translate an ICMPv4 error about a packet this NAT64 sent out into the
@@ -1334,6 +1386,17 @@ struct V6Frag {
     offset: usize,
     more: bool,
     id: u32,
+}
+
+/// What an inbound IPv4 packet's header says about fragmentation.
+#[derive(Clone, Copy, Debug)]
+struct V4Frag {
+    id: u16,
+    /// In bytes.
+    offset: usize,
+    more: bool,
+    /// Don't Fragment.
+    df: bool,
 }
 
 /// The hop count (TTL or Hop Limit) and traffic class (TOS or Traffic
@@ -2322,6 +2385,131 @@ mod tests {
         assert_eq!(v4_flags(&out[0]), (true, 0));
         assert_eq!(v4_flags(&out[1]), (false, 16));
         assert_eq!(&out[1][20..], &f2[48..]);
+    }
+
+    /// A UDP reply from the server to the client's mapped `port`, carrying
+    /// `len` bytes, with Don't Fragment as given and IP ID 0x4242.
+    fn big_v4_reply(port: u16, len: usize, df: bool) -> Vec<u8> {
+        let udp_len = 8 + len;
+        let mut d = vec![0u8; 20 + udp_len];
+        d[0] = 0x45;
+        d[2..4].copy_from_slice(&((20 + udp_len) as u16).to_be_bytes());
+        d[4..6].copy_from_slice(&0x4242u16.to_be_bytes());
+        d[6] = if df { 0x40 } else { 0 };
+        d[8] = 64;
+        d[9] = PROTO_UDP;
+        d[12..16].copy_from_slice(&SERVER.octets());
+        d[16..20].copy_from_slice(&[198, 51, 100, 1]);
+        let ic = checksum(&d[..20]);
+        d[10..12].copy_from_slice(&ic.to_be_bytes());
+        d[20..22].copy_from_slice(&53u16.to_be_bytes());
+        d[22..24].copy_from_slice(&port.to_be_bytes());
+        d[24..26].copy_from_slice(&(udp_len as u16).to_be_bytes());
+        for (i, b) in d[28..].iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        crate::nat::l4::fill_v4_l4_checksum(&mut d, 20);
+        d
+    }
+
+    /// Reassemble IPv6 fragments (Fragment Header right after the fixed
+    /// header) into the transport payload they carry.
+    fn reassemble_v6(frags: &[Vec<u8>]) -> Vec<u8> {
+        let mut parts: Vec<(usize, bool, &[u8])> = frags
+            .iter()
+            .map(|p| {
+                assert_eq!(p[6], 44, "Fragment Header");
+                let fo = u16::from_be_bytes([p[42], p[43]]);
+                (usize::from(fo & 0xFFF8), fo & 1 != 0, &p[48..])
+            })
+            .collect();
+        parts.sort_by_key(|p| p.0);
+        let mut whole = Vec::new();
+        for (i, (off, more, data)) in parts.iter().enumerate() {
+            assert_eq!(*off, whole.len(), "contiguous");
+            assert_eq!(*more, i + 1 < parts.len());
+            whole.extend_from_slice(data);
+        }
+        whole
+    }
+
+    #[test]
+    fn large_inbound_packets_without_df_are_fragmented_to_fit() {
+        let (nat, inside, outside) = wired();
+        let sent = send_udp(&nat, &outside);
+        let port = u16::from_be_bytes([sent[20], sent[21]]);
+        let client: Ipv6Addr = CLIENT.parse().unwrap();
+
+        let d = big_v4_reply(port, 3000, false);
+        nat.outside().send(Packet::from_slice(&d)).unwrap();
+        let got = std::mem::take(&mut *inside.lock().unwrap());
+        assert_eq!(got.len(), 3);
+        for p in &got {
+            assert!(p.len() <= 1280, "{} bytes", p.len());
+            assert_eq!(u16::from_be_bytes([p[4], p[5]]) as usize + 40, p.len());
+            assert_eq!(&p[44..48], &[0, 0, 0x42, 0x42], "identification");
+            assert_eq!(p[40], PROTO_UDP);
+        }
+        let l4 = reassemble_v6(&got);
+        assert_eq!(&l4[8..], &d[28..]);
+        let sum = crate::checksum::raw_transport_sum(
+            Protocol::UDP,
+            IpAddr::V6(wkp(SERVER)),
+            IpAddr::V6(client),
+            &l4,
+        );
+        assert_eq!(sum, 0xFFFF, "UDP checksum");
+
+        // With Don't Fragment it goes whole, for the inside path's Packet
+        // Too Big to shrink it.
+        let d = big_v4_reply(port, 3000, true);
+        nat.outside().send(Packet::from_slice(&d)).unwrap();
+        let got = std::mem::take(&mut *inside.lock().unwrap());
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].len(), 40 + 8 + 3000);
+
+        // A larger IPv6 MTU, once configured, is used.
+        nat.set_ipv6_mtu(1500);
+        let d = big_v4_reply(port, 1400, false);
+        nat.outside().send(Packet::from_slice(&d)).unwrap();
+        let got = std::mem::take(&mut *inside.lock().unwrap());
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0][6], PROTO_UDP);
+    }
+
+    #[test]
+    fn large_inbound_fragments_are_cut_again_to_fit() {
+        let (nat, inside, outside) = wired();
+        let sent = send_udp(&nat, &outside);
+        let port = u16::from_be_bytes([sent[20], sent[21]]);
+        let d = big_v4_reply(port, 2992, false);
+        // Two IPv4 fragments of 1480 + 1520 transport bytes.
+        let frag = |data: &[u8], off: usize, more: bool| {
+            let mut p = d[..20].to_vec();
+            p.extend_from_slice(data);
+            let total = p.len() as u16;
+            p[2..4].copy_from_slice(&total.to_be_bytes());
+            let fo = (off / 8) as u16 | if more { 0x2000 } else { 0 };
+            p[6..8].copy_from_slice(&fo.to_be_bytes());
+            p[10..12].copy_from_slice(&[0, 0]);
+            let ic = checksum(&p[..20]);
+            p[10..12].copy_from_slice(&ic.to_be_bytes());
+            p
+        };
+        let l4 = &d[20..];
+        nat.outside()
+            .send(Packet::from_slice(&frag(&l4[..1480], 0, true)))
+            .unwrap();
+        nat.outside()
+            .send(Packet::from_slice(&frag(&l4[1480..], 1480, false)))
+            .unwrap();
+        let got = std::mem::take(&mut *inside.lock().unwrap());
+        assert_eq!(got.len(), 4);
+        for p in &got {
+            assert!(p.len() <= 1280, "{} bytes", p.len());
+        }
+        let whole = reassemble_v6(&got);
+        assert_eq!(&whole[8..], &d[28..]);
     }
 
     #[test]
