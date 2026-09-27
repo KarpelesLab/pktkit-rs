@@ -379,11 +379,15 @@ impl Listener {
         }
         self.state.signal.notify_all();
         if let Some(stack) = self.stack.upgrade() {
-            stack
-                .listeners
-                .lock()
-                .unwrap()
-                .remove(&self.state.local_port);
+            let mut listeners = stack.listeners.lock().unwrap();
+            // Only our own entry: once closed, the port may belong to a newer
+            // listener, which dropping this handle must leave alone.
+            if listeners
+                .get(&self.state.local_port)
+                .is_some_and(|l| Arc::ptr_eq(l, &self.state))
+            {
+                listeners.remove(&self.state.local_port);
+            }
         }
     }
 }

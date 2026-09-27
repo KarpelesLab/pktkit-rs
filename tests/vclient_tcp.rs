@@ -300,6 +300,20 @@ fn handshake_completing_after_listener_closed_is_reset() {
     assert!(rst, "the orphaned connection was not reset");
 }
 
+#[test]
+fn dropping_a_closed_listener_leaves_its_successor_alone() {
+    let client = client(2);
+    let old = client.listen_tcp(LISTEN_PORT).unwrap();
+    old.close();
+    let _new = client.listen_tcp(LISTEN_PORT).unwrap();
+    drop(old);
+    assert_eq!(
+        client.listen_tcp(LISTEN_PORT).unwrap_err().kind(),
+        std::io::ErrorKind::AddrInUse,
+        "the newer listener was unregistered"
+    );
+}
+
 /// Route `client`'s packets to a raw `vtcp::Conn` server on
 /// `SERVER_IP:SERVER_PORT`, created on the first SYN. Once the handshake
 /// completes, `on_established` runs on the server and its segments are sent.
