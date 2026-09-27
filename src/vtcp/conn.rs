@@ -729,21 +729,33 @@ impl Conn {
         self.outgoing.push(seg.marshal());
     }
 
-    /// Answer an invalid segment (a challenge ACK, RFC 5961, or the
-    /// duplicate ACK owed to an out-of-window one), throttled as RFC 5961
-    /// §7 asks: at most one per 500 ms per connection, like Linux's
-    /// `tcp_invalid_ratelimit`. Otherwise a blind attacker gets an ACK for
-    /// every guess, and two ends that disagree about the sequence space can
-    /// ACK each other forever. Segments carrying data are exempt, as in
-    /// Linux: they are not part of an ACK loop, and the peer's
-    /// retransmission may be waiting on exactly this ACK.
+    /// Answer an out-of-window segment with the duplicate ACK RFC 9293
+    /// owes it, throttled like a [challenge ACK](Self::queue_challenge_ack)
+    /// unless it occupies sequence space: data or a FIN is not part of an
+    /// ACK loop, and the peer's retransmission may be waiting on exactly
+    /// this ACK. That exemption is Linux's `tcp_oow_rate_limited`, and it
+    /// never covers a SYN or RST, which are not part of the data flow.
     fn queue_oow_ack(&mut self, seg: &Segment) {
-        let carries_data = !seg.payload.is_empty() && !seg.has_flag(flags::SYN);
+        let in_flow = seg.seg_len() > 0 && !seg.has_flag(flags::SYN) && !seg.has_flag(flags::RST);
+        if in_flow {
+            self.last_oow_ack = Some(Instant::now());
+            self.queue_ack();
+        } else {
+            self.queue_challenge_ack();
+        }
+    }
+
+    /// Send a challenge ACK (RFC 5961 §§3-5), throttled as §7 asks: at most
+    /// one per 500 ms per connection, whatever the segment carried, like
+    /// Linux's `tcp_invalid_ratelimit`. Otherwise a blind attacker gets an
+    /// ACK for every guess (with a payload attached, if that bought an
+    /// exemption), and two ends that disagree about the sequence space can
+    /// ACK each other forever.
+    fn queue_challenge_ack(&mut self) {
         let now = Instant::now();
-        if !carries_data
-            && self
-                .last_oow_ack
-                .is_some_and(|t| now.duration_since(t) < OOW_ACK_INTERVAL)
+        if self
+            .last_oow_ack
+            .is_some_and(|t| now.duration_since(t) < OOW_ACK_INTERVAL)
         {
             return;
         }
@@ -969,7 +981,7 @@ impl Conn {
         if seg.has_flag(flags::RST) {
             let (accept, challenge) = self.validate_rst(seg);
             if challenge {
-                self.queue_oow_ack(seg);
+                self.queue_challenge_ack();
                 return self.take_outgoing();
             }
             if !accept {
@@ -981,7 +993,7 @@ impl Conn {
 
         // 4) SYN in a synchronized state ≠ SYN-RECEIVED → challenge ACK.
         if seg.has_flag(flags::SYN) && self.state != State::SynReceived {
-            self.queue_oow_ack(seg);
+            self.queue_challenge_ack();
             return self.take_outgoing();
         }
 
@@ -1304,7 +1316,7 @@ impl Conn {
         // blind attacker who guessed only the SEQ would get its payload in.
         let oldest = una.wrapping_sub(self.max_snd_wnd.min(1 << 30));
         if seq_after(ack, snd_nxt) || seq_before(ack, oldest) {
-            self.queue_oow_ack(seg);
+            self.queue_challenge_ack();
             return false;
         }
         // The window comes first: the flush below must see this segment's.
@@ -3487,6 +3499,36 @@ mod tests {
         };
         assert_eq!(client.handle_segment(&old).len(), 1);
         assert_eq!(client.handle_segment(&old).len(), 1);
+    }
+
+    /// A payload does not exempt a segment from the challenge-ACK throttle
+    /// (RFC 5961 §7): a RST or SYN is never part of the data flow, and a
+    /// blind attacker can attach bytes to each guess for free. Linux sends
+    /// every challenge ACK through the per-socket limit.
+    #[test]
+    fn challenge_acks_are_throttled_for_segments_with_payload() {
+        let (mut client, server) = established(40361);
+        let nxt = client.recv_buf.as_ref().unwrap().nxt();
+        let (sport, dport) = (server.cfg.local_port, client.cfg.local_port);
+        let rst = move |seq: u32| Segment {
+            src_port: sport,
+            dst_port: dport,
+            seq,
+            flags: flags::RST,
+            payload: vec![0; 20],
+            ..Default::default()
+        };
+        assert_eq!(client.handle_segment(&rst(nxt.wrapping_add(10))).len(), 1);
+        assert!(client.handle_segment(&rst(nxt.wrapping_add(20))).is_empty());
+        assert_eq!(client.state(), State::Established);
+
+        // An in-window segment whose ACK is further back than any window
+        // the peer offered (RFC 5961 §5.2) draws a challenge ACK too.
+        client.last_oow_ack = None;
+        let una = client.send_buf.as_ref().unwrap().una();
+        let seg = data_with_ack(&client, &server, una.wrapping_sub(100_000), b"evil", false);
+        assert_eq!(client.handle_segment(&seg).len(), 1);
+        assert!(client.handle_segment(&seg).is_empty());
     }
 
     /// A cookie connection takes the completing ACK's window, and its data.
