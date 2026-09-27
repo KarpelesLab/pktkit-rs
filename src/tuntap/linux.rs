@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 #[non_exhaustive]
 pub struct TuntapConfig {
     /// Requested interface name; empty asks the kernel to pick one
-    /// (`tun0`, `tap0`, …).
+    /// (`tun0`, `tap0`, …). At most 15 bytes: a longer name is refused.
     pub name: String,
 }
 
@@ -233,6 +233,9 @@ impl Drop for Tap {
 // --- syscalls --------------------------------------------------------------
 
 fn open_tuntap(name: &str, flags: i32) -> Result<(OwnedFd, String)> {
+    // Checked before anything is opened: TUNSETIFF would attach to (or create)
+    // whatever a truncated name names.
+    let ifname = crate::sys::ifname(name)?;
     // Open /dev/net/tun
     let path = CString::new("/dev/net/tun").unwrap();
     let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
@@ -244,9 +247,7 @@ fn open_tuntap(name: &str, flags: i32) -> Result<(OwnedFd, String)> {
     // struct ifreq { char ifr_name[IFNAMSIZ]; union { short flags; ... }; }
     // We hand-build the request as a 40-byte buffer to be ABI-stable.
     let mut ifr = [0u8; 40];
-    let bytes = name.as_bytes();
-    let n = bytes.len().min(15); // leave room for NUL
-    ifr[..n].copy_from_slice(&bytes[..n]);
+    ifr[..16].copy_from_slice(&ifname);
     let flags_u16 = flags as u16;
     ifr[16..18].copy_from_slice(&flags_u16.to_ne_bytes());
 
