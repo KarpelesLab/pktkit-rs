@@ -79,25 +79,39 @@ impl ConnState {
 
     /// Record a completed handshake and, for an inbound connection, hand it
     /// to its listener. Called after every segment, without the conn lock.
-    fn after_segment(self: &Arc<Self>) {
+    ///
+    /// Returns `false` if the listener could not take the connection (closed,
+    /// or its queue full): nobody could ever accept it, so it has been reset
+    /// and the caller must drop it from the table.
+    fn after_segment(self: &Arc<Self>) -> bool {
         if self.connected.load(Ordering::Acquire) {
-            return;
+            return true;
         }
         if !self.conn.lock().unwrap().state().is_synchronized() {
-            return;
+            return true;
         }
         self.connected.store(true, Ordering::Release);
         let Some(listener) = self.pending_accept.lock().unwrap().take() else {
-            return;
+            return true;
         };
-        if listener.closed.load(Ordering::Acquire) {
-            return;
-        }
+        // Checked under the queue lock, which `Listener::close` also takes
+        // to drain the queue, so nothing is queued on a closed listener.
         let mut q = listener.queue.lock().unwrap();
-        if q.len() < ACCEPT_QUEUE_CAP {
-            q.push_back(TcpConn::new(self.clone()));
-            listener.signal.notify_one();
+        if listener.closed.load(Ordering::Acquire) || q.len() >= ACCEPT_QUEUE_CAP {
+            drop(q);
+            self.abort();
+            return false;
         }
+        q.push_back(TcpConn::new(self.clone()));
+        listener.signal.notify_one();
+        true
+    }
+
+    /// Send a RST, close, and wake anyone waiting on the connection.
+    fn abort(&self) {
+        let segs = self.conn.lock().unwrap().abort();
+        self.wrap_and_send(segs);
+        self.signal.notify_all();
     }
 }
 
@@ -351,9 +365,18 @@ impl Listener {
         }
     }
 
-    /// Stop listening. Pending unaccepted connections are dropped.
+    /// Stop listening. Pending unaccepted connections are reset.
     pub fn close(&self) {
-        self.state.closed.store(true, Ordering::Release);
+        let pending: Vec<TcpConn> = {
+            let mut q = self.state.queue.lock().unwrap();
+            self.state.closed.store(true, Ordering::Release);
+            q.drain(..).collect()
+        };
+        // Connections nobody will accept now: reset them rather than leave
+        // the peer talking to no one.
+        for c in pending {
+            c.state.abort();
+        }
         self.state.signal.notify_all();
         if let Some(stack) = self.stack.upgrade() {
             stack
@@ -574,7 +597,9 @@ impl TcpStack {
                 conn.handle_segment(&seg)
             };
             state.wrap_and_send(segs);
-            state.after_segment();
+            if !state.after_segment() {
+                self.conns.lock().unwrap().remove(&key);
+            }
             state.signal.notify_all();
             return true;
         }

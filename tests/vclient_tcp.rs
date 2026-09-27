@@ -263,6 +263,43 @@ fn nonblocking_dial_reports_progress() {
     assert_eq!(conn.read(&mut buf).unwrap_err().kind(), WouldBlock);
 }
 
+/// A connection whose handshake completes after its listener has closed
+/// cannot be accepted by anyone: it must be reset, not left established.
+#[test]
+fn handshake_completing_after_listener_closed_is_reset() {
+    let client = client(2);
+    let sent: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+    let s = sent.clone();
+    client.set_handler(Arc::new(move |pkt: &Packet| {
+        s.lock().unwrap().push(pkt.payload().to_vec());
+        Ok(())
+    }));
+    let listener = client.listen_tcp(LISTEN_PORT).unwrap();
+    let mut peer = Conn::new(
+        ConnConfig::default()
+            .local_port(PEER_PORT)
+            .remote_port(LISTEN_PORT),
+    );
+    let deliver = |segs: Vec<Vec<u8>>| {
+        for s in segs {
+            client
+                .send(Packet::from_slice(&wrap(PEER_IP, CLIENT_IP, &s)))
+                .unwrap();
+        }
+    };
+    deliver(peer.connect());
+    let synack = sent.lock().unwrap().remove(0);
+
+    listener.close();
+    deliver(peer.handle_segment(&Segment::parse(&synack).unwrap()));
+    assert_eq!(peer.state(), pktkit::vtcp::State::Established);
+    let rst =
+        sent.lock().unwrap().iter().any(|s| {
+            Segment::parse(s).is_ok_and(|s| s.has_flag(pktkit::vtcp::segment::flags::RST))
+        });
+    assert!(rst, "the orphaned connection was not reset");
+}
+
 /// Route `client`'s packets to a raw `vtcp::Conn` server on
 /// `SERVER_IP:SERVER_PORT`, created on the first SYN. Once the handshake
 /// completes, `on_established` runs on the server and its segments are sent.
