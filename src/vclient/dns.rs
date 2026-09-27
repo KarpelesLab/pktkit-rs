@@ -2,7 +2,8 @@
 //!
 //! [`wire`] holds the pure RFC 1035 query builder and response parser (no
 //! I/O — easy to unit test). [`Resolver`] runs those over a real
-//! [`UdpSocket`], querying each configured server in turn until one answers.
+//! [`UdpSocket`], querying each configured server in turn until one answers,
+//! and asks again over TCP when the answer comes back truncated.
 //!
 //! In the Go upstream, vclient routes DNS through the *virtual* network so
 //! lookups traverse the tunnel. That path is also available here once a
@@ -348,9 +349,56 @@ impl Resolver {
             {
                 continue;
             }
+            if resp[2] & 0x02 != 0 {
+                // TC: the answer did not fit in a datagram, and what came
+                // is not all of it. Ask again over TCP (RFC 7766 §5).
+                return self.query_tcp(server, &query, id);
+            }
             return wire::parse_response(resp, id)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e));
         }
+    }
+
+    /// Send `query` to `server` over TCP, each message behind its two-byte
+    /// length (RFC 1035 §4.2.2), within a timeout of its own.
+    fn query_tcp(&self, server: SocketAddr, query: &[u8], id: u16) -> io::Result<Vec<IpAddr>> {
+        use std::io::{Read, Write};
+
+        let deadline = Instant::now() + self.cfg.timeout;
+        let left = || {
+            deadline
+                .checked_duration_since(Instant::now())
+                .filter(|d| !d.is_zero())
+                .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "DNS query timed out"))
+        };
+        let mut s = std::net::TcpStream::connect_timeout(&server, left()?)?;
+        s.set_write_timeout(Some(left()?))?;
+        let mut msg = Vec::with_capacity(2 + query.len());
+        msg.extend_from_slice(&(query.len() as u16).to_be_bytes());
+        msg.extend_from_slice(query);
+        s.write_all(&msg)?;
+        let mut read = |buf: &mut [u8]| -> io::Result<()> {
+            s.set_read_timeout(Some(left()?))?;
+            s.read_exact(buf).map_err(|e| match e.kind() {
+                io::ErrorKind::WouldBlock => {
+                    io::Error::new(io::ErrorKind::TimedOut, "DNS query timed out")
+                }
+                _ => e,
+            })
+        };
+        let mut len = [0u8; 2];
+        read(&mut len)?;
+        let mut resp = vec![0u8; u16::from_be_bytes(len) as usize];
+        read(&mut resp)?;
+        // Only the server can speak on this connection, but it must still
+        // be answering this question.
+        if !wire::question_matches(&resp, query) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "DNS answer to another question",
+            ));
+        }
+        wire::parse_response(&resp, id).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 }
 
@@ -540,6 +588,45 @@ mod tests {
                 .timeout(Duration::from_secs(2)),
         );
         let ips = r.query("example.test", RecordType::A).unwrap();
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))]);
+    }
+
+    #[test]
+    fn truncated_answer_is_retried_over_tcp() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        // UDP and TCP on the same port, as a DNS server listens.
+        let (udp, tcp) = loop {
+            let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+            if let Ok(tcp) = TcpListener::bind(udp.local_addr().unwrap()) {
+                break (udp, tcp);
+            }
+        };
+        let server_addr = udp.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1500];
+            let (n, from) = udp.recv_from(&mut buf).unwrap();
+            // Too big for UDP: the header and question, with TC set.
+            let mut tc = buf[..n].to_vec();
+            tc[2..4].copy_from_slice(&0x8380u16.to_be_bytes());
+            udp.send_to(&tc, from).unwrap();
+
+            let (mut s, _) = tcp.accept().unwrap();
+            let mut len = [0u8; 2];
+            s.read_exact(&mut len).unwrap();
+            let mut q = vec![0u8; u16::from_be_bytes(len) as usize];
+            s.read_exact(&mut q).unwrap();
+            let resp = answer(&q, [1, 2, 3, 4]);
+            s.write_all(&(resp.len() as u16).to_be_bytes()).unwrap();
+            s.write_all(&resp).unwrap();
+        });
+        let r = Resolver::new(
+            ResolverConfig::default()
+                .servers(vec![server_addr])
+                .timeout(Duration::from_secs(2)),
+        );
+        let ips = r.query("big.test", RecordType::A).unwrap();
         assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))]);
     }
 
