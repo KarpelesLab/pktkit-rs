@@ -709,6 +709,11 @@ impl Stack {
         if listener.queue_full() {
             return Ok(());
         }
+        // A full backlog drops the SYN, as Linux does: the peer retransmits,
+        // and by then a slot may have freed up.
+        let Some(slot) = listener.half_open_slot() else {
+            return Ok(());
+        };
         let seg = match Segment::parse(tcp) {
             Ok(s) => s,
             Err(_) => return Ok(()),
@@ -741,6 +746,8 @@ impl Stack {
         );
         let listener = Arc::downgrade(&listener);
         state.set_pending_accept(Box::new(move |s| {
+            // Whatever becomes of the handshake, it is no longer half open.
+            drop(slot);
             listener.upgrade().is_some_and(|l| l.enqueue(s))
         }));
         inner
@@ -1030,6 +1037,11 @@ impl Stack {
         if listener.queue_full() {
             return Ok(());
         }
+        // A full backlog drops the SYN, as Linux does: the peer retransmits,
+        // and by then a slot may have freed up.
+        let Some(slot) = listener.half_open_slot() else {
+            return Ok(());
+        };
         let seg = match Segment::parse(tcp) {
             Ok(s) => s,
             Err(_) => return Ok(()),
@@ -1062,6 +1074,8 @@ impl Stack {
         );
         let listener = Arc::downgrade(&listener);
         state.set_pending_accept(Box::new(move |s| {
+            // Whatever becomes of the handshake, it is no longer half open.
+            drop(slot);
             listener.upgrade().is_some_and(|l| l.enqueue(s))
         }));
         inner
@@ -2789,6 +2803,48 @@ mod tests {
         dgram[26..28].copy_from_slice(&[0, 0]);
         inject(&dgram);
         assert_eq!(s.inner.udp.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn half_open_connections_per_listener_are_capped() {
+        use crate::slirp::listener::HALF_OPEN_CAP;
+        let s = Stack::new();
+        let _l = s.listen("tcp", "10.0.0.1:80").unwrap();
+        let _l6 = s.listen6("[fd00::1]:80").unwrap();
+        let _captured = capture(&s);
+        let (client, us) = (Ipv4Addr::new(10, 0, 0, 5), Ipv4Addr::new(10, 0, 0, 1));
+        let (c6, us6): (Ipv6Addr, Ipv6Addr) =
+            ("fd00::5".parse().unwrap(), "fd00::1".parse().unwrap());
+        let seg = |port: u16, flags: u8| Segment {
+            src_port: port,
+            dst_port: 80,
+            seq: 1000,
+            flags,
+            ..Default::default()
+        };
+        let inject = |p: Vec<u8>| L3Device::send(&*s, Packet::from_slice(&p)).unwrap();
+        for port in 0..(HALF_OPEN_CAP as u16 + 50) {
+            let syn = seg(10000 + port, tcp_flags::SYN).marshal();
+            inject(crate::slirp::packet::build_packet4(client, us, &syn));
+            inject(crate::slirp::packet::build_packet6(c6, us6, &syn));
+        }
+        assert_eq!(s.inner.virt_tcp.lock().unwrap().len(), HALF_OPEN_CAP);
+        assert_eq!(s.inner.virt_tcp6.lock().unwrap().len(), HALF_OPEN_CAP);
+
+        // A handshake that ends gives its slot back.
+        let mut rst = seg(10000, tcp_flags::RST);
+        rst.seq = 1001;
+        inject(crate::slirp::packet::build_packet4(
+            client,
+            us,
+            &rst.marshal(),
+        ));
+        wait_for("the reset connection to be reaped", || {
+            s.inner.virt_tcp.lock().unwrap().len() < HALF_OPEN_CAP
+        });
+        let syn = seg(20000, tcp_flags::SYN).marshal();
+        inject(crate::slirp::packet::build_packet4(client, us, &syn));
+        assert_eq!(s.inner.virt_tcp.lock().unwrap().len(), HALF_OPEN_CAP);
     }
 
     #[test]

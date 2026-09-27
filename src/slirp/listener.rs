@@ -11,11 +11,40 @@ use crate::slirp::tcp_stream::{ConnState, TcpStream};
 use std::collections::VecDeque;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 /// Bounded accept-queue depth; mirrors the Go `acceptCh` buffer of 10.
 pub(crate) const ACCEPT_QUEUE_CAP: usize = 10;
+
+/// Connections a listener holds in SYN-RECEIVED at once, as a listen backlog
+/// bounds them. Each SYN would otherwise mint a connection that lives until
+/// its handshake times out, and a flood at one listener could fill the
+/// stack-wide table of virtual connections that every listener shares.
+pub(crate) const HALF_OPEN_CAP: usize = 128;
+
+/// One of a listener's [`HALF_OPEN_CAP`] half-open slots, held by a
+/// connection until its handshake completes or it is dropped.
+#[derive(Debug)]
+pub(crate) struct HalfOpenSlot(Arc<AtomicUsize>);
+
+impl HalfOpenSlot {
+    /// Take a slot from `count`, unless all are in use.
+    pub(crate) fn take(count: &Arc<AtomicUsize>) -> Option<HalfOpenSlot> {
+        count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < HALF_OPEN_CAP).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| HalfOpenSlot(count.clone()))
+    }
+}
+
+impl Drop for HalfOpenSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// Key used to find a listener by (IP, port). Wildcard IP is `0.0.0.0`.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
@@ -35,6 +64,8 @@ pub struct Listener {
     signal: Condvar,
     /// Removes this listener from the stack's table; taken by the first close.
     unregister: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Connections still in their handshake; see [`HalfOpenSlot`].
+    half_open: Arc<AtomicUsize>,
 }
 
 impl core::fmt::Debug for Listener {
@@ -54,6 +85,7 @@ impl Listener {
             queue: Mutex::new(VecDeque::new()),
             signal: Condvar::new(),
             unregister: Mutex::new(None),
+            half_open: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -83,6 +115,12 @@ impl Listener {
         drop(q);
         self.signal.notify_one();
         true
+    }
+
+    /// A half-open slot for a new connection, or `None` when the listener
+    /// already has [`HALF_OPEN_CAP`] handshakes under way.
+    pub(crate) fn half_open_slot(&self) -> Option<HalfOpenSlot> {
+        HalfOpenSlot::take(&self.half_open)
     }
 
     /// How close the accept queue is to full; used by the stack to decide

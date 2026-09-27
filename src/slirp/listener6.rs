@@ -8,12 +8,12 @@
 //! queue.
 
 use crate::Result;
-use crate::slirp::listener::ACCEPT_QUEUE_CAP;
+use crate::slirp::listener::{ACCEPT_QUEUE_CAP, HalfOpenSlot};
 use crate::slirp::tcp_stream::{ConnState, TcpStream};
 use std::collections::VecDeque;
 use std::io;
 use std::net::{Ipv6Addr, SocketAddrV6};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 /// Key used to find a listener by (IP, port). Wildcard IP is `::`.
@@ -34,6 +34,8 @@ pub struct Listener6 {
     signal: Condvar,
     /// Removes this listener from the stack's table; taken by the first close.
     unregister: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Connections still in their handshake; see [`HalfOpenSlot`].
+    half_open: Arc<AtomicUsize>,
 }
 
 impl core::fmt::Debug for Listener6 {
@@ -53,6 +55,7 @@ impl Listener6 {
             queue: Mutex::new(VecDeque::new()),
             signal: Condvar::new(),
             unregister: Mutex::new(None),
+            half_open: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -82,6 +85,13 @@ impl Listener6 {
         drop(q);
         self.signal.notify_one();
         true
+    }
+
+    /// A half-open slot for a new connection, or `None` when the listener
+    /// already has [`HALF_OPEN_CAP`](super::listener::HALF_OPEN_CAP) handshakes
+    /// under way.
+    pub(crate) fn half_open_slot(&self) -> Option<HalfOpenSlot> {
+        HalfOpenSlot::take(&self.half_open)
     }
 
     /// How close the accept queue is to full; used by the stack to decide
