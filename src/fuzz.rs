@@ -546,13 +546,13 @@ pub fn slirp_reassembly(data: &[u8]) {
 
 #[cfg(feature = "vclient")]
 pub fn dns_parse(data: &[u8]) {
-    let _ = crate::vclient::dns::wire::parse_response(data, 0x1234);
-    if data.len() >= 2 {
-        // Also try with the id the message actually carries, so the parser
-        // gets past its first check and into the record loop.
-        let id = u16::from_be_bytes([data[0], data[1]]);
-        let _ = crate::vclient::dns::wire::parse_response(data, id);
+    use crate::vclient::dns::{RecordType, wire};
+    if let Some(query) = wire::build_query(0x1234, "example.com", RecordType::A) {
+        let _ = wire::parse_response(data, &query);
     }
+    // Also as the answer to itself: its ID and question then match, so the
+    // parser gets past those checks and into the records and names.
+    let _ = wire::parse_response(data, data);
 }
 
 #[cfg(feature = "nat")]

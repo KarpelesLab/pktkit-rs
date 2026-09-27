@@ -87,14 +87,28 @@ pub mod wire {
         (buf.len() <= 255).then_some(buf)
     }
 
-    /// Parse a DNS response, returning the A/AAAA addresses it carries.
-    /// Verifies the transaction id, the QR bit, and the RCODE.
-    pub fn parse_response(data: &[u8], expected_id: u16) -> Result<Vec<IpAddr>, &'static str> {
+    const TYPE_CNAME: u16 = 5;
+    const CLASS_IN: u16 = 1;
+
+    /// Most CNAMEs followed from the question's name. Real chains are a
+    /// few links long; this only has to stop a looping one.
+    const MAX_CNAME_HOPS: usize = 16;
+
+    /// Parse the response `data` to `query` (the whole message sent),
+    /// returning the addresses it gives for the name asked about.
+    ///
+    /// The response must carry the query's ID, be a response with RCODE 0,
+    /// and repeat its question. Of the answers, only CLASS IN records of the
+    /// type asked for count, and only those owned by the name asked about
+    /// or one it leads to through CNAMEs in the same answer (RFC 1034
+    /// §3.6.2, §5.3.3): anything else in the answer section is not an
+    /// answer to this question, and taking it would let a server, or a
+    /// forger, slip in addresses for a name nobody asked about.
+    pub fn parse_response(data: &[u8], query: &[u8]) -> Result<Vec<IpAddr>, &'static str> {
         if data.len() < 12 {
             return Err("response too short");
         }
-        let id = u16::from_be_bytes([data[0], data[1]]);
-        if id != expected_id {
+        if query.len() < 12 || data[..2] != query[..2] {
             return Err("transaction ID mismatch");
         }
         let flags = u16::from_be_bytes([data[2], data[3]]);
@@ -104,52 +118,119 @@ pub mod wire {
         if flags & 0x000F != 0 {
             return Err("DNS error rcode");
         }
-        let qdcount = u16::from_be_bytes([data[4], data[5]]);
+        if !question_matches(data, query) {
+            return Err("answer to another question");
+        }
+        let (qname, qend) = read_name(query, 12).ok_or("malformed query")?;
+        let qtype = query.get(qend..qend + 2).ok_or("malformed query")?;
+        let qtype = u16::from_be_bytes([qtype[0], qtype[1]]);
         let ancount = u16::from_be_bytes([data[6], data[7]]);
 
-        let mut off = 12;
-        for _ in 0..qdcount {
-            off = skip_name(data, off).ok_or("malformed question")?;
-            if off + 4 > data.len() {
-                return Err("truncated question");
+        // The question matched the query's, so it ends where the query's
+        // does.
+        let mut off = qend + 4;
+        // Owner, type, and RDATA range of each CLASS IN answer.
+        let mut records = Vec::new();
+        for _ in 0..ancount {
+            let (owner, o) = read_name(data, off).ok_or("malformed answer")?;
+            let rr = data.get(o..o + 10).ok_or("truncated answer")?;
+            let rtype = u16::from_be_bytes([rr[0], rr[1]]);
+            let class = u16::from_be_bytes([rr[2], rr[3]]);
+            let rdlength = u16::from_be_bytes([rr[8], rr[9]]) as usize;
+            let rdata = o + 10..o + 10 + rdlength;
+            if rdata.end > data.len() {
+                return Err("truncated answer");
             }
-            off += 4; // QTYPE + QCLASS
+            off = rdata.end;
+            if class == CLASS_IN {
+                records.push((owner, rtype, rdata));
+            }
+        }
+
+        // The names the answer is for: the question's, and each one a CNAME
+        // leads to from it, in turn.
+        let mut names = vec![qname];
+        while names.len() <= MAX_CNAME_HOPS {
+            let last = names.last().expect("never empty");
+            let Some((_, _, rdata)) = records
+                .iter()
+                .find(|(owner, t, _)| *t == TYPE_CNAME && owner == last)
+            else {
+                break;
+            };
+            let (target, end) = read_name(data, rdata.start).ok_or("malformed CNAME")?;
+            if end != rdata.end {
+                return Err("malformed CNAME");
+            }
+            if names.contains(&target) {
+                break; // a loop: nothing further down it
+            }
+            names.push(target);
         }
 
         let mut out = Vec::new();
-        for _ in 0..ancount {
-            off = match skip_name(data, off) {
-                Some(o) => o,
-                None => break,
-            };
-            if off + 10 > data.len() {
-                break;
+        for (owner, rtype, rdata) in &records {
+            if *rtype != qtype || !names.contains(owner) {
+                continue;
             }
-            let rtype = u16::from_be_bytes([data[off], data[off + 1]]);
-            let rdlength = u16::from_be_bytes([data[off + 8], data[off + 9]]) as usize;
-            off += 10;
-            if off + rdlength > data.len() {
-                break;
-            }
-            match (rtype, rdlength) {
-                (1, 4) => {
-                    out.push(IpAddr::V4(Ipv4Addr::new(
-                        data[off],
-                        data[off + 1],
-                        data[off + 2],
-                        data[off + 3],
-                    )));
-                }
+            let rdata = &data[rdata.clone()];
+            match (*rtype, rdata.len()) {
+                (1, 4) => out.push(IpAddr::V4(Ipv4Addr::new(
+                    rdata[0], rdata[1], rdata[2], rdata[3],
+                ))),
                 (28, 16) => {
-                    let mut b = [0u8; 16];
-                    b.copy_from_slice(&data[off..off + 16]);
+                    let b: [u8; 16] = rdata.try_into().expect("length checked");
                     out.push(IpAddr::V6(Ipv6Addr::from(b)));
                 }
                 _ => {}
             }
-            off += rdlength;
         }
         Ok(out)
+    }
+
+    /// Read the (possibly compressed) name at `off` in the message `data`.
+    /// Returns it in wire form with its labels lowercased, so names compare
+    /// without regard to ASCII case (RFC 4343) by plain equality, and the
+    /// offset just past it where it sits.
+    ///
+    /// Each compression pointer must point before the one followed last
+    /// (or, the first, before the name itself), as any a compressor writes
+    /// do, to an earlier occurrence (RFC 1035 §4.1.4): so the walk cannot
+    /// loop. The name must fit the 255-octet limit (§3.1), and label types
+    /// other than plain labels and pointers are refused (RFC 6891 §5).
+    pub fn read_name(data: &[u8], mut off: usize) -> Option<(Vec<u8>, usize)> {
+        let mut name = Vec::new();
+        let mut end = None;
+        let mut limit = off;
+        loop {
+            let l = *data.get(off)? as usize;
+            match l & 0xC0 {
+                0 if l == 0 => {
+                    name.push(0);
+                    return Some((name, end.unwrap_or(off + 1)));
+                }
+                0 => {
+                    let label = data.get(off + 1..off + 1 + l)?;
+                    // With the root label still to come.
+                    if name.len() + 1 + l + 1 > 255 {
+                        return None;
+                    }
+                    name.push(l as u8);
+                    name.extend(label.iter().map(u8::to_ascii_lowercase));
+                    off += 1 + l;
+                }
+                0xC0 => {
+                    let target = (l & 0x3F) << 8 | *data.get(off + 1)? as usize;
+                    if target >= limit {
+                        return None;
+                    }
+                    end.get_or_insert(off + 2);
+                    limit = target;
+                    off = target;
+                }
+                _ => return None,
+            }
+        }
     }
 
     /// Whether `response` answers the question asked in `query` (both whole
@@ -160,7 +241,7 @@ pub mod wire {
         if response.len() < 12 || query.len() < 12 || response[4..6] != [0, 1] {
             return false;
         }
-        let Some(name_end) = skip_name(query, 12) else {
+        let Some((_, name_end)) = read_name(query, 12) else {
             return false;
         };
         let q = &query[12..];
@@ -169,23 +250,6 @@ pub mod wire {
             return false;
         };
         r[..name_len].eq_ignore_ascii_case(&q[..name_len]) && r[name_len..] == q[name_len..]
-    }
-
-    /// Skip a (possibly compressed) name, returning the offset just past it.
-    pub fn skip_name(data: &[u8], mut off: usize) -> Option<usize> {
-        loop {
-            if off >= data.len() {
-                return None;
-            }
-            let l = data[off] as usize;
-            if l == 0 {
-                return Some(off + 1);
-            }
-            if l & 0xC0 == 0xC0 {
-                return Some(off + 2); // compression pointer
-            }
-            off += 1 + l;
-        }
     }
 }
 
@@ -358,9 +422,9 @@ impl Resolver {
             if resp[2] & 0x02 != 0 {
                 // TC: the answer did not fit in a datagram, and what came
                 // is not all of it. Ask again over TCP (RFC 7766 §5).
-                return self.query_tcp(server, &query, id, deadline);
+                return self.query_tcp(server, &query, deadline);
             }
-            return wire::parse_response(resp, id)
+            return wire::parse_response(resp, &query)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e));
         }
     }
@@ -372,7 +436,6 @@ impl Resolver {
         &self,
         server: SocketAddr,
         query: &[u8],
-        id: u16,
         deadline: Option<Instant>,
     ) -> io::Result<Vec<IpAddr>> {
         use std::io::{Read, Write};
@@ -424,14 +487,9 @@ impl Resolver {
         let mut resp = vec![0u8; u16::from_be_bytes(len) as usize];
         read(&mut resp)?;
         // Only the server can speak on this connection, but it must still
-        // be answering this question.
-        if !wire::question_matches(&resp, query) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "DNS answer to another question",
-            ));
-        }
-        wire::parse_response(&resp, id).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        // be answering this question, which the parser checks.
+        wire::parse_response(&resp, query)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 }
 
@@ -506,8 +564,119 @@ mod tests {
         r.extend_from_slice(&4u16.to_be_bytes()); // RDLENGTH
         r.extend_from_slice(&[1, 2, 3, 4]); // RDATA
 
-        let ips = wire::parse_response(&r, id).unwrap();
+        let q = wire::build_query(id, "a.com", RecordType::A).unwrap();
+        let ips = wire::parse_response(&r, &q).unwrap();
         assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))]);
+    }
+
+    /// Append a resource record owned by `owner` (wire form, pointers
+    /// allowed) to `msg` and count it as an answer.
+    fn push_rr(msg: &mut Vec<u8>, owner: &[u8], rtype: u16, class: u16, rdata: &[u8]) {
+        msg.extend_from_slice(owner);
+        msg.extend_from_slice(&rtype.to_be_bytes());
+        msg.extend_from_slice(&class.to_be_bytes());
+        msg.extend_from_slice(&60u32.to_be_bytes());
+        msg.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        msg.extend_from_slice(rdata);
+        let an = u16::from_be_bytes([msg[6], msg[7]]) + 1;
+        msg[6..8].copy_from_slice(&an.to_be_bytes());
+    }
+
+    /// `query` turned into a response with no answers yet.
+    fn response_to(query: &[u8]) -> Vec<u8> {
+        let mut r = query.to_vec();
+        r[2..4].copy_from_slice(&0x8180u16.to_be_bytes());
+        r
+    }
+
+    #[test]
+    fn only_answers_to_the_question_count() {
+        let q = wire::build_query(7, "www.example.test", RecordType::A).unwrap();
+        let name = |s| wire::encode_name(s).unwrap();
+        let v4 = |ip: [u8; 4]| IpAddr::V4(ip.into());
+
+        let mut r = response_to(&q);
+        // Owned by another name, of another class, of another type: none
+        // of these answers the question.
+        push_rr(&mut r, &name("evil.test"), 1, 1, &[6, 6, 6, 6]);
+        push_rr(&mut r, &[0xC0, 12], 1, 3, &[6, 6, 6, 7]);
+        push_rr(&mut r, &[0xC0, 12], 28, 1, &[6; 16]);
+        // The question's name, in another case, and through a pointer.
+        push_rr(&mut r, &name("WWW.Example.TEST"), 1, 1, &[1, 1, 1, 1]);
+        push_rr(&mut r, &[0xC0, 12], 1, 1, &[1, 1, 1, 2]);
+        assert_eq!(
+            wire::parse_response(&r, &q).unwrap(),
+            [v4([1, 1, 1, 1]), v4([1, 1, 1, 2])]
+        );
+
+        // Through a CNAME chain, in any order, and nothing off it.
+        let mut r = response_to(&q);
+        let b_at = r.len() + 12; // where the first CNAME's target sits
+        push_rr(&mut r, &[0xC0, 12], 5, 1, &name("b.test"));
+        push_rr(&mut r, &name("c.test"), 1, 1, &[3, 3, 3, 3]);
+        push_rr(&mut r, &name("other.test"), 1, 1, &[6, 6, 6, 6]);
+        push_rr(
+            &mut r,
+            &[0xC0, b_at as u8],
+            5,
+            1,
+            &[1, b'c', 0xC0, b_at as u8 + 2],
+        );
+        push_rr(&mut r, &name("other.test"), 5, 1, &name("c.test"));
+        assert_eq!(wire::parse_response(&r, &q).unwrap(), [v4([3, 3, 3, 3])]);
+
+        // A CNAME loop ends the chain rather than the parse.
+        let mut r = response_to(&q);
+        push_rr(&mut r, &[0xC0, 12], 5, 1, &name("x.test"));
+        push_rr(&mut r, &name("x.test"), 5, 1, &name("www.example.test"));
+        push_rr(&mut r, &name("x.test"), 1, 1, &[4, 4, 4, 4]);
+        assert_eq!(wire::parse_response(&r, &q).unwrap(), [v4([4, 4, 4, 4])]);
+
+        // A response to another question, or with another ID, is refused.
+        let other = wire::build_query(7, "evil.test", RecordType::A).unwrap();
+        assert!(wire::parse_response(&response_to(&other), &q).is_err());
+        let mut r = response_to(&q);
+        r[1] ^= 1;
+        assert!(wire::parse_response(&r, &q).is_err());
+    }
+
+    #[test]
+    fn compression_pointers_cannot_loop_or_point_ahead() {
+        let q = wire::build_query(7, "a.test", RecordType::A).unwrap();
+        for owner in [
+            &[0xC0, 12][..],     // fine: the question's name
+            &[0xC0, 0xFF],       // ahead of itself
+            &[1, b'x', 0xC0, 2], // at the flags: not a label
+        ] {
+            let mut r = response_to(&q);
+            let at = r.len();
+            push_rr(&mut r, owner, 1, 1, &[1, 2, 3, 4]);
+            let ok = owner == [0xC0, 12];
+            assert_eq!(wire::parse_response(&r, &q).is_ok(), ok, "{owner:?}");
+            // A pointer to itself.
+            r[at..at + 2].copy_from_slice(&[0xC0 | (at >> 8) as u8, at as u8]);
+            assert!(wire::read_name(&r, at).is_none());
+        }
+        // Two names pointing at each other.
+        let msg = [0u8, 0, 0xC0, 4, 0xC0, 2];
+        assert!(wire::read_name(&msg, 2).is_none());
+        assert!(wire::read_name(&msg, 4).is_none());
+        // Past 255 octets through pointers: each name is a 63-octet label
+        // in front of the one before it.
+        let mut msg = vec![63];
+        msg.extend_from_slice(&[b'a'; 63]);
+        msg.push(0);
+        let mut starts = vec![0];
+        for _ in 0..4 {
+            let prev = *starts.last().unwrap();
+            starts.push(msg.len());
+            msg.push(63);
+            msg.extend_from_slice(&[b'a'; 63]);
+            msg.extend_from_slice(&[0xC0 | (prev >> 8) as u8, prev as u8]);
+        }
+        // 3 labels: 193 octets; 4: 257.
+        assert_eq!(wire::read_name(&msg, starts[2]).unwrap().0.len(), 193);
+        assert!(wire::read_name(&msg, starts[3]).is_none());
     }
 
     #[test]
@@ -526,8 +695,11 @@ mod tests {
 
     #[test]
     fn parse_rejects_wrong_id() {
-        let r = vec![0u8; 12];
-        assert!(wire::parse_response(&r, 0x1234).is_err());
+        let q = wire::build_query(0x1234, "a.com", RecordType::A).unwrap();
+        let mut r = q.clone();
+        r[..2].copy_from_slice(&[0, 0]);
+        r[2] = 0x81;
+        assert!(wire::parse_response(&r, &q).is_err());
     }
 
     #[test]
@@ -608,6 +780,32 @@ mod tests {
             server
                 .send_to(&answer(&buf[..n], [1, 2, 3, 4]), from)
                 .unwrap();
+        });
+        let r = Resolver::new(
+            ResolverConfig::default()
+                .servers(vec![server_addr])
+                .timeout(Duration::from_secs(2)),
+        );
+        let ips = r.query("example.test", RecordType::A).unwrap();
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))]);
+    }
+
+    #[test]
+    fn records_for_other_names_are_not_answers() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let server_addr = server.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1500];
+            let (n, from) = server.recv_from(&mut buf).unwrap();
+            let mut resp = answer(&buf[..n], [1, 2, 3, 4]);
+            push_rr(
+                &mut resp,
+                &wire::encode_name("evil.test").unwrap(),
+                1,
+                1,
+                &[6, 6, 6, 6],
+            );
+            server.send_to(&resp, from).unwrap();
         });
         let r = Resolver::new(
             ResolverConfig::default()
