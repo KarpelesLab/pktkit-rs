@@ -65,20 +65,38 @@ impl AuthHash {
 ///
 /// The default constructor mirrors the upstream's `NewOptions()`:
 /// AES-128-CBC + SHA256, tun, UDPv4, LZO.
+///
+/// `#[non_exhaustive]`, so an option can be added without breaking anyone:
+/// build one from [`Default`] or [`parse`](Self::parse) and set its fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Options {
+    /// Options string format version: the `V4` it starts with.
     pub version: u32,
+    /// Rendered as `tls-server` rather than `tls-client`.
     pub is_server: bool,
-    pub dev_type: String, // "tun" or "tap"
+    /// `dev-type`: `"tun"` or `"tap"`.
+    pub dev_type: String,
+    /// `link-mtu`.
     pub link_mtu: u64,
+    /// `tun-mtu`.
     pub tun_mtu: u64,
+    /// `proto`, e.g. `UDPv4`.
     pub proto: String,
+    /// `"lzo"` if a compression context is active (`comp-lzo`), else
+    /// `"none"`.
     pub compression: String,
+    /// The data cipher's algorithm (`cipher`).
     pub cipher_crypto: CipherCryptoAlg,
+    /// The data cipher's key size in bits.
     pub cipher_size: u32,
+    /// The data cipher's mode.
     pub cipher_block: CipherBlockMethod,
+    /// `auth`: the HMAC digest for CBC.
     pub auth: AuthHash,
+    /// `keysize`, in bits.
     pub key_size: u64,
+    /// `key-method`.
     pub key_method: u64,
 }
 
@@ -104,9 +122,15 @@ impl Default for Options {
 
 impl Options {
     /// Parse an `V4,…` options string (the format OpenVPN exchanges during
-    /// negotiation). Returns the error as a String to keep the dependency
-    /// footprint minimal.
-    pub fn parse(s: &str) -> Result<Options, String> {
+    /// negotiation). A malformed one is an [`InvalidData`] error; options
+    /// this crate does not know are ignored.
+    ///
+    /// [`InvalidData`]: std::io::ErrorKind::InvalidData
+    pub fn parse(s: &str) -> crate::Result<Options> {
+        Self::parse_str(s).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    }
+
+    fn parse_str(s: &str) -> Result<Options, String> {
         // `,comp-lzo` says a compression context is active, whatever the
         // algorithm (options_string.c); without it there is none.
         let mut o = Options {
@@ -250,7 +274,8 @@ mod tests {
 
     #[test]
     fn rejects_non_v4_header() {
-        assert!(Options::parse("V3,…").is_err());
+        let e = Options::parse("V3,…").unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[test]

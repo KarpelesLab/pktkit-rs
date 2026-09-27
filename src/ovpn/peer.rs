@@ -1549,7 +1549,7 @@ fn try_parse_key_exchange(buf: &[u8]) -> io::Result<Option<(KeyExchange, usize)>
     // usable is part of choosing the data cipher, below, not a malformed
     // options string. A negotiating client may well name one we lack.
     let (options_rest, remote_cipher) = split_cipher(&options_string);
-    let mut opts = Options::parse(&options_rest).map_err(invalid)?;
+    let mut opts = Options::parse(&options_rest)?;
     opts.is_server = false;
     // The PUSH_REPLY carries `comp-lzo no`, which puts the client on
     // stub framing (every packet starts with the no-compression byte)
