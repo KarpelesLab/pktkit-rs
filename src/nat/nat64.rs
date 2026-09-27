@@ -242,6 +242,13 @@ impl Nat64 {
             return;
         }
 
+        // Likewise for a fragment of a datagram that would come out larger
+        // than IPv4 allows: the pieces would translate, but the receiver
+        // could never reassemble them into one datagram.
+        if frag.is_some_and(|f| IPV4_MIN_HEADER + f.offset + data.len() > usize::from(u16::MAX)) {
+            return;
+        }
+
         match (next_header, frag) {
             // A non-first fragment carries no ports and needs no mapping:
             // only its IP header is translated (RFC 7915 §5.1.1).
@@ -1986,6 +1993,27 @@ mod tests {
         whole[2..4].copy_from_slice(&total.to_be_bytes());
         whole[6..8].copy_from_slice(&[0, 0]);
         assert!(crate::nat::l4::v4_l4_checksum_ok(&whole, 20));
+    }
+
+    /// A fragment reaching past what an IPv4 datagram can hold is dropped:
+    /// no receiver could reassemble it.
+    #[test]
+    fn a_fragment_past_the_ipv4_size_limit_is_dropped() {
+        let (nat, _inside, outside) = wired();
+        let pkt = build_v6_udp(CLIENT.parse().unwrap(), 5555, wkp(SERVER), 53, &[0x22; 24]);
+        let (_, mut far) = split_v6(&pkt, 16, 7);
+        let fo = 65_520u16; // + 16 bytes of data + 20 of IPv4 header > 65535
+        far[IPV6_HEADER_LEN + 2..IPV6_HEADER_LEN + 4].copy_from_slice(&fo.to_be_bytes());
+        nat.inside().send(Packet::from_slice(&far)).unwrap();
+        assert!(outside.lock().unwrap().is_empty());
+
+        let (_, near) = split_v6(&pkt, 16, 8);
+        nat.inside().send(Packet::from_slice(&near)).unwrap();
+        assert_eq!(
+            outside.lock().unwrap().len(),
+            1,
+            "an ordinary fragment still goes"
+        );
     }
 
     #[test]
