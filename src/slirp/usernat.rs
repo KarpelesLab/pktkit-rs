@@ -819,7 +819,9 @@ impl Stack {
             }
             58 => {
                 // ICMPv6.
-                if let Some(reply) = build_icmpv6_echo_reply(pkt, src_addr, dst_addr, transport_off)
+                let our = inner.addr.read().expect("poisoned").addr();
+                if let Some(reply) =
+                    build_icmpv6_echo_reply(pkt, src_addr, dst_addr, transport_off, Some(our))
                 {
                     return Self::dispatch(inner, ns, &reply);
                 }
@@ -1230,6 +1232,35 @@ mod tests {
         let echo = make_v4_icmp_echo(Ipv4Addr::new(10, 0, 0, 5), Ipv4Addr::new(10, 0, 0, 9));
         L3Device::send(&*s, Packet::from_slice(&echo)).unwrap();
         assert_eq!(count.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn icmpv6_echo_answered_only_for_our_address() {
+        let ours: Ipv6Addr = "fd00::1".parse().unwrap();
+        let s = Stack::new();
+        s.set_addr(IpPrefix::new(IpAddr::V6(ours), 64)).unwrap();
+        let captured = capture(&s);
+        let echo = |dst: Ipv6Addr| {
+            let src: Ipv6Addr = "fd00::5".parse().unwrap();
+            let mut p = vec![0u8; 48];
+            p[0] = 0x60;
+            p[4..6].copy_from_slice(&8u16.to_be_bytes());
+            p[6] = 58;
+            p[7] = 64;
+            p[8..24].copy_from_slice(&src.octets());
+            p[24..40].copy_from_slice(&dst.octets());
+            p[40] = 128; // echo request
+            p
+        };
+        for dst in ["fd00::9", "ff02::1"] {
+            L3Device::send(&*s, Packet::from_slice(&echo(dst.parse().unwrap()))).unwrap();
+        }
+        assert!(
+            captured.lock().unwrap().is_empty(),
+            "answered for another address"
+        );
+        L3Device::send(&*s, Packet::from_slice(&echo(ours))).unwrap();
+        assert_eq!(captured.lock().unwrap().len(), 1);
     }
 
     fn build_udp_v4_packet(

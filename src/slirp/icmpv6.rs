@@ -4,19 +4,27 @@
 //! ignored — slirp operates above L2.
 
 use crate::slirp::checksum::ipv6_pseudo_checksum;
-use std::net::Ipv6Addr;
+use std::net::{IpAddr, Ipv6Addr};
 
 pub(crate) const ICMPV6_ECHO_REQUEST: u8 = 128;
 pub(crate) const ICMPV6_ECHO_REPLY: u8 = 129;
 
-/// Process an ICMPv6 packet. Returns a reply packet if appropriate, or
-/// `None` for messages we ignore (RS/RA/NS/NA, unknown types).
+/// Process an ICMPv6 packet. Returns a reply packet if it is an echo request
+/// addressed to `our_ip`, or `None` for anything else: echoes for other
+/// hosts (the stack does not speak for them), messages we ignore (RS/RA/
+/// NS/NA, unknown types). Requiring our own unicast address also keeps
+/// multicast echoes from drawing a reply sourced from a multicast address.
 pub(crate) fn build_icmpv6_echo_reply(
     packet: &[u8],
     src_ip: Ipv6Addr,
     dst_ip: Ipv6Addr,
     transport_off: usize,
+    our_ip: Option<IpAddr>,
 ) -> Option<Vec<u8>> {
+    match our_ip {
+        Some(IpAddr::V6(a)) if a == dst_ip => {}
+        _ => return None,
+    }
     if packet.len() < transport_off + 8 {
         return None;
     }
@@ -76,7 +84,7 @@ mod tests {
         let src: Ipv6Addr = "fe80::5".parse().unwrap();
         let dst: Ipv6Addr = "fe80::1".parse().unwrap();
         let req = build_echo_request6(src, dst, b"ping");
-        let reply = build_icmpv6_echo_reply(&req, src, dst, 40).unwrap();
+        let reply = build_icmpv6_echo_reply(&req, src, dst, 40, Some(IpAddr::V6(dst))).unwrap();
         assert_eq!(reply[40], ICMPV6_ECHO_REPLY);
         // Source/dest swapped.
         assert_eq!(&reply[8..24], &dst.octets());
@@ -89,6 +97,25 @@ mod tests {
         let dst: Ipv6Addr = "fe80::1".parse().unwrap();
         let mut req = build_echo_request6(src, dst, b"x");
         req[40] = 1; // Destination Unreachable
-        assert!(build_icmpv6_echo_reply(&req, src, dst, 40).is_none());
+        assert!(build_icmpv6_echo_reply(&req, src, dst, 40, Some(IpAddr::V6(dst))).is_none());
+    }
+
+    #[test]
+    fn echo_for_another_address_ignored() {
+        let src: Ipv6Addr = "fe80::5".parse().unwrap();
+        let dst: Ipv6Addr = "fe80::9".parse().unwrap();
+        let ours = Some(IpAddr::V6("fe80::1".parse().unwrap()));
+        let req = build_echo_request6(src, dst, b"x");
+        assert!(build_icmpv6_echo_reply(&req, src, dst, 40, ours).is_none());
+        assert!(build_icmpv6_echo_reply(&req, src, dst, 40, None).is_none());
+    }
+
+    #[test]
+    fn multicast_echo_ignored() {
+        let src: Ipv6Addr = "fe80::5".parse().unwrap();
+        let all_nodes: Ipv6Addr = "ff02::1".parse().unwrap();
+        let ours = Some(IpAddr::V6("fe80::1".parse().unwrap()));
+        let req = build_echo_request6(src, all_nodes, b"x");
+        assert!(build_icmpv6_echo_reply(&req, src, all_nodes, 40, ours).is_none());
     }
 }
