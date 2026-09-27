@@ -56,4 +56,4 @@ fn spawn_flow_thread<F: FnOnce() + Send + 'static>(f: F) -> std::io::Result<()> 
 pub use listener::Listener;
 pub use listener6::Listener6;
 pub use tcp_stream::TcpStream;
-pub use usernat::{NsSide, Stack};
+pub use usernat::{DestFilter, NsSide, Stack};

@@ -12,6 +12,7 @@
 //! - IPv4 TCP non-SYN to nothing → send RST per RFC 9293.
 //! - IPv4 UDP → dial real `UdpSocket`, ship payload through, return responses.
 //! - Symmetric handling for IPv6.
+//! - Host destinations can be restricted with [`Stack::set_dest_filter`].
 //!
 //! Inbound to a virtual listener (ports claimed via [`Stack::listen`]) is also
 //! served by the `vtcp` engine: an inbound SYN passive-opens a server-side
@@ -28,13 +29,13 @@ use crate::slirp::ipv6::skip_extension_headers;
 use crate::slirp::listener::{Listener, ListenerKey, resolve_v4};
 use crate::slirp::listener6::{Listener6, ListenerKey6, resolve_v6};
 use crate::slirp::packet::fit_link;
-use crate::slirp::tcp_out::{TcpOutConn, build_rst_for_stray};
+use crate::slirp::tcp_out::{TcpOutConn, build_refused_rst, build_rst_for_stray};
 use crate::slirp::tcp_stream::{ConnState, Endpoints, tick_conn};
 use crate::slirp::udp::{SendFn as UdpSendFn, UdpConn};
 use crate::slirp::udp6::{SendFn as UdpSendFn6, UdpConn6};
 use crate::vtcp::segment::{Segment, flags as tcp_flags};
 use crate::vtcp::{Conn, ConnConfig};
-use crate::{IpPrefix, Result, connect_l3};
+use crate::{IpPrefix, Protocol, Result, connect_l3};
 
 use crate::time::Instant;
 use std::collections::HashMap;
@@ -92,6 +93,11 @@ const MAX_UDP_FLOWS: usize = if cfg!(test) { 8 } else { 2048 };
 /// Time a UDP flow may sit idle before its socket is reaped.
 const UDP_IDLE: Duration = Duration::from_secs(60);
 
+/// Decides whether a guest may reach a host destination; see
+/// [`Stack::set_dest_filter`]. It gets the destination and the transport
+/// ([`Protocol::TCP`] or [`Protocol::UDP`]), and returns `true` to allow.
+pub type DestFilter = Arc<dyn Fn(SocketAddr, Protocol) -> bool + Send + Sync>;
+
 /// State shared between Stack and its background maintenance thread.
 struct Inner {
     addr: RwLock<IpPrefix>,
@@ -121,6 +127,8 @@ struct Inner {
     pending_dials: Arc<AtomicUsize>,
     /// Fragments from the virtual network awaiting the rest of their datagram.
     defrag: Mutex<Reassembler>,
+    /// Which host destinations the guests may reach; `None` allows all.
+    filter: RwLock<Option<DestFilter>>,
     closed: AtomicBool,
 }
 
@@ -207,6 +215,7 @@ impl Stack {
             ns_counter: AtomicU64::new(0),
             pending_dials: Arc::new(AtomicUsize::new(0)),
             defrag: Mutex::new(Reassembler::default()),
+            filter: RwLock::new(None),
             closed: AtomicBool::new(false),
         });
 
@@ -382,6 +391,30 @@ impl Stack {
             }
         }));
         Ok(listener)
+    }
+
+    /// Restrict which host destinations the guests may reach.
+    ///
+    /// By default the stack relays to any address the host can reach,
+    /// which includes the host's own loopback, link-local neighbours and
+    /// cloud metadata endpoints (169.254.169.254). A filter decides instead.
+    /// It is asked before each new TCP connection is dialed, and a refused
+    /// one is reset as a closed port would be; and before each UDP datagram
+    /// is sent, a refused one being dropped. Connections already open are
+    /// not revisited. Virtual listeners ([`listen`](Self::listen)) are not
+    /// host destinations and are never filtered.
+    ///
+    /// The filter runs on the packet path, so it should be quick, and must
+    /// not call back into the stack. `None` allows everything again.
+    pub fn set_dest_filter(&self, filter: Option<DestFilter>) {
+        *self.inner.filter.write().expect("poisoned") = filter;
+    }
+
+    /// Whether the filter lets the guests reach `dest` over `proto`.
+    fn allowed(inner: &Inner, dest: SocketAddr, proto: Protocol) -> bool {
+        // Cloned out, so the filter never runs under the lock.
+        let filter = inner.filter.read().expect("poisoned").clone();
+        filter.is_none_or(|f| f(dest, proto))
     }
 
     /// Shut the stack down: close every listener and in-flight connection,
@@ -616,6 +649,19 @@ impl Stack {
             return Ok(());
         }
 
+        // A destination the filter refuses is refused as a closed port would
+        // be, before anything reaches the host.
+        if !Self::allowed(
+            inner,
+            SocketAddr::V4(SocketAddrV4::new(dst, dst_port)),
+            Protocol::TCP,
+        ) {
+            let seq = u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]);
+            let rst = build_refused_rst(src_port, dst_port, seq);
+            let pkt = crate::slirp::packet::build_packet4(dst, src, &rst);
+            return Self::dispatch(inner, ns, &pkt);
+        }
+
         // SYN → dial the real destination and bridge it to a server-side
         // vtcp::Conn terminating the virtual side.
         if !outbound_slot_free(&inner.tcp, &inner.tcp_time_wait)
@@ -788,6 +834,13 @@ impl Stack {
             dst_port,
         };
 
+        if !Self::allowed(
+            inner,
+            SocketAddr::V4(SocketAddrV4::new(dst, dst_port)),
+            Protocol::UDP,
+        ) {
+            return Ok(()); // refused by the filter: dropped
+        }
         // Look up or create.
         let conn = {
             let mut t = inner.udp.lock().expect("poisoned");
@@ -957,6 +1010,15 @@ impl Stack {
             return Ok(());
         }
 
+        // Refused as in the IPv4 path.
+        let dest = SocketAddr::V6(SocketAddrV6::new(dst, dst_port, 0, 0));
+        if !Self::allowed(inner, dest, Protocol::TCP) {
+            let seq = u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]);
+            let rst = build_refused_rst(src_port, dst_port, seq);
+            let pkt = crate::slirp::packet::build_packet6(dst, src, &rst);
+            return Self::dispatch(inner, ns, &pkt);
+        }
+
         if !outbound_slot_free(&inner.tcp6, &inner.tcp6_time_wait)
             || inner.pending_dials.load(Ordering::Acquire) >= MAX_PENDING_DIALS
         {
@@ -1115,6 +1177,10 @@ impl Stack {
             dst_ip,
             dst_port,
         };
+        let dest = SocketAddr::V6(SocketAddrV6::new(dst, dst_port, 0, 0));
+        if !Self::allowed(inner, dest, Protocol::UDP) {
+            return Ok(()); // refused by the filter: dropped
+        }
         let conn = {
             let mut t = inner.udp6.lock().expect("poisoned");
             if let Some(c) = t.get(&key).filter(|c| !c.is_closed()) {
@@ -2845,6 +2911,55 @@ mod tests {
         let syn = seg(20000, tcp_flags::SYN).marshal();
         inject(crate::slirp::packet::build_packet4(client, us, &syn));
         assert_eq!(s.inner.virt_tcp.lock().unwrap().len(), HALF_OPEN_CAP);
+    }
+
+    #[test]
+    fn dest_filter_refuses_tcp_with_a_reset_and_drops_udp() {
+        let real_udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+        real_udp
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let uport = real_udp.local_addr().unwrap().port();
+        let s = Stack::new();
+        let captured = capture(&s);
+        let asked: Arc<Mutex<Vec<(SocketAddr, Protocol)>>> = Arc::default();
+        let a = asked.clone();
+        s.set_dest_filter(Some(Arc::new(move |dest: SocketAddr, proto| {
+            a.lock().unwrap().push((dest, proto));
+            !dest.ip().is_loopback()
+        })));
+        let client = Ipv4Addr::new(10, 0, 0, 5);
+        let lo = Ipv4Addr::LOCALHOST;
+
+        let syn = build_tcp_v4_packet(client, 40000, lo, 22, 7000, 0, tcp_flags::SYN, &[]);
+        L3Device::send(&*s, Packet::from_slice(&syn)).unwrap();
+        assert!(s.inner.tcp.lock().unwrap().is_empty(), "dialed the host");
+        let got = captured.lock().unwrap().clone();
+        assert_eq!(got.len(), 1);
+        let rst = Segment::parse(&got[0][20..]).unwrap();
+        assert_eq!(rst.flags, tcp_flags::RST | tcp_flags::ACK);
+        assert_eq!(rst.ack, 7001);
+
+        let dgram = build_udp_v4_packet(client, 40000, lo, uport, b"hello");
+        L3Device::send(&*s, Packet::from_slice(&dgram)).unwrap();
+        assert!(s.inner.udp.lock().unwrap().is_empty(), "opened a UDP flow");
+        assert!(real_udp.recv_from(&mut [0u8; 16]).is_err(), "datagram sent");
+
+        let lo_addr = |port| SocketAddr::V4(SocketAddrV4::new(lo, port));
+        assert_eq!(
+            *asked.lock().unwrap(),
+            [
+                (lo_addr(22), Protocol::TCP),
+                (lo_addr(uport), Protocol::UDP)
+            ]
+        );
+
+        // Allowed again, the same datagram goes through.
+        s.set_dest_filter(None);
+        L3Device::send(&*s, Packet::from_slice(&dgram)).unwrap();
+        let mut buf = [0u8; 16];
+        let (n, _) = real_udp.recv_from(&mut buf).expect("datagram relayed");
+        assert_eq!(&buf[..n], b"hello");
     }
 
     #[test]
