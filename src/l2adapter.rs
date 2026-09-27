@@ -155,8 +155,9 @@ impl L2Adapter {
         }
     }
 
-    /// Drive the DHCP lease renewal. Only needed on targets without threads
-    /// (`wasm32`), where nothing runs in the background; see
+    /// Drive the DHCP client's timers: retransmissions, lease renewal and
+    /// expiry. Only needed on targets without threads (`wasm32`), where
+    /// nothing runs in the background; see
     /// [`dhcp::Client::tick`](crate::dhcp::Client::tick).
     #[cfg(feature = "dhcp")]
     pub fn tick(&self) {
@@ -484,6 +485,16 @@ impl crate::dhcp::ClientTransport for AdapterDhcpTransport {
             if let Some(gw) = gateway {
                 a.set_gateway_v4(gw);
             }
+        }
+    }
+    fn on_lease_lost(&self) {
+        // The leased address must not be used past the lease (RFC 2131
+        // §4.4.5); leave the device unconfigured until the next lease.
+        if let Some(a) = self.weak.upgrade()
+            && a.l3.addr().is_v4()
+        {
+            let _ =
+                a.l3.set_addr(IpPrefix::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0));
         }
     }
 }
