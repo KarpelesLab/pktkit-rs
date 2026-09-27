@@ -7,7 +7,7 @@
 //! TCP/UDP, with `src_port` substituted by the ICMP identifier for ICMP echo.
 //! Reverse lookup is keyed by `(proto, outside_port)`.
 
-use crate::nat::defrag::Defragger;
+use crate::nat::defrag::{Defragger, FragMax};
 use crate::nat::frag::FragTable;
 use crate::nat::helper::{
     Expectation, Helper, LocalHelper, NatMapping, PROTO_ICMP, PROTO_TCP, PROTO_UDP, PacketHelper,
@@ -181,6 +181,11 @@ impl Nat {
     }
 
     /// Enable IPv4 defragmentation (off by default).
+    ///
+    /// Fragmented datagrams are then translated whole, so ALGs see complete
+    /// messages, and sent on cut into fragments no larger than the largest
+    /// one they arrived in (keeping Don't Fragment if that one had it), as
+    /// Linux conntrack does.
     pub fn enable_defrag(&self) {
         let mut d = self.defragger.lock().unwrap();
         *d = Some(Arc::new(Defragger::new()));
@@ -767,16 +772,16 @@ impl Nat {
 
     fn handle_outbound(&self, ns: u64, pkt_in: &[u8]) {
         let owned;
-        let pkt: &[u8] = if let Some(d) = self.defragger.lock().unwrap().clone() {
-            match d.process(pkt_in) {
-                Some(v) => {
+        let (pkt, fmax): (&[u8], _) = if let Some(d) = self.defragger.lock().unwrap().clone() {
+            match d.reassemble(pkt_in) {
+                Some((v, fmax)) => {
                     owned = v;
-                    &owned
+                    (&owned, fmax)
                 }
                 None => return,
             }
         } else {
-            pkt_in
+            (pkt_in, None)
         };
 
         let Some((pkt, ihl)) = ipv4_datagram(pkt) else {
@@ -815,13 +820,13 @@ impl Nat {
                 if pkt.len() < ihl + 4 {
                     return;
                 }
-                self.outbound_tcpudp(ns, pkt, ihl, proto, whole);
+                self.outbound_tcpudp(ns, pkt, ihl, proto, whole, fmax);
             }
             PROTO_ICMP => {
                 if pkt.len() < ihl + 8 {
                     return;
                 }
-                self.outbound_icmp(ns, pkt, ihl);
+                self.outbound_icmp(ns, pkt, ihl, fmax);
             }
             _ => {}
         }
@@ -839,13 +844,23 @@ impl Nat {
         out[12..16].copy_from_slice(&outside_ip.octets());
         update_ip_checksum(&mut out, old, outside_ip.octets());
         if out[16..20] == outside_ip.octets() {
-            self.inbound(&out);
+            self.inbound(&out, None);
             return;
         }
         self.outside.deliver(Packet::from_slice(&out));
     }
 
-    fn outbound_tcpudp(&self, ns: u64, pkt: &[u8], ihl: usize, proto: u8, whole: bool) {
+    /// Translate an outbound TCP/UDP datagram, or the first fragment of one
+    /// (`whole` false). `fmax` is set if it was reassembled.
+    fn outbound_tcpudp(
+        &self,
+        ns: u64,
+        pkt: &[u8],
+        ihl: usize,
+        proto: u8,
+        whole: bool,
+        fmax: Option<FragMax>,
+    ) {
         // A first fragment must at least hold the checksum field, which is
         // patched here for the whole datagram (RFC 6146 §3.4 lets a
         // translator insist on the header being in the first fragment).
@@ -942,13 +957,13 @@ impl Nat {
         // had arrived from outside, so the receiver sees that public address
         // too.
         if out[16..20] == outside_ip.octets() {
-            self.inbound(&out);
+            self.inbound(&out, fmax);
             return;
         }
-        self.outside.deliver(Packet::from_slice(&out));
+        emit(&out, fmax, |p| self.outside.deliver(p));
     }
 
-    fn outbound_icmp(&self, ns: u64, pkt: &[u8], ihl: usize) {
+    fn outbound_icmp(&self, ns: u64, pkt: &[u8], ihl: usize, fmax: Option<FragMax>) {
         let icmp_type = pkt[ihl];
         if icmp_type != 8 {
             return; // outbound: only Echo Request
@@ -990,30 +1005,31 @@ impl Nat {
         update_ip_checksum(&mut out, old_src_ip, new_src_ip);
         update_icmp_checksum(&mut out, ihl, old_id, outside_port);
 
-        self.outside.deliver(Packet::from_slice(&out));
+        emit(&out, fmax, |p| self.outside.deliver(p));
     }
 
     // ---------- Inbound (outside -> inside) ----------
 
     fn handle_inbound(&self, pkt_in: &[u8]) {
         let owned;
-        let pkt: &[u8] = if let Some(d) = self.defragger.lock().unwrap().clone() {
-            match d.process(pkt_in) {
-                Some(v) => {
+        let (pkt, fmax): (&[u8], _) = if let Some(d) = self.defragger.lock().unwrap().clone() {
+            match d.reassemble(pkt_in) {
+                Some((v, fmax)) => {
                     owned = v;
-                    &owned
+                    (&owned, fmax)
                 }
                 None => return,
             }
         } else {
-            pkt_in
+            (pkt_in, None)
         };
 
-        self.inbound(pkt);
+        self.inbound(pkt, fmax);
     }
 
-    /// Translate one inbound datagram (or fragment of one).
-    fn inbound(&self, pkt: &[u8]) {
+    /// Translate one inbound datagram (or fragment of one). `fmax` is set if
+    /// it was reassembled.
+    fn inbound(&self, pkt: &[u8], fmax: Option<FragMax>) {
         let Some((pkt, ihl)) = ipv4_datagram(pkt) else {
             return;
         };
@@ -1030,9 +1046,9 @@ impl Nat {
         let proto = pkt[9];
         let target = match proto {
             PROTO_TCP | PROTO_UDP if pkt.len() >= ihl + 4 => {
-                self.inbound_tcpudp(pkt, ihl, proto, whole)
+                self.inbound_tcpudp(pkt, ihl, proto, whole, fmax)
             }
-            PROTO_ICMP if pkt.len() >= ihl + 8 => self.inbound_icmp(pkt, ihl, whole),
+            PROTO_ICMP if pkt.len() >= ihl + 8 => self.inbound_icmp(pkt, ihl, whole, fmax),
             _ => None,
         };
         if !whole && let Some(target) = target {
@@ -1064,6 +1080,7 @@ impl Nat {
         ihl: usize,
         proto: u8,
         whole: bool,
+        fmax: Option<FragMax>,
     ) -> Option<(u64, Ipv4Addr)> {
         if !whole && pkt.len() < ihl + if proto == PROTO_TCP { 18 } else { 8 } {
             return None;
@@ -1168,13 +1185,19 @@ impl Nat {
             let peer = SocketAddrV4::new(src_ip, src_port);
             self.tcp_seq_fixup(mapping_key, peer, false, before, &mut out, ihl);
         }
-        self.send_ns(mapping_key.ns, Packet::from_slice(&out));
+        emit(&out, fmax, |p| self.send_ns(mapping_key.ns, p));
         Some((mapping_key.ns, mapping_key.ip))
     }
 
     /// Translate an inbound ICMP message, or the first fragment of an echo
     /// reply (`whole` false). Returns where it went.
-    fn inbound_icmp(&self, pkt: &[u8], ihl: usize, whole: bool) -> Option<(u64, Ipv4Addr)> {
+    fn inbound_icmp(
+        &self,
+        pkt: &[u8],
+        ihl: usize,
+        whole: bool,
+        fmax: Option<FragMax>,
+    ) -> Option<(u64, Ipv4Addr)> {
         let icmp_type = pkt[ihl];
         match icmp_type {
             0 => {
@@ -1203,12 +1226,12 @@ impl Nat {
                 out[ihl + 4..ihl + 6].copy_from_slice(&mapping_key.port.to_be_bytes());
                 update_ip_checksum(&mut out, old_dst_ip, new_dst_ip);
                 update_icmp_checksum(&mut out, ihl, old_id, mapping_key.port);
-                self.send_ns(mapping_key.ns, Packet::from_slice(&out));
+                emit(&out, fmax, |p| self.send_ns(mapping_key.ns, p));
                 Some((mapping_key.ns, mapping_key.ip))
             }
             // Errors are small; a fragmented one is not worth reassembling.
             3 | 11 | 12 if whole => {
-                self.inbound_icmp_error(pkt, ihl);
+                self.inbound_icmp_error(pkt, ihl, fmax);
                 None
             }
             _ => None,
@@ -1218,7 +1241,7 @@ impl Nat {
     /// Translate an ICMP error about a packet this NAT sent out (RFC 5508
     /// §7): the outer destination and the embedded packet's source go back to
     /// the inside endpoint, with every checksum that covers them patched.
-    fn inbound_icmp_error(&self, pkt: &[u8], outer_ihl: usize) {
+    fn inbound_icmp_error(&self, pkt: &[u8], outer_ihl: usize, fmax: Option<FragMax>) {
         let emb_off = outer_ihl + 8;
         if pkt.len() < emb_off + 20 {
             return;
@@ -1315,7 +1338,7 @@ impl Nat {
         let csum = checksum(&out[outer_ihl..]);
         out[outer_ihl + 2..outer_ihl + 4].copy_from_slice(&csum.to_be_bytes());
 
-        self.send_ns(mapping_key.ns, Packet::from_slice(&out));
+        emit(&out, fmax, |p| self.send_ns(mapping_key.ns, p));
     }
 }
 
@@ -1477,6 +1500,16 @@ impl L3Device for NatNsSide {
     }
     fn close(&self) -> Result<()> {
         Ok(())
+    }
+}
+
+/// Hand a translated datagram to `send`, cut back into fragments no larger
+/// than the ones it was reassembled from (`fmax`), since the path it came
+/// by could not carry it whole.
+fn emit(out: &[u8], fmax: Option<FragMax>, send: impl Fn(&Packet)) {
+    match fmax.and_then(|m| m.refragment(out)) {
+        Some(parts) => parts.iter().for_each(|p| send(Packet::from_slice(p))),
+        None => send(Packet::from_slice(out)),
     }
 }
 
@@ -2688,5 +2721,73 @@ mod tests {
         let (_, r2) = split(&r, 8, 0x6161);
         nat.outside().send(Packet::from_slice(&r2)).unwrap();
         assert!(i.lock().unwrap().is_empty());
+    }
+
+    /// `dgram` cut into fragments of at most `mtu` bytes, with DF set on
+    /// each if `df`.
+    fn fragments_of(dgram: &[u8], mtu: usize, id: u16, df: bool) -> Vec<Vec<u8>> {
+        let mut d = dgram.to_vec();
+        d[4..6].copy_from_slice(&id.to_be_bytes());
+        d[10..12].copy_from_slice(&[0, 0]);
+        let ic = checksum(&d[..20]);
+        d[10..12].copy_from_slice(&ic.to_be_bytes());
+        let crate::fragment::Fragmentation::Fragments(mut parts) =
+            crate::fragment::fragment_ipv4(Packet::from_slice(&d), mtu)
+        else {
+            panic!("not fragmented");
+        };
+        for p in parts.iter_mut().filter(|_| df) {
+            p[6] |= 0x40;
+            p[10..12].copy_from_slice(&[0, 0]);
+            let ic = checksum(&p[..20]);
+            p[10..12].copy_from_slice(&ic.to_be_bytes());
+        }
+        parts
+    }
+
+    /// Reassemble what the NAT sent, checking every piece's header.
+    fn reassembled(pieces: &[Vec<u8>], mtu: usize, df: bool) -> Vec<u8> {
+        let d = Defragger::new();
+        let mut whole = None;
+        for p in pieces {
+            assert!(p.len() <= mtu, "{} byte piece over {}", p.len(), mtu);
+            assert_eq!(checksum(&p[..20]), 0);
+            assert_eq!(p[6] & 0x40 != 0, df, "DF carried over");
+            whole = d.process(p);
+        }
+        whole.expect("pieces make a whole datagram")
+    }
+
+    #[test]
+    fn reassembled_datagrams_are_refragmented_to_their_fragment_size() {
+        let (nat, i, o) = setup();
+        nat.enable_defrag();
+        let payload: Vec<u8> = (0..3000u32).map(|n| n as u8).collect();
+        let mut d = build_udp(INSIDE, 5000, REMOTE, 53, &payload);
+        crate::nat::l4::fill_v4_l4_checksum(&mut d, 20);
+        for f in fragments_of(&d, 1500, 0x7070, false) {
+            nat.inside().send(Packet::from_slice(&f)).unwrap();
+        }
+        let sent = o.lock().unwrap().clone();
+        assert_eq!(sent.len(), 3, "sent as three fragments again");
+        let whole = reassembled(&sent, 1500, false);
+        assert_eq!(&whole[12..16], &PUBLIC.octets());
+        assert_eq!(&whole[28..], &payload[..]);
+        assert!(crate::nat::l4::v4_l4_checksum_ok(&whole, 20));
+        let port = src_port(&whole);
+
+        // Inbound, with the smallest fragments deciding, and DF on all of
+        // them: the pieces keep it.
+        let mut r = build_udp(REMOTE, 53, PUBLIC, port, &payload);
+        crate::nat::l4::fill_v4_l4_checksum(&mut r, 20);
+        for f in fragments_of(&r, 576, 0x7171, true) {
+            nat.outside().send(Packet::from_slice(&f)).unwrap();
+        }
+        let got = i.lock().unwrap().clone();
+        assert!(got.len() > 1);
+        let whole = reassembled(&got, 576, true);
+        assert_eq!(&whole[16..20], &INSIDE.octets());
+        assert_eq!(dst_port(&whole), 5000);
+        assert!(crate::nat::l4::v4_l4_checksum_ok(&whole, 20));
     }
 }

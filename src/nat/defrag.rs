@@ -3,9 +3,16 @@
 //! Buffers fragments by (src, dst, id, proto), discards on timeout, rejects
 //! overlapping fragments (RFC 5722 best practice), reassembles when the full
 //! datagram is covered.
+//!
+//! A forwarder that reassembles must fragment again on the way out: the
+//! datagram arrived in pieces because some link on its path could not carry
+//! it whole. Like Linux conntrack (`frag_max_size`), reassembly remembers the
+//! largest fragment it saw, and [`FragMax::refragment`] cuts the forwarded
+//! datagram back down to that.
 
-use crate::checksum;
+use crate::fragment::{Fragmentation, MIN_IPV4_MTU, fragment_ipv4};
 use crate::time::Instant;
+use crate::{Packet, checksum};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -37,6 +44,62 @@ struct FragEntry {
     created: Instant,
     /// Total reassembled payload length once last fragment is seen, else `None`.
     total: Option<usize>,
+    /// Largest fragment seen, in bytes of IP packet.
+    max_size: usize,
+    /// Largest fragment seen with Don't Fragment set.
+    max_df_size: usize,
+}
+
+/// What reassembly learned about the fragments of a datagram: how big they
+/// were allowed to be on the way in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FragMax {
+    /// The largest fragment, in bytes of IP packet.
+    pub(crate) size: usize,
+    /// Whether that fragment had Don't Fragment set: the sender is doing
+    /// path MTU discovery, and the pieces sent on must keep the bit.
+    pub(crate) df: bool,
+}
+
+impl FragMax {
+    /// Split `pkt`, a reassembled datagram after translation, into fragments
+    /// no larger than the ones it arrived in, as Linux's `ip_do_fragment`
+    /// does with `frag_max_size`. `None` when it fits as it is.
+    pub(crate) fn refragment(&self, pkt: &[u8]) -> Option<Vec<Vec<u8>>> {
+        if pkt.len() <= self.size || pkt.len() < 20 {
+            return None;
+        }
+        // Reassembly put DF on the datagram if the fragments had it; it
+        // must come off to split, and goes back on every piece.
+        let mut whole = pkt.to_vec();
+        set_df(&mut whole, false);
+        // Every IPv4 link carries 68 bytes (RFC 791), so tinier fragments
+        // than that are never needed, however small the ones that came in.
+        let mtu = self.size.max(MIN_IPV4_MTU);
+        let Fragmentation::Fragments(mut parts) = fragment_ipv4(Packet::from_slice(&whole), mtu)
+        else {
+            return None;
+        };
+        if self.df {
+            for p in parts.iter_mut() {
+                set_df(p, true);
+            }
+        }
+        Some(parts)
+    }
+}
+
+/// Set or clear an IPv4 header's Don't Fragment bit, keeping its checksum.
+fn set_df(pkt: &mut [u8], on: bool) {
+    let old = [pkt[6], pkt[7]];
+    if on {
+        pkt[6] |= 0x40;
+    } else {
+        pkt[6] &= !0x40;
+    }
+    let cs = u16::from_be_bytes([pkt[10], pkt[11]]);
+    let cs = crate::incremental_update(cs, &old, &[pkt[6], pkt[7]]);
+    pkt[10..12].copy_from_slice(&cs.to_be_bytes());
 }
 
 /// Reassembler for fragmented IPv4 packets.
@@ -71,8 +134,14 @@ impl Defragger {
     /// - Last fragment that completes the datagram: returns the reassembled
     ///   packet as a fresh `Vec`.
     pub fn process(&self, pkt: &[u8]) -> Option<Vec<u8>> {
+        self.reassemble(pkt).map(|(p, _)| p)
+    }
+
+    /// [`process`](Self::process), also returning, for a datagram put
+    /// together from fragments, the size they came in.
+    pub(crate) fn reassemble(&self, pkt: &[u8]) -> Option<(Vec<u8>, Option<FragMax>)> {
         if pkt.len() < 20 {
-            return Some(pkt.to_vec());
+            return Some((pkt.to_vec(), None));
         }
 
         let flags_off = u16::from_be_bytes([pkt[6], pkt[7]]);
@@ -81,7 +150,7 @@ impl Defragger {
 
         // Not fragmented — pass through.
         if !mf && frag_offset == 0 {
-            return Some(pkt.to_vec());
+            return Some((pkt.to_vec(), None));
         }
 
         let ihl = (pkt[0] & 0x0F) as usize * 4;
@@ -121,6 +190,8 @@ impl Defragger {
             frags: Vec::new(),
             created: Instant::now(),
             total: None,
+            max_size: 0,
+            max_df_size: 0,
         });
 
         if !mf {
@@ -152,6 +223,10 @@ impl Defragger {
             return None;
         }
 
+        entry.max_size = entry.max_size.max(total_len);
+        if flags_off & 0x4000 != 0 {
+            entry.max_df_size = entry.max_df_size.max(total_len);
+        }
         entry.frags.push(FragData {
             offset: frag_offset,
             data: payload.to_vec(),
@@ -199,6 +274,12 @@ impl Defragger {
             reassembled[f.offset..end].copy_from_slice(&f.data[..end - f.offset]);
         }
 
+        // Linux's rule (ip_frag_reasm): the datagram is as unfragmentable
+        // as its largest fragment.
+        let max = FragMax {
+            size: entry.max_size,
+            df: entry.max_df_size == entry.max_size,
+        };
         inner.entries.remove(&k);
 
         let total_len = hdr.len() + reassembled.len();
@@ -212,12 +293,12 @@ impl Defragger {
         // Clear MF + offset, fix total length, recompute IP checksum.
         let tl = total_len as u16;
         result[2..4].copy_from_slice(&tl.to_be_bytes());
-        result[6..8].copy_from_slice(&[0, 0]);
+        result[6..8].copy_from_slice(&[if max.df { 0x40 } else { 0 }, 0]);
         result[10..12].copy_from_slice(&[0, 0]);
         let csum = checksum(&result[..hdr.len()]);
         result[10..12].copy_from_slice(&csum.to_be_bytes());
 
-        Some(result)
+        Some((result, Some(max)))
     }
 
     /// Drop entries older than the defrag timeout. Call this periodically;
