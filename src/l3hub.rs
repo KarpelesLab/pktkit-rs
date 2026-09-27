@@ -34,8 +34,9 @@ fn next_port_id() -> u64 {
 /// [`stats`](Self::stats) is where that shows up.
 ///
 /// Like a router, the hub decrements the TTL / hop limit of every packet it
-/// forwards and drops those that run out, answering with ICMP Time Exceeded
-/// once [`set_icmp_source`](Self::set_icmp_source) gives it an address.
+/// routes to one port and drops those that run out, answering with ICMP Time
+/// Exceeded once [`set_icmp_source`](Self::set_icmp_source) gives it an
+/// address. Flooded broadcast and multicast pass unchanged, as on a link.
 pub struct L3Hub {
     ports: RwLock<Vec<Arc<Port>>>,
     default_route: Mutex<Option<u64>>,
@@ -169,18 +170,12 @@ impl L3Hub {
             return;
         }
 
-        // RFC 1812 §5.3.1 / RFC 8200 §3: a router decrements the TTL / hop
-        // limit of what it forwards, and discards what reaches zero -- that
-        // is what finally ends a routing loop.
-        let mut buf = pkt.to_vec();
-        let fwd = Packet::from_mut(&mut buf);
-        if !fwd.decrement_hop_limit() {
-            self.stats.record_dropped();
-            self.time_exceeded(pkt, &ports, source_id);
-            return;
-        }
-        let pkt: &Packet = fwd;
-
+        // Flooding makes the hub the ports' shared link, not a router
+        // between them: broadcast and multicast go out as they came in. A
+        // decrement would break Neighbor Discovery, which insists on hop
+        // limit 255 (RFC 4861 §7.1), and drop everything sent with TTL 1
+        // to stay on the link (IGMP, OSPF hellos). The depth guard above
+        // still ends a flooding loop.
         if pkt.is_broadcast() || pkt.is_multicast() {
             let mut sent = 0u64;
             for p in &ports {
@@ -196,6 +191,18 @@ impl L3Hub {
             }
             return;
         }
+
+        // RFC 1812 §5.3.1 / RFC 8200 §3: a router decrements the TTL / hop
+        // limit of what it forwards, and discards what reaches zero -- that
+        // is what finally ends a routing loop.
+        let mut buf = pkt.to_vec();
+        let fwd = Packet::from_mut(&mut buf);
+        if !fwd.decrement_hop_limit() {
+            self.stats.record_dropped();
+            self.time_exceeded(pkt, &ports, source_id);
+            return;
+        }
+        let pkt: &Packet = fwd;
 
         // Longest prefix wins, so a narrower network inside a wider one is
         // reachable whatever order the ports were attached in. A device with
@@ -618,5 +625,31 @@ mod tests {
         assert_eq!(count(&b), 0, "hop limit 1 expires here");
         // No ICMP source configured: dropped quietly.
         assert_eq!(count(&a), 0);
+    }
+
+    #[test]
+    fn flooded_packets_keep_their_ttl() {
+        let hub = Arc::new(L3Hub::new());
+        let a = sink("10.0.0.1/24");
+        let b = sink("10.0.1.1/24");
+        let ha = hub.connect(a.clone());
+        let _hb = hub.connect(b.clone());
+        hub.set_icmp_source("10.0.0.254".parse().unwrap());
+
+        // TTL 1 multicast is meant to stay on the link, which the flood is.
+        let mcast = udp4([10, 0, 0, 1], [224, 0, 0, 251], 1);
+        hub.route(Packet::from_slice(&mcast), ha.id);
+        let bcast = udp4([10, 0, 0, 1], [255, 255, 255, 255], 64);
+        hub.route(Packet::from_slice(&bcast), ha.id);
+        assert_eq!(*b.inner.lock().unwrap(), vec![mcast, bcast]);
+        assert_eq!(count(&a), 0, "no Time Exceeded for a flood");
+
+        // Neighbor Discovery needs hop limit 255 on arrival.
+        let (s, d): (std::net::Ipv6Addr, std::net::Ipv6Addr) =
+            ("fe80::1".parse().unwrap(), "ff02::1".parse().unwrap());
+        let udp = crate::build::build_udp(s.into(), d.into(), 1, 2, b"x");
+        let nd = crate::build::build_ipv6(s, d, crate::Protocol::UDP, 255, &udp);
+        hub.route(Packet::from_slice(&nd), ha.id);
+        assert_eq!(b.inner.lock().unwrap()[2], nd);
     }
 }
