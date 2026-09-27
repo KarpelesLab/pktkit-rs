@@ -86,20 +86,16 @@ impl ConnState {
         }
     }
 
-    /// Record a completed handshake and, for an inbound connection, hand it
-    /// to its listener. Called after every segment, without the conn lock.
+    /// For an inbound connection whose handshake has completed, hand it to
+    /// its listener. Called after every segment, without the conn lock.
     ///
     /// Returns `false` if the listener could not take the connection (closed,
     /// or its queue full): nobody could ever accept it, so it has been reset
     /// and the caller must drop it from the table.
     fn after_segment(self: &Arc<Self>) -> bool {
-        if self.connected.load(Ordering::Acquire) {
+        if !self.connected.load(Ordering::Acquire) {
             return true;
         }
-        if !self.conn.lock().unwrap().state().is_synchronized() {
-            return true;
-        }
-        self.connected.store(true, Ordering::Release);
         let Some(listener) = self.pending_accept.lock().unwrap().take() else {
             return true;
         };
@@ -461,9 +457,14 @@ impl TcpStack {
         let mut dead = Vec::new();
         for cs in conns {
             let mut conn = cs.conn.lock().unwrap();
+            let ended = conn.fin_received();
             let segs = conn.tick();
             let closed = conn.is_closed();
             drop(conn);
+            if closed && !ended {
+                // Retransmissions or keepalives went unanswered.
+                cs.fail(io::ErrorKind::TimedOut);
+            }
             if !segs.is_empty() {
                 cs.wrap_and_send(segs);
             }
@@ -627,7 +628,20 @@ impl TcpStack {
         if let Some(state) = existing {
             let segs = {
                 let mut conn = state.conn.lock().unwrap();
-                conn.handle_segment(&seg)
+                // Closing marks the FIN as received too, so this tells a
+                // stream that had ended from one cut short.
+                let ended = conn.fin_received();
+                let segs = conn.handle_segment(&seg);
+                // Noted under the lock, before sending anything: the reply
+                // can loop back through a synchronous link and close the
+                // connection before this function returns.
+                if conn.state().is_synchronized() {
+                    state.connected.store(true, Ordering::Release);
+                }
+                if seg.has_flag(flags::RST) && conn.is_closed() && !ended {
+                    state.fail(io::ErrorKind::ConnectionReset);
+                }
+                segs
             };
             state.wrap_and_send(segs);
             if !state.after_segment() {

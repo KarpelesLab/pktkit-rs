@@ -371,6 +371,31 @@ fn close_wakes_waiters_and_refuses_new_work() {
     assert!(udp.send(b"x").is_err());
 }
 
+/// A reset is not an end of stream: data that arrived is still read, and
+/// then the reset is reported.
+#[test]
+fn reset_reads_as_an_error_not_eof() {
+    let client = client(2);
+    let _server = raw_server(&client, |c| {
+        let mut out = c.write(b"partial").1;
+        out.extend(c.abort());
+        out
+    });
+    let conn = client
+        .dial_tcp_timeout(
+            SocketAddr::new(IpAddr::V4(SERVER_IP), SERVER_PORT),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+    let mut buf = [0u8; 64];
+    let n = conn.read(&mut buf).unwrap();
+    assert_eq!(&buf[..n], b"partial");
+    assert_eq!(
+        conn.read(&mut buf).unwrap_err().kind(),
+        std::io::ErrorKind::ConnectionReset
+    );
+}
+
 /// Route `client`'s packets to a raw `vtcp::Conn` server on
 /// `SERVER_IP:SERVER_PORT`, created on the first SYN. Once the handshake
 /// completes, `on_established` runs on the server and its segments are sent.
