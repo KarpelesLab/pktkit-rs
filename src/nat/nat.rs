@@ -158,6 +158,8 @@ struct NatInner {
     next_port: u16,
     helpers: Vec<Arc<dyn HelperKind>>,
     forwards: HashMap<NatRevKey, PortForward>,
+    /// The last [`PortForward::id`] handed out.
+    forward_id: u64,
     expectations: Vec<Expectation>,
 }
 
@@ -196,6 +198,7 @@ impl Nat {
                 next_port: NAT_PORT_MIN,
                 helpers: Vec::new(),
                 forwards: HashMap::new(),
+                forward_id: 0,
                 expectations: Vec::new(),
             }),
             defragger: Mutex::new(None),
@@ -392,6 +395,13 @@ impl Nat {
     /// inside endpoint a single public port, from which all its traffic
     /// leaves.
     pub fn add_port_forward(&self, pf: PortForward) -> Result<()> {
+        self.add_port_forward_id(pf).map(|_| ())
+    }
+
+    /// [`add_port_forward`](Self::add_port_forward), returning the id the
+    /// forward got (see [`PortForward::id`]). Each call gets a new one, a
+    /// renewal of the same forward included.
+    pub(crate) fn add_port_forward_id(&self, mut pf: PortForward) -> Result<u64> {
         let rk = NatRevKey {
             proto: pf.proto,
             port: pf.outside_port,
@@ -454,8 +464,10 @@ impl Nat {
         if !same {
             Self::remove_mapping_at_locked(inner, rk);
         }
+        inner.forward_id += 1;
+        pf.id = inner.forward_id;
         inner.forwards.insert(rk, pf);
-        Ok(())
+        Ok(inner.forward_id)
     }
 
     /// Remove a previously-added port forward, and the session it carried.

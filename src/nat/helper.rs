@@ -167,6 +167,10 @@ pub struct PortForward {
     pub expires: Option<Instant>,
     /// Inside namespace of `inside_ip` (see [`NatMapping::namespace`]).
     pub namespace: u64,
+    /// Which [`Nat::add_port_forward`](super::Nat::add_port_forward) call
+    /// installed this forward, assigned by the NAT. Whoever added a forward
+    /// can tell it from one added over it later, even an identical one.
+    pub(crate) id: u64,
 }
 
 impl PortForward {
@@ -181,6 +185,7 @@ impl PortForward {
             description: String::new(),
             expires: None,
             namespace: 0,
+            id: 0,
         }
     }
 }

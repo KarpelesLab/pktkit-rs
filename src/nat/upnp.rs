@@ -122,6 +122,17 @@ struct CtrlConn {
     last: Instant,
 }
 
+/// A forward UPnP made: for whom, and which one ([`PortForward::id`]). A
+/// forward added later on the same port is someone else's, even if it
+/// points at the same host: an administrator's static forward must not
+/// become deletable by the host a lapsed UPnP mapping belonged to.
+#[derive(Clone, Copy, Debug)]
+struct Owned {
+    ns: u64,
+    ip: Ipv4Addr,
+    id: u64,
+}
+
 /// UPnP IGD helper. Register via
 /// [`Nat::add_local_helper`](crate::nat::Nat::add_local_helper).
 #[derive(Debug)]
@@ -133,7 +144,7 @@ pub struct UPnPHelper {
     /// namespace and address of the client that asked. A control point may
     /// only delete its own mappings, and statically configured forwards are
     /// not UPnP's to touch at all.
-    owned: Mutex<HashMap<(u8, u16), (u64, Ipv4Addr)>>,
+    owned: Mutex<HashMap<(u8, u16), Owned>>,
 }
 
 impl UPnPHelper {
@@ -518,10 +529,18 @@ EXT:\r\n\r\n",
             .description(desc)
             .namespace(ns);
         pf.expires = expires;
-        if nat.add_port_forward(pf).is_err() {
-            return soap_fault(718, "ConflictInMappingEntry");
-        }
-        owned.insert((proto, ext_port), (ns, inside_ip));
+        let id = match nat.add_port_forward_id(pf) {
+            Ok(id) => id,
+            Err(_) => return soap_fault(718, "ConflictInMappingEntry"),
+        };
+        owned.insert(
+            (proto, ext_port),
+            Owned {
+                ns,
+                ip: inside_ip,
+                id,
+            },
+        );
         drop(owned);
         soap_response(
             "<u:AddPortMappingResponse xmlns:u=\"urn:schemas-upnp-org:service:WANIPConnection:1\"></u:AddPortMappingResponse>",
@@ -533,21 +552,21 @@ EXT:\r\n\r\n",
     /// did. Ownership records whose forward has lapsed or been replaced are
     /// dropped on the way.
     fn owner_locked(
-        owned: &mut HashMap<(u8, u16), (u64, Ipv4Addr)>,
+        owned: &mut HashMap<(u8, u16), Owned>,
         nat: &Nat,
         proto: u8,
         port: u16,
     ) -> Option<Option<(u64, Ipv4Addr)>> {
         let forwards = nat.list_port_forwards();
-        owned.retain(|&(p, o), &mut (ns, ip)| {
-            forwards.iter().any(|pf| {
-                pf.proto == p && pf.outside_port == o && pf.namespace == ns && pf.inside_ip == ip
-            })
+        owned.retain(|&(p, o), rec| {
+            forwards
+                .iter()
+                .any(|pf| pf.proto == p && pf.outside_port == o && pf.id == rec.id)
         });
         forwards
             .iter()
             .find(|pf| pf.proto == proto && pf.outside_port == port)?;
-        Some(owned.get(&(proto, port)).copied())
+        Some(owned.get(&(proto, port)).map(|o| (o.ns, o.ip)))
     }
 
     fn action_delete_port_mapping(
@@ -1483,5 +1502,54 @@ MAN: \"ssdp:discover\"\r\nST: upnp:rootdevice\r\n\r\n";
             // A second mapping is still over the cap.
             assert!(add(8081, 60).body.contains("728"));
         }
+    }
+
+    #[test]
+    fn a_static_forward_added_over_a_upnp_one_is_not_upnps() {
+        let owner = Ipv4Addr::new(10, 0, 0, 42);
+        // Re-added over the live UPnP mapping, or after it was removed.
+        for remove_first in [false, true] {
+            let nat = Nat::new(pfx("10.0.0.1/24"), pfx("203.0.113.1/24"));
+            let h = UPnPHelper::new(UPnPConfig::default());
+            let res = h.handle_soap(
+                &nat,
+                "AddPortMapping",
+                &add_body(9000, 9000, "10.0.0.42", "UDP", 3600),
+                Some(owner),
+            );
+            assert_eq!(res.status, 200);
+            if remove_first {
+                nat.remove_port_forward(PROTO_UDP, 9000);
+            }
+            nat.add_port_forward(PortForward::new(PROTO_UDP, 9000, owner, 9000))
+                .unwrap();
+
+            let res = h.handle_soap(
+                &nat,
+                "DeletePortMapping",
+                &del_body(9000, "UDP"),
+                Some(owner),
+            );
+            assert!(res.body.contains("606"), "body: {}", res.body);
+            assert_eq!(nat.list_port_forwards().len(), 1);
+            assert!(nat.list_port_forwards()[0].expires.is_none());
+        }
+    }
+
+    #[test]
+    fn a_renewed_upnp_mapping_stays_its_clients() {
+        let nat = Nat::new(pfx("10.0.0.1/24"), pfx("203.0.113.1/24"));
+        let h = UPnPHelper::new(UPnPConfig::default());
+        let owner = Some(Ipv4Addr::new(10, 0, 0, 42));
+        for _ in 0..2 {
+            let body = add_body(9000, 9000, "10.0.0.42", "UDP", 3600);
+            assert_eq!(
+                h.handle_soap(&nat, "AddPortMapping", &body, owner).status,
+                200
+            );
+        }
+        let res = h.handle_soap(&nat, "DeletePortMapping", &del_body(9000, "UDP"), owner);
+        assert_eq!(res.status, 200, "body: {}", res.body);
+        assert!(nat.list_port_forwards().is_empty());
     }
 }
