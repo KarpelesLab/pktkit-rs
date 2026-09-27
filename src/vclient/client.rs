@@ -91,7 +91,7 @@ impl Client {
     /// Open a connected UDP socket to `addr` over the virtual network.
     pub fn dial_udp(&self, addr: SocketAddr) -> Result<UdpConn> {
         let local_ip = self.local_ip_for(addr)?;
-        Ok(self.udp.dial(local_ip, addr))
+        self.udp.dial(local_ip, addr)
     }
 
     /// Open a TCP connection to `addr` without waiting for the handshake.
@@ -102,7 +102,7 @@ impl Client {
     /// [`dial_tcp`](Self::dial_tcp) is not available.
     pub fn dial_tcp_nonblocking(&self, addr: SocketAddr) -> Result<TcpConn> {
         let local_ip = self.local_ip_for(addr)?;
-        Ok(self.tcp.dial_nonblocking(local_ip, addr))
+        self.tcp.dial_nonblocking(local_ip, addr)
     }
 
     /// Run the TCP timers: retransmission, persist, keepalive, TIME-WAIT,

@@ -7,6 +7,7 @@
 //! `UdpConn` by 4-tuple. This is the building block the (tunnel-routed) DNS
 //! path uses and mirrors the Go `vclient` `udpConn`.
 
+use super::tcp::pick_port;
 use crate::time::Instant;
 use crate::{Packet, Protocol, checksum};
 use std::collections::{HashMap, VecDeque};
@@ -127,7 +128,14 @@ impl UdpConn {
 
 impl Drop for UdpConn {
     fn drop(&mut self) {
-        self.stack.conns.lock().unwrap().remove(&self.state.key);
+        let mut conns = self.stack.conns.lock().unwrap();
+        // Only our own entry, never a later socket's on the same 4-tuple.
+        if conns
+            .get(&self.state.key)
+            .is_some_and(|s| Arc::ptr_eq(s, &self.state))
+        {
+            conns.remove(&self.state.key);
+        }
     }
 }
 
@@ -143,20 +151,21 @@ impl UdpStack {
         Arc::new(UdpStack {
             conns: Mutex::new(HashMap::new()),
             sink,
-            next_port: Mutex::new(49152),
+            next_port: Mutex::new(super::tcp::EPHEMERAL_FIRST),
         })
     }
 
-    fn alloc_port(&self) -> u16 {
-        let mut p = self.next_port.lock().unwrap();
-        let port = *p;
-        *p = if *p == 65535 { 49152 } else { *p + 1 };
-        port
-    }
-
     /// Open a connected UDP socket to `remote` from `local_ip`.
-    pub fn dial(self: &Arc<Self>, local_ip: IpAddr, remote: SocketAddr) -> UdpConn {
-        let local_port = self.alloc_port();
+    pub fn dial(self: &Arc<Self>, local_ip: IpAddr, remote: SocketAddr) -> io::Result<UdpConn> {
+        // Picked and registered under the one lock (see the TCP dial).
+        let mut conns = self.conns.lock().unwrap();
+        let local_port = pick_port(&mut self.next_port.lock().unwrap(), |p| {
+            conns.contains_key(&UdpKey {
+                local_port: p,
+                remote: remote.ip(),
+                remote_port: remote.port(),
+            })
+        })?;
         let key = UdpKey {
             local_port,
             remote: remote.ip(),
@@ -169,13 +178,13 @@ impl UdpStack {
             signal: Condvar::new(),
             sink: self.sink.clone(),
         });
-        self.conns.lock().unwrap().insert(key, state.clone());
-        UdpConn {
+        conns.insert(key, state.clone());
+        Ok(UdpConn {
             state,
             read_timeout: Mutex::new(None),
             nonblocking: AtomicBool::new(false),
             stack: self.clone(),
-        }
+        })
     }
 
     /// Demultiplex an inbound UDP packet to the matching connection. Returns
@@ -311,10 +320,12 @@ mod tests {
             Arc::new(move |b: &[u8]| cc.lock().unwrap().push(b.to_vec()));
         let stack = UdpStack::new(sink);
 
-        let conn = stack.dial(
-            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
-            SocketAddr::from(([10, 0, 0, 1], 53)),
-        );
+        let conn = stack
+            .dial(
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+                SocketAddr::from(([10, 0, 0, 1], 53)),
+            )
+            .unwrap();
         conn.send(b"query").unwrap();
         assert_eq!(captured.lock().unwrap().len(), 1);
 
@@ -332,5 +343,29 @@ mod tests {
         let mut buf = [0u8; 16];
         let n = conn.recv(&mut buf).unwrap();
         assert_eq!(&buf[..n], b"answer");
+    }
+
+    #[test]
+    fn port_wrap_skips_sockets_still_open() {
+        let sink: Arc<dyn Fn(&[u8]) + Send + Sync> = Arc::new(|_b: &[u8]| {});
+        let stack = UdpStack::new(sink);
+        let local = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+        let remote = SocketAddr::from(([10, 0, 0, 1], 53));
+        let first = stack.dial(local, remote).unwrap();
+        // Wrap the allocator round to the port `first` still holds.
+        *stack.next_port.lock().unwrap() = first.local_addr().port();
+        let second = stack.dial(local, remote).unwrap();
+        assert_ne!(second.local_addr().port(), first.local_addr().port());
+
+        drop(first);
+        // `second` still receives.
+        let reply = wrap_udp_v4(
+            Ipv4Addr::new(10, 0, 0, 1),
+            53,
+            Ipv4Addr::new(10, 0, 0, 2),
+            second.local_addr().port(),
+            b"answer",
+        );
+        assert!(stack.handle_inbound(Packet::from_slice(&reply)));
     }
 }

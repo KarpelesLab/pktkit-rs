@@ -415,7 +415,7 @@ impl TcpStack {
             conns: Mutex::new(HashMap::new()),
             listeners: Mutex::new(HashMap::new()),
             sink,
-            next_port: Mutex::new(49152),
+            next_port: Mutex::new(EPHEMERAL_FIRST),
             stop: Arc::new(Mutex::new(false)),
         });
         // Tick thread: drive timers for all connections every 100ms. Without
@@ -436,13 +436,6 @@ impl TcpStack {
             });
         }
         stack
-    }
-
-    fn alloc_port(&self) -> u16 {
-        let mut p = self.next_port.lock().unwrap();
-        let port = *p;
-        *p = if *p == 65535 { 49152 } else { *p + 1 };
-        port
     }
 
     pub fn tick_all(&self) {
@@ -470,8 +463,20 @@ impl TcpStack {
     }
 
     /// Open a connection and send the SYN, without waiting for the answer.
-    pub fn start_dial(&self, local_ip: IpAddr, remote: SocketAddr) -> Arc<ConnState> {
-        let local_port = self.alloc_port();
+    pub fn start_dial(&self, local_ip: IpAddr, remote: SocketAddr) -> io::Result<Arc<ConnState>> {
+        // The port is picked and the connection registered under the one
+        // lock, so two dials cannot pick the same 4-tuple.
+        let mut conns = self.conns.lock().unwrap();
+        let listeners = self.listeners.lock().unwrap();
+        let local_port = pick_port(&mut self.next_port.lock().unwrap(), |p| {
+            listeners.contains_key(&p)
+                || conns.contains_key(&ConnKey {
+                    local_port: p,
+                    remote: remote.ip(),
+                    remote_port: remote.port(),
+                })
+        })?;
+        drop(listeners);
         let mss = if remote.is_ipv6() { 1440 } else { 1460 };
         let cfg = ConnConfig {
             local_addr: Some(SocketAddr::new(local_ip, local_port)),
@@ -489,7 +494,8 @@ impl TcpStack {
             remote_port: remote.port(),
         };
         let state = ConnState::new(key, local_ip, conn, self.sink.clone(), None);
-        self.conns.lock().unwrap().insert(key, state.clone());
+        conns.insert(key, state.clone());
+        drop(conns);
 
         // Send SYN.
         let segs = {
@@ -497,14 +503,14 @@ impl TcpStack {
             conn.connect()
         };
         state.wrap_and_send(segs);
-        state
+        Ok(state)
     }
 
     /// Open a connection and hand it back at once, still handshaking.
-    pub fn dial_nonblocking(&self, local_ip: IpAddr, remote: SocketAddr) -> TcpConn {
-        let conn = TcpConn::new(self.start_dial(local_ip, remote));
+    pub fn dial_nonblocking(&self, local_ip: IpAddr, remote: SocketAddr) -> io::Result<TcpConn> {
+        let conn = TcpConn::new(self.start_dial(local_ip, remote)?);
         conn.set_nonblocking(true);
-        conn
+        Ok(conn)
     }
 
     /// Dial a remote endpoint, blocking until the handshake completes or fails.
@@ -515,7 +521,7 @@ impl TcpStack {
         remote: SocketAddr,
         connect_timeout: Duration,
     ) -> io::Result<TcpConn> {
-        let state = self.start_dial(local_ip, remote);
+        let state = self.start_dial(local_ip, remote)?;
         let key = state.key;
 
         // Wait for the handshake. The peer may have sent data or even closed
@@ -708,6 +714,31 @@ fn wrap_v6(src: Ipv6Addr, dst: Ipv6Addr, seg: &[u8]) -> Vec<u8> {
     ip
 }
 
+/// First and last port of the ephemeral range (RFC 6335 dynamic ports).
+pub(crate) const EPHEMERAL_FIRST: u16 = 49152;
+const EPHEMERAL_LAST: u16 = 65535;
+
+/// Pick the next ephemeral port, starting at `*next`, that `in_use` does not
+/// claim. Once the counter wraps, ports still held by live sockets come round
+/// again, and reusing one would hijack its connection.
+pub(crate) fn pick_port(next: &mut u16, in_use: impl Fn(u16) -> bool) -> io::Result<u16> {
+    for _ in EPHEMERAL_FIRST..=EPHEMERAL_LAST {
+        let port = *next;
+        *next = if port == EPHEMERAL_LAST {
+            EPHEMERAL_FIRST
+        } else {
+            port + 1
+        };
+        if !in_use(port) {
+            return Ok(port);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AddrNotAvailable,
+        "no free ephemeral port",
+    ))
+}
+
 /// Compute the local IP for a connection from the client's prefix.
 pub(crate) fn local_ip_for(prefix: IpPrefix, remote: IpAddr) -> Option<IpAddr> {
     match (prefix.addr(), remote) {
@@ -755,5 +786,31 @@ mod tests {
             checksum::pseudo_header_checksum(Protocol::TCP, src, dst, recv_seg.len() as u16);
         let body = !checksum::checksum(recv_seg);
         assert_eq!(checksum::combine_checksums(pseudo, body), 0xFFFF);
+    }
+
+    #[test]
+    fn port_wrap_skips_connections_still_open() {
+        let sink: Arc<dyn Fn(&[u8]) + Send + Sync> = Arc::new(|_b: &[u8]| {});
+        let stack = TcpStack::new(sink);
+        let local = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+        let remote = SocketAddr::from(([10, 0, 0, 1], 80));
+        let first = stack.start_dial(local, remote).unwrap();
+        *stack.next_port.lock().unwrap() = first.key.local_port;
+        let second = stack.start_dial(local, remote).unwrap();
+        assert_ne!(second.key.local_port, first.key.local_port);
+        let conns = stack.conns.lock().unwrap();
+        assert!(Arc::ptr_eq(&conns[&first.key], &first));
+        assert!(Arc::ptr_eq(&conns[&second.key], &second));
+    }
+
+    #[test]
+    fn pick_port_wraps_and_reports_exhaustion() {
+        let mut next = EPHEMERAL_LAST;
+        assert_eq!(pick_port(&mut next, |_| false).unwrap(), EPHEMERAL_LAST);
+        assert_eq!(next, EPHEMERAL_FIRST);
+        assert_eq!(
+            pick_port(&mut next, |_| true).unwrap_err().kind(),
+            io::ErrorKind::AddrNotAvailable
+        );
     }
 }
