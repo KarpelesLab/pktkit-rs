@@ -58,6 +58,9 @@ pub(crate) struct ConnState {
     /// For a passively opened connection not yet accepted, what it has
     /// taken of its listener's [`UNACCEPTED_BYTES`] budget.
     charge: Mutex<Option<Charge>>,
+    /// When the tick first found the connection in TIME-WAIT: the oldest
+    /// go first once there are more than [`MAX_TIME_WAIT`].
+    time_wait_since: Mutex<Option<Instant>>,
 }
 
 impl ConnState {
@@ -82,6 +85,7 @@ impl ConnState {
                 bytes: 0,
             })),
             pending_accept: Mutex::new(pending_accept),
+            time_wait_since: Mutex::new(None),
         })
     }
 
@@ -497,6 +501,16 @@ const HALF_OPEN_CAP: usize = 128;
 /// peer whose ACKs are being lost still gets as long as it would there.
 const SYN_RECEIVED_TIMEOUT: Duration = Duration::from_secs(63);
 
+/// Connections a client keeps in TIME-WAIT. Each holds its table entry
+/// for a minute after it closes, and a server that closes first can be
+/// made to close them as fast as peers connect; past this the oldest are
+/// dropped early, as Linux does past `tcp_max_tw_buckets` (and slirp at the
+/// same number). Early is still safe for a later connection on the same
+/// 4-tuple: vtcp's ISNs advance with the clock (RFC 6528), so its sequence
+/// numbers start beyond anything the old one used, which is what RFC 6191
+/// asks of a SYN taking over a 4-tuple from TIME-WAIT.
+const MAX_TIME_WAIT: usize = if cfg!(test) { 4 } else { 8192 };
+
 /// How long after the last cookie went out an ACK is still checked for one:
 /// a cookie is valid for 64 to 128 s (two counter periods of vtcp's
 /// `SynCookies`).
@@ -679,6 +693,7 @@ impl TcpStack {
     /// run out of time (the engine's own timers read the clock themselves).
     fn tick_at(&self, now: Instant) {
         let conns: Vec<Arc<ConnState>> = self.conns.lock().unwrap().values().cloned().collect();
+        let mut time_wait = Vec::new();
         for cs in conns {
             let mut conn = cs.conn.lock().unwrap();
             if conn.state() == State::SynReceived
@@ -695,6 +710,7 @@ impl TcpStack {
             let ended = conn.fin_received();
             let segs = conn.tick();
             let closed = conn.is_closed();
+            let state = conn.state();
             if closed && !ended {
                 // Retransmissions or keepalives went unanswered. Recorded
                 // under the conn lock, as `handle_inbound` records a reset:
@@ -709,6 +725,18 @@ impl TcpStack {
             }
             cs.signal.notify_all();
             if closed {
+                self.forget(&cs);
+            } else if state == State::TimeWait {
+                let since = *cs.time_wait_since.lock().unwrap().get_or_insert(now);
+                time_wait.push((since, cs));
+            }
+        }
+        if time_wait.len() > MAX_TIME_WAIT {
+            time_wait.sort_by_key(|(since, _)| *since);
+            let excess = time_wait.len() - MAX_TIME_WAIT;
+            for (_, cs) in time_wait.drain(..excess) {
+                // Silently, as TIME-WAIT itself ends: the peer has closed.
+                let _ = cs.conn.lock().unwrap().abort();
                 self.forget(&cs);
             }
         }
@@ -1582,6 +1610,51 @@ mod tests {
         // Accepted, it takes data again: what was dropped comes back.
         feed(data(2 + 65_000, 1000));
         assert_eq!(conn.read(&mut buf).unwrap(), 1000);
+    }
+
+    /// Past [`MAX_TIME_WAIT`], the connections longest in TIME-WAIT are
+    /// dropped early rather than let a server that closes first fill the
+    /// table with them.
+    #[test]
+    fn time_wait_is_capped() {
+        let (stack, out) = capturing_stack();
+        let listener = stack.listen(own(US), 80).unwrap();
+        listener.set_nonblocking(true);
+        let feed = |seg: Segment| {
+            stack.handle_inbound(Packet::from_slice(&inbound(seg)), IpAddr::V4(US));
+        };
+        let seg = |port: u16, seq: u32, ack: u32, flags: u8| Segment {
+            src_port: port,
+            dst_port: 80,
+            seq,
+            ack,
+            flags,
+            window: 65535,
+            ..Default::default()
+        };
+        let ports: Vec<u16> = (4000..4000 + MAX_TIME_WAIT as u16 + 2).collect();
+        let mut handles = Vec::new();
+        for &port in &ports {
+            feed(syn_from(port));
+            let iss = last_sent(&out).seq;
+            feed(seg(port, 2, iss.wrapping_add(1), flags::ACK));
+            let conn = listener.accept().unwrap();
+            // We close first, then the peer: TIME-WAIT is ours.
+            conn.close().unwrap();
+            feed(seg(port, 2, iss.wrapping_add(2), flags::ACK | flags::FIN));
+            handles.push(conn);
+            stack.tick_all();
+        }
+        let conns = stack.conns.lock().unwrap();
+        assert_eq!(conns.len(), MAX_TIME_WAIT);
+        for (i, &port) in ports.iter().enumerate() {
+            let key = ConnKey {
+                local_port: 80,
+                remote: IpAddr::V4(PEER),
+                remote_port: port,
+            };
+            assert_eq!(conns.contains_key(&key), i >= 2, "port {port}");
+        }
     }
 
     #[test]
