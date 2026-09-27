@@ -15,6 +15,8 @@
 #![cfg_attr(target_family = "wasm", allow(dead_code))]
 
 #[cfg(not(target_family = "wasm"))]
+use crate::time::Instant;
+#[cfg(not(target_family = "wasm"))]
 use std::io;
 #[cfg(not(target_family = "wasm"))]
 use std::net::{IpAddr, SocketAddr, UdpSocket};
@@ -144,6 +146,25 @@ pub mod wire {
         Ok(out)
     }
 
+    /// Whether `response` answers the question asked in `query` (both whole
+    /// messages): one question, same name, type and class. The name is
+    /// compared without regard to ASCII case (RFC 4343), since servers and
+    /// resolvers may echo it in another case.
+    pub fn question_matches(response: &[u8], query: &[u8]) -> bool {
+        if response.len() < 12 || query.len() < 12 || response[4..6] != [0, 1] {
+            return false;
+        }
+        let Some(name_end) = skip_name(query, 12) else {
+            return false;
+        };
+        let q = &query[12..];
+        let (name_len, len) = (name_end - 12, q.len());
+        let Some(r) = response.get(12..12 + len) else {
+            return false;
+        };
+        r[..name_len].eq_ignore_ascii_case(&q[..name_len]) && r[name_len..] == q[name_len..]
+    }
+
     /// Skip a (possibly compressed) name, returning the offset just past it.
     pub fn skip_name(data: &[u8], mut off: usize) -> Option<usize> {
         loop {
@@ -169,7 +190,7 @@ pub mod wire {
 pub struct ResolverConfig {
     /// DNS servers to query, in priority order. Defaults to UDP/53.
     pub servers: Vec<SocketAddr>,
-    /// Per-server query timeout.
+    /// How long to wait for each server's answer.
     pub timeout: Duration,
 }
 
@@ -189,6 +210,19 @@ impl Default for ResolverConfig {
             timeout: Duration::from_secs(5),
         }
     }
+}
+
+/// A transaction ID an off-path host cannot predict.
+///
+/// `crate::rand` is seeded from the clock, which is guessable. std's
+/// `RandomState` is keyed from the OS's random source, so SipHash under it
+/// gives unpredictable output with no extra dependency.
+#[cfg(not(target_family = "wasm"))]
+fn query_id() -> u16 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u32(crate::rand::u32());
+    h.finish() as u16
 }
 
 /// A DNS resolver over real UDP sockets.
@@ -262,7 +296,7 @@ impl Resolver {
         name: &str,
         rtype: RecordType,
     ) -> io::Result<Vec<IpAddr>> {
-        let id = crate::rand::u32() as u16;
+        let id = query_id();
         let query = wire::build_query(id, name, rtype)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "label too long"))?;
 
@@ -271,17 +305,51 @@ impl Resolver {
         } else {
             "0.0.0.0:0"
         };
+        // A fresh socket on an OS-chosen port, connected so that the kernel
+        // drops datagrams from anyone but the server: an off-path forger then
+        // has to guess the port as well as the ID. Connecting also surfaces
+        // a port-unreachable reply at once, rather than as a timeout.
         let sock = UdpSocket::bind(bind)?;
-        sock.set_read_timeout(Some(self.cfg.timeout))?;
-        sock.send_to(&query, server)?;
+        sock.connect(server)?;
+        sock.send(&query)?;
 
+        // One deadline for the whole exchange: stray datagrams must not
+        // extend it.
+        let deadline = Instant::now() + self.cfg.timeout;
         let mut buf = [0u8; 1500];
         loop {
-            let (n, _from) = sock.recv_from(&mut buf)?;
-            match wire::parse_response(&buf[..n], id) {
-                Ok(addrs) => return Ok(addrs),
-                Err(_) => continue, // wrong id / parse error: keep waiting (until timeout)
+            let left = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|d| !d.is_zero())
+                .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "DNS query timed out"))?;
+            sock.set_read_timeout(Some(left))?;
+            let n = match sock.recv(&mut buf) {
+                Ok(n) => n,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "DNS query timed out",
+                    ));
+                }
+                Err(e) => return Err(e),
+            };
+            let resp = &buf[..n];
+            // Anything that is not a response to exactly this query is
+            // ignored: wrong ID, not a response, another question.
+            if resp.len() < 12
+                || resp[..2] != id.to_be_bytes()
+                || resp[2] & 0x80 == 0
+                || !wire::question_matches(resp, &query)
+            {
+                continue;
             }
+            return wire::parse_response(resp, id)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e));
         }
     }
 }
@@ -343,6 +411,20 @@ mod tests {
     }
 
     #[test]
+    fn question_match_is_case_insensitive_on_the_name_only() {
+        let q = wire::build_query(1, "Example.test", RecordType::A).unwrap();
+        let mut r = q.clone();
+        r[13] = b'E';
+        assert!(wire::question_matches(&r, &q));
+        let mut r = q.clone();
+        r[13] = b'e';
+        assert!(wire::question_matches(&r, &q));
+        let aaaa = wire::build_query(1, "Example.test", RecordType::Aaaa).unwrap();
+        assert!(!wire::question_matches(&aaaa, &q));
+        assert!(!wire::question_matches(&q[..q.len() - 1], &q));
+    }
+
+    #[test]
     fn parse_rejects_wrong_id() {
         let r = vec![0u8; 12];
         assert!(wire::parse_response(&r, 0x1234).is_err());
@@ -393,5 +475,97 @@ mod tests {
         });
         let ips = r.query("anything.test", RecordType::A).unwrap();
         assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))]);
+    }
+
+    /// A response to `query` (as received) carrying one A record.
+    fn answer(query: &[u8], ip: [u8; 4]) -> Vec<u8> {
+        let mut resp = query.to_vec();
+        resp[2..4].copy_from_slice(&0x8180u16.to_be_bytes());
+        resp[6..8].copy_from_slice(&1u16.to_be_bytes()); // ANCOUNT
+        resp.extend_from_slice(&[0xC0, 0x0C]);
+        resp.extend_from_slice(&1u16.to_be_bytes());
+        resp.extend_from_slice(&1u16.to_be_bytes());
+        resp.extend_from_slice(&60u32.to_be_bytes());
+        resp.extend_from_slice(&4u16.to_be_bytes());
+        resp.extend_from_slice(&ip);
+        resp
+    }
+
+    #[test]
+    fn replies_from_elsewhere_are_ignored() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let server_addr = server.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1500];
+            let (n, from) = server.recv_from(&mut buf).unwrap();
+            // An off-path host races the real server with a forged answer.
+            let forger = UdpSocket::bind("127.0.0.1:0").unwrap();
+            forger
+                .send_to(&answer(&buf[..n], [6, 6, 6, 6]), from)
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            server
+                .send_to(&answer(&buf[..n], [1, 2, 3, 4]), from)
+                .unwrap();
+        });
+        let r = Resolver::new(
+            ResolverConfig::default()
+                .servers(vec![server_addr])
+                .timeout(Duration::from_secs(2)),
+        );
+        let ips = r.query("example.test", RecordType::A).unwrap();
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))]);
+    }
+
+    #[test]
+    fn answer_to_another_question_is_ignored() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let server_addr = server.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1500];
+            let (n, from) = server.recv_from(&mut buf).unwrap();
+            // Same ID, but for a different name.
+            let other = wire::build_query(0, "evil.test", RecordType::A).unwrap();
+            let mut forged = answer(&other, [6, 6, 6, 6]);
+            forged[..2].copy_from_slice(&buf[..2]);
+            server.send_to(&forged, from).unwrap();
+            // The name echoed in another letter case is still ours.
+            let mut real = answer(&buf[..n], [1, 2, 3, 4]);
+            real[13] = real[13].to_ascii_uppercase();
+            server.send_to(&real, from).unwrap();
+        });
+        let r = Resolver::new(
+            ResolverConfig::default()
+                .servers(vec![server_addr])
+                .timeout(Duration::from_secs(2)),
+        );
+        let ips = r.query("example.test", RecordType::A).unwrap();
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))]);
+    }
+
+    #[test]
+    fn junk_does_not_extend_the_timeout() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let server_addr = server.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1500];
+            let (_, from) = server.recv_from(&mut buf).unwrap();
+            for _ in 0..100 {
+                let _ = server.send_to(b"junk", from);
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+        let r = Resolver::new(
+            ResolverConfig::default()
+                .servers(vec![server_addr])
+                .timeout(Duration::from_millis(300)),
+        );
+        let start = std::time::Instant::now();
+        assert!(r.query("example.test", RecordType::A).is_err());
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "took {:?}",
+            start.elapsed()
+        );
     }
 }
