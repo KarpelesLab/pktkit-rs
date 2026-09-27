@@ -320,18 +320,32 @@ impl L2Adapter {
             None => return,
         };
         let (op, sender_mac, sender_ip, _, target_ip) = p;
-        self.arp.set(sender_ip, sender_mac, arp::DEFAULT_TTL);
+        let our_addr = match self.l3.addr().addr() {
+            IpAddr::V4(a) if !a.is_unspecified() => Some(a),
+            _ => None,
+        };
+        let for_us = our_addr == Some(target_ip);
 
-        // Drain pending packets for the sender.
-        for buf in self.arp_pending.drain(sender_ip) {
-            self.handle_outgoing(Packet::from_slice(&buf));
+        // RFC 826's merge rule: refresh a station already known from any
+        // ARP it sends, but add a new one only when it is talking to us (or
+        // answering our question), so the cache holds what we use rather
+        // than everyone overheard. A 0.0.0.0 sender is probing for an
+        // address (RFC 5227) and owns nothing yet.
+        if !sender_ip.is_unspecified()
+            && (for_us
+                || self.arp.lookup(sender_ip).is_some()
+                || self.arp_pending.contains(sender_ip))
+        {
+            self.arp.set(sender_ip, sender_mac, arp::DEFAULT_TTL);
+            for buf in self.arp_pending.drain(sender_ip) {
+                self.handle_outgoing(Packet::from_slice(&buf));
+            }
         }
 
-        let our_addr = match self.l3.addr().addr() {
-            IpAddr::V4(a) => a,
-            _ => return,
-        };
-        if op == arp::OP_REQUEST && target_ip == our_addr {
+        if let Some(our_addr) = our_addr
+            && op == arp::OP_REQUEST
+            && for_us
+        {
             let payload =
                 arp::build_packet(arp::OP_REPLY, self.mac, our_addr, sender_mac, sender_ip);
             let frame = build_frame(sender_mac, self.mac, EtherType::ARP, &payload);
@@ -844,5 +858,40 @@ mod tests {
         let na = Packet::from_slice(f.payload());
         assert_eq!(na.ipv6_payload()[0], ndp::NA_TYPE);
         assert_eq!(na.ipv6_dst_addr(), Some(peer_ip()));
+    }
+
+    fn arp_in(adapter: &L2Adapter, op: u16, mac: MacAddr, ip: [u8; 4], target: [u8; 4]) {
+        let payload = arp::build_packet(op, mac, ip.into(), MacAddr::zero(), target.into());
+        let frame = build_frame(MacAddr::broadcast(), mac, EtherType::ARP, &payload);
+        adapter.send(Frame::from_slice(&frame)).unwrap();
+    }
+
+    #[test]
+    fn arp_learns_new_stations_only_from_messages_for_us() {
+        let (_pipe, adapter, _out) = rig("10.0.0.5/24");
+        let a = MacAddr([2, 0, 0, 0, 0, 7]);
+
+        // Somebody else's conversation.
+        arp_in(&adapter, arp::OP_REQUEST, a, [10, 0, 0, 7], [10, 0, 0, 9]);
+        assert_eq!(adapter.arp.lookup(Ipv4Addr::new(10, 0, 0, 7)), None);
+
+        // An address probe (RFC 5227) claims nothing yet.
+        arp_in(&adapter, arp::OP_REQUEST, a, [0, 0, 0, 0], [10, 0, 0, 5]);
+        assert_eq!(adapter.arp.lookup(Ipv4Addr::UNSPECIFIED), None);
+
+        // For us: learnt.
+        arp_in(&adapter, arp::OP_REQUEST, a, [10, 0, 0, 7], [10, 0, 0, 5]);
+        assert_eq!(adapter.arp.lookup(Ipv4Addr::new(10, 0, 0, 7)), Some(a));
+
+        // Known already: any ARP from it updates it (RFC 826 merge).
+        let moved = MacAddr([2, 0, 0, 0, 0, 8]);
+        arp_in(
+            &adapter,
+            arp::OP_REQUEST,
+            moved,
+            [10, 0, 0, 7],
+            [10, 0, 0, 9],
+        );
+        assert_eq!(adapter.arp.lookup(Ipv4Addr::new(10, 0, 0, 7)), Some(moved));
     }
 }
