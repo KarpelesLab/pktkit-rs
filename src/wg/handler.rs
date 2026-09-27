@@ -65,7 +65,9 @@ impl std::fmt::Debug for Config {
 
 /// Outcome of feeding one incoming WireGuard packet into [`Handler::process_packet`].
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct PacketResult {
+    /// What the packet was, and so which of the other fields are set.
     pub ty: PacketType,
     /// Bytes to send back to the peer (handshake response or cookie reply).
     pub response: Vec<u8>,
@@ -91,13 +93,22 @@ pub enum PacketType {
     CookieReceived,
 }
 
-/// Public summary of a peer's session state.
+/// Public summary of a peer's session state, from
+/// [`Handler::get_peer_info`].
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct PeerInfo {
+    /// The peer's static public key.
     pub public_key: NoisePublicKey,
+    /// Whether handshakes with the peer mix in a preshared key.
     pub has_psk: bool,
+    /// When the peer was first authorized.
     pub created_at: Instant,
+    /// When its authorization lapses, if it does
+    /// ([`Handler::set_peer_expiry`]).
     pub expires_at: Option<Instant>,
+    /// When a handshake with it last went through (an initiation from it
+    /// accepted, or its response to ours), if one has.
     pub last_handshake: Option<Instant>,
 }
 

@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// consistent with each other under concurrent traffic — near enough for
 /// monitoring, not a transactional view.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Stats {
     /// Packets or frames handed to the device's handler.
     pub rx_packets: u64,
@@ -127,6 +128,7 @@ impl DeviceStats {
 
 /// A snapshot of a hub's counters. See [`HubStats`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct HubCounters {
     /// Messages that arrived at the hub from a connected port.
     pub received: u64,

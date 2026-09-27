@@ -27,8 +27,11 @@ use crate::wg::handshake::check_mac1;
 
 /// A processed-packet result tagged with the handler that produced it.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct MultiPacketResult {
+    /// What the handler made of the packet.
     pub result: PacketResult,
+    /// The member identity the packet was for.
     pub handler: Arc<Handler>,
 }
 
