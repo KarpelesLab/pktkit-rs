@@ -18,8 +18,8 @@ use std::time::Duration;
 
 use super::congestion::{CongestionController, HighSpeed, NewReno};
 use super::options::{
-    self, TcpOption, get_mss, get_sack_blocks, get_timestamp, get_wscale, has_sack_perm,
-    mss_option, sack_option, sack_perm_option, timestamp_option, wscale_option,
+    self, TcpOption, get_sack_blocks, get_timestamp, get_wscale, has_sack_perm, mss_option,
+    sack_option, sack_perm_option, timestamp_option, wscale_option,
 };
 use super::recvbuf::RecvBuf;
 use super::rto::{MAX_RTO, RtoState};
@@ -31,7 +31,8 @@ use super::seqspace::{
 
 // --- Tunables -------------------------------------------------------------
 
-/// Default MSS used when the peer does not advertise one.
+/// Default MSS: the largest segment we accept, and send when the peer
+/// allows it.
 pub const DEFAULT_MSS: u16 = 1460;
 /// Default advertised window when no SACK / Window Scale negotiated.
 pub const DEFAULT_WINDOW_SIZE: u16 = 65535;
@@ -414,10 +415,6 @@ impl Conn {
         if self.state != State::Closed && self.state != State::Listen {
             return Vec::new();
         }
-        let m = get_mss(&syn.options);
-        if m > 0 && m < self.mss {
-            self.mss = m;
-        }
         self.negotiate_options(&syn.options);
 
         let iss = self.new_iss();
@@ -468,9 +465,7 @@ impl Conn {
         if self.state != State::Closed && self.state != State::Listen {
             return Vec::new();
         }
-        if mss < self.mss {
-            self.mss = mss;
-        }
+        self.set_mss(mss.max(options::MIN_MSS));
         self.send_buf = Some(SendBuf::new(
             self.cfg.send_buf_size,
             our_iss.wrapping_add(1),
@@ -498,7 +493,8 @@ impl Conn {
 
     fn build_syn_options(&self) -> Vec<TcpOption> {
         let mut opts = Vec::with_capacity(4);
-        opts.push(mss_option(self.mss));
+        // What we can receive, not the MSS we send with.
+        opts.push(mss_option(self.cfg.mss.max(1)));
         // Always offer wscale; shift=0 is valid and means "I support it".
         opts.push(wscale_option(self.rcv_wnd_shift));
         if self.sack_enabled {
@@ -510,7 +506,21 @@ impl Conn {
         opts
     }
 
+    /// Send with at most `mss`, and size the congestion controller, which
+    /// counts in segments, to match: a SYN's MSS applies only after `new`
+    /// made one.
+    fn set_mss(&mut self, mss: u16) {
+        self.mss = mss.min(self.cfg.mss.max(1));
+        self.cc = make_cc(self.cfg.congestion, self.mss as u32);
+    }
+
     fn negotiate_options(&mut self, remote_opts: &[TcpOption]) {
+        let ipv6 = self
+            .cfg
+            .remote_addr
+            .or(self.cfg.local_addr)
+            .is_some_and(|a| a.is_ipv6());
+        self.set_mss(options::peer_mss(remote_opts, ipv6));
         if let Some(ws) = get_wscale(remote_opts) {
             self.snd_wnd_shift = ws.min(14);
             self.wscale_ok = true;
@@ -904,10 +914,6 @@ impl Conn {
         }
 
         // SYN is set. Negotiate.
-        let m = get_mss(&seg.options);
-        if m > 0 && m < self.mss {
-            self.mss = m;
-        }
         self.negotiate_options(&seg.options);
 
         if seg.has_flag(flags::ACK) {
@@ -923,7 +929,6 @@ impl Conn {
             // scaled. Scaling it made the first real ACK look like a window
             // change, so it could not count as a duplicate.
             self.set_snd_wnd(seg.window as u32);
-            self.cc = make_cc(self.cfg.congestion, self.mss as u32);
             self.rto.ack_received(seg.ack);
             self.state = State::Established;
 
@@ -1847,6 +1852,7 @@ fn _options_export_is_used(_o: &TcpOption) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vtcp::options::get_mss;
 
     fn cfg(local: u16, remote: u16) -> ConnConfig {
         ConnConfig {
@@ -2982,6 +2988,62 @@ mod tests {
             deliver(&mut client, &acks);
         }
         assert_eq!(client.cc.send_window(), cwnd);
+    }
+
+    fn syn_with(opts: Vec<TcpOption>) -> Segment {
+        Segment {
+            src_port: 40290,
+            dst_port: 80,
+            seq: 1000,
+            flags: flags::SYN,
+            window: 65535,
+            options: opts,
+            ..Default::default()
+        }
+    }
+
+    fn v6_cfg() -> ConnConfig {
+        let mut c = cfg(80, 40290);
+        c.local_addr = Some("[fd00::1]:80".parse().unwrap());
+        c.remote_addr = Some("[fd00::2]:40290".parse().unwrap());
+        c
+    }
+
+    // RFC 9293 §3.7.1: a SYN without an MSS option means 536 over IPv4, and
+    // 1220 over IPv6 (RFC 8200 §5); a tiny MSS is raised to MIN_MSS.
+    #[test]
+    fn peer_mss_defaults_and_floor() {
+        let mut c = Conn::new(cfg(80, 40290));
+        c.accept_syn(&syn_with(vec![]));
+        assert_eq!(c.mss, 536);
+        let mut c = Conn::new(v6_cfg());
+        c.accept_syn(&syn_with(vec![]));
+        assert_eq!(c.mss, 1220);
+        let mut c = Conn::new(cfg(80, 40290));
+        let synack = parse(&c.accept_syn(&syn_with(vec![mss_option(1)]))[0]);
+        assert_eq!(c.mss, options::MIN_MSS);
+        // Our SYN-ACK still offers what we can receive.
+        assert_eq!(get_mss(&synack.options), 1460);
+    }
+
+    // The congestion controller counts in segments of the negotiated MSS,
+    // however the connection was opened.
+    #[test]
+    fn congestion_controller_uses_negotiated_mss() {
+        let initial_cwnd = 10 * 536;
+        let mut c = Conn::new(cfg(80, 40290));
+        c.accept_syn(&syn_with(vec![mss_option(536)]));
+        assert_eq!(c.cc.send_window(), initial_cwnd, "passive open");
+
+        let mut c = Conn::new(cfg(80, 40290));
+        c.accept_cookie(1001, 5000, 536, b"");
+        assert_eq!(c.cc.send_window(), initial_cwnd, "SYN cookie");
+
+        let mut c = Conn::new(cfg(80, 40290));
+        c.connect();
+        c.handle_segment(&syn_with(vec![mss_option(536)]));
+        assert_eq!(c.state(), State::SynReceived);
+        assert_eq!(c.cc.send_window(), initial_cwnd, "simultaneous open");
     }
 
     // RFC 6528: a new connection on the same 4-tuple starts just past the
