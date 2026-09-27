@@ -124,3 +124,26 @@ fn a_server_reset_reaches_the_guest_as_a_reset() {
         got.len()
     );
 }
+
+/// A dial through a stack that has been shut down fails at once, rather
+/// than after the whole connect timeout.
+#[test]
+fn a_dial_through_a_shut_down_stack_fails_fast() {
+    let (stack, client) = topology();
+    let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let dest = server.local_addr().unwrap();
+    stack.shutdown().unwrap();
+    let started = std::time::Instant::now();
+    let r = client.dial_tcp_timeout(dest, Duration::from_secs(10));
+    assert!(r.is_err(), "dialed through a shut-down stack");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "took {:?} to fail",
+        started.elapsed()
+    );
+    let listener = stack.listen("tcp", &format!("{STACK_IP}:8080"));
+    assert!(listener.is_err());
+    let r = client.dial_tcp_timeout(SocketAddr::from((STACK_IP, 8080)), Duration::from_secs(10));
+    assert!(r.is_err());
+    assert!(started.elapsed() < Duration::from_secs(4));
+}

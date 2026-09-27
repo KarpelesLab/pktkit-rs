@@ -142,6 +142,52 @@ fn shut_down() -> io::Error {
     io::Error::new(io::ErrorKind::NotConnected, "stack is shut down")
 }
 
+/// The RST a shut-down stack answers a TCP segment with (RFC 9293
+/// §3.10.7.1, as for a segment to no connection), wrapped in IP; `None` for
+/// anything else, or a segment that is itself a RST.
+///
+/// The guest's error return from `send` does not reach a TCP client whose
+/// packets pass through a link: without the RST, a dial through a stack that
+/// has shut down would wait out the client's whole connect timeout.
+fn reset_for_closed(pkt: &[u8]) -> Option<Vec<u8>> {
+    let port = |b: &[u8], i: usize| u16::from_be_bytes([b[i], b[i + 1]]);
+    match pkt.first()? >> 4 {
+        4 => {
+            let ihl = (pkt[0] & 0x0F) as usize * 4;
+            let total = u16::from_be_bytes([*pkt.get(2)?, *pkt.get(3)?]) as usize;
+            // Past the first fragment there is no TCP header to answer.
+            if ihl < 20 || total > pkt.len() || total < ihl + 20 || pkt[9] != 6 {
+                return None;
+            }
+            if u16::from_be_bytes([pkt[6], pkt[7]]) & 0x1FFF != 0 {
+                return None;
+            }
+            let tcp = &pkt[ihl..total];
+            let rst = build_rst_for_stray(tcp, port(tcp, 2), port(tcp, 0))?;
+            let src = Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]);
+            let dst = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
+            Some(crate::slirp::packet::build_packet4(dst, src, &rst))
+        }
+        6 => {
+            if pkt.len() < 40 {
+                return None;
+            }
+            let end = 40 + u16::from_be_bytes([pkt[4], pkt[5]]) as usize;
+            let pkt = pkt.get(..end)?;
+            let (proto, off) = skip_extension_headers(pkt, pkt[6], 40);
+            if proto != 6 || pkt.len() < off + 20 {
+                return None;
+            }
+            let tcp = &pkt[off..];
+            let rst = build_rst_for_stray(tcp, port(tcp, 2), port(tcp, 0))?;
+            let src = Ipv6Addr::from(<[u8; 16]>::try_from(&pkt[8..24]).ok()?);
+            let dst = Ipv6Addr::from(<[u8; 16]>::try_from(&pkt[24..40]).ok()?);
+            Some(crate::slirp::packet::build_packet6(dst, src, &rst))
+        }
+        _ => None,
+    }
+}
+
 /// Decides whether a guest may reach a host destination; see
 /// [`Stack::set_dest_filter`]. It gets the destination and the transport
 /// ([`Protocol::TCP`] or [`Protocol::UDP`]), and returns `true` to allow.
@@ -616,6 +662,9 @@ impl Stack {
     /// entry point is `<Stack as L3Device>::send`.
     fn handle_packet(inner: &Arc<Inner>, ns: u64, pkt: &[u8]) -> Result<()> {
         if inner.closed.load(Ordering::Acquire) {
+            if let Some(rst) = reset_for_closed(pkt) {
+                let _ = Self::dispatch(inner, ns, &rst);
+            }
             return Err(shut_down());
         }
         if pkt.len() < 20 {
@@ -3192,6 +3241,41 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::NotConnected);
         let err = s.listen6("[fd00::1]:80").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotConnected);
+    }
+
+    /// A shut-down stack refuses a SYN with a RST, over either family, so
+    /// the guest's dial fails at once; a RST draws nothing.
+    #[test]
+    fn syn_after_shutdown_draws_rst() {
+        let s = Stack::new();
+        let captured = capture(&s);
+        s.shutdown().unwrap();
+        let (c4, lo4) = (Ipv4Addr::new(10, 0, 0, 5), Ipv4Addr::LOCALHOST);
+        let syn = build_tcp_v4_packet(c4, 40000, lo4, 80, 500, 0, tcp_flags::SYN, &[]);
+        assert!(L3Device::send(&*s, Packet::from_slice(&syn)).is_err());
+        let (c6, lo6): (Ipv6Addr, Ipv6Addr) = ("fd00::5".parse().unwrap(), Ipv6Addr::LOCALHOST);
+        let syn6 = Segment {
+            src_port: 40000,
+            dst_port: 80,
+            seq: 600,
+            flags: tcp_flags::SYN,
+            ..Default::default()
+        };
+        let syn6 = crate::slirp::packet::build_packet6(c6, lo6, &syn6.marshal());
+        assert!(L3Device::send(&*s, Packet::from_slice(&syn6)).is_err());
+        let rst = build_tcp_v4_packet(c4, 40000, lo4, 80, 500, 0, tcp_flags::RST, &[]);
+        assert!(L3Device::send(&*s, Packet::from_slice(&rst)).is_err());
+
+        let got = captured.lock().unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(&got[0][16..20], &c4.octets());
+        let seg = Segment::parse(&got[0][20..]).unwrap();
+        assert_eq!(seg.flags, tcp_flags::RST | tcp_flags::ACK);
+        assert_eq!((seg.src_port, seg.dst_port, seg.ack), (80, 40000, 501));
+        assert_eq!(&got[1][24..40], &c6.octets());
+        let seg = Segment::parse(&got[1][40..]).unwrap();
+        assert_eq!(seg.flags, tcp_flags::RST | tcp_flags::ACK);
+        assert_eq!((seg.src_port, seg.dst_port, seg.ack), (80, 40000, 601));
     }
 
     #[test]
