@@ -388,26 +388,52 @@ impl Adapter {
     // --- callbacks fired by the server -----------------------------------
 
     fn on_peer_connected(self: &Arc<Self>, key: NoisePublicKey) {
-        let mut peers = self.peers.write().expect("peers lock");
-        if peers.contains_key(&key) {
+        if self.peers.read().expect("peers lock").contains_key(&key) {
             // Already wired (this is a rekey). Nothing else to do.
             return;
         }
 
+        // The connector is caller code and may call back into the adapter
+        // (remove_peer, close) while it wires the device, so it runs
+        // without the peers lock held.
         let dev = PeerL3Device::new(self, key, self.addr);
         let dev_dyn: Arc<dyn L3Device> = dev.clone();
         let cleanup = match self.connector.connect_l3(dev_dyn) {
             Ok(c) => c,
             Err(_) => return,
         };
-        peers.insert(
-            key,
-            WgPeer {
+
+        let mut peers = self.peers.write().expect("peers lock");
+        // Meanwhile the peer may have been removed (remove_peer deauthorizes
+        // before tearing down, so either it sees our entry or we see the
+        // peer gone), the adapter closed (close sets the flag before
+        // draining), or a concurrent connect wired it first.
+        let keep = !self.closed.load(Ordering::SeqCst)
+            && self.is_authorized(&key)
+            && !peers.contains_key(&key);
+        if keep {
+            peers.insert(
                 key,
-                dev,
-                cleanup: Mutex::new(Some(cleanup)),
-            },
-        );
+                WgPeer {
+                    key,
+                    dev,
+                    cleanup: Mutex::new(Some(cleanup)),
+                },
+            );
+            return;
+        }
+        drop(peers);
+        let _ = cleanup();
+    }
+
+    fn is_authorized(&self, key: &NoisePublicKey) -> bool {
+        if let Some(mh) = self.multi_handler.as_ref() {
+            mh.handlers().iter().any(|h| h.is_authorized_peer(key))
+        } else {
+            self.handler
+                .as_ref()
+                .is_some_and(|h| h.is_authorized_peer(key))
+        }
     }
 
     fn on_packet(&self, data: &[u8], key: NoisePublicKey) {
@@ -460,7 +486,103 @@ mod tests {
             .expect("deadlocked in the device handler");
     }
     use crate::wg::handler::PacketType;
+    use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
+
+    type Hook = Box<dyn Fn(&Arc<Adapter>) + Send + Sync>;
+
+    /// A connector that calls back into the adapter while wiring a device,
+    /// and counts the cleanups it hands out that have run.
+    struct Reentrant {
+        adapter: Mutex<Option<Weak<Adapter>>>,
+        hook: Mutex<Option<Hook>>,
+        cleaned: Arc<AtomicUsize>,
+    }
+
+    impl L3Connector for Reentrant {
+        fn connect_l3(&self, _dev: Arc<dyn L3Device>) -> Result<Cleanup> {
+            let a = self
+                .adapter
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(Weak::upgrade);
+            // Taken, so a nested connect does not run it again.
+            let hook = self.hook.lock().unwrap().take();
+            if let (Some(a), Some(hook)) = (a, hook) {
+                hook(&a);
+            }
+            let c = self.cleaned.clone();
+            Ok(Box::new(move || {
+                c.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }))
+        }
+    }
+
+    fn reentrant_adapter(hook: Hook) -> (Arc<Adapter>, Arc<AtomicUsize>) {
+        let cleaned = Arc::new(AtomicUsize::new(0));
+        let conn = Arc::new(Reentrant {
+            adapter: Mutex::new(None),
+            hook: Mutex::new(Some(hook)),
+            cleaned: cleaned.clone(),
+        });
+        let a = Adapter::new(AdapterConfig::new(
+            crate::wg::generate_private_key().unwrap(),
+            conn.clone(),
+            "10.0.0.1/24".parse().unwrap(),
+        ))
+        .unwrap();
+        *conn.adapter.lock().unwrap() = Some(Arc::downgrade(&a));
+        (a, cleaned)
+    }
+
+    fn connect_in_thread(a: &Arc<Adapter>, key: NoisePublicKey) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let a2 = a.clone();
+        thread::spawn(move || {
+            a2.on_peer_connected(key);
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("deadlocked in the connector");
+    }
+
+    /// The connector runs outside the peers lock: one that removes the peer
+    /// (or closes the adapter) while wiring it must not deadlock, and the
+    /// device it was handing over is torn down rather than kept for a peer
+    /// that is gone.
+    #[test]
+    fn a_connector_may_remove_the_peer_it_is_wiring() {
+        let key = NoisePublicKey([9; 32]);
+        let (a, cleaned) = reentrant_adapter(Box::new(move |a| a.remove_peer(&key)));
+        a.add_peer(key);
+        connect_in_thread(&a, key);
+        assert!(!a.peers.read().unwrap().contains_key(&key));
+        assert_eq!(cleaned.load(Ordering::SeqCst), 1);
+
+        let (a, cleaned) = reentrant_adapter(Box::new(|a| {
+            let _ = a.close();
+        }));
+        a.add_peer(key);
+        connect_in_thread(&a, key);
+        assert!(a.peers.read().unwrap().is_empty());
+        assert_eq!(cleaned.load(Ordering::SeqCst), 1);
+    }
+
+    /// Two connects for one peer at once wire one device; the other's is
+    /// cleaned up.
+    #[test]
+    fn a_duplicate_connect_keeps_one_device() {
+        let key = NoisePublicKey([9; 32]);
+        let (a, cleaned) = reentrant_adapter(Box::new(move |a| a.on_peer_connected(key)));
+        a.add_peer(key);
+        connect_in_thread(&a, key);
+        assert!(a.peers.read().unwrap().contains_key(&key));
+        assert_eq!(cleaned.load(Ordering::SeqCst), 1);
+        a.close().unwrap();
+        assert_eq!(cleaned.load(Ordering::SeqCst), 2);
+    }
 
     /// An unknown peer accepted from `on_unknown_peer` gets its handshake
     /// response, over the wire, without having to retry.
