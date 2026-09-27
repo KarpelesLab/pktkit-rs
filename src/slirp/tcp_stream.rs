@@ -429,13 +429,21 @@ fn deadline_after(timeout: Option<Duration>) -> Option<Instant> {
 /// caller can drop it from the table).
 pub(crate) fn tick_conn(state: &Arc<ConnState>) -> bool {
     // A handshake that has not completed in time is abandoned, as a listen
-    // queue would drop a stale embryonic connection.
-    let expired = matches!(
-        &*state.pending_accept.lock().expect("poisoned"),
-        Some((deadline, _)) if Instant::now() >= *deadline
-    );
-    if expired {
-        state.pending_accept.lock().expect("poisoned").take();
+    // queue would drop a stale embryonic connection. Checked and taken under
+    // one lock: the final ACK may complete the handshake at the same time,
+    // and `complete_accept` takes the accept under that lock too, so exactly
+    // one of them gets it. Taken on a stale check, it could be gone to the
+    // listener already, and the reset would hit a connection just accepted.
+    let expired = {
+        let mut pending = state.pending_accept.lock().expect("poisoned");
+        match &*pending {
+            Some((deadline, _)) if Instant::now() >= *deadline => pending.take(),
+            _ => None,
+        }
+    };
+    if let Some((_, accept)) = expired {
+        // Dropped unrun, which gives the listener's backlog slot back.
+        drop(accept);
         state.abort();
     }
     let (segs, closed) = {
@@ -507,6 +515,55 @@ mod tests {
 
     fn peer() -> Conn {
         Conn::new(ConnConfig::default().local_port(5000).remote_port(80))
+    }
+
+    /// A handshake that completes just as its deadline passes is either
+    /// handed to the listener or dropped, never both: the tick must not
+    /// reset a connection the listener has just accepted.
+    #[test]
+    fn a_handshake_timing_out_as_it_completes_is_not_reset_once_accepted() {
+        use std::sync::Barrier;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for round in 0..20_000 {
+            let mut peer = peer();
+            let (state, _out) = accepted(&mut peer);
+            let accepted = Arc::new(AtomicBool::new(false));
+            let a = accepted.clone();
+            // Already due, as when the tick and the final ACK meet.
+            *state.pending_accept.lock().unwrap() = Some((
+                Instant::now(),
+                Box::new(move |_| {
+                    a.store(true, Ordering::SeqCst);
+                    true
+                }),
+            ));
+            let barrier = Arc::new(Barrier::new(2));
+            let ticked = Arc::new(AtomicBool::new(false));
+            let (s2, b2, t2) = (state.clone(), barrier.clone(), ticked.clone());
+            let ticker = std::thread::spawn(move || {
+                b2.wait();
+                // A start swept across the rounds, so that the tick's look at
+                // the pending accept meets the ACK's at every offset: the
+                // window is a few instructions wide.
+                for _ in 0..round % 400 {
+                    std::hint::spin_loop();
+                }
+                tick_conn(&s2);
+                t2.store(true, Ordering::SeqCst);
+            });
+            barrier.wait();
+            // The final ACK, delivered until one of the two has settled it.
+            while !ticked.load(Ordering::SeqCst) && !accepted.load(Ordering::SeqCst) {
+                state.complete_accept();
+            }
+            ticker.join().unwrap();
+            if accepted.load(Ordering::SeqCst) {
+                assert!(
+                    !state.conn.lock().unwrap().is_closed(),
+                    "reset a connection the listener had accepted"
+                );
+            }
+        }
     }
 
     /// A reset cuts the stream short: reading reports it rather than a
