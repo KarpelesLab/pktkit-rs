@@ -434,9 +434,9 @@ impl Drop for TcpOutConn {
     }
 }
 
-/// Build a standalone RST segment used to reject a non-SYN to nothing.
-/// Mirrors the Go `slirp` RFC 9293 §3.10.7.1 behaviour. Returns the marshaled
-/// TCP segment bytes (the caller wraps it in IP).
+/// Build a standalone RST segment used to reject a segment, other than a
+/// bare SYN, to no connection, as RFC 9293 §3.10.7.1 asks of the CLOSED
+/// state. Returns the marshaled TCP segment bytes (the caller wraps it in IP).
 pub(crate) fn build_rst_for_stray(tcp: &[u8], dst_port: u16, src_port: u16) -> Option<Vec<u8>> {
     let seg = Segment::parse(tcp).ok()?;
     let rst = if seg.has_flag(crate::vtcp::segment::flags::ACK) {
@@ -449,11 +449,11 @@ pub(crate) fn build_rst_for_stray(tcp: &[u8], dst_port: u16, src_port: u16) -> O
             ..Default::default()
         }
     } else {
-        // Send RST+ACK with SEQ=0, ACK=SEG.SEQ+SEG.LEN.
-        let mut data_len = seg.data_len();
-        if seg.has_flag(crate::vtcp::segment::flags::FIN) {
-            data_len = data_len.wrapping_add(1);
-        }
+        // Send RST+ACK with SEQ=0, ACK=SEG.SEQ+SEG.LEN, where SEG.LEN counts
+        // the SYN and FIN as well as the data.
+        let data_len = seg.data_len()
+            + seg.has_flag(crate::vtcp::segment::flags::SYN) as u32
+            + seg.has_flag(crate::vtcp::segment::flags::FIN) as u32;
         Segment {
             src_port: dst_port,
             dst_port: src_port,
@@ -522,14 +522,14 @@ mod tests {
             src_port: 5000,
             dst_port: 80,
             seq: 100,
-            flags: flags::SYN,
+            flags: flags::SYN | flags::FIN,
             ..Default::default()
         };
         let rst = build_rst_for_stray(&seg.marshal(), 80, 5000).unwrap();
         let parsed = Segment::parse(&rst).unwrap();
         assert_eq!(parsed.flags, flags::RST | flags::ACK);
-        // SYN does not count toward data_len here (only FIN does), so ack=100.
-        assert_eq!(parsed.ack, 100);
+        // SEG.LEN counts the SYN and the FIN.
+        assert_eq!(parsed.ack, 102);
     }
 
     #[test]

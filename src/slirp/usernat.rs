@@ -581,7 +581,7 @@ impl Stack {
 
         // 2) SYN destined for a registered virtual listener? Passive-open a
         //    server-side vtcp::Conn and drive the handshake.
-        if (flags & tcp_flags::SYN) != 0 {
+        if opens_connection(flags) {
             let listener = Self::find_listener(inner, dst, dst_port);
             if let Some(listener) = listener {
                 return Self::accept_syn_v4(inner, ns, tcp, src, dst, src_port, dst_port, listener);
@@ -602,8 +602,9 @@ impl Stack {
             return c.handle_segment(tcp);
         }
 
-        // Non-SYN to unknown connection — RST per RFC 9293.
-        if (flags & tcp_flags::SYN) == 0 {
+        // Anything but a bare SYN to an unknown connection takes the
+        // CLOSED-state path of RFC 9293 §3.10.7.1.
+        if !opens_connection(flags) {
             if let Some(rst) = build_rst_for_stray(tcp, dst_port, src_port) {
                 let pkt = crate::slirp::packet::build_packet4(dst, src, &rst);
                 return Self::dispatch(inner, ns, &pkt);
@@ -912,7 +913,7 @@ impl Stack {
 
         // 2) SYN destined for a registered virtual listener? Passive-open a
         //    server-side vtcp::Conn and drive the handshake.
-        if (flags & tcp_flags::SYN) != 0 {
+        if opens_connection(flags) {
             let listener = Self::find_listener6(inner, dst, dst_port);
             if let Some(listener) = listener {
                 return Self::accept_syn_v6(inner, ns, tcp, src, dst, src_port, dst_port, listener);
@@ -931,7 +932,7 @@ impl Stack {
             return c.handle_segment(tcp);
         }
 
-        if (flags & tcp_flags::SYN) == 0 {
+        if !opens_connection(flags) {
             if let Some(rst) = build_rst_for_stray(tcp, dst_port, src_port) {
                 let pkt = crate::slirp::packet::build_packet6(dst, src, &rst);
                 return Self::dispatch(inner, ns, &pkt);
@@ -1278,6 +1279,16 @@ fn tick_outbound<K: Copy + Eq + std::hash::Hash>(
     for c in gone {
         c.close();
     }
+}
+
+/// Whether a segment with these flags, to a 4-tuple with no connection,
+/// opens one. Only a bare SYN does: a SYN that also carries ACK answers a
+/// handshake we never started, and one with RST or FIN is not an opener
+/// either (RFC 9293 §3.10.7.1–2). Treating those as SYNs would let a stray
+/// or forged segment dial a real host or mint a SYN-RECEIVED connection.
+fn opens_connection(flags: u8) -> bool {
+    use tcp_flags::{ACK, FIN, RST, SYN};
+    flags & (SYN | ACK | RST | FIN) == SYN
 }
 
 /// Whether `tcp` is a new connection's SYN that may take over `conn`'s
@@ -2693,6 +2704,65 @@ mod tests {
                 .recv_timeout(Duration::from_secs(5))
                 .expect("accept still blocked after the stack shut down");
             assert!(failed);
+        }
+    }
+
+    #[test]
+    fn only_a_bare_syn_opens_a_connection() {
+        let real = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let rport = real.local_addr().unwrap().port();
+        let s = Stack::new();
+        let _l = s.listen("tcp", "10.0.0.1:80").unwrap();
+        let _l6 = s.listen6("[fd00::1]:80").unwrap();
+        let captured = capture(&s);
+        let client = Ipv4Addr::new(10, 0, 0, 5);
+        let (c6, us6): (Ipv6Addr, Ipv6Addr) =
+            ("fd00::5".parse().unwrap(), "fd00::1".parse().unwrap());
+        let seg = |port: u16, flags: u8| Segment {
+            src_port: 40000,
+            dst_port: port,
+            seq: 1000,
+            ack: 5000,
+            flags,
+            ..Default::default()
+        };
+        for flags in [
+            tcp_flags::SYN | tcp_flags::ACK,
+            tcp_flags::SYN | tcp_flags::FIN,
+        ] {
+            for (dst, port) in [
+                (Ipv4Addr::new(10, 0, 0, 1), 80),
+                (Ipv4Addr::LOCALHOST, rport),
+            ] {
+                let p =
+                    crate::slirp::packet::build_packet4(client, dst, &seg(port, flags).marshal());
+                L3Device::send(&*s, Packet::from_slice(&p)).unwrap();
+            }
+            let p = crate::slirp::packet::build_packet6(c6, us6, &seg(80, flags).marshal());
+            L3Device::send(&*s, Packet::from_slice(&p)).unwrap();
+        }
+        assert!(s.inner.tcp.lock().unwrap().is_empty(), "dialed the host");
+        assert!(
+            s.inner.virt_tcp.lock().unwrap().is_empty(),
+            "minted a v4 conn"
+        );
+        assert!(
+            s.inner.virt_tcp6.lock().unwrap().is_empty(),
+            "minted a v6 conn"
+        );
+        // Each is refused as a stray segment: with SEQ=SEG.ACK when it
+        // carries an ACK, else acknowledging its SYN and FIN.
+        let got = captured.lock().unwrap();
+        assert_eq!(got.len(), 6);
+        for (i, p) in got.iter().enumerate() {
+            let off = if p[0] >> 4 == 4 { 20 } else { 40 };
+            let rst = Segment::parse(&p[off..]).unwrap();
+            if i < 3 {
+                assert_eq!((rst.flags, rst.seq), (tcp_flags::RST, 5000));
+            } else {
+                assert_eq!(rst.flags, tcp_flags::RST | tcp_flags::ACK);
+                assert_eq!(rst.ack, 1002);
+            }
         }
     }
 }
