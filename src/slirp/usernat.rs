@@ -26,6 +26,7 @@ use crate::slirp::icmpv6::build_icmpv6_echo_reply;
 use crate::slirp::ipv6::skip_extension_headers;
 use crate::slirp::listener::{Listener, ListenerKey, resolve_v4};
 use crate::slirp::listener6::{Listener6, ListenerKey6, resolve_v6};
+use crate::slirp::packet::fit_link;
 use crate::slirp::tcp_out::{TcpOutConn, build_rst_for_stray};
 use crate::slirp::tcp_stream::{ConnState, Endpoints, tick_conn};
 use crate::slirp::udp::{SendFn as UdpSendFn, UdpConn};
@@ -413,6 +414,15 @@ impl Stack {
         Ok(())
     }
 
+    /// Dispatch a packet the stack built, fragmented to fit the link: an
+    /// echo reply is as large as the (possibly reassembled) request.
+    fn dispatch_fitted(inner: &Arc<Inner>, ns: u64, pkt: Vec<u8>) -> Result<()> {
+        for p in fit_link(pkt) {
+            Self::dispatch(inner, ns, &p)?;
+        }
+        Ok(())
+    }
+
     /// The packet sink handed to a flow, injecting into namespace `ns`.
     ///
     /// It holds the stack weakly: the flows live in the stack's own tables,
@@ -492,7 +502,7 @@ impl Stack {
                 // ICMP.
                 let our = inner.addr.read().expect("poisoned").addr();
                 if let Some(reply) = build_icmpv4_echo_reply(pkt, src, dst, ihl, Some(our)) {
-                    return Self::dispatch(inner, ns, &reply);
+                    return Self::dispatch_fitted(inner, ns, reply);
                 }
                 Ok(())
             }
@@ -825,7 +835,7 @@ impl Stack {
                 if let Some(reply) =
                     build_icmpv6_echo_reply(pkt, src_addr, dst_addr, transport_off, Some(our))
                 {
-                    return Self::dispatch(inner, ns, &reply);
+                    return Self::dispatch_fitted(inner, ns, reply);
                 }
                 Ok(())
             }
@@ -2474,6 +2484,60 @@ mod tests {
         p[24..40].copy_from_slice(&"fd00::1".parse::<Ipv6Addr>().unwrap().octets());
         p.extend_from_slice(&body);
         crate::slirp::packet::fit_link(p)
+    }
+
+    #[test]
+    fn large_echo_replies_fit_the_link() {
+        use crate::fragment::{Fragmentation, fragment_ipv4};
+        use crate::slirp::packet::LINK_MTU;
+
+        // Reassemble what the stack sent, checking every piece fits.
+        let collect = |captured: &Arc<Mutex<Vec<Vec<u8>>>>| {
+            let mut r = Reassembler::default();
+            let mut whole = None;
+            for p in captured.lock().unwrap().drain(..) {
+                assert!(p.len() <= LINK_MTU, "{}-byte packet sent", p.len());
+                if let Some(w) = r.reassemble(Instant::now(), 0, &p) {
+                    whole = Some(w.into_owned());
+                }
+            }
+            whole.expect("a whole reply")
+        };
+
+        let s = Stack::new();
+        s.set_addr(IpPrefix::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 24))
+            .unwrap();
+        let captured = capture(&s);
+        let mut echo = make_v4_icmp_echo(Ipv4Addr::new(10, 0, 0, 5), Ipv4Addr::new(10, 0, 0, 1));
+        echo.resize(4000, 0x33);
+        echo[2..4].copy_from_slice(&4000u16.to_be_bytes());
+        echo[4..6].copy_from_slice(&0x99u16.to_be_bytes());
+        echo[22..24].copy_from_slice(&[0, 0]);
+        let cs = super::super::checksum::internet_checksum(&echo[20..]);
+        echo[22..24].copy_from_slice(&cs.to_be_bytes());
+        echo[10..12].copy_from_slice(&[0, 0]);
+        let cs = ipv4_header_checksum(&echo[..20]);
+        echo[10..12].copy_from_slice(&cs.to_be_bytes());
+        let Fragmentation::Fragments(frags) = fragment_ipv4(Packet::from_slice(&echo), 1500) else {
+            panic!("expected fragments");
+        };
+        for f in &frags {
+            L3Device::send(&*s, Packet::from_slice(f)).unwrap();
+        }
+        let reply = collect(&captured);
+        assert_eq!(reply[20], 0, "echo reply");
+        assert_eq!(reply[28..], echo[28..]);
+
+        let s = Stack::new();
+        s.set_addr(IpPrefix::new(IpAddr::V6("fd00::1".parse().unwrap()), 64))
+            .unwrap();
+        let captured = capture(&s);
+        for f in v6_echo_behind(58, &[], 3000) {
+            L3Device::send(&*s, Packet::from_slice(&f)).unwrap();
+        }
+        let reply = collect(&captured);
+        assert_eq!(reply[40], 129, "echo reply");
+        assert_eq!(reply.len(), 40 + 8 + 3000);
     }
 
     #[test]

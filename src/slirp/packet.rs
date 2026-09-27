@@ -30,10 +30,22 @@ pub(crate) fn fit_link(pkt: Vec<u8>) -> Vec<Vec<u8>> {
         return vec![pkt];
     }
     match pkt[0] >> 4 {
-        4 => match fragment_ipv4(Packet::from_slice(&pkt), LINK_MTU) {
-            Fragmentation::Fragments(f) => f,
-            _ => vec![pkt],
-        },
+        4 => {
+            // The fragments need an ID of their own: an echo reply carries
+            // its request's, which may be anything (0 after reassembly), and
+            // its DF flag, which would forbid the split the stack is making.
+            let mut pkt = pkt;
+            let ihl = (pkt[0] & 0x0F) as usize * 4;
+            pkt[4..6].copy_from_slice(&(next_ip_id() as u16).to_be_bytes());
+            pkt[6..8].copy_from_slice(&[0, 0]);
+            pkt[10..12].copy_from_slice(&[0, 0]);
+            let cs = ipv4_header_checksum(&pkt[..ihl]);
+            pkt[10..12].copy_from_slice(&cs.to_be_bytes());
+            match fragment_ipv4(Packet::from_slice(&pkt), LINK_MTU) {
+                Fragmentation::Fragments(f) => f,
+                _ => vec![pkt],
+            }
+        }
         6 => fragment_ipv6(&pkt, LINK_MTU),
         _ => vec![pkt],
     }
