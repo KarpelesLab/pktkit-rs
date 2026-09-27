@@ -11,6 +11,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 const MAX_LEASES: usize = 1024;
+const OFFER_HOLD: Duration = Duration::from_secs(60);
 const DEFAULT_LEASE: Duration = Duration::from_secs(3600);
 
 /// Configure a [`Server`].
@@ -81,6 +82,7 @@ impl ServerConfig {
 struct Lease {
     ip: Ipv4Addr,
     expiry: Instant,
+    bound: bool,
 }
 
 /// A DHCP server, implementing [`L2Device`] so it plugs into an
@@ -156,37 +158,56 @@ impl Server {
         }
     }
 
-    fn allocate(&self, mac: MacAddr) -> Option<Ipv4Addr> {
-        let now = Instant::now();
+    /// The table as of `now`: leases and offers that have run out are
+    /// dropped, so they neither keep their address from anyone else nor
+    /// count toward [`MAX_LEASES`].
+    fn live_leases(&self, now: Instant) -> std::sync::MutexGuard<'_, HashMap<MacAddr, Lease>> {
         let mut leases = self.leases.lock().unwrap();
+        leases.retain(|_, l| l.expiry > now);
+        self.declined.lock().unwrap().retain(|_, exp| *exp > now);
+        leases
+    }
 
-        if let Some(ip) = self.cfg.static_leases.get(&mac).copied() {
-            leases.insert(
-                mac,
-                Lease {
-                    ip,
-                    expiry: now + self.cfg.lease_time,
-                },
-            );
-            return Some(ip);
-        }
-
-        if let Some(l) = leases.get_mut(&mac) {
-            l.expiry = now + self.cfg.lease_time;
-            return Some(l.ip);
-        }
-
-        // Build the "assigned" set.
-        let mut assigned: std::collections::HashSet<Ipv4Addr> = std::collections::HashSet::new();
-        for l in leases.values() {
-            if l.expiry > now {
-                assigned.insert(l.ip);
+    /// Addresses that `mac` cannot have because another client holds them.
+    fn held_by_others(
+        &self,
+        leases: &HashMap<MacAddr, Lease>,
+        mac: MacAddr,
+    ) -> std::collections::HashSet<Ipv4Addr> {
+        let mut held = std::collections::HashSet::new();
+        for (m, l) in leases {
+            if *m != mac {
+                held.insert(l.ip);
             }
         }
         for (m, ip) in &self.cfg.static_leases {
             if *m != mac {
-                assigned.insert(*ip);
+                held.insert(*ip);
             }
+        }
+        held
+    }
+
+    /// Pick an address to OFFER. The offer only reserves it for
+    /// [`OFFER_HOLD`]: a DISCOVER is unauthenticated and cheap to forge, and
+    /// holding the address for a whole lease would let a flood of made-up
+    /// client addresses drain the pool.
+    fn allocate(&self, mac: MacAddr) -> Option<Ipv4Addr> {
+        let now = Instant::now();
+        if let Some(ip) = self.cfg.static_leases.get(&mac).copied() {
+            return Some(ip);
+        }
+        let mut leases = self.live_leases(now);
+        let held = self.held_by_others(&leases, mac);
+
+        if let Some(l) = leases.get_mut(&mac) {
+            if !held.contains(&l.ip) {
+                if !l.bound {
+                    l.expiry = now + OFFER_HOLD;
+                }
+                return Some(l.ip);
+            }
+            leases.remove(&mac);
         }
 
         if leases.len() >= MAX_LEASES {
@@ -196,31 +217,23 @@ impl Server {
         let declined = self.declined.lock().unwrap();
         let start = u32::from(self.cfg.range_start);
         let end = u32::from(self.cfg.range_end);
-        for raw in start..=end {
-            let ip = Ipv4Addr::from(raw);
-            if assigned.contains(&ip) {
-                continue;
-            }
-            if let Some(exp) = declined.get(&ip)
-                && *exp > now
-            {
-                continue;
-            }
-            leases.insert(
-                mac,
-                Lease {
-                    ip,
-                    expiry: now + self.cfg.lease_time,
-                },
-            );
-            return Some(ip);
-        }
-        None
+        let ip = (start..=end)
+            .map(Ipv4Addr::from)
+            .find(|ip| !held.contains(ip) && !declined.contains_key(ip))?;
+        leases.insert(
+            mac,
+            Lease {
+                ip,
+                expiry: now + OFFER_HOLD,
+                bound: false,
+            },
+        );
+        Some(ip)
     }
 
     fn confirm(&self, mac: MacAddr, requested: Option<Ipv4Addr>) -> Option<Ipv4Addr> {
         let now = Instant::now();
-        let mut leases = self.leases.lock().unwrap();
+        let mut leases = self.live_leases(now);
 
         if let Some(static_ip) = self.cfg.static_leases.get(&mac).copied() {
             if let Some(req) = requested
@@ -233,18 +246,19 @@ impl Server {
                 Lease {
                     ip: static_ip,
                     expiry: now + self.cfg.lease_time,
+                    bound: true,
                 },
             );
             return Some(static_ip);
         }
 
+        let held = self.held_by_others(&leases, mac);
         if let Some(l) = leases.get_mut(&mac) {
-            if let Some(req) = requested
-                && req != l.ip
-            {
+            if requested.is_some_and(|req| req != l.ip) || held.contains(&l.ip) {
                 return None;
             }
             l.expiry = now + self.cfg.lease_time;
+            l.bound = true;
             return Some(l.ip);
         }
 
@@ -257,19 +271,7 @@ impl Server {
         if raw < u32::from(self.cfg.range_start) || raw > u32::from(self.cfg.range_end) {
             return None;
         }
-        for (m, rip) in &self.cfg.static_leases {
-            if *m != mac && *rip == req {
-                return None;
-            }
-        }
-        for l in leases.values() {
-            if l.ip == req && l.expiry > now {
-                return None;
-            }
-        }
-        if let Some(exp) = self.declined.lock().unwrap().get(&req)
-            && *exp > now
-        {
+        if held.contains(&req) || self.declined.lock().unwrap().contains_key(&req) {
             return None;
         }
         if leases.len() >= MAX_LEASES {
@@ -280,6 +282,7 @@ impl Server {
             Lease {
                 ip: req,
                 expiry: now + self.cfg.lease_time,
+                bound: true,
             },
         );
         Some(req)
@@ -464,5 +467,108 @@ mod tests {
 
         // Lease table should be empty.
         assert_eq!(s.leases.lock().unwrap().len(), 0);
+    }
+
+    type Sent = Arc<Mutex<Vec<Vec<u8>>>>;
+
+    fn recording(cfg: ServerConfig) -> (Server, Sent) {
+        let s = Server::new(cfg);
+        let r: Sent = Arc::default();
+        let rc = r.clone();
+        s.set_handler(Arc::new(move |f: &Frame| {
+            rc.lock().unwrap().push(f.as_bytes().to_vec());
+            Ok(())
+        }));
+        (s, r)
+    }
+
+    /// Parse every reply sent so far, and forget them.
+    fn replies(r: &Sent) -> Vec<wire::Parsed> {
+        r.lock()
+            .unwrap()
+            .drain(..)
+            .map(|f| wire::Parsed::from_bytes(&Frame::from_slice(&f).payload()[28..]).unwrap())
+            .collect()
+    }
+
+    fn request(xid: u32, mac: MacAddr, ip: Ipv4Addr, server: Ipv4Addr) -> Vec<u8> {
+        let mut b = wire::Builder::new(1, xid, mac);
+        b.message_type(wire::MSG_REQUEST)
+            .ipv4_option(wire::OPT_REQUESTED_IP, ip)
+            .ipv4_option(wire::OPT_SERVER_ID, server);
+        b.finish()
+    }
+
+    fn one_address_pool() -> ServerConfig {
+        ServerConfig::new(
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(10, 0, 0, 10),
+            Ipv4Addr::new(10, 0, 0, 10),
+        )
+    }
+
+    #[test]
+    fn expired_lease_is_not_handed_back_once_someone_else_holds_it() {
+        let (s, r) = recording(one_address_pool());
+        let a = MacAddr([2, 0, 0, 0, 0, 0xa]);
+        let b = MacAddr([2, 0, 0, 0, 0, 0xb]);
+        let server = Ipv4Addr::new(10, 0, 0, 1);
+        let ip = Ipv4Addr::new(10, 0, 0, 10);
+
+        s.handle_dhcp(&build_discover(1, a));
+        s.handle_dhcp(&request(1, a, ip, server));
+        assert_eq!(replies(&r).last().unwrap().msg_type, wire::MSG_ACK);
+
+        // A's lease runs out and B takes the address.
+        s.leases.lock().unwrap().get_mut(&a).unwrap().expiry = Instant::now();
+        s.handle_dhcp(&build_discover(2, b));
+        s.handle_dhcp(&request(2, b, ip, server));
+        let got = replies(&r);
+        assert_eq!(got.last().unwrap().msg_type, wire::MSG_ACK);
+        assert_eq!(got.last().unwrap().yiaddr, ip);
+
+        // A comes back: the only address is B's now, so there is nothing to
+        // offer.
+        s.handle_dhcp(&build_discover(3, a));
+        assert!(
+            replies(&r).iter().all(|p| p.msg_type != wire::MSG_OFFER),
+            "offered B's address to A"
+        );
+    }
+
+    #[test]
+    fn an_offer_holds_its_address_only_briefly() {
+        let (s, r) = recording(one_address_pool());
+        s.handle_dhcp(&build_discover(1, MacAddr([2, 0, 0, 0, 0, 1])));
+        assert_eq!(replies(&r).len(), 1);
+        let held = s.leases.lock().unwrap()[&MacAddr([2, 0, 0, 0, 0, 1])].expiry;
+        assert!(
+            held <= Instant::now() + OFFER_HOLD,
+            "a DISCOVER must not reserve the address for a whole lease"
+        );
+    }
+
+    #[test]
+    fn expired_leases_do_not_count_toward_the_table_limit() {
+        let (s, r) = recording(one_address_pool());
+        {
+            let mut leases = s.leases.lock().unwrap();
+            let gone = Instant::now();
+            for i in 0..MAX_LEASES {
+                let n = i as u32;
+                leases.insert(
+                    MacAddr([2, 1, 0, (n >> 16) as u8, (n >> 8) as u8, n as u8]),
+                    Lease {
+                        ip: Ipv4Addr::new(10, 0, 0, 10),
+                        expiry: gone,
+                        bound: true,
+                    },
+                );
+            }
+        }
+        s.handle_dhcp(&build_discover(1, MacAddr([2, 0, 0, 0, 0, 1])));
+        let got = replies(&r);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].msg_type, wire::MSG_OFFER);
     }
 }
