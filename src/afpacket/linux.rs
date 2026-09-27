@@ -144,6 +144,7 @@ fn spawn_reader(sock: &Arc<Socket>, inbound_only: bool) {
     let closed = sock.closed.clone();
     let stats = sock.stats.clone();
     // Room for a jumbo frame plus its header, behind headroom for a VLAN tag.
+    // Grown if the kernel hands us anything larger.
     let mut buf = vec![0u8; super::VLAN_TAG_LEN + 65_536];
 
     std::thread::spawn(move || {
@@ -165,7 +166,9 @@ fn spawn_reader(sock: &Arc<Socket>, inbound_only: bool) {
             msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
             msg.msg_controllen = std::mem::size_of_val(&control) as _;
             // SAFETY: every pointer in `msg` is to a live local sized as stated.
-            let n = unsafe { libc::recvmsg(fd.as_raw_fd(), &mut msg, 0) };
+            // MSG_TRUNC: return the frame's real length even when it did not
+            // fit, so a truncated frame can be told apart and dropped.
+            let n = unsafe { libc::recvmsg(fd.as_raw_fd(), &mut msg, libc::MSG_TRUNC) };
             if n < 0 {
                 let e = io::Error::last_os_error();
                 match e.kind() {
@@ -179,6 +182,14 @@ fn spawn_reader(sock: &Arc<Socket>, inbound_only: bool) {
                 }
             }
             let n = n as usize;
+            if n > buf.len() - super::VLAN_TAG_LEN {
+                // A GRO or BIG TCP super-frame larger than the buffer. Half of
+                // one is worse than none, so drop it, and make room for the
+                // next: the kernel bounds how large they get.
+                stats.record_rx_drop();
+                buf.resize(super::VLAN_TAG_LEN + n, 0);
+                continue;
+            }
             if n < 14 {
                 stats.record_rx_drop();
                 continue;
