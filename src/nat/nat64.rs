@@ -79,6 +79,10 @@ pub struct Nat64 {
     out_frags: Mutex<FragTable<(Ipv6Addr, Ipv6Addr, u32), ()>>,
     /// When packet handling next sweeps.
     next_sweep: Mutex<Instant>,
+    /// Source of the ICMPv6 errors the NAT64 sends, or translates from an
+    /// IPv4 address the prefix cannot stand for (see
+    /// [`set_icmp_source`](Nat64::set_icmp_source)).
+    icmp_source: Mutex<Option<Ipv6Addr>>,
 }
 
 struct Nat64Inner {
@@ -119,7 +123,38 @@ impl Nat64 {
             frags: Mutex::new(FragTable::default()),
             out_frags: Mutex::new(FragTable::default()),
             next_sweep: Mutex::new(Instant::now() + SWEEP_INTERVAL),
+            icmp_source: Mutex::new(None),
         })
+    }
+
+    /// Set the IPv6 address ICMPv6 errors come from when the IPv4 address
+    /// they stand for cannot be written under the NAT64 prefix. `None` (the
+    /// default) uses the address of the inside interface.
+    ///
+    /// The Well-Known Prefix may not represent non-global IPv4 addresses
+    /// (RFC 6052 §3.1), yet routers on the IPv4 path often have one, and a
+    /// NAT64 may itself sit behind a private address. Their errors (Packet
+    /// Too Big above all, without which path MTU discovery fails) still
+    /// have to reach the IPv6 host, so, as RFC 6791 does for the other
+    /// direction, they are sent from an address of the translator's own.
+    pub fn set_icmp_source(&self, addr: Option<Ipv6Addr>) {
+        *self.icmp_source.lock().unwrap() = addr;
+    }
+
+    /// The source for an ICMPv6 error on behalf of IPv4 address `v4`: `v4`
+    /// under the prefix if it can be written there, else the NAT64's own
+    /// (see [`set_icmp_source`](Self::set_icmp_source)).
+    fn icmp_source_for(&self, v4: Ipv4Addr) -> Option<Ipv6Addr> {
+        if let Some(a) = self.pref64().and_then(|p| p.embed(v4)) {
+            return Some(a);
+        }
+        if let Some(a) = *self.icmp_source.lock().unwrap() {
+            return Some(a);
+        }
+        match self.inside.addr().addr() {
+            IpAddr::V6(a) => Some(a),
+            IpAddr::V4(_) => None,
+        }
     }
 
     pub fn inside(&self) -> Arc<dyn L3Device> {
@@ -220,10 +255,11 @@ impl Nat64 {
         let pkt = &pkt[..IPV6_HEADER_LEN + payload_len];
         // The translator is a router (RFC 7915 §5.1): it spends one hop, and
         // owes the sender a Hop Limit Exceeded when none is left. It answers
-        // from its own IPv4 address as seen through the prefix.
+        // from its own IPv4 address as seen through the prefix, if that can
+        // be written there.
         let hop = pkt[7];
         if hop <= 1 {
-            if let Some(me) = self.outside_ipv4().and_then(|ip| self.pref64()?.embed(ip))
+            if let Some(me) = self.outside_ipv4().and_then(|ip| self.icmp_source_for(ip))
                 && let Some(err) =
                     crate::icmp::time_exceeded(Packet::from_slice(pkt), IpAddr::V6(me))
             {
@@ -289,7 +325,7 @@ impl Nat64 {
         // full-size IPv4 one.
         if IPV4_MIN_HEADER + data.len() > usize::from(u16::MAX) {
             let mtu = (usize::from(u16::MAX) - IPV4_MIN_HEADER + off) as u32;
-            if let Some(me) = self.pref64().and_then(|p| p.embed(outside_ip))
+            if let Some(me) = self.icmp_source_for(outside_ip)
                 && let Some(err) =
                     crate::icmp::packet_too_big(Packet::from_slice(pkt), IpAddr::V6(me), mtu)
             {
@@ -963,10 +999,12 @@ impl Nat64 {
             k
         };
 
-        let pref = self.pref64();
+        // The router reporting the error may be one the prefix cannot
+        // stand for; the remote the quoted packet went to was translated
+        // on the way out, so it can.
         let (Some(src_v6), Some(emb_dst_v6)) = (
-            pref.and_then(|p| p.embed(src_v4)),
-            pref.and_then(|p| p.embed(emb_dst_v4)),
+            self.icmp_source_for(src_v4),
+            self.pref64().and_then(|p| p.embed(emb_dst_v4)),
         ) else {
             return;
         };
@@ -1798,6 +1836,66 @@ mod tests {
         assert_eq!(&quote[24..40], &wkp(SERVER).octets());
         assert_eq!(u16::from_be_bytes([quote[40], quote[41]]), 5555);
         assert!(v6_sum_ok(quote), "quoted UDP checksum");
+    }
+
+    #[test]
+    fn errors_from_non_global_routers_reach_the_client() {
+        let (nat, inside, outside) = wired();
+        let sent = send_udp(&nat, &outside);
+        // A router on private addressing, which the Well-Known Prefix
+        // cannot stand for.
+        let router = Ipv4Addr::new(10, 1, 1, 1);
+        let err = icmp4_error(router, 3, 4, [0, 0, 0x05, 0x78], &sent);
+        nat.outside().send(Packet::from_slice(&err)).unwrap();
+        let got = inside
+            .lock()
+            .unwrap()
+            .pop()
+            .expect("PTB must reach the client");
+        assert_eq!((got[40], got[41]), (2, 0));
+        assert_eq!(
+            &got[8..24],
+            &"64:ff9b::".parse::<Ipv6Addr>().unwrap().octets()
+        );
+        assert!(v6_sum_ok(&got), "ICMPv6 checksum");
+
+        let own: Ipv6Addr = "2001:db8:ffff::1".parse().unwrap();
+        nat.set_icmp_source(Some(own));
+        nat.outside().send(Packet::from_slice(&err)).unwrap();
+        let got = inside
+            .lock()
+            .unwrap()
+            .pop()
+            .expect("PTB must reach the client");
+        assert_eq!(&got[8..24], &own.octets());
+        assert!(v6_sum_ok(&got), "ICMPv6 checksum");
+    }
+
+    #[test]
+    fn a_nat64_on_a_private_address_still_sends_errors() {
+        let nat = Nat64::new(pfx("64:ff9b::/96"), pfx("192.168.1.2/24"));
+        let inside: Captured = Arc::default();
+        let c = inside.clone();
+        nat.inside().set_handler(Arc::new(move |p| {
+            c.lock().unwrap().push(p.as_bytes().to_vec());
+            Ok(())
+        }));
+        let mut pkt = build_v6_udp(CLIENT.parse().unwrap(), 5555, wkp(SERVER), 53, b"q");
+        pkt[7] = 1;
+        nat.inside().send(Packet::from_slice(&pkt)).unwrap();
+        let big = build_v6_udp(CLIENT.parse().unwrap(), 1, wkp(SERVER), 53, &[0; 65527]);
+        nat.inside().send(Packet::from_slice(&big)).unwrap();
+        let got = inside.lock().unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!((got[0][40], got[0][41]), (3, 0), "Hop Limit Exceeded");
+        assert_eq!(got[1][40], 2, "Packet Too Big");
+        for p in got.iter() {
+            assert_eq!(
+                &p[8..24],
+                &"64:ff9b::".parse::<Ipv6Addr>().unwrap().octets()
+            );
+            assert!(v6_sum_ok(p));
+        }
     }
 
     #[test]
