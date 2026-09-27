@@ -738,9 +738,8 @@ impl Server {
         if let Err(found) = admit(&self.peers.read().unwrap()) {
             return found;
         }
-        // Built with no lock held: it runs the TLS library on the caller's
-        // config, and a panic under the table's write lock would poison it
-        // for every client. A panic costs this client only.
+        // Built with no lock held: a panic under the table's write lock
+        // would poison it for every client. A panic costs this client only.
         let peer =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.build_peer(stateless)))
                 .ok()??;
@@ -769,14 +768,12 @@ impl Server {
                 id
             }
         };
-        // Server::new checked the TLS config, so this does not fail in
-        // practice; if it does, the client is just not served.
-        let mut peer = Peer::new(
+        // Server::new checked the TLS config.
+        let mut peer = Peer::with_checked_config(
             self.cfg.tls_config.clone(),
             local_id,
             self.cfg.on_auth.clone(),
         )
-        .ok()?
         .with_timers(self.cfg.timers)
         // on_auth runs on an auth worker: see start_auth.
         .deferred_auth();

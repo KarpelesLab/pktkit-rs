@@ -281,6 +281,24 @@ const MAX_HELD_TLS: usize = 64 * 1024;
 /// the reliable layer until the client has it.
 const PUSH_REPLY_HOLDOFF: Duration = Duration::from_secs(30);
 
+/// Most TLS bytes a key holds from the client before it has ACKed our
+/// reset. Until then nothing shows the reset came from whoever receives at
+/// its address, so the bytes wait, unread by any TLS engine: running the
+/// handshake -- a signature for the server's flight -- for anyone able to
+/// forge two datagrams is work an attacker gets for free. A genuine client
+/// sends its ClientHello, a few packets at most, and then waits for our
+/// answer; one TLS record's worth is generous.
+const MAX_UNPROVEN_TLS: usize = 16 * 1024;
+
+/// A peer starts at most this many sessions beyond its first, per period:
+/// each costs a TLS handshake, which a sender that does receive at the
+/// address could otherwise have the server run back to back by restarting
+/// its session over and over. A client restarting for real does so a
+/// handful of times at most. Charged when the new session's sender ACKs our
+/// reset, so resets from anyone else -- spoofed, and never ACKed -- cannot
+/// use up the budget of the genuine client.
+const NEW_SESSIONS: (u32, Duration) = (4, Duration::from_secs(60));
+
 /// One OpenVPN peer (one client address).
 pub struct Peer {
     config: Arc<purecrypto::tls::Config>,
@@ -307,6 +325,9 @@ pub struct Peer {
     last_recv: Instant,
     /// Last time we produced a datagram for the client.
     last_sent: Instant,
+    /// Sessions beyond the first started this period, and when it began
+    /// (see [`NEW_SESSIONS`]).
+    new_sessions: (Instant, u32),
 }
 
 impl std::fmt::Debug for Peer {
@@ -342,7 +363,19 @@ impl Peer {
         // that cannot make one now rather than on the first client packet.
         TlsConnection::server(&config)
             .map_err(|e| invalid(format!("TLS server connection: {e:?}")))?;
-        Ok(Peer {
+        Ok(Peer::with_checked_config(config, local_id, on_auth))
+    }
+
+    /// [`new`](Self::new), for a `config` already known to make a TLS server
+    /// connection: making one just to find out costs more than all else a
+    /// bare hard reset costs, and the server checked when it started.
+    pub(super) fn with_checked_config(
+        config: Arc<purecrypto::tls::Config>,
+        local_id: [u8; 8],
+        on_auth: OnAuth,
+    ) -> Peer {
+        let now = Instant::now();
+        Peer {
             config,
             on_auth,
             first_local_id: Some(local_id),
@@ -352,9 +385,10 @@ impl Peer {
             timers: PeerTimers::default(),
             defer_auth: false,
             next_auth_token: 0,
-            last_recv: Instant::now(),
-            last_sent: Instant::now(),
-        })
+            last_recv: now,
+            last_sent: now,
+            new_sessions: (now, 0),
+        }
     }
 
     /// Whether `data` is a datagram that opens a session: a well-formed
@@ -383,7 +417,7 @@ impl Peer {
         let local_id = self
             .first_local_id
             .ok_or_else(|| invalid("the peer already opened a session"))?;
-        let session = Session::after_reset(&self.config, local_id, remote_id, self.timers)?;
+        let session = Session::after_reset(local_id, remote_id, self.timers);
         self.first_local_id = None;
         self.initial = Some(session);
         Ok(())
@@ -428,6 +462,17 @@ impl Peer {
             Some(s) => &s.peer_info,
             None => EMPTY.get_or_init(HashMap::new),
         }
+    }
+
+    /// TLS output held back, across all sessions' current keys: what the
+    /// TLS engines produced and the reliable layer has not sent yet.
+    #[cfg(test)]
+    pub(super) fn held_tls(&self) -> usize {
+        [&self.active, &self.initial, &self.untrusted]
+            .into_iter()
+            .flatten()
+            .map(|s| s.primary.reliable.held_len())
+            .sum()
     }
 
     /// Control packets sent and not yet acknowledged, across all sessions.
@@ -512,10 +557,8 @@ impl Peer {
         if let Some(s) = self.active.as_mut()
             && s.should_renegotiate(now, &timers)
         {
-            match s.soft_reset(&self.config, &timers, now) {
-                Ok(reset) => out.send.push(reset.to_bytes(&[])),
-                Err(e) => self.fail_session(Slot::Active, &mut out, Some(e)),
-            }
+            let reset = s.soft_reset(&timers, now);
+            out.send.push(reset.to_bytes(&[]));
         }
 
         if self.active.is_some() {
@@ -568,7 +611,7 @@ impl Peer {
             Opcode::CONTROL_HARD_RESET_CLIENT_V2
             | Opcode::CONTROL_SOFT_RESET_V1
             | Opcode::CONTROL_V1
-            | Opcode::ACK_V1 => self.handle_control(key_id, data)?,
+            | Opcode::ACK_V1 => self.handle_control(key_id, data, now)?,
             _ => return Err(invalid(format!("unexpected opcode {opcode}"))),
         };
         // Only a packet that got past validation, and that belongs to the
@@ -587,7 +630,12 @@ impl Peer {
     /// Handle a control packet. Returns the output, and whether the packet
     /// belonged to the active session -- the only one whose packets say the
     /// client is still there.
-    fn handle_control(&mut self, key_id: u8, data: &[u8]) -> io::Result<(PeerOutput, bool)> {
+    fn handle_control(
+        &mut self,
+        key_id: u8,
+        data: &[u8],
+        now: Instant,
+    ) -> io::Result<(PeerOutput, bool)> {
         let pkt = ControlPacket::parse(data)?;
         let sid = pkt.session_id;
         if sid == [0; 8] {
@@ -619,8 +667,7 @@ impl Peer {
                     id
                 }
             };
-            let (mut session, server_reset) =
-                Session::new(&self.config, local_id, sid, self.timers)?;
+            let (mut session, server_reset) = Session::new(local_id, sid, self.timers);
             // The packet has to pass the new session's checks before the
             // session takes a slot (tls_pre_decrypt validates first).
             opened = Some(session.primary.recv(key_id, pkt.clone())?);
@@ -665,8 +712,7 @@ impl Peer {
             if pkt.pid != Some(0) {
                 return Err(invalid("soft reset must be packet 0 of its key"));
             }
-            let now = Instant::now();
-            let (mut ks, server_reset) = session.next_key(&config, &timers, now)?;
+            let (mut ks, server_reset) = session.next_key(&timers, now);
             opened = Some(ks.recv(key_id, pkt.clone())?);
             session.install_key(ks, &timers, now);
             reset = Some(server_reset);
@@ -679,6 +725,10 @@ impl Peer {
         // to this address: the client restarted, and has given up on any
         // session still negotiating, which this one now replaces.
         if slot == Slot::Untrusted && session.primary.reliable.reset_acked() {
+            if !self.allow_new_session(now) {
+                self.untrusted = None;
+                return Err(invalid("too many new sessions from this address"));
+            }
             self.initial = self.untrusted.take();
             slot = Slot::Initial;
         }
@@ -688,12 +738,25 @@ impl Peer {
             out.send
                 .push(reset.to_bytes(&session.primary.reliable.take_pending_acks()));
         }
-        if let Err(e) = session.process_tls(&tls_bytes, &auth, &mut out) {
+        if let Err(e) = session.process_tls(&config, &tls_bytes, &auth, &mut out) {
             self.fail_key(slot, &mut out, e);
             return Ok((out, slot == Slot::Active));
         }
         self.settle(slot, &mut out);
         Ok((out, slot == Slot::Active))
+    }
+
+    /// Count a session beyond the first starting its handshake; whether the
+    /// budget allows it (see [`NEW_SESSIONS`]).
+    fn allow_new_session(&mut self, now: Instant) -> bool {
+        let (max, period) = NEW_SESSIONS;
+        let (start, count) = &mut self.new_sessions;
+        if now.saturating_duration_since(*start) >= period {
+            *start = now;
+            *count = 0;
+        }
+        *count += 1;
+        *count <= max
     }
 
     /// Record in `out` whether the peer is authenticated once it is acted
@@ -947,8 +1010,13 @@ struct Session {
 /// reliable transport, the key-method-2 exchange, and the data-channel keys.
 struct KeyState {
     key_id: u8,
-    tls: TlsConnection,
+    /// Made when the client's first TLS bytes are fed to it, once it has
+    /// ACKed our reset: a reset alone does not cost a TLS connection.
+    tls: Option<TlsConnection>,
     reliable: Reliable,
+    /// TLS bytes from the client held until it ACKs our reset (see
+    /// [`MAX_UNPROVEN_TLS`]).
+    unproven_tls: Vec<u8>,
     /// Key-method-2 exchange scratch (read incrementally from the TLS stream).
     ctrl_buf: Vec<u8>,
     kx_done: bool,
@@ -1030,15 +1098,12 @@ fn aead_blocks(opts: &Options, len: usize) -> u64 {
 
 impl KeyState {
     fn new(
-        config: &purecrypto::tls::Config,
         key_id: u8,
         local_id: [u8; 8],
         remote_id: [u8; 8],
         timers: &PeerTimers,
         now: Instant,
-    ) -> io::Result<KeyState> {
-        let tls = TlsConnection::server(config)
-            .map_err(|e| invalid(format!("TLS server connection: {e:?}")))?;
+    ) -> KeyState {
         let mut reliable = Reliable::new(local_id);
         reliable.peer_id = remote_id;
         reliable.key_id = key_id;
@@ -1048,10 +1113,11 @@ impl KeyState {
         if !timers.renegotiate_interval.is_zero() {
             defer = defer.min(timers.renegotiate_interval / 2);
         }
-        Ok(KeyState {
+        KeyState {
             key_id,
-            tls,
+            tls: None,
             reliable,
+            unproven_tls: Vec::new(),
             ctrl_buf: Vec::new(),
             kx_done: false,
             must_negotiate: now.checked_add(timers.handshake_window),
@@ -1061,7 +1127,15 @@ impl KeyState {
             server_random: [0u8; 64],
             auth_pending: None,
             data: None,
-        })
+        }
+    }
+
+    /// The key's TLS connection. It exists once the client's TLS has been
+    /// fed to it, and nothing is written to it before that.
+    fn tls(&mut self) -> io::Result<&mut TlsConnection> {
+        self.tls
+            .as_mut()
+            .ok_or_else(|| invalid("no TLS connection yet"))
     }
 
     /// Run a control packet through this key's reliable layer, returning the
@@ -1077,10 +1151,10 @@ impl KeyState {
     /// ACKs for what we owe but no control packet carried.
     fn pump(&mut self, out: &mut PeerOutput) -> io::Result<()> {
         // `pop` returns the whole pending wire stream in one call.
-        let tls_out = self
-            .tls
-            .pop()
-            .map_err(|e| invalid(format!("tls pop: {e:?}")))?;
+        let tls_out = match &mut self.tls {
+            Some(tls) => tls.pop().map_err(|e| invalid(format!("tls pop: {e:?}")))?,
+            None => Vec::new(),
+        };
 
         self.reliable.queue_tls(&tls_out);
         // OpenVPN gives up on a key whose output it has no buffer for; a
@@ -1118,28 +1192,18 @@ impl KeyState {
 impl Session {
     /// Open a session for a client hard reset from `remote_id`, returning it
     /// with the server hard reset to send back.
-    fn new(
-        config: &purecrypto::tls::Config,
-        local_id: [u8; 8],
-        remote_id: [u8; 8],
-        timers: PeerTimers,
-    ) -> io::Result<(Session, ControlPacket)> {
-        let mut ks = KeyState::new(config, 0, local_id, remote_id, &timers, Instant::now())?;
+    fn new(local_id: [u8; 8], remote_id: [u8; 8], timers: PeerTimers) -> (Session, ControlPacket) {
+        let mut ks = KeyState::new(0, local_id, remote_id, &timers, Instant::now());
         let reset = ks.reliable.build_hard_reset();
-        Ok((Session::with_key(ks, timers), reset))
+        (Session::with_key(ks, timers), reset)
     }
 
     /// Open a session whose hard resets were exchanged statelessly: the
     /// client's reset was answered, ours acknowledged.
-    fn after_reset(
-        config: &purecrypto::tls::Config,
-        local_id: [u8; 8],
-        remote_id: [u8; 8],
-        timers: PeerTimers,
-    ) -> io::Result<Session> {
-        let mut ks = KeyState::new(config, 0, local_id, remote_id, &timers, Instant::now())?;
+    fn after_reset(local_id: [u8; 8], remote_id: [u8; 8], timers: PeerTimers) -> Session {
+        let mut ks = KeyState::new(0, local_id, remote_id, &timers, Instant::now());
         ks.reliable.skip_reset();
-        Ok(Session::with_key(ks, timers))
+        Session::with_key(ks, timers)
     }
 
     fn with_key(ks: KeyState, timers: PeerTimers) -> Session {
@@ -1207,29 +1271,19 @@ impl Session {
     /// current key becomes the lame duck, kept for the transition window,
     /// and a fresh TLS handshake runs on the next key id. Returns our
     /// P_CONTROL_SOFT_RESET_V1, which opens the new key's reliable stream.
-    fn soft_reset(
-        &mut self,
-        config: &purecrypto::tls::Config,
-        timers: &PeerTimers,
-        now: Instant,
-    ) -> io::Result<ControlPacket> {
-        let (ks, reset) = self.next_key(config, timers, now)?;
+    fn soft_reset(&mut self, timers: &PeerTimers, now: Instant) -> ControlPacket {
+        let (ks, reset) = self.next_key(timers, now);
         self.install_key(ks, timers, now);
-        Ok(reset)
+        reset
     }
 
     /// The next key, not yet installed, with the soft reset that opens its
     /// stream.
-    fn next_key(
-        &self,
-        config: &purecrypto::tls::Config,
-        timers: &PeerTimers,
-        now: Instant,
-    ) -> io::Result<(KeyState, ControlPacket)> {
+    fn next_key(&self, timers: &PeerTimers, now: Instant) -> (KeyState, ControlPacket) {
         let key_id = self.next_key_id;
-        let mut ks = KeyState::new(config, key_id, self.local_id, self.remote_id, timers, now)?;
+        let mut ks = KeyState::new(key_id, self.local_id, self.remote_id, timers, now);
         let reset = ks.reliable.build_soft_reset();
-        Ok((ks, reset))
+        (ks, reset)
     }
 
     /// Make `ks`, from [`next_key`](Self::next_key), the primary key; the
@@ -1255,11 +1309,12 @@ impl Session {
     /// TLS error ends an OpenVPN key state too.
     fn process_tls(
         &mut self,
+        config: &purecrypto::tls::Config,
         tls_bytes: &[u8],
         auth: &AuthMode,
         out: &mut PeerOutput,
     ) -> io::Result<()> {
-        let res = self.advance_tls(tls_bytes, auth, &mut out.auth);
+        let res = self.advance_tls(config, tls_bytes, auth, &mut out.auth);
         // Flush what the TLS engine queued even on failure (an alert,
         // typically), along with the ACKs we owe.
         let pumped = self.pump_tls(out);
@@ -1268,23 +1323,39 @@ impl Session {
 
     fn advance_tls(
         &mut self,
+        config: &purecrypto::tls::Config,
         tls_bytes: &[u8],
         auth: &AuthMode,
         request: &mut Option<AuthRequest>,
     ) -> io::Result<()> {
-        if tls_bytes.is_empty() {
+        let k = &mut self.primary;
+        // Nothing reaches the TLS engine before the client has ACKed our
+        // reset (see MAX_UNPROVEN_TLS); what came before is fed then.
+        if !k.reliable.reset_acked() {
+            k.unproven_tls.extend_from_slice(tls_bytes);
+            if k.unproven_tls.len() > MAX_UNPROVEN_TLS {
+                return Err(invalid("too much TLS before our reset was acknowledged"));
+            }
             return Ok(());
         }
+        let mut bytes = std::mem::take(&mut k.unproven_tls);
+        bytes.extend_from_slice(tls_bytes);
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let tls = match &mut k.tls {
+            Some(tls) => tls,
+            None => k.tls.insert(
+                TlsConnection::server(config)
+                    .map_err(|e| invalid(format!("TLS server connection: {e:?}")))?,
+            ),
+        };
         // `feed` consumes the whole slice.
-        self.primary
-            .tls
-            .feed(tls_bytes)
+        tls.feed(&bytes)
             .map_err(|e| invalid(format!("tls feed: {e:?}")))?;
         // Drain decrypted plaintext into the control buffer. `recv` hands
         // back everything buffered in one call.
-        let plain = self
-            .primary
-            .tls
+        let plain = tls
             .recv()
             .map_err(|e| invalid(format!("tls recv: {e:?}")))?;
         // A rejected session is only kept to deliver AUTH_FAILED; nothing
@@ -1339,7 +1410,7 @@ impl Session {
         // Build the server reply onto the TLS stream.
         let reply = build_kx_reply(&self.primary.server_random, &parsed);
         self.primary
-            .tls
+            .tls()?
             .send(&reply)
             .map_err(|e| invalid(format!("tls write reply: {e:?}")))?;
 
@@ -1388,7 +1459,7 @@ impl Session {
                 // client, generate no keys, and end the session a few
                 // seconds later, once the message has had time to arrive.
                 self.primary
-                    .tls
+                    .tls()?
                     .send(b"AUTH_FAILED\0")
                     .map_err(|e| invalid(format!("tls write AUTH_FAILED: {e:?}")))?;
                 self.auth_failed = Some((Instant::now() + AUTH_FAILED_EXIT, why));
@@ -1446,7 +1517,7 @@ impl Session {
                 }
                 let reply = self.build_push_reply();
                 self.primary
-                    .tls
+                    .tls()?
                     .send(reply.as_bytes())
                     .map_err(|e| invalid(format!("tls push reply: {e:?}")))?;
                 self.push_reply_until = now.checked_add(PUSH_REPLY_HOLDOFF);
@@ -1779,8 +1850,7 @@ mod tests {
         let tls = crate::ovpn::tests::server_config();
         let on_auth: OnAuth = Arc::new(|_: &AuthInfo| Err(invalid("unused")));
         let mut p = Peer::new(tls.clone(), *b"SERVERID", on_auth).unwrap();
-        let (mut s, _) =
-            Session::new(&tls, *b"SERVERID", *b"CLIENTID", PeerTimers::default()).unwrap();
+        let (mut s, _) = Session::new(*b"SERVERID", *b"CLIENTID", PeerTimers::default());
         s.opts = Some(Options {
             cipher_block: super::super::GCM,
             cipher_size: 256,

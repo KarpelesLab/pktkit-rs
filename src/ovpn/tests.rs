@@ -592,10 +592,11 @@ fn tls_garbage_closes_the_session() {
     let mut client = TestClient::new(*b"CLIENTID");
     server.handle_packet(&client.hard_reset()).unwrap();
 
-    let mut p = ControlPacket::new(Opcode::CONTROL_V1, 0, *b"CLIENTID", [0; 8]);
+    // The client ACKs our reset: until it has, its TLS is not read.
+    let mut p = ControlPacket::new(Opcode::CONTROL_V1, 0, *b"CLIENTID", *b"SERVERID");
     p.set_pid(1);
     p.payload = vec![0x99, 0x03, 0x03, 0x00, 0x01, 0x00];
-    let out = server.handle_packet(&p.to_bytes(&[])).unwrap();
+    let out = server.handle_packet(&p.to_bytes(&[0])).unwrap();
     assert!(out.close, "TLS failure must end the session");
     assert!(out.error.is_some());
 }
@@ -746,6 +747,101 @@ fn soft_reset_key_sends_tls_only_after_our_reset_is_acked() {
     let ack = ControlPacket::new(Opcode::ACK_V1, 1, *b"CLIENTID", reset.session_id);
     let out = server.handle_packet(&ack.to_bytes(&[0])).unwrap();
     assert!(tls_packets(&out.send) > 0, "the ACK releases the flight");
+}
+
+/// Nor does the server run the TLS handshake for such a sender -- a
+/// signature for its flight, a few milliseconds of CPU for two spoofed
+/// datagrams -- only to hold the output back: the ClientHello waits unread
+/// until our reset is ACKed.
+#[test]
+fn no_tls_work_before_our_reset_is_acked() {
+    let mut server = Peer::new(server_config(), *b"SERVERID", auth_hook())
+        .unwrap()
+        .with_timers(quiet_timers());
+    let mut client = TestClient::new(*b"CLIENTID");
+    connect(&mut server, &mut client);
+    assert_eq!(server.held_tls(), 0);
+
+    for i in 0..3u8 {
+        let mut attacker = TestClient::new([b'A', b'T', b'T', b'A', b'C', b'K', b'-', i]);
+        let mut dgrams = vec![attacker.hard_reset()];
+        attacker.reliable.peer_id = [0x55; 8];
+        attacker.pump_tls(&mut dgrams);
+        assert!(dgrams.len() > 1, "no ClientHello");
+        for d in &dgrams {
+            server.handle_packet(d).unwrap();
+        }
+        assert_eq!(server.held_tls(), 0, "the TLS engine ran for a spoofer");
+    }
+}
+
+/// A ClientHello that arrives before the ACK of our reset -- the packet
+/// carrying the ACK was lost, say -- is kept, and the handshake goes on
+/// once the ACK comes.
+#[test]
+fn tls_sent_before_the_ack_is_kept_for_it() {
+    let mut server = Peer::new(server_config(), *b"SERVERID", auth_hook())
+        .unwrap()
+        .with_timers(quiet_timers());
+    let mut client = TestClient::new(*b"CLIENTID");
+    let out = server.handle_packet(&client.hard_reset()).unwrap();
+    let mut to_server = Vec::new();
+    for d in out.send {
+        to_server.extend(client.handle(&d));
+    }
+    client.pump_tls(&mut to_server);
+    let mut acks = Vec::new();
+    for d in &to_server {
+        let p = ControlPacket::parse(d).unwrap();
+        acks.extend(&p.acked_pids);
+        if p.opcode == Opcode::CONTROL_V1 {
+            let out = server.handle_packet(&p.to_bytes(&[])).unwrap();
+            assert_eq!(tls_packets(&out.send), 0);
+        }
+    }
+    assert_eq!(acks, vec![0]);
+    let ack = ControlPacket::new(Opcode::ACK_V1, 0, *b"CLIENTID", *b"SERVERID");
+    let out = server.handle_packet(&ack.to_bytes(&acks)).unwrap();
+    assert!(tls_packets(&out.send) > 0, "the ACK releases the flight");
+    let mut next = Vec::new();
+    for d in out.send {
+        next.extend(client.handle(&d));
+    }
+    let keys = connect_from(&mut server, &mut client, next);
+    assert_eq!(deliver(&mut server, &keys, 1, b"hi"), Some(b"hi".to_vec()));
+}
+
+/// A sender that does receive at the client's address -- the client itself,
+/// or whoever shares it -- can still restart its session at will, each
+/// restart a fresh TLS handshake for the server. How many a peer starts
+/// beyond its first is bounded.
+#[test]
+fn new_sessions_from_one_address_are_rate_limited() {
+    let mut server = Peer::new(server_config(), *b"SERVERID", auth_hook())
+        .unwrap()
+        .with_timers(quiet_timers());
+    let mut client = TestClient::new(*b"CLIENTID");
+    connect(&mut server, &mut client);
+
+    let mut served = 0;
+    for i in 0..10u8 {
+        let mut restart = TestClient::new([b'R', b'E', b'S', b'T', b'A', b'R', b'T', i]);
+        let out = server.handle_packet(&restart.hard_reset()).unwrap();
+        let mut to_server = Vec::new();
+        for d in out.send {
+            to_server.extend(restart.handle(&d));
+        }
+        restart.pump_tls(&mut to_server);
+        let mut flight = 0;
+        for d in &to_server {
+            if let Ok(out) = server.handle_packet(d) {
+                flight += tls_packets(&out.send);
+            }
+        }
+        served += usize::from(flight > 0);
+    }
+    assert!(served >= 1, "a restarting client must get through");
+    assert!(served <= 4, "{served} handshakes run for one address");
 }
 
 /// A new session that does prove the client got our answer -- the ACK of
