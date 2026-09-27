@@ -149,6 +149,13 @@ impl SipHelper {
 /// Rewrite SDP `c=` connection lines, `m=` media lines and `a=rtcp:`
 /// attributes outbound, swapping the inside address for the outside address
 /// and mapping each media stream's RTP and RTCP ports.
+///
+/// Only what the inside host itself receives on is translated: a `c=` line
+/// naming it, and the media sections whose connection address is it. Any
+/// other address is left alone: `0.0.0.0` puts a stream on hold (RFC 3264
+/// §8.4), and a relay or multicast group receives the media itself, so
+/// rewriting it to the public address, or mapping ports for it, would send
+/// the media to the wrong place.
 fn rewrite_sdp_outbound(
     nat: &Nat,
     ns: u64,
@@ -157,32 +164,33 @@ fn rewrite_sdp_outbound(
     inside_ip: Ipv4Addr,
 ) -> Vec<u8> {
     let inside_addr = inside_ip.to_string();
-    let mut remote_ip = Ipv4Addr::UNSPECIFIED;
     let lines = split_subslice(sdp, b"\r\n");
+    // The session-level connection address: a c= line before the first m=.
+    let session_c = lines
+        .iter()
+        .take_while(|l| !l.starts_with(b"m="))
+        .find_map(|l| connection_addr(l));
     let mut out: Vec<Vec<u8>> = Vec::with_capacity(lines.len() + 1);
     // The outside RTCP port of the media section being rewritten.
     let mut rtcp_out: Option<u16> = None;
     for (i, raw) in lines.iter().enumerate() {
         let mut line = raw.clone();
-        if line.starts_with(b"c=IN IP4 ") {
-            let rest = &line[b"c=IN IP4 ".len()..];
-            let addr = String::from_utf8_lossy(rest).trim().to_string();
-            if addr != inside_addr
-                && let Ok(a) = addr.parse::<Ipv4Addr>()
-            {
-                remote_ip = a;
+        if let Some(addr) = connection_addr(&line) {
+            if addr == inside_addr.as_bytes() {
+                line = format!("c=IN IP4 {}", outside_addr).into_bytes();
             }
-            line = format!("c=IN IP4 {}", outside_addr).into_bytes();
         } else if line.starts_with(b"m=") {
             rtcp_out = None;
-            // An a=rtcp attribute moves RTCP off RTP + 1 (RFC 3605); it is
-            // media-level, so it belongs to the lines up to the next m=.
-            let explicit = lines[i + 1..]
-                .iter()
-                .take_while(|l| !l.starts_with(b"m="))
-                .find_map(|l| rtcp_attr(l).map(|(port, _)| port));
-            if let Some((new_line, rtp, rtcp)) =
-                sip_parse_media_line(&line, nat, ns, remote_ip, inside_ip, explicit)
+            // Media-level attributes are the lines up to the next m=.
+            let section = || lines[i + 1..].iter().take_while(|l| !l.starts_with(b"m="));
+            // A media-level c= overrides the session-level one for this
+            // stream (RFC 4566 §5.7).
+            let conn = section().find_map(|l| connection_addr(l)).or(session_c);
+            // An a=rtcp attribute moves RTCP off RTP + 1 (RFC 3605).
+            let explicit = section().find_map(|l| rtcp_attr(l).map(|(port, _)| port));
+            if conn == Some(inside_addr.as_bytes())
+                && let Some((new_line, rtp, rtcp)) =
+                    sip_parse_media_line(&line, nat, ns, inside_ip, explicit)
             {
                 out.push(new_line);
                 rtcp_out = rtcp;
@@ -207,6 +215,12 @@ fn rewrite_sdp_outbound(
         out.push(line);
     }
     join_subslice(&out, b"\r\n")
+}
+
+/// The address of an SDP `c=IN IP4 <address>` line (RFC 4566 §5.7), with
+/// any multicast `/ttl` suffix still on it.
+fn connection_addr(line: &[u8]) -> Option<&[u8]> {
+    Some(line.strip_prefix(b"c=IN IP4 ")?.trim_ascii())
 }
 
 /// The port of an `a=rtcp:<port> [<nettype> <addrtype> <address>]`
@@ -234,7 +248,6 @@ fn sip_parse_media_line(
     line: &[u8],
     nat: &Nat,
     ns: u64,
-    remote_ip: Ipv4Addr,
     inside_ip: Ipv4Addr,
     explicit: Option<u16>,
 ) -> Option<(Vec<u8>, u16, Option<u16>)> {
@@ -275,7 +288,8 @@ fn sip_parse_media_line(
         ),
     };
 
-    // The remote media ports are not known yet.
+    // Neither the remote's media address nor its ports are known yet: the
+    // offer carries only this side's.
     let expires = Instant::now() + SIP_RTP_TIMEOUT;
     let streams = [
         (inside_port, Some(rtp_out)),
@@ -284,9 +298,7 @@ fn sip_parse_media_line(
     for (inside, outside) in streams {
         if let Some(outside) = outside {
             nat.add_expectation(
-                Expectation::new(PROTO_UDP, inside_ip, inside, outside, expires)
-                    .remote_ip(remote_ip)
-                    .namespace(ns),
+                Expectation::new(PROTO_UDP, inside_ip, inside, outside, expires).namespace(ns),
             );
         }
     }
@@ -684,6 +696,49 @@ a=rtcp:9001 IN IP4 10.0.0.5\r\na=sendrecv\r\n";
         assert_ne!(rtcp, rtp + 1, "{}", out);
         assert_eq!(reaches(&nat, &inbound, rtp), Some(8000));
         assert_eq!(reaches(&nat, &inbound, rtcp), Some(8001));
+    }
+
+    #[test]
+    fn hold_relay_and_multicast_connection_addresses_are_left_alone() {
+        // On hold (RFC 3264 §8.4): nothing to map, nothing to rewrite.
+        let sdp = "v=0\r\nc=IN IP4 0.0.0.0\r\nm=audio 8000 RTP/AVP 0\r\n";
+        let (nat, out, _) = invite_with_sdp(sdp, |_| {});
+        assert_eq!(out, sdp);
+        assert!(
+            nat.take_expectation(PROTO_UDP, Ipv4Addr::new(10, 0, 0, 5), 8000)
+                .is_none()
+        );
+
+        // A multicast group receives the media itself.
+        let sdp = "v=0\r\nc=IN IP4 233.252.0.1/127\r\nm=audio 8000 RTP/AVP 0\r\n";
+        let (_, out, _) = invite_with_sdp(sdp, |_| {});
+        assert_eq!(out, sdp);
+
+        // The session-level address is the host's, but the video stream's
+        // own c= names a relay: only the audio stream is translated.
+        let sdp = "v=0\r\nc=IN IP4 10.0.0.5\r\nm=audio 8000 RTP/AVP 0\r\n\
+m=video 9000 RTP/AVP 96\r\nc=IN IP4 192.0.2.77\r\n";
+        let (_, out, _) = invite_with_sdp(sdp, |_| {});
+        assert!(
+            out.starts_with("v=0\r\nc=IN IP4 203.0.113.1\r\n"),
+            "{}",
+            out
+        );
+        assert_ne!(port_after(&out, "m=audio "), 8000, "{}", out);
+        assert!(
+            out.ends_with("m=video 9000 RTP/AVP 96\r\nc=IN IP4 192.0.2.77\r\n"),
+            "{}",
+            out
+        );
+
+        // And the other way round: held at session level, one stream on the
+        // host itself.
+        let sdp = "v=0\r\nc=IN IP4 0.0.0.0\r\nm=audio 8000 RTP/AVP 0\r\n\
+m=video 9000 RTP/AVP 96\r\nc=IN IP4 10.0.0.5\r\n";
+        let (_, out, _) = invite_with_sdp(sdp, |_| {});
+        assert!(out.contains("c=IN IP4 0.0.0.0\r\nm=audio 8000 "), "{}", out);
+        assert_ne!(port_after(&out, "m=video "), 9000, "{}", out);
+        assert!(out.ends_with("\r\nc=IN IP4 203.0.113.1\r\n"), "{}", out);
     }
 
     #[test]
