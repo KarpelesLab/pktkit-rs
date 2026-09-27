@@ -102,9 +102,8 @@ fn encrypt_gcm(opts: &Options, keys: &PeerKeys, pid: u32, payload: &[u8]) -> io:
     let ad = pid.to_be_bytes();
 
     // Plaintext = [compression?:1][payload..].
-    let has_comp = opts.compression != "none" && !opts.compression.is_empty();
     let mut pt = Vec::with_capacity(payload.len() + 1);
-    if has_comp {
+    if opts.compression_framing() {
         pt.push(COMP_NONE);
     }
     pt.extend_from_slice(payload);
@@ -151,7 +150,7 @@ fn decrypt_gcm<'a>(
 
     // ct now holds the plaintext in its first pt_len bytes.
     let plaintext = &data[21..21 + pt_len];
-    finish_plaintext(pid, plaintext)
+    finish_plaintext(opts, pid, plaintext)
 }
 
 /// Seal `buf` in place, returning the 16-byte tag. Selects key size by length.
@@ -209,10 +208,9 @@ fn encrypt_cbc(
     rng(&mut iv)?;
 
     // Plaintext = [pid:4][compression?:1][payload..], PKCS#7 padded to 16.
-    let has_comp = opts.compression != "none" && !opts.compression.is_empty();
     let mut pt = Vec::with_capacity(5 + payload.len() + 16);
     pt.extend_from_slice(&pid.to_be_bytes());
-    if has_comp {
+    if opts.compression_framing() {
         pt.push(COMP_NONE);
     }
     pt.extend_from_slice(payload);
@@ -292,7 +290,7 @@ fn decrypt_cbc<'a>(
         return Ok(None);
     }
     let pid = u32::from_be_bytes([plain[0], plain[1], plain[2], plain[3]]);
-    finish_plaintext(pid, &plain[4..])
+    finish_plaintext(opts, pid, &plain[4..])
 }
 
 fn cbc_encrypt(key: &[u8], iv: &[u8; 16], buf: &mut [u8]) -> io::Result<()> {
@@ -349,18 +347,26 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 
 // --- shared plaintext post-processing --------------------------------------
 
-/// Plaintext after the packet id is `[compression:1][payload..]` (the pid is
-/// in the clear header for GCM, inside the ciphertext for CBC). Strip the
-/// compression byte and detect a ping.
-fn finish_plaintext(pid: u32, plaintext: &[u8]) -> io::Result<Option<Decrypted<'_>>> {
-    if plaintext.is_empty() {
-        return Ok(None);
-    }
-    let payload = match plaintext[0] {
-        COMP_NONE => &plaintext[1..],
-        COMP_LZO => return Err(invalid("lzo compression not supported")),
-        COMP_LZ4 => return Err(invalid("lz4 compression not supported")),
-        _ => return Err(invalid("unsupported compression format")),
+/// Plaintext after the packet id is `[compression?:1][payload..]` (the pid
+/// is in the clear header for GCM, inside the ciphertext for CBC). Strip the
+/// compression byte, if framed, and detect a ping.
+fn finish_plaintext<'a>(
+    opts: &Options,
+    pid: u32,
+    plaintext: &'a [u8],
+) -> io::Result<Option<Decrypted<'a>>> {
+    let payload = if opts.compression_framing() {
+        let Some((&comp, rest)) = plaintext.split_first() else {
+            return Ok(None);
+        };
+        match comp {
+            COMP_NONE => rest,
+            COMP_LZO => return Err(invalid("lzo compression not supported")),
+            COMP_LZ4 => return Err(invalid("lz4 compression not supported")),
+            _ => return Err(invalid("unsupported compression format")),
+        }
+    } else {
+        plaintext
     };
     let is_ping = payload.len() == OPENVPN_PING.len() && payload == OPENVPN_PING;
     Ok(Some(Decrypted {
@@ -557,6 +563,19 @@ mod tests {
         let d = decrypt(&opts, &rk, &mut wire).unwrap().unwrap();
         assert_eq!(d.pid, 9);
         assert_eq!(d.payload, b"from openvpn");
+    }
+
+    /// Whether packets carry the compression byte is one setting, and both
+    /// directions must honour it.
+    #[test]
+    fn compression_framing_is_symmetric() {
+        let (sk, rk) = key_pair();
+        for mut opts in [gcm_opts(256), cbc_opts(256)] {
+            opts.compression = "none".into();
+            let mut pkt = encrypt(&opts, &sk, 3, b"no framing", rng_zero).unwrap();
+            let d = decrypt(&opts, &rk, &mut pkt).unwrap().unwrap();
+            assert_eq!(d.payload, b"no framing");
+        }
     }
 
     #[test]

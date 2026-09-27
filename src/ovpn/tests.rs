@@ -793,6 +793,27 @@ fn empty_strings_in_key_exchange_are_accepted() {
     assert!(info.peer_info.is_empty());
 }
 
+/// OpenVPN only warns when the client's options string differs from what
+/// it expects (ssl.c key_method_2_read -> options_warning). Real clients'
+/// strings rarely match ours byte for byte -- this one is what a 2.6 client
+/// with `cipher AES-256-GCM` and no compression sends -- and must still be
+/// served. The server pushes `comp-lzo no`, so the client frames its packets
+/// with the no-compression byte all the same.
+#[test]
+fn real_client_options_string_is_accepted() {
+    let mut server = Peer::new(server_config(), *b"SERVERID", auth_hook()).unwrap();
+    let mut client = TestClient::new(*b"CLIENTID");
+    client.kx.options = "V4,dev-type tun,link-mtu 1559,tun-mtu 1500,proto UDPv4,\
+                         cipher AES-256-GCM,auth [null-digest],keysize 256,\
+                         key-method 2,tls-client"
+        .into();
+    let keys = connect(&mut server, &mut client);
+    assert_eq!(
+        deliver(&mut server, &keys, 1, b"hello"),
+        Some(b"hello".to_vec())
+    );
+}
+
 // --- helpers ----------------------------------------------------------------
 
 /// Exchange what `client` has queued with `server` until both go quiet;

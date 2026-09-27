@@ -883,12 +883,15 @@ fn try_parse_key_exchange(buf: &[u8]) -> io::Result<Option<(KeyExchange, usize)>
         None => return Ok(None),
     };
 
-    // Validate the options string round-trips (as the Go upstream does).
+    // OpenVPN only warns when the peer's options string differs from its
+    // own (key_method_2_read -> options_warning), so take what we need from
+    // it and ignore the rest rather than insisting it round-trips.
     let mut opts = Options::parse(&options_string).map_err(invalid)?;
     opts.is_server = false;
-    if opts.to_string() != options_string {
-        return Err(invalid("invalid options provided"));
-    }
+    // The PUSH_REPLY carries `comp-lzo no`, which puts the client on
+    // stub framing (every packet starts with the no-compression byte)
+    // whatever it had configured, so both directions frame.
+    opts.compression = "lzo".into();
 
     let peer_info = parse_peer_info(&peer_info_raw)?;
 

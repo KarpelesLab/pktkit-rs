@@ -91,7 +91,12 @@ impl Options {
     /// negotiation). Returns the error as a String to keep the dependency
     /// footprint minimal.
     pub fn parse(s: &str) -> Result<Options, String> {
-        let mut o = Options::default();
+        // `,comp-lzo` says a compression context is active, whatever the
+        // algorithm (options_string.c); without it there is none.
+        let mut o = Options {
+            compression: "none".into(),
+            ..Options::default()
+        };
         let mut parts = s.split(',');
         let first = parts.next().ok_or("empty options")?;
         if first != "V4" {
@@ -114,10 +119,18 @@ impl Options {
                 "auth" => o.auth = AuthHash::from_str(v)?,
                 "keysize" => o.key_size = v.parse().map_err(|e| format!("keysize: {e}"))?,
                 "key-method" => o.key_method = v.parse().map_err(|e| format!("key-method: {e}"))?,
+                "comp-lzo" => o.compression = "lzo".into(),
                 _ => {} // ignore unknown options for forward-compat
             }
         }
         Ok(o)
+    }
+
+    /// Whether data-channel packets carry the one-byte compression header
+    /// (`0xfa` for an uncompressed packet). Encrypt and decrypt both go by
+    /// this, so the two directions cannot disagree.
+    pub(crate) fn compression_framing(&self) -> bool {
+        !self.compression.is_empty() && self.compression != "none"
     }
 
     fn parse_cipher(&mut self, c: &str) -> Result<(), String> {
@@ -201,6 +214,17 @@ mod tests {
         assert_eq!(o.link_mtu, 1570);
         assert_eq!(o.cipher_size, 256);
         assert_eq!(o.cipher_block, CipherBlockMethod::Gcm);
+    }
+
+    /// `,comp-lzo` in an options string means a compression context is
+    /// active (options_string.c); its absence means there is none.
+    #[test]
+    fn parse_reads_compression() {
+        let with = Options::parse("V4,dev-type tun,comp-lzo,cipher AES-256-GCM").unwrap();
+        assert_eq!(with.compression, "lzo");
+        let without = Options::parse("V4,dev-type tun,cipher AES-256-GCM").unwrap();
+        assert_eq!(without.compression, "none");
+        assert!(!without.to_string().contains("comp-lzo"));
     }
 
     #[test]
