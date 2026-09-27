@@ -18,7 +18,10 @@ use std::io;
 use std::time::Duration;
 
 use super::Opcode;
-use super::consts::{CONTROL_CHANNEL_MTU, TLS_RELIABLE_N_REC_BUFFERS, TLS_RELIABLE_N_SEND_BUFFERS};
+use super::consts::{
+    CONTROL_CHANNEL_MTU, CONTROL_SEND_ACK_MAX, TLS_RELIABLE_N_REC_BUFFERS,
+    TLS_RELIABLE_N_SEND_BUFFERS,
+};
 use super::packet_ctrl::ControlPacket;
 
 /// Initial retransmit timeout for an unacked control packet. OpenVPN's
@@ -166,8 +169,10 @@ impl Reliable {
         };
 
         // We owe an ACK for this received packet, even for a duplicate: our
-        // earlier ACK may have been lost.
-        self.pending_ack.push(pid);
+        // earlier ACK may have been lost. Once is enough, though.
+        if !self.pending_ack.contains(&pid) {
+            self.pending_ack.push(pid);
+        }
 
         // The client learns the server's session id from its hard reset; a
         // server's is fixed when the session is opened.
@@ -191,10 +196,14 @@ impl Reliable {
         Ok(outcome)
     }
 
-    /// Take the list of ACKs we currently owe, clearing the pending set. The
-    /// caller attaches these to the next outgoing packet (or a dedicated ACK).
+    /// Take up to [`CONTROL_SEND_ACK_MAX`] of the ACKs we owe, oldest first,
+    /// for the caller to attach to the next outgoing packet (or a dedicated
+    /// ACK). One packet carries no more (reliable_ack_write), which keeps it
+    /// within [`TLS_MTU`](super::consts::TLS_MTU); the rest wait for the
+    /// next.
     pub fn take_pending_acks(&mut self) -> Vec<u32> {
-        std::mem::take(&mut self.pending_ack)
+        let n = self.pending_ack.len().min(CONTROL_SEND_ACK_MAX);
+        self.pending_ack.drain(..n).collect()
     }
 
     /// True if there are ACKs awaiting transmission.
@@ -489,6 +498,25 @@ mod tests {
         // pids assigned sequentially.
         assert_eq!(chunks[0].pid, Some(0));
         assert_eq!(chunks[2].pid, Some(2));
+    }
+
+    /// One packet carries at most CONTROL_SEND_ACK_MAX ACKs, so it stays
+    /// within the tls-mtu; the rest wait for the next, and a packet
+    /// received twice is owed one ACK.
+    #[test]
+    fn acks_per_packet_are_capped() {
+        let mut r = Reliable::new(local());
+        let sid = [9u8; 8];
+        let mut reset = ControlPacket::new(Opcode::CONTROL_HARD_RESET_CLIENT_V2, 0, sid, [0; 8]);
+        reset.set_pid(0);
+        r.recv(&reset.to_bytes(&[])).unwrap();
+        for pid in 1..6 {
+            r.recv(&client_control(pid, sid, b"x")).unwrap();
+        }
+        r.recv(&client_control(5, sid, b"x")).unwrap();
+        assert_eq!(r.take_pending_acks(), vec![0, 1, 2, 3]);
+        assert_eq!(r.take_pending_acks(), vec![4, 5]);
+        assert!(!r.has_pending_acks());
     }
 
     /// At most TLS_RELIABLE_N_SEND_BUFFERS packets are in flight; the rest

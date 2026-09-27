@@ -59,9 +59,20 @@ pub const CONTROL_SEND_ACK_MAX: usize = 4;
 pub const TLS_RELIABLE_N_SEND_BUFFERS: usize = 4;
 pub const TLS_RELIABLE_N_REC_BUFFERS: usize = 8;
 
-pub const PUBLIC_NETWORK_MTU: usize = 1500;
-pub const MAX_CONTROL_HEADER_SIZE: usize = 38;
-pub const CONTROL_CHANNEL_MTU: usize = PUBLIC_NETWORK_MTU - MAX_CONTROL_HEADER_SIZE;
+/// Largest datagram a control packet makes, IP and UDP headers included
+/// (OpenVPN 2.6's default `tls-mtu`): small enough to cross a path with a
+/// reduced MTU unfragmented. The same bound serves TCP.
+pub const TLS_MTU: usize = 1250;
+/// The IP and UDP headers counted against [`TLS_MTU`]: IPv6's, the larger
+/// (ssl.c calc_control_channel_frame_overhead counts the peer's own
+/// family's; over TCP it counts UDP's all the same).
+pub const DATAGRAM_OVERHEAD: usize = 40 + 8;
+/// A control packet's header at its largest: opcode and key id, session
+/// id, ACK count, [`CONTROL_SEND_ACK_MAX`] ACKs and the session id they
+/// name, and packet id.
+pub const MAX_CONTROL_HEADER_SIZE: usize = 1 + 8 + 1 + 4 * CONTROL_SEND_ACK_MAX + 8 + 4;
+/// Most TLS bytes a control packet carries.
+pub const CONTROL_CHANNEL_MTU: usize = TLS_MTU - DATAGRAM_OVERHEAD - MAX_CONTROL_HEADER_SIZE;
 
 pub const KEY_METHOD_MASK: u8 = 0x0f;
 

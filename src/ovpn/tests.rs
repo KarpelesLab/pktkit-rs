@@ -706,6 +706,49 @@ fn packets_for_other_sessions_do_not_count_as_hearing_from_the_client() {
     assert!(out.close, "ping-restart should have fired");
 }
 
+/// Every control packet, headers and ACKs included, makes a datagram
+/// within OpenVPN 2.6's default tls-mtu of 1250 bytes, IPv6 and UDP headers
+/// counted: a full 1500-byte one is fragmented, or dropped, on many paths,
+/// and the handshake then never completes.
+#[test]
+fn control_packets_fit_the_tls_mtu() {
+    // A chain of a few certificates, so the server's first flight takes
+    // several packets.
+    let chain = vec![der(TEST_CERT, "CERTIFICATE"); 4];
+    let key =
+        purecrypto::rsa::BoxedRsaPrivateKey::from_pkcs8_der(&der(TEST_KEY, "PRIVATE KEY")).unwrap();
+    let config = Arc::new(
+        TlsConfig::builder()
+            .versions(TLS12_ONLY.0, TLS12_ONLY.1)
+            .rng(Arc::new(purecrypto::rng::OsRng))
+            .identity(chain, purecrypto::tls::SigningKey::Rsa(key))
+            .build(),
+    );
+    let mut server = Peer::new(config, *b"SERVERID", auth_hook()).unwrap();
+    let mut client = TestClient::new(*b"CLIENTID");
+    let mut to_server = vec![client.hard_reset()];
+    let mut largest = 0;
+    let mut sent = 0;
+    for _ in 0..50 {
+        let mut next = Vec::new();
+        for d in to_server.drain(..) {
+            for s in server.handle_packet(&d).unwrap().send {
+                largest = largest.max(s.len());
+                sent += 1;
+                next.extend(client.handle(&s));
+            }
+        }
+        client.pump_tls(&mut next);
+        if client.handshake_done() && next.is_empty() {
+            break;
+        }
+        to_server = next;
+    }
+    assert!(client.handshake_done());
+    assert!(sent > 2);
+    assert!(largest + 40 + 8 <= 1250, "{largest}-byte control packet");
+}
+
 /// A retransmitted hard reset is a duplicate of the session's packet 0: it is
 /// ACKed again, not answered with another server reset.
 #[test]

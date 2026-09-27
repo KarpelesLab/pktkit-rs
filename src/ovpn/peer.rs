@@ -1151,18 +1151,14 @@ impl Session {
         }
         // Whatever the send window has room for: ACKs arriving later open
         // it, and this runs again for every packet received.
-        for (i, pkt) in ks.reliable.flush_tls().iter().enumerate() {
-            // Attach pending acks only to the first packet of the burst.
-            let acks = if i == 0 {
-                ks.reliable.take_pending_acks()
-            } else {
-                Vec::new()
-            };
+        for pkt in ks.reliable.flush_tls() {
+            // The ACKs we owe ride along, as many as fit each packet.
+            let acks = ks.reliable.take_pending_acks();
             out.send.push(pkt.to_bytes(&acks));
         }
 
-        // If we still owe acks (no control packet carried them), send a plain ACK.
-        if ks.reliable.has_pending_acks() {
+        // ACKs no control packet carried go in plain ACKs.
+        while ks.reliable.has_pending_acks() {
             let acks = ks.reliable.take_pending_acks();
             let ack = ks.reliable.build_ack();
             out.send.push(ack.to_bytes(&acks));
