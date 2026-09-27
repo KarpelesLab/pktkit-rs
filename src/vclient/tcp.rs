@@ -350,6 +350,11 @@ pub(crate) struct ListenerState {
 
 const ACCEPT_QUEUE_CAP: usize = 128;
 
+/// Connections a listener holds in SYN-RECEIVED at once, as a listen
+/// backlog bounds them: each SYN would otherwise mint a connection that
+/// lives until its SYN-ACKs give up.
+const HALF_OPEN_CAP: usize = 128;
+
 impl ListenerState {
     /// Mark closed, reset what was waiting to be accepted, and wake `accept`.
     fn shut(&self) {
@@ -624,7 +629,7 @@ impl TcpStack {
     /// Demultiplex an inbound TCP packet to the matching connection, or accept
     /// it against a registered listener if it's an opening SYN.
     /// Returns `true` if the packet was consumed.
-    pub fn handle_inbound(self: &Arc<Self>, pkt: &Packet) -> bool {
+    pub fn handle_inbound(self: &Arc<Self>, pkt: &Packet, ours: IpAddr) -> bool {
         if pkt.ip_protocol() != Protocol::TCP {
             return false;
         }
@@ -687,11 +692,60 @@ impl TcpStack {
         if seg.has_flag(flags::SYN) && !seg.has_flag(flags::ACK) {
             let listener = self.listeners.lock().unwrap().get(&seg.dst_port).cloned();
             if let Some(listener) = listener {
-                self.accept_syn(listener, dst, src, &seg);
+                // A full backlog drops the SYN, as Linux does: the peer
+                // retransmits, and by then a slot may have freed up.
+                if self.half_open(&listener) < HALF_OPEN_CAP {
+                    self.accept_syn(listener, dst, src, &seg);
+                }
                 return true;
             }
         }
-        false
+
+        // Nothing here for it: say so with a RST (RFC 9293 §3.10.7.1), so
+        // a dialer is refused at once and a stale peer stops, but never in
+        // answer to a RST, nor for an address that is not ours to speak for.
+        if seg.has_flag(flags::RST) || dst != ours || ours.is_unspecified() {
+            return false;
+        }
+        let rst = if seg.has_flag(flags::ACK) {
+            Segment {
+                src_port: seg.dst_port,
+                dst_port: seg.src_port,
+                seq: seg.ack,
+                flags: flags::RST,
+                ..Default::default()
+            }
+        } else {
+            // SEG.LEN counts the SYN and FIN as well as the data.
+            let len =
+                seg.data_len() + seg.has_flag(flags::SYN) as u32 + seg.has_flag(flags::FIN) as u32;
+            Segment {
+                src_port: seg.dst_port,
+                dst_port: seg.src_port,
+                ack: seg.seq.wrapping_add(len),
+                flags: flags::RST | flags::ACK,
+                ..Default::default()
+            }
+        };
+        (self.sink)(&wrap_segment(dst, src, &rst.marshal()));
+        true
+    }
+
+    /// Connections `listener` holds whose handshake has not completed.
+    fn half_open(&self, listener: &Arc<ListenerState>) -> usize {
+        self.conns
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|c| {
+                !c.connected.load(Ordering::Acquire)
+                    && c.pending_accept
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .is_some_and(|l| Arc::ptr_eq(l, listener))
+            })
+            .count()
     }
 
     /// Passively open a connection for an inbound SYN and send the SYN-ACK.
@@ -891,6 +945,79 @@ mod tests {
         let conns = stack.conns.lock().unwrap();
         assert!(Arc::ptr_eq(&conns[&first.key], &first));
         assert!(Arc::ptr_eq(&conns[&second.key], &second));
+    }
+
+    fn capturing_stack() -> (Arc<TcpStack>, Arc<Mutex<Vec<Vec<u8>>>>) {
+        let out: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
+        let o = out.clone();
+        let sink: Arc<dyn Fn(&[u8]) + Send + Sync> =
+            Arc::new(move |b: &[u8]| o.lock().unwrap().push(b.to_vec()));
+        (TcpStack::new(sink), out)
+    }
+
+    const PEER: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
+    const US: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
+
+    fn inbound(seg: Segment) -> Vec<u8> {
+        wrap_v4(PEER, US, &seg.marshal())
+    }
+
+    #[test]
+    fn segments_to_no_connection_are_reset() {
+        let (stack, out) = capturing_stack();
+        let seg = |flags, seq, ack| Segment {
+            src_port: 4000,
+            dst_port: 5555,
+            seq,
+            ack,
+            flags,
+            ..Default::default()
+        };
+        let reply = |pkt: Vec<u8>| {
+            out.lock().unwrap().clear();
+            stack.handle_inbound(Packet::from_slice(&pkt), IpAddr::V4(US));
+            let sent = out.lock().unwrap().clone();
+            sent.iter()
+                .map(|p| Segment::parse(Packet::from_slice(p).payload()).unwrap())
+                .collect::<Vec<_>>()
+        };
+
+        // With an ACK: RST numbered from it.
+        let r = reply(inbound(seg(flags::ACK, 100, 777)));
+        assert_eq!(r.len(), 1);
+        assert_eq!((r[0].flags, r[0].seq), (flags::RST, 777));
+        assert_eq!((r[0].src_port, r[0].dst_port), (5555, 4000));
+
+        // A SYN to a port nobody listens on: RST+ACK of the SYN.
+        let r = reply(inbound(seg(flags::SYN, 100, 0)));
+        assert_eq!(r.len(), 1);
+        assert_eq!((r[0].flags, r[0].ack), (flags::RST | flags::ACK, 101));
+
+        // Never a RST for a RST, nor on behalf of another address.
+        assert!(reply(inbound(seg(flags::RST, 100, 0))).is_empty());
+        let elsewhere = wrap_v4(
+            PEER,
+            Ipv4Addr::new(10, 0, 0, 9),
+            &seg(flags::ACK, 1, 1).marshal(),
+        );
+        assert!(reply(elsewhere).is_empty());
+    }
+
+    #[test]
+    fn half_open_connections_per_listener_are_capped() {
+        let (stack, _out) = capturing_stack();
+        let _listener = stack.listen(IpAddr::V4(US), 80).unwrap();
+        for port in 0..(HALF_OPEN_CAP as u16 + 50) {
+            let syn = Segment {
+                src_port: 10000 + port,
+                dst_port: 80,
+                seq: 1,
+                flags: flags::SYN,
+                ..Default::default()
+            };
+            stack.handle_inbound(Packet::from_slice(&inbound(syn)), IpAddr::V4(US));
+        }
+        assert_eq!(stack.conns.lock().unwrap().len(), HALF_OPEN_CAP);
     }
 
     #[test]

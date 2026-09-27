@@ -182,7 +182,7 @@ impl L3Device for Client {
         let pkt = Packet::from_slice(&whole);
         // Inbound from the L3 network: demux to a TCP connection, then a UDP
         // socket. Unmatched packets (e.g. ICMP) are dropped.
-        if self.tcp.handle_inbound(pkt) {
+        if self.tcp.handle_inbound(pkt, self.addr().addr()) {
             return Ok(());
         }
         let _ = self.udp.handle_inbound(pkt);
