@@ -300,7 +300,7 @@ impl Adapter {
         packet: &[u8],
         addr: SocketAddr,
     ) -> Result<()> {
-        if let Some(mh) = self.multi_handler.as_ref() {
+        let h = if let Some(mh) = self.multi_handler.as_ref() {
             let h = mh
                 .handlers()
                 .into_iter()
@@ -309,10 +309,21 @@ impl Adapter {
                     io::Error::new(io::ErrorKind::NotFound, "no handler matched MAC1")
                 })?;
             h.add_peer(key);
+            h
         } else if let Some(h) = self.handler.as_ref() {
             h.add_peer(key);
+            h.clone()
         } else {
             return Err(io::Error::other("no handler"));
+        };
+        // Handling the packet for a peer still unauthorized (removed or
+        // expired again meanwhile) would only invoke on_unknown_peer again,
+        // from inside the call that got us here.
+        if !h.is_authorized_peer(&key) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "peer not authorized after adding it",
+            ));
         }
         self.server.handle_packet(packet, addr)
     }
@@ -588,11 +599,31 @@ mod tests {
     /// response, over the wire, without having to retry.
     #[test]
     fn accepted_unknown_peer_gets_its_response() {
+        accept_from_callback(false);
+    }
+
+    /// The same for a peer whose authorization expired: accepting it again
+    /// authorizes it again. Before, it stayed expired, and handling the
+    /// initiation again invoked on_unknown_peer again, which accepted it
+    /// again, until the stack overflowed.
+    #[test]
+    fn an_expired_peer_can_be_accepted_again() {
+        accept_from_callback(true);
+    }
+
+    fn accept_from_callback(expired: bool) {
         let hub = L3Hub::new();
         let slot: Arc<Mutex<Option<Weak<Adapter>>>> = Arc::new(Mutex::new(None));
         let s = slot.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
         let on_unknown: crate::wg::handler::UnknownPeerFn =
             Arc::new(move |key, addr, pkt: &[u8]| {
+                // Stop short of a stack overflow, which would take the whole
+                // test binary down.
+                if c.fetch_add(1, Ordering::SeqCst) > 20 {
+                    return;
+                }
                 let a = s.lock().unwrap().as_ref().and_then(Weak::upgrade);
                 if let Some(a) = a {
                     a.accept_unknown_peer(key, pkt, addr).unwrap();
@@ -614,8 +645,14 @@ mod tests {
         let _t = adapter.spawn_serve(sock);
 
         let client = Handler::new(HandlerConfig::default()).unwrap();
-        let server_pub = adapter.handler.as_ref().unwrap().public_key();
+        let server = adapter.handler.as_ref().unwrap();
+        let server_pub = server.public_key();
         client.add_peer(server_pub);
+        if expired {
+            server.add_peer(client.public_key());
+            let past = crate::time::Instant::now() - Duration::from_secs(1);
+            server.set_peer_expiry(&client.public_key(), past);
+        }
         let csock = UdpSocket::bind("127.0.0.1:0").unwrap();
         csock
             .set_read_timeout(Some(Duration::from_secs(5)))
@@ -631,6 +668,7 @@ mod tests {
             adapter.server.peer_addr(&client.public_key()),
             Some(csock.local_addr().unwrap())
         );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
         adapter.close().unwrap();
     }
 }

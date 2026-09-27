@@ -250,11 +250,26 @@ impl Handler {
     }
 
     /// Add (or refresh) an authorized peer with no preshared key.
+    ///
+    /// Refreshing a known peer clears any [expiry](Self::set_peer_expiry),
+    /// so a peer that lapsed can be authorized again. A preshared key it
+    /// already has is kept: dropping it here would quietly weaken the
+    /// handshake, and [`Adapter::add_peer`](crate::wg::Adapter::add_peer)
+    /// calls this on every identity. Use [`remove_peer`](Self::remove_peer)
+    /// first to take the key away.
     pub fn add_peer(&self, peer_key: NoisePublicKey) {
         let mut peers = self.peers.write().expect("peers lock");
-        peers
-            .entry(peer_key)
-            .or_insert_with(|| PeerEntry::new(peer_key, NoisePresharedKey::zero(), false));
+        match peers.get_mut(&peer_key) {
+            // Update in place, as add_peer_with_psk does, to keep the replay
+            // state.
+            Some(p) => p.expires_at = None,
+            None => {
+                peers.insert(
+                    peer_key,
+                    PeerEntry::new(peer_key, NoisePresharedKey::zero(), false),
+                );
+            }
+        }
     }
 
     /// Install (or replace) the callback invoked when a handshake arrives from
@@ -265,7 +280,8 @@ impl Handler {
         *self.on_unknown_peer.lock().expect("unknown lock") = Some(cb);
     }
 
-    /// Add (or refresh) an authorized peer with a preshared key.
+    /// Add (or refresh) an authorized peer with a preshared key. Refreshing
+    /// a known peer replaces its key and clears any expiry.
     pub fn add_peer_with_psk(&self, peer_key: NoisePublicKey, psk: NoisePresharedKey) {
         let mut peers = self.peers.write().expect("peers lock");
         match peers.get_mut(&peer_key) {
@@ -275,6 +291,7 @@ impl Handler {
             Some(p) => {
                 p.preshared_key = psk;
                 p.has_psk = true;
+                p.expires_at = None;
             }
             None => {
                 peers.insert(peer_key, PeerEntry::new(peer_key, psk, true));
@@ -395,9 +412,26 @@ impl Handler {
         // block, and a callback that calls set_on_unknown_peer would wait
         // on itself.
         let cb = self.on_unknown_peer.lock().expect("unknown lock").clone();
-        if let Some(cb) = cb {
-            cb(*peer_key, *addr, packet);
+        let Some(cb) = cb else { return };
+        // The callback is expected to authorize the peer and feed the packet
+        // back in. If that still leaves it unauthorized (it expired again,
+        // was removed meanwhile, or the callback re-feeds without
+        // authorizing), calling back again from inside the call recurses
+        // until the stack runs out. The packet is refused either way.
+        thread_local! {
+            static IN_UNKNOWN_PEER_CB: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         }
+        if IN_UNKNOWN_PEER_CB.with(|f| f.replace(true)) {
+            return;
+        }
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                IN_UNKNOWN_PEER_CB.with(|f| f.set(false));
+            }
+        }
+        let _reset = Reset;
+        cb(*peer_key, *addr, packet);
     }
 
     /// Process one incoming UDP datagram. Dispatches on the WireGuard type byte.
@@ -966,6 +1000,14 @@ impl Handler {
         remote_addr: &SocketAddr,
     ) -> Result<Vec<u8>> {
         self.add_peer(peer_key);
+        // Re-running an initiation from a peer still unauthorized would only
+        // be refused again, after invoking on_unknown_peer once more.
+        if !self.is_authorized_peer(&peer_key) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "peer not authorized after adding it",
+            ));
+        }
         let res = self.process_packet(initiation_packet, remote_addr)?;
         Ok(res.response)
     }
@@ -1449,6 +1491,101 @@ mod tests {
         });
         rx.recv_timeout(Duration::from_secs(10))
             .expect("deadlocked in the unknown-peer callback");
+    }
+
+    /// "Add (or refresh)": adding an expired peer again authorizes it
+    /// again, whichever way it is added. Before, both left the expiry in
+    /// place and the peer could never come back short of remove_peer.
+    #[test]
+    fn re_adding_an_expired_peer_authorizes_it_again() {
+        let a = Handler::new(Config::default()).unwrap();
+        let k = NoisePublicKey([7; 32]);
+        let past = Instant::now() - Duration::from_secs(1);
+        a.add_peer(k);
+        a.set_peer_expiry(&k, past);
+        a.add_peer(k);
+        assert!(a.is_authorized_peer(&k));
+        a.set_peer_expiry(&k, past);
+        a.add_peer_with_psk(k, NoisePresharedKey([1; 32]));
+        assert!(a.is_authorized_peer(&k));
+        // add_peer keeps the preshared key it already had.
+        a.add_peer(k);
+        assert!(a.get_peer_info(&k).unwrap().has_psk);
+    }
+
+    /// An expired peer's initiation, accepted from the unknown-peer callback
+    /// as documented, completes the handshake. Before, the peer stayed
+    /// unauthorized, the re-fed initiation invoked the callback again, and
+    /// the two recursed until the stack overflowed.
+    #[test]
+    fn accepting_an_expired_peer_from_the_callback_completes() {
+        use std::sync::Weak;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let slot: Arc<Mutex<Option<Weak<Handler>>>> = Arc::default();
+        let (c, s) = (calls.clone(), slot.clone());
+        let resp: Arc<Mutex<Option<Result<Vec<u8>>>>> = Arc::default();
+        let r = resp.clone();
+        let b = Handler::new(Config::default().on_unknown_peer(Arc::new(
+            move |k, addr, pkt: &[u8]| {
+                // Bail out well before the stack would overflow.
+                if c.fetch_add(1, Ordering::SeqCst) > 20 {
+                    return;
+                }
+                let h = s.lock().unwrap().as_ref().and_then(Weak::upgrade);
+                if let Some(h) = h {
+                    let got = h.accept_unknown_peer(k, pkt, &addr);
+                    r.lock().unwrap().get_or_insert(got);
+                }
+            },
+        )))
+        .unwrap();
+        *slot.lock().unwrap() = Some(Arc::downgrade(&b));
+        let a = Handler::new(Config::default()).unwrap();
+        a.add_peer(b.public_key());
+        b.add_peer(a.public_key());
+        b.set_peer_expiry(&a.public_key(), Instant::now() - Duration::from_secs(1));
+
+        let init = a.initiate_handshake(&b.public_key()).unwrap();
+        assert!(b.process_packet(&init, &loopback()).is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let resp = resp.lock().unwrap().take().unwrap().unwrap();
+        assert_eq!(
+            a.process_packet(&resp, &loopback()).unwrap().ty,
+            PacketType::HandshakeResponse
+        );
+    }
+
+    /// A callback that re-feeds the initiation without authorizing the peer
+    /// is not invoked again from inside itself.
+    #[test]
+    fn the_unknown_peer_callback_does_not_recurse() {
+        use std::sync::Weak;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let slot: Arc<Mutex<Option<Weak<Handler>>>> = Arc::default();
+        let (c, s) = (calls.clone(), slot.clone());
+        let b = Handler::new(Config::default().on_unknown_peer(Arc::new(
+            move |_, addr, pkt: &[u8]| {
+                if c.fetch_add(1, Ordering::SeqCst) > 20 {
+                    return;
+                }
+                let h = s.lock().unwrap().as_ref().and_then(Weak::upgrade);
+                if let Some(h) = h {
+                    assert!(h.process_packet(pkt, &addr).is_err());
+                }
+            },
+        )))
+        .unwrap();
+        *slot.lock().unwrap() = Some(Arc::downgrade(&b));
+        let a = Handler::new(Config::default()).unwrap();
+        a.add_peer(b.public_key());
+        for _ in 0..2 {
+            let init = a.initiate_handshake(&b.public_key()).unwrap();
+            assert!(b.process_packet(&init, &loopback()).is_err());
+        }
+        // Once per packet: the guard is released between them.
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]
