@@ -3,7 +3,7 @@
 //! - [`Table`] is the resolver cache: lookups, learning, capped at 4096 entries
 //!   (a full cache evicts the entry closest to expiry),
 //!   entries age out after 5 minutes.
-//! - [`Pending`] buffers packets awaiting resolution, up to 16 per target and
+//! - [`Pending`] buffers packets awaiting resolution, the newest 16 per target and
 //!   256 targets, and discards stale queues after 3 seconds.
 //! - [`build_packet`] / [`parse`] encode and decode the 28-byte ARP body.
 
@@ -158,6 +158,7 @@ impl<K: Eq + Hash + Copy + Send + 'static> Pending<K> {
 
     /// Buffer `pkt` for `ip`. Returns `true` when this is the first packet
     /// queued for `ip` — i.e. the caller should send an ARP solicitation now.
+    /// A queue already holding [`PENDING_MAX_PKTS`] drops its oldest packet.
     ///
     /// Once [`PENDING_MAX_TARGETS`] destinations are waiting, a packet for
     /// yet another one is dropped and `false` returned, so nothing is
@@ -176,9 +177,13 @@ impl<K: Eq + Hash + Copy + Send + 'static> Pending<K> {
         if first {
             entry.created = Some(now);
         }
-        if entry.packets.len() < PENDING_MAX_PKTS {
-            entry.packets.push(pkt.to_vec());
+        // RFC 4861 §7.2.2: a full queue makes room by dropping its oldest
+        // packet. The newest is the one a sender still cares about -- a
+        // retransmission supersedes what it retransmits.
+        if entry.packets.len() >= PENDING_MAX_PKTS {
+            entry.packets.remove(0);
         }
+        entry.packets.push(pkt.to_vec());
         first
     }
 
@@ -343,6 +348,19 @@ mod tests {
         assert!(!p.enqueue(Ipv4Addr::from(0x0a00_0000), b"y"));
         assert_eq!(p.drain(Ipv4Addr::from(0x0a00_0000)).len(), 2);
         assert_eq!(p.inner.lock().unwrap().len(), PENDING_MAX_TARGETS - 1);
+    }
+
+    #[test]
+    fn full_queue_drops_its_oldest_packet() {
+        let p = Pending::new();
+        let ip = Ipv4Addr::new(10, 0, 0, 1);
+        for i in 0..=PENDING_MAX_PKTS as u8 {
+            p.enqueue(ip, &[i]);
+        }
+        let q = p.drain(ip);
+        assert_eq!(q.len(), PENDING_MAX_PKTS);
+        assert_eq!(q[0], [1], "the oldest was kept");
+        assert_eq!(q[PENDING_MAX_PKTS - 1], [PENDING_MAX_PKTS as u8]);
     }
 
     #[test]
