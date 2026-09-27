@@ -53,11 +53,16 @@ pub struct Request {
     headers: Vec<(String, String)>,
     body: Vec<u8>,
     timeout: Duration,
+    max_response_body: usize,
 }
 
 /// How long [`Client::http`] waits by default for the connection, the
 /// request to go out, and the whole response to arrive.
 pub const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The largest response body [`Client::http`] accepts by default. The body
+/// is held in memory whole, so what a server may send has to stop somewhere.
+pub const DEFAULT_MAX_RESPONSE_BODY: usize = 64 << 20;
 
 impl Request {
     /// Start a GET request to `url` (form: `http://host[:port]/path`).
@@ -82,6 +87,7 @@ impl Request {
             headers: Vec::new(),
             body: Vec::new(),
             timeout: DEFAULT_HTTP_TIMEOUT,
+            max_response_body: DEFAULT_MAX_RESPONSE_BODY,
         })
     }
 
@@ -90,6 +96,14 @@ impl Request {
     /// bounded separately, by the resolver's own timeout.
     pub fn timeout(mut self, timeout: Duration) -> Request {
         self.timeout = timeout;
+        self
+    }
+
+    /// Refuse a response whose body is longer than `max` bytes (after
+    /// chunked decoding) with [`InvalidData`](io::ErrorKind::InvalidData)
+    /// ([`DEFAULT_MAX_RESPONSE_BODY`] unless set).
+    pub fn max_response_body(mut self, max: usize) -> Request {
+        self.max_response_body = max;
         self
     }
 
@@ -187,7 +201,10 @@ impl Client {
 
         // Read until the response's own framing says it is complete, or to
         // EOF when it has none (we ask for `Connection: close`).
-        let mut reader = ResponseReader::new(req.method.eq_ignore_ascii_case("HEAD"));
+        let mut reader = ResponseReader::new(
+            req.method.eq_ignore_ascii_case("HEAD"),
+            req.max_response_body,
+        );
         let mut buf = [0u8; 16 * 1024];
         loop {
             conn.set_read_timeout(Some(remaining()?));
@@ -324,8 +341,20 @@ const MAX_HEAD: usize = 64 * 1024;
 /// Longest chunk-size or trailer line accepted in a chunked body.
 const MAX_CHUNK_LINE: usize = 4096;
 
+/// Most trailer lines accepted after a chunked body: each is bounded by
+/// [`MAX_CHUNK_LINE`], but a peer could otherwise send them forever.
+const MAX_TRAILERS: usize = 100;
+
+/// Most interim (1xx) responses accepted before the final one, for the same
+/// reason.
+const MAX_INTERIM: usize = 16;
+
 fn invalid(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.to_string())
+}
+
+fn too_large() -> io::Error {
+    invalid("response body too large")
 }
 
 /// How the body of a response is delimited (RFC 9112 §6.3).
@@ -350,8 +379,16 @@ enum Chunked {
 /// An incremental HTTP/1.1 response parser: bytes are fed as they arrive,
 /// each one examined a bounded number of times, so reading a large or
 /// slowly arriving response costs time linear in its size.
+///
+/// Consumed bytes are dropped from `buf` after every feed, so it holds only
+/// what is not yet complete (a partial head or line); the body is kept once,
+/// in `body`, and bounded by `max_body`.
 struct ResponseReader {
     head_request: bool,
+    max_body: usize,
+    /// Interim responses skipped, and trailer lines read.
+    interim: usize,
+    trailers: usize,
     buf: Vec<u8>,
     /// Where the header terminator search resumes.
     scan: usize,
@@ -363,9 +400,12 @@ struct ResponseReader {
 }
 
 impl ResponseReader {
-    fn new(head_request: bool) -> ResponseReader {
+    fn new(head_request: bool, max_body: usize) -> ResponseReader {
         ResponseReader {
             head_request,
+            max_body,
+            interim: 0,
+            trailers: 0,
             buf: Vec::new(),
             scan: 0,
             head: None,
@@ -378,6 +418,12 @@ impl ResponseReader {
     /// Add received bytes. Returns the response once it is complete.
     fn feed(&mut self, data: &[u8]) -> io::Result<Option<Response>> {
         self.buf.extend_from_slice(data);
+        let done = self.advance();
+        self.compact();
+        done
+    }
+
+    fn advance(&mut self) -> io::Result<Option<Response>> {
         loop {
             if self.head.is_none() && !self.parse_head()? {
                 return Ok(None);
@@ -400,10 +446,8 @@ impl ResponseReader {
             return Err(eof("connection closed before the response headers"));
         }
         match self.framing {
-            Framing::ToEof => {
-                self.body.extend_from_slice(&self.buf[self.pos..]);
-                Ok(self.take())
-            }
+            // Every byte has gone into the body as it arrived.
+            Framing::ToEof => Ok(self.take()),
             Framing::Length(_) => Err(eof("connection closed before the whole body arrived")),
             Framing::Chunked(_) => Err(eof("connection closed inside a chunked body")),
         }
@@ -420,6 +464,10 @@ impl ResponseReader {
             return Ok(false);
         };
         let end = from + i + 4;
+        // One feed can bring a whole oversized head at once.
+        if end - self.pos > MAX_HEAD {
+            return Err(invalid("response headers too large"));
+        }
         let (status, reason, headers, set_cookies) =
             parse_head(&self.buf[self.pos..end]).map_err(invalid)?;
         self.pos = end;
@@ -427,6 +475,10 @@ impl ResponseReader {
         if (100..200).contains(&status) && status != 101 {
             // Interim response (100 Continue, 103 Early Hints): the real one
             // follows.
+            self.interim += 1;
+            if self.interim > MAX_INTERIM {
+                return Err(invalid("too many interim responses"));
+            }
             return Ok(true);
         }
         let chunked = headers.get("transfer-encoding").is_some_and(|te| {
@@ -441,7 +493,11 @@ impl ResponseReader {
         } else if headers.contains_key("transfer-encoding") {
             Framing::ToEof
         } else if let Some(cl) = headers.get("content-length") {
-            Framing::Length(content_length(cl).ok_or_else(|| invalid("bad Content-Length"))?)
+            let len = content_length(cl).ok_or_else(|| invalid("bad Content-Length"))?;
+            if len > self.max_body {
+                return Err(too_large());
+            }
+            Framing::Length(len)
         } else {
             Framing::ToEof
         };
@@ -455,16 +511,22 @@ impl ResponseReader {
             return Ok(false); // skipped an interim response
         }
         match &mut self.framing {
-            Framing::ToEof => Ok(false),
-            Framing::Length(n) => {
-                let have = self.buf.len() - self.pos;
-                if have < *n {
-                    return Ok(false);
+            Framing::ToEof => {
+                let rest = &self.buf[self.pos..];
+                if rest.len() > self.max_body - self.body.len() {
+                    return Err(too_large());
                 }
-                let end = self.pos + *n;
-                self.body.extend_from_slice(&self.buf[self.pos..end]);
-                self.pos = end;
-                Ok(true)
+                self.body.extend_from_slice(rest);
+                self.pos = self.buf.len();
+                Ok(false)
+            }
+            Framing::Length(left) => {
+                let take = (self.buf.len() - self.pos).min(*left);
+                self.body
+                    .extend_from_slice(&self.buf[self.pos..self.pos + take]);
+                self.pos += take;
+                *left -= take;
+                Ok(*left == 0)
             }
             Framing::Chunked(state) => loop {
                 match state {
@@ -485,6 +547,11 @@ impl ResponseReader {
                         }
                         let size = usize::from_str_radix(hex, 16)
                             .map_err(|_| invalid("bad chunk size"))?;
+                        // Refused on the announcement: waiting for the data
+                        // would only let it fill memory first.
+                        if size > self.max_body - self.body.len() {
+                            return Err(too_large());
+                        }
                         *state = if size == 0 {
                             Chunked::Trailer
                         } else {
@@ -492,28 +559,20 @@ impl ResponseReader {
                         };
                     }
                     Chunked::Data(left) => {
-                        let have = self.buf.len() - self.pos;
-                        // A size near usize::MAX is legal to announce;
-                        // it just never arrives, so saturate.
-                        if have < left.saturating_add(2) {
-                            // Take what is here so the buffer need not hold
-                            // the whole chunk.
-                            let take = have.min(*left);
-                            self.body
-                                .extend_from_slice(&self.buf[self.pos..self.pos + take]);
-                            self.pos += take;
-                            *left -= take;
-                            if *left > 0 || have < 2 + take {
-                                self.compact();
-                                return Ok(false);
-                            }
+                        // Take what is here so the buffer need not hold the
+                        // whole chunk.
+                        let take = (self.buf.len() - self.pos).min(*left);
+                        self.body
+                            .extend_from_slice(&self.buf[self.pos..self.pos + take]);
+                        self.pos += take;
+                        *left -= take;
+                        if *left > 0 || self.buf.len() - self.pos < 2 {
+                            return Ok(false);
                         }
-                        let end = self.pos + *left;
-                        self.body.extend_from_slice(&self.buf[self.pos..end]);
-                        if &self.buf[end..end + 2] != b"\r\n" {
+                        if &self.buf[self.pos..self.pos + 2] != b"\r\n" {
                             return Err(invalid("chunk not followed by CRLF"));
                         }
-                        self.pos = end + 2;
+                        self.pos += 2;
                         *state = Chunked::Size;
                     }
                     Chunked::Trailer => {
@@ -523,16 +582,20 @@ impl ResponseReader {
                         if line.is_empty() {
                             return Ok(true);
                         }
+                        self.trailers += 1;
+                        if self.trailers > MAX_TRAILERS {
+                            return Err(invalid("too many trailer fields"));
+                        }
                     }
                 }
             },
         }
     }
 
-    /// Drop consumed body bytes so a long chunked body does not stay
-    /// buffered twice.
+    /// Drop the bytes already consumed, so neither a long body nor a run of
+    /// interim heads or trailers stays buffered.
     fn compact(&mut self) {
-        if self.pos > 64 * 1024 {
+        if self.pos > 0 {
             self.buf.drain(..self.pos);
             self.scan = self.scan.saturating_sub(self.pos);
             self.pos = 0;
@@ -745,7 +808,7 @@ mod tests {
 
     /// Feed `raw` in pieces of `step` bytes, then close.
     fn read_response(raw: &[u8], step: usize) -> io::Result<Response> {
-        let mut r = ResponseReader::new(false);
+        let mut r = ResponseReader::new(false, DEFAULT_MAX_RESPONSE_BODY);
         for piece in raw.chunks(step) {
             if let Some(resp) = r.feed(piece)? {
                 return Ok(resp);
@@ -796,7 +859,7 @@ mod tests {
 
     #[test]
     fn complete_before_eof_when_length_known() {
-        let mut r = ResponseReader::new(false);
+        let mut r = ResponseReader::new(false, DEFAULT_MAX_RESPONSE_BODY);
         let resp = r
             .feed(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi")
             .unwrap();
@@ -864,10 +927,10 @@ mod tests {
     #[test]
     fn interim_and_bodyless_responses() {
         let raw = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 204 No Content\r\n\r\n";
-        let mut r = ResponseReader::new(false);
+        let mut r = ResponseReader::new(false, DEFAULT_MAX_RESPONSE_BODY);
         assert_eq!(r.feed(raw).unwrap().unwrap().status, 204);
 
-        let mut r = ResponseReader::new(true);
+        let mut r = ResponseReader::new(true, DEFAULT_MAX_RESPONSE_BODY);
         let head = b"HTTP/1.1 200 OK\r\nContent-Length: 99\r\n\r\n";
         assert!(r.feed(head).unwrap().unwrap().body.is_empty());
     }
@@ -886,6 +949,102 @@ mod tests {
         let r = read_response(&raw, 4096).unwrap();
         assert_eq!(r.body.len(), 8_000_000);
         assert!(start.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    /// Only what is not yet parsed stays buffered: consumed body bytes,
+    /// interim heads and trailers are dropped, whatever the framing.
+    #[test]
+    fn consumed_bytes_do_not_stay_buffered() {
+        let body = vec![b'x'; 1 << 20];
+        let mut interim = Vec::new();
+        for _ in 0..MAX_INTERIM {
+            interim.extend_from_slice(b"HTTP/1.1 103 Early Hints\r\nLink: </a>\r\n\r\n");
+        }
+        let mut chunked = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        for c in body.chunks(1000) {
+            chunked.extend_from_slice(format!("{:x}\r\n", c.len()).as_bytes());
+            chunked.extend_from_slice(c);
+            chunked.extend_from_slice(b"\r\n");
+        }
+        chunked.extend_from_slice(b"0\r\n");
+        for _ in 0..MAX_TRAILERS {
+            chunked.extend_from_slice(b"X-Trailer: 1\r\n");
+        }
+        chunked.extend_from_slice(b"\r\n");
+        let with_length = [
+            &interim[..],
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()).as_bytes(),
+            &body,
+        ]
+        .concat();
+        let to_eof = [&interim[..], b"HTTP/1.1 200 OK\r\n\r\n", &body].concat();
+
+        for raw in [&with_length, &chunked, &to_eof] {
+            let mut r = ResponseReader::new(false, DEFAULT_MAX_RESPONSE_BODY);
+            let mut resp = None;
+            for piece in raw.chunks(16 * 1024) {
+                resp = r.feed(piece).unwrap();
+                assert!(r.buf.len() <= MAX_HEAD, "{} bytes buffered", r.buf.len());
+                if resp.is_some() {
+                    break;
+                }
+            }
+            let resp = match resp {
+                Some(resp) => resp,
+                None => r.finish().unwrap(),
+            };
+            assert_eq!(resp.body, body);
+        }
+    }
+
+    #[test]
+    fn response_limits_are_enforced() {
+        let limited = |raw: &[u8], max: usize| {
+            let mut r = ResponseReader::new(false, max);
+            for piece in raw.chunks(7) {
+                if let Some(resp) = r.feed(piece)? {
+                    return Ok(resp);
+                }
+            }
+            r.finish()
+        };
+        let is_invalid =
+            |res: io::Result<Response>| res.is_err_and(|e| e.kind() == io::ErrorKind::InvalidData);
+        // A body of exactly the limit is fine; one byte over is not, however
+        // it is framed.
+        for (raw, len) in [
+            (&b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"[..], 5),
+            (
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nhel\r\n2\r\nlo\r\n0\r\n\r\n",
+                5,
+            ),
+            (b"HTTP/1.1 200 OK\r\n\r\nhello", 5),
+        ] {
+            assert_eq!(limited(raw, len).unwrap().body, b"hello");
+            assert!(is_invalid(limited(raw, len - 1)), "{raw:?}");
+        }
+
+        let head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n";
+        let mut raw = head.to_vec();
+        for _ in 0..=MAX_TRAILERS {
+            raw.extend_from_slice(b"X: 1\r\n");
+        }
+        raw.extend_from_slice(b"\r\n");
+        assert!(is_invalid(limited(&raw, 100)));
+
+        let mut raw = Vec::new();
+        for _ in 0..=MAX_INTERIM {
+            raw.extend_from_slice(b"HTTP/1.1 100 Continue\r\n\r\n");
+        }
+        raw.extend_from_slice(b"HTTP/1.1 204 No Content\r\n\r\n");
+        assert!(is_invalid(limited(&raw, 100)));
+
+        // A head over the limit that arrives in one piece.
+        let mut raw = b"HTTP/1.1 200 OK\r\nX: ".to_vec();
+        raw.resize(MAX_HEAD + 100, b'a');
+        raw.extend_from_slice(b"\r\nContent-Length: 0\r\n\r\n");
+        let mut r = ResponseReader::new(false, 100);
+        assert!(is_invalid(r.feed(&raw).map(|_| unreachable!())));
     }
 
     /// A server that completes the handshake and then never answers.
