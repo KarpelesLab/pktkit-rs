@@ -62,5 +62,7 @@ pub use multihandler::{MultiHandler, MultiPacketResult};
 pub use replay::SlidingWindow;
 #[cfg(not(target_family = "wasm"))]
 pub use server::{OnPacketFn, OnPeerConnectedFn, Server, ServerConfig};
-pub use timers::{KEEPALIVE_TIMEOUT, REKEY_ATTEMPT_TIME, REKEY_TIMEOUT, TimerAction};
+pub use timers::{
+    KEEPALIVE_TIMEOUT, MAX_TIMER_HANDSHAKES, REKEY_ATTEMPT_TIME, REKEY_TIMEOUT, TimerAction,
+};
 pub use transport::{EncryptError, encrypted_size};

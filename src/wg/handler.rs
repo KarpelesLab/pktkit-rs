@@ -1332,7 +1332,10 @@ mod tests {
         assert!(timer_actions(&a).is_empty());
         rewind(&a, &b.public_key(), Duration::from_secs(6));
         assert_eq!(timer_actions(&a), ["handshake"]);
-        rewind(&a, &b.public_key(), crate::wg::REKEY_ATTEMPT_TIME);
+        a.with_timers(&b.public_key(), |t| {
+            t.attempts = crate::wg::MAX_TIMER_HANDSHAKES + 1;
+        });
+        rewind(&a, &b.public_key(), Duration::from_secs(6));
         assert_eq!(timer_actions(&a), ["failed"]);
     }
 
@@ -1726,7 +1729,7 @@ mod tests {
         let t0 = Instant::now();
         a.with_timers(&b.public_key(), |t| t.keepalive_due_since = Some(t0));
         let (inits, failed, _) = run_timers(&a, t0, 3600);
-        assert!((1..=20).contains(&inits), "{inits} initiations");
+        assert_eq!(inits, crate::wg::MAX_TIMER_HANDSHAKES as usize + 2);
         assert_eq!(failed, 1);
     }
 

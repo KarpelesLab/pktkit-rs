@@ -17,8 +17,17 @@ use crate::wg::NoisePublicKey;
 /// How long to wait for a handshake response before sending the initiation
 /// again.
 pub const REKEY_TIMEOUT: Duration = Duration::from_secs(5);
-/// How long to keep retrying a handshake before giving up.
+/// How long to keep retrying a handshake before giving up. As in the
+/// reference, this sets the number of retries, [`MAX_TIMER_HANDSHAKES`],
+/// rather than a deadline: with the jitter each retry adds, the last one
+/// goes out a little past it.
 pub const REKEY_ATTEMPT_TIME: Duration = Duration::from_secs(90);
+/// An unanswered initiation is sent again `MAX_TIMER_HANDSHAKES + 1` times,
+/// `MAX_TIMER_HANDSHAKES + 2` initiations in all, before the attempt is
+/// abandoned. The value and the count are the reference's
+/// (`REKEY_ATTEMPT_TIME / REKEY_TIMEOUT`, compared with `>`).
+pub const MAX_TIMER_HANDSHAKES: u32 =
+    (REKEY_ATTEMPT_TIME.as_secs() / REKEY_TIMEOUT.as_secs()) as u32;
 /// How long after receiving data to wait for something to send back before
 /// sending a keepalive instead.
 pub const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -42,7 +51,8 @@ pub enum TimerAction {
         peer: NoisePublicKey,
         packet: Vec<u8>,
     },
-    /// No handshake response came within `REKEY_ATTEMPT_TIME`, or an
+    /// No handshake response came to `MAX_TIMER_HANDSHAKES + 2`
+    /// initiations (about `REKEY_ATTEMPT_TIME`), or an
     /// initiation could not be built at all (the peer's authorization
     /// expired, say). Anything queued for this peer should be dropped.
     HandshakeFailed { peer: NoisePublicKey },
@@ -53,6 +63,8 @@ pub enum TimerAction {
 pub(crate) struct PeerTimers {
     /// When the current handshake attempt began; `None` when not trying.
     pub attempt_started: Option<Instant>,
+    /// Retries of the current attempt so far.
+    pub attempts: u32,
     /// When the last initiation went out, and how much jitter to add before
     /// the next.
     pub last_initiation: Option<Instant>,
@@ -71,7 +83,10 @@ pub(crate) struct PeerTimers {
 
 impl PeerTimers {
     pub fn initiation_sent(&mut self, now: Instant) {
-        self.attempt_started.get_or_insert(now);
+        if self.attempt_started.is_none() {
+            self.attempt_started = Some(now);
+            self.attempts = 0;
+        }
         self.last_initiation = Some(now);
         // An initiation is an authenticated packet like any other for
         // persistent keepalive, which the reference re-arms on every one
@@ -85,6 +100,7 @@ impl PeerTimers {
 
     pub fn handshake_complete(&mut self) {
         self.attempt_started = None;
+        self.attempts = 0;
         self.want_handshake = false;
         self.reply_due_since = None;
     }
@@ -105,10 +121,17 @@ impl PeerTimers {
     }
 
     /// Whether an initiation should go out now. `None` means the attempt has
-    /// run out of time.
+    /// run out of retries.
     pub fn handshake_due(&mut self, now: Instant) -> Option<bool> {
         if let Some(start) = self.attempt_started {
-            if now.duration_since(start) >= REKEY_ATTEMPT_TIME {
+            let last = self.last_initiation.unwrap_or(start);
+            if now.duration_since(last) < REKEY_TIMEOUT + self.jitter {
+                return Some(false);
+            }
+            // Counted as wg_expired_retransmit_handshake counts: a deadline
+            // of REKEY_ATTEMPT_TIME from the first initiation cut the
+            // attempt short by the two retries the reference still sends.
+            if self.attempts > MAX_TIMER_HANDSHAKES {
                 // Giving up drops the pending keepalive as well, as the
                 // reference's wg_expired_retransmit_handshake deletes its
                 // timer: it would otherwise start the next attempt at once.
@@ -118,8 +141,8 @@ impl PeerTimers {
                 self.keepalive_due_since = None;
                 return None;
             }
-            let last = self.last_initiation.unwrap_or(start);
-            return Some(now.duration_since(last) >= REKEY_TIMEOUT + self.jitter);
+            self.attempts += 1;
+            return Some(true);
         }
         if self
             .reply_due_since
@@ -157,13 +180,31 @@ mod tests {
         let mut t = PeerTimers::default();
         t.initiation_sent(t0);
         assert_eq!(t.handshake_due(t0 + Duration::from_secs(1)), Some(false));
-        assert_eq!(
-            t.handshake_due(t0 + REKEY_TIMEOUT + Duration::from_millis(400)),
-            Some(true)
-        );
-        t.initiation_sent(t0 + REKEY_TIMEOUT);
-        assert_eq!(t.handshake_due(t0 + REKEY_ATTEMPT_TIME), None, "gave up");
-        assert_eq!(t.handshake_due(t0 + REKEY_ATTEMPT_TIME), Some(false));
+        // The reference sends MAX_TIMER_HANDSHAKES + 2 initiations, each
+        // REKEY_TIMEOUT plus jitter after the last, and gives up when the
+        // last goes unanswered as long; a deadline of REKEY_ATTEMPT_TIME
+        // gave up two or three initiations sooner.
+        let step = REKEY_TIMEOUT + Duration::from_millis(400);
+        let mut now = t0;
+        let mut sent = 1;
+        loop {
+            now += step;
+            match t.handshake_due(now) {
+                Some(true) => {
+                    t.initiation_sent(now);
+                    sent += 1;
+                }
+                Some(false) => panic!("retry not due after {step:?}"),
+                None => break,
+            }
+        }
+        assert_eq!(sent, MAX_TIMER_HANDSHAKES + 2);
+        assert_eq!(MAX_TIMER_HANDSHAKES, 18);
+        assert_eq!(t.handshake_due(now), Some(false), "gave up once");
+
+        // A new attempt gets its retries afresh.
+        t.initiation_sent(now);
+        assert_eq!(t.handshake_due(now + step), Some(true));
     }
 
     #[test]
