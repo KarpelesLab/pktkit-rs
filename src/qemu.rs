@@ -15,7 +15,7 @@
 
 use crate::{Frame, L2Device, L2Handler, MacAddr, Result};
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs};
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
@@ -27,6 +27,32 @@ const MAX_FRAME_SIZE: usize = 65535;
 struct DoneSignal {
     closed: AtomicBool,
     wait: (Mutex<bool>, Condvar),
+}
+
+/// The frame handler, plus a condvar the reader waits on until one is
+/// installed. The stream is reliable: QEMU sent every frame on it once, so a
+/// frame that arrives before [`set_handler`](L2Device::set_handler) must be
+/// held, not dropped. Waiting in the reader leaves it in the socket buffer.
+struct HandlerSlot {
+    handler: Mutex<Option<L2Handler>>,
+    ready: Condvar,
+}
+
+impl HandlerSlot {
+    /// The handler, waiting for one if none is installed yet. `None` once
+    /// the connection is closed.
+    fn get(&self, done: &DoneSignal) -> Option<L2Handler> {
+        let mut h = self.handler.lock().unwrap();
+        loop {
+            if done.closed.load(Ordering::Acquire) {
+                return None;
+            }
+            if let Some(h) = h.as_ref() {
+                return Some(h.clone());
+            }
+            h = self.ready.wait(h).unwrap();
+        }
+    }
 }
 
 impl DoneSignal {
@@ -58,8 +84,11 @@ impl DoneSignal {
 pub struct Conn {
     mac: MacAddr,
     write: Mutex<Box<dyn Write + Send>>,
-    handler: Arc<Mutex<Option<L2Handler>>>,
+    handler: Arc<HandlerSlot>,
     done: Arc<DoneSignal>,
+    /// Shuts the socket down in both directions: the peer sees EOF and the
+    /// reader thread's blocked read returns.
+    shutdown: Box<dyn Fn() + Send + Sync>,
 }
 
 impl core::fmt::Debug for Conn {
@@ -71,14 +100,19 @@ impl core::fmt::Debug for Conn {
 }
 
 impl Conn {
-    /// Build a Conn from a pre-split read/write pair. Spawns a reader thread
-    /// that invokes the installed handler for each received frame.
+    /// Build a Conn from a pre-split read/write pair and a way to shut the
+    /// socket down. Spawns a reader thread that invokes the installed handler
+    /// for each received frame.
     fn from_split(
         read: Box<dyn Read + Send + 'static>,
         write: Box<dyn Write + Send + 'static>,
+        shutdown: Box<dyn Fn() + Send + Sync>,
     ) -> Arc<Conn> {
         let mac = MacAddr::random_local_unicast();
-        let handler: Arc<Mutex<Option<L2Handler>>> = Arc::new(Mutex::new(None));
+        let handler = Arc::new(HandlerSlot {
+            handler: Mutex::new(None),
+            ready: Condvar::new(),
+        });
         let done = DoneSignal::new();
 
         let handler_t = handler.clone();
@@ -98,10 +132,10 @@ impl Conn {
                 if read.read_exact(&mut buf[..len]).is_err() {
                     break;
                 }
-                let h = handler_t.lock().unwrap().clone();
-                if let Some(h) = h {
-                    let _ = h(Frame::from_slice(&buf[..len]));
-                }
+                let Some(h) = handler_t.get(&done_t) else {
+                    break;
+                };
+                let _ = h(Frame::from_slice(&buf[..len]));
             }
             done_t.signal();
         });
@@ -111,7 +145,17 @@ impl Conn {
             write: Mutex::new(write),
             handler,
             done,
+            shutdown,
         })
+    }
+
+    fn shut(&self) {
+        self.done.signal();
+        // Wake a reader waiting for a handler, so it sees the close.
+        let _guard = self.handler.handler.lock().unwrap();
+        self.handler.ready.notify_all();
+        drop(_guard);
+        (self.shutdown)();
     }
 
     /// Wait until the connection is closed (peer disconnects or
@@ -123,7 +167,8 @@ impl Conn {
 
 impl L2Device for Conn {
     fn set_handler(&self, h: L2Handler) {
-        *self.handler.lock().unwrap() = Some(h);
+        *self.handler.handler.lock().unwrap() = Some(h);
+        self.handler.ready.notify_all();
     }
     fn send(&self, f: &Frame) -> Result<()> {
         let bytes = f.as_bytes();
@@ -141,8 +186,17 @@ impl L2Device for Conn {
         self.mac
     }
     fn close(&self) -> Result<()> {
-        self.done.signal();
+        self.shut();
         Ok(())
+    }
+}
+
+impl Drop for Conn {
+    fn drop(&mut self) {
+        // The reader thread holds no reference to the Conn, so without this
+        // the socket would stay open, and the thread blocked on it, until the
+        // peer happened to hang up.
+        self.shut();
     }
 }
 
@@ -154,9 +208,15 @@ impl crate::DoneSignal for Arc<Conn> {
 
 /// Dial a QEMU socket netdev over TCP.
 pub fn dial_tcp(addr: impl ToSocketAddrs) -> Result<Arc<Conn>> {
-    let s = TcpStream::connect(addr)?;
-    let s2 = s.try_clone()?;
-    Ok(Conn::from_split(Box::new(s), Box::new(s2)))
+    tcp_conn(TcpStream::connect(addr)?)
+}
+
+fn tcp_conn(s: TcpStream) -> Result<Arc<Conn>> {
+    let (w, c) = (s.try_clone()?, s.try_clone()?);
+    let shutdown = Box::new(move || {
+        let _ = c.shutdown(Shutdown::Both);
+    });
+    Ok(Conn::from_split(Box::new(s), Box::new(w), shutdown))
 }
 
 /// Dial a QEMU socket netdev over a Unix domain socket.
@@ -165,9 +225,16 @@ pub fn dial_tcp(addr: impl ToSocketAddrs) -> Result<Arc<Conn>> {
 /// use [`dial_tcp`] there.
 #[cfg(unix)]
 pub fn dial_unix(path: impl AsRef<Path>) -> Result<Arc<Conn>> {
-    let s = UnixStream::connect(path)?;
-    let s2 = s.try_clone()?;
-    Ok(Conn::from_split(Box::new(s), Box::new(s2)))
+    unix_conn(UnixStream::connect(path)?)
+}
+
+#[cfg(unix)]
+fn unix_conn(s: UnixStream) -> Result<Arc<Conn>> {
+    let (w, c) = (s.try_clone()?, s.try_clone()?);
+    let shutdown = Box::new(move || {
+        let _ = c.shutdown(Shutdown::Both);
+    });
+    Ok(Conn::from_split(Box::new(s), Box::new(w), shutdown))
 }
 
 /// Dial a QEMU socket netdev over a Unix domain socket.
@@ -236,17 +303,9 @@ impl Listener {
     /// Block until a peer arrives, then wrap it as a [`Conn`].
     pub fn accept(&self) -> Result<Arc<Conn>> {
         match self {
-            Listener::Tcp(l) => {
-                let (s, _) = l.accept()?;
-                let s2 = s.try_clone()?;
-                Ok(Conn::from_split(Box::new(s), Box::new(s2)))
-            }
+            Listener::Tcp(l) => tcp_conn(l.accept()?.0),
             #[cfg(unix)]
-            Listener::Unix(l) => {
-                let (s, _) = l.accept()?;
-                let s2 = s.try_clone()?;
-                Ok(Conn::from_split(Box::new(s), Box::new(s2)))
-            }
+            Listener::Unix(l) => unix_conn(l.accept()?.0),
         }
     }
 }
@@ -299,6 +358,59 @@ mod tests {
         assert_eq!(echoed, frame);
         // Exactly one copy: nothing else may already be queued behind it.
         assert!(rx.try_recv().is_err(), "frame echoed more than once");
+    }
+
+    /// A frame that arrives before the handler is installed is delivered
+    /// once it is, not dropped: the race behind the old flaky roundtrips,
+    /// made certain here by sending before installing.
+    #[test]
+    fn frames_before_the_handler_are_held() {
+        let ln = Listener::bind_tcp("127.0.0.1:0").unwrap();
+        let Listener::Tcp(l) = &ln else {
+            unreachable!()
+        };
+        let addr = l.local_addr().unwrap();
+        let client = dial_tcp(addr).unwrap();
+        let server = ln.accept().unwrap();
+
+        let m = MacAddr([2, 0, 0, 0, 0, 1]);
+        let frame = build_frame(m, m, EtherType::IPV4, b"early");
+        client.send(Frame::from_slice(&frame)).unwrap();
+        std::thread::sleep(Duration::from_millis(50)); // let the reader get it
+
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        server.set_handler(Arc::new(move |f: &Frame| {
+            let _ = tx.send(f.as_bytes().to_vec());
+            Ok(())
+        }));
+        assert_eq!(rx.recv_timeout(ECHO_TIMEOUT).expect("frame dropped"), frame);
+    }
+
+    /// Closing one end hangs up the socket, so the other end's reader sees
+    /// EOF and its done signal fires.
+    #[test]
+    fn close_hangs_up_the_socket() {
+        let ln = Listener::bind_tcp("127.0.0.1:0").unwrap();
+        let Listener::Tcp(l) = &ln else {
+            unreachable!()
+        };
+        let addr = l.local_addr().unwrap();
+        let client = dial_tcp(addr).unwrap();
+        let server = ln.accept().unwrap();
+        server.set_handler(Arc::new(|_: &Frame| Ok(())));
+
+        let (tx, rx) = mpsc::channel();
+        let s = server.clone();
+        std::thread::spawn(move || {
+            s.wait_done();
+            let _ = tx.send(());
+        });
+        client.close().unwrap();
+        rx.recv_timeout(ECHO_TIMEOUT)
+            .expect("peer never saw the close");
+        // Closing is idempotent, and dropping after it is fine.
+        client.close().unwrap();
+        drop(client);
     }
 
     #[test]
