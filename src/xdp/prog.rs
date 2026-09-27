@@ -54,10 +54,11 @@ impl Mode {
     pub const HARDWARE: Mode = Mode(1 << 3);
 
     /// True if a socket bound behind a program in this mode can negotiate
-    /// `XDP_ZEROCOPY`. Generic XDP always copies.
+    /// `XDP_ZEROCOPY`. Generic XDP always copies, and an offloaded program
+    /// cannot redirect to a socket at all (XSKMAPs are not offloadable).
     #[inline]
     pub fn supports_zerocopy(self) -> bool {
-        self == Mode::DRIVER || self == Mode::HARDWARE
+        self == Mode::DRIVER
     }
 
     /// The concrete modes to try, in order, for this setting.
@@ -425,7 +426,7 @@ mod tests {
     #[test]
     fn only_native_modes_can_zerocopy() {
         assert!(Mode::DRIVER.supports_zerocopy());
-        assert!(Mode::HARDWARE.supports_zerocopy());
+        assert!(!Mode::HARDWARE.supports_zerocopy());
         assert!(!Mode::GENERIC.supports_zerocopy());
         // AUTO is not a resolved mode; it must not promise zero-copy.
         assert!(!Mode::AUTO.supports_zerocopy());
