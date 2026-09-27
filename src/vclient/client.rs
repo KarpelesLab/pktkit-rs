@@ -42,7 +42,9 @@ setters! {
 pub struct Client {
     cfg: Mutex<ClientConfig>,
     handler: Arc<Mutex<Option<L3Handler>>>,
-    addr: Mutex<IpPrefix>,
+    /// Shared with the listeners bound to the client's own address, so that
+    /// they report it as it is now, not as it was when they were opened.
+    addr: Arc<Mutex<IpPrefix>>,
     tcp: Arc<TcpStack>,
     udp: Arc<UdpStack>,
     /// Inbound fragments awaiting the rest of their datagram.
@@ -78,19 +80,21 @@ impl Client {
         Arc::new(Client {
             cfg: Mutex::new(cfg),
             handler,
-            addr: Mutex::new(addr),
+            addr: Arc::new(Mutex::new(addr)),
             tcp,
             udp,
             defrag: Mutex::new(Reassembler::default()),
         })
     }
 
-    /// Listen for inbound virtual TCP connections on `port` (bound to the
-    /// client's own address). [`Listener::accept`](super::Listener::accept)
+    /// Listen for inbound virtual TCP connections on `port` at the client's
+    /// own address: whatever that is when each connection arrives, so the
+    /// listener follows the client through a change of address
+    /// ([`set_addr`](L3Device::set_addr), DHCP) rather than keep answering
+    /// for the old one. [`Listener::accept`](super::Listener::accept)
     /// yields each connection once its handshake completes.
     pub fn listen_tcp(&self, port: u16) -> Result<super::Listener> {
-        let local_ip = self.addr().addr();
-        self.tcp.listen(local_ip, port)
+        self.tcp.listen(self.addr.clone(), port)
     }
 
     /// Open a connected UDP socket to `addr` over the virtual network.
@@ -251,5 +255,57 @@ mod tests {
                 .expect("a handle stayed blocked");
             assert!(failed, "{what} returned success");
         }
+    }
+
+    /// A listener on the client's own address follows it when it changes.
+    #[test]
+    fn listener_follows_the_clients_address() {
+        use crate::vtcp::segment::{Segment, flags};
+        let (old, new) = (Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(10, 0, 0, 3));
+        let client = Client::new(ClientConfig::default().prefix(IpPrefix::new(old.into(), 24)));
+        let sent: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
+        let s = sent.clone();
+        client.set_handler(Arc::new(move |p: &Packet| {
+            s.lock().unwrap().push(p.as_bytes().to_vec());
+            Ok(())
+        }));
+        let listener = client.listen_tcp(80).unwrap();
+        client.set_addr(IpPrefix::new(new.into(), 24)).unwrap();
+        assert_eq!(listener.local_addr(), SocketAddr::from((new, 80)));
+
+        // Replies to a SYN from port `src_port` to `dst`:80.
+        let syn = |dst: Ipv4Addr, src_port: u16| {
+            let seg = Segment {
+                src_port,
+                dst_port: 80,
+                seq: 1,
+                flags: flags::SYN,
+                ..Default::default()
+            };
+            let mut ip = crate::build::build_ipv4(
+                Ipv4Addr::new(10, 0, 0, 1),
+                dst,
+                crate::Protocol::TCP,
+                64,
+                &seg.marshal(),
+            );
+            Packet::from_mut(&mut ip).recompute_transport_checksum();
+            sent.lock().unwrap().clear();
+            client.send(Packet::from_slice(&ip)).unwrap();
+            let replies = sent.lock().unwrap().clone();
+            replies
+                .iter()
+                .map(|p| {
+                    let p = Packet::from_slice(p);
+                    (
+                        p.src_addr().unwrap(),
+                        Segment::parse(p.payload()).unwrap().flags,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(syn(new, 4000), [(IpAddr::V4(new), flags::SYN | flags::ACK)]);
+        // The old address is no longer the client's to answer for.
+        assert!(syn(old, 4001).is_empty());
     }
 }

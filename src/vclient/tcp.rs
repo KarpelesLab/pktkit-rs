@@ -357,7 +357,12 @@ impl Drop for TcpConn {
 /// Shared state for a listening socket: an accept queue fed by the stack's
 /// inbound dispatcher when a SYN completes its handshake.
 pub(crate) struct ListenerState {
-    local_ip: IpAddr,
+    /// The client's address, in the cell the client keeps it in. A
+    /// listener is bound to the client's own address, whatever that is
+    /// when each SYN arrives, not to the one it had when the listener was
+    /// opened: after a renumbering (DHCP, `set_addr`) it would otherwise
+    /// refuse connections to the new address and answer for the old.
+    own: Arc<Mutex<IpPrefix>>,
     local_port: u16,
     queue: Mutex<VecDeque<TcpConn>>,
     signal: Condvar,
@@ -372,17 +377,16 @@ const ACCEPT_QUEUE_CAP: usize = 128;
 const HALF_OPEN_CAP: usize = 128;
 
 impl ListenerState {
-    /// Whether a SYN to `dst` is for this listener: one bound to an
-    /// address takes connections to that address alone, and one bound to
-    /// the unspecified address those to the client's own (`ours`) in the
-    /// same family. Anything else would answer for addresses that are not
+    /// Whether a SYN to `dst` is for this listener: only if it is to the
+    /// client's address as it is now (`ours`, read from the same cell for
+    /// this packet). Anything else would answer for addresses that are not
     /// ours, and hand the application connections it never listened for.
     fn accepts(&self, dst: IpAddr, ours: IpAddr) -> bool {
-        if self.local_ip.is_unspecified() {
-            dst == ours && !ours.is_unspecified() && dst.is_ipv4() == self.local_ip.is_ipv4()
-        } else {
-            dst == self.local_ip
-        }
+        dst == ours && !ours.is_unspecified()
+    }
+
+    fn local_ip(&self) -> IpAddr {
+        self.own.lock().unwrap().addr()
     }
 
     /// Mark closed, reset what was waiting to be accepted, and wake `accept`.
@@ -418,9 +422,11 @@ impl core::fmt::Debug for Listener {
 }
 
 impl Listener {
-    /// The address this listener is bound to.
+    /// The address this listener is bound to. For one opened with
+    /// [`Client::listen_tcp`](super::Client::listen_tcp), that is the
+    /// client's address as it is now.
     pub fn local_addr(&self) -> SocketAddr {
-        SocketAddr::new(self.state.local_ip, self.state.local_port)
+        SocketAddr::new(self.state.local_ip(), self.state.local_port)
     }
 
     /// Switch between blocking and non-blocking [`accept`](Self::accept). On
@@ -637,9 +643,10 @@ impl TcpStack {
         }
     }
 
-    /// Register a listening socket on `local_ip:port`. Returns a [`Listener`]
-    /// whose `accept` yields completed inbound connections.
-    pub fn listen(self: &Arc<Self>, local_ip: IpAddr, port: u16) -> io::Result<Listener> {
+    /// Register a listening socket on `port` at the client's own address,
+    /// kept in `own`. Returns a [`Listener`] whose `accept` yields completed
+    /// inbound connections.
+    pub fn listen(self: &Arc<Self>, own: Arc<Mutex<IpPrefix>>, port: u16) -> io::Result<Listener> {
         self.check_open()?;
         let mut listeners = self.listeners.lock().unwrap();
         if listeners.contains_key(&port) {
@@ -649,7 +656,7 @@ impl TcpStack {
             ));
         }
         let state = Arc::new(ListenerState {
-            local_ip,
+            own,
             local_port: port,
             queue: Mutex::new(VecDeque::new()),
             signal: Condvar::new(),
@@ -1087,7 +1094,7 @@ mod tests {
     #[test]
     fn half_open_connections_per_listener_are_capped() {
         let (stack, _out) = capturing_stack();
-        let _listener = stack.listen(IpAddr::V4(US), 80).unwrap();
+        let _listener = stack.listen(own(US), 80).unwrap();
         for port in 0..(HALF_OPEN_CAP as u16 + 50) {
             let syn = Segment {
                 src_port: 10000 + port,
@@ -1104,7 +1111,7 @@ mod tests {
     #[test]
     fn listener_answers_only_for_its_own_address() {
         let (stack, out) = capturing_stack();
-        let _listener = stack.listen(IpAddr::V4(US), 80).unwrap();
+        let _listener = stack.listen(own(US), 80).unwrap();
         let syn = Segment {
             src_port: 4000,
             dst_port: 80,
@@ -1124,24 +1131,26 @@ mod tests {
         stack.handle_inbound(Packet::from_slice(&inbound(syn.clone())), IpAddr::V4(US));
         assert_eq!(stack.conns.lock().unwrap().len(), 1);
 
-        // Bound to the unspecified address: the client's own address, in
-        // the listener's family, and nothing else.
-        let (stack, _out) = capturing_stack();
-        let _listener = stack.listen(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 80).unwrap();
-        let v6 = |dst: Ipv6Addr| wrap_v6("fd00::1".parse().unwrap(), dst, &syn.marshal());
-        let ours6: Ipv6Addr = "fd00::2".parse().unwrap();
-        stack.handle_inbound(Packet::from_slice(&v6(ours6)), IpAddr::V6(ours6));
-        let elsewhere = wrap_v4(PEER, Ipv4Addr::new(10, 0, 0, 9), &syn.marshal());
-        stack.handle_inbound(Packet::from_slice(&elsewhere), IpAddr::V4(US));
+        // A client with no address yet answers for none.
+        let (stack, out) = capturing_stack();
+        let _listener = stack.listen(own(Ipv4Addr::UNSPECIFIED), 80).unwrap();
+        let unspec = wrap_v4(PEER, Ipv4Addr::UNSPECIFIED, &syn.marshal());
+        let ours = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        stack.handle_inbound(Packet::from_slice(&unspec), ours);
+        stack.handle_inbound(Packet::from_slice(&inbound(syn)), ours);
         assert!(stack.conns.lock().unwrap().is_empty());
-        stack.handle_inbound(Packet::from_slice(&inbound(syn)), IpAddr::V4(US));
-        assert_eq!(stack.conns.lock().unwrap().len(), 1);
+        assert!(out.lock().unwrap().is_empty());
+    }
+
+    /// The cell a client keeps its address in, holding `ip`.
+    fn own(ip: Ipv4Addr) -> Arc<Mutex<IpPrefix>> {
+        Arc::new(Mutex::new(IpPrefix::new(IpAddr::V4(ip), 24)))
     }
 
     #[test]
     fn segments_with_a_bad_checksum_are_dropped() {
         let (stack, out) = capturing_stack();
-        let _listener = stack.listen(IpAddr::V4(US), 80).unwrap();
+        let _listener = stack.listen(own(US), 80).unwrap();
         let syn = Segment {
             src_port: 4000,
             dst_port: 80,
