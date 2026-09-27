@@ -71,14 +71,22 @@ struct Entry {
 }
 
 impl Entry {
-    /// Stale and past its time: as good as gone.
+    /// As good as gone: stale and past its time, or probed and never
+    /// answered.
     fn gone(&self, now: Instant) -> bool {
-        let stale = match self.state {
-            Nud::Stale => true,
-            Nud::Reachable(until) => until <= now,
-            _ => false,
-        };
-        stale && self.expires <= now
+        match self.state {
+            Nud::Stale => self.expires <= now,
+            Nud::Reachable(until) => until <= now && self.expires <= now,
+            Nud::Delay(_) => false,
+            // Also once the time for every probe left has passed, sent or
+            // not: with nothing driving the timers between two sends (no
+            // tick() on wasm), the next send must not find a neighbour
+            // that ignored its probe long ago still trusted.
+            Nud::Probe { sent, next } => {
+                let left = MAX_UNICAST_SOLICIT.saturating_sub(sent);
+                now >= next + RETRANS_TIMER * left
+            }
+        }
     }
 }
 
@@ -172,16 +180,13 @@ impl<K: Eq + Hash + Copy> Table<K> {
                 Resolved::Probe(e.mac)
             }
             Nud::Probe { next, .. } if next > now => Resolved::Hit(e.mac),
-            Nud::Probe { sent, .. } if sent < MAX_UNICAST_SOLICIT => {
+            // Not gone, so a probe is left to send.
+            Nud::Probe { sent, .. } => {
                 e.state = Nud::Probe {
                     sent: sent + 1,
                     next: now + RETRANS_TIMER,
                 };
                 Resolved::Probe(e.mac)
-            }
-            Nud::Probe { .. } => {
-                t.remove(&ip);
-                Resolved::Miss
             }
         }
     }
@@ -200,10 +205,8 @@ impl<K: Eq + Hash + Copy> Table<K> {
                     };
                     probes.push((*ip, e.mac));
                 }
+                _ if e.gone(now) => return false,
                 Nud::Probe { sent, next } if next <= now => {
-                    if sent >= MAX_UNICAST_SOLICIT {
-                        return false;
-                    }
                     e.state = Nud::Probe {
                         sent: sent + 1,
                         next: now + RETRANS_TIMER,
@@ -374,8 +377,9 @@ impl<K: Eq + Hash + Copy> Pending<K> {
         }
     }
 
-    /// Buffer `pkt` for `ip`. Returns `true` when this is the first packet
-    /// queued for `ip` — i.e. the caller should send an ARP solicitation now.
+    /// Buffer `pkt` for `ip`. Returns `true` when the caller should send a
+    /// solicitation now: this is the first packet queued for `ip`, or a
+    /// retransmission has come due that [`poll`](Self::poll) has not sent.
     /// A queue already holding [`PENDING_MAX_PKTS`] drops its oldest packet.
     ///
     /// Once [`PENDING_MAX_TARGETS`] destinations are waiting, a packet for
@@ -422,6 +426,13 @@ impl<K: Eq + Hash + Copy> Pending<K> {
             entry.packets.remove(0);
         }
         entry.packets.push(pkt.to_vec());
+        // A retransmission due that no timer has sent yet: traffic still
+        // flowing gets it out, even with nothing calling poll.
+        if entry.next <= now {
+            entry.sent += 1;
+            entry.next = now + RETRANS_TIMER;
+            return true;
+        }
         false
     }
 
@@ -610,6 +621,46 @@ mod tests {
         t.update_at(ip, m, true, true, at(6, 100));
         assert!(t.poll(at(8, 0)).is_empty());
         assert_eq!(t.resolve_at(ip, at(30, 0)), Resolved::Hit(m));
+    }
+
+    #[test]
+    fn traffic_drives_the_timers_when_nothing_polls() {
+        // Resolution: a packet sent once a retransmission is due solicits.
+        let p = Pending::new();
+        let ip = Ipv4Addr::new(10, 0, 0, 9);
+        let t0 = Instant::now();
+        assert!(p.enqueue_at(ip, b"a", t0));
+        assert!(!p.enqueue_at(ip, b"b", t0 + Duration::from_millis(900)));
+        assert!(
+            p.enqueue_at(ip, b"c", t0 + RETRANS_TIMER),
+            "not solicited again"
+        );
+        assert!(!p.enqueue_at(ip, b"d", t0 + Duration::from_millis(1500)));
+        assert!(
+            p.poll(t0 + Duration::from_millis(1900)).is_empty(),
+            "sent twice"
+        );
+
+        // NUD: a neighbour that ignored its probe is not trusted when the
+        // next packet comes long after, though no timer sent the rest.
+        let t = Table::new();
+        let m = MacAddr([2, 0, 0, 0, 0, 7]);
+        t.update_at(ip, m, false, true, t0);
+        assert_eq!(t.resolve_at(ip, t0), Resolved::Hit(m));
+        let probed = t0 + DELAY_FIRST_PROBE_TIME;
+        assert_eq!(t.resolve_at(ip, probed), Resolved::Probe(m));
+        assert_eq!(
+            t.resolve_at(ip, probed + Duration::from_secs(2)),
+            Resolved::Probe(m)
+        );
+        let t = Table::new();
+        t.update_at(ip, m, false, true, t0);
+        t.resolve_at(ip, t0);
+        assert_eq!(t.resolve_at(ip, probed), Resolved::Probe(m));
+        assert_eq!(
+            t.resolve_at(ip, probed + Duration::from_secs(30)),
+            Resolved::Miss
+        );
     }
 
     #[test]
