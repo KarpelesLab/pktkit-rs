@@ -2597,37 +2597,45 @@ mod tests {
 
     #[test]
     fn udp_flow_survives_port_unreachable() {
-        // A port nothing listens on yet.
-        let port = UdpSocket::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let stack = Stack::new();
-        let captured = capture(&stack);
-        let dgram = build_udp_v4_packet(
-            Ipv4Addr::new(10, 0, 0, 5),
-            41500,
-            Ipv4Addr::new(127, 0, 0, 1),
-            port,
-            b"early",
-        );
-        // The kernel answers with port unreachable, which the flow's socket
-        // reports as ECONNREFUSED on its next recv.
-        L3Device::send(&*stack, Packet::from_slice(&dgram)).unwrap();
-        thread::sleep(Duration::from_millis(200));
+        // A port nothing listens on yet. Freed so the kernel refuses the
+        // first datagram, it may be taken by another test before the server
+        // below binds it: then start over on a fresh port.
+        for _ in 0..20 {
+            let port = UdpSocket::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port();
+            let stack = Stack::new();
+            let captured = capture(&stack);
+            let dgram = build_udp_v4_packet(
+                Ipv4Addr::new(10, 0, 0, 5),
+                41500,
+                Ipv4Addr::new(127, 0, 0, 1),
+                port,
+                b"early",
+            );
+            // The kernel answers with port unreachable, which the flow's
+            // socket reports as ECONNREFUSED on its next recv.
+            L3Device::send(&*stack, Packet::from_slice(&dgram)).unwrap();
+            thread::sleep(Duration::from_millis(200));
 
-        // The server comes up on that port; the same flow must now work.
-        let server = UdpSocket::bind(("127.0.0.1", port)).unwrap();
-        server
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        L3Device::send(&*stack, Packet::from_slice(&dgram)).unwrap();
-        let mut buf = [0u8; 64];
-        let (n, from) = server.recv_from(&mut buf).unwrap();
-        server.send_to(&buf[..n], from).unwrap();
-        wait_for("the reply", || !captured.lock().unwrap().is_empty());
-        assert_eq!(&captured.lock().unwrap()[0][28..], b"early");
+            // The server comes up on that port; the same flow must now work.
+            let Ok(server) = UdpSocket::bind(("127.0.0.1", port)) else {
+                continue;
+            };
+            server
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            L3Device::send(&*stack, Packet::from_slice(&dgram)).unwrap();
+            let mut buf = [0u8; 64];
+            let (n, from) = server.recv_from(&mut buf).unwrap();
+            server.send_to(&buf[..n], from).unwrap();
+            wait_for("the reply", || !captured.lock().unwrap().is_empty());
+            assert_eq!(&captured.lock().unwrap()[0][28..], b"early");
+            return;
+        }
+        panic!("no free port to test with");
     }
 
     #[test]
