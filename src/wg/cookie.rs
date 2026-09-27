@@ -12,8 +12,8 @@
 use crate::Result;
 use crate::time::Instant;
 use crate::wg::constants::{
-    BLAKE2S_128_SIZE, COOKIE_REFRESH_TIME, MESSAGE_COOKIE_REPLY_SIZE, MESSAGE_COOKIE_REPLY_TYPE,
-    NoisePublicKey,
+    BLAKE2S_128_SIZE, COOKIE_REFRESH_TIME, COOKIE_SECRET_LATENCY, MESSAGE_COOKIE_REPLY_SIZE,
+    MESSAGE_COOKIE_REPLY_TYPE, NoisePublicKey,
 };
 use crate::wg::crypto::{
     blake2s_mac_128, calculate_cookie_key, calculate_mac1_key, ct_eq, fill_random, xaead_open,
@@ -143,10 +143,13 @@ impl CookieGenerator {
         self.last_mac1.copy_from_slice(&mac1);
         self.has_last_mac1 = true;
 
+        // Held for COOKIE_SECRET_LATENCY less than the responder keeps its
+        // secret, as in the reference: a MAC2 from a cookie near the end of
+        // its secret's life would reach the responder after the rotation,
+        // fail there, and cost another cookie round trip.
         let fresh = self
             .cookie_set
-            .map(|t| t.elapsed() <= COOKIE_REFRESH_TIME)
-            .unwrap_or(false);
+            .is_some_and(|t| t.elapsed() < COOKIE_REFRESH_TIME - COOKIE_SECRET_LATENCY);
         if !fresh {
             // Leave MAC2 zeroed.
             for b in &mut msg[smac2..] {
@@ -243,6 +246,32 @@ mod tests {
         assert!(checker.check_mac2(&pkt2, &src));
         // A different source address must NOT validate the MAC2.
         assert!(!checker.check_mac2(&pkt2, &[10, 0, 0, 10]));
+    }
+
+    /// The initiator uses a cookie for COOKIE_REFRESH_TIME less
+    /// COOKIE_SECRET_LATENCY (115 s), as the reference does, not for the
+    /// full 120 s the responder keeps the secret it came from.
+    #[test]
+    fn a_received_cookie_is_used_for_115_seconds() {
+        let responder = keypair();
+        let mut checker = CookieChecker::new(&responder);
+        let mut generator = CookieGenerator::new(&responder);
+        let mut pkt = vec![3u8; 148];
+        generator.add_macs(&mut pkt);
+        let reply = checker
+            .generate_reply(&[10, 0, 0, 9], 1, &pkt[116..132])
+            .unwrap();
+        let nonce: [u8; 24] = reply[8..32].try_into().unwrap();
+        generator.consume_reply(&nonce, &reply[32..]).unwrap();
+
+        let has_mac2 = |g: &mut CookieGenerator, age: u64| {
+            g.cookie_set = Instant::now().checked_sub(std::time::Duration::from_secs(age));
+            let mut pkt = vec![5u8; 148];
+            g.add_macs(&mut pkt);
+            pkt[132..].iter().any(|&b| b != 0)
+        };
+        assert!(has_mac2(&mut generator, 114));
+        assert!(!has_mac2(&mut generator, 116));
     }
 
     #[test]

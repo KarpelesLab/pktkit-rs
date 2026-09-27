@@ -58,6 +58,12 @@ pub(crate) const MESSAGE_TRANSPORT_HEADER_SIZE: usize = 16;
 /// Maximum lifetime of a cookie secret.
 pub const COOKIE_REFRESH_TIME: Duration = Duration::from_secs(120);
 
+/// How much sooner than [`COOKIE_REFRESH_TIME`] an initiator stops using a
+/// cookie it received (the reference's `COOKIE_SECRET_LATENCY`): the
+/// cookie was minted from a secret already some age when it arrived, which
+/// the responder may have rotated by the time a MAC2 made with it reaches it.
+pub(crate) const COOKIE_SECRET_LATENCY: Duration = Duration::from_secs(5);
+
 /// How long sessions and pending handshakes stick around before maintenance
 /// removes them.
 pub const REJECT_AFTER_TIME: Duration = Duration::from_secs(180);
