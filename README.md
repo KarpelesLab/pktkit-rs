@@ -11,15 +11,16 @@ Zero-copy L2/L3 packet handling toolkit for Rust.
 devices, hubs, adapters, NAT, and tunnels that move Ethernet frames and IP
 packets without copying buffers on the hot path.
 
-It is a Rust port of the Go [pktkit](https://github.com/KarpelesLab/pktkit) library,
-re-cast into idiomatic Rust:
+It began as a port of the Go [pktkit](https://github.com/KarpelesLab/pktkit)
+library, which is being discontinued; this crate is where development continues.
+Behaviour follows the kernel ABIs, RFCs and wire formats it implements rather
+than the Go code, and the design is idiomatic Rust:
 
 - `Frame` and `Packet` are `#[repr(transparent)]` newtypes around `[u8]`. You hold
   them as `&Frame` / `&mut Frame`, exactly like Go's `[]byte` alias, with no
   per-call allocation.
 - Forwarding uses synchronous callbacks (`Arc<dyn Fn(&Frame) -> io::Result<()>>`),
-  not channels or async — matching the Go API one-for-one and keeping the
-  hot path zero-cost.
+  not channels or async, which keeps the hot path zero-cost.
 - Everything beyond the core (`Frame`, `Packet`, `L2Hub`, `L3Hub`, `Pipe`, …)
   lives behind a Cargo feature so a user pulling only the core types pays
   nothing for crypto, OS FFI, or protocol stacks they don't use.
@@ -108,7 +109,7 @@ required if the build uses it):
 const imports = {
   pktkit: {
     now_ms: () => performance.now(), // monotonic clock, used by every timer
-    unix_ms: () => Date.now(),       // wall clock: pcap timestamps, TCP ISNs, WireGuard TAI64N
+    unix_ms: () => Date.now(),       // wall clock: pcap timestamps, WireGuard TAI64N, RNG seeding
   },
   purecrypto: {                      // `wg` / `ovpn` only
     random_get: (ptr, len) =>
@@ -190,7 +191,11 @@ let gw = L2Adapter::new_arc(stack.clone(), L2AdapterConfig::default());
 let _gw_handle = hub.connect_arc(gw);
 ```
 
-### Virtual client over the tunnel (DNS + TCP + HTTP)
+### Virtual client (TCP + HTTP over the virtual network)
+
+TCP and UDP connections, and so HTTP, travel the virtual network the client is
+wired into. Name resolution does not: `Client::resolve` (which `http_get` uses
+for host names) queries the configured DNS servers from the host's own sockets.
 
 ```rust,ignore
 // requires: --features "vclient"
@@ -214,10 +219,14 @@ println!("{} {}", resp.status, resp.text());
 ```rust,ignore
 // requires: --features "wg slirp"
 use std::net::{Ipv4Addr, UdpSocket};
-use std::sync::Arc;
 use pktkit::{IpPrefix, L3Device};
-use pktkit::wg::{Adapter, AdapterConfig};
+use pktkit::wg::{Adapter, AdapterConfig, NoisePublicKey, generate_private_key};
 use pktkit::slirp::Stack;
+
+// In practice, load both keys from your configuration: each is 32 raw bytes
+// (`NoisePrivateKey::from([u8; 32])`, `NoisePublicKey::from([u8; 32])`).
+let private_key = generate_private_key()?;
+let client_public_key = NoisePublicKey::from([0u8; 32]);
 
 let stack = Stack::new();
 stack.set_addr(IpPrefix::new(Ipv4Addr::new(10, 0, 0, 1).into(), 24)).unwrap();
@@ -416,8 +425,9 @@ let cfg = Config::new("eth0")
 Active development; the API is not yet stable. Most features are functionally
 complete and tested; a few have documented `// TODO(<feature>)` gaps:
 
-- **ovpn**: tls-crypt/tls-auth, control-packet retransmit timers, and fuller
-  PUSH_REPLY negotiation are not yet implemented.
+- **ovpn**: tls-crypt/tls-auth and fuller PUSH_REPLY negotiation are not yet
+  implemented. (Control-packet retransmission, keepalive and renegotiation
+  timers run from `Peer::tick`, which `ovpn::Server` drives.)
 - **xdp / afxdp**: program codegen, map key layout and ring math are
   unit-tested, and `tests/xdp_kernel.rs` covers verifier acceptance and the
   veth datapath — but those are `#[ignore]`d because they need root, so the
@@ -426,9 +436,10 @@ complete and tested; a few have documented `// TODO(<feature>)` gaps:
   reports what was actually negotiated.
 - **tuntap**: macOS `utun` is type-checked against the Apple target but not yet
   exercised on a macOS host.
-- **slirp**: inbound virtual TCP accept is IPv4-only (IPv6 accept is a TODO).
-- **nat**: SIP/H.323/PPTP ALGs rewrite payloads; UPnP's live TCP control
-  endpoint awaits wiring through the virtual TCP listener.
+- **slirp**: virtual listeners (`Stack::listen`, `Stack::listen6`) drop a SYN
+  when their accept queue is full rather than falling back to SYN cookies.
+- **nat**: UPnP's SOAP control port is served over the in-tree `vtcp` engine,
+  one request per connection; pipelined and chunked requests are not handled.
 
 ## License
 
