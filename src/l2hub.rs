@@ -710,9 +710,13 @@ impl L2Hub {
             return;
         };
 
-        let mut mac = [0u8; 6];
-        mac.copy_from_slice(&bytes[6..12]);
-        self.learn((vlan, mac), source);
+        // A group address is never a station's own (802.1Q §8.8): learning
+        // one would pin the whole group's traffic to one port.
+        if bytes[6] & 1 == 0 {
+            let mut mac = [0u8; 6];
+            mac.copy_from_slice(&bytes[6..12]);
+            self.learn((vlan, mac), source);
+        }
 
         let mut egress = Egress::new(f);
 
@@ -764,12 +768,14 @@ impl L2Hub {
         // Either new, moved, or past halfway to expiry: take the write lock.
         let mut table = self.mac_table.write().unwrap();
         let known = table.entries.get(&key).map(|e| e.port_id);
-        if known.is_none() {
-            // A new address has to fit both budgets. The per-port limit is
-            // what keeps one port spraying random sources from crowding every
-            // other port out of the table.
+        if known != Some(source.id) {
+            // A new address has to fit both budgets, and one moving here has
+            // to fit this port's. The per-port limit is what keeps one port
+            // spraying random sources from crowding every other port out of
+            // the table -- and a port could otherwise fill itself past it by
+            // claiming addresses first learned elsewhere.
             let full = |t: &MacTable| {
-                t.entries.len() >= MAC_TABLE_MAX_SIZE
+                (known.is_none() && t.entries.len() >= MAC_TABLE_MAX_SIZE)
                     || source
                         .mac_limit
                         .is_some_and(|l| t.port_count(source.id) >= l)
@@ -777,6 +783,10 @@ impl L2Hub {
             if full(&table) {
                 table.prune_expired(now);
                 if full(&table) {
+                    // The station has left the port it was learned on, so
+                    // that entry is wrong now; forget it and let frames for
+                    // it flood until it can be learned again.
+                    table.remove(&key);
                     return;
                 }
             }
@@ -1888,6 +1898,57 @@ mod tests {
                 .unwrap()
                 .entries
                 .contains_key(&(20, ports[2].0.mac.octets()))
+        );
+    }
+
+    #[test]
+    fn group_source_addresses_are_not_learned() {
+        let hub = Arc::new(L2Hub::new());
+        let a = Sink::default();
+        let b = Sink::default();
+        let ha = hub.connect(a.clone());
+        let _hb = hub.connect(b.clone());
+        // No station sends from a group address (802.1Q §8.8); learning one
+        // would steer that group's traffic to a single port.
+        let group = MacAddr([0x01, 0x00, 0x5e, 0, 0, 1]);
+        let f = build_frame(MacAddr::broadcast(), group, EtherType::IPV4, &[0; 40]);
+        hub.forward_from(Frame::from_slice(&f), ha.id);
+        let f = build_frame(
+            MacAddr::broadcast(),
+            MacAddr::broadcast(),
+            EtherType::IPV4,
+            &[0; 40],
+        );
+        hub.forward_from(Frame::from_slice(&f), ha.id);
+        assert_eq!(hub.mac_table_len(), 0);
+    }
+
+    #[test]
+    fn an_address_moving_onto_a_full_port_respects_its_limit() {
+        let hub = Arc::new(L2Hub::new());
+        let a = Sink::default();
+        let b = Sink::default();
+        let ha = hub.connect(a.clone());
+        let hb = hub.connect(b.clone());
+        hub.set_port_mac_limit(&hb, Some(2));
+
+        let from = |src: u8, port: u64| {
+            let mac = MacAddr([2, 0, 0, 0, 0, src]);
+            let f = build_frame(MacAddr::broadcast(), mac, EtherType::IPV4, &[0; 40]);
+            hub.forward_from(Frame::from_slice(&f), port);
+        };
+        from(1, hb.id);
+        from(2, hb.id);
+        from(3, ha.id);
+        // Station 3 turns up behind B, which is at its limit.
+        from(3, hb.id);
+        let t = hub.mac_table.read().unwrap();
+        assert_eq!(t.port_count(hb.id), 2, "moved past the per-port limit");
+        assert!(
+            t.entries
+                .get(&(0, [2, 0, 0, 0, 0, 3]))
+                .is_none_or(|e| e.port_id != ha.id),
+            "left pointing at the port it moved away from"
         );
     }
 }
