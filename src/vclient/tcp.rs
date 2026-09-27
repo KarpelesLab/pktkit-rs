@@ -315,6 +315,23 @@ impl TcpConn {
         self.nonblocking.store(nonblocking, Ordering::Relaxed);
     }
 
+    /// Turn the Nagle algorithm off (`true`) or back on, as
+    /// [`std::net::TcpStream::set_nodelay`]. With it off, a write shorter
+    /// than a segment goes out at once even while earlier data is still
+    /// unacknowledged; turning it off also sends whatever it was holding.
+    pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
+        let mut conn = self.state.conn.lock().unwrap();
+        self.state.queue(conn.set_nodelay(nodelay));
+        drop(conn);
+        self.state.flush();
+        Ok(())
+    }
+
+    /// Whether the Nagle algorithm is off (see [`set_nodelay`](Self::set_nodelay)).
+    pub fn nodelay(&self) -> io::Result<bool> {
+        Ok(self.state.conn.lock().unwrap().nodelay())
+    }
+
     /// Check on a connection opened with
     /// [`Client::dial_tcp_nonblocking`](super::Client::dial_tcp_nonblocking):
     /// `Ok(true)` once the handshake has completed, `Ok(false)` while it is

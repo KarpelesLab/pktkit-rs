@@ -579,6 +579,43 @@ fn dropping_a_connection_with_unread_data_resets_it() {
     }
 }
 
+/// With `set_nodelay`, as on a `std::net::TcpStream`, a short write goes
+/// out at once even while the one before it is unacknowledged.
+#[test]
+fn nodelay_sends_short_writes_without_waiting_for_an_ack() {
+    let client = client(2);
+    let _server = raw_server(&client, |_| Vec::new());
+    let conn = client
+        .dial_tcp_timeout(
+            SocketAddr::new(IpAddr::V4(SERVER_IP), SERVER_PORT),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+    // From here on the server hears nothing, so no ACK comes back.
+    let sent: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
+    let s = sent.clone();
+    client.set_handler(Arc::new(move |pkt: &Packet| {
+        if let Ok(seg) = Segment::parse(pkt.payload())
+            && !seg.payload.is_empty()
+        {
+            s.lock().unwrap().push(seg.payload);
+        }
+        Ok(())
+    }));
+    assert!(!conn.nodelay().unwrap());
+    conn.write(b"0123456789").unwrap();
+    conn.write(b"abcdefghij").unwrap();
+    assert_eq!(sent.lock().unwrap().len(), 1, "Nagle holds the second back");
+    // Turning Nagle off sends what it held, and then every write at once.
+    conn.set_nodelay(true).unwrap();
+    assert!(conn.nodelay().unwrap());
+    conn.write(b"klmnopqrst").unwrap();
+    assert_eq!(
+        *sent.lock().unwrap(),
+        [&b"0123456789"[..], b"abcdefghij", b"klmnopqrst"]
+    );
+}
+
 /// Records the TCP data segments (SEQ, length) a client sends.
 struct Sniff {
     dev: Arc<pktkit::vclient::Client>,

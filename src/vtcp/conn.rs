@@ -155,6 +155,13 @@ pub struct ConnConfig {
     pub fin_wait2_timeout: Option<Duration>,
     /// How long TIME-WAIT lasts ([`TIME_WAIT_DURATION`] by default).
     pub time_wait: Duration,
+    /// Turn off the Nagle algorithm (RFC 9293 §3.7.4), as `TCP_NODELAY`
+    /// does: a write shorter than a segment goes out at once even with data
+    /// in flight, instead of waiting for it to be acknowledged. For
+    /// request/response traffic that writes a message in pieces, or that
+    /// cannot wait out a delayed ACK. Off by default;
+    /// [`Conn::set_nodelay`] changes it on an open connection.
+    pub nodelay: bool,
 }
 
 setters! {
@@ -176,6 +183,7 @@ setters! {
         set recv_buf_size: usize;
         set fin_wait2_timeout: Option<Duration>;
         set time_wait: Duration;
+        set nodelay: bool;
     }
 }
 
@@ -199,6 +207,7 @@ impl Default for ConnConfig {
             recv_buf_size: DEFAULT_RECV_BUF,
             fin_wait2_timeout: Some(DEFAULT_FIN_WAIT2_TIMEOUT),
             time_wait: TIME_WAIT_DURATION,
+            nodelay: false,
         }
     }
 }
@@ -1856,8 +1865,16 @@ impl Conn {
             // window never reaches one, half the largest window it has
             // offered is as good, or every send would wait for all data in
             // flight to be ACKed.
+            //
+            // Without Nagle a short segment still goes out if it is all
+            // there is to send, as Linux's TCP_NODELAY has it: only the
+            // application is holding it back, and more may be long coming.
+            // One the window cuts short still waits, or a peer reading
+            // slowly would be sent a trickle of tiny segments.
             let half_wnd = self.max_snd_wnd / 2;
-            let big_enough = n >= room || (half_wnd > 0 && n >= half_wnd as usize);
+            let big_enough = n >= room
+                || (half_wnd > 0 && n >= half_wnd as usize)
+                || (self.cfg.nodelay && n == pending);
             if !big_enough && self.send_buf.as_ref().unwrap().unacked() > 0 && !self.fin_queued {
                 break;
             }
@@ -2350,6 +2367,27 @@ impl Conn {
             self.flush_send_queue();
         }
         (n, self.take_outgoing())
+    }
+
+    /// Whether the Nagle algorithm is off (see [`ConnConfig::nodelay`]).
+    #[inline]
+    pub fn nodelay(&self) -> bool {
+        self.cfg.nodelay
+    }
+
+    /// Turn the Nagle algorithm off (`true`) or back on, as `TCP_NODELAY`
+    /// does on a socket. Turning it off sends at once whatever it was
+    /// holding back, as Linux does; those segments are returned.
+    pub fn set_nodelay(&mut self, nodelay: bool) -> Vec<Vec<u8>> {
+        self.cfg.nodelay = nodelay;
+        if nodelay
+            && !self.closed
+            && self.state.is_synchronized()
+            && self.send_buf.as_ref().is_some_and(|s| s.pending() > 0)
+        {
+            self.flush_send_queue();
+        }
+        self.take_outgoing()
     }
 
     /// Initiate graceful close (FIN). Returns any segments produced.
@@ -3118,6 +3156,40 @@ mod tests {
         deliver(&mut client, &ack);
         assert_eq!(client.state(), State::FinWait2);
         assert_eq!(read_all(&mut server).len(), 4096);
+    }
+
+    // TCP_NODELAY: a short write goes out with data still in flight, but
+    // one the window cuts short does not.
+    #[test]
+    fn nodelay_sends_short_writes_at_once() {
+        let (mut client, _server) = established(40400);
+        let (_, first) = client.write(&[1; 10]);
+        assert_eq!(first.len(), 1);
+        let (_, held) = client.write(&[2; 10]);
+        assert!(held.is_empty(), "Nagle holds the second write back");
+        // Turning Nagle off sends what it was holding.
+        let pushed = client.set_nodelay(true);
+        assert_eq!(pushed.len(), 1);
+        assert_eq!(parse(&pushed[0]).payload, [2; 10]);
+        let (_, third) = client.write(&[3; 10]);
+        assert_eq!(third.len(), 1, "sent without waiting for an ACK");
+        assert_eq!(parse(&third[0]).payload, [3; 10]);
+
+        // From the config, too.
+        let mut client = Conn::new(cfg(40401, 80).nodelay(true));
+        let mut server = Conn::new(cfg(80, 40401));
+        drive_handshake(&mut client, &mut server);
+        assert!(client.nodelay());
+        assert_eq!(client.write(&[1; 10]).1.len(), 1);
+        assert_eq!(client.write(&[2; 10]).1.len(), 1);
+
+        // A segment the peer's window cuts short still waits for room.
+        client.set_snd_wnd(20 + 1050);
+        client.max_snd_wnd = 4000;
+        assert_eq!(client.write(&[4; 1000]).1.len(), 1);
+        let (n, trickle) = client.write(&[5; 100]);
+        assert_eq!(n, 100);
+        assert!(trickle.is_empty(), "sent a runt into a closing window");
     }
 
     // RFC 9293 §3.8.6.2.1: with data in flight, a segment is still worth
