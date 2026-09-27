@@ -251,7 +251,7 @@ fn open_tuntap(name: &str, flags: i32) -> Result<(OwnedFd, String)> {
     let flags_u16 = flags as u16;
     ifr[16..18].copy_from_slice(&flags_u16.to_ne_bytes());
 
-    let r = unsafe { libc::ioctl(owned.as_raw_fd(), libc::TUNSETIFF, &mut ifr) };
+    let r = unsafe { libc::ioctl(owned.as_raw_fd(), libc::TUNSETIFF as _, &mut ifr) };
     if r < 0 {
         return Err(io::Error::last_os_error());
     }

@@ -66,7 +66,9 @@ fn ifreq(name: &str) -> Result<[u8; 40]> {
 pub(crate) fn if_hw_addr(name: &str) -> Result<MacAddr> {
     let sock = ioctl_socket()?;
     let mut ifr = ifreq(name)?;
-    let r = unsafe { libc::ioctl(sock.0, libc::SIOCGIFHWADDR, &mut ifr) };
+    // The request argument is c_ulong on glibc but c_int on musl; `as _`
+    // lets both libcs' prototypes pick the type.
+    let r = unsafe { libc::ioctl(sock.0, libc::SIOCGIFHWADDR as _, &mut ifr) };
     if r < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -97,7 +99,7 @@ pub(crate) fn if_index(name: &str) -> Result<u32> {
 pub(crate) fn if_mtu(name: &str) -> Result<usize> {
     let sock = ioctl_socket()?;
     let mut ifr = ifreq(name)?;
-    let r = unsafe { libc::ioctl(sock.0, libc::SIOCGIFMTU, &mut ifr) };
+    let r = unsafe { libc::ioctl(sock.0, libc::SIOCGIFMTU as _, &mut ifr) };
     if r < 0 {
         return Err(io::Error::last_os_error());
     }

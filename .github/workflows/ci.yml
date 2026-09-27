@@ -74,6 +74,21 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
+  musl:
+    name: Clippy (Linux musl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      # musl's libc differs from glibc in ways that only show at compile
+      # time: ioctl takes a c_int request rather than c_ulong, and some time
+      # aliases are deprecated. Checking needs no musl toolchain on the host.
+      - run: cargo clippy --target x86_64-unknown-linux-musl --features full --all-targets -- -D warnings
+
   docs:
     name: Docs
     runs-on: ubuntu-latest

@@ -498,9 +498,11 @@ fn set_recv_timeout(fd: &OwnedFd, timeout: std::time::Duration) -> Result<()> {
     // A zero timeout means "block forever" to the kernel, which would leave a
     // reader stuck past close; keep a floor under it.
     let timeout = timeout.max(std::time::Duration::from_millis(1));
+    // Cast through `as _` rather than naming time_t / suseconds_t: musl's
+    // libc crate deprecates those aliases ahead of their 64-bit change.
     let tv = libc::timeval {
-        tv_sec: timeout.as_secs() as libc::time_t,
-        tv_usec: timeout.subsec_micros() as libc::suseconds_t,
+        tv_sec: timeout.as_secs() as _,
+        tv_usec: timeout.subsec_micros() as _,
     };
     let r = unsafe {
         libc::setsockopt(
