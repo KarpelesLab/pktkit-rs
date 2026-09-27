@@ -425,8 +425,8 @@ fn deadline_after(timeout: Option<Duration>) -> Option<Instant> {
 }
 
 /// Helper used by the stack's tick thread: drive timers for one connection and
-/// wake any waiters. Returns `true` if the connection is now closed (so the
-/// caller can drop it from the table).
+/// wake its waiters if that changed its state. Returns `true` if the
+/// connection is now closed (so the caller can drop it from the table).
 pub(crate) fn tick_conn(state: &Arc<ConnState>) -> bool {
     // A handshake that has not completed in time is abandoned, as a listen
     // queue would drop a stale embryonic connection. Checked and taken under
@@ -446,21 +446,29 @@ pub(crate) fn tick_conn(state: &Arc<ConnState>) -> bool {
         drop(accept);
         state.abort();
     }
-    let (segs, closed) = {
+    let (segs, closed, changed) = {
         let mut conn = state.conn.lock().expect("poisoned");
         let ended = conn.fin_received();
+        let before = (conn.state(), conn.is_closed());
         let segs = conn.tick();
         let closed = conn.is_closed();
         if closed && !ended {
             // Retransmissions or keepalives went unanswered.
             state.fail(io::ErrorKind::TimedOut);
         }
-        (segs, closed)
+        (segs, closed, (conn.state(), closed) != before)
     };
     if !segs.is_empty() {
         state.wrap_and_send(segs);
     }
-    state.signal.notify_all();
+    // Timers never make data readable or free send buffer space: only
+    // segments from the peer do, and `deliver` wakes the waiters for those.
+    // What a timer can do is end the connection, or move it on to another
+    // state; waking every waiter on every tick regardless would wake each
+    // thread blocked on any connection of the stack ten times a second.
+    if changed {
+        state.signal.notify_all();
+    }
     closed
 }
 
@@ -692,5 +700,63 @@ mod tests {
         .unwrap();
         assert!(n < big.len(), "wrote {n}");
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// A tick that changes nothing a waiter could act on wakes nobody: the
+    /// tick visits every connection of the stack ten times a second, and
+    /// would otherwise wake every thread blocked on one of them as often.
+    #[test]
+    fn an_idle_tick_wakes_no_waiter() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let mut peer = peer();
+        let (state, out) =
+            accepted_with(&mut peer, ConnConfig::default().time_wait(Duration::ZERO));
+        let ready = Arc::new(AtomicBool::new(false));
+        let (s2, r2) = (state.clone(), ready.clone());
+        let waiter = std::thread::spawn(move || {
+            let conn = s2.conn.lock().unwrap();
+            r2.store(true, Ordering::SeqCst);
+            let (_conn, r) = s2
+                .signal
+                .wait_timeout(conn, Duration::from_millis(500))
+                .unwrap();
+            !r.timed_out()
+        });
+        while !ready.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        // Taken only once the waiter is waiting, as waiting releases it.
+        drop(state.conn.lock().unwrap());
+        for _ in 0..5 {
+            assert!(!tick_conn(&state));
+        }
+        assert!(!waiter.join().unwrap(), "an idle tick woke the waiter");
+
+        // One that closes the connection does wake it: here, the end of a
+        // TIME-WAIT that the engine's own timer ends.
+        let fin = state.conn.lock().unwrap().close();
+        state.wrap_and_send(fin);
+        pump(&state, &out, &mut peer);
+        for seg in peer.close() {
+            state.deliver(&Segment::parse(&seg).unwrap());
+        }
+        assert_eq!(state.conn.lock().unwrap().state(), State::TimeWait);
+        let ready = Arc::new(AtomicBool::new(false));
+        let (s2, r2) = (state.clone(), ready.clone());
+        let waiter = std::thread::spawn(move || {
+            let conn = s2.conn.lock().unwrap();
+            r2.store(true, Ordering::SeqCst);
+            let (conn, _) = s2
+                .signal
+                .wait_timeout_while(conn, Duration::from_secs(5), |c| !c.is_closed())
+                .unwrap();
+            conn.is_closed()
+        });
+        while !ready.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        drop(state.conn.lock().unwrap());
+        assert!(tick_conn(&state));
+        assert!(waiter.join().unwrap());
     }
 }

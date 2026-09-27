@@ -53,6 +53,12 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// over the 2048 bridges of each address family.
 const BRIDGE_BUF: usize = 256 * 1024;
 
+/// Longest a pump waits on the virtual side before looking again, although
+/// every change it waits for (data, window, FIN, close) wakes it: only a
+/// backstop, so that the thousands of pumps a stack may run do not each
+/// wake ten times a second to find nothing new.
+const PUMP_BACKSTOP: Duration = Duration::from_secs(5);
+
 /// How long the client has to ACK our SYN-ACK once the destination has
 /// accepted, as for the inbound handshakes of a listener. Until then the
 /// bridge holds a real connection to a third party on the client's behalf,
@@ -456,7 +462,7 @@ impl TcpOutConn {
                 let _ = self
                     .state
                     .signal
-                    .wait_timeout(conn, Duration::from_millis(100))
+                    .wait_timeout(conn, PUMP_BACKSTOP)
                     .expect("poisoned");
             }
         }
@@ -493,7 +499,7 @@ impl TcpOutConn {
                     let _ = self
                         .state
                         .signal
-                        .wait_timeout(conn, Duration::from_millis(100))
+                        .wait_timeout(conn, PUMP_BACKSTOP)
                         .expect("poisoned");
                     (0, false)
                 }
