@@ -283,7 +283,10 @@ pub struct Server {
 
 /// The threads calling on_auth: at most `max_auth_threads`, started as
 /// work arrives and gone once there is none. A peer is queued at most once
-/// (see [`PeerAuth`]), so the queue is bounded by the peer table.
+/// (see [`PeerAuth`]), and peers gone from the table are pruned each time
+/// one is queued, so the queue holds at most one entry per live peer.
+/// Without the pruning, peers coming and going while every worker is stuck
+/// in a slow on_auth would each leave an entry behind.
 #[derive(Default)]
 struct AuthPool {
     ready: VecDeque<Weak<PeerEntry>>,
@@ -684,6 +687,16 @@ impl Server {
     fn schedule_auth(&self, entry: &Arc<PeerEntry>) {
         let spawn = {
             let mut pool = self.auth.lock().unwrap();
+            // A removed peer is never served (run_auth skips it), so it
+            // need not wait for its turn either.
+            pool.ready.retain(|w| {
+                w.upgrade().is_some_and(|e| {
+                    !e.link
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .removed
+                })
+            });
             pool.ready.push_back(Arc::downgrade(entry));
             let more = pool.workers < self.cfg.max_auth_threads.max(1);
             pool.workers += usize::from(more);
@@ -2269,6 +2282,41 @@ mod tests {
             "third peer must be refused"
         );
         assert_eq!(server.peers.read().unwrap().len(), 2);
+        server.close();
+    }
+
+    /// While every auth worker is busy -- a slow on_auth -- peers that come
+    /// and go must not pile up in the run queue: only live peers wait there.
+    #[test]
+    fn the_auth_run_queue_holds_only_live_peers() {
+        let server = test_server();
+        // As if the one worker allowed were stuck in on_auth.
+        let max = server.cfg.max_auth_threads;
+        server.auth.lock().unwrap().workers = max;
+        let entry = || {
+            let peer = Peer::new(
+                crate::ovpn::tests::server_config(),
+                *b"SERVERID",
+                server.cfg.on_auth.clone(),
+            )
+            .unwrap();
+            let addr = "192.0.2.1:1194".parse().unwrap();
+            Arc::new(PeerEntry::new(peer, Transport::Udp, addr, None))
+        };
+        let removed = entry();
+        removed.mark_removed();
+        server.schedule_auth(&removed);
+        for _ in 0..20 {
+            server.schedule_auth(&entry());
+        }
+        let live = entry();
+        server.schedule_auth(&live);
+        let queued = server.auth.lock().unwrap().ready.len();
+        assert_eq!(queued, 1, "dead peers left in the queue");
+        let mut pool = server.auth.lock().unwrap();
+        pool.workers = 0;
+        pool.ready.clear();
+        drop(pool);
         server.close();
     }
 
