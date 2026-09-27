@@ -394,7 +394,34 @@ impl Engine {
         }
         let cfg = self.cfg.lock().unwrap().clone();
         if cfg.is_perfect() {
-            return Some(data.to_vec());
+            let mut q = self.queue.lock().unwrap();
+            // A closed link delivers nothing, however perfect.
+            if !q.running {
+                return None;
+            }
+            if q.heap.is_empty() && q.in_flight == 0 {
+                return Some(data.to_vec());
+            }
+            // Still releasing what an earlier impairment queued: delivered
+            // inline, this message would overtake it. It goes behind the
+            // last one queued its way instead, and leaves with them.
+            let now = Instant::now();
+            let at = q
+                .heap
+                .iter()
+                .filter(|Reverse(m)| m.dir == dir)
+                .map(|Reverse(m)| m.at)
+                .max()
+                .map_or(now, |last| last.max(now));
+            if q.len() >= cfg.queue_limit.max(1) {
+                drop(q);
+                self.record_drop(dir);
+                return None;
+            }
+            push(&mut q, at, dir, data.to_vec());
+            drop(q);
+            self.wake.notify_one();
+            return None;
         }
 
         let mut rng = self.rng.lock().unwrap();
@@ -1377,6 +1404,29 @@ mod tests {
         assert_eq!(link.impairment().loss, 1.0);
         link.send(Frame::from_slice(&frame(1))).unwrap();
         assert_eq!(wire.count(), 1, "the second frame was lost");
+    }
+
+    #[test]
+    fn a_closed_perfect_link_delivers_nothing() {
+        let (wire, link) = wrap(Impairment::default());
+        link.close().unwrap();
+        link.send(Frame::from_slice(&frame(1))).unwrap();
+        assert_eq!(wire.count(), 0, "delivered on a closed link");
+    }
+
+    #[test]
+    fn turning_impairment_off_does_not_reorder_what_is_queued() {
+        let (wire, link) = wrap(Impairment::default().delay(Duration::from_millis(50)));
+        link.send(Frame::from_slice(&frame(1))).unwrap();
+        link.set_impairment(Impairment::default());
+        link.send(Frame::from_slice(&frame(2))).unwrap();
+        assert!(link.wait_idle(Duration::from_secs(5)));
+        let tags: Vec<u8> = wire.sent.lock().unwrap().iter().map(|f| f[14]).collect();
+        assert_eq!(tags, vec![1, 2], "the new frame overtook the queued one");
+
+        // Once drained, the fast path is back.
+        link.send(Frame::from_slice(&frame(3))).unwrap();
+        assert_eq!(wire.count(), 3);
     }
 
     #[test]
