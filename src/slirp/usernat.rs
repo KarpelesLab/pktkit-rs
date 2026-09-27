@@ -93,6 +93,11 @@ const MAX_UDP_FLOWS: usize = if cfg!(test) { 8 } else { 2048 };
 /// Time a UDP flow may sit idle before its socket is reaped.
 const UDP_IDLE: Duration = Duration::from_secs(60);
 
+/// The error for an operation on a stack that has been shut down.
+fn shut_down() -> io::Error {
+    io::Error::new(io::ErrorKind::NotConnected, "stack is shut down")
+}
+
 /// Decides whether a guest may reach a host destination; see
 /// [`Stack::set_dest_filter`]. It gets the destination and the transport
 /// ([`Protocol::TCP`] or [`Protocol::UDP`]), and returns `true` to allow.
@@ -335,6 +340,13 @@ impl Stack {
                     port: addr.port(),
                 };
                 let mut m = self.inner.listeners.lock().expect("poisoned");
+                // Checked under the table lock that `shutdown` sets it under:
+                // a listener registered after shutdown has collected the
+                // table would never be closed, and its `accept` would wait
+                // on a stack that will never feed it.
+                if self.inner.closed.load(Ordering::Acquire) {
+                    return Err(shut_down());
+                }
                 if m.get(&key).is_some_and(|l| l.strong_count() > 0) {
                     return Err(io::Error::new(
                         io::ErrorKind::AddrInUse,
@@ -372,6 +384,10 @@ impl Stack {
             port: addr.port(),
         };
         let mut m = self.inner.listeners6.lock().expect("poisoned");
+        // See `listen`.
+        if self.inner.closed.load(Ordering::Acquire) {
+            return Err(shut_down());
+        }
         if m.get(&key).is_some_and(|l| l.strong_count() > 0) {
             return Err(io::Error::new(
                 io::ErrorKind::AddrInUse,
@@ -447,27 +463,20 @@ impl Stack {
     /// Shut the stack down: close every listener and in-flight connection,
     /// and stop the maintenance thread.
     pub fn shutdown(&self) -> Result<()> {
-        self.inner.closed.store(true, Ordering::Release);
         // A listener outlives the stack in the application's hands, and
         // nothing will ever feed its queue again: close it, or a thread
-        // parked in `accept` waits forever. Collected first, as closing
-        // unregisters through these same table locks.
-        let listeners: Vec<Arc<Listener>> = self
-            .inner
-            .listeners
-            .lock()
-            .expect("poisoned")
-            .values()
-            .filter_map(Weak::upgrade)
-            .collect();
-        let listeners6: Vec<Arc<Listener6>> = self
-            .inner
-            .listeners6
-            .lock()
-            .expect("poisoned")
-            .values()
-            .filter_map(Weak::upgrade)
-            .collect();
+        // parked in `accept` waits forever. `closed` is set with both tables
+        // locked, so a concurrent `listen` either registered before and is
+        // collected here, or sees the flag and fails. Collected first, as
+        // closing unregisters through these same table locks.
+        let (listeners, listeners6) = {
+            let m = self.inner.listeners.lock().expect("poisoned");
+            let m6 = self.inner.listeners6.lock().expect("poisoned");
+            self.inner.closed.store(true, Ordering::Release);
+            let l: Vec<Arc<Listener>> = m.values().filter_map(Weak::upgrade).collect();
+            let l6: Vec<Arc<Listener6>> = m6.values().filter_map(Weak::upgrade).collect();
+            (l, l6)
+        };
         for l in listeners {
             let _ = l.close();
         }
@@ -528,10 +537,7 @@ impl Stack {
     /// entry point is `<Stack as L3Device>::send`.
     fn handle_packet(inner: &Arc<Inner>, ns: u64, pkt: &[u8]) -> Result<()> {
         if inner.closed.load(Ordering::Acquire) {
-            return Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "stack is shut down",
-            ));
+            return Err(shut_down());
         }
         if pkt.len() < 20 {
             return Err(io::Error::new(
@@ -2811,6 +2817,16 @@ mod tests {
             L3Device::send(&*s, Packet::from_slice(&f)).unwrap();
         }
         assert!(!captured.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn listen_after_shutdown_fails() {
+        let s = Stack::new();
+        s.shutdown().unwrap();
+        let err = s.listen("tcp", "10.0.0.1:80").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotConnected);
+        let err = s.listen6("[fd00::1]:80").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotConnected);
     }
 
     #[test]
