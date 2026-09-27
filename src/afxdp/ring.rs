@@ -275,6 +275,13 @@ impl DescRing {
         (self.cur.size - prod.wrapping_sub(cons)) as usize
     }
 
+    /// Descriptors produced that the kernel has not consumed yet: on the TX
+    /// ring, frames still waiting to be picked up for transmission.
+    #[inline]
+    pub fn pending(&self) -> usize {
+        self.cur.size as usize - self.free()
+    }
+
     /// Enqueue TX descriptors (app asks the kernel to transmit). Returns how
     /// many were enqueued.
     pub fn produce(&mut self, descs: &[XdpDesc]) -> usize {
@@ -441,8 +448,10 @@ mod tests {
             },
         ];
         assert_eq!(ring.free(), 8);
+        assert_eq!(ring.pending(), 0);
         assert_eq!(ring.produce(&descs), 2);
         assert_eq!(ring.free(), 6);
+        assert_eq!(ring.pending(), 2);
 
         let mut out = [XdpDesc {
             addr: 0,
@@ -455,6 +464,7 @@ mod tests {
         assert_eq!(out[1].addr, 4096);
         assert_eq!(out[1].len, 1514);
         assert_eq!(ring.free(), 8);
+        assert_eq!(ring.pending(), 0);
     }
 
     #[test]

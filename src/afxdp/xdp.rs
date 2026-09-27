@@ -1030,10 +1030,18 @@ impl Socket {
     }
 
     /// Ask the kernel to pick up queued TX descriptors.
+    ///
+    /// Called without the TX lock held: the loop takes it between kicks to
+    /// reap completions.
     fn kick_tx(&self) {
-        // Failure is not ours to act on: EAGAIN/EBUSY mean the kernel is
-        // already busy with the ring, and the next kick retries anyway.
-        let _ = syscall::sendto(self.raw(), &[], syscall::MSG_DONTWAIT, None);
+        kick_until_drained(
+            || syscall::sendto(self.raw(), &[], syscall::MSG_DONTWAIT, None),
+            || {
+                let mut tx = self.tx.lock().unwrap();
+                tx.reclaim();
+                tx.ring.pending()
+            },
+        );
     }
 
     /// Block until there is RX work or `timeout_ms` elapses.
@@ -1056,6 +1064,69 @@ fn capture_config_for(ccfg: &CaptureConfig, queue_ids: &[u32]) -> CaptureConfig 
     let mut c = ccfg.clone();
     c.max_queues = c.max_queues.max(need);
     c
+}
+
+/// Frames the kernel transmits per wakeup in copy mode (`TX_BATCH_SIZE` in
+/// net/xdp/xsk.c) before it gives up the CPU and answers `EAGAIN`, with the
+/// rest of the TX ring still queued.
+const KERNEL_TX_BATCH: usize = 32;
+
+/// Wakeups in a row that may leave the TX ring no emptier before
+/// [`kick_until_drained`] leaves the rest to the next one.
+const TX_KICK_STALLS: usize = 4;
+
+/// Wake the kernel's TX path until it has taken every queued descriptor.
+/// Returns how many wakeups that took.
+///
+/// One `sendto` is not enough in copy mode: the kernel sends at most
+/// [`KERNEL_TX_BATCH`] frames per call and returns `EAGAIN` if more are
+/// queued, and it also answers `EAGAIN` when the COMPLETION ring has no room
+/// for what it would send, or when the NIC queue is busy. A send that kicked
+/// once would leave the rest of its frames on the ring until some later send
+/// happened to kick again, which for the last burst of a flow is never. So,
+/// as long as the kernel says to try again: reap completions (`pending` does
+/// that, and reports what is left on the TX ring), and kick again. Bounded by
+/// the batches the ring held at the first answer, and by
+/// [`TX_KICK_STALLS`] kicks in a row that move nothing, since a busy NIC or
+/// a zero-copy driver that transmits asynchronously would otherwise have us
+/// spin; the poll loop retries whatever that leaves behind.
+///
+/// Any other error ends it: `ENOBUFS`, `ENETDOWN` and friends are not cured
+/// by asking again right away.
+fn kick_until_drained(
+    mut kick: impl FnMut() -> Result<usize>,
+    mut pending: impl FnMut() -> usize,
+) -> usize {
+    let mut kicks = 0;
+    let mut budget = 1;
+    let mut last = usize::MAX;
+    let mut stalls = 0;
+    loop {
+        kicks += 1;
+        match kick() {
+            Err(e) if matches!(e.raw_os_error(), Some(syscall::EAGAIN | syscall::EBUSY)) => {}
+            _ => return kicks,
+        }
+        let left = pending();
+        if left == 0 {
+            return kicks;
+        }
+        if kicks == 1 {
+            budget = 1 + left.div_ceil(KERNEL_TX_BATCH) + TX_KICK_STALLS;
+        }
+        if left < last {
+            stalls = 0;
+        } else {
+            stalls += 1;
+            if stalls >= TX_KICK_STALLS {
+                return kicks;
+            }
+        }
+        last = left;
+        if kicks >= budget {
+            return kicks;
+        }
+    }
 }
 
 /// Split a UMEM into RX and TX halves, guaranteeing at least one frame each.
@@ -1089,8 +1160,16 @@ fn poll_loop(sock: Arc<Socket>, mut rings: RxRings) {
         }
         if got == 0 {
             // Idle: give TX completions back to the pool for whichever thread
-            // sends next, then sleep until the kernel has something for us.
-            sock.tx.lock().unwrap().reclaim();
+            // sends next, retry any frames a sender's kick left on the TX
+            // ring, then sleep until the kernel has something for us.
+            let stranded = {
+                let mut tx = sock.tx.lock().unwrap();
+                tx.reclaim();
+                tx.ring.pending() > 0 && tx.ring.need_wakeup()
+            };
+            if stranded {
+                sock.kick_tx();
+            }
             sock.wait(POLL_TIMEOUT_MS);
             continue;
         }
@@ -1606,6 +1685,73 @@ mod tests {
         assert_eq!(capture_config_for(&base, &[0, 1]).max_queues, 64);
         let big = base.clone().max_queues(512);
         assert_eq!(capture_config_for(&big, &queues).max_queues, 512);
+    }
+
+    /// A copy-mode kernel: sends up to 32 of `queued` per kick and answers
+    /// EAGAIN while any remain. Returns the kicks made and what is left.
+    fn copy_mode_kicks(queued: usize) -> (usize, usize) {
+        let left = Cell::new(queued);
+        let kicks = kick_until_drained(
+            || {
+                let sent = left.get().min(KERNEL_TX_BATCH);
+                left.set(left.get() - sent);
+                if left.get() > 0 {
+                    Err(io::Error::from_raw_os_error(syscall::EAGAIN))
+                } else {
+                    Ok(0)
+                }
+            },
+            || left.get(),
+        );
+        (kicks, left.get())
+    }
+
+    #[test]
+    fn a_copy_mode_kick_drains_the_whole_tx_ring() {
+        assert_eq!(copy_mode_kicks(1), (1, 0));
+        assert_eq!(copy_mode_kicks(32), (1, 0));
+        assert_eq!(copy_mode_kicks(33), (2, 0));
+        assert_eq!(copy_mode_kicks(100), (4, 0));
+        assert_eq!(copy_mode_kicks(2048), (64, 0));
+    }
+
+    #[test]
+    fn a_kick_that_moves_nothing_gives_up() {
+        // A NIC queue that stays busy: EBUSY, and the ring never drains.
+        let n = kick_until_drained(|| Err(io::Error::from_raw_os_error(syscall::EBUSY)), || 10);
+        assert_eq!(n, 1 + TX_KICK_STALLS);
+    }
+
+    #[test]
+    fn a_hard_error_is_not_retried() {
+        let n = kick_until_drained(
+            || Err(io::Error::from_raw_os_error(syscall::ENODEV)),
+            || panic!("nothing to reap after a hard error"),
+        );
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn completions_reaped_between_kicks_unblock_the_kernel() {
+        // EAGAIN because the COMPLETION ring is full: the kernel sends nothing
+        // until it is reaped, then everything.
+        let reaped = Cell::new(false);
+        let left = Cell::new(40usize);
+        let n = kick_until_drained(
+            || {
+                if reaped.get() {
+                    left.set(0);
+                    Ok(0)
+                } else {
+                    Err(io::Error::from_raw_os_error(syscall::EAGAIN))
+                }
+            },
+            || {
+                reaped.set(true);
+                left.get()
+            },
+        );
+        assert_eq!((n, left.get()), (2, 0));
     }
 
     #[test]
