@@ -565,6 +565,21 @@ impl Nat64 {
         }
         // The translator is a router (RFC 7915 §4.1): it spends one hop, and
         // owes the sender a Time Exceeded when none is left.
+        // Options are dropped in translation (RFC 7915 §4.1), but a source
+        // route still naming hops to visit cannot be honoured, so the packet
+        // is refused and the sender told why.
+        if unexpired_source_route(&pkt[IPV4_MIN_HEADER..ihl]) {
+            if let Some(ip) = self.outside_ipv4()
+                && let Some(err) = crate::icmp::error(
+                    Packet::from_slice(pkt),
+                    IpAddr::V4(ip),
+                    crate::icmp::IcmpError::DestUnreachable(5),
+                )
+            {
+                self.outside.deliver(Packet::from_slice(&err));
+            }
+            return;
+        }
         let ttl = pkt[8];
         if ttl <= 1 {
             if let Some(ip) = self.outside_ipv4()
@@ -1044,6 +1059,32 @@ fn tcp_flags(transport: &[u8], proto: u8) -> Option<u8> {
     (proto == PROTO_TCP)
         .then(|| transport.get(13).copied())
         .flatten()
+}
+
+/// Whether IPv4 options `opts` hold a Loose or Strict Source Route (RFC 791)
+/// whose pointer has not yet run past its last address.
+fn unexpired_source_route(opts: &[u8]) -> bool {
+    let mut i = 0;
+    while i < opts.len() {
+        match opts[i] {
+            0 => break,
+            1 => i += 1,
+            kind => {
+                let Some(&len) = opts.get(i + 1) else { break };
+                let len = len as usize;
+                if len < 2 || i + len > opts.len() {
+                    break;
+                }
+                // The pointer counts from the option's first byte, and is
+                // past the route once it exceeds the length.
+                if (kind == 131 || kind == 137) && len >= 3 && usize::from(opts[i + 2]) <= len {
+                    return true;
+                }
+                i += len;
+            }
+        }
+    }
+    false
 }
 
 fn read_v6(b: &[u8]) -> Ipv6Addr {
@@ -2086,6 +2127,48 @@ mod tests {
             .send(Packet::from_slice(&v4_reply(SERVER, port)))
             .unwrap();
         assert_eq!(inside.lock().unwrap().len(), 1);
+    }
+
+    /// `pkt` (a 20-byte-header IPv4 packet) with IP options `opts`, padded
+    /// to a 4-byte boundary.
+    fn with_options(pkt: &[u8], opts: &[u8]) -> Vec<u8> {
+        let mut o = opts.to_vec();
+        o.resize(opts.len().div_ceil(4) * 4, 0);
+        let mut p = pkt[..20].to_vec();
+        p.extend_from_slice(&o);
+        p.extend_from_slice(&pkt[20..]);
+        p[0] = 0x40 | ((20 + o.len()) / 4) as u8;
+        let total = p.len() as u16;
+        p[2..4].copy_from_slice(&total.to_be_bytes());
+        p[10..12].copy_from_slice(&[0, 0]);
+        let ic = checksum(&p[..20 + o.len()]);
+        p[10..12].copy_from_slice(&ic.to_be_bytes());
+        p
+    }
+
+    #[test]
+    fn unexpired_source_route_is_refused() {
+        let (nat, inside, outside) = wired();
+        let sent = send_udp(&nat, &outside);
+        outside.lock().unwrap().clear();
+        let port = u16::from_be_bytes([sent[20], sent[21]]);
+        let reply = v4_reply(SERVER, port);
+        // Loose and strict source routes with a hop still to visit: NOP,
+        // then type, length 7, pointer 4, one address.
+        for kind in [131, 137] {
+            let r = with_options(&reply, &[1, kind, 7, 4, 192, 0, 2, 1]);
+            nat.outside().send(Packet::from_slice(&r)).unwrap();
+            assert!(inside.lock().unwrap().is_empty(), "option {kind}");
+            let err = outside.lock().unwrap().pop().expect("an ICMP error");
+            assert_eq!(&err[16..20], &SERVER.octets());
+            assert_eq!((err[9], err[20], err[21]), (PROTO_ICMP, 3, 5));
+        }
+        // A route already followed to its end is just ignored, like any
+        // other option.
+        let r = with_options(&reply, &[131, 7, 8, 192, 0, 2, 1]);
+        nat.outside().send(Packet::from_slice(&r)).unwrap();
+        assert_eq!(inside.lock().unwrap().len(), 1);
+        assert!(outside.lock().unwrap().is_empty());
     }
 
     #[test]
