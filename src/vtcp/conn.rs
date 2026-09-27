@@ -10,7 +10,7 @@
 //! The state machine follows RFC 9293 §3.10 (the rolled-up RFC 793 +
 //! errata). Window scaling, SACK, and timestamps are all negotiated during
 //! the handshake; congestion control plugs in via the [`CongestionController`]
-//! trait. Anything not yet handled is flagged with `TODO(vtcp)`.
+//! trait.
 
 use crate::time::Instant;
 use std::net::SocketAddr;
@@ -2314,7 +2314,10 @@ impl Conn {
         self.close()
     }
 
-    /// Immediate teardown: send RST and mark closed.
+    /// Immediate teardown: mark the connection closed and return a RST for
+    /// the peer. From SYN-SENT no RST is sent, as RFC 9293 §3.10.5 has it:
+    /// the peer has acknowledged nothing, so it holds nothing to reset.
+    /// Nothing is sent from CLOSED either.
     pub fn abort(&mut self) -> Vec<Vec<u8>> {
         if self.state == State::Closed {
             return Vec::new();

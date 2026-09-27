@@ -120,8 +120,9 @@ impl Client {
         self.tcp.dial_nonblocking(local_ip, addr)
     }
 
-    /// Run the TCP timers: retransmission, persist, keepalive, TIME-WAIT,
-    /// and delayed ACKs.
+    /// Run the TCP timers (retransmission, persist, keepalive, FIN-WAIT-2
+    /// and TIME-WAIT), and send any segment a connection has queued, such
+    /// as the window update a read leaves behind.
     ///
     /// Where threads exist a background thread already does this every
     /// 100 ms, and calling it as well is harmless. On `wasm32` nothing else

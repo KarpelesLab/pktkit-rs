@@ -1,21 +1,33 @@
 //! Virtual TCP engine.
 //!
-//! Pure-Rust port of the Go `vtcp` subpackage: a synchronous TCP state machine
-//! operating on raw TCP segments. It is IP-agnostic and Ethernet-agnostic —
-//! callers feed inbound segments via [`Conn::handle_segment`] and transmit
-//! whatever the connection returns. A periodic [`Conn::tick`] drives RTO,
-//! persist, keepalive, and TIME-WAIT timers; there is no background thread.
+//! A synchronous TCP state machine operating on raw TCP segments, in pure
+//! Rust (it began as a port of the Go `vtcp` subpackage). It is IP-agnostic
+//! and Ethernet-agnostic — callers feed inbound segments via
+//! [`Conn::handle_segment`] and transmit whatever the connection returns. A
+//! periodic [`Conn::tick`] drives the RTO, Early Retransmit, persist,
+//! keepalive, FIN-WAIT-2 and TIME-WAIT timers; there is no background
+//! thread.
 //!
 //! Supported RFCs:
-//! - RFC 9293 (TCP, rolled-up): state machine, basic segment processing.
+//! - RFC 9293 (TCP, rolled-up): state machine and segment processing.
 //! - RFC 6298: RTO smoothing + Karn's algorithm.
-//! - RFC 5681: NewReno congestion control (slow start, congestion avoidance,
-//!   fast retransmit/recovery).
-//! - RFC 3649: HighSpeed TCP (default controller).
+//! - RFC 5681: congestion control (slow start, congestion avoidance, fast
+//!   retransmit/recovery), with RFC 6582's NewReno partial-ACK handling,
+//!   RFC 3042 Limited Transmit and RFC 6928's initial window.
+//! - RFC 3649: HighSpeed TCP (default controller); NewReno is the other.
+//! - RFC 7661 §4.3: no cwnd growth while the sender is application-limited.
 //! - RFC 7323: window scaling, timestamps (PAWS).
-//! - RFC 2018: SACK.
+//! - RFC 2018: SACK, and RFC 6675 SACK-based loss recovery.
+//! - RFC 5827: Early Retransmit, for a flight too small to draw three
+//!   duplicate ACKs.
+//! - RFC 5961: challenge ACKs against blind RST, SYN and data injection,
+//!   rate-limited.
+//! - RFC 6191: a new SYN may reuse a 4-tuple in TIME-WAIT when its
+//!   timestamps show it is newer.
 //! - RFC 6528: initial sequence numbers from a keyed hash and a clock.
-//! - SYN-cookie engine for stateless half-open completion.
+//! - RFC 4987: SYN cookies ([`SynCookies`]) for stateless half-open
+//!   completion.
+//! - RFC 2525 §2.17: releasing a connection with unread data resets it.
 //!
 //! # Layering: blocking I/O and accept live above this engine
 //!
