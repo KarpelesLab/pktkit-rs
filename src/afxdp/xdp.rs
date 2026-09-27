@@ -1279,8 +1279,49 @@ fn set_busy_poll(fd: RawFd, bp: BusyPoll) -> Result<()> {
 fn getsockopt_mmap_offsets(fd: RawFd) -> Result<MmapOffsets> {
     let mut offs = MmapOffsets::default();
     // SAFETY: plain integers; any bytes are a valid MmapOffsets.
-    unsafe { syscall::getsockopt(fd, SOL_XDP, XDP_MMAP_OFFSETS, &mut offs)? };
-    Ok(offs)
+    let len = unsafe { syscall::getsockopt(fd, SOL_XDP, XDP_MMAP_OFFSETS, &mut offs)? };
+    mmap_offsets_from(offs, len)
+}
+
+/// Size of the pre-5.4 `struct xdp_mmap_offsets`, whose per-ring offsets are
+/// only producer/consumer/desc: the `flags` word came with need-wakeup.
+const MMAP_OFFSETS_V1_LEN: usize = 4 * 3 * 8;
+
+/// Interpret the `len` bytes `XDP_MMAP_OFFSETS` wrote into `raw`.
+///
+/// A pre-5.4 kernel writes the v1 layout, three u64s per ring; read as the
+/// current layout, every ring after RX would take its neighbours' fields and
+/// be mapped at the wrong offsets. Those rings have no flags word. libbpf
+/// aims `flags` at the padding after `consumer`, which reads as "no wakeup
+/// needed"; a zero offset instead tells the ring there is no flags word and
+/// to always wake the kernel, which is what a kernel without need-wakeup
+/// requires.
+fn mmap_offsets_from(raw: MmapOffsets, len: usize) -> Result<MmapOffsets> {
+    if len == std::mem::size_of::<MmapOffsets>() {
+        return Ok(raw);
+    }
+    if len != MMAP_OFFSETS_V1_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("afxdp: XDP_MMAP_OFFSETS returned {len} bytes"),
+        ));
+    }
+    let v: Vec<u64> = [raw.rx, raw.tx, raw.fr, raw.cr]
+        .iter()
+        .flat_map(|r| [r.producer, r.consumer, r.desc, r.flags])
+        .collect();
+    let ring = |i: usize| RingOffset {
+        producer: v[3 * i],
+        consumer: v[3 * i + 1],
+        desc: v[3 * i + 2],
+        flags: 0,
+    };
+    Ok(MmapOffsets {
+        rx: ring(0),
+        tx: ring(1),
+        fr: ring(2),
+        cr: ring(3),
+    })
 }
 
 fn getsockopt_statistics(fd: RawFd) -> Result<Statistics> {
@@ -1397,6 +1438,57 @@ fn bind_xdp(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fill an `MmapOffsets` from a flat list of u64s, the way the kernel's
+    /// `copy_to_user` would.
+    fn raw_offsets(words: &[u64]) -> MmapOffsets {
+        let mut w = [0u64; 16];
+        w[..words.len()].copy_from_slice(words);
+        let r = |i: usize| RingOffset {
+            producer: w[4 * i],
+            consumer: w[4 * i + 1],
+            desc: w[4 * i + 2],
+            flags: w[4 * i + 3],
+        };
+        MmapOffsets {
+            rx: r(0),
+            tx: r(1),
+            fr: r(2),
+            cr: r(3),
+        }
+    }
+
+    #[test]
+    fn mmap_offsets_v2_taken_as_is() {
+        let words: Vec<u64> = (1..=16).collect();
+        let o = mmap_offsets_from(raw_offsets(&words), 128).unwrap();
+        assert_eq!(o.cr, raw_offsets(&words).cr);
+        assert_eq!(o.tx.flags, 8);
+    }
+
+    #[test]
+    fn mmap_offsets_v1_layout_is_converted() {
+        // Pre-5.4: producer/consumer/desc per ring, no flags.
+        let words = [0, 64, 128, 1, 65, 129, 2, 66, 130, 3, 67, 131];
+        let o = mmap_offsets_from(raw_offsets(&words), 96).unwrap();
+        for (i, r) in [o.rx, o.tx, o.fr, o.cr].into_iter().enumerate() {
+            let i = i as u64;
+            assert_eq!(
+                r,
+                RingOffset {
+                    producer: i,
+                    consumer: 64 + i,
+                    desc: 128 + i,
+                    flags: 0,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn mmap_offsets_unknown_length_rejected() {
+        assert!(mmap_offsets_from(MmapOffsets::default(), 64).is_err());
+    }
 
     #[test]
     fn default_config_values() {

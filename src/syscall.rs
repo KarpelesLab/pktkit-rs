@@ -192,11 +192,13 @@ pub(crate) fn setsockopt<T>(fd: RawFd, level: i32, opt: i32, val: &T) -> Result<
     Ok(())
 }
 
-/// `getsockopt(2)` into `val`. The kernel may fill in less than all of it.
+/// `getsockopt(2)` into `val`. The kernel may fill in less than all of it, so
+/// this returns how many bytes it wrote: callers reading a struct that grew
+/// across kernel versions must check it.
 ///
 /// # Safety
 /// Every bit pattern must be a valid `T`, since the kernel writes raw bytes.
-pub(crate) unsafe fn getsockopt<T>(fd: RawFd, level: i32, opt: i32, val: &mut T) -> Result<()> {
+pub(crate) unsafe fn getsockopt<T>(fd: RawFd, level: i32, opt: i32, val: &mut T) -> Result<usize> {
     let mut len = size_of::<T>() as u32;
     // SAFETY: `val` is writable for `len` bytes and `len` is a live socklen_t;
     // the caller guarantees any bytes the kernel writes make a valid `T`.
@@ -213,7 +215,7 @@ pub(crate) unsafe fn getsockopt<T>(fd: RawFd, level: i32, opt: i32, val: &mut T)
             ],
         )?;
     }
-    Ok(())
+    Ok(len as usize)
 }
 
 /// `sendto(2)`. `addr` is the raw `sockaddr` bytes, or `None` for a connected
