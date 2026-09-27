@@ -9,6 +9,7 @@
 use crate::MacAddr;
 use crate::time::Instant;
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -72,15 +73,16 @@ impl Table {
     }
 }
 
-/// Buffers packets waiting for ARP/NDP resolution. A queue older than
-/// [`PENDING_TIMEOUT`] is dropped, so the next packet for that target
+/// Buffers packets waiting for ARP/NDP resolution, keyed by the address
+/// being resolved (`Ipv4Addr` for ARP, `Ipv6Addr` for NDP). A queue older
+/// than [`PENDING_TIMEOUT`] is dropped, so the next packet for that target
 /// solicits again.
 ///
 /// Stale queues are pruned whenever a packet is queued; where threads are
 /// available a background thread also sweeps every second, so memory held for
 /// targets that never answer is released even when traffic stops.
-pub struct Pending {
-    inner: Arc<Mutex<HashMap<Ipv4Addr, PendingEntry>>>,
+pub struct Pending<K = Ipv4Addr> {
+    inner: Arc<Mutex<HashMap<K, PendingEntry>>>,
     stop: Arc<Mutex<bool>>,
 }
 
@@ -90,20 +92,20 @@ struct PendingEntry {
     created: Option<Instant>,
 }
 
-impl core::fmt::Debug for Pending {
+impl<K> core::fmt::Debug for Pending<K> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let n = self.inner.lock().map(|m| m.len()).unwrap_or(0);
         f.debug_struct("arp::Pending").field("queues", &n).finish()
     }
 }
 
-impl Default for Pending {
+impl<K: Eq + Hash + Copy + Send + 'static> Default for Pending<K> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-fn prune(map: &mut HashMap<Ipv4Addr, PendingEntry>, now: Instant) {
+fn prune<K>(map: &mut HashMap<K, PendingEntry>, now: Instant) {
     map.retain(|_, e| {
         e.created
             .map(|c| now.duration_since(c) <= PENDING_TIMEOUT)
@@ -111,11 +113,11 @@ fn prune(map: &mut HashMap<Ipv4Addr, PendingEntry>, now: Instant) {
     });
 }
 
-impl Pending {
+impl<K: Eq + Hash + Copy + Send + 'static> Pending<K> {
     /// Build a new pending-queue, spawning a background cleanup thread where
     /// the target has threads.
-    pub fn new() -> Pending {
-        let inner = Arc::new(Mutex::new(HashMap::<Ipv4Addr, PendingEntry>::new()));
+    pub fn new() -> Pending<K> {
+        let inner = Arc::new(Mutex::new(HashMap::<K, PendingEntry>::new()));
         let stop = Arc::new(Mutex::new(false));
 
         #[cfg(not(target_family = "wasm"))]
@@ -138,7 +140,7 @@ impl Pending {
 
     /// Buffer `pkt` for `ip`. Returns `true` when this is the first packet
     /// queued for `ip` — i.e. the caller should send an ARP solicitation now.
-    pub fn enqueue(&self, ip: Ipv4Addr, pkt: &[u8]) -> bool {
+    pub fn enqueue(&self, ip: K, pkt: &[u8]) -> bool {
         let now = Instant::now();
         let mut map = self.inner.lock().unwrap();
         prune(&mut map, now);
@@ -154,7 +156,7 @@ impl Pending {
     }
 
     /// Remove and return every packet waiting for `ip`.
-    pub fn drain(&self, ip: Ipv4Addr) -> Vec<Vec<u8>> {
+    pub fn drain(&self, ip: K) -> Vec<Vec<u8>> {
         self.inner
             .lock()
             .unwrap()
@@ -164,7 +166,7 @@ impl Pending {
     }
 }
 
-impl Drop for Pending {
+impl<K> Drop for Pending<K> {
     fn drop(&mut self) {
         *self.stop.lock().unwrap() = true;
     }

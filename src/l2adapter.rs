@@ -16,7 +16,6 @@ use crate::{
 // Only the DHCP client callback names this type.
 #[cfg(feature = "dhcp")]
 use crate::IpPrefix;
-use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, Mutex, Weak};
 
@@ -56,7 +55,7 @@ pub struct L2Adapter {
     arp: ArpTable,
     arp_pending: ArpPending,
     ndp: NdpTable,
-    ndp_pending: Mutex<HashMap<Ipv6Addr, Vec<Vec<u8>>>>,
+    ndp_pending: ArpPending<Ipv6Addr>,
 
     #[cfg(feature = "dhcp")]
     dhcp: Mutex<Option<Arc<crate::dhcp::Client>>>,
@@ -96,7 +95,7 @@ impl L2Adapter {
             arp: ArpTable::new(),
             arp_pending: ArpPending::new(),
             ndp: NdpTable::new(),
-            ndp_pending: Mutex::new(HashMap::new()),
+            ndp_pending: ArpPending::new(),
             #[cfg(feature = "dhcp")]
             dhcp: Mutex::new(None),
             weak_self: Mutex::new(Weak::new()),
@@ -284,12 +283,7 @@ impl L2Adapter {
                     match self.ndp.lookup(target) {
                         Some(m) => (m, EtherType::IPV6),
                         None => {
-                            let mut pending = self.ndp_pending.lock().unwrap();
-                            let entry = pending.entry(target).or_default();
-                            let first = entry.is_empty();
-                            entry.push(pkt.as_bytes().to_vec());
-                            drop(pending);
-                            if first {
+                            if self.ndp_pending.enqueue(target, pkt.as_bytes()) {
                                 self.send_neighbor_solicitation(target);
                             }
                             return;
@@ -362,7 +356,7 @@ impl L2Adapter {
                 if !src.is_unspecified()
                     && let Some(src_mac) = ndp::parse_option(&icmp[24..], ndp::OPT_SOURCE_LINK_ADDR)
                 {
-                    self.ndp.set(src, src_mac, ndp::DEFAULT_TTL);
+                    self.learn_neighbor(src, src_mac);
                 }
 
                 let ll = ndp::link_local_from_mac(self.mac);
@@ -390,17 +384,23 @@ impl L2Adapter {
                 let target = Ipv6Addr::from(t);
                 if let Some(target_mac) = ndp::parse_option(&icmp[24..], ndp::OPT_TARGET_LINK_ADDR)
                 {
-                    self.ndp.set(target, target_mac, ndp::DEFAULT_TTL);
-                    if let Some(pending) = self.ndp_pending.lock().unwrap().remove(&target) {
-                        for buf in pending {
-                            self.handle_outgoing(Packet::from_slice(&buf));
-                        }
-                    }
+                    self.learn_neighbor(target, target_mac);
                 }
                 true
             }
             ndp::RS_TYPE | ndp::RA_TYPE => false, // pass through to L3
             _ => false,
+        }
+    }
+
+    /// Cache a neighbour's MAC and send whatever was waiting for it,
+    /// however it was learnt.
+    fn learn_neighbor(&self, ip: Ipv6Addr, mac: MacAddr) {
+        self.ndp.set(ip, mac, ndp::DEFAULT_TTL);
+        // Drained before sending: a packet that misses the cache again is
+        // queued anew, which needs the queue's lock.
+        for buf in self.ndp_pending.drain(ip) {
+            self.handle_outgoing(Packet::from_slice(&buf));
         }
     }
 
@@ -565,5 +565,125 @@ mod tests {
         let frames = out.lock().unwrap();
         assert_eq!(frames.len(), 1);
         assert_eq!(Frame::from_slice(&frames[0]).ether_type(), EtherType::ARP);
+    }
+
+    type Out = Arc<Mutex<Vec<Vec<u8>>>>;
+
+    fn rig(addr: &str) -> (Arc<PipeL3>, Arc<L2Adapter>, Out) {
+        let pipe = Arc::new(PipeL3::new(addr.parse().unwrap()));
+        let adapter = L2Adapter::new_arc(pipe.clone(), L2AdapterConfig::default());
+        let out: Out = Arc::default();
+        let oc = out.clone();
+        adapter.set_handler(Arc::new(move |f: &Frame| {
+            oc.lock().unwrap().push(f.as_bytes().to_vec());
+            Ok(())
+        }));
+        (pipe, adapter, out)
+    }
+
+    fn take(out: &Out) -> Vec<Vec<u8>> {
+        std::mem::take(&mut *out.lock().unwrap())
+    }
+
+    fn v6_packet(src: Ipv6Addr, dst: Ipv6Addr) -> Vec<u8> {
+        let mut p = vec![0u8; 40];
+        p[0] = 0x60;
+        p[6] = 59; // no next header
+        p[7] = 64;
+        p[8..24].copy_from_slice(&src.octets());
+        p[24..40].copy_from_slice(&dst.octets());
+        p
+    }
+
+    /// An NDP message from `src_mac`/`src`, as the adapter would receive it.
+    fn ndp_frame(
+        adapter: &L2Adapter,
+        src_mac: MacAddr,
+        src: Ipv6Addr,
+        dst: Ipv6Addr,
+        icmp: &mut [u8],
+    ) -> Vec<u8> {
+        let ip = ndp::wrap_icmpv6(src, dst, icmp);
+        build_frame(adapter.mac, src_mac, EtherType::IPV6, &ip)
+    }
+
+    const PEER_MAC: MacAddr = MacAddr([2, 0, 0, 0, 0, 0x66]);
+
+    fn peer_ip() -> Ipv6Addr {
+        "2001:db8::66".parse().unwrap()
+    }
+
+    fn our_ip() -> Ipv6Addr {
+        "2001:db8::5".parse().unwrap()
+    }
+
+    #[test]
+    fn neighbour_queue_is_bounded() {
+        let (pipe, adapter, out) = rig("2001:db8::5/64");
+        for _ in 0..100 {
+            pipe.inject(Packet::from_slice(&v6_packet(our_ip(), peer_ip())))
+                .unwrap();
+        }
+        assert_eq!(take(&out).len(), 1, "one solicitation");
+
+        let mut na = ndp::build_na(PEER_MAC, peer_ip(), true);
+        let f = ndp_frame(&adapter, PEER_MAC, peer_ip(), our_ip(), &mut na);
+        adapter.send(Frame::from_slice(&f)).unwrap();
+        let flushed = take(&out);
+        assert!(!flushed.is_empty());
+        assert!(flushed.len() <= arp::PENDING_MAX_PKTS, "{}", flushed.len());
+    }
+
+    #[test]
+    fn solicitation_from_the_neighbour_flushes_its_queue() {
+        let (pipe, adapter, out) = rig("2001:db8::5/64");
+        pipe.inject(Packet::from_slice(&v6_packet(our_ip(), peer_ip())))
+            .unwrap();
+        assert_eq!(take(&out).len(), 1, "NS sent");
+
+        // The neighbour happens to resolve us first.
+        let mut ns = ndp::build_ns(PEER_MAC, our_ip());
+        let f = ndp_frame(
+            &adapter,
+            PEER_MAC,
+            peer_ip(),
+            ndp::solicited_node_multicast(our_ip()),
+            &mut ns,
+        );
+        adapter.send(Frame::from_slice(&f)).unwrap();
+        let sent = take(&out);
+        let data: Vec<_> = sent
+            .iter()
+            .map(|f| Frame::from_slice(f))
+            .filter(|f| Packet::from_slice(f.payload()).ipv6_next_header() == Protocol(59))
+            .collect();
+        assert_eq!(data.len(), 1, "queued packet delivered");
+        assert_eq!(data[0].dst_mac(), Some(PEER_MAC));
+    }
+
+    #[test]
+    fn advertisement_that_cannot_be_cached_does_not_deadlock() {
+        let (pipe, adapter, out) = rig("2001:db8::5/64");
+        // A full neighbour cache: the advertised address will not stick, so
+        // the flushed packet misses again and is queued anew.
+        for i in 0..ndp::MAX_ENTRIES as u32 {
+            let ip = Ipv6Addr::from(0xfd00_u128 << 112 | i as u128);
+            adapter.ndp.set(ip, PEER_MAC, ndp::DEFAULT_TTL);
+        }
+        pipe.inject(Packet::from_slice(&v6_packet(our_ip(), peer_ip())))
+            .unwrap();
+        take(&out);
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let a = adapter.clone();
+        std::thread::spawn(move || {
+            let mut na = ndp::build_na(PEER_MAC, peer_ip(), true);
+            let f = ndp_frame(&a, PEER_MAC, peer_ip(), our_ip(), &mut na);
+            a.send(Frame::from_slice(&f)).unwrap();
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("deadlocked flushing the neighbour queue");
     }
 }
