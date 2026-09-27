@@ -485,6 +485,14 @@ impl L2Adapter {
         true
     }
 
+    /// Drop the ARP cache and whatever was queued for resolution, when the
+    /// IPv4 configuration they were learnt under goes away.
+    #[cfg(feature = "dhcp")]
+    fn forget_ipv4_neighbours(&self) {
+        self.arp.clear();
+        self.arp_pending.clear();
+    }
+
     /// Cache a neighbour's MAC and send whatever was waiting for it,
     /// however it was learnt.
     fn learn_neighbor(&self, ip: Ipv6Addr, mac: MacAddr) {
@@ -607,20 +615,28 @@ impl crate::dhcp::ClientTransport for AdapterDhcpTransport {
     fn on_bound(&self, prefix: IpPrefix, gateway: Option<Ipv4Addr>) {
         if let Some(a) = self.weak.upgrade() {
             *a.probe.lock().unwrap() = None;
-            let _ = a.l3.set_addr(prefix);
-            if let Some(gw) = gateway {
-                a.set_gateway_v4(gw);
+            // A lease on another network makes every neighbour we know of
+            // somebody else's; a renewal of the same one does not.
+            if a.l3.addr() != prefix {
+                a.forget_ipv4_neighbours();
             }
+            let _ = a.l3.set_addr(prefix);
+            // The lease is the whole configuration: one naming no router
+            // means there is none, not that the last lease's still applies.
+            *a.gateway_v4.lock().unwrap() = gateway;
         }
     }
     fn on_lease_lost(&self) {
         // The leased address must not be used past the lease (RFC 2131
-        // §4.4.5); leave the device unconfigured until the next lease.
-        if let Some(a) = self.weak.upgrade()
-            && a.l3.addr().is_v4()
-        {
-            let _ =
-                a.l3.set_addr(IpPrefix::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0));
+        // §4.4.5); leave the device unconfigured until the next lease, and
+        // drop what came with it -- the next lease may be elsewhere.
+        if let Some(a) = self.weak.upgrade() {
+            if a.l3.addr().is_v4() {
+                let _ =
+                    a.l3.set_addr(IpPrefix::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0));
+            }
+            *a.gateway_v4.lock().unwrap() = None;
+            a.forget_ipv4_neighbours();
         }
     }
 }
@@ -1081,6 +1097,35 @@ mod tests {
             [10, 0, 0, 51],
         );
         assert!(t.probe_conflict(ip2));
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn losing_the_lease_forgets_the_gateway_and_the_neighbours() {
+        use crate::dhcp::ClientTransport;
+        let (_pipe, adapter, _out) = rig("0.0.0.0/0");
+        let t = AdapterDhcpTransport {
+            weak: Arc::downgrade(&adapter),
+        };
+        let gw = Ipv4Addr::new(10, 0, 0, 1);
+        t.on_bound("10.0.0.5/24".parse().unwrap(), Some(gw));
+        adapter
+            .arp
+            .set(gw, MacAddr([2, 0, 0, 0, 0, 1]), arp::DEFAULT_TTL);
+
+        t.on_lease_lost();
+        assert_eq!(*adapter.gateway_v4.lock().unwrap(), None);
+        assert_eq!(
+            adapter.arp.lookup(gw),
+            None,
+            "ARP cache from the old network kept"
+        );
+
+        // A lease that names no router has none: the last one's is not
+        // carried over onto what may be another network.
+        t.on_bound("10.0.0.5/24".parse().unwrap(), Some(gw));
+        t.on_bound("192.168.7.5/24".parse().unwrap(), None);
+        assert_eq!(*adapter.gateway_v4.lock().unwrap(), None);
     }
 
     #[test]

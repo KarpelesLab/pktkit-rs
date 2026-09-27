@@ -52,6 +52,11 @@ impl Table {
         }
     }
 
+    /// Forget every entry, as when the network they were learnt on is left.
+    pub fn clear(&self) {
+        self.inner.lock().unwrap().clear();
+    }
+
     /// Install or refresh an entry.
     pub fn set(&self, ip: Ipv4Addr, mac: MacAddr, ttl: Duration) {
         let mut t = self.inner.lock().unwrap();
@@ -162,6 +167,11 @@ impl<K: Eq + Hash + Copy + Send + 'static> Pending<K> {
             e.created
                 .is_some_and(|c| Instant::now().duration_since(c) <= PENDING_TIMEOUT)
         })
+    }
+
+    /// Drop every queue, and the packets in them.
+    pub fn clear(&self) {
+        self.inner.lock().unwrap().clear();
     }
 
     /// Remove and return every packet waiting for `ip`.
