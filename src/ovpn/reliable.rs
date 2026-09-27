@@ -118,12 +118,21 @@ impl Reliable {
     }
 
     /// Process an inbound control packet already routed to this transport.
-    /// `Err` means the packet was dropped; nothing in it was applied.
+    /// `Err` means the packet was dropped: its payload was not taken, nor is
+    /// it ACKed. The ACKs it carried for this session still count, as in
+    /// OpenVPN, which reads them before looking at the packet's own id.
     pub fn recv_packet(&mut self, pkt: ControlPacket) -> io::Result<RecvOutcome> {
         // An ACK names the session it acknowledges (reliable_ack_read): one
         // for another session must not release our unacknowledged packets.
         if !pkt.acked_pids.is_empty() && pkt.remote_id != self.local_id {
             return Err(invalid("ACK for another session"));
+        }
+        // ssl.c tls_pre_decrypt purges acknowledged packets first: an ACK
+        // riding on a packet that is itself refused below (out of the
+        // window, say) is still news, and dropping it would only cause
+        // needless retransmissions.
+        for pid in &pkt.acked_pids {
+            self.unacked.remove(pid);
         }
 
         let mut outcome = RecvOutcome::default();
@@ -140,18 +149,14 @@ impl Reliable {
         if is_reset && pid != Some(0) {
             return Err(invalid("hard reset with a non-zero packet id"));
         }
-        // Refuse a packet that would not fit the receive window before
-        // touching any state, so it is neither applied nor ACKed.
+        // A packet that would not fit the receive window is neither stored
+        // nor ACKed.
         if let Some(pid) = pid
             && pid >= self.in_counter + TLS_RELIABLE_N_REC_BUFFERS as u32
         {
             return Err(invalid("rejecting packet because pid looks invalid"));
         }
 
-        // Apply ACKs the peer reported.
-        for pid in &pkt.acked_pids {
-            self.unacked.remove(pid);
-        }
         let Some(pid) = pid else {
             return Ok(outcome);
         };
@@ -428,6 +433,21 @@ mod tests {
         // pids assigned sequentially.
         assert_eq!(chunks[0].pid, Some(0));
         assert_eq!(chunks[2].pid, Some(2));
+    }
+
+    /// ACKs are read before the packet's own id is checked (ssl.c
+    /// tls_pre_decrypt: reliable_send_purge, then
+    /// reliable_wont_break_sequentiality): ones riding on a packet we cannot
+    /// take yet still release what they acknowledge.
+    #[test]
+    fn acks_on_an_out_of_window_packet_are_applied() {
+        let mut r = Reliable::new(local());
+        let _p0 = r.build_control(b"x");
+        let mut far = ControlPacket::new(Opcode::CONTROL_V1, 0, [9; 8], r.local_id);
+        far.set_pid(1000);
+        assert!(r.recv(&far.to_bytes(&[0])).is_err());
+        assert_eq!(r.unacked_count(), 0);
+        assert!(!r.has_pending_acks(), "the packet itself is not ACKed");
     }
 
     #[test]
