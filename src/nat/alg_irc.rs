@@ -4,6 +4,7 @@
 //! and `\x01DCC CHAT ...\x01` payloads and registers an expectation so the
 //! incoming DCC connection is forwarded to the inside client.
 
+use crate::nat::alg_ftp::is_own_endpoint;
 use crate::nat::helper::{Expectation, Helper, NatMapping, PROTO_TCP, PacketHelper};
 use crate::nat::l4::replace_payload;
 use crate::nat::nat::Nat;
@@ -42,7 +43,7 @@ impl PacketHelper for IrcHelper {
         proto == PROTO_TCP && self.ports.contains(&dst_port)
     }
 
-    fn process_outbound(&self, nat: &Nat, pkt: Vec<u8>, _m: &NatMapping) -> Vec<u8> {
+    fn process_outbound(&self, nat: &Nat, pkt: Vec<u8>, m: &NatMapping) -> Vec<u8> {
         let ihl = (pkt[0] & 0x0F) as usize * 4;
         if pkt.len() < ihl + 20 {
             return pkt;
@@ -101,6 +102,9 @@ impl PacketHelper for IrcHelper {
             None => return pkt,
         };
         let inside_ip = Ipv4Addr::from(ip_val);
+        if !is_own_endpoint(m, inside_ip, port_val) {
+            return pkt;
+        }
         let outside_port = match nat.create_mapping(PROTO_TCP, inside_ip, port_val) {
             Some(p) => p,
             None => return pkt,
@@ -223,5 +227,26 @@ mod tests {
             v4_l4_checksum_ok(&out[0], 20),
             "rewritten DCC segment must verify"
         );
+    }
+
+    #[test]
+    fn dcc_naming_another_host_is_left_alone() {
+        let (nat, captured) = setup();
+        let victim = Ipv4Addr::new(10, 0, 0, 7);
+        let msg = format!(
+            "PRIVMSG bob :\x01DCC SEND f {} 22 1\x01\r\n",
+            u32::from(victim)
+        );
+        let pkt = build_irc(
+            Ipv4Addr::new(10, 0, 0, 5),
+            40000,
+            Ipv4Addr::new(198, 51, 100, 9),
+            6667,
+            msg.as_bytes(),
+        );
+        nat.inside().send(Packet::from_slice(&pkt)).unwrap();
+        let out = captured.lock().unwrap();
+        assert_eq!(&out[0][40..], msg.as_bytes());
+        assert!(nat.take_expectation(PROTO_TCP, victim, 22).is_none());
     }
 }

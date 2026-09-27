@@ -60,7 +60,7 @@ impl PacketHelper for FtpHelper {
     }
 }
 
-fn rewrite_port(nat: &Nat, pkt: &[u8], ihl: usize, data_off: usize, _m: &NatMapping) -> Vec<u8> {
+fn rewrite_port(nat: &Nat, pkt: &[u8], ihl: usize, data_off: usize, m: &NatMapping) -> Vec<u8> {
     let payload = &pkt[ihl + data_off..];
     let end = match find_crlf(payload) {
         Some(p) => p,
@@ -98,6 +98,9 @@ fn rewrite_port(nat: &Nat, pkt: &[u8], ihl: usize, data_off: usize, _m: &NatMapp
     };
     let inside_port = p1 * 256 + p2;
     let inside_ip = Ipv4Addr::from(ip);
+    if !is_own_endpoint(m, inside_ip, inside_port) {
+        return pkt.to_vec();
+    }
 
     let outside_data_port = match nat.create_mapping(PROTO_TCP, inside_ip, inside_port) {
         Some(p) => p,
@@ -134,7 +137,7 @@ fn rewrite_port(nat: &Nat, pkt: &[u8], ihl: usize, data_off: usize, _m: &NatMapp
     replace_payload(pkt, ihl, data_off, &new_payload)
 }
 
-fn rewrite_eprt(nat: &Nat, pkt: &[u8], ihl: usize, data_off: usize, _m: &NatMapping) -> Vec<u8> {
+fn rewrite_eprt(nat: &Nat, pkt: &[u8], ihl: usize, data_off: usize, m: &NatMapping) -> Vec<u8> {
     let payload = &pkt[ihl + data_off..];
     let end = match find_crlf(payload) {
         Some(p) => p,
@@ -166,6 +169,9 @@ fn rewrite_eprt(nat: &Nat, pkt: &[u8], ihl: usize, data_off: usize, _m: &NatMapp
         Some(p) => p,
         None => return pkt.to_vec(),
     };
+    if !is_own_endpoint(m, inside_ip, inside_port) {
+        return pkt.to_vec();
+    }
 
     let outside_data_port = match nat.create_mapping(PROTO_TCP, inside_ip, inside_port) {
         Some(p) => p,
@@ -188,6 +194,14 @@ fn rewrite_eprt(nat: &Nat, pkt: &[u8], ihl: usize, data_off: usize, _m: &NatMapp
     let mut new_payload = format!("EPRT |1|{}|{}|\r\n", outside_ip, outside_data_port).into_bytes();
     new_payload.extend_from_slice(&payload[end + 2..]);
     replace_payload(pkt, ihl, data_off, &new_payload)
+}
+
+/// Only an address belonging to the host that sent the command is opened
+/// up. The payload is the client's to write: honouring any address in it
+/// would let one inside host expose another host's port to the Internet
+/// (`PORT 10,0,0,7,0,22` sent by 10.0.0.5).
+pub(crate) fn is_own_endpoint(m: &NatMapping, ip: Ipv4Addr, port: u16) -> bool {
+    port != 0 && m.inside_ip == std::net::IpAddr::V4(ip)
 }
 
 fn find_crlf(b: &[u8]) -> Option<usize> {
@@ -269,6 +283,27 @@ mod tests {
             crate::nat::l4::v4_l4_checksum_ok(out, ihl),
             "rewritten PORT segment must carry a valid TCP checksum"
         );
+    }
+
+    #[test]
+    fn port_naming_another_host_is_left_alone() {
+        let nat = Nat::new(pfx("10.0.0.1/24"), pfx("203.0.113.1/24"));
+        nat.add_packet_helper(Arc::new(FtpHelper::new()));
+        let captured = Arc::new(StdMutex::new(Vec::<Vec<u8>>::new()));
+        let c = captured.clone();
+        nat.outside().set_handler(Arc::new(move |p| {
+            c.lock().unwrap().push(p.as_bytes().to_vec());
+            Ok(())
+        }));
+        let server = Ipv4Addr::new(198, 51, 100, 9);
+        let victim = Ipv4Addr::new(10, 0, 0, 7);
+        for cmd in [&b"PORT 10,0,0,7,0,22\r\n"[..], b"EPRT |1|10.0.0.7|22|\r\n"] {
+            let pkt = build_ftp_port_pkt(Ipv4Addr::new(10, 0, 0, 5), 45000, server, 21, cmd);
+            nat.inside().send(Packet::from_slice(&pkt)).unwrap();
+            let out = captured.lock().unwrap().pop().unwrap();
+            assert_eq!(&out[40..], cmd, "payload must pass unchanged");
+            assert!(nat.take_expectation(PROTO_TCP, victim, 22).is_none());
+        }
     }
 
     #[test]
