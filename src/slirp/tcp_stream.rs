@@ -327,8 +327,13 @@ impl TcpStream {
     }
 
     /// Read into `buf`, blocking until data is available or the peer closes.
-    /// Returns 0 at end of stream.
+    /// Returns 0 at end of stream, and at once for an empty `buf`.
     pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+        // Nothing can fill an empty buffer, so waiting for data would block
+        // until the peer closes; std's streams return 0 at once instead.
+        if buf.is_empty() {
+            return Ok(0);
+        }
         let deadline = self
             .read_timeout
             .lock()
@@ -522,6 +527,23 @@ mod tests {
         let n = stream.read(&mut buf).unwrap();
         assert_eq!(&buf[..n], b"whole");
         assert_eq!(stream.read(&mut buf).unwrap(), 0);
+    }
+
+    /// An empty read returns at once, as std's does, rather than waiting
+    /// for data it has no room for.
+    #[test]
+    fn an_empty_read_does_not_block() {
+        let mut peer = peer();
+        let (state, _out) = accepted(&mut peer);
+        let stream = TcpStream::new(state);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(stream.read(&mut []).map_err(|e| e.kind()));
+        });
+        let got = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("read(&mut []) blocked");
+        assert_eq!(got, Ok(0));
     }
 
     /// A write that the peer's closed window holds back gives up at the
