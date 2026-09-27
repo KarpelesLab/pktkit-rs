@@ -334,7 +334,13 @@ impl io::Write for TcpConn {
 
 impl Drop for TcpConn {
     fn drop(&mut self) {
-        let _ = self.close();
+        // Unlike close() (a half-close: we may still read), dropping the
+        // handle means nobody will read or write again. Releasing lets the
+        // engine time out a peer that never finishes, and reset one that
+        // keeps sending or whose data was left unread, as Linux does for an
+        // orphaned socket.
+        let segs = self.state.conn.lock().unwrap().release();
+        self.state.wrap_and_send(segs);
     }
 }
 

@@ -394,7 +394,14 @@ impl io::Write for TcpStream {
 
 impl Drop for TcpStream {
     fn drop(&mut self) {
-        let _ = self.close();
+        // Unlike close() (a half-close: we may still read), dropping the
+        // stream means nobody will read or write again. Releasing lets the
+        // engine time out a peer that never finishes, and reset one that
+        // keeps sending or whose data was left unread, as Linux does for an
+        // orphaned socket.
+        let segs = self.state.conn.lock().expect("poisoned").release();
+        self.state.wrap_and_send(segs);
+        self.state.signal.notify_all();
     }
 }
 

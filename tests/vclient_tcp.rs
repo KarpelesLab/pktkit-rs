@@ -547,3 +547,28 @@ fn write_after_close_is_a_broken_pipe() {
     assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
     assert!(start.elapsed() < Duration::from_secs(1));
 }
+
+/// Dropping a connection whose incoming data was never read resets it
+/// rather than closing it gracefully: a FIN would tell the sender its bytes
+/// were consumed (RFC 2525 §2.17), which is how Linux closes such a socket.
+#[test]
+fn dropping_a_connection_with_unread_data_resets_it() {
+    use std::io::ErrorKind::ConnectionReset;
+
+    let (a, b) = (client(1), client(2));
+    let listener = b.listen_tcp(LISTEN_PORT).unwrap();
+    listener.set_nonblocking(true);
+    pktkit::connect_l3(a.clone(), b.clone());
+    let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), LISTEN_PORT);
+    let conn = a.dial_tcp_nonblocking(dst).unwrap();
+    let accepted = listener.accept().unwrap();
+
+    conn.write(b"never read").unwrap();
+    drop(accepted);
+
+    let mut buf = [0u8; 16];
+    match conn.read(&mut buf) {
+        Err(e) => assert_eq!(e.kind(), ConnectionReset),
+        Ok(n) => panic!("read {n} bytes, expected a reset"),
+    }
+}
