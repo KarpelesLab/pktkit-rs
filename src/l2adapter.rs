@@ -5,7 +5,8 @@
 //! - Handles ARP for IPv4 (cache + solicitation + reply).
 //! - Handles NDP for IPv6 (cache + NS/NA).
 //! - Optionally runs a DHCP client to obtain the L3 device's address.
-//! - When DHCP is bound, the gateway is set on the adapter automatically.
+//! - When DHCP is bound, the IPv4 gateway is taken from the lease (and
+//!   cleared when the lease names no router, or is lost).
 
 use crate::arp::{self, Pending as ArpPending, Table as ArpTable};
 use crate::ndp::{self, Table as NdpTable};
@@ -25,8 +26,14 @@ use std::sync::{Arc, Mutex, Weak};
 pub struct L2AdapterConfig {
     /// Override the MAC. Defaults to a random locally-administered unicast.
     pub mac: Option<MacAddr>,
-    /// Initial gateway. Updated automatically once DHCP binds.
+    /// Initial IPv4 gateway, the next hop for off-subnet destinations.
+    ///
+    /// A static value does not survive DHCP: once the client binds, each
+    /// lease replaces it with the lease's router, or clears it if the lease
+    /// names none, and a lost lease clears it.
     pub gateway_v4: Option<Ipv4Addr>,
+    /// Initial IPv6 gateway, the next hop for off-link destinations. DHCP,
+    /// being IPv4 only, leaves it alone.
     pub gateway_v6: Option<Ipv6Addr>,
 }
 
@@ -125,7 +132,9 @@ impl L2Adapter {
         self.mac
     }
 
-    /// Set the IPv4 default gateway used for off-subnet ARP.
+    /// Set the IPv4 default gateway used for off-subnet ARP. With DHCP
+    /// running, the next binding or lost lease replaces it (see
+    /// [`L2AdapterConfig::gateway_v4`]).
     pub fn set_gateway_v4(&self, gw: Ipv4Addr) {
         *self.gateway_v4.lock().unwrap() = Some(gw);
     }
