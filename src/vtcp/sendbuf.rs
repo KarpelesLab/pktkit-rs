@@ -7,6 +7,12 @@ use super::seqspace::{seq_after, seq_after_eq, seq_before, seq_before_eq};
 /// separately, so this bounds how many holes a peer can make us track.
 const MAX_SACKED: usize = 128;
 
+/// Capacity an empty buffer may keep. Above it, draining to empty frees the
+/// storage: an idle connection would otherwise pin its peak (up to the
+/// whole send buffer) for as long as it lives. Below it, a connection
+/// that empties its buffer on every ACK keeps reusing the same allocation.
+pub(crate) const KEEP_IDLE_CAPACITY: usize = 64 * 1024;
+
 /// Tracks application data through the TCP send pipeline:
 ///
 /// ```text
@@ -110,7 +116,10 @@ impl SendBuf {
         // at most four bytes per byte acknowledged since the last, and the
         // dead space stays bounded.
         let live = self.buf.len() - self.head;
-        if self.head >= live || self.head >= self.cap / 4 {
+        if live == 0 && self.buf.capacity() > KEEP_IDLE_CAPACITY {
+            self.buf = Vec::new();
+            self.head = 0;
+        } else if self.head >= live || self.head >= self.cap / 4 {
             self.buf.drain(..self.head);
             self.head = 0;
         }
@@ -357,6 +366,21 @@ impl SendBuf {
         None
     }
 
+    /// Free the storage for good, once the connection will send nothing
+    /// more (TIME-WAIT, CLOSED). Data still held is discarded; the sequence
+    /// numbers stay as they are.
+    pub fn release_memory(&mut self) {
+        self.buf = Vec::new();
+        self.head = 0;
+        self.sacked = Vec::new();
+    }
+
+    /// Bytes allocated for data and the SACK scoreboard.
+    #[cfg(test)]
+    pub fn allocated(&self) -> usize {
+        self.buf.capacity() + self.sacked.capacity() * std::mem::size_of::<SackBlock>()
+    }
+
     /// True if no data is buffered, unacknowledged or not yet sent.
     #[inline]
     pub fn is_empty(&self) -> bool {
@@ -591,6 +615,27 @@ mod tests {
         assert_eq!(s.pending(), refilled);
         assert_eq!(s.peek_unsent(3), &[3, 3, 3][..]);
         assert_eq!(s.available(), CAP - refilled);
+    }
+
+    #[test]
+    fn draining_to_empty_frees_a_large_buffer() {
+        let mut s = SendBuf::new(1 << 20, 0);
+        assert_eq!(s.write(&vec![1; 1 << 20]), 1 << 20);
+        s.advance_sent(1 << 20);
+        s.acknowledge(1 << 19);
+        assert!(s.buf.capacity() >= 1 << 19, "freed with data in flight");
+        s.acknowledge(1 << 20);
+        assert!(s.is_empty());
+        assert!(s.buf.capacity() <= KEEP_IDLE_CAPACITY, "idle buffer kept");
+
+        // A small one is kept for reuse.
+        s.write(&[2; 1000]);
+        s.advance_sent(1000);
+        let cap = s.buf.capacity();
+        s.acknowledge((1 << 20) + 1000);
+        assert_eq!(s.buf.capacity(), cap);
+        assert_eq!(s.write(b"x"), 1);
+        assert_eq!(s.peek_unsent(10), b"x");
     }
 
     #[test]

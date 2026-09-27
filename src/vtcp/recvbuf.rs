@@ -3,6 +3,7 @@
 use std::collections::VecDeque;
 
 use super::options::SackBlock;
+use super::sendbuf::KEEP_IDLE_CAPACITY;
 use super::seqspace::{seq_after, seq_after_eq, seq_before, seq_before_eq};
 
 /// Cap on the number of out-of-order ranges. Adjacent and overlapping
@@ -262,7 +263,31 @@ impl RecvBuf {
     /// Copy contiguous bytes into `p`, returning the count moved.
     pub fn read(&mut self, p: &mut [u8]) -> usize {
         // VecDeque's Read copies from its two halves and frees the front.
-        std::io::Read::read(&mut self.buf, p).unwrap_or(0)
+        let n = std::io::Read::read(&mut self.buf, p).unwrap_or(0);
+        // Emptied, a large ring goes: an idle connection would otherwise
+        // pin its peak (up to the whole window) for as long as it lives.
+        // A small one stays for the next segments to reuse.
+        if self.buf.is_empty() && self.buf.capacity() > KEEP_IDLE_CAPACITY {
+            self.buf = VecDeque::new();
+        }
+        n
+    }
+
+    /// Free what the connection no longer needs once no more data can
+    /// arrive (TIME-WAIT, CLOSED): the out-of-order ranges, and the
+    /// in-order data too unless it is still to be read (`keep_unread`).
+    pub fn release_memory(&mut self, keep_unread: bool) {
+        self.ooo = Vec::new();
+        self.recent = Vec::new();
+        if !keep_unread || self.buf.is_empty() {
+            self.buf = VecDeque::new();
+        }
+    }
+
+    /// Bytes allocated for data, in order and out of order.
+    #[cfg(test)]
+    pub fn allocated(&self) -> usize {
+        self.buf.capacity() + self.ooo.iter().map(|e| e.data.capacity()).sum::<usize>()
     }
 
     /// In-order bytes waiting to be read.
@@ -323,6 +348,38 @@ impl RecvBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reading_to_empty_frees_a_large_ring() {
+        let mut r = RecvBuf::new(0, 1 << 20);
+        assert_eq!(r.insert(0, &vec![1; 1 << 20]), 1 << 20);
+        let mut out = vec![0; 1 << 19];
+        assert_eq!(r.read(&mut out), 1 << 19);
+        assert!(r.buf.capacity() >= 1 << 19, "freed with data unread");
+        assert_eq!(r.read(&mut out), 1 << 19);
+        assert!(r.buf.capacity() <= KEEP_IDLE_CAPACITY, "idle ring kept");
+
+        // A small one is kept for reuse.
+        r.insert(1 << 20, &[2; 1000]);
+        let cap = r.buf.capacity();
+        assert_eq!(r.read(&mut out), 1000);
+        assert_eq!(r.buf.capacity(), cap);
+    }
+
+    #[test]
+    fn release_memory_keeps_only_unread_data() {
+        let mut r = RecvBuf::new(0, 1 << 20);
+        r.insert(0, b"unread");
+        r.insert(100, &[3; 5000]);
+        r.release_memory(true);
+        assert!(!r.has_ooo());
+        let mut out = [0; 16];
+        assert_eq!(r.read(&mut out), 6);
+        assert_eq!(&out[..6], b"unread");
+        r.insert(6, b"more");
+        r.release_memory(false);
+        assert_eq!((r.readable(), r.allocated()), (0, 0));
+    }
 
     #[test]
     fn in_order_insert_is_readable() {

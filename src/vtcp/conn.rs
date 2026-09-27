@@ -1937,6 +1937,7 @@ impl Conn {
     fn start_time_wait(&mut self) {
         self.stop_keepalive();
         self.stop_persist();
+        self.release_buffers();
         self.time_wait_deadline = Some(Instant::now() + self.cfg.time_wait);
     }
 
@@ -2028,6 +2029,7 @@ impl Conn {
             self.time_wait_deadline = None;
             self.state = State::Closed;
             self.closed = true;
+            self.release_buffers();
         }
         // FIN-WAIT-2: the peer has gone quiet without closing, and nothing
         // on our side is waiting for what it might still send. Quiet since
@@ -2387,9 +2389,10 @@ impl Conn {
     /// socket is in CLOSE by then, where `tcp_close` sends nothing).
     pub fn release(&mut self) -> Vec<Vec<u8>> {
         self.released.get_or_insert_with(Instant::now);
-        if !matches!(self.state, State::TimeWait | State::Closed)
-            && self.recv_buf.as_ref().is_some_and(|rb| rb.readable() > 0)
-        {
+        if matches!(self.state, State::TimeWait | State::Closed) {
+            // Unread data kept for the application goes with it.
+            self.release_buffers();
+        } else if self.recv_buf.as_ref().is_some_and(|rb| rb.readable() > 0) {
             return self.abort();
         }
         self.close()
@@ -2430,6 +2433,23 @@ impl Conn {
         if self.closed {
             self.signal_established();
             self.signal_fin_recvd();
+            self.release_buffers();
+        }
+    }
+
+    /// Give back the buffers' memory once nothing more will be sent or
+    /// received (TIME-WAIT, CLOSED). Sized for the peak of the transfer,
+    /// they would otherwise stay allocated through TIME-WAIT, or for as
+    /// long as the owner keeps a closed connection around. Data the
+    /// application has yet to read stays until it is read, unless it was
+    /// [released](Self::release) and nobody will.
+    fn release_buffers(&mut self) {
+        if let Some(sb) = self.send_buf.as_mut() {
+            sb.release_memory();
+        }
+        let keep_unread = self.released.is_none();
+        if let Some(rb) = self.recv_buf.as_mut() {
+            rb.release_memory(keep_unread);
         }
     }
 
@@ -4268,6 +4288,63 @@ mod tests {
         assert!(client.release().is_empty(), "reset from TIME-WAIT");
         assert_eq!(client.state(), State::TimeWait);
         assert!(client.time_wait_deadline.is_some());
+        // Nobody will read it now.
+        assert_eq!(client.recv_buf.as_ref().unwrap().allocated(), 0);
+    }
+
+    fn allocated(c: &Conn) -> (usize, usize) {
+        (
+            c.send_buf.as_ref().unwrap().allocated(),
+            c.recv_buf.as_ref().unwrap().allocated(),
+        )
+    }
+
+    /// TIME-WAIT and CLOSED send and receive nothing more, so they give
+    /// back the buffers' memory, which an idle connection keeps as long as
+    /// it stays under the shrink threshold. Unread data stays for the
+    /// application to read.
+    #[test]
+    fn time_wait_and_closed_free_the_buffers() {
+        let conf = |l, r| big(l, r).send_buf_size(1 << 20).recv_buf_size(1 << 20);
+        let mut client = Conn::new(conf(40384, 80));
+        let mut server = Conn::new(conf(80, 40384));
+        drive_handshake(&mut client, &mut server);
+        let chunk = vec![5u8; 30_000];
+        let send = |tx: &mut Conn, rx: &mut Conn| {
+            let (_, mut pkts) = tx.write(&chunk);
+            while !pkts.is_empty() {
+                let acks = deliver(rx, &pkts);
+                pkts = deliver(tx, &acks);
+                pkts.extend(tx.take_outgoing());
+            }
+        };
+        send(&mut client, &mut server);
+        send(&mut server, &mut client);
+        assert_eq!(read_all(&mut server).len(), chunk.len());
+        assert!(allocated(&client).0 > 0 && allocated(&server).0 > 0);
+        assert!(allocated(&client).1 > 0 && allocated(&server).1 > 0);
+
+        let fin = client.close();
+        let acks = deliver(&mut server, &fin);
+        deliver(&mut client, &acks);
+        let fin = server.close();
+        let acks = deliver(&mut client, &fin);
+        assert_eq!(client.state(), State::TimeWait);
+        deliver(&mut server, &acks);
+        assert!(server.is_closed());
+
+        assert_eq!(allocated(&server), (0, 0));
+        // The client never read what the server sent.
+        assert_eq!(allocated(&client).0, 0);
+        assert_eq!(client.recv_buf.as_ref().unwrap().readable(), chunk.len());
+        assert_eq!(read_all(&mut client).len(), chunk.len());
+
+        // And an abort gives back the rest.
+        let (mut client, mut server) = established(40385);
+        let (_, data) = client.write(&[1; 1000]);
+        deliver(&mut server, &data);
+        client.abort();
+        assert_eq!(allocated(&client), (0, 0));
     }
 
     /// A SYN numbered beyond the old connection may take over a 4-tuple in
