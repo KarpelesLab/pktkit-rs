@@ -23,6 +23,11 @@ pub(crate) const DEFRAG_MAX_ENTRIES: usize = 256;
 /// 576-byte path is about 120 fragments; more than this is an attack on the
 /// buffer, not a datagram.
 pub(crate) const DEFRAG_MAX_FRAGS: usize = 256;
+/// Cap on the memory all reassemblies together may hold, fragments and
+/// their bookkeeping, as Linux's `ipfrag_high_thresh` (4 MiB) does. Without
+/// it the entry and fragment caps alone allow some 16 MiB of data, and far
+/// more in bookkeeping when the fragments are tiny.
+pub(crate) const DEFRAG_MAX_BYTES: usize = 4 << 20;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct FragKey {
@@ -39,11 +44,27 @@ struct FragData {
     hdr: Option<Vec<u8>>,
 }
 
+impl FragData {
+    /// What holding this fragment costs, counted against
+    /// [`DEFRAG_MAX_BYTES`].
+    fn charge(&self) -> usize {
+        std::mem::size_of::<FragData>() + self.data.len() + self.hdr.as_ref().map_or(0, Vec::len)
+    }
+}
+
 struct FragEntry {
+    /// In offset order, so a new fragment is checked against its two
+    /// neighbours only.
     frags: Vec<FragData>,
     created: Instant,
     /// Total reassembled payload length once last fragment is seen, else `None`.
     total: Option<usize>,
+    /// Payload bytes the fragments hold. Overlaps are refused on arrival,
+    /// so once it reaches `total` the datagram is whole.
+    covered: usize,
+    /// What the entry's fragments cost, counted against
+    /// [`DEFRAG_MAX_BYTES`].
+    charge: usize,
     /// Largest fragment seen, in bytes of IP packet.
     max_size: usize,
     /// Largest fragment seen with Don't Fragment set.
@@ -116,6 +137,46 @@ impl std::fmt::Debug for Defragger {
 
 struct DefragInner {
     entries: HashMap<FragKey, FragEntry>,
+    /// The sum of the entries' charges.
+    charge: usize,
+}
+
+impl DefragInner {
+    fn drop_entry(&mut self, k: &FragKey) {
+        if let Some(e) = self.entries.remove(k) {
+            self.charge -= e.charge;
+        }
+    }
+
+    fn expire(&mut self, now: Instant) {
+        let charge = &mut self.charge;
+        self.entries.retain(|_, e| {
+            let live = now.saturating_duration_since(e.created) < DEFRAG_TIMEOUT;
+            if !live {
+                *charge -= e.charge;
+            }
+            live
+        });
+    }
+
+    /// Drop the oldest reassembly other than `keep`, the least likely to
+    /// complete, as Linux evicts the oldest queue under pressure. Returns
+    /// whether there was one.
+    fn evict_oldest(&mut self, keep: &FragKey) -> bool {
+        let oldest = self
+            .entries
+            .iter()
+            .filter(|(k, _)| *k != keep)
+            .min_by_key(|(_, e)| e.created)
+            .map(|(k, _)| *k);
+        match oldest {
+            Some(k) => {
+                self.drop_entry(&k);
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 impl Defragger {
@@ -123,6 +184,7 @@ impl Defragger {
         Defragger {
             inner: Mutex::new(DefragInner {
                 entries: HashMap::new(),
+                charge: 0,
             }),
         }
     }
@@ -184,31 +246,27 @@ impl Defragger {
         };
 
         let mut inner = self.inner.lock().expect("Defragger poisoned");
+        let inner = &mut *inner;
 
-        // Nothing else runs on a timer (the NAT has no maintenance thread,
-        // and there are no threads on wasm), so lapsed reassemblies go here:
-        // left in place, datagrams that never completed would fill the table
-        // and block every later fragmented datagram.
-        inner
-            .entries
-            .retain(|_, e| now.saturating_duration_since(e.created) < DEFRAG_TIMEOUT);
-        // Still full: the oldest reassembly is the least likely to complete,
-        // and makes room, as Linux evicts the oldest queue under pressure.
-        if !inner.entries.contains_key(&k)
-            && inner.entries.len() >= DEFRAG_MAX_ENTRIES
-            && let Some(oldest) = inner
-                .entries
-                .iter()
-                .min_by_key(|(_, e)| e.created)
-                .map(|(k, _)| *k)
-        {
-            inner.entries.remove(&oldest);
+        if !inner.entries.contains_key(&k) {
+            // Nothing else runs on a timer (the NAT has no maintenance
+            // thread, and there are no threads on wasm), so lapsed
+            // reassemblies go when a new one starts: left in place,
+            // datagrams that never completed would fill the table and block
+            // every later fragmented datagram.
+            inner.expire(now);
+            // Still full: the oldest makes room.
+            if inner.entries.len() >= DEFRAG_MAX_ENTRIES {
+                inner.evict_oldest(&k);
+            }
         }
 
         let entry = inner.entries.entry(k).or_insert_with(|| FragEntry {
             frags: Vec::new(),
             created: now,
             total: None,
+            covered: 0,
+            charge: 0,
             max_size: 0,
             max_df_size: 0,
         });
@@ -216,29 +274,30 @@ impl Defragger {
         if !mf {
             // Two different last fragments means the datagram is corrupt.
             if entry.total.is_some_and(|t| t != end) {
-                inner.entries.remove(&k);
+                inner.drop_entry(&k);
                 return None;
             }
             entry.total = Some(end);
         }
         // Data past the end of the datagram is as corrupt as an overlap
         // (RFC 791 gives it nowhere to go), whichever fragment arrived first.
+        let frag_end = |f: &FragData| f.offset + f.data.len();
         if let Some(total) = entry.total
-            && (end > total || entry.frags.iter().any(|f| f.offset + f.data.len() > total))
+            && (end > total || entry.frags.last().is_some_and(|f| frag_end(f) > total))
         {
-            inner.entries.remove(&k);
+            inner.drop_entry(&k);
             return None;
         }
 
         // Overlaps are rejected on arrival rather than at reassembly, so a
         // fragment sent over and over cannot pile up copies of itself (RFC
-        // 5722 has IPv6 drop the whole datagram too).
-        let overlaps = entry
-            .frags
-            .iter()
-            .any(|f| frag_offset < f.offset + f.data.len() && f.offset < end);
+        // 5722 has IPv6 drop the whole datagram too), and the bytes held
+        // count the bytes covered.
+        let at = entry.frags.partition_point(|f| f.offset < frag_offset);
+        let overlaps = (at > 0 && frag_end(&entry.frags[at - 1]) > frag_offset)
+            || entry.frags.get(at).is_some_and(|f| f.offset < end);
         if overlaps || entry.frags.len() >= DEFRAG_MAX_FRAGS {
-            inner.entries.remove(&k);
+            inner.drop_entry(&k);
             return None;
         }
 
@@ -246,7 +305,7 @@ impl Defragger {
         if flags_off & 0x4000 != 0 {
             entry.max_df_size = entry.max_df_size.max(total_len);
         }
-        entry.frags.push(FragData {
+        let frag = FragData {
             offset: frag_offset,
             data: payload.to_vec(),
             hdr: if frag_offset == 0 {
@@ -254,36 +313,31 @@ impl Defragger {
             } else {
                 None
             },
-        });
-
-        let total = entry.total?;
-
-        // Coverage check; reject overlaps.
-        let mut covered = vec![false; total];
-        let mut first_hdr: Option<Vec<u8>> = None;
-        for f in entry.frags.iter() {
-            let end = (f.offset + f.data.len()).min(total);
-            for slot in &mut covered[f.offset..end] {
-                if *slot {
-                    inner.entries.remove(&k);
-                    return None;
-                }
-                *slot = true;
-            }
-            if let Some(h) = &f.hdr {
-                first_hdr = Some(h.clone());
-            }
-        }
-        if covered.iter().any(|c| !c) {
-            return None;
-        }
-
-        let hdr = match first_hdr {
-            Some(h) => h,
-            None => {
-                inner.entries.remove(&k);
+        };
+        let charge = frag.charge();
+        entry.covered += frag.data.len();
+        entry.charge += charge;
+        entry.frags.insert(at, frag);
+        inner.charge += charge;
+        // Over the memory cap, older reassemblies make room; if this one
+        // alone is over it, it goes too.
+        while inner.charge > DEFRAG_MAX_BYTES {
+            if !inner.evict_oldest(&k) {
+                inner.drop_entry(&k);
                 return None;
             }
+        }
+        let entry = inner.entries.get(&k)?;
+
+        let total = entry.total?;
+        if entry.covered < total {
+            return None;
+        }
+        // Covered without overlaps, and nothing past the end: the fragment
+        // at offset 0 is there, and with it the header.
+        let Some(hdr) = entry.frags.iter().find_map(|f| f.hdr.clone()) else {
+            inner.drop_entry(&k);
+            return None;
         };
 
         // Reassemble.
@@ -299,7 +353,7 @@ impl Defragger {
             size: entry.max_size,
             df: entry.max_df_size == entry.max_size,
         };
-        inner.entries.remove(&k);
+        inner.drop_entry(&k);
 
         let total_len = hdr.len() + reassembled.len();
         if total_len > 65535 {
@@ -325,10 +379,7 @@ impl Defragger {
     /// whenever a fragment arrives.
     pub fn sweep(&self) {
         let now = Instant::now();
-        let mut inner = self.inner.lock().expect("Defragger poisoned");
-        inner
-            .entries
-            .retain(|_, e| now.saturating_duration_since(e.created) < DEFRAG_TIMEOUT);
+        self.inner.lock().expect("Defragger poisoned").expire(now);
     }
 }
 
@@ -503,5 +554,56 @@ mod tests {
         }
         // The lapsed ones are gone without anyone calling sweep().
         assert!(d.inner.lock().unwrap().entries.len() <= 1);
+    }
+
+    #[test]
+    fn memory_held_is_bounded() {
+        let d = Defragger::new();
+        // Large first fragments of datagrams that never complete.
+        for id in 0..DEFRAG_MAX_ENTRIES as u16 {
+            let f = build_ipv4(id, true, 0, &vec![0u8; 65000]);
+            assert!(d.process(&f).is_none());
+        }
+        let inner = d.inner.lock().unwrap();
+        let held: usize = inner
+            .entries
+            .values()
+            .flat_map(|e| e.frags.iter())
+            .map(|f| f.data.capacity())
+            .sum();
+        assert!(held <= DEFRAG_MAX_BYTES, "{held} bytes held");
+        assert!(inner.charge <= DEFRAG_MAX_BYTES);
+        drop(inner);
+
+        // What is left still reassembles, and gives its memory back.
+        let f1 = build_ipv4(5000, true, 0, &[1u8; 8]);
+        let f2 = build_ipv4(5000, false, 8, &[2u8; 4]);
+        assert!(d.process(&f1).is_none());
+        assert!(d.process(&f2).is_some());
+        d.sweep();
+        let inner = d.inner.lock().unwrap();
+        let charged: usize = inner.entries.values().map(|e| e.charge).sum();
+        assert_eq!(inner.charge, charged);
+    }
+
+    #[test]
+    fn fragments_cost_no_rescan_of_the_datagram() {
+        // Each datagram's last fragment first, so its length is known, then
+        // fragments covering all but a gap before it, which never complete
+        // it. Each used to rescan every fragment and the whole datagram;
+        // now a count answers, and a fragment is checked against its two
+        // neighbours. The bound is loose enough for a slow debug build.
+        let d = Defragger::new();
+        let start = std::time::Instant::now();
+        for id in 0..32u16 {
+            d.process(&build_ipv4(id, false, 65480, &[0u8; 8]));
+            for i in 0..(DEFRAG_MAX_FRAGS - 2) {
+                d.process(&build_ipv4(id, true, i * 256, &[0u8; 256]));
+            }
+        }
+        let took = start.elapsed();
+        assert!(took < Duration::from_millis(500), "{took:?}");
+        // All of it still held.
+        assert_eq!(buffered(&d), 32 * (DEFRAG_MAX_FRAGS - 1));
     }
 }
