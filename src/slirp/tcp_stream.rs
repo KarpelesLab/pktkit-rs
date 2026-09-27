@@ -13,9 +13,10 @@
 use crate::time::Instant;
 use crate::vtcp::segment::Segment;
 use crate::vtcp::{Conn, State};
+use std::collections::VecDeque;
 use std::io::{self};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
 /// Endpoint addressing for an accepted virtual connection. The "local" side is
@@ -114,6 +115,8 @@ pub(crate) struct ConnState {
     /// Sink for fully-framed IP packets the engine wants to transmit back into
     /// the virtual network. Provided by the stack (wraps `Stack::dispatch`).
     pub(crate) sink: Arc<dyn Fn(&[u8]) + Send + Sync>,
+    /// Segments on their way to the sink, in the order the engine made them.
+    outbox: Mutex<Outbox>,
     /// For a passively opened connection: hands it to its listener once the
     /// handshake completes, unless the deadline passes first.
     pending_accept: Mutex<Option<(Instant, AcceptFn)>>,
@@ -121,6 +124,14 @@ pub(crate) struct ConnState {
     /// the peer, or our timers giving up. Reads report it instead of a clean
     /// end of stream, so a truncated transfer is not mistaken for a whole one.
     error: Mutex<Option<io::ErrorKind>>,
+}
+
+/// See [`ConnState::emit`].
+#[derive(Default)]
+struct Outbox {
+    segs: VecDeque<Vec<u8>>,
+    /// A thread is feeding the sink from `segs`.
+    emitting: bool,
 }
 
 /// Offers an established connection to a listener; `false` means the
@@ -142,6 +153,7 @@ impl ConnState {
             conn: Mutex::new(conn),
             signal: Condvar::new(),
             sink,
+            outbox: Mutex::new(Outbox::default()),
             pending_accept: Mutex::new(None),
             error: Mutex::new(None),
         })
@@ -191,34 +203,59 @@ impl ConnState {
     }
 
     /// Send a RST and close.
-    fn abort(&self) {
-        let segs = self.conn.lock().expect("poisoned").abort();
-        self.wrap_and_send(segs);
+    pub(crate) fn abort(&self) {
+        let mut conn = self.conn.lock().expect("poisoned");
+        let segs = conn.abort();
+        self.emit(conn, segs);
         self.signal.notify_all();
     }
 
-    /// Wrap each segment in IP and push it into the virtual network.
-    pub(crate) fn wrap_and_send(&self, segments: Vec<Vec<u8>>) {
-        for seg in segments {
+    /// Transmit segments the engine has just produced through `conn`, the
+    /// held lock on it, which this releases.
+    ///
+    /// The segments join the outbox before the lock is released, so the
+    /// outbox holds them in the order the engine made them, and one thread at
+    /// a time feeds it to the sink. On an in-process link the sink runs the
+    /// peer synchronously, and its ACK re-enters `deliver`, which makes more
+    /// segments: sent from inside the sink call, those would overtake the
+    /// rest of the batch still waiting in the caller's hands, and the peer,
+    /// seeing a hole and then data from beyond it, would answer every
+    /// segment with a duplicate ACK and fast-retransmit its way through the
+    /// transfer. The re-entrant call only queues; the outermost sender sends.
+    pub(crate) fn emit(&self, conn: MutexGuard<'_, Conn>, segs: Vec<Vec<u8>>) {
+        let mut out = self.outbox.lock().expect("poisoned");
+        out.segs.extend(segs);
+        drop(conn);
+        if out.emitting {
+            return;
+        }
+        out.emitting = true;
+        while let Some(seg) = out.segs.pop_front() {
+            drop(out);
             let pkt = self.endpoints.wrap(&seg);
             (self.sink)(&pkt);
+            out = self.outbox.lock().expect("poisoned");
         }
+        out.emitting = false;
+    }
+
+    /// Transmit segments made without the engine (or before anything else
+    /// could reach it), after whatever it has queued already.
+    pub(crate) fn send(&self, segs: Vec<Vec<u8>>) {
+        self.emit(self.conn.lock().expect("poisoned"), segs);
     }
 
     /// Feed an inbound segment to the engine, transmit its replies, and wake
     /// any blocked reader/writer.
     pub(crate) fn deliver(&self, seg: &Segment) {
-        let segs = {
-            let mut conn = self.conn.lock().expect("poisoned");
-            // A FIN before the RST means the stream had already ended whole.
-            let ended = conn.fin_received();
-            let segs = conn.handle_segment(seg);
-            if seg.has_flag(crate::vtcp::segment::flags::RST) && conn.is_closed() && !ended {
-                self.fail(io::ErrorKind::ConnectionReset);
-            }
-            segs
-        };
-        self.wrap_and_send(segs);
+        let mut conn = self.conn.lock().expect("poisoned");
+        // A FIN before the RST means the stream had already ended whole.
+        let ended = conn.fin_received();
+        let segs = conn.handle_segment(seg);
+        if seg.has_flag(crate::vtcp::segment::flags::RST) && conn.is_closed() && !ended {
+            self.fail(io::ErrorKind::ConnectionReset);
+        }
+        self.emit(conn, segs);
         self.signal.notify_all();
     }
 }
@@ -306,9 +343,8 @@ impl TcpStream {
                 }));
             }
             let (n, segs) = conn.write(&buf[written..]);
-            drop(conn);
+            self.state.emit(conn, segs);
             if n > 0 {
-                self.state.wrap_and_send(segs);
                 written += n;
             } else {
                 // Send window full (or not yet established) — wait for an ACK
@@ -347,8 +383,7 @@ impl TcpStream {
                 // now, not on the next tick up to 100 ms later, which would
                 // stall a sender at every buffer-full.
                 let segs = conn.take_outgoing();
-                drop(conn);
-                self.state.wrap_and_send(segs);
+                self.state.emit(conn, segs);
                 return Ok(n);
             }
             if conn.fin_received() || conn.is_closed() {
@@ -379,11 +414,9 @@ impl TcpStream {
 
     /// Initiate a graceful close (sends FIN).
     pub fn close(&self) -> io::Result<()> {
-        let segs = {
-            let mut conn = self.state.conn.lock().expect("poisoned");
-            conn.close()
-        };
-        self.state.wrap_and_send(segs);
+        let mut conn = self.state.conn.lock().expect("poisoned");
+        let segs = conn.close();
+        self.state.emit(conn, segs);
         self.state.signal.notify_all();
         Ok(())
     }
@@ -411,8 +444,9 @@ impl Drop for TcpStream {
         // engine time out a peer that never finishes, and reset one that
         // keeps sending or whose data was left unread, as Linux does for an
         // orphaned socket.
-        let segs = self.state.conn.lock().expect("poisoned").release();
-        self.state.wrap_and_send(segs);
+        let mut conn = self.state.conn.lock().expect("poisoned");
+        let segs = conn.release();
+        self.state.emit(conn, segs);
         self.state.signal.notify_all();
     }
 }
@@ -446,21 +480,17 @@ pub(crate) fn tick_conn(state: &Arc<ConnState>) -> bool {
         drop(accept);
         state.abort();
     }
-    let (segs, closed, changed) = {
-        let mut conn = state.conn.lock().expect("poisoned");
-        let ended = conn.fin_received();
-        let before = (conn.state(), conn.is_closed());
-        let segs = conn.tick();
-        let closed = conn.is_closed();
-        if closed && !ended {
-            // Retransmissions or keepalives went unanswered.
-            state.fail(io::ErrorKind::TimedOut);
-        }
-        (segs, closed, (conn.state(), closed) != before)
-    };
-    if !segs.is_empty() {
-        state.wrap_and_send(segs);
+    let mut conn = state.conn.lock().expect("poisoned");
+    let ended = conn.fin_received();
+    let before = (conn.state(), conn.is_closed());
+    let segs = conn.tick();
+    let closed = conn.is_closed();
+    if closed && !ended {
+        // Retransmissions or keepalives went unanswered.
+        state.fail(io::ErrorKind::TimedOut);
     }
+    let changed = (conn.state(), closed) != before;
+    state.emit(conn, segs);
     // Timers never make data readable or free send buffer space: only
     // segments from the peer do, and `deliver` wakes the waiters for those.
     // What a timer can do is end the connection, or move it on to another
@@ -502,7 +532,7 @@ mod tests {
         );
         let syn = Segment::parse(&peer.connect()[0]).unwrap();
         let synack = state.conn.lock().unwrap().accept_syn(&syn);
-        state.wrap_and_send(synack);
+        state.send(synack);
         pump(&state, &out, peer);
         (state, out)
     }
@@ -652,6 +682,68 @@ mod tests {
         assert!(Segment::parse(update).unwrap().window > 0);
     }
 
+    /// A peer on an in-process link answers from inside the sink, and its
+    /// ACKs make the engine send more from there: the segments still reach
+    /// the wire in sequence, not with the newer ones ahead of the batch the
+    /// outer call was sending, and the nesting does not grow the stack by a
+    /// frame per segment (it overflowed it before).
+    #[test]
+    fn segments_leave_in_order_when_the_peer_answers_synchronously() {
+        use std::sync::{OnceLock, Weak};
+        let peer = Arc::new(Mutex::new(peer()));
+        let this: Arc<OnceLock<Weak<ConnState>>> = Arc::new(OnceLock::new());
+        // (seq, len) of each data segment, in wire order.
+        let wire: Arc<Mutex<Vec<(u32, u32)>>> = Arc::default();
+        let (p, t, w) = (peer.clone(), this.clone(), wire.clone());
+        let state = ConnState::new(
+            Endpoints::V4 {
+                local_ip: Ipv4Addr::new(10, 0, 0, 1),
+                local_port: 80,
+                remote_ip: Ipv4Addr::new(10, 0, 0, 5),
+                remote_port: 5000,
+            },
+            Conn::new(ConnConfig::default().local_port(80).remote_port(5000)),
+            Arc::new(move |pkt: &[u8]| {
+                let seg = Segment::parse(&pkt[20..]).unwrap();
+                if seg.data_len() > 0 {
+                    w.lock().unwrap().push((seg.seq, seg.data_len()));
+                }
+                let replies = {
+                    let mut peer = p.lock().unwrap();
+                    let mut r = peer.handle_segment(&seg);
+                    let mut sink = [0u8; 65536];
+                    while peer.read(&mut sink) > 0 {}
+                    r.extend(peer.take_outgoing());
+                    r
+                };
+                let state = t.get().and_then(Weak::upgrade).unwrap();
+                for r in replies {
+                    state.deliver(&Segment::parse(&r).unwrap());
+                }
+            }),
+        );
+        this.set(Arc::downgrade(&state)).unwrap();
+        let syn = Segment::parse(&peer.lock().unwrap().connect()[0]).unwrap();
+        let synack = state.conn.lock().unwrap().accept_syn(&syn);
+        state.send(synack);
+        assert_eq!(state.conn.lock().unwrap().state(), State::Established);
+
+        let stream = TcpStream::new(state.clone());
+        stream.set_write_timeout(Some(Duration::from_secs(10)));
+        let data = vec![7u8; 1 << 20];
+        let mut sent = 0;
+        while sent < data.len() {
+            sent += stream.write(&data[sent..]).unwrap();
+        }
+        let wire = wire.lock().unwrap();
+        let mut next = wire[0].0;
+        for &(seq, len) in wire.iter() {
+            assert_eq!(seq, next, "segment sent out of order (or resent)");
+            next = seq.wrapping_add(len);
+        }
+        assert_eq!(next.wrapping_sub(wire[0].0) as usize, data.len());
+    }
+
     /// A timeout too long for an `Instant` means no deadline, not a panic.
     #[test]
     fn a_huge_timeout_waits_instead_of_panicking() {
@@ -735,7 +827,7 @@ mod tests {
         // One that closes the connection does wake it: here, the end of a
         // TIME-WAIT that the engine's own timer ends.
         let fin = state.conn.lock().unwrap().close();
-        state.wrap_and_send(fin);
+        state.send(fin);
         pump(&state, &out, &mut peer);
         for seg in peer.close() {
             state.deliver(&Segment::parse(&seg).unwrap());

@@ -914,7 +914,7 @@ impl Stack {
             .insert(key, state.clone());
         // Emit the SYN-ACK. The connection joins the listener's queue when an
         // inbound segment completes the handshake (see `complete_accept`).
-        state.wrap_and_send(synack);
+        state.send(synack);
         Ok(())
     }
 
@@ -1263,7 +1263,7 @@ impl Stack {
             .insert(key, state.clone());
         // Emit the SYN-ACK. The connection joins the listener's queue when an
         // inbound segment completes the handshake (see `complete_accept`).
-        state.wrap_and_send(synack);
+        state.send(synack);
         Ok(())
     }
 
@@ -1349,9 +1349,7 @@ impl Stack {
             .chain(take(&inner.virt_tcp6, |k| k.ns, &which))
             .collect();
         for state in virt {
-            let segs = state.conn.lock().expect("poisoned").abort();
-            state.wrap_and_send(segs);
-            state.signal.notify_all();
+            state.abort();
         }
         for c in take(&inner.tcp, |k| k.ns, &which).into_iter().chain(take(
             &inner.tcp6,

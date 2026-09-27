@@ -156,8 +156,7 @@ impl Listener {
             f();
         }
         for state in drained {
-            let segs = state.conn.lock().expect("poisoned").abort();
-            state.wrap_and_send(segs);
+            state.abort();
         }
         self.signal.notify_all();
         Ok(())

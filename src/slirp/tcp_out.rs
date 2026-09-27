@@ -227,7 +227,7 @@ impl TcpOutConn {
                 *pending = None;
                 // Not under the lock: the sink may answer synchronously.
                 drop(pending);
-                self.state.wrap_and_send(vec![rst]);
+                self.state.send(vec![rst]);
                 return;
             }
         };
@@ -240,14 +240,17 @@ impl TcpOutConn {
             self.shutdown_remote(Shutdown::Both);
             return;
         }
-        let synack = self.state.conn.lock().expect("poisoned").accept_syn(syn);
         // In place before the SYN-ACK goes out: the client's ACK may come
-        // back through the sink before `wrap_and_send` even returns.
+        // back through the sink before `emit` even returns. (Harmless
+        // before the engine has the SYN: only a synchronized connection
+        // starts the pumps, and the deadline is far off.)
         *self.handshake.lock().expect("poisoned") =
             Some((Instant::now() + HANDSHAKE_TIMEOUT, remote_read));
+        let mut conn = self.state.conn.lock().expect("poisoned");
+        let synack = conn.accept_syn(syn);
         *pending = None;
         drop(pending);
-        self.state.wrap_and_send(synack);
+        self.state.emit(conn, synack);
     }
 
     /// Start the byte pumps if the client has just completed the handshake.
@@ -380,15 +383,13 @@ impl TcpOutConn {
             return;
         }
         self.orphan_dial();
-        let segs = {
-            let mut conn = self.state.conn.lock().expect("poisoned");
-            // In TIME-WAIT both sides have already finished; a RST would
-            // only reach a peer that has moved on.
-            let finished = conn.state() == State::TimeWait;
-            let segs = conn.abort();
-            if finished { Vec::new() } else { segs }
-        };
-        self.state.wrap_and_send(segs);
+        let mut conn = self.state.conn.lock().expect("poisoned");
+        // In TIME-WAIT both sides have already finished; a RST would only
+        // reach a peer that has moved on.
+        let finished = conn.state() == State::TimeWait;
+        let segs = conn.abort();
+        self.state
+            .emit(conn, if finished { Vec::new() } else { segs });
         self.state.signal.notify_all();
         self.shutdown_remote(Shutdown::Both);
     }
@@ -422,11 +423,9 @@ impl TcpOutConn {
             }
         }
         // Remote closed (or errored): send FIN to the client.
-        let segs = {
-            let mut conn = self.state.conn.lock().expect("poisoned");
-            conn.close()
-        };
-        self.state.wrap_and_send(segs);
+        let mut conn = self.state.conn.lock().expect("poisoned");
+        let segs = conn.close();
+        self.state.emit(conn, segs);
         self.state.signal.notify_all();
         // Don't slam the real socket shut here — the client→remote pump may
         // still be draining bytes the client sent. The bridge is reaped once
@@ -441,15 +440,13 @@ impl TcpOutConn {
             if self.closed.load(Ordering::Acquire) {
                 return false;
             }
-            let (n, segs) = {
-                let mut conn = self.state.conn.lock().expect("poisoned");
-                if conn.is_closed() {
-                    return false;
-                }
-                conn.write(data)
-            };
+            let mut conn = self.state.conn.lock().expect("poisoned");
+            if conn.is_closed() {
+                return false;
+            }
+            let (n, segs) = conn.write(data);
+            self.state.emit(conn, segs);
             if n > 0 {
-                self.state.wrap_and_send(segs);
                 self.state.signal.notify_all();
                 data = &data[n..];
             } else {
@@ -482,8 +479,7 @@ impl TcpOutConn {
                     // See `TcpStream::read`: a reopened window goes out now,
                     // not on the next tick.
                     let segs = conn.take_outgoing();
-                    drop(conn);
-                    self.state.wrap_and_send(segs);
+                    self.state.emit(conn, segs);
                     (n, false)
                 } else if conn.is_closed() {
                     // Reset, or our timers gave up: nothing will ever reach
