@@ -1436,6 +1436,49 @@ fn client_may_renegotiate_after_a_failed_attempt() {
     );
 }
 
+/// A soft reset is checked before it starts a new key: one that is not
+/// packet 0, or that ACKs for another session, is dropped (ssl.c
+/// tls_pre_decrypt validates before key_state_soft_reset), not left to
+/// demote the working key and open a key nobody negotiates.
+#[test]
+fn invalid_soft_reset_does_not_start_a_new_key() {
+    let mut server = Peer::new(server_config(), *b"SERVERID", auth_hook())
+        .unwrap()
+        .with_timers(quiet_timers());
+    let mut client = TestClient::new(*b"CLIENTID");
+    let k0 = connect(&mut server, &mut client);
+    // What the handshake left unacknowledged is not the point here.
+    let all: Vec<u32> = (0..64).collect();
+    for chunk in all.chunks(4) {
+        let ack = ControlPacket::new(Opcode::ACK_V1, 0, *b"CLIENTID", *b"SERVERID");
+        let _ = server.handle_packet(&ack.to_bytes(chunk));
+    }
+
+    let mut not_first = ControlPacket::new(Opcode::CONTROL_SOFT_RESET_V1, 1, *b"CLIENTID", [0; 8]);
+    not_first.set_pid(3);
+    let mut foreign_ack =
+        ControlPacket::new(Opcode::CONTROL_SOFT_RESET_V1, 1, *b"CLIENTID", *b"NOTUS!!!");
+    foreign_ack.set_pid(0);
+    for bogus in [not_first.to_bytes(&[]), foreign_ack.to_bytes(&[0])] {
+        assert!(server.handle_packet(&bogus).is_err());
+    }
+    let out = server
+        .tick(Instant::now() + Duration::from_secs(10))
+        .unwrap();
+    assert!(
+        out.send.iter().all(|d| key_id_of(d) == 0),
+        "a key was started"
+    );
+    assert_eq!(deliver(&mut server, &k0, 1, b"k0"), Some(b"k0".to_vec()));
+    // The client's real renegotiation still gets key id 1.
+    let first = vec![client.renegotiate(1)];
+    let k1 = connect_from(&mut server, &mut client, first);
+    assert_eq!(
+        deliver_on(&mut server, &k1, 1, 1, b"k1"),
+        Some(b"k1".to_vec())
+    );
+}
+
 /// After a renegotiation the previous key is a lame duck: its data keys
 /// keep working, but its control channel is over, as in OpenVPN (ssl.c
 /// services only the primary key's reliable layer, and tls_pre_decrypt

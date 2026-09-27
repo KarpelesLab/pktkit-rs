@@ -581,7 +581,8 @@ impl Peer {
         // Route by the sender's session id (ssl.c tls_pre_decrypt).
         let mut out = PeerOutput::default();
         let mut reset = None;
-        // For a new session: what its reliable layer made of the hard reset.
+        // For a new session or key: what its reliable layer made of the
+        // reset that opened it.
         let mut opened = None;
         let mut slot = if self.active.as_ref().is_some_and(|s| s.remote_id == sid) {
             Slot::Active
@@ -637,13 +638,22 @@ impl Peer {
         // The client asks for a new key (ssl.c key_state_soft_reset): only
         // once the current one is in use, and only for the next key id, so a
         // retransmission of the soft reset that started the current key is
-        // just a duplicate.
+        // just a duplicate. The packet must pass the new key's checks --
+        // packet 0 of its stream, ACKs for this session -- before the key
+        // replaces the working one (tls_pre_decrypt validates first).
         if pkt.opcode == Opcode::CONTROL_SOFT_RESET_V1
             && session.primary.data.is_some()
             && session.auth_failed.is_none()
             && key_id == session.next_key_id
         {
-            reset = Some(session.soft_reset(&config, &timers, Instant::now())?);
+            if pkt.pid != Some(0) {
+                return Err(invalid("soft reset must be packet 0 of its key"));
+            }
+            let now = Instant::now();
+            let (mut ks, server_reset) = session.next_key(&config, &timers, now)?;
+            opened = Some(ks.recv(key_id, pkt.clone())?);
+            session.install_key(ks, &timers, now);
+            reset = Some(server_reset);
         }
         let tls_bytes = match opened {
             Some(bytes) => bytes,
@@ -1180,9 +1190,29 @@ impl Session {
         timers: &PeerTimers,
         now: Instant,
     ) -> io::Result<ControlPacket> {
+        let (ks, reset) = self.next_key(config, timers, now)?;
+        self.install_key(ks, timers, now);
+        Ok(reset)
+    }
+
+    /// The next key, not yet installed, with the soft reset that opens its
+    /// stream.
+    fn next_key(
+        &self,
+        config: &purecrypto::tls::Config,
+        timers: &PeerTimers,
+        now: Instant,
+    ) -> io::Result<(KeyState, ControlPacket)> {
         let key_id = self.next_key_id;
         let mut ks = KeyState::new(config, key_id, self.local_id, self.remote_id, timers, now)?;
         let reset = ks.reliable.build_soft_reset();
+        Ok((ks, reset))
+    }
+
+    /// Make `ks`, from [`next_key`](Self::next_key), the primary key; the
+    /// current one becomes the lame duck.
+    fn install_key(&mut self, ks: KeyState, timers: &PeerTimers, now: Instant) {
+        let key_id = ks.key_id;
         self.next_key_id = if key_id >= 7 { 1 } else { key_id + 1 };
         let mut old = std::mem::replace(&mut self.primary, ks);
         if old.data.is_some() {
@@ -1194,7 +1224,6 @@ impl Session {
             };
             self.lame = Some(old);
         }
-        Ok(reset)
     }
 
     /// Feed in-order TLS bytes to the engine, run the control exchange on the
