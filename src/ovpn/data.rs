@@ -18,7 +18,7 @@
 use std::io;
 
 use purecrypto::cipher::{Aes128, Aes128Gcm, Aes256, Aes256Gcm, Cbc};
-use purecrypto::hash::{Hmac, Mac, Sha1, Sha224, Sha256};
+use purecrypto::hash::{Hmac, Mac, Sha1, Sha224, Sha256, Sha384, Sha512};
 
 use super::consts::OPENVPN_PING;
 use super::keys::PeerKeys;
@@ -78,6 +78,9 @@ pub(crate) fn check_supported(opts: &Options) -> io::Result<()> {
     }
     match opts.cipher_block {
         CipherBlockMethod::Gcm => Ok(()),
+        CipherBlockMethod::Cbc if opts.auth == AuthHash::Unsupported => {
+            Err(invalid("unsupported HMAC digest for AES-CBC"))
+        }
         CipherBlockMethod::Cbc if opts.auth != AuthHash::None => Ok(()),
         CipherBlockMethod::Cbc => Err(invalid("refusing AES-CBC without an HMAC")),
         CipherBlockMethod::None => Err(invalid("no cipher mode")),
@@ -320,8 +323,10 @@ fn cbc_decrypt(key: &[u8], iv: &[u8; 16], buf: &mut [u8]) -> io::Result<()> {
     .map_err(|_| invalid("CBC input is not a whole number of blocks"))
 }
 
-fn hmac_compute(auth: AuthHash, key: &[u8], data: &[u8]) -> [u8; 32] {
-    let mut out = [0u8; 32];
+/// HMAC of `data` under the first `auth.size()` bytes of `key` (the key
+/// material's HMAC slots are 64 bytes, room for SHA-512's).
+fn hmac_compute(auth: AuthHash, key: &[u8], data: &[u8]) -> [u8; 64] {
+    let mut out = [0u8; 64];
     match auth {
         AuthHash::Sha1 => {
             let mut m = Hmac::<Sha1>::new(key);
@@ -338,7 +343,17 @@ fn hmac_compute(auth: AuthHash, key: &[u8], data: &[u8]) -> [u8; 32] {
             m.update(data);
             m.finalize_into(&mut out[..32]);
         }
-        AuthHash::None => {}
+        AuthHash::Sha384 => {
+            let mut m = Hmac::<Sha384>::new(key);
+            m.update(data);
+            m.finalize_into(&mut out[..48]);
+        }
+        AuthHash::Sha512 => {
+            let mut m = Hmac::<Sha512>::new(key);
+            m.update(data);
+            m.finalize_into(&mut out[..64]);
+        }
+        AuthHash::None | AuthHash::Unsupported => {}
     }
     out
 }
@@ -440,6 +455,42 @@ mod tests {
             compression: "lzo".into(),
             ..Default::default()
         }
+    }
+
+    /// `auth SHA384` / `auth SHA512` are common hardening settings; CBC must
+    /// work with them, and the MAC must be the digest's full length.
+    #[test]
+    fn cbc_with_sha384_and_sha512() {
+        let (sk, rk) = key_pair();
+        for (auth, n) in [(AuthHash::Sha384, 48), (AuthHash::Sha512, 64)] {
+            let mut opts = cbc_opts(256);
+            opts.auth = auth;
+            let mut pkt = encrypt(&opts, &sk, 0, 5, b"strong mac", rng_zero).unwrap();
+            let body = pkt[1 + n..].to_vec();
+            let want = hmac_compute(auth, &sk.hmac_encrypt[..n], &body);
+            assert_eq!(pkt[1..1 + n], want[..n], "{auth:?}");
+            let d = decrypt(&opts, &rk, &mut pkt).unwrap().unwrap();
+            assert_eq!(d.payload, b"strong mac");
+            // A flipped bit anywhere in the MAC fails it.
+            let mut bad = encrypt(&opts, &sk, 0, 6, b"x", rng_zero).unwrap();
+            bad[n] ^= 1;
+            assert!(decrypt(&opts, &rk, &mut bad).unwrap().is_none());
+        }
+    }
+
+    /// A digest we do not implement is fine with GCM, which never uses it,
+    /// and refused for CBC, which would.
+    #[test]
+    fn an_unsupported_digest_matters_only_for_cbc() {
+        let o = Options::parse("V4,dev-type tun,cipher AES-256-GCM,auth BLAKE2s256").unwrap();
+        assert_eq!(o.auth, AuthHash::Unsupported);
+        let (sk, _) = key_pair();
+        let mut gcm = gcm_opts(256);
+        gcm.auth = AuthHash::Unsupported;
+        assert!(encrypt(&gcm, &sk, 0, 1, b"x", rng_zero).is_ok());
+        let mut cbc = cbc_opts(256);
+        cbc.auth = AuthHash::Unsupported;
+        assert!(encrypt(&cbc, &sk, 0, 1, b"x", rng_zero).is_err());
     }
 
     #[test]
@@ -568,7 +619,7 @@ mod tests {
         body.extend_from_slice(&padded);
         let mac = hmac_compute(AuthHash::Sha256, &sk.hmac_encrypt[..32], &body);
         let mut wire = vec![Opcode::DATA_V1.to_byte(0)];
-        wire.extend_from_slice(&mac);
+        wire.extend_from_slice(&mac[..32]);
         wire.extend_from_slice(&body);
         let d = decrypt(&opts, &rk, &mut wire).unwrap().unwrap();
         assert_eq!(d.pid, 9);
@@ -629,7 +680,7 @@ mod tests {
         body.extend_from_slice(&block);
         let mac = hmac_compute(AuthHash::Sha256, &sk.hmac_encrypt[..32], &body);
         let mut wire = vec![Opcode::DATA_V1.to_byte(0)];
-        wire.extend_from_slice(&mac);
+        wire.extend_from_slice(&mac[..32]);
         wire.extend_from_slice(&body);
         assert!(!matches!(decrypt(&opts, &rk, &mut wire), Ok(Some(_))));
     }

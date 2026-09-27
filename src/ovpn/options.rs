@@ -6,12 +6,19 @@ use core::fmt;
 
 /// Hash algorithm for the OpenVPN HMAC auth.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+#[non_exhaustive]
 pub enum AuthHash {
     #[default]
     None,
     Sha1,
     Sha224,
     Sha256,
+    Sha384,
+    Sha512,
+    /// A digest this crate does not implement. A client may still name one:
+    /// AEAD ciphers never use it, so it matters only if CBC is negotiated,
+    /// and the data channel refuses it then.
+    Unsupported,
 }
 
 impl AuthHash {
@@ -21,7 +28,10 @@ impl AuthHash {
             "SHA1" => Ok(AuthHash::Sha1),
             "SHA224" => Ok(AuthHash::Sha224),
             "SHA256" => Ok(AuthHash::Sha256),
-            other => Err(format!("unrecognized crypto hash {other:?}")),
+            "SHA384" => Ok(AuthHash::Sha384),
+            "SHA512" => Ok(AuthHash::Sha512),
+            "" => Err("empty auth digest".into()),
+            _ => Ok(AuthHash::Unsupported),
         }
     }
 
@@ -31,6 +41,9 @@ impl AuthHash {
             AuthHash::Sha1 => "SHA1",
             AuthHash::Sha224 => "SHA224",
             AuthHash::Sha256 => "SHA256",
+            AuthHash::Sha384 => "SHA384",
+            AuthHash::Sha512 => "SHA512",
+            AuthHash::Unsupported => "[unsupported]",
         }
     }
 
@@ -41,6 +54,9 @@ impl AuthHash {
             AuthHash::Sha1 => 20,
             AuthHash::Sha224 => 28,
             AuthHash::Sha256 => 32,
+            AuthHash::Sha384 => 48,
+            AuthHash::Sha512 => 64,
+            AuthHash::Unsupported => 0,
         }
     }
 }
