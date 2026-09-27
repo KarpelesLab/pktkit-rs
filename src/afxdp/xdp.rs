@@ -1512,10 +1512,11 @@ fn mmap_anon(len: usize, extra_flags: i32) -> Result<Mapping> {
 }
 
 /// Map one ring at the given page offset. The mapping spans the descriptor
-/// array: `off.desc + size * elem_size`. The kernel reports `desc` past the
-/// cursors, and the element size is 8 bytes for the FILL/COMPLETION rings or
-/// 16 bytes (`xdp_desc`) for RX/TX. We always reserve the larger 16-byte
-/// stride, which is a harmless over-map for the address rings.
+/// array: `off.desc + size * elem`. The kernel reports `desc` past the
+/// cursors, and `elem` is the ring's own stride: 8 bytes (a `u64` address)
+/// for FILL/COMPLETION, 16 (`xdp_desc`) for RX/TX. Mapping more than the
+/// kernel allocated for the ring fails, so the address rings must not be
+/// sized with the larger stride.
 fn mmap_ring(fd: RawFd, pgoff: i64, off: &RingOffset, size: u32, elem: usize) -> Result<Mapping> {
     let total = ring_map_len(off.desc, size, elem);
     // SAFETY: the ring is shared with the kernel, not with any Rust object;
