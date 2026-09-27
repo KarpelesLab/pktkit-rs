@@ -31,6 +31,12 @@ pub(crate) struct UdpState {
     rx: Mutex<VecDeque<Vec<u8>>>,
     signal: Condvar,
     sink: Arc<dyn Fn(&[u8]) + Send + Sync>,
+    /// Set when the owning client closes.
+    closed: AtomicBool,
+}
+
+fn client_closed() -> io::Error {
+    io::Error::new(io::ErrorKind::NotConnected, "client is closed")
 }
 
 impl UdpState {
@@ -77,6 +83,9 @@ impl UdpConn {
 
     /// Send a datagram to the connected remote.
     pub fn send(&self, buf: &[u8]) -> io::Result<usize> {
+        if self.state.closed.load(Ordering::Acquire) {
+            return Err(client_closed());
+        }
         let pkt = wrap_udp(
             self.state.local_ip,
             self.state.key.local_port,
@@ -103,6 +112,9 @@ impl UdpConn {
                 let n = dgram.len().min(buf.len());
                 buf[..n].copy_from_slice(&dgram[..n]);
                 return Ok(n);
+            }
+            if self.state.closed.load(Ordering::Acquire) {
+                return Err(client_closed());
             }
             // Without threads nothing could deliver a datagram while we wait.
             if cfg!(target_family = "wasm") || self.nonblocking.load(Ordering::Relaxed) {
@@ -144,6 +156,7 @@ pub(crate) struct UdpStack {
     conns: Mutex<HashMap<UdpKey, Arc<UdpState>>>,
     sink: Arc<dyn Fn(&[u8]) + Send + Sync>,
     next_port: Mutex<u16>,
+    closed: AtomicBool,
 }
 
 impl UdpStack {
@@ -152,6 +165,7 @@ impl UdpStack {
             conns: Mutex::new(HashMap::new()),
             sink,
             next_port: Mutex::new(super::tcp::EPHEMERAL_FIRST),
+            closed: AtomicBool::new(false),
         })
     }
 
@@ -159,6 +173,9 @@ impl UdpStack {
     pub fn dial(self: &Arc<Self>, local_ip: IpAddr, remote: SocketAddr) -> io::Result<UdpConn> {
         // Picked and registered under the one lock (see the TCP dial).
         let mut conns = self.conns.lock().unwrap();
+        if self.closed.load(Ordering::Acquire) {
+            return Err(client_closed());
+        }
         let local_port = pick_port(&mut self.next_port.lock().unwrap(), |p| {
             conns.contains_key(&UdpKey {
                 local_port: p,
@@ -177,6 +194,7 @@ impl UdpStack {
             rx: Mutex::new(VecDeque::new()),
             signal: Condvar::new(),
             sink: self.sink.clone(),
+            closed: AtomicBool::new(false),
         });
         conns.insert(key, state.clone());
         Ok(UdpConn {
@@ -185,6 +203,19 @@ impl UdpStack {
             nonblocking: AtomicBool::new(false),
             stack: self.clone(),
         })
+    }
+
+    /// Close every socket and wake its readers; no new ones can be opened.
+    pub fn shutdown(&self) {
+        let mut conns = self.conns.lock().unwrap();
+        self.closed.store(true, Ordering::Release);
+        for (_, s) in conns.drain() {
+            // Under the rx lock, so a reader between its checks and its wait
+            // cannot miss the wakeup.
+            let _rx = s.rx.lock().unwrap();
+            s.closed.store(true, Ordering::Release);
+            s.signal.notify_all();
+        }
     }
 
     /// Demultiplex an inbound UDP packet to the matching connection. Returns

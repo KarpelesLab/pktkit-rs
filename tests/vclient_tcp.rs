@@ -314,6 +314,63 @@ fn dropping_a_closed_listener_leaves_its_successor_alone() {
     );
 }
 
+/// Closing the client tears down everything it has open and wakes whoever
+/// is waiting on it; nothing new can be opened afterwards.
+#[test]
+fn close_wakes_waiters_and_refuses_new_work() {
+    use std::sync::mpsc;
+
+    let client = client(2);
+    let _server = raw_server(&client, |_| Vec::new());
+    let conn = client
+        .dial_tcp_timeout(
+            SocketAddr::new(IpAddr::V4(SERVER_IP), SERVER_PORT),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+    let listener = Arc::new(client.listen_tcp(LISTEN_PORT).unwrap());
+    let udp = Arc::new(
+        client
+            .dial_udp(SocketAddr::new(IpAddr::V4(SERVER_IP), 53))
+            .unwrap(),
+    );
+
+    let (tx, rx) = mpsc::channel();
+    let t = tx.clone();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 8];
+        let _ = t.send(("read", conn.read(&mut buf).map(|_| ())));
+    });
+    let (t, l) = (tx.clone(), listener.clone());
+    std::thread::spawn(move || {
+        let _ = t.send(("accept", l.accept().map(|_| ())));
+    });
+    let (t, u) = (tx, udp.clone());
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 8];
+        let _ = t.send(("recv", u.recv(&mut buf).map(|_| ())));
+    });
+    std::thread::sleep(Duration::from_millis(100));
+
+    client.close().unwrap();
+    for _ in 0..3 {
+        let (what, res) = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("a waiter was not woken by close");
+        assert!(res.is_err(), "{what} succeeded on a closed client");
+    }
+    let dst = SocketAddr::new(IpAddr::V4(SERVER_IP), SERVER_PORT);
+    assert!(
+        client
+            .dial_tcp_timeout(dst, Duration::from_millis(100))
+            .is_err()
+    );
+    assert!(client.dial_tcp_nonblocking(dst).is_err());
+    assert!(client.listen_tcp(LISTEN_PORT + 1).is_err());
+    assert!(client.dial_udp(dst).is_err());
+    assert!(udp.send(b"x").is_err());
+}
+
 /// Route `client`'s packets to a raw `vtcp::Conn` server on
 /// `SERVER_IP:SERVER_PORT`, created on the first SYN. Once the handshake
 /// completes, `on_established` runs on the server and its segments are sent.

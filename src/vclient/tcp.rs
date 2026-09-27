@@ -49,6 +49,9 @@ pub(crate) struct ConnState {
     /// For a passively opened connection, the listener whose accept queue it
     /// joins when the handshake completes.
     pending_accept: Mutex<Option<Arc<ListenerState>>>,
+    /// Why the connection ended, when that was not a clean close: reads
+    /// report it instead of an end of stream.
+    error: Mutex<Option<io::ErrorKind>>,
 }
 
 impl ConnState {
@@ -67,7 +70,13 @@ impl ConnState {
             sink,
             connected: AtomicBool::new(false),
             pending_accept: Mutex::new(pending_accept),
+            error: Mutex::new(None),
         })
+    }
+
+    /// Record why the connection failed; the first reason sticks.
+    fn fail(&self, kind: io::ErrorKind) {
+        self.error.lock().unwrap().get_or_insert(kind);
     }
 
     fn wrap_and_send(&self, segments: Vec<Vec<u8>>) {
@@ -253,6 +262,9 @@ impl TcpConn {
                 return Ok(n);
             }
             if conn.fin_received() || conn.is_closed() {
+                if let Some(kind) = *self.state.error.lock().unwrap() {
+                    return Err(io::Error::new(kind, "connection failed"));
+                }
                 return Ok(0); // clean EOF
             }
             if !may_block(&self.nonblocking) {
@@ -318,6 +330,23 @@ pub(crate) struct ListenerState {
 
 const ACCEPT_QUEUE_CAP: usize = 128;
 
+impl ListenerState {
+    /// Mark closed, reset what was waiting to be accepted, and wake `accept`.
+    fn shut(&self) {
+        let pending: Vec<TcpConn> = {
+            let mut q = self.queue.lock().unwrap();
+            self.closed.store(true, Ordering::Release);
+            q.drain(..).collect()
+        };
+        // Connections nobody will accept now: reset them rather than leave
+        // the peer talking to no one.
+        for c in pending {
+            c.state.abort();
+        }
+        self.signal.notify_all();
+    }
+}
+
 /// A virtual TCP listener. [`accept`](Self::accept) blocks until an inbound
 /// connection completes its handshake.
 pub struct Listener {
@@ -367,17 +396,7 @@ impl Listener {
 
     /// Stop listening. Pending unaccepted connections are reset.
     pub fn close(&self) {
-        let pending: Vec<TcpConn> = {
-            let mut q = self.state.queue.lock().unwrap();
-            self.state.closed.store(true, Ordering::Release);
-            q.drain(..).collect()
-        };
-        // Connections nobody will accept now: reset them rather than leave
-        // the peer talking to no one.
-        for c in pending {
-            c.state.abort();
-        }
-        self.state.signal.notify_all();
+        self.state.shut();
         if let Some(stack) = self.stack.upgrade() {
             let mut listeners = stack.listeners.lock().unwrap();
             // Only our own entry: once closed, the port may belong to a newer
@@ -404,8 +423,7 @@ pub(crate) struct TcpStack {
     listeners: Mutex<HashMap<u16, Arc<ListenerState>>>,
     sink: Arc<dyn Fn(&[u8]) + Send + Sync>,
     next_port: Mutex<u16>,
-    // Read only by the tick thread, which wasm does not have.
-    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    /// Set by `shutdown`: stops the tick thread and refuses new work.
     stop: Arc<Mutex<bool>>,
 }
 
@@ -464,6 +482,7 @@ impl TcpStack {
 
     /// Open a connection and send the SYN, without waiting for the answer.
     pub fn start_dial(&self, local_ip: IpAddr, remote: SocketAddr) -> io::Result<Arc<ConnState>> {
+        self.check_open()?;
         // The port is picked and the connection registered under the one
         // lock, so two dials cannot pick the same 4-tuple.
         let mut conns = self.conns.lock().unwrap();
@@ -554,6 +573,7 @@ impl TcpStack {
     /// Register a listening socket on `local_ip:port`. Returns a [`Listener`]
     /// whose `accept` yields completed inbound connections.
     pub fn listen(self: &Arc<Self>, local_ip: IpAddr, port: u16) -> io::Result<Listener> {
+        self.check_open()?;
         let mut listeners = self.listeners.lock().unwrap();
         if listeners.contains_key(&port) {
             return Err(io::Error::new(
@@ -582,6 +602,9 @@ impl TcpStack {
     pub fn handle_inbound(self: &Arc<Self>, pkt: &Packet) -> bool {
         if pkt.ip_protocol() != Protocol::TCP {
             return false;
+        }
+        if *self.stop.lock().unwrap() {
+            return true; // closed: nothing here to deliver to
         }
         let (src, dst) = match (pkt.src_addr(), pkt.dst_addr()) {
             (Some(s), Some(d)) => (s, d),
@@ -657,8 +680,29 @@ impl TcpStack {
         state.wrap_and_send(synack);
     }
 
+    /// Close everything: listeners stop, connections are reset, and every
+    /// waiter wakes with an error. Afterwards nothing new can be opened.
     pub fn shutdown(&self) {
         *self.stop.lock().unwrap() = true;
+        let listeners: Vec<_> = self.listeners.lock().unwrap().drain().collect();
+        for (_, l) in listeners {
+            l.shut();
+        }
+        let conns: Vec<_> = self.conns.lock().unwrap().drain().collect();
+        for (_, c) in conns {
+            c.fail(io::ErrorKind::ConnectionAborted);
+            c.abort();
+        }
+    }
+
+    fn check_open(&self) -> io::Result<()> {
+        if *self.stop.lock().unwrap() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "client is closed",
+            ));
+        }
+        Ok(())
     }
 }
 

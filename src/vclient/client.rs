@@ -179,8 +179,12 @@ impl L3Device for Client {
         *self.addr.lock().unwrap() = p;
         Ok(())
     }
+    /// Close the client: every connection is reset, listeners and UDP
+    /// sockets are closed, blocked calls on any of them return an error, and
+    /// nothing new can be opened.
     fn close(&self) -> Result<()> {
         self.tcp.shutdown();
+        self.udp.shutdown();
         Ok(())
     }
 }
