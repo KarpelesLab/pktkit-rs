@@ -389,7 +389,12 @@ impl Handler {
         addr: &SocketAddr,
         packet: &[u8],
     ) {
-        if let Some(cb) = self.on_unknown_peer.lock().expect("unknown lock").clone() {
+        // Clone the callback out and release the lock before calling it: in
+        // edition 2024 an `if let` scrutinee's guard lives through the
+        // block, and a callback that calls set_on_unknown_peer would wait
+        // on itself.
+        let cb = self.on_unknown_peer.lock().expect("unknown lock").clone();
+        if let Some(cb) = cb {
             cb(*peer_key, *addr, packet);
         }
     }
@@ -1233,6 +1238,35 @@ mod tests {
         assert!(a.has_session(&b.public_key()));
         rewind(&a, &b.public_key(), Duration::from_secs(6));
         assert!(timer_actions(&a).is_empty(), "still retrying");
+    }
+
+    /// The unknown-peer callback may replace itself: it must not run under
+    /// the lock that set_on_unknown_peer takes.
+    #[test]
+    fn unknown_peer_callback_may_replace_itself() {
+        use std::sync::Weak;
+        let slot: Arc<Mutex<Option<Weak<Handler>>>> = Arc::new(Mutex::new(None));
+        let s = slot.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let tx = Mutex::new(tx);
+        let cb: UnknownPeerFn = Arc::new(move |_, _, _| {
+            let h = s.lock().unwrap().as_ref().and_then(Weak::upgrade);
+            if let Some(h) = h {
+                h.set_on_unknown_peer(Arc::new(|_, _, _| {}));
+            }
+            let _ = tx.lock().unwrap().send(());
+        });
+        let b = Handler::new(Config::default().on_unknown_peer(cb)).unwrap();
+        *slot.lock().unwrap() = Some(Arc::downgrade(&b));
+        let a = Handler::new(Config::default()).unwrap();
+        a.add_peer(b.public_key());
+        let init = a.initiate_handshake(&b.public_key()).unwrap();
+        let b2 = b.clone();
+        std::thread::spawn(move || {
+            let _ = b2.process_packet(&init, &loopback());
+        });
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("deadlocked in the unknown-peer callback");
     }
 
     #[test]

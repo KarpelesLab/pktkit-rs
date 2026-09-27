@@ -124,7 +124,11 @@ impl PeerL3Device {
     }
 
     fn deliver(&self, data: &[u8]) {
-        if let Some(h) = self.handler.lock().expect("handler lock").clone() {
+        // Not under the lock: the guard of an `if let` scrutinee lives
+        // through its block, and a handler that calls set_handler (or
+        // anything that does) would wait on itself.
+        let h = self.handler.lock().expect("handler lock").clone();
+        if let Some(h) = h {
             let p = Packet::from_slice(data);
             let _ = h(p);
         }
@@ -430,6 +434,31 @@ impl Adapter {
 mod tests {
     use super::*;
     use crate::L3Hub;
+
+    /// A peer device's handler may replace itself from inside a delivery.
+    #[test]
+    fn device_handler_may_replace_itself() {
+        let dev = Arc::new(PeerL3Device {
+            adapter: Weak::new(),
+            key: NoisePublicKey([1; 32]),
+            handler: Mutex::new(None),
+            addr: Mutex::new("10.0.0.1/24".parse().unwrap()),
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        let tx = Mutex::new(tx);
+        let weak = Arc::downgrade(&dev);
+        dev.set_handler(Arc::new(move |_p: &Packet| {
+            if let Some(d) = weak.upgrade() {
+                d.set_handler(Arc::new(|_p: &Packet| Ok(())));
+            }
+            let _ = tx.lock().unwrap().send(());
+            Ok(())
+        }));
+        let d = dev.clone();
+        thread::spawn(move || d.deliver(&[0x45; 20]));
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("deadlocked in the device handler");
+    }
     use crate::wg::handler::PacketType;
     use std::time::Duration;
 
