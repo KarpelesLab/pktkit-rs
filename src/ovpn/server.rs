@@ -414,12 +414,14 @@ impl Server {
         if !self.cookies.check(&pkt, src, now) {
             return None;
         }
-        // A completed three-way handshake does not count against the
-        // limit on replies to strangers.
-        self.initial_limit.lock().unwrap().refund();
         let key = PeerKey::new(src, Transport::Udp);
         let ids = (pkt.remote_id, pkt.session_id);
-        self.create_peer(key, Transport::Udp, src, None, Some(ids))
+        let entry = self.create_peer(key, Transport::Udp, src, None, Some(ids))?;
+        // A completed three-way handshake does not count against the
+        // limit on replies to strangers -- only one that got a peer: an
+        // echo refused one (a full table) can be replayed at will.
+        self.initial_limit.lock().unwrap().refund();
+        Some(entry)
     }
 
     fn accept_tcp(&self, weak: &Weak<Server>, stream: TcpStream, addr: SocketAddr) {
@@ -988,6 +990,46 @@ mod tests {
         assert!(answered(*b"SPOOF-01"));
         assert!(answered(*b"SPOOF-02"));
         assert!(!answered(*b"SPOOF-03"), "over the limit");
+        server.close();
+    }
+
+    /// An echo that does not lead to a peer -- the table is full -- gives
+    /// nothing back to the budget: replaying it would otherwise refund an
+    /// answer each time, and lift the limit on reflected answers.
+    #[test]
+    fn an_echo_refused_a_peer_is_not_refunded() {
+        let on_auth: OnAuth = Arc::new(|_| Err(io::Error::other("no auth in this test")));
+        let on_data: OnData = Arc::new(|_, _, _| {});
+        let cfg = ServerConfig::new(
+            crate::ovpn::tests::server_config(),
+            "127.0.0.1:0".parse().unwrap(),
+            on_auth,
+            on_data,
+        )
+        .max_peers(1)
+        .connect_freq_initial((2, Duration::from_secs(600)));
+        let server = Server::new(cfg).unwrap();
+        assert!(open_udp(&udp_client(&server), *b"REALPEER").1);
+
+        // A valid echo, replayed, while the table is full.
+        let c = udp_client(&server);
+        c.send(&client_reset(*b"REFUSED!")).unwrap();
+        let reply = recv_ctrl(&c);
+        let ack = ControlPacket::new(Opcode::ACK_V1, 0, *b"REFUSED!", reply.session_id);
+        for _ in 0..5 {
+            c.send(&ack.to_bytes(&[0])).unwrap();
+        }
+        let answered = |sid: [u8; 8]| {
+            let c = udp_client(&server);
+            c.set_read_timeout(Some(Duration::from_millis(300)))
+                .unwrap();
+            c.send(&client_reset(sid)).unwrap();
+            let mut buf = [0u8; 2048];
+            c.recv(&mut buf).is_ok()
+        };
+        assert!(answered(*b"SPOOF-01"));
+        assert!(!answered(*b"SPOOF-02"), "over the limit");
+        assert_eq!(server.peers.read().unwrap().len(), 1);
         server.close();
     }
 
