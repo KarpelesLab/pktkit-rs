@@ -136,7 +136,7 @@ pub(crate) fn encrypt_into(
         });
     }
 
-    let (kp_view, kp_age) = h
+    let (kp, kp_age) = h
         .with_current_keypair(peer_key)
         .ok_or(EncryptError::NoSession)?;
     if kp_age > REJECT_AFTER_TIME {
@@ -144,18 +144,18 @@ pub(crate) fn encrypt_into(
     }
 
     // Increment per-keypair counter (starts at 0).
-    let counter = kp_view.send_counter.fetch_add(1, Ordering::SeqCst);
+    let counter = kp.send_counter.fetch_add(1, Ordering::SeqCst);
     if counter >= REJECT_AFTER_MESSAGES {
         return Err(EncryptError::MessageLimitExceeded);
     }
 
     // Header: type | remote-index | counter.
     dst[0..4].copy_from_slice(&MESSAGE_TRANSPORT_TYPE.to_le_bytes());
-    dst[4..8].copy_from_slice(&kp_view.remote_index.to_le_bytes());
+    dst[4..8].copy_from_slice(&kp.remote_index.to_le_bytes());
     dst[8..16].copy_from_slice(&counter.to_le_bytes());
 
     aead_seal_in_place(
-        kp_view.send_key,
+        &kp.send_key,
         counter,
         data,
         &[],

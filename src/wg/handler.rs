@@ -144,17 +144,12 @@ pub(crate) struct Keypair {
     pub replay_filter: SlidingWindow,
 }
 
-/// Read-only view used by hot-path code to avoid taking the full keypair
-/// `Arc` across crate boundaries.
-#[allow(dead_code)] // some fields are reserved for future hot-path optimisations
-pub(crate) struct KeypairView<'a> {
-    pub send_key: &'a [u8; CHACHAPOLY_KEY_SIZE],
-    pub receive_key: &'a [u8; CHACHAPOLY_KEY_SIZE],
-    pub send_counter: &'a AtomicU64,
-    pub created: Instant,
-    pub remote_index: u32,
-    pub peer_key: NoisePublicKey,
-    pub replay_filter: &'a SlidingWindow,
+impl Drop for Keypair {
+    fn drop(&mut self) {
+        // Forward secrecy is only as good as the old keys' disappearance.
+        crate::zeroize::zeroize(&mut self.send_key);
+        crate::zeroize::zeroize(&mut self.receive_key);
+    }
 }
 
 /// A peer's session — current keypair plus the most recently rotated one.
@@ -582,46 +577,21 @@ impl Handler {
         }
     }
 
-    /// Return the current keypair view + its age. Updates `last_sent` as a
-    /// side effect (matching the Go transport path).
-    pub(crate) fn with_current_keypair<'a>(
-        &'a self,
+    /// Return the current keypair and its age. Updates `last_sent` as a
+    /// side effect. The `Arc` keeps the keypair alive for the caller without
+    /// holding the sessions lock, and releases it when dropped.
+    pub(crate) fn with_current_keypair(
+        &self,
         peer_key: &NoisePublicKey,
-    ) -> Option<(KeypairView<'a>, Duration)> {
-        // The keypairs map holds the same Arc<Keypair>; resolving via the
-        // session avoids a second lookup but the borrow checker prefers we
-        // hold a single Arc.
+    ) -> Option<(Arc<Keypair>, Duration)> {
         let kp = {
             let s = self.sessions.read().expect("sessions lock");
             s.get(peer_key)
                 .and_then(|s| s.keypair_current.as_ref().cloned())?
         };
         self.touch_session_sent(peer_key);
-
         let age = Instant::now().duration_since(kp.created);
-
-        // SAFETY: we lengthen the borrow of `&Keypair` to `'a` by reborrowing
-        // through the `Arc<Keypair>` that the session keeps. The session lock
-        // is released here, but the keypair stays alive because we just cloned
-        // the Arc above. We immediately leak it via Box::leak'd reference
-        // bound to 'a so the caller can use it without holding a guard — the
-        // map still owns the canonical Arc, so this won't grow the leak set
-        // beyond the lifetime of `self`.
-        //
-        // In practice the encrypt path holds the resulting view for only a
-        // few microseconds; we accept the minor allocation cost in exchange
-        // for keeping lock scope tight.
-        let leaked: &'a Keypair = Box::leak(Box::new(KeypairCarrier(kp))).0.as_ref();
-        let view = KeypairView {
-            send_key: &leaked.send_key,
-            receive_key: &leaked.receive_key,
-            send_counter: &leaked.send_counter,
-            created: leaked.created,
-            remote_index: leaked.remote_index,
-            peer_key: leaked.peer_key,
-            replay_filter: &leaked.replay_filter,
-        };
-        Some((view, age))
+        Some((kp, age))
     }
 
     pub(crate) fn inc_active_handshakes(&self) {
@@ -746,9 +716,6 @@ impl Handler {
     }
 }
 
-// Tiny shim so the `Box::leak` in `with_current_keypair` carries the Arc.
-struct KeypairCarrier(#[allow(dead_code)] pub Arc<Keypair>);
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -789,6 +756,32 @@ mod tests {
         let dec = b.process_packet(&enc, &addr).unwrap();
         assert_eq!(dec.ty, PacketType::TransportData);
         assert_eq!(dec.data, pt);
+    }
+
+    #[test]
+    fn encrypting_does_not_leak_the_keypair() {
+        let a = Handler::new(Config::default()).unwrap();
+        let b = Handler::new(Config::default()).unwrap();
+        a.add_peer(b.public_key());
+        b.add_peer(a.public_key());
+        let addr = loopback();
+        let init = a.initiate_handshake(&b.public_key()).unwrap();
+        let resp = b.process_packet(&init, &addr).unwrap();
+        a.process_packet(&resp.response, &addr).unwrap();
+
+        let kp = a.sessions.read().unwrap()[&b.public_key()]
+            .keypair_current
+            .clone()
+            .unwrap();
+        let before = Arc::strong_count(&kp);
+        for _ in 0..100 {
+            a.encrypt(b"x", &b.public_key()).unwrap();
+        }
+        assert_eq!(
+            Arc::strong_count(&kp),
+            before,
+            "each encrypt leaked a reference"
+        );
     }
 
     #[test]

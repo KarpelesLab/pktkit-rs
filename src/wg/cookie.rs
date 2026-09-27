@@ -28,6 +28,12 @@ pub(crate) struct CookieChecker {
     encryption_key: [u8; 32],
 }
 
+impl Drop for CookieChecker {
+    fn drop(&mut self) {
+        crate::zeroize::zeroize(&mut self.secret);
+    }
+}
+
 impl CookieChecker {
     /// Build a checker keyed on the *local* (responder) public key.
     pub fn new(local_pub: &NoisePublicKey) -> CookieChecker {
