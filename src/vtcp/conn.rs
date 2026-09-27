@@ -1974,7 +1974,7 @@ impl Conn {
             self.start_keepalive();
             return;
         }
-        if self.last_recv.elapsed() > self.cfg.keepalive_idle {
+        if self.last_recv.elapsed() >= self.cfg.keepalive_idle {
             if self.keepalive_sent >= self.cfg.keepalive_count {
                 self.tear_down(State::Closed);
                 return;
@@ -1997,7 +1997,10 @@ impl Conn {
         if self.keepalive_sent > 0 {
             self.keepalive_deadline = Some(Instant::now() + self.cfg.keepalive_interval);
         } else {
-            self.start_keepalive();
+            // Heard from the peer since the timer was set: the idle time
+            // runs from then, not from now, or a probe could come up to
+            // twice the idle time after it went quiet.
+            self.keepalive_deadline = Some(self.last_recv + self.cfg.keepalive_idle);
         }
     }
 
@@ -3802,6 +3805,24 @@ mod tests {
         assert!(seg.payload.is_empty() && seg.flags == flags::ACK);
         // The peer answers it, since it is below RCV.NXT.
         assert_eq!(deliver(&mut server, &probe).len(), 1);
+    }
+
+    // Idle time counts from the last segment heard, not from whenever the
+    // timer last fired: otherwise a probe could come up to twice the idle
+    // time after the peer went quiet.
+    #[test]
+    fn keepalive_idle_counts_from_last_segment() {
+        let (mut client, _server) = keepalive_pair(40303);
+        let idle = client.cfg.keepalive_idle;
+        client.last_recv = Instant::now() - idle / 2;
+        client.keepalive_deadline = Some(Instant::now());
+        assert!(client.tick().is_empty());
+        let due = client.keepalive_deadline.unwrap();
+        assert!(
+            due <= client.last_recv + idle,
+            "re-armed {:?} late",
+            due - (client.last_recv + idle)
+        );
     }
 
     // Once released, FIN-WAIT-2 has its own timeout: answered probes would
