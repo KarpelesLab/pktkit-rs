@@ -491,7 +491,7 @@ pub(crate) fn process_handshake_initiation(
     zeroize(&mut temp_ss);
     zeroize(&mut t1);
 
-    // Decrypt the timestamp; accept_peer_timestamp below refuses one that is
+    // Decrypt the timestamp; accept_peer_initiation below refuses one that is
     // not newer than the last, so a replayed initiation is dropped.
     let enc_timestamp = &data[INIT_OFF_TIMESTAMP..INIT_OFF_TIMESTAMP_END];
     let timestamp = aead_open_zero(&k, enc_timestamp, &hs.hash)
@@ -508,10 +508,9 @@ pub(crate) fn process_handshake_initiation(
         ));
     }
 
-    // Timestamp replay: must be strictly greater than the last accepted one.
-    if !h.accept_peer_timestamp(&hs.remote_static, &timestamp) {
-        return Err(io::Error::other("replayed handshake timestamp"));
-    }
+    // Timestamp replay (must be strictly greater than the last accepted
+    // one) and flood (not within 20 ms of the last accepted) checks.
+    h.accept_peer_initiation(&hs.remote_static, &timestamp, Instant::now())?;
 
     // === Build response ===
     let sender_idx_local = h.allocate_index()?;

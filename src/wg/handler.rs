@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use crate::Result;
 use crate::wg::constants::{
-    CHACHAPOLY_KEY_SIZE, DEFAULT_LOAD_THRESHOLD, NoisePresharedKey, NoisePrivateKey,
-    NoisePublicKey, REJECT_AFTER_TIME, TAI64N_TIMESTAMP_SIZE,
+    CHACHAPOLY_KEY_SIZE, DEFAULT_LOAD_THRESHOLD, MIN_INITIATION_INTERVAL, NoisePresharedKey,
+    NoisePrivateKey, NoisePublicKey, REJECT_AFTER_TIME, TAI64N_TIMESTAMP_SIZE,
 };
 use crate::wg::crypto::x25519_public;
 use crate::wg::replay::SlidingWindow;
@@ -122,6 +122,8 @@ struct PeerEntry {
     last_handshake: Option<Instant>,
     last_timestamp: [u8; TAI64N_TIMESTAMP_SIZE],
     has_timestamp: bool,
+    /// When an initiation from the peer was last accepted.
+    last_initiation_consumed: Option<Instant>,
     /// Initiator-side cookie state: writes MAC1/MAC2 on outgoing handshakes.
     cookie_gen: Mutex<crate::wg::cookie::CookieGenerator>,
     timers: Mutex<PeerTimers>,
@@ -138,6 +140,7 @@ impl PeerEntry {
             last_handshake: None,
             last_timestamp: [0u8; TAI64N_TIMESTAMP_SIZE],
             has_timestamp: false,
+            last_initiation_consumed: None,
             cookie_gen: Mutex::new(crate::wg::cookie::CookieGenerator::new(&key)),
             timers: Mutex::new(PeerTimers::default()),
         }
@@ -405,22 +408,44 @@ impl Handler {
         }
     }
 
-    /// Check & update the per-peer last-timestamp. Returns true if the new
-    /// timestamp is strictly greater than the previously stored one (or no
-    /// previous one existed).
-    pub(crate) fn accept_peer_timestamp(&self, peer_key: &NoisePublicKey, ts: &[u8]) -> bool {
+    /// Accept an initiation from `peer_key` carrying timestamp `ts`,
+    /// arriving at `now`, and record it; false to refuse it. Refused are a
+    /// timestamp not strictly greater than the last accepted (a replay), and,
+    /// as in the reference's wg_noise_handshake_consume_initiation, any
+    /// initiation within MIN_INITIATION_INTERVAL of the last accepted: a peer
+    /// (or anyone replaying its fresh initiations faster than it rekeys) could
+    /// otherwise make us run the responder's DH work and replace its session
+    /// as fast as it could send.
+    pub(crate) fn accept_peer_initiation(
+        &self,
+        peer_key: &NoisePublicKey,
+        ts: &[u8],
+        now: Instant,
+    ) -> Result<()> {
         let mut peers = self.peers.write().expect("peers lock");
         let Some(p) = peers.get_mut(peer_key) else {
-            return false;
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "unauthorized peer",
+            ));
         };
         if p.has_timestamp && ts <= &p.last_timestamp[..] {
-            return false;
+            return Err(io::Error::other("replayed handshake timestamp"));
+        }
+        if p.last_initiation_consumed
+            .is_some_and(|t| now.saturating_duration_since(t) < MIN_INITIATION_INTERVAL)
+        {
+            return Err(io::Error::other("handshake initiations too frequent"));
         }
         let n = ts.len().min(TAI64N_TIMESTAMP_SIZE);
         p.last_timestamp[..n].copy_from_slice(&ts[..n]);
         p.has_timestamp = true;
-        p.last_handshake = Some(Instant::now());
-        true
+        // Never moved back, as in the reference, should `now` be older.
+        if p.last_initiation_consumed.is_none_or(|t| t < now) {
+            p.last_initiation_consumed = Some(now);
+        }
+        p.last_handshake = Some(now);
+        Ok(())
     }
 
     pub(crate) fn touch_peer_handshake(&self, peer_key: &NoisePublicKey) {
@@ -505,6 +530,12 @@ impl Handler {
     }
 
     /// Initiate a handshake to a peer. The peer must be authorized first.
+    ///
+    /// A responder, this one included, accepts at most 50 initiations a
+    /// second from one peer and only with a newer timestamp than the last,
+    /// and timestamps are only precise to about 17 ms: of two initiations
+    /// made within 20 ms of each other, the second is refused if the first
+    /// was accepted.
     pub fn initiate_handshake(&self, peer_key: &NoisePublicKey) -> Result<Vec<u8>> {
         crate::wg::handshake::initiate_handshake(self, peer_key)
     }
@@ -1154,14 +1185,51 @@ mod tests {
         );
     }
 
-    /// Full handshake a→b, returning the keepalive a sent.
+    /// Full handshake a→b, returning the keepalive a sent. Returns only
+    /// once another initiation from a would be accepted.
     fn handshake(a: &Handler, b: &Handler) -> Vec<u8> {
         let addr = loopback();
         let init = a.initiate_handshake(&b.public_key()).unwrap();
         let resp = b.process_packet(&init, &addr).unwrap();
         let ka = a.process_packet(&resp.response, &addr).unwrap();
         b.process_packet(&ka.response, &addr).unwrap();
+        pace();
         ka.response
+    }
+
+    /// Wait until a responder takes another initiation from the same peer:
+    /// it refuses one within MIN_INITIATION_INTERVAL of the last, and the
+    /// timestamps of two made closer together than that may be equal.
+    fn pace() {
+        std::thread::sleep(MIN_INITIATION_INTERVAL + Duration::from_millis(5));
+    }
+
+    /// As the reference does, a peer's initiations are accepted at most
+    /// INITIATIONS_PER_SECOND times a second, each with a timestamp newer
+    /// than the last. Before, any newer timestamp was taken at once, so a
+    /// peer could have the responder redo its DH work and replace the
+    /// session as fast as it could send.
+    #[test]
+    fn a_peers_initiations_are_accepted_at_most_50_a_second() {
+        let (a, b) = pair();
+        let peer = b.public_key();
+        let ts = |n: u32| crate::wg::time::encode_tai64n(1_000, n << 24);
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        assert!(a.accept_peer_initiation(&peer, &ts(1), at(0)).is_ok());
+        assert!(a.accept_peer_initiation(&peer, &ts(2), at(10)).is_err());
+        assert!(a.accept_peer_initiation(&peer, &ts(2), at(19)).is_err());
+        assert!(a.accept_peer_initiation(&peer, &ts(2), at(20)).is_ok());
+        // The replay check still stands on its own.
+        assert!(a.accept_peer_initiation(&peer, &ts(2), at(100)).is_err());
+        assert!(a.accept_peer_initiation(&peer, &ts(3), at(100)).is_ok());
+
+        // End to end: an initiation right after an accepted one is refused.
+        handshake(&a, &b);
+        let init = a.initiate_handshake(&b.public_key()).unwrap();
+        b.process_packet(&init, &loopback()).unwrap();
+        let init = a.initiate_handshake(&b.public_key()).unwrap();
+        assert!(b.process_packet(&init, &loopback()).is_err());
     }
 
     fn pair() -> (Arc<Handler>, Arc<Handler>) {
@@ -1291,6 +1359,7 @@ mod tests {
         b.add_peer(a.public_key());
         let tys: Vec<PacketType> = (0..5)
             .map(|_| {
+                pace();
                 let init = a.initiate_handshake(&b.public_key()).unwrap();
                 b.process_packet(&init, &loopback()).unwrap().ty
             })

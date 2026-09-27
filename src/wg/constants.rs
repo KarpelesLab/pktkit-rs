@@ -81,6 +81,14 @@ pub const REKEY_AFTER_TIME: Duration = Duration::from_secs(120);
 
 pub(crate) const DEFAULT_LOAD_THRESHOLD: usize = 1000;
 
+/// Initiations accepted from one peer per second, at most (the reference's
+/// `INITIATIONS_PER_SECOND`).
+pub(crate) const INITIATIONS_PER_SECOND: u32 = 50;
+
+/// The shortest gap between two initiations accepted from one peer.
+pub(crate) const MIN_INITIATION_INTERVAL: Duration =
+    Duration::from_nanos(1_000_000_000 / INITIATIONS_PER_SECOND as u64);
+
 /// Size of the per-keypair replay window.
 pub const WINDOW_SIZE: usize = 8192;
 
