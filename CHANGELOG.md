@@ -6,6 +6,18 @@ semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+## [0.1.6](https://github.com/KarpelesLab/pktkit-rs/compare/v0.1.5...v0.1.6) - 2026-09-27
+
+### Fixed
+
+- *(vtcp)* end ACK storms while closing, and fix window handling on ACKs
+- *(vtcp)* stop shrinking the receive window, fix handshake and zero-window stalls
+- *(vtcp)* send queued data before the FIN, and recover stalled closes
+
+### Other
+
+- cap loss bursts in the lossy-link fuzz test
+
 ## [0.1.5](https://github.com/KarpelesLab/pktkit-rs/compare/v0.1.4...v0.1.5) - 2026-09-23
 
 ### Other
