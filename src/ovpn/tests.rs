@@ -1436,17 +1436,19 @@ fn client_may_renegotiate_after_a_failed_attempt() {
     );
 }
 
-/// After a renegotiation the previous key's control channel keeps working
-/// for as long as the key does (ssl.c runs every key state's reliable
-/// layer): what it still has in flight is retransmitted, and ACKs for it
-/// on the old key id are taken, not dropped as for an unknown key.
+/// After a renegotiation the previous key is a lame duck: its data keys
+/// keep working, but its control channel is over, as in OpenVPN (ssl.c
+/// services only the primary key's reliable layer, and tls_pre_decrypt
+/// takes control packets for the primary key id alone). What it still had
+/// in flight is not retransmitted to a client that has moved on, and a
+/// control packet on its key id is dropped.
 #[test]
-fn lame_duck_key_keeps_its_control_channel() {
+fn nothing_is_retransmitted_on_the_old_key_after_renegotiation() {
     let mut server = Peer::new(server_config(), *b"SERVERID", auth_hook())
         .unwrap()
         .with_timers(quiet_timers());
     let mut client = TestClient::new(*b"CLIENTID");
-    connect(&mut server, &mut client);
+    let k0 = connect(&mut server, &mut client);
     // A reply on key 0 that the client never ACKs.
     let mut lost = Vec::new();
     for d in client.send_control(b"PUSH_REQUEST\0") {
@@ -1462,24 +1464,26 @@ fn lame_duck_key_keeps_its_control_channel() {
     connect_from(&mut server, &mut client, first);
 
     let start = Instant::now();
-    let key0 = |out: &super::peer::PeerOutput| {
-        out.send
+    for s in 1..=120 {
+        let out = server.tick(start + Duration::from_secs(s)).unwrap();
+        let old = out
+            .send
             .iter()
             .filter(|d| ControlPacket::parse(d).is_ok_and(|p| p.key_id == 0))
-            .count()
-    };
-    let out = server.tick(start + Duration::from_secs(2)).unwrap();
-    assert!(key0(&out) > 0, "old key's reply not retransmitted");
+            .count();
+        assert_eq!(old, 0, "retransmitted on the old key at {s}s");
+    }
 
-    // Everything key 0 sent: the test client's handshake loop stops as
-    // soon as the TLS handshake completes, before ACKing the last flight.
-    let all: Vec<u32> = (1..=*lost.iter().max().unwrap()).collect();
     let ack = ControlPacket::new(Opcode::ACK_V1, 0, *b"CLIENTID", *b"SERVERID");
-    server
-        .handle_packet(&ack.to_bytes(&all))
-        .expect("ACK on the old key id is taken");
-    let out = server.tick(start + Duration::from_secs(60)).unwrap();
-    assert_eq!(key0(&out), 0, "acknowledged, so no longer retransmitted");
+    assert!(
+        server.handle_packet(&ack.to_bytes(&lost)).is_err(),
+        "control packet on the old key id taken"
+    );
+    // Its data keys still work.
+    assert_eq!(
+        deliver_on(&mut server, &k0, 0, 2, b"old"),
+        Some(b"old".to_vec())
+    );
 }
 
 /// The server's key-method-2 reply carries its own peer info, not the

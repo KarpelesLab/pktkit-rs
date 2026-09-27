@@ -435,10 +435,9 @@ impl Peer {
             let Some(s) = self.session_mut(slot) else {
                 continue;
             };
+            // Only the primary key's: the lame duck's control channel is
+            // over (see Session::lame).
             out.send.extend(s.primary.reliable.tick(now).resend);
-            if let Some(lame) = s.lame.as_mut() {
-                out.send.extend(lame.reliable.tick(now).resend);
-            }
             if let Some((at, why)) = &s.auth_failed {
                 if now >= *at {
                     let e = io::Error::new(io::ErrorKind::PermissionDenied, why.clone());
@@ -626,16 +625,6 @@ impl Peer {
             && key_id == session.next_key_id
         {
             reset = Some(session.soft_reset(&config, &timers, Instant::now())?);
-        }
-        // The previous key keeps its own control channel until it expires,
-        // as every OpenVPN key state does: ACKs for what it still has in
-        // flight, and the client's retransmissions on it, go there.
-        if opened.is_none()
-            && key_id != session.primary.key_id
-            && session.lame.as_ref().is_some_and(|k| k.key_id == key_id)
-        {
-            session.handle_lame(key_id, pkt, &mut out)?;
-            return Ok((out, slot == Slot::Active));
         }
         let tls_bytes = match opened {
             Some(bytes) => bytes,
@@ -871,7 +860,13 @@ struct Session {
     /// The newest key: negotiating, or in use (OpenVPN's `KS_PRIMARY`).
     primary: KeyState,
     /// The previous key, still accepted until its transition window ends
-    /// (OpenVPN's `KS_LAME_DUCK`).
+    /// (OpenVPN's `KS_LAME_DUCK`). Only its data channel lives on: as in
+    /// OpenVPN, which only services the primary key's reliable layer and
+    /// takes control packets for the primary key id alone
+    /// (tls_pre_decrypt: "key IDs out of sync"), its control channel is
+    /// neither retransmitted nor fed. Were it kept running, whatever it
+    /// had in flight would be resent to a client that has moved on, for
+    /// the whole transition window.
     lame: Option<KeyState>,
     /// Key id the next renegotiation uses: 1..=7, then back to 1 (0 is the
     /// session's first key only).
@@ -1238,37 +1233,6 @@ impl Session {
     /// Emit the primary key's pending TLS output and ACKs.
     fn pump_tls(&mut self, out: &mut PeerOutput) -> io::Result<()> {
         self.primary.pump(out)
-    }
-
-    /// A control packet for the previous key, still alive for its
-    /// transition window. Its reliable layer takes the ACKs and answers
-    /// with its own; TLS it carries is fed to the key's engine to keep the
-    /// stream in step, but what it decrypts to is not acted on -- OpenVPN
-    /// only reads control messages from the primary key (tls_rec_payload).
-    /// A failure takes down this key alone, which is on its way out.
-    fn handle_lame(
-        &mut self,
-        key_id: u8,
-        pkt: ControlPacket,
-        out: &mut PeerOutput,
-    ) -> io::Result<()> {
-        let ks = self.lame.as_mut().expect("caller checked the key id");
-        let tls_bytes = ks.recv(key_id, pkt)?;
-        let res = (|| {
-            if !tls_bytes.is_empty() {
-                ks.tls
-                    .feed(&tls_bytes)
-                    .map_err(|e| invalid(format!("tls feed: {e:?}")))?;
-                ks.tls
-                    .recv()
-                    .map_err(|e| invalid(format!("tls recv: {e:?}")))?;
-            }
-            ks.pump(out)
-        })();
-        if res.is_err() {
-            self.lame = None;
-        }
-        Ok(())
     }
 
     /// Advance the key-method-2 control exchange using whatever plaintext bytes
