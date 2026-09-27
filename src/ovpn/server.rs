@@ -32,7 +32,8 @@ pub type OnData = Arc<dyn Fn(PeerKey, u8, &[u8]) + Send + Sync>;
 /// disconnect followed by a new connect.
 pub type OnConnect = Arc<dyn Fn(PeerKey, &PeerConfig) + Send + Sync>;
 
-/// Callback fired when a peer disconnects / is reaped.
+/// Callback fired when a peer disconnects / is reaped. It pairs with
+/// [`OnConnect`]: a peer that never authenticated is dropped silently.
 pub type OnDisconnect = Arc<dyn Fn(PeerKey) + Send + Sync>;
 
 /// Server configuration.
@@ -128,6 +129,10 @@ struct PeerEntry {
     // For TCP peers, the write half (length-prefixed). For UDP, None (the
     // server writes via the shared UDP socket).
     tcp: Option<Mutex<TcpStream>>,
+    /// Whether on_connect was fired for the peer and not yet matched by an
+    /// on_disconnect: the callbacks pair, so only such a peer is reported
+    /// gone.
+    connected: AtomicBool,
 }
 
 /// An OpenVPN server.
@@ -240,6 +245,7 @@ impl Server {
             .write()
             .unwrap()
             .drain()
+            .filter(|(_, e)| e.connected.swap(false, Ordering::SeqCst))
             .map(|(k, _)| k)
             .collect();
         if let Some(cb) = &self.cfg.on_disconnect {
@@ -350,6 +356,7 @@ impl Server {
             transport,
             addr,
             tcp: tcp.map(Mutex::new),
+            connected: AtomicBool::new(false),
         });
         peers.insert(key, entry.clone());
         Some(entry)
@@ -371,7 +378,9 @@ impl Server {
         if let Some(w) = &entry.tcp {
             let _ = w.lock().unwrap().shutdown(std::net::Shutdown::Both);
         }
-        if let Some(cb) = &self.cfg.on_disconnect {
+        if entry.connected.swap(false, Ordering::SeqCst)
+            && let Some(cb) = &self.cfg.on_disconnect
+        {
             cb(key);
         }
     }
@@ -395,7 +404,11 @@ impl Server {
         // Callbacks run without the peer's lock held: they may well call
         // back into the server for this peer (send_to_peer, say).
         if let Some(cfg) = &out.connected {
-            if out.replaced
+            // A new session taking over from one that was reported
+            // connected ends that connection first. The flag, not
+            // `out.replaced`, decides: the old session may have failed on
+            // its own before this one authenticated.
+            if entry.connected.swap(true, Ordering::SeqCst)
                 && let Some(cb) = &self.cfg.on_disconnect
             {
                 cb(key);
@@ -826,6 +839,7 @@ mod tests {
             transport: Transport::Tcp,
             addr,
             tcp: Some(Mutex::new(s)),
+            connected: AtomicBool::new(false),
         });
         assert!(server.send_raw(&entry, &vec![0u8; 70_000]).is_err());
         server.send_raw(&entry, b"ok").unwrap();
@@ -987,6 +1001,55 @@ mod tests {
             .unwrap();
         assert_eq!(dec.payload, b"welcome");
         server.close();
+    }
+
+    /// on_disconnect pairs with on_connect: a peer that never authenticated
+    /// was never reported connected, so its removal is not reported either.
+    #[test]
+    fn on_disconnect_only_follows_on_connect() {
+        let connects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let disconnects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let on_auth: OnAuth = Arc::new(|_| {
+            Ok(PeerConfig::new(
+                "10.8.0.2".parse().unwrap(),
+                "10.8.0.1".parse().unwrap(),
+                "255.255.255.0".parse().unwrap(),
+                24,
+            ))
+        });
+        let on_data: OnData = Arc::new(|_, _, _| {});
+        let cfg = ServerConfig::new(
+            crate::ovpn::tests::server_config(),
+            "127.0.0.1:0".parse().unwrap(),
+            on_auth,
+            on_data,
+        )
+        .on_connect({
+            let c = connects.clone();
+            Arc::new(move |_, _| {
+                c.fetch_add(1, Ordering::SeqCst);
+            })
+        })
+        .on_disconnect({
+            let d = disconnects.clone();
+            Arc::new(move |_| {
+                d.fetch_add(1, Ordering::SeqCst);
+            })
+        });
+        let server = Server::new(cfg).unwrap();
+
+        // One client authenticates; another only opens a session.
+        let sock = udp_client(&server);
+        let mut client = TestClient::new(*b"CLIENTID");
+        connect_udp(&sock, &mut client);
+        let half = udp_client(&server);
+        half.send(&client_reset(*b"HALFOPEN")).unwrap();
+        recv_ctrl(&half);
+        assert_eq!(server.peers.read().unwrap().len(), 2);
+        assert_eq!(connects.load(Ordering::SeqCst), 1);
+
+        server.close();
+        assert_eq!(disconnects.load(Ordering::SeqCst), 1);
     }
 
     #[test]
