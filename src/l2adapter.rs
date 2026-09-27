@@ -396,31 +396,41 @@ impl L2Adapter {
 
         if icmp[0] == ndp::NS_TYPE {
             let slla = ndp::parse_option(opts, ndp::OPT_SOURCE_LINK_ADDR);
-            if src.is_unspecified() {
-                // Duplicate Address Detection: only to a solicited-node
-                // group, and with no address of the sender's to offer.
-                if dst != ndp::solicited_node_multicast(target) || slla.is_some() {
-                    return true;
-                }
-            } else if let Some(mac) = slla {
-                self.learn_neighbor(src, mac);
+            // Duplicate Address Detection: only to a solicited-node group,
+            // and with no address of the sender's to offer.
+            if src.is_unspecified()
+                && (dst != ndp::solicited_node_multicast(target) || slla.is_some())
+            {
+                return true;
             }
 
+            // RFC 4861 §7.2.3: an NS whose target is not ours is silently
+            // discarded -- before anything is learnt from it. Anyone on the
+            // link hears a multicast NS, and caching its source for every
+            // one overheard would let any station rewrite, say, the
+            // gateway's entry by soliciting some other address.
             let dev_addr = match self.l3.addr().addr() {
                 IpAddr::V6(a) => Some(a),
                 _ => None,
             };
-            if target == ndp::link_local_from_mac(self.mac) || dev_addr == Some(target) {
-                if src.is_unspecified() {
-                    // DAD: answer to all-nodes (RFC 4861 §7.2.4).
-                    let all_nodes = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
-                    let mac = MacAddr([0x33, 0x33, 0, 0, 0, 1]);
-                    self.send_neighbor_advertisement(all_nodes, mac, target, false);
-                } else if let Some(mac) = slla.or_else(|| self.ndp.lookup(src)).or(frame_src) {
-                    // Without a source link-layer option the sender is still
-                    // right there: it is the frame's own source.
-                    self.send_neighbor_advertisement(src, mac, target, true);
-                }
+            if target != ndp::link_local_from_mac(self.mac) && dev_addr != Some(target) {
+                return true;
+            }
+            if !src.is_unspecified()
+                && let Some(mac) = slla
+            {
+                self.learn_neighbor(src, mac);
+            }
+
+            if src.is_unspecified() {
+                // DAD: answer to all-nodes (RFC 4861 §7.2.4).
+                let all_nodes = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
+                let mac = MacAddr([0x33, 0x33, 0, 0, 0, 1]);
+                self.send_neighbor_advertisement(all_nodes, mac, target, false);
+            } else if let Some(mac) = slla.or_else(|| self.ndp.lookup(src)).or(frame_src) {
+                // Without a source link-layer option the sender is still
+                // right there: it is the frame's own source.
+                self.send_neighbor_advertisement(src, mac, target, true);
             }
             return true;
         }
@@ -893,5 +903,42 @@ mod tests {
             [10, 0, 0, 9],
         );
         assert_eq!(adapter.arp.lookup(Ipv4Addr::new(10, 0, 0, 7)), Some(moved));
+    }
+
+    #[test]
+    fn overheard_solicitation_for_someone_else_does_not_touch_the_cache() {
+        let (_pipe, adapter, out) = rig("2001:db8::5/64");
+        let gw: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let gw_mac = MacAddr([2, 0, 0, 0, 0, 1]);
+        adapter.ndp.set(gw, gw_mac, ndp::DEFAULT_TTL);
+
+        // An attacker claims the gateway's address in an NS for a third
+        // party's address, multicast so the whole link hears it.
+        let evil = MacAddr([2, 0, 0, 0, 0, 0xee]);
+        let third: Ipv6Addr = "2001:db8::77".parse().unwrap();
+        let mut ns = ndp::build_ns(evil, third);
+        let f = ndp_frame(
+            &adapter,
+            evil,
+            gw,
+            ndp::solicited_node_multicast(third),
+            &mut ns,
+        );
+        adapter.send(Frame::from_slice(&f)).unwrap();
+        assert_eq!(adapter.ndp.lookup(gw), Some(gw_mac), "cache poisoned");
+
+        // Nor does a stranger get a new entry that way.
+        let stranger: Ipv6Addr = "2001:db8::88".parse().unwrap();
+        let mut ns = ndp::build_ns(evil, third);
+        let f = ndp_frame(
+            &adapter,
+            evil,
+            stranger,
+            ndp::solicited_node_multicast(third),
+            &mut ns,
+        );
+        adapter.send(Frame::from_slice(&f)).unwrap();
+        assert_eq!(adapter.ndp.lookup(stranger), None);
+        assert!(take(&out).is_empty());
     }
 }
