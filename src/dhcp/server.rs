@@ -471,10 +471,13 @@ impl Server {
         if !self.cfg.dns.is_empty() {
             b.ipv4_list_option(wire::OPT_DNS, &self.cfg.dns);
         }
+        // RFC 2131 Table 3: every OFFER and ACK names its server, an ACK to
+        // an INFORM (which grants no address, so carries no lease time)
+        // included; clients use it to tell servers' answers apart.
         if yiaddr.is_some() {
             b.u32_option(wire::OPT_LEASE_TIME, self.lease_secs());
-            b.ipv4_option(wire::OPT_SERVER_ID, self.cfg.server_ip);
         }
+        b.ipv4_option(wire::OPT_SERVER_ID, self.cfg.server_ip);
         let (mac, ip, port) = self.destination(p, from, yiaddr, false);
         self.send_message(mac, ip, port, &b.finish());
     }
@@ -1146,5 +1149,21 @@ mod tests {
             ));
             assert!(s.declined.lock().unwrap().contains_key(&offer.yiaddr));
         }
+    }
+
+    #[test]
+    fn an_inform_ack_names_the_server_and_grants_nothing() {
+        let (s, r) = recording(one_address_pool());
+        let mac = MacAddr([2, 0, 0, 0, 0, 1]);
+        let mut b = wire::Builder::new(1, 7, mac);
+        b.ciaddr(Ipv4Addr::new(10, 0, 0, 50))
+            .message_type(wire::MSG_INFORM);
+        s.handle_dhcp(&b.finish());
+        let got = replies(&r);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].msg_type, wire::MSG_ACK);
+        assert_eq!(got[0].server_id, Some(Ipv4Addr::new(10, 0, 0, 1)));
+        assert_eq!(got[0].lease_time, None);
+        assert!(got[0].yiaddr.is_unspecified());
     }
 }
