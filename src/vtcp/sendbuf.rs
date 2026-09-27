@@ -307,12 +307,21 @@ impl SendBuf {
     /// The first hole at or after `from` that counts as lost, and up to `n`
     /// bytes of it.
     ///
-    /// RFC 6675 §4 (IsLost): a hole is lost once more than `lost_after`
-    /// bytes above it have been SACKed — with `lost_after = (DupThresh - 1) *
-    /// SMSS`, the same evidence three duplicate ACKs give for the first hole.
-    /// Holes above the highest SACKed byte are never candidates: nothing yet
-    /// says that data is missing rather than still in flight.
-    pub fn lost_hole_from(&self, from: u32, n: usize, lost_after: u32) -> Option<(u32, &[u8])> {
+    /// Lost as [`is_lost`](Self::is_lost) has it (RFC 6675 §4): `dup_thresh`
+    /// discontiguous SACKed ranges above the hole, or more than
+    /// `(dup_thresh - 1) * mss` SACKed bytes, the same evidence DupThresh
+    /// duplicate ACKs give for the first hole. Both halves count: with
+    /// small segments SACKed apart, the ranges pile up well before the
+    /// bytes do. Holes above the highest SACKed byte are never candidates:
+    /// nothing yet says that data is missing rather than still in flight.
+    pub fn lost_hole_from(
+        &self,
+        from: u32,
+        n: usize,
+        dup_thresh: u32,
+        mss: u32,
+    ) -> Option<(u32, &[u8])> {
+        let lost_after = (dup_thresh - 1).saturating_mul(mss);
         let unacked = (self.nxt.wrapping_sub(self.una) as usize).min(self.data().len());
         let end = self.una.wrapping_add(unacked as u32);
         let from = if seq_before(from, self.una) {
@@ -326,7 +335,8 @@ impl SendBuf {
             .map(|b| b.right.wrapping_sub(b.left))
             .sum();
         let mut hole_start = self.una;
-        for b in &self.sacked {
+        for (i, b) in self.sacked.iter().enumerate() {
+            let ranges_above = (self.sacked.len() - i) as u32;
             // The hole is [hole_start, b.left); `b` and everything after it
             // are SACKed above it.
             let start = if seq_before(hole_start, from) {
@@ -335,7 +345,8 @@ impl SendBuf {
                 hole_start
             };
             let hole_end = if seq_after(b.left, end) { end } else { b.left };
-            if seq_before(start, hole_end) && sacked_above > lost_after {
+            let lost = ranges_above >= dup_thresh || sacked_above > lost_after;
+            if seq_before(start, hole_end) && lost {
                 let off = start.wrapping_sub(self.una) as usize;
                 let len = (hole_end.wrapping_sub(start) as usize).min(n);
                 return Some((start, &self.data()[off..off + len]));
@@ -477,19 +488,77 @@ mod tests {
         // Holes 0..10, 20..30, 40..60; SACKed 10..20, 30..40, 60..70.
         s.mark_sacked(&[b(10, 20), b(30, 40), b(60, 70)]);
         // 30 bytes SACKed above the first hole, 20 above the second, 10
-        // above the third.
-        assert_eq!(s.lost_hole_from(0, 100, 15).map(|h| h.0), Some(0));
-        assert_eq!(s.lost_hole_from(5, 100, 15), Some((5, &[3u8; 5][..])));
-        assert_eq!(s.lost_hole_from(10, 100, 15), Some((20, &[3u8; 10][..])));
+        // above the third; with DupThresh 3 and a 7-byte MSS, more than 14
+        // make a hole lost.
+        assert_eq!(s.lost_hole_from(0, 100, 3, 7).map(|h| h.0), Some(0));
+        assert_eq!(s.lost_hole_from(5, 100, 3, 7), Some((5, &[3u8; 5][..])));
+        assert_eq!(s.lost_hole_from(10, 100, 3, 7), Some((20, &[3u8; 10][..])));
         assert_eq!(
-            s.lost_hole_from(30, 100, 15),
+            s.lost_hole_from(30, 100, 3, 7),
             None,
             "only 10 bytes above 40..60"
         );
-        assert_eq!(s.lost_hole_from(30, 100, 5), Some((40, &[3u8; 20][..])));
-        assert_eq!(s.lost_hole_from(30, 8, 5), Some((40, &[3u8; 8][..])));
+        assert_eq!(s.lost_hole_from(30, 100, 3, 2), Some((40, &[3u8; 20][..])));
+        assert_eq!(s.lost_hole_from(30, 8, 3, 2), Some((40, &[3u8; 8][..])));
         // Past the highest SACK nothing is known to be lost.
-        assert_eq!(s.lost_hole_from(70, 100, 0), None);
+        assert_eq!(s.lost_hole_from(70, 100, 3, 0), None);
+    }
+
+    /// Three SACKed ranges above a hole make it lost however few bytes
+    /// they hold (IsLost's other half): the first hole here, not the
+    /// second, which has two ranges and 300 bytes above it.
+    #[test]
+    fn lost_holes_count_sacked_ranges_above() {
+        let mut s = SendBuf::new(10_000, 0);
+        s.write(&[1; 1000]);
+        s.advance_sent(1000);
+        let b = |left, right| SackBlock { left, right };
+        s.mark_sacked(&[b(100, 200), b(300, 400), b(500, 700)]);
+        assert!(s.is_lost(0, 3, 1000));
+        assert_eq!(
+            s.lost_hole_from(0, 1000, 3, 1000),
+            Some((0, &[1u8; 100][..]))
+        );
+        assert!(!s.is_lost(200, 3, 1000));
+        assert_eq!(s.lost_hole_from(200, 1000, 3, 1000), None);
+    }
+
+    /// lost_hole_from finds exactly the first byte from `from` on that is
+    /// neither SACKed nor acknowledged and that is_lost says is lost.
+    #[test]
+    fn lost_hole_from_agrees_with_is_lost() {
+        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut rng = |n: u32| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x % n as u64) as u32
+        };
+        for round in 0..300 {
+            let base = (u32::MAX - 150).wrapping_add(round);
+            let mut s = SendBuf::new(400, base);
+            s.write(&[0; 300]);
+            s.advance_sent(300);
+            let blocks: Vec<SackBlock> = (0..1 + rng(8))
+                .map(|_| {
+                    let left = base.wrapping_add(rng(300));
+                    SackBlock {
+                        left,
+                        right: left.wrapping_add(1 + rng(30)),
+                    }
+                })
+                .collect();
+            s.mark_sacked(&blocks);
+            let (thresh, mss) = (1 + rng(4), rng(40));
+            for off in 0..300 {
+                let from = base.wrapping_add(off);
+                let want = (off..300)
+                    .map(|o| base.wrapping_add(o))
+                    .find(|&q| !s.is_sacked(q) && s.is_lost(q, thresh, mss));
+                let got = s.lost_hole_from(from, 1000, thresh, mss).map(|h| h.0);
+                assert_eq!(got, want, "round {round} from +{off}: {:?}", s.sacked);
+            }
+        }
     }
 
     /// A megabyte in flight, ACKed a few bytes at a time: each ACK must

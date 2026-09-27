@@ -1707,7 +1707,7 @@ impl Conn {
             .send_buf
             .as_ref()
             .unwrap()
-            .lost_hole_from(self.high_rxt, room, 2 * mss)
+            .lost_hole_from(self.high_rxt, room, 3, mss)
             .map(|(seq, d)| (seq, d.to_vec()))
         else {
             return false;
