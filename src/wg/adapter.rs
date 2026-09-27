@@ -9,7 +9,7 @@
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::thread;
 
 use crate::accept::{Cleanup, L3Connector};
@@ -167,34 +167,27 @@ impl L3Device for PeerL3Device {
 impl Adapter {
     /// Build a new adapter from `cfg`. Call [`Adapter::serve`] to run.
     pub fn new(cfg: AdapterConfig) -> Result<Arc<Self>> {
-        // We pre-allocate the Arc<Self> via Arc::new_cyclic so the per-peer
-        // devices can hold a Weak<Adapter>.
-        let weak_for_cb: Mutex<Option<Weak<Adapter>>> = Mutex::new(None);
-        let weak_for_cb = Arc::new(weak_for_cb);
+        // The server's callbacks reach the adapter, built after the server,
+        // through a Weak set once it exists. Set once and read without a
+        // lock: a lock taken here would be held through the connector and
+        // the device handlers, caller code that may re-enter (a connector
+        // accepting a pending peer deadlocked) or panic (poisoning it for
+        // every later packet).
+        let weak_for_cb: Arc<OnceLock<Weak<Adapter>>> = Arc::new(OnceLock::new());
         let weak_for_cb_pkt = weak_for_cb.clone();
         let weak_for_cb_conn = weak_for_cb.clone();
 
         // OnPacket: deliver decrypted bytes to the matching peer device.
         let on_packet: OnPacketFn =
             Arc::new(move |data: &[u8], key: NoisePublicKey, _h: &Arc<Handler>| {
-                if let Some(a) = weak_for_cb_pkt
-                    .lock()
-                    .expect("weak lock")
-                    .as_ref()
-                    .and_then(|w| w.upgrade())
-                {
+                if let Some(a) = weak_for_cb_pkt.get().and_then(Weak::upgrade) {
                     a.on_packet(data, key);
                 }
             });
         // OnPeerConnected: wire up the per-peer device.
         let on_connected: OnPeerConnectedFn =
             Arc::new(move |key: NoisePublicKey, _h: &Arc<Handler>| {
-                if let Some(a) = weak_for_cb_conn
-                    .lock()
-                    .expect("weak lock")
-                    .as_ref()
-                    .and_then(|w| w.upgrade())
-                {
+                if let Some(a) = weak_for_cb_conn.get().and_then(Weak::upgrade) {
                     a.on_peer_connected(key);
                 }
             });
@@ -244,7 +237,7 @@ impl Adapter {
             peers: RwLock::new(std::collections::HashMap::new()),
             closed: AtomicBool::new(false),
         });
-        *weak_for_cb.lock().expect("weak lock") = Some(Arc::downgrade(&me));
+        let _ = weak_for_cb.set(Arc::downgrade(&me));
         Ok(me)
     }
 
@@ -676,5 +669,119 @@ mod tests {
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         adapter.close().unwrap();
+    }
+
+    /// A connector may accept a pending unknown peer, whose handshake then
+    /// completes, and connects, from inside the call that runs it.
+    #[test]
+    fn a_connector_may_accept_a_pending_peer() {
+        type Pending = (NoisePublicKey, Vec<u8>, SocketAddr);
+        let pending: Arc<Mutex<Option<Pending>>> = Arc::default();
+        let (p, done) = (pending.clone(), Arc::new(AtomicUsize::new(0)));
+        let d = done.clone();
+        let (a, _) = reentrant_adapter(Box::new(move |a| {
+            let item = p.lock().unwrap().take();
+            if let Some((k, pkt, addr)) = item {
+                let _ = a.accept_unknown_peer(k, &pkt, addr);
+            }
+            d.fetch_add(1, Ordering::SeqCst);
+        }));
+        let p = pending.clone();
+        a.handler()
+            .unwrap()
+            .set_on_unknown_peer(Arc::new(move |k, addr, pkt: &[u8]| {
+                *p.lock().unwrap() = Some((k, pkt.to_vec(), addr));
+            }));
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let saddr = sock.local_addr().unwrap();
+        let _t = a.spawn_serve(sock);
+        let spub = a.public_key();
+
+        // An unknown peer, parked by on_unknown_peer.
+        let stranger = Handler::new(HandlerConfig::default()).unwrap();
+        stranger.add_peer(spub);
+        let ssock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        ssock
+            .send_to(&stranger.initiate_handshake(&spub).unwrap(), saddr)
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while pending.lock().unwrap().is_none() {
+            assert!(std::time::Instant::now() < deadline, "never parked");
+            thread::sleep(Duration::from_millis(5));
+        }
+        // A known one, whose connect runs the connector.
+        let known = Handler::new(HandlerConfig::default()).unwrap();
+        known.add_peer(spub);
+        a.add_peer(known.public_key());
+        let ksock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        ksock
+            .send_to(&known.initiate_handshake(&spub).unwrap(), saddr)
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while done.load(Ordering::SeqCst) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "deadlocked in the connector"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let peers = a.peers.read().unwrap();
+        assert!(peers.contains_key(&known.public_key()));
+        assert!(peers.contains_key(&stranger.public_key()));
+        drop(peers);
+        a.close().unwrap();
+    }
+
+    /// A device handler that panics costs the packet it was handed; the
+    /// next one is still delivered.
+    #[test]
+    fn a_panicking_device_handler_does_not_break_the_adapter() {
+        struct PanicOnce(Arc<AtomicUsize>);
+        impl L3Connector for PanicOnce {
+            fn connect_l3(&self, dev: Arc<dyn L3Device>) -> Result<Cleanup> {
+                let n = self.0.clone();
+                dev.set_handler(Arc::new(move |_p: &Packet| {
+                    if n.fetch_add(1, Ordering::SeqCst) == 0 {
+                        panic!("caller bug");
+                    }
+                    Ok(())
+                }));
+                Ok(Box::new(|| Ok(())))
+            }
+        }
+        let n = Arc::new(AtomicUsize::new(0));
+        let a = Adapter::new(AdapterConfig::new(
+            crate::wg::generate_private_key().unwrap(),
+            Arc::new(PanicOnce(n.clone())),
+            "10.0.0.1/24".parse().unwrap(),
+        ))
+        .unwrap();
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let saddr = sock.local_addr().unwrap();
+        let _t = a.spawn_serve(sock);
+        let spub = a.public_key();
+        let c = Handler::new(HandlerConfig::default()).unwrap();
+        c.add_peer(spub);
+        a.add_peer(c.public_key());
+        let cs = UdpSocket::bind("127.0.0.1:0").unwrap();
+        cs.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        cs.send_to(&c.initiate_handshake(&spub).unwrap(), saddr)
+            .unwrap();
+        let mut buf = [0u8; 256];
+        let (k, from) = cs.recv_from(&mut buf).unwrap();
+        c.process_packet(&buf[..k], &from).unwrap();
+        for _ in 0..2 {
+            cs.send_to(&c.encrypt(&[0x45; 40], &spub).unwrap(), saddr)
+                .unwrap();
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while n.load(Ordering::SeqCst) < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "second packet never delivered"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        a.close().unwrap();
     }
 }
