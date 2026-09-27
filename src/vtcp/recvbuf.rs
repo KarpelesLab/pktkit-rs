@@ -265,6 +265,7 @@ impl RecvBuf {
         std::io::Read::read(&mut self.buf, p).unwrap_or(0)
     }
 
+    /// In-order bytes waiting to be read.
     #[inline]
     pub fn readable(&self) -> usize {
         self.buf.len()
@@ -312,6 +313,7 @@ impl RecvBuf {
         out
     }
 
+    /// True if out-of-order data is held beyond a hole.
     #[inline]
     pub fn has_ooo(&self) -> bool {
         !self.ooo.is_empty()

@@ -33,6 +33,8 @@ pub struct SendBuf {
 }
 
 impl SendBuf {
+    /// An empty buffer holding up to `capacity` bytes, whose first byte will
+    /// have sequence number `initial_seq`.
     pub fn new(capacity: usize, initial_seq: u32) -> Self {
         Self {
             buf: Vec::new(),
@@ -344,26 +346,31 @@ impl SendBuf {
         None
     }
 
+    /// True if no data is buffered, unacknowledged or not yet sent.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.data().is_empty()
     }
 
+    /// SND.UNA: the oldest unacknowledged sequence number.
     #[inline]
     pub fn una(&self) -> u32 {
         self.una
     }
 
+    /// SND.NXT: the next sequence number to send.
     #[inline]
     pub fn nxt(&self) -> u32 {
         self.nxt
     }
 
+    /// The most bytes the buffer holds.
     #[inline]
     pub fn capacity(&self) -> usize {
         self.cap
     }
 
+    /// Room left for more data, in bytes.
     #[inline]
     pub fn available(&self) -> usize {
         self.cap.saturating_sub(self.data().len())

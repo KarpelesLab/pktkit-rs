@@ -156,10 +156,12 @@ pub struct HubStats {
 }
 
 impl HubStats {
+    /// Counters all at zero.
     pub fn new() -> HubStats {
         HubStats::default()
     }
 
+    /// Record a packet or frame received from a port.
     #[inline]
     pub fn record_received(&self) {
         bump(&self.received, 1);
@@ -171,16 +173,19 @@ impl HubStats {
         bump(&self.forwarded, n);
     }
 
+    /// Record one flooded to every port but its source.
     #[inline]
     pub fn record_flooded(&self) {
         bump(&self.flooded, 1);
     }
 
+    /// Record one dropped.
     #[inline]
     pub fn record_dropped(&self) {
         bump(&self.dropped, 1);
     }
 
+    /// The counters as they stand.
     pub fn snapshot(&self) -> HubCounters {
         HubCounters {
             received: self.received.load(Ordering::Relaxed),
@@ -190,6 +195,7 @@ impl HubStats {
         }
     }
 
+    /// Zero every counter.
     pub fn reset(&self) {
         for c in [
             &self.received,

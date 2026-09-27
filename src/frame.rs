@@ -64,6 +64,7 @@ impl Frame {
         self.0.len()
     }
 
+    /// True for an empty buffer.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()

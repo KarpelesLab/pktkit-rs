@@ -24,11 +24,13 @@ impl EtherType {
     pub const VLAN: EtherType = EtherType(0x8100);
     pub const IPV6: EtherType = EtherType(0x86DD);
 
+    /// The EtherType with value `v`.
     #[inline]
     pub const fn new(v: u16) -> EtherType {
         EtherType(v)
     }
 
+    /// The raw value.
     #[inline]
     pub const fn as_u16(self) -> u16 {
         self.0

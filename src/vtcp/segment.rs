@@ -118,6 +118,7 @@ impl Segment {
         n
     }
 
+    /// True if any of the bits in `flag` (see [`flags`]) is set.
     #[inline]
     pub fn has_flag(&self, flag: u8) -> bool {
         self.flags & flag != 0

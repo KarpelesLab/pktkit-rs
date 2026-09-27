@@ -24,11 +24,13 @@ impl Protocol {
     pub const ESP: Protocol = Protocol(50);
     pub const AH: Protocol = Protocol(51);
 
+    /// The protocol with number `v`.
     #[inline]
     pub const fn new(v: u8) -> Protocol {
         Protocol(v)
     }
 
+    /// The raw protocol number.
     #[inline]
     pub const fn as_u8(self) -> u8 {
         self.0

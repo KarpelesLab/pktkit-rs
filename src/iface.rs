@@ -57,15 +57,24 @@ pub trait L2Device: Send + Sync {
 
 /// A Layer 3 (IP) network device.
 ///
-/// `Addr` returns the device's current IP prefix; `set_addr` updates it,
-/// typically from a DHCP client or other source of dynamic configuration.
+/// [`addr`](Self::addr) returns the device's current IP prefix;
+/// [`set_addr`](Self::set_addr) updates it, typically from a DHCP client or
+/// other source of dynamic configuration.
 pub trait L3Device: Send + Sync {
+    /// Install or replace the handler invoked on every received packet.
     fn set_handler(&self, h: L3Handler);
+
+    /// Transmit a packet on the device.
     fn send(&self, packet: &Packet) -> Result<()>;
 
+    /// The device's current address and the prefix of its network.
     fn addr(&self) -> IpPrefix;
+
+    /// Change the device's address, as a DHCP client or other dynamic
+    /// configuration does.
     fn set_addr(&self, prefix: IpPrefix) -> Result<()>;
 
+    /// Release any resources held by the device.
     fn close(&self) -> Result<()>;
 
     /// Traffic counters, if the device keeps any. See [`L2Device::stats`].

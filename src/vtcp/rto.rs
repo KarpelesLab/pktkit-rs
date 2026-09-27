@@ -37,6 +37,7 @@ impl Default for RtoState {
 }
 
 impl RtoState {
+    /// No sample yet: the RTO is [`DEFAULT_RTO`] (RFC 6298 §2.1).
     pub fn new() -> Self {
         Self {
             srtt: Duration::ZERO,
@@ -80,11 +81,13 @@ impl RtoState {
         }
     }
 
+    /// The current retransmission timeout.
     #[inline]
     pub fn rto(&self) -> Duration {
         self.rto
     }
 
+    /// The smoothed round-trip time; zero before the first sample.
     #[inline]
     pub fn srtt(&self) -> Duration {
         self.srtt

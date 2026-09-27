@@ -86,6 +86,7 @@ impl NewReno {
         }
     }
 
+    /// The slow-start threshold, in bytes; `u32::MAX` until the first loss.
     pub fn ssthresh(&self) -> u32 {
         self.ssthresh
     }
@@ -213,6 +214,8 @@ pub struct HighSpeed {
 }
 
 impl HighSpeed {
+    /// A controller for segments of `mss` bytes, starting from RFC 6928's
+    /// initial window.
     pub fn new(mss: u32) -> Self {
         let mut initial = 10 * mss;
         let alt = (2 * mss).max(14600);
@@ -229,6 +232,7 @@ impl HighSpeed {
         }
     }
 
+    /// The slow-start threshold, in bytes; `u32::MAX` until the first loss.
     pub fn ssthresh(&self) -> u32 {
         self.ssthresh
     }

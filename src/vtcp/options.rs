@@ -82,6 +82,7 @@ pub fn build_options(opts: &[TcpOption]) -> Vec<u8> {
     buf
 }
 
+/// A Maximum Segment Size option.
 pub fn mss_option(mss: u16) -> TcpOption {
     TcpOption {
         kind: kind::Mss,
@@ -89,6 +90,7 @@ pub fn mss_option(mss: u16) -> TcpOption {
     }
 }
 
+/// A Window Scale option with shift count `shift`.
 pub fn wscale_option(shift: u8) -> TcpOption {
     TcpOption {
         kind: kind::WScale,
@@ -96,6 +98,7 @@ pub fn wscale_option(shift: u8) -> TcpOption {
     }
 }
 
+/// A SACK-Permitted option.
 pub fn sack_perm_option() -> TcpOption {
     TcpOption {
         kind: kind::SackPerm,
@@ -103,6 +106,7 @@ pub fn sack_perm_option() -> TcpOption {
     }
 }
 
+/// A SACK option reporting `blocks`.
 pub fn sack_option(blocks: &[SackBlock]) -> TcpOption {
     let mut data = Vec::with_capacity(8 * blocks.len());
     for b in blocks {
@@ -115,6 +119,7 @@ pub fn sack_option(blocks: &[SackBlock]) -> TcpOption {
     }
 }
 
+/// A Timestamps option (TSval, TSecr).
 pub fn timestamp_option(ts_val: u32, ts_ecr: u32) -> TcpOption {
     let mut data = Vec::with_capacity(8);
     data.extend_from_slice(&ts_val.to_be_bytes());

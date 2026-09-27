@@ -38,6 +38,7 @@ pub struct Table {
 }
 
 impl Table {
+    /// An empty cache.
     pub fn new() -> Table {
         Table::default()
     }

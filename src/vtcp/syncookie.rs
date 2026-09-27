@@ -46,6 +46,8 @@ impl Default for SynCookies {
 }
 
 impl SynCookies {
+    /// A cookie engine with a salt of its own, so its cookies are not valid at
+    /// another.
     pub fn new() -> Self {
         static INSTANCE: AtomicU64 = AtomicU64::new(0);
         let n = INSTANCE.fetch_add(1, Ordering::Relaxed);

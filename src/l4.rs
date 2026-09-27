@@ -57,11 +57,13 @@ impl TcpFlags {
     pub const ECE: TcpFlags = TcpFlags(0x40);
     pub const CWR: TcpFlags = TcpFlags(0x80);
 
+    /// Flags from the raw byte (the low eight bits of the TCP flags field).
     #[inline]
     pub const fn new(bits: u8) -> TcpFlags {
         TcpFlags(bits)
     }
 
+    /// The raw byte.
     #[inline]
     pub const fn bits(self) -> u8 {
         self.0
@@ -79,6 +81,7 @@ impl TcpFlags {
         self.0 & other.0 != 0
     }
 
+    /// True if no flag is set.
     #[inline]
     pub const fn is_empty(self) -> bool {
         self.0 == 0
@@ -155,33 +158,40 @@ impl TcpSegment {
     /// Minimum TCP header size, with no options.
     pub const MIN_HEADER_LEN: usize = 20;
 
+    /// View `b` as a TCP segment. No copy; nothing is checked until an accessor
+    /// is called.
     #[inline]
     pub fn from_slice(b: &[u8]) -> &TcpSegment {
         // SAFETY: `#[repr(transparent)]` over `[u8]`.
         unsafe { &*(b as *const [u8] as *const TcpSegment) }
     }
 
+    /// View `b` mutably as a TCP segment. No copy.
     #[inline]
     pub fn from_mut(b: &mut [u8]) -> &mut TcpSegment {
         // SAFETY: see `from_slice`.
         unsafe { &mut *(b as *mut [u8] as *mut TcpSegment) }
     }
 
+    /// The underlying bytes.
     #[inline]
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
 
+    /// The underlying bytes, mutably.
     #[inline]
     pub fn as_bytes_mut(&mut self) -> &mut [u8] {
         &mut self.0
     }
 
+    /// Length in bytes, header and payload.
     #[inline]
     pub fn len(&self) -> usize {
         self.0.len()
     }
 
+    /// True for an empty buffer.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
@@ -192,21 +202,25 @@ impl TcpSegment {
         self.0.len() >= Self::MIN_HEADER_LEN && self.header_len() <= self.0.len()
     }
 
+    /// Source port; 0 if the buffer is too short.
     #[inline]
     pub fn src_port(&self) -> u16 {
         read_u16(&self.0, 0)
     }
 
+    /// Destination port; 0 if the buffer is too short.
     #[inline]
     pub fn dst_port(&self) -> u16 {
         read_u16(&self.0, 2)
     }
 
+    /// Sequence number; 0 if the buffer is too short.
     #[inline]
     pub fn seq(&self) -> u32 {
         read_u32(&self.0, 4)
     }
 
+    /// Acknowledgment number; 0 if the buffer is too short.
     #[inline]
     pub fn ack(&self) -> u32 {
         read_u32(&self.0, 8)
@@ -222,6 +236,7 @@ impl TcpSegment {
         ((self.0[12] >> 4) as usize * 4).max(Self::MIN_HEADER_LEN)
     }
 
+    /// Control flags; none if the buffer is too short.
     #[inline]
     pub fn flags(&self) -> TcpFlags {
         if self.0.len() < 14 {
@@ -231,16 +246,20 @@ impl TcpSegment {
         }
     }
 
+    /// Window field as sent, before any window scaling; 0 if the buffer is too
+    /// short.
     #[inline]
     pub fn window(&self) -> u16 {
         read_u16(&self.0, 14)
     }
 
+    /// Checksum as it appears on the wire; 0 if the buffer is too short.
     #[inline]
     pub fn checksum(&self) -> u16 {
         read_u16(&self.0, 16)
     }
 
+    /// Urgent pointer; 0 if the buffer is too short.
     #[inline]
     pub fn urgent_ptr(&self) -> u16 {
         read_u16(&self.0, 18)
@@ -273,32 +292,46 @@ impl TcpSegment {
         &mut self.0[hl..]
     }
 
+    /// Set the source port. The checksum is not updated. A no-op on a buffer
+    /// too short to hold the field.
     pub fn set_src_port(&mut self, port: u16) {
         write_u16(&mut self.0, 0, port);
     }
 
+    /// Set the destination port. The checksum is not updated. A no-op on a
+    /// buffer too short to hold the field.
     pub fn set_dst_port(&mut self, port: u16) {
         write_u16(&mut self.0, 2, port);
     }
 
+    /// Set the sequence number. The checksum is not updated. A no-op on a
+    /// buffer too short to hold the field.
     pub fn set_seq(&mut self, seq: u32) {
         write_u32(&mut self.0, 4, seq);
     }
 
+    /// Set the acknowledgment number. The checksum is not updated. A no-op on a
+    /// buffer too short to hold the field.
     pub fn set_ack(&mut self, ack: u32) {
         write_u32(&mut self.0, 8, ack);
     }
 
+    /// Set the control flags. The checksum is not updated. A no-op on a buffer
+    /// too short to hold the field.
     pub fn set_flags(&mut self, flags: TcpFlags) {
         if self.0.len() >= 14 {
             self.0[13] = flags.bits();
         }
     }
 
+    /// Set the window field. The checksum is not updated. A no-op on a buffer
+    /// too short to hold the field.
     pub fn set_window(&mut self, window: u16) {
         write_u16(&mut self.0, 14, window);
     }
 
+    /// Store `sum` in the checksum field as is. A no-op on a buffer too short
+    /// to hold the field.
     pub fn set_checksum(&mut self, sum: u16) {
         write_u16(&mut self.0, 16, sum);
     }
@@ -373,48 +406,58 @@ pub struct UdpDatagram(pub [u8]);
 impl UdpDatagram {
     pub const HEADER_LEN: usize = 8;
 
+    /// View `b` as a UDP datagram. No copy; nothing is checked until an
+    /// accessor is called.
     #[inline]
     pub fn from_slice(b: &[u8]) -> &UdpDatagram {
         // SAFETY: `#[repr(transparent)]` over `[u8]`.
         unsafe { &*(b as *const [u8] as *const UdpDatagram) }
     }
 
+    /// View `b` mutably as a UDP datagram. No copy.
     #[inline]
     pub fn from_mut(b: &mut [u8]) -> &mut UdpDatagram {
         // SAFETY: see `from_slice`.
         unsafe { &mut *(b as *mut [u8] as *mut UdpDatagram) }
     }
 
+    /// The underlying bytes.
     #[inline]
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
 
+    /// The underlying bytes, mutably.
     #[inline]
     pub fn as_bytes_mut(&mut self) -> &mut [u8] {
         &mut self.0
     }
 
+    /// Length in bytes, header and payload.
     #[inline]
     pub fn len(&self) -> usize {
         self.0.len()
     }
 
+    /// True for an empty buffer.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
+    /// True if the buffer holds the full 8-byte header.
     #[inline]
     pub fn is_valid(&self) -> bool {
         self.0.len() >= Self::HEADER_LEN
     }
 
+    /// Source port; 0 if the buffer is too short.
     #[inline]
     pub fn src_port(&self) -> u16 {
         read_u16(&self.0, 0)
     }
 
+    /// Destination port; 0 if the buffer is too short.
     #[inline]
     pub fn dst_port(&self) -> u16 {
         read_u16(&self.0, 2)
@@ -426,6 +469,8 @@ impl UdpDatagram {
         read_u16(&self.0, 4)
     }
 
+    /// Checksum as it appears on the wire (0 means none was computed, over
+    /// IPv4); 0 if the buffer is too short.
     #[inline]
     pub fn checksum(&self) -> u16 {
         read_u16(&self.0, 6)
@@ -460,18 +505,26 @@ impl UdpDatagram {
         &mut self.0[Self::HEADER_LEN..end]
     }
 
+    /// Set the source port. The checksum is not updated. A no-op on a buffer
+    /// too short to hold the field.
     pub fn set_src_port(&mut self, port: u16) {
         write_u16(&mut self.0, 0, port);
     }
 
+    /// Set the destination port. The checksum is not updated. A no-op on a
+    /// buffer too short to hold the field.
     pub fn set_dst_port(&mut self, port: u16) {
         write_u16(&mut self.0, 2, port);
     }
 
+    /// Set the Length field. The checksum is not updated. A no-op on a buffer
+    /// too short to hold the field.
     pub fn set_length(&mut self, len: u16) {
         write_u16(&mut self.0, 4, len);
     }
 
+    /// Store `sum` in the checksum field as is. A no-op on a buffer too short
+    /// to hold the field.
     pub fn set_checksum(&mut self, sum: u16) {
         write_u16(&mut self.0, 6, sum);
     }
@@ -557,33 +610,40 @@ pub struct IcmpMessage(pub [u8]);
 impl IcmpMessage {
     pub const HEADER_LEN: usize = 8;
 
+    /// View `b` as a ICMP or ICMPv6 message. No copy; nothing is checked until
+    /// an accessor is called.
     #[inline]
     pub fn from_slice(b: &[u8]) -> &IcmpMessage {
         // SAFETY: `#[repr(transparent)]` over `[u8]`.
         unsafe { &*(b as *const [u8] as *const IcmpMessage) }
     }
 
+    /// View `b` mutably as a ICMP or ICMPv6 message. No copy.
     #[inline]
     pub fn from_mut(b: &mut [u8]) -> &mut IcmpMessage {
         // SAFETY: see `from_slice`.
         unsafe { &mut *(b as *mut [u8] as *mut IcmpMessage) }
     }
 
+    /// The underlying bytes.
     #[inline]
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
 
+    /// The underlying bytes, mutably.
     #[inline]
     pub fn as_bytes_mut(&mut self) -> &mut [u8] {
         &mut self.0
     }
 
+    /// Length in bytes, header and payload.
     #[inline]
     pub fn len(&self) -> usize {
         self.0.len()
     }
 
+    /// True for an empty buffer.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
@@ -597,16 +657,19 @@ impl IcmpMessage {
         self.0.len() >= 4
     }
 
+    /// The Type field; 0 for an empty buffer.
     #[inline]
     pub fn message_type(&self) -> u8 {
         if self.0.is_empty() { 0 } else { self.0[0] }
     }
 
+    /// The Code field; 0 if the buffer is too short.
     #[inline]
     pub fn code(&self) -> u8 {
         if self.0.len() < 2 { 0 } else { self.0[1] }
     }
 
+    /// Checksum as it appears on the wire; 0 if the buffer is too short.
     #[inline]
     pub fn checksum(&self) -> u16 {
         read_u16(&self.0, 2)
@@ -653,18 +716,24 @@ impl IcmpMessage {
         }
     }
 
+    /// Set the Type field. The checksum is not updated. A no-op on a buffer too
+    /// short to hold the field.
     pub fn set_message_type(&mut self, t: u8) {
         if !self.0.is_empty() {
             self.0[0] = t;
         }
     }
 
+    /// Set the Code field. The checksum is not updated. A no-op on a buffer too
+    /// short to hold the field.
     pub fn set_code(&mut self, c: u8) {
         if self.0.len() >= 2 {
             self.0[1] = c;
         }
     }
 
+    /// Store `sum` in the checksum field as is. A no-op on a buffer too short
+    /// to hold the field.
     pub fn set_checksum(&mut self, sum: u16) {
         write_u16(&mut self.0, 2, sum);
     }

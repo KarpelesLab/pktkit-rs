@@ -33,6 +33,7 @@ pub trait L2Acceptor {
 /// Implementations:
 /// - `Arc<L2Hub>`: every device joins the shared hub
 pub trait L2Connector {
+    /// Attach `dev`. The returned [`Cleanup`] detaches it again.
     fn connect_l2(&self, dev: Arc<dyn L2Device>) -> Result<Cleanup>;
 }
 
@@ -41,6 +42,7 @@ pub trait L2Connector {
 /// Natural for protocols that operate at the IP layer (e.g. WireGuard),
 /// avoiding unnecessary L2 framing overhead.
 pub trait L3Connector {
+    /// Attach `dev`. The returned [`Cleanup`] detaches it again.
     fn connect_l3(&self, dev: Arc<dyn L3Device>) -> Result<Cleanup>;
 }
 
@@ -125,12 +127,15 @@ where
 /// Variant of [`L2Acceptor`] that yields an optional connection-closed signal
 /// alongside each device.
 pub trait L2AcceptorWithDone {
+    /// Block until the next device is available, returning it with the signal
+    /// that its connection has closed, if it has one.
     fn accept_l2_with_done(&self) -> Result<(Arc<dyn L2Device>, Option<Box<dyn Done + Send>>)>;
 }
 
 /// A blocking signal raised when a peer connection is fully closed. The
 /// connector uses this to release per-peer resources.
 pub trait Done {
+    /// Block until the connection has closed.
     fn wait(self: Box<Self>);
 }
 

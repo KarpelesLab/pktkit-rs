@@ -159,11 +159,13 @@ impl Packet {
         unsafe { &mut *(b as *mut [u8] as *mut Packet) }
     }
 
+    /// The underlying bytes.
     #[inline]
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
 
+    /// The underlying bytes, mutably.
     #[inline]
     pub fn as_bytes_mut(&mut self) -> &mut [u8] {
         &mut self.0
@@ -175,11 +177,13 @@ impl Packet {
         self.0.to_vec()
     }
 
+    /// Length of the buffer in bytes.
     #[inline]
     pub fn len(&self) -> usize {
         self.0.len()
     }
 
+    /// True for an empty buffer.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
@@ -302,6 +306,7 @@ impl Packet {
         }
     }
 
+    /// IPv4 source address; `None` if the buffer is too short.
     pub fn ipv4_src_addr(&self) -> Option<Ipv4Addr> {
         if self.0.len() < 16 {
             None
@@ -312,6 +317,7 @@ impl Packet {
         }
     }
 
+    /// IPv4 destination address; `None` if the buffer is too short.
     pub fn ipv4_dst_addr(&self) -> Option<Ipv4Addr> {
         if self.0.len() < 20 {
             None
@@ -344,6 +350,9 @@ impl Packet {
         &self.0[hl..tl]
     }
 
+    /// Set the DSCP, the upper six bits of the second byte; `dscp` above 63
+    /// loses its top bits. ECN is kept. The header checksum is not updated. A
+    /// no-op on a buffer too short to hold the field.
     pub fn set_ipv4_dscp(&mut self, dscp: u8) {
         if self.0.len() < 2 {
             return;
@@ -351,6 +360,9 @@ impl Packet {
         self.0[1] = (dscp << 2) | (self.0[1] & 0x03);
     }
 
+    /// Set the two ECN bits; higher bits of `ecn` are ignored. DSCP is kept.
+    /// The header checksum is not updated. A no-op on a buffer too short to
+    /// hold the field.
     pub fn set_ipv4_ecn(&mut self, ecn: u8) {
         if self.0.len() < 2 {
             return;
@@ -358,6 +370,8 @@ impl Packet {
         self.0[1] = (self.0[1] & 0xFC) | (ecn & 0x03);
     }
 
+    /// Set the Total Length field. The header checksum is not updated. A no-op
+    /// on a buffer too short to hold the field.
     pub fn set_ipv4_total_len(&mut self, len: u16) {
         if self.0.len() < 4 {
             return;
@@ -365,6 +379,8 @@ impl Packet {
         self.0[2..4].copy_from_slice(&len.to_be_bytes());
     }
 
+    /// Set the Identification field. The header checksum is not updated. A
+    /// no-op on a buffer too short to hold the field.
     pub fn set_ipv4_id(&mut self, id: u16) {
         if self.0.len() < 6 {
             return;
@@ -372,6 +388,8 @@ impl Packet {
         self.0[4..6].copy_from_slice(&id.to_be_bytes());
     }
 
+    /// Set or clear the DF flag. The header checksum is not updated. A no-op on
+    /// a buffer too short to hold the field.
     pub fn set_ipv4_dont_fragment(&mut self, on: bool) {
         if self.0.len() < 7 {
             return;
@@ -383,6 +401,8 @@ impl Packet {
         }
     }
 
+    /// Set or clear the MF flag. The header checksum is not updated. A no-op on
+    /// a buffer too short to hold the field.
     pub fn set_ipv4_more_fragments(&mut self, on: bool) {
         if self.0.len() < 7 {
             return;
@@ -405,6 +425,8 @@ impl Packet {
         self.0[6..8].copy_from_slice(&(flags | units).to_be_bytes());
     }
 
+    /// Set the TTL. The header checksum is not updated. A no-op on a buffer too
+    /// short to hold the field.
     pub fn set_ipv4_ttl(&mut self, ttl: u8) {
         if self.0.len() < 9 {
             return;
@@ -412,6 +434,8 @@ impl Packet {
         self.0[8] = ttl;
     }
 
+    /// Set the Protocol field. The header checksum is not updated. A no-op on a
+    /// buffer too short to hold the field.
     pub fn set_ipv4_protocol(&mut self, proto: Protocol) {
         if self.0.len() < 10 {
             return;
@@ -419,6 +443,8 @@ impl Packet {
         self.0[9] = proto.as_u8();
     }
 
+    /// Store `sum` in the header checksum field as is. A no-op on a buffer too
+    /// short to hold the field.
     pub fn set_ipv4_checksum(&mut self, sum: u16) {
         if self.0.len() < 12 {
             return;
@@ -426,6 +452,9 @@ impl Packet {
         self.0[10..12].copy_from_slice(&sum.to_be_bytes());
     }
 
+    /// Set the source address. Neither the header checksum nor a transport
+    /// checksum covering it is updated. A no-op on a buffer too short to hold
+    /// the field.
     pub fn set_ipv4_src_addr(&mut self, addr: Ipv4Addr) {
         if self.0.len() < 16 {
             return;
@@ -433,6 +462,9 @@ impl Packet {
         self.0[12..16].copy_from_slice(&addr.octets());
     }
 
+    /// Set the destination address. Neither the header checksum nor a transport
+    /// checksum covering it is updated. A no-op on a buffer too short to hold
+    /// the field.
     pub fn set_ipv4_dst_addr(&mut self, addr: Ipv4Addr) {
         if self.0.len() < 20 {
             return;
@@ -470,6 +502,8 @@ impl Packet {
         }
     }
 
+    /// IPv6 Payload Length: everything after the fixed header, extension
+    /// headers included; 0 if the buffer is too short.
     pub fn ipv6_payload_len(&self) -> u16 {
         if self.0.len() < 6 {
             0
@@ -492,10 +526,12 @@ impl Packet {
         }
     }
 
+    /// IPv6 Hop Limit; 0 if the buffer is too short.
     pub fn ipv6_hop_limit(&self) -> u8 {
         if self.0.len() < 8 { 0 } else { self.0[7] }
     }
 
+    /// IPv6 source address; `None` if the buffer is too short.
     pub fn ipv6_src_addr(&self) -> Option<Ipv6Addr> {
         if self.0.len() < 24 {
             None
@@ -506,6 +542,7 @@ impl Packet {
         }
     }
 
+    /// IPv6 destination address; `None` if the buffer is too short.
     pub fn ipv6_dst_addr(&self) -> Option<Ipv6Addr> {
         if self.0.len() < 40 {
             None
@@ -588,6 +625,7 @@ impl Packet {
         false
     }
 
+    /// Set the Traffic Class. A no-op on a buffer too short to hold the field.
     pub fn set_ipv6_traffic_class(&mut self, tc: u8) {
         if self.0.len() < 2 {
             return;
@@ -596,6 +634,8 @@ impl Packet {
         self.0[1] = ((tc & 0x0F) << 4) | (self.0[1] & 0x0F);
     }
 
+    /// Set the Flow Label; bits of `label` above the low 20 are ignored. A
+    /// no-op on a buffer too short to hold the field.
     pub fn set_ipv6_flow_label(&mut self, label: u32) {
         if self.0.len() < 4 {
             return;
@@ -605,6 +645,8 @@ impl Packet {
         self.0[3] = label as u8;
     }
 
+    /// Set the Payload Length field. A no-op on a buffer too short to hold the
+    /// field.
     pub fn set_ipv6_payload_len(&mut self, len: u16) {
         if self.0.len() < 6 {
             return;
@@ -612,6 +654,8 @@ impl Packet {
         self.0[4..6].copy_from_slice(&len.to_be_bytes());
     }
 
+    /// Set the fixed header's Next Header field. A no-op on a buffer too short
+    /// to hold the field.
     pub fn set_ipv6_next_header(&mut self, proto: Protocol) {
         if self.0.len() < 7 {
             return;
@@ -619,6 +663,7 @@ impl Packet {
         self.0[6] = proto.as_u8();
     }
 
+    /// Set the Hop Limit. A no-op on a buffer too short to hold the field.
     pub fn set_ipv6_hop_limit(&mut self, hop_limit: u8) {
         if self.0.len() < 8 {
             return;
@@ -626,6 +671,8 @@ impl Packet {
         self.0[7] = hop_limit;
     }
 
+    /// Set the source address. A transport checksum covering it is not updated.
+    /// A no-op on a buffer too short to hold the field.
     pub fn set_ipv6_src_addr(&mut self, addr: Ipv6Addr) {
         if self.0.len() < 24 {
             return;
@@ -633,6 +680,8 @@ impl Packet {
         self.0[8..24].copy_from_slice(&addr.octets());
     }
 
+    /// Set the destination address. A transport checksum covering it is not
+    /// updated. A no-op on a buffer too short to hold the field.
     pub fn set_ipv6_dst_addr(&mut self, addr: Ipv6Addr) {
         if self.0.len() < 40 {
             return;

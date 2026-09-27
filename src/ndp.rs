@@ -32,10 +32,13 @@ pub struct Table {
 }
 
 impl Table {
+    /// An empty cache.
     pub fn new() -> Table {
         Table::default()
     }
 
+    /// Look up `ip`, returning its MAC if a non-expired entry exists. An
+    /// expired entry is removed.
     pub fn lookup(&self, ip: Ipv6Addr) -> Option<MacAddr> {
         let mut t = self.inner.lock().unwrap();
         match t.get(&ip).copied() {
@@ -48,6 +51,8 @@ impl Table {
         }
     }
 
+    /// Record that `ip` is at `mac` for `ttl`. A full cache makes room by
+    /// evicting expired entries first, else the one closest to expiring.
     pub fn set(&self, ip: Ipv6Addr, mac: MacAddr, ttl: Duration) {
         let mut t = self.inner.lock().unwrap();
         if !t.contains_key(&ip) && t.len() >= MAX_ENTRIES {

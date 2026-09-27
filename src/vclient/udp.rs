@@ -94,14 +94,18 @@ impl core::fmt::Debug for UdpConn {
 }
 
 impl UdpConn {
+    /// Local socket address.
     pub fn local_addr(&self) -> SocketAddr {
         SocketAddr::new(self.state.local_ip, self.state.key.local_port)
     }
 
+    /// The remote this socket is connected to.
     pub fn peer_addr(&self) -> SocketAddr {
         SocketAddr::new(self.state.key.remote, self.state.key.remote_port)
     }
 
+    /// Bound how long a blocking [`recv`](Self::recv) waits; it then fails with
+    /// `WouldBlock`. `None`, the default, waits for ever.
     pub fn set_read_timeout(&self, t: Option<Duration>) {
         *self.read_timeout.lock().unwrap() = t;
     }
