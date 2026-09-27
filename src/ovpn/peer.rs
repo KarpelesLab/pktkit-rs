@@ -231,6 +231,16 @@ const AUTH_FAILED_EXIT: Duration = Duration::from_secs(5);
 /// the largest (OpenVPN reads it into a 2 KiB buffer); this is generous.
 const MAX_CONTROL_MESSAGE: usize = 64 * 1024;
 
+/// Most TLS output a key holds back while its send window is full. A TLS
+/// handshake flight, certificate chain included, fits several times over;
+/// past it the client is not reading what we send, and the key fails.
+const MAX_HELD_TLS: usize = 64 * 1024;
+
+/// After a PUSH_REPLY, repeated PUSH_REQUESTs are ignored this long
+/// (push.c: sent_push_reply_expiry). The reply itself is retransmitted by
+/// the reliable layer until the client has it.
+const PUSH_REPLY_HOLDOFF: Duration = Duration::from_secs(30);
+
 /// One OpenVPN peer (one client address).
 pub struct Peer {
     config: Arc<purecrypto::tls::Config>,
@@ -369,6 +379,16 @@ impl Peer {
             Some(s) => &s.peer_info,
             None => EMPTY.get_or_init(HashMap::new),
         }
+    }
+
+    /// Control packets sent and not yet acknowledged, across all sessions.
+    #[cfg(test)]
+    pub(super) fn unacked_count(&self) -> usize {
+        [&self.active, &self.initial]
+            .into_iter()
+            .flatten()
+            .map(|s| s.primary.reliable.unacked_count())
+            .sum()
     }
 
     fn session_mut(&mut self, slot: Slot) -> Option<&mut Session> {
@@ -791,6 +811,9 @@ struct Session {
     auth_failed: Option<(Instant, String)>,
     /// Data cipher chosen by negotiation, pushed to the client.
     pushed_cipher: Option<&'static str>,
+    /// Until then, a PUSH_REQUEST gets no new PUSH_REPLY: one was just
+    /// sent.
+    push_reply_until: Option<Instant>,
 }
 
 /// One TLS handshake and what it produced (OpenVPN's `key_state`): its own
@@ -952,6 +975,7 @@ impl Session {
             timers,
             auth_failed: None,
             pushed_cipher: None,
+            push_reply_until: None,
         }
     }
 
@@ -1061,17 +1085,23 @@ impl Session {
             .pop()
             .map_err(|e| invalid(format!("tls pop: {e:?}")))?;
 
-        if !tls_out.is_empty() {
-            let chunks = ks.reliable.chunk_tls_stream(&tls_out);
-            for (i, pkt) in chunks.iter().enumerate() {
-                // Attach pending acks only to the first packet of the burst.
-                let acks = if i == 0 {
-                    ks.reliable.take_pending_acks()
-                } else {
-                    Vec::new()
-                };
-                out.send.push(pkt.to_bytes(&acks));
-            }
+        ks.reliable.queue_tls(&tls_out);
+        // OpenVPN gives up on a key whose output it has no buffer for; a
+        // client that never ACKs would otherwise have us hold its output
+        // without bound.
+        if ks.reliable.held_len() > MAX_HELD_TLS {
+            return Err(invalid("control channel send backlog exceeded"));
+        }
+        // Whatever the send window has room for: ACKs arriving later open
+        // it, and this runs again for every packet received.
+        for (i, pkt) in ks.reliable.flush_tls().iter().enumerate() {
+            // Attach pending acks only to the first packet of the burst.
+            let acks = if i == 0 {
+                ks.reliable.take_pending_acks()
+            } else {
+                Vec::new()
+            };
+            out.send.push(pkt.to_bytes(&acks));
         }
 
         // If we still owe acks (no control packet carried them), send a plain ACK.
@@ -1194,9 +1224,11 @@ impl Session {
     /// messages over the TLS stream. Mirrors the post-auth loop in the Go
     /// `peer-control.go`:
     ///
-    /// - `PUSH_REQUEST` — (re)send the `PUSH_REPLY`. OpenVPN clients repeat the
-    ///   request until they see a reply, so every occurrence must be answered,
-    ///   not just the first.
+    /// - `PUSH_REQUEST` — send the `PUSH_REPLY`. OpenVPN clients repeat the
+    ///   request until they see a reply, but the reply travels on the
+    ///   reliable layer, which retransmits it until it arrives; so, as
+    ///   OpenVPN's server does, repeats within [`PUSH_REPLY_HOLDOFF`] of a
+    ///   reply are ignored rather than answered with another copy each.
     /// - everything else (`PING`, `INFO`, additional `PUSH_*`, etc.) is
     ///   gracefully ignored: we consume the message and keep the channel open.
     fn handle_post_auth_control(&mut self) -> io::Result<()> {
@@ -1215,11 +1247,16 @@ impl Session {
             // matching the Go upstream's permissive post-auth loop.
             let verb = s.split(',').next().unwrap_or("");
             if verb == "PUSH_REQUEST" {
+                let now = Instant::now();
+                if self.push_reply_until.is_some_and(|t| now < t) {
+                    continue;
+                }
                 let reply = self.build_push_reply();
                 self.primary
                     .tls
                     .send(reply.as_bytes())
                     .map_err(|e| invalid(format!("tls push reply: {e:?}")))?;
+                self.push_reply_until = now.checked_add(PUSH_REPLY_HOLDOFF);
             }
         }
         Ok(())

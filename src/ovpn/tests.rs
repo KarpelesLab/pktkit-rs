@@ -1308,6 +1308,44 @@ fn unacked_control_packet_does_not_undo_a_renegotiation() {
     );
 }
 
+/// A client that keeps asking for its config and never ACKs anything must
+/// not make the server hold, and retransmit, a reply for each request:
+/// OpenVPN answers one PUSH_REQUEST and ignores repeats for a while
+/// (push.c sent_push_reply_expiry), and never has more than
+/// TLS_RELIABLE_N_SEND_BUFFERS control packets in flight.
+#[test]
+fn push_request_flood_does_not_grow_the_send_queue() {
+    use super::consts::TLS_RELIABLE_N_SEND_BUFFERS;
+
+    let mut server = Peer::new(server_config(), *b"SERVERID", auth_hook())
+        .unwrap()
+        .with_timers(quiet_timers());
+    let mut client = TestClient::new(*b"CLIENTID");
+    let keys = connect(&mut server, &mut client);
+    let mut replies = 0;
+    for _ in 0..500 {
+        for d in client.send_control(b"PUSH_REQUEST\0") {
+            let out = server.handle_packet(&d).unwrap();
+            assert!(!out.close);
+            replies += out
+                .send
+                .iter()
+                .filter(|d| ControlPacket::parse(d).is_ok_and(|p| p.opcode == Opcode::CONTROL_V1))
+                .count();
+        }
+    }
+    assert!(replies <= 1, "{replies} PUSH_REPLY packets");
+    assert!(server.unacked_count() <= TLS_RELIABLE_N_SEND_BUFFERS);
+    let out = server
+        .tick(Instant::now() + Duration::from_secs(9))
+        .unwrap();
+    assert!(out.send.len() <= TLS_RELIABLE_N_SEND_BUFFERS);
+    assert_eq!(
+        deliver(&mut server, &keys, 1, b"alive"),
+        Some(b"alive".to_vec())
+    );
+}
+
 // --- helpers ----------------------------------------------------------------
 
 /// Exchange what `client` has queued with `server` until both go quiet;

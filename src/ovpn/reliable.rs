@@ -18,7 +18,7 @@ use std::io;
 use std::time::Duration;
 
 use super::Opcode;
-use super::consts::{CONTROL_CHANNEL_MTU, TLS_RELIABLE_N_REC_BUFFERS};
+use super::consts::{CONTROL_CHANNEL_MTU, TLS_RELIABLE_N_REC_BUFFERS, TLS_RELIABLE_N_SEND_BUFFERS};
 use super::packet_ctrl::ControlPacket;
 
 /// Initial retransmit timeout for an unacked control packet. OpenVPN's
@@ -70,6 +70,9 @@ pub struct Reliable {
     // Outgoing.
     out_counter: u32,
     unacked: HashMap<u32, Unacked>,
+    /// TLS output not yet put in a packet, held back while the send window
+    /// is full (OpenVPN leaves it in the TLS engine's BIO the same way).
+    held: Vec<u8>,
 
     // Incoming reorder buffer.
     in_counter: u32, // id of the next in-order packet we expect
@@ -103,6 +106,7 @@ impl Reliable {
             key_id: 0,
             out_counter: 0,
             unacked: HashMap::new(),
+            held: Vec::new(),
             in_counter: 0,
             in_buf: HashMap::new(),
             pending_ack: Vec::new(),
@@ -226,8 +230,10 @@ impl Reliable {
     }
 
     /// Chunk a TLS-record byte stream into one or more outgoing control
-    /// packets, each within the control-channel MTU. Each returned packet has
-    /// its pid assigned and is tracked for retransmit.
+    /// packets, each within the control-channel MTU, with no regard for the
+    /// send window. Only the test client uses this; the server goes through
+    /// [`queue_tls`](Self::queue_tls) and [`flush_tls`](Self::flush_tls).
+    #[cfg(test)]
     pub fn chunk_tls_stream(&mut self, data: &[u8]) -> Vec<ControlPacket> {
         let mut packets = Vec::new();
         let mut off = 0;
@@ -235,6 +241,42 @@ impl Reliable {
             let end = (off + CONTROL_CHANNEL_MTU).min(data.len());
             packets.push(self.build_control(&data[off..end]));
             off = end;
+        }
+        packets
+    }
+
+    /// Append TLS output to what is waiting to be sent.
+    pub fn queue_tls(&mut self, data: &[u8]) {
+        self.held.extend_from_slice(data);
+    }
+
+    /// Bytes of TLS output waiting for room in the send window.
+    pub fn held_len(&self) -> usize {
+        self.held.len()
+    }
+
+    /// Whether the send window has room for another packet
+    /// (reliable_can_send, reliable_get_buf_output_sequenced): its id must
+    /// stay within TLS_RELIABLE_N_SEND_BUFFERS of the oldest one still
+    /// unacknowledged. Without the bound, a peer that never ACKs has us
+    /// keep, and retransmit, everything we ever sent it.
+    fn can_send(&self) -> bool {
+        let window = TLS_RELIABLE_N_SEND_BUFFERS as u32;
+        match self.unacked.keys().min() {
+            Some(&oldest) => self.out_counter < oldest.saturating_add(window),
+            None => true,
+        }
+    }
+
+    /// Put as much of the held-back TLS output into control packets as the
+    /// send window allows. Each returned packet has its pid assigned and is
+    /// tracked for retransmit; the rest waits for ACKs to open the window.
+    pub fn flush_tls(&mut self) -> Vec<ControlPacket> {
+        let mut packets = Vec::new();
+        while !self.held.is_empty() && self.can_send() {
+            let n = self.held.len().min(CONTROL_CHANNEL_MTU);
+            let chunk: Vec<u8> = self.held.drain(..n).collect();
+            packets.push(self.build_control(&chunk));
         }
         packets
     }
@@ -442,6 +484,34 @@ mod tests {
         // pids assigned sequentially.
         assert_eq!(chunks[0].pid, Some(0));
         assert_eq!(chunks[2].pid, Some(2));
+    }
+
+    /// At most TLS_RELIABLE_N_SEND_BUFFERS packets are in flight; the rest
+    /// of the TLS output waits until ACKs open the window, oldest first.
+    #[test]
+    fn send_window_holds_back_output_until_acked() {
+        let mut r = Reliable::new(local());
+        r.queue_tls(&vec![7u8; CONTROL_CHANNEL_MTU * 6]);
+        let first = r.flush_tls();
+        assert_eq!(first.len(), TLS_RELIABLE_N_SEND_BUFFERS);
+        assert_eq!(r.unacked_count(), TLS_RELIABLE_N_SEND_BUFFERS);
+        assert_eq!(r.held_len(), CONTROL_CHANNEL_MTU * 2);
+        assert!(r.flush_tls().is_empty(), "window is full");
+
+        // An ACK for a later packet does not move the window past the
+        // oldest one still outstanding.
+        let ack = ControlPacket::new(Opcode::ACK_V1, 0, [9; 8], r.local_id);
+        r.recv(&ack.to_bytes(&[3])).unwrap();
+        assert!(r.flush_tls().is_empty());
+        r.recv(&ack.to_bytes(&[0])).unwrap();
+        let next = r.flush_tls();
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].pid, Some(4));
+        r.recv(&ack.to_bytes(&[1, 2])).unwrap();
+        let last = r.flush_tls();
+        assert_eq!(last.len(), 1);
+        assert_eq!(last[0].pid, Some(5));
+        assert_eq!(r.held_len(), 0);
     }
 
     /// ACKs are read before the packet's own id is checked (ssl.c
