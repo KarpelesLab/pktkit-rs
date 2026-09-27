@@ -516,12 +516,43 @@ impl Conn {
 
     /// Process an incoming SYN, transition to SYN-RECEIVED, emit SYN-ACK.
     pub fn accept_syn(&mut self, syn: &Segment) -> Vec<Vec<u8>> {
+        let iss = self.new_iss();
+        self.open_passive(syn, iss)
+    }
+
+    /// Rebuild the SYN-RECEIVED state a SYN cookie stood in for, from `ack`,
+    /// the segment that [`SynCookies::validate_ack`](super::SynCookies::validate_ack)
+    /// accepted with `mss`, without completing the handshake: for a listener
+    /// that cannot take the connection yet, its accept queue being full.
+    /// `ack` itself is not processed, as Linux drops it on overflow.
+    ///
+    /// From then on the connection is as if the SYN had been kept: its
+    /// SYN-ACK is retransmitted on the RTO, and the next segment from the
+    /// peer that [`handle_segment`](Self::handle_segment) is given
+    /// completes the handshake. Only the first segment after the handshake
+    /// carries a valid cookie, so without this the peer's later segments
+    /// would find no connection and be reset. It negotiates what a cookie
+    /// can carry: the MSS, and no window scaling, SACK or timestamps.
+    /// Nothing is sent now; the SYN-ACK went out, statelessly, already.
+    pub fn accept_cookie_syn_received(&mut self, ack: &Segment, our_iss: u32, mss: u16) {
+        let syn = Segment {
+            src_port: ack.src_port,
+            dst_port: ack.dst_port,
+            seq: ack.seq.wrapping_sub(1),
+            flags: flags::SYN,
+            window: ack.window,
+            options: vec![mss_option(mss.max(options::MIN_MSS))],
+            ..Default::default()
+        };
+        let _ = self.open_passive(&syn, our_iss);
+    }
+
+    fn open_passive(&mut self, syn: &Segment, iss: u32) -> Vec<Vec<u8>> {
         if self.state != State::Closed && self.state != State::Listen {
             return Vec::new();
         }
         self.negotiate_options(&syn.options);
 
-        let iss = self.new_iss();
         self.send_buf = Some(SendBuf::new(self.cfg.send_buf_size, iss));
         self.recv_buf = Some(RecvBuf::new(
             syn.seq.wrapping_add(1),
@@ -5054,6 +5085,32 @@ mod tests {
         };
         c.handle_segment(&seg);
         assert_eq!(read_all(&mut c), b"hi");
+    }
+
+    // A cookie connection put back in SYN-RECEIVED resends the cookie's
+    // SYN-ACK, and a later segment of the peer's completes it.
+    #[test]
+    fn cookie_connection_can_wait_in_syn_received() {
+        let mut c = Conn::new(cfg(80, 40290));
+        c.accept_cookie_syn_received(&cookie_ack(), 5000, 1400);
+        assert_eq!(c.state(), State::SynReceived);
+        assert!(c.take_outgoing().is_empty(), "sent before the RTO");
+        let synack = parse(&fire_rto(&mut c)[0]);
+        assert_eq!(synack.flags, flags::SYN | flags::ACK);
+        assert_eq!((synack.seq, synack.ack), (5000, 1001));
+        let seg = Segment {
+            seq: 1003,
+            payload: b"cd".to_vec(),
+            ..cookie_ack()
+        };
+        c.handle_segment(&seg);
+        assert_eq!(c.state(), State::Established);
+        assert_eq!(c.mss, 1400);
+        c.handle_segment(&Segment {
+            payload: b"ab".to_vec(),
+            ..cookie_ack()
+        });
+        assert_eq!(read_all(&mut c), b"abcd");
     }
 
     // RFC 6528: a new connection on the same 4-tuple starts just past the

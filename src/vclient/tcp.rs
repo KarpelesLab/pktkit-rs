@@ -192,12 +192,28 @@ impl ConnState {
         self.flush();
     }
 
+    /// Whether this connection is waiting for its listener, and that
+    /// listener's accept queue is full.
+    fn accept_queue_full(&self) -> bool {
+        self.pending_accept
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|p| p.listener.queue_full())
+    }
+
     /// For an inbound connection whose handshake has completed, hand it to
     /// its listener. Called after every segment, without the conn lock.
     ///
-    /// Returns `false` if the listener could not take the connection (closed,
-    /// or its queue full): nobody could ever accept it, so it has been reset
-    /// and the caller must drop it from the table.
+    /// Returns `false` if the listener could not take the connection
+    /// because it has closed: nobody could ever accept it, so it has been
+    /// reset and the caller must drop it from the table.
+    ///
+    /// A full queue does not count: the handshake's ACK is not let in while
+    /// it is (see `handle_inbound`). Only handshakes completing on several
+    /// threads at once can each find the last free place, and they may take
+    /// the queue that many past its cap, rather than reset a connection the
+    /// application would have accepted.
     fn after_segment(self: &Arc<Self>) -> bool {
         if !self.connected.load(Ordering::Acquire) {
             return true;
@@ -210,7 +226,7 @@ impl ConnState {
         // Checked under the queue lock, which `Listener::close` also takes
         // to drain the queue, so nothing is queued on a closed listener.
         let mut q = listener.queue.lock().unwrap();
-        if listener.closed.load(Ordering::Acquire) || q.len() >= ACCEPT_QUEUE_CAP {
+        if listener.closed.load(Ordering::Acquire) {
             drop(q);
             self.abort();
             return false;
@@ -575,6 +591,16 @@ const UNACCEPTED_BYTES: usize = if cfg!(test) { 64 * 1024 } else { 8 << 20 };
 /// lives until its SYN-ACKs give up.
 const HALF_OPEN_CAP: usize = 128;
 
+/// Half-open connections a listener holds counting those rebuilt from a
+/// SYN cookie whose ACK came in while the accept queue was full. The
+/// backlog is full then (or the SYN would not have had a cookie), mostly
+/// with handshakes waiting on the same queue, and without this headroom
+/// the cookie's peer would be reset as soon as it sent a second segment.
+/// Such a peer has shown it receives at its address, which a SYN flood
+/// does not, but a bound is still needed against one that opens and
+/// abandons connections on purpose.
+const COOKIE_HALF_OPEN_CAP: usize = 2 * HALF_OPEN_CAP;
+
 /// How long a passively opened connection may stay in SYN-RECEIVED. vtcp
 /// retransmits a SYN-ACK up to its full retry count, doubling from 1 s to
 /// its 60 s ceiling, which holds a half-open slot for about four minutes
@@ -617,7 +643,12 @@ impl ListenerState {
     /// Checked and taken in one step, so SYNs racing on several threads
     /// cannot overrun the cap between them.
     fn reserve_half_open(self: &Arc<Self>) -> Option<PendingAccept> {
-        if !crate::stats::add_within(&self.half_open, 1, HALF_OPEN_CAP) {
+        self.reserve_half_open_within(HALF_OPEN_CAP)
+    }
+
+    /// [`reserve_half_open`](Self::reserve_half_open) up to `cap`.
+    fn reserve_half_open_within(self: &Arc<Self>, cap: usize) -> Option<PendingAccept> {
+        if !crate::stats::add_within(&self.half_open, 1, cap) {
             return None;
         }
         Some(PendingAccept {
@@ -1009,6 +1040,20 @@ impl TcpStack {
         if let Some(state) = existing {
             {
                 let mut conn = state.conn.lock().unwrap();
+                // The ACK completing a handshake while the accept queue is
+                // full is dropped, and the connection stays in
+                // SYN-RECEIVED, as Linux does unless told to abort on
+                // overflow: our SYN-ACK is retransmitted, the peer answers
+                // it (or resends its data), and the handshake completes
+                // once the application has made room. A reset would fail a
+                // connection that is merely early; and if the application
+                // never makes room, the half-open timeout ends it.
+                if conn.state() == State::SynReceived
+                    && seg.flags & (flags::ACK | flags::SYN | flags::RST) == flags::ACK
+                    && state.accept_queue_full()
+                {
+                    return true;
+                }
                 // Closing marks the FIN as received too, so this tells a
                 // stream that had ended from one cut short.
                 let ended = conn.fin_received();
@@ -1089,7 +1134,19 @@ impl TcpStack {
             if let Some(listener) = listener
                 && let Some((mss, _)) = listener.cookies.validate_ack(&seg, dst, src)
             {
-                self.accept_cookie(listener, dst, src, &seg, mss);
+                if !listener.queue_full() {
+                    self.accept_cookie(listener, dst, src, &seg, mss);
+                } else if let Some(pending) =
+                    listener.reserve_half_open_within(COOKIE_HALF_OPEN_CAP)
+                {
+                    // No room to accept it yet: the ACK is dropped, as
+                    // Linux drops it, but the SYN-RECEIVED state the cookie
+                    // stood for is kept from here on, as for a SYN that got
+                    // a half-open slot. Dropped with no state, the peer's
+                    // next segments, which carry no cookie, would be reset.
+                    self.park_cookie(pending, dst, src, &seg, mss);
+                }
+                // Past even that, the ACK is simply dropped, as Linux does.
                 return true;
             }
         }
@@ -1170,6 +1227,25 @@ impl TcpStack {
         if !state.after_segment() {
             self.forget(&state);
         }
+    }
+
+    /// Open a connection in SYN-RECEIVED from the ACK completing a cookie
+    /// handshake that its listener has no room to accept yet. The ACK is
+    /// not taken: the connection waits in SYN-RECEIVED, holding `pending`'s
+    /// half-open slot, for the next one (see [`Conn::accept_cookie_syn_received`]).
+    fn park_cookie(
+        self: &Arc<Self>,
+        pending: PendingAccept,
+        local_ip: IpAddr,
+        remote: IpAddr,
+        ack: &Segment,
+        mss: u16,
+    ) {
+        let mut conn = Conn::new(passive_config(local_ip, remote, ack));
+        conn.accept_cookie_syn_received(ack, ack.ack.wrapping_sub(1), mss);
+        let key = passive_key(remote, ack);
+        let state = ConnState::new(key, local_ip, conn, self.sink.clone(), Some(pending));
+        self.register(key, &state);
     }
 
     /// Put a passively opened connection in the table. A SYN racing
@@ -1617,6 +1693,84 @@ mod tests {
             listener.state.half_open.load(Ordering::Acquire),
             HALF_OPEN_CAP
         );
+    }
+
+    /// A handshake that completes while the accept queue is full is held
+    /// in SYN-RECEIVED, not reset, and completes once there is room; one
+    /// completed from a SYN cookie is too, and the peer's later segments,
+    /// which carry no cookie, find it there.
+    #[test]
+    fn a_full_accept_queue_holds_handshakes_back() {
+        let (stack, out) = capturing_stack();
+        let listener = stack.listen(own(US), 80).unwrap();
+        listener.set_nonblocking(true);
+        let feed = |seg: Segment| {
+            out.lock().unwrap().clear();
+            stack.handle_inbound(Packet::from_slice(&inbound(seg)), IpAddr::V4(US));
+            let sent = out.lock().unwrap().clone();
+            sent.iter()
+                .map(|p| Segment::parse(Packet::from_slice(p).payload()).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let ack = |port: u16, seq: u32, ack: u32, payload: &[u8]| Segment {
+            src_port: port,
+            dst_port: 80,
+            seq,
+            ack,
+            flags: flags::ACK,
+            window: 65535,
+            payload: payload.to_vec(),
+            ..Default::default()
+        };
+        let state_of = |port: u16| {
+            let key = ConnKey {
+                local_port: 80,
+                remote: IpAddr::V4(PEER),
+                remote_port: port,
+            };
+            let conns = stack.conns.lock().unwrap();
+            conns.get(&key).map(|c| c.conn.lock().unwrap().state())
+        };
+        // Fill the queue, but for one place.
+        for port in 0..ACCEPT_QUEUE_CAP as u16 - 1 {
+            let synack = feed(syn_from(10000 + port)).remove(0);
+            feed(ack(10000 + port, 2, synack.seq.wrapping_add(1), b""));
+        }
+        // A half-open backlog, so the next SYN gets a cookie...
+        let mut isn = Vec::new();
+        for port in 0..HALF_OPEN_CAP as u16 {
+            isn.push(feed(syn_from(20000 + port)).remove(0).seq);
+        }
+        let cookie = feed(syn_from(30000)).remove(0).seq;
+        assert_eq!(state_of(30000), None, "no cookie was sent");
+        // ...and the last place goes before its ACK comes back.
+        feed(ack(20000, 2, isn[0].wrapping_add(1), b""));
+        assert!(listener.state.queue_full());
+
+        // The ACK completing a handshake is ignored, not reset.
+        assert!(feed(ack(20001, 2, isn[1].wrapping_add(1), b"x")).is_empty());
+        assert_eq!(state_of(20001), Some(State::SynReceived));
+        // So is the cookie's, but the connection is kept from then on: a
+        // segment beyond the cookie's does not find the port empty.
+        assert!(feed(ack(30000, 2, cookie.wrapping_add(1), b"ab")).is_empty());
+        assert_eq!(state_of(30000), Some(State::SynReceived));
+        assert!(feed(ack(30000, 4, cookie.wrapping_add(1), b"cd")).is_empty());
+
+        // Once the application makes room, the next ACK gets in.
+        drop(listener.accept().unwrap());
+        drop(listener.accept().unwrap());
+        feed(ack(20001, 2, isn[1].wrapping_add(1), b"x"));
+        feed(ack(30000, 2, cookie.wrapping_add(1), b"abcd"));
+        let mut got = Vec::new();
+        while let Ok(c) = listener.accept() {
+            let mut buf = [0; 8];
+            c.set_nonblocking(true);
+            let n = c.read(&mut buf).unwrap_or(0);
+            got.push((c.peer_addr().port(), buf[..n].to_vec()));
+        }
+        let tail = &got[got.len() - 2..];
+        assert_eq!(tail[0], (20001, b"x".to_vec()));
+        assert_eq!(tail[1], (30000, b"abcd".to_vec()));
     }
 
     /// A SYN-RECEIVED connection gives up after Linux's five SYN-ACK

@@ -616,6 +616,61 @@ fn nodelay_sends_short_writes_without_waiting_for_an_ack() {
     );
 }
 
+/// A listener whose application is slow to accept must not reset the
+/// handshakes that complete while its accept queue is full: as Linux does
+/// (`tcp_abort_on_overflow` = 0), it lets them wait, and each connection is
+/// accepted once there is room.
+#[test]
+fn a_full_accept_queue_does_not_reset_connections() {
+    use std::io::Read;
+
+    const DIALS: usize = 400;
+    let (a, b) = (client(2), client(3));
+    let hub = Arc::new(pktkit::L3Hub::new());
+    let _ha = hub.connect_arc(a.clone());
+    let _hb = hub.connect_arc(b.clone());
+    let listener = b.listen_tcp(LISTEN_PORT).unwrap();
+    std::thread::spawn(move || {
+        while let Ok(mut s) = listener.accept() {
+            std::thread::sleep(Duration::from_millis(2));
+            std::thread::spawn(move || {
+                let mut v = Vec::new();
+                s.set_read_timeout(Some(Duration::from_secs(60)));
+                if s.read_to_end(&mut v).is_ok() {
+                    let _ = s.write_all(&v);
+                }
+            });
+        }
+    });
+    let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3)), LISTEN_PORT);
+    let dials: Vec<_> = (0..DIALS)
+        .map(|i| {
+            let a = a.clone();
+            std::thread::spawn(move || -> std::io::Result<()> {
+                let mut c = a.dial_tcp_timeout(dst, Duration::from_secs(60))?;
+                c.set_read_timeout(Some(Duration::from_secs(60)));
+                let msg = vec![i as u8; 2000];
+                c.write_all(&msg)?;
+                c.close()?;
+                let mut v = Vec::new();
+                c.read_to_end(&mut v)?;
+                assert!(v == msg, "connection {i} echoed the wrong data");
+                Ok(())
+            })
+        })
+        .collect();
+    let errors: Vec<_> = dials
+        .into_iter()
+        .filter_map(|h| h.join().unwrap().err())
+        .map(|e| e.kind())
+        .collect();
+    assert!(
+        errors.is_empty(),
+        "{} connections failed: {errors:?}",
+        errors.len()
+    );
+}
+
 /// Records the TCP data segments (SEQ, length) a client sends.
 struct Sniff {
     dev: Arc<pktkit::vclient::Client>,
