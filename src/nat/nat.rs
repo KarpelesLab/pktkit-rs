@@ -296,6 +296,7 @@ impl Nat {
             port: e.inside_port,
         };
         let mut inner = self.inner.lock().unwrap();
+        Self::expire_port_locked(&mut inner, rk, Instant::now());
         if inner.reverse.get(&rk).is_some_and(|k| *k != target) || inner.forwards.contains_key(&rk)
         {
             return;
@@ -377,6 +378,7 @@ impl Nat {
             inner.forwards.remove(&k);
             Self::remove_mapping_at_locked(inner, k);
         }
+        Self::expire_port_locked(inner, rk, now);
         if let Some(existing) = inner.forwards.get(&rk)
             && (existing.inside_ip != pf.inside_ip || existing.namespace != pf.namespace)
         {
@@ -548,6 +550,41 @@ impl Nat {
                 .is_some_and(|m| m.outside_port == rk.port)
         {
             inner.mappings.remove(&k);
+        }
+    }
+
+    /// Drop mapping `k` if it has been idle past its timeout. Sweeps are
+    /// lazy, so one can linger; where it would decide something, it must not
+    /// count as live.
+    fn expire_mapping_locked(inner: &mut NatInner, k: NatKey, now: Instant) {
+        let Some(m) = inner.mappings.get_mut(&k) else {
+            return;
+        };
+        if m.peers.expire(k.proto, m.last_active, now) {
+            let rk = NatRevKey {
+                proto: k.proto,
+                port: m.outside_port,
+            };
+            inner.mappings.remove(&k);
+            if inner.reverse.get(&rk) == Some(&k) {
+                inner.reverse.remove(&rk);
+            }
+        }
+    }
+
+    /// Free outside port `rk` of whatever holds it only until the next
+    /// sweep: a lapsed forward (with its session) or an idle mapping.
+    fn expire_port_locked(inner: &mut NatInner, rk: NatRevKey, now: Instant) {
+        if inner
+            .forwards
+            .get(&rk)
+            .is_some_and(|f| f.expires.is_some_and(|e| e < now))
+        {
+            inner.forwards.remove(&rk);
+            Self::remove_mapping_at_locked(inner, rk);
+        }
+        if let Some(k) = inner.reverse.get(&rk).copied() {
+            Self::expire_mapping_locked(inner, k, now);
         }
     }
 
@@ -1434,6 +1471,7 @@ impl Nat {
                     ip: e.inside_ip,
                     port: e.inside_port,
                 };
+                Self::expire_mapping_locked(&mut inner, k, now);
                 if !Self::install_mapping_locked(&mut inner, k, rk, false) {
                     return None;
                 }
@@ -3599,5 +3637,51 @@ mod tests {
             &join(&out[0], &out[1]),
             20
         ));
+    }
+
+    #[test]
+    fn an_idle_mapping_not_yet_swept_does_not_hold_its_port() {
+        let (nat, i, o) = setup();
+        let p = build_udp(INSIDE, 5000, REMOTE, 53, b"q");
+        nat.inside().send(Packet::from_slice(&p)).unwrap();
+        let port = src_port(&o.lock().unwrap()[0]);
+        age_mappings(&nat, UDP_TIMEOUT + Duration::from_secs(1));
+
+        // Nothing has swept, but the mapping is over: the port is free.
+        let server = Ipv4Addr::new(10, 0, 0, 50);
+        nat.add_port_forward(PortForward::new(PROTO_UDP, port, server, 53))
+            .unwrap();
+        let q = build_udp(REMOTE, 53, PUBLIC, port, b"a");
+        nat.outside().send(Packet::from_slice(&q)).unwrap();
+        assert_eq!(&i.lock().unwrap()[0][16..20], &server.octets());
+    }
+
+    #[test]
+    fn an_idle_mapping_not_yet_swept_does_not_block_an_expectation() {
+        let (nat, i, o) = setup();
+        let p = build_udp(INSIDE, 5000, REMOTE, 53, b"q");
+        nat.inside().send(Packet::from_slice(&p)).unwrap();
+        let port = src_port(&o.lock().unwrap()[0]);
+        age_mappings(&nat, UDP_TIMEOUT + Duration::from_secs(1));
+
+        // For another host, on the idle mapping's port...
+        let other = Ipv4Addr::new(10, 0, 0, 6);
+        nat.add_expectation(Expectation::new(PROTO_UDP, other, 7000, port, soon()));
+        // ... and for the idle mapping's own endpoint, on another port.
+        nat.add_expectation(Expectation::new(PROTO_UDP, INSIDE, 5000, 30000, soon()));
+        let q = build_udp(REMOTE, 53, PUBLIC, port, b"a");
+        nat.outside().send(Packet::from_slice(&q)).unwrap();
+        let r = build_udp(REMOTE, 53, PUBLIC, 30000, b"b");
+        nat.outside().send(Packet::from_slice(&r)).unwrap();
+        let got = i.lock().unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(
+            (&got[0][16..20], dst_port(&got[0])),
+            (&other.octets()[..], 7000)
+        );
+        assert_eq!(
+            (&got[1][16..20], dst_port(&got[1])),
+            (&INSIDE.octets()[..], 5000)
+        );
     }
 }
