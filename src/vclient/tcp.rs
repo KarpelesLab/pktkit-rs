@@ -483,7 +483,6 @@ impl TcpStack {
 
     pub fn tick_all(&self) {
         let conns: Vec<Arc<ConnState>> = self.conns.lock().unwrap().values().cloned().collect();
-        let mut dead = Vec::new();
         for cs in conns {
             let mut conn = cs.conn.lock().unwrap();
             let ended = conn.fin_received();
@@ -499,14 +498,17 @@ impl TcpStack {
             }
             cs.signal.notify_all();
             if closed {
-                dead.push(cs.key);
+                self.forget(&cs);
             }
         }
-        if !dead.is_empty() {
-            let mut map = self.conns.lock().unwrap();
-            for k in dead {
-                map.remove(&k);
-            }
+    }
+
+    /// Drop `state` from the table, and only it: by now a newer connection
+    /// may hold its 4-tuple, having taken it over from TIME-WAIT.
+    fn forget(&self, state: &Arc<ConnState>) {
+        let mut conns = self.conns.lock().unwrap();
+        if conns.get(&state.key).is_some_and(|c| Arc::ptr_eq(c, state)) {
+            conns.remove(&state.key);
         }
     }
 
@@ -571,7 +573,6 @@ impl TcpStack {
         connect_timeout: Duration,
     ) -> io::Result<TcpConn> {
         let state = self.start_dial(local_ip, remote)?;
-        let key = state.key;
 
         // Wait for the handshake. The peer may have sent data or even closed
         // by the time we look, so any synchronized state (or a completed
@@ -584,7 +585,7 @@ impl TcpStack {
             }
             if conn.is_closed() {
                 drop(conn);
-                self.conns.lock().unwrap().remove(&key);
+                self.forget(&state);
                 return Err(io::Error::new(
                     io::ErrorKind::ConnectionRefused,
                     "connection reset during handshake",
@@ -592,7 +593,8 @@ impl TcpStack {
             }
             let now = Instant::now();
             if now >= deadline {
-                self.conns.lock().unwrap().remove(&key);
+                drop(conn);
+                self.forget(&state);
                 return Err(io::Error::new(io::ErrorKind::TimedOut, "connect timeout"));
             }
             let (c, _) = state.signal.wait_timeout(conn, deadline - now).unwrap();
@@ -655,11 +657,10 @@ impl TcpStack {
         // Existing connection (dialed or previously accepted)? One in
         // TIME-WAIT gives way to a new connection's SYN on its 4-tuple.
         let mut existing = self.conns.lock().unwrap().get(&key).cloned();
-        if existing
-            .as_ref()
-            .is_some_and(|st| st.conn.lock().unwrap().accepts_new_syn(&seg))
+        if let Some(st) = existing.as_ref()
+            && st.conn.lock().unwrap().accepts_new_syn(&seg)
         {
-            self.conns.lock().unwrap().remove(&key);
+            self.forget(st);
             existing = None;
         }
         if let Some(state) = existing {
@@ -682,7 +683,7 @@ impl TcpStack {
             };
             state.wrap_and_send(segs);
             if !state.after_segment() {
-                self.conns.lock().unwrap().remove(&key);
+                self.forget(&state);
             }
             state.signal.notify_all();
             return true;
@@ -1001,6 +1002,28 @@ mod tests {
             &seg(flags::ACK, 1, 1).marshal(),
         );
         assert!(reply(elsewhere).is_empty());
+    }
+
+    #[test]
+    fn forgetting_a_connection_leaves_its_successor_alone() {
+        let (stack, _out) = capturing_stack();
+        let old = stack
+            .start_dial(IpAddr::V4(US), SocketAddr::from((PEER, 80)))
+            .unwrap();
+        // A newer connection takes the 4-tuple over, as a SYN does one in
+        // TIME-WAIT.
+        let new = ConnState::new(
+            old.key,
+            old.local_ip,
+            Conn::new(ConnConfig::default()),
+            stack.sink.clone(),
+            None,
+        );
+        stack.conns.lock().unwrap().insert(old.key, new.clone());
+        stack.forget(&old);
+        assert!(Arc::ptr_eq(&stack.conns.lock().unwrap()[&old.key], &new));
+        stack.forget(&new);
+        assert!(stack.conns.lock().unwrap().is_empty());
     }
 
     #[test]
