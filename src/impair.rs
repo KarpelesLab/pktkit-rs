@@ -198,6 +198,9 @@ struct Queue {
     heap: BinaryHeap<Reverse<Queued>>,
     seq: u64,
     running: bool,
+    /// Messages taken off the heap but not yet handed over. They are no
+    /// longer queued, yet the link is not idle until they are out.
+    in_flight: usize,
     /// When each direction's link finishes serializing what it already has.
     free_at: [Option<Instant>; 2],
 }
@@ -365,6 +368,7 @@ impl Engine {
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 deliver(item.dir, &item.data)
             }));
+            self.queue.lock().unwrap().in_flight -= 1;
             if let Err(p) = r {
                 first_panic.get_or_insert(p);
             }
@@ -480,6 +484,13 @@ impl Engine {
         self.queue.lock().unwrap().len()
     }
 
+    /// Queued or being delivered: zero only once the link is really idle.
+    #[cfg(not(target_family = "wasm"))]
+    fn pending(&self) -> usize {
+        let q = self.queue.lock().unwrap();
+        q.len() + q.in_flight
+    }
+
     /// Pop every message whose deadline has passed, in release order.
     fn take_due(&self) -> Vec<Queued> {
         let now = Instant::now();
@@ -488,6 +499,7 @@ impl Engine {
         while matches!(q.heap.peek(), Some(Reverse(h)) if h.at <= now) {
             due.push(q.heap.pop().unwrap().0);
         }
+        q.in_flight += due.len();
         due
     }
 
@@ -506,18 +518,19 @@ fn push(q: &mut Queue, at: Instant, dir: Direction, data: Vec<u8>) {
     q.heap.push(Reverse(Queued { at, seq, dir, data }));
 }
 
-/// Wait for the queue to drain, up to `timeout`.
+/// Wait for the queue to drain and the last delivery to finish, up to
+/// `timeout`.
 #[cfg(not(target_family = "wasm"))]
 fn drain(engine: &Engine, timeout: Duration) -> bool {
     // No deadline the clock can represent means no deadline.
     let deadline = Instant::now().checked_add(timeout);
     while deadline.is_none_or(|d| Instant::now() < d) {
-        if engine.queued() == 0 {
+        if engine.pending() == 0 {
             return true;
         }
         std::thread::sleep(Duration::from_millis(1));
     }
-    engine.queued() == 0
+    engine.pending() == 0
 }
 
 /// Join the release thread, unless this *is* the release thread.
@@ -660,8 +673,9 @@ macro_rules! impaired_device {
                 self.engine.until_next()
             }
 
-            /// Block until the delay queue is empty or `timeout` elapses.
-            /// Returns whether it drained. Intended for tests, which otherwise
+            /// Block until the delay queue is empty and every message taken
+            /// off it has been delivered, or `timeout` elapses. Returns
+            /// whether it drained. Intended for tests, which otherwise
             /// have to guess how long a delayed packet needs.
             #[cfg(not(target_family = "wasm"))]
             pub fn wait_idle(&self, timeout: Duration) -> bool {
@@ -855,8 +869,6 @@ mod tests {
         assert_eq!(wire.count(), 0, "must not be delivered inline");
 
         assert!(link.wait_idle(Duration::from_secs(5)));
-        // Give the worker a moment to finish the delivery it just dequeued.
-        std::thread::sleep(Duration::from_millis(20));
         assert_eq!(wire.count(), 1);
         assert!(
             start.elapsed() >= Duration::from_millis(30),
@@ -911,7 +923,6 @@ mod tests {
                 link.send(Frame::from_slice(&frame(i))).unwrap();
             }
             link.wait_idle(Duration::from_secs(5));
-            std::thread::sleep(Duration::from_millis(20));
             wire.count()
         };
         let a = run();
@@ -984,7 +995,6 @@ mod tests {
         });
         link.send(Frame::from_slice(&frame(4))).unwrap();
         assert!(link.wait_idle(Duration::from_secs(5)));
-        std::thread::sleep(Duration::from_millis(20));
         // One guard: locking `sent` twice in a single expression would
         // deadlock, since std's Mutex is not reentrant.
         let sent = wire.sent.lock().unwrap();
@@ -1002,7 +1012,6 @@ mod tests {
         let f = frame(5);
         link.send(Frame::from_slice(&f)).unwrap();
         assert!(link.wait_idle(Duration::from_secs(5)));
-        std::thread::sleep(Duration::from_millis(20));
 
         let got = wire.sent.lock().unwrap()[0].clone();
         assert_eq!(got.len(), f.len());
@@ -1026,7 +1035,6 @@ mod tests {
             link.send(Frame::from_slice(&frame(i))).unwrap();
         }
         assert!(link.wait_idle(Duration::from_secs(5)));
-        std::thread::sleep(Duration::from_millis(20));
 
         assert_eq!(wire.count(), 4);
         let bits = 4 * frame(0).len() as u64 * 8;
@@ -1139,7 +1147,6 @@ mod tests {
             link.send(Frame::from_slice(&frame(i))).unwrap();
         }
         assert!(link.wait_idle(Duration::from_secs(5)));
-        std::thread::sleep(Duration::from_millis(20));
 
         let sent = wire.sent.lock().unwrap();
         assert_eq!(sent.len(), 16);
@@ -1307,6 +1314,34 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(*wire.0.lock().unwrap(), vec![1, 2]);
+    }
+
+    #[test]
+    fn wait_idle_waits_for_the_delivery_in_progress() {
+        struct Slow(Mutex<usize>);
+        impl L2Device for Slow {
+            fn set_handler(&self, _h: L2Handler) {}
+            fn send(&self, _f: &Frame) -> Result<()> {
+                std::thread::sleep(Duration::from_millis(100));
+                *self.0.lock().unwrap() += 1;
+                Ok(())
+            }
+            fn hw_addr(&self) -> MacAddr {
+                MacAddr::zero()
+            }
+            fn close(&self) -> Result<()> {
+                Ok(())
+            }
+        }
+        let wire = Arc::new(Slow(Mutex::new(0)));
+        let link = ImpairL2::new(
+            wire.clone(),
+            Impairment::default().delay(Duration::from_millis(1)),
+        );
+        link.send(Frame::from_slice(&frame(0))).unwrap();
+        link.send(Frame::from_slice(&frame(1))).unwrap();
+        assert!(link.wait_idle(Duration::from_secs(5)));
+        assert_eq!(*wire.0.lock().unwrap(), 2, "returned mid-delivery");
     }
 
     #[test]
