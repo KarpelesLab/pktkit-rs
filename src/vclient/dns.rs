@@ -95,6 +95,10 @@ pub mod wire {
     /// few links long; this only has to stop a looping one.
     const MAX_CNAME_HOPS: usize = 16;
 
+    /// Most compression pointers followed reading one name (see
+    /// [`read_name`]).
+    pub(crate) const MAX_POINTER_HOPS: usize = 128;
+
     /// Parse the response `data` to `query` (the whole message sent),
     /// returning the addresses it gives for the name asked about.
     ///
@@ -199,10 +203,17 @@ pub mod wire {
     /// do, to an earlier occurrence (RFC 1035 §4.1.4): so the walk cannot
     /// loop. The name must fit the 255-octet limit (§3.1), and label types
     /// other than plain labels and pointers are refused (RFC 6891 §5).
+    ///
+    /// Backwards-only pointers still let a chain of bare pointers run the
+    /// length of the message, and every record's name is read through it:
+    /// a crafted 64 KiB answer over TCP would cost tens of thousands of hops
+    /// per record. A name has at most 127 labels, so it never needs more
+    /// than [`MAX_POINTER_HOPS`] pointers; past that the name is refused.
     pub fn read_name(data: &[u8], mut off: usize) -> Option<(Vec<u8>, usize)> {
         let mut name = Vec::new();
         let mut end = None;
         let mut limit = off;
+        let mut hops = 0;
         loop {
             let l = *data.get(off)? as usize;
             match l & 0xC0 {
@@ -222,7 +233,8 @@ pub mod wire {
                 }
                 0xC0 => {
                     let target = (l & 0x3F) << 8 | *data.get(off + 1)? as usize;
-                    if target >= limit {
+                    hops += 1;
+                    if target >= limit || hops > MAX_POINTER_HOPS {
                         return None;
                     }
                     end.get_or_insert(off + 2);
@@ -679,6 +691,24 @@ mod tests {
         // 3 labels: 193 octets; 4: 257.
         assert_eq!(wire::read_name(&msg, starts[2]).unwrap().0.len(), 193);
         assert!(wire::read_name(&msg, starts[3]).is_none());
+    }
+
+    /// A chain of bare pointers, each to the one before, adds nothing to
+    /// the name, so the 255-octet limit never stops it: the hop count does.
+    #[test]
+    fn pointer_chains_are_capped_in_hops() {
+        let mut msg = vec![0u8]; // the root name, at 0
+        let mut last = 0;
+        for _ in 0..1000 {
+            let at = msg.len();
+            msg.extend_from_slice(&[0xC0 | (last >> 8) as u8, last as u8]);
+            last = at;
+        }
+        // The pointer MAX_POINTER_HOPS links from the root still reads.
+        let within = 1 + 2 * (wire::MAX_POINTER_HOPS - 1);
+        assert_eq!(wire::read_name(&msg, within).unwrap().0, [0]);
+        assert!(wire::read_name(&msg, within + 2).is_none());
+        assert!(wire::read_name(&msg, last).is_none());
     }
 
     #[test]
