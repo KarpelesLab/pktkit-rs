@@ -74,6 +74,10 @@ pub struct Nat64 {
     /// Inbound fragmented datagrams: the inside host each one's first
     /// fragment went to, by source, IP ID and protocol.
     frags: Mutex<FragTable<(Ipv4Addr, u16, u8), Ipv6Addr>>,
+    /// Outbound fragmented datagrams whose first fragment was translated,
+    /// by source, destination and identification (RFC 8200 §4.5), so the
+    /// rest may follow it out.
+    out_frags: Mutex<FragTable<(Ipv6Addr, Ipv6Addr, u32), ()>>,
     /// When packet handling next sweeps.
     next_sweep: Mutex<Instant>,
 }
@@ -113,6 +117,7 @@ impl Nat64 {
             self_ref: Mutex::new(Weak::new()),
             next_id: AtomicU16::new(crate::rand::u32() as u16),
             frags: Mutex::new(FragTable::default()),
+            out_frags: Mutex::new(FragTable::default()),
             next_sweep: Mutex::new(Instant::now() + SWEEP_INTERVAL),
         });
         *nat.self_ref.lock().unwrap() = Arc::downgrade(&nat);
@@ -164,6 +169,7 @@ impl Nat64 {
 
     fn sweep_at(&self, now: Instant) {
         self.frags.lock().unwrap().expire(now);
+        self.out_frags.lock().unwrap().expire(now);
         Self::expire_locked(&mut self.inner.lock().unwrap(), now);
     }
 
@@ -305,8 +311,21 @@ impl Nat64 {
 
         match (next_header, frag) {
             // A non-first fragment carries no ports and needs no mapping:
-            // only its IP header is translated (RFC 7915 §5.1.1).
+            // only its IP header is translated (RFC 7915 §5.1.1). But it
+            // may only follow a first fragment that was translated, or any
+            // inside host could send anything from the public address with
+            // no mapping behind it. One that overtakes its first fragment
+            // is held until that arrives, as inbound.
             (PROTO_TCP | PROTO_UDP, Some(f)) if f.offset != 0 => {
+                let key = (src_v6, dst_v6, f.id);
+                let ok = self
+                    .out_frags
+                    .lock()
+                    .unwrap()
+                    .later(key, pkt, Instant::now());
+                if ok.is_none() {
+                    return;
+                }
                 let flags = (f.offset / 8) as u16 | if f.more { 0x2000 } else { 0 };
                 let mut out = v4_header(
                     outside_ip,
@@ -320,14 +339,27 @@ impl Nat64 {
                 out.extend_from_slice(data);
                 self.send_v4(&out);
             }
-            (PROTO_TCP | PROTO_UDP, _) => self.outbound_tcpudp(
-                data,
-                next_header,
-                (src_v6, dst_v6),
-                (outside_ip, dst_v4),
-                hop,
-                frag,
-            ),
+            (PROTO_TCP | PROTO_UDP, _) => {
+                let sent = self.outbound_tcpudp(
+                    data,
+                    next_header,
+                    (src_v6, dst_v6),
+                    (outside_ip, dst_v4),
+                    hop,
+                    frag,
+                );
+                if let Some(f) = frag.filter(|f| sent && f.more) {
+                    let held = self.out_frags.lock().unwrap().resolve(
+                        (src_v6, dst_v6, f.id),
+                        (),
+                        Instant::now(),
+                    );
+                    // Now let through as their first fragment was.
+                    for h in held {
+                        self.handle_outbound(&h);
+                    }
+                }
+            }
             // The ICMPv6 checksum covers a pseudo-header holding the whole
             // message's length, which a first fragment does not know, so
             // fragmented ICMP is not translated.
@@ -339,6 +371,7 @@ impl Nat64 {
     }
 
     /// Translate a TCP/UDP packet, or the first fragment of one, to IPv4.
+    /// Returns whether it went out through a mapping.
     fn outbound_tcpudp(
         &self,
         transport: &[u8],
@@ -347,14 +380,14 @@ impl Nat64 {
         (outside_ip, dst_v4): (Ipv4Addr, Ipv4Addr),
         hop: Hop,
         frag: Option<V6Frag>,
-    ) {
+    ) -> bool {
         let field = if proto == PROTO_TCP { 16 } else { 6 };
         if transport.len() < field + 2 {
-            return;
+            return false;
         }
         // IPv6 has no checksum-less UDP; such a datagram is invalid.
         if proto == PROTO_UDP && transport[6..8] == [0, 0] {
-            return;
+            return false;
         }
         let src_port = u16::from_be_bytes([transport[0], transport[1]]);
         let k = Nat64Key {
@@ -364,7 +397,7 @@ impl Nat64 {
         };
         let (outside_port, _) = match self.get_or_create_mapping(k) {
             Some(v) => v,
-            None => return,
+            None => return false,
         };
 
         let dst_port = u16::from_be_bytes([transport[2], transport[3]]);
@@ -402,6 +435,7 @@ impl Nat64 {
         let mut out = v4_header(outside_ip, dst_v4, proto, hop, l4.len(), id, flags);
         out.extend_from_slice(&l4);
         self.send_v4(&out);
+        true
     }
 
     /// Identification and flags for an IPv4 packet translated from an
@@ -2149,11 +2183,12 @@ mod tests {
         nat.inside().send(Packet::from_slice(&far)).unwrap();
         assert!(outside.lock().unwrap().is_empty());
 
-        let (_, near) = split_v6(&pkt, 16, 8);
+        let (first, near) = split_v6(&pkt, 16, 8);
+        nat.inside().send(Packet::from_slice(&first)).unwrap();
         nat.inside().send(Packet::from_slice(&near)).unwrap();
         assert_eq!(
             outside.lock().unwrap().len(),
-            1,
+            2,
             "an ordinary fragment still goes"
         );
     }
@@ -2165,6 +2200,37 @@ mod tests {
         let (_, f2) = split_v6(&pkt, 16, 7);
         nat.inside().send(Packet::from_slice(&f2)).unwrap();
         assert!(nat.inner.lock().unwrap().mappings.is_empty());
+    }
+
+    #[test]
+    fn outbound_later_fragments_need_a_translated_first_one() {
+        let (nat, _inside, outside) = wired();
+        let pkt = build_v6_udp(CLIENT.parse().unwrap(), 5555, wkp(SERVER), 53, &[0x22; 24]);
+        // Alone, it never goes out.
+        let (_, stray) = split_v6(&pkt, 16, 7);
+        nat.inside().send(Packet::from_slice(&stray)).unwrap();
+        nat.sweep_at(Instant::now() + std::time::Duration::from_secs(60));
+        assert!(outside.lock().unwrap().is_empty(), "stray fragment sent");
+
+        // Nor behind a first fragment that is not translated (UDP without
+        // a checksum, which IPv6 forbids).
+        let mut bad = pkt.clone();
+        bad[IPV6_HEADER_LEN + 6..IPV6_HEADER_LEN + 8].copy_from_slice(&[0, 0]);
+        let (bad1, bad2) = split_v6(&bad, 16, 8);
+        nat.inside().send(Packet::from_slice(&bad1)).unwrap();
+        nat.inside().send(Packet::from_slice(&bad2)).unwrap();
+        assert!(outside.lock().unwrap().is_empty(), "orphaned fragment sent");
+
+        // Ahead of its first fragment, it waits for it.
+        let (f1, f2) = split_v6(&pkt, 16, 9);
+        nat.inside().send(Packet::from_slice(&f2)).unwrap();
+        assert!(outside.lock().unwrap().is_empty());
+        nat.inside().send(Packet::from_slice(&f1)).unwrap();
+        let out = outside.lock().unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(v4_flags(&out[0]), (true, 0));
+        assert_eq!(v4_flags(&out[1]), (false, 16));
+        assert_eq!(&out[1][20..], &f2[48..]);
     }
 
     #[test]

@@ -116,6 +116,9 @@ pub struct Nat {
     /// host each one's first fragment went to, keyed by source, IP ID and
     /// protocol, so the rest can follow.
     frags: Mutex<FragTable<(Ipv4Addr, u16, u8), (u64, Ipv4Addr)>>,
+    /// Outbound fragmented datagrams whose first fragment was translated,
+    /// so the rest may follow it out (see [`OutFragKey`]).
+    out_frags: Mutex<FragTable<OutFragKey, ()>>,
 
     /// When packet handling next sweeps (see [`SWEEP_INTERVAL`]).
     next_sweep: Mutex<Instant>,
@@ -173,6 +176,7 @@ impl Nat {
             self_ref: Mutex::new(Weak::new()),
             seqadj_used: AtomicBool::new(false),
             frags: Mutex::new(FragTable::default()),
+            out_frags: Mutex::new(FragTable::default()),
             next_sweep: Mutex::new(Instant::now() + SWEEP_INTERVAL),
         });
         *nat.self_ref.lock().unwrap() = Arc::downgrade(&nat);
@@ -862,6 +866,7 @@ impl Nat {
     fn sweep_at(&self, now: Instant) {
         Self::expire_locked(&mut self.inner.lock().unwrap(), now);
         self.frags.lock().unwrap().expire(now);
+        self.out_frags.lock().unwrap().expire(now);
         // Also sweep the defragger if enabled.
         if let Some(d) = self.defragger.lock().unwrap().clone() {
             d.sweep();
@@ -982,33 +987,48 @@ impl Nat {
             return;
         }
 
+        // A later fragment has no ports to find a mapping by. It may only
+        // follow a first fragment that was translated; otherwise any inside
+        // host could send anything out from the public address, with no
+        // mapping behind it. Like inbound, one that overtakes its first
+        // fragment is held until that arrives.
         if offset != 0 {
-            self.outbound_later_fragment(pkt);
+            let key = out_frag_key(ns, pkt);
+            let ok = self
+                .out_frags
+                .lock()
+                .unwrap()
+                .later(key, pkt, Instant::now());
+            if ok.is_some() {
+                self.outbound_later_fragment(pkt);
+            }
             return;
         }
         let whole = !more;
 
         let proto = pkt[9];
-        match proto {
-            PROTO_TCP | PROTO_UDP => {
-                if pkt.len() < ihl + 4 {
-                    return;
-                }
-                self.outbound_tcpudp(ns, pkt, ihl, proto, whole, fmax);
+        let translated = match proto {
+            PROTO_TCP | PROTO_UDP if pkt.len() >= ihl + 4 => {
+                self.outbound_tcpudp(ns, pkt, ihl, proto, whole, fmax)
             }
-            PROTO_ICMP => {
-                if pkt.len() < ihl + 8 {
-                    return;
-                }
-                self.outbound_icmp(ns, pkt, ihl, whole, fmax);
+            PROTO_ICMP if pkt.len() >= ihl + 8 => self.outbound_icmp(ns, pkt, ihl, whole, fmax),
+            _ => false,
+        };
+        if !whole && translated {
+            let held =
+                self.out_frags
+                    .lock()
+                    .unwrap()
+                    .resolve(out_frag_key(ns, pkt), (), Instant::now());
+            for f in held {
+                self.outbound_later_fragment(&f);
             }
-            _ => {}
         }
     }
 
-    /// A non-first fragment going out: it only needs the source address the
-    /// first fragment got. (A fragment to the NAT's own address is hairpinned
-    /// like the rest of its datagram.)
+    /// A non-first fragment going out, after its first one: it only needs
+    /// the source address that one got. (A fragment to the NAT's own address
+    /// is hairpinned like the rest of its datagram.)
     fn outbound_later_fragment(&self, pkt: &[u8]) {
         let Some(outside_ip) = self.outside_addr() else {
             return;
@@ -1025,7 +1045,9 @@ impl Nat {
     }
 
     /// Translate an outbound TCP/UDP datagram, or the first fragment of one
-    /// (`whole` false). `fmax` is set if it was reassembled.
+    /// (`whole` false). `fmax` is set if it was reassembled. Returns whether
+    /// it went out through a mapping, which the rest of a fragmented
+    /// datagram may then follow.
     fn outbound_tcpudp(
         &self,
         ns: u64,
@@ -1034,9 +1056,9 @@ impl Nat {
         proto: u8,
         whole: bool,
         fmax: Option<FragMax>,
-    ) {
+    ) -> bool {
         if !whole && !l4_header_in(pkt, ihl, proto) {
-            return;
+            return false;
         }
         let src_port = u16::from_be_bytes([pkt[ihl], pkt[ihl + 1]]);
         let src_ip = Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]);
@@ -1050,7 +1072,7 @@ impl Nat {
             let mut inner = self.inner.lock().unwrap();
             let m = match Self::get_or_create_mapping_locked(&mut inner, k) {
                 Some(m) => m,
-                None => return,
+                None => return false,
             };
             let peer = SocketAddrV4::new(
                 Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]),
@@ -1063,7 +1085,7 @@ impl Nat {
 
         let outside_ip = match self.outside_addr() {
             Some(a) => a,
-            None => return,
+            None => return false,
         };
 
         let mut out = pkt.to_vec();
@@ -1136,20 +1158,34 @@ impl Nat {
         // too.
         if out[16..20] == outside_ip.octets() {
             self.inbound(&out, fmax);
-            return;
+            return true;
         }
         emit(&out, fmax, |p| self.outside.deliver(p));
+        true
     }
 
-    fn outbound_icmp(&self, ns: u64, pkt: &[u8], ihl: usize, whole: bool, fmax: Option<FragMax>) {
+    /// Translate an outbound echo request, or the first fragment of one, or
+    /// an ICMP error. Returns whether an echo request went out through a
+    /// mapping, as [`outbound_tcpudp`](Self::outbound_tcpudp) does.
+    fn outbound_icmp(
+        &self,
+        ns: u64,
+        pkt: &[u8],
+        ihl: usize,
+        whole: bool,
+        fmax: Option<FragMax>,
+    ) -> bool {
         match pkt[ihl] {
             8 => {}
             // Errors are small; a fragmented one is not worth reassembling.
-            3 | 11 | 12 if whole => return self.outbound_icmp_error(ns, pkt, ihl),
-            _ => return,
+            3 | 11 | 12 if whole => {
+                self.outbound_icmp_error(ns, pkt, ihl);
+                return false;
+            }
+            _ => return false,
         }
         let Some(outside_ip) = self.outside_addr() else {
-            return;
+            return false;
         };
         // An echo request to the NAT's public address, the one TCP and UDP
         // are hairpinned on. Under NAPT no inside host owns it for ICMP (an
@@ -1161,7 +1197,7 @@ impl Nat {
             if whole && let Some(reply) = echo_reply(pkt, ihl) {
                 emit(&reply, fmax, |p| self.send_ns(ns, p));
             }
-            return;
+            return false;
         }
         let src_ip = Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]);
         let id = u16::from_be_bytes([pkt[ihl + 4], pkt[ihl + 5]]);
@@ -1180,7 +1216,7 @@ impl Nat {
                     m.peers.note(peer, true, None, m.last_active);
                     m.outside_port
                 }
-                None => return,
+                None => return false,
             }
         };
 
@@ -1196,6 +1232,7 @@ impl Nat {
         update_icmp_checksum(&mut out, ihl, old_id, outside_port);
 
         emit(&out, fmax, |p| self.outside.deliver(p));
+        true
     }
 
     /// Translate an ICMP error an inside host, or a router on the inside,
@@ -1860,6 +1897,20 @@ pub(crate) fn update_l4_checksum(
 pub(crate) fn frag_info(pkt: &[u8]) -> (bool, usize) {
     let v = u16::from_be_bytes([pkt[6], pkt[7]]);
     (v & 0x2000 != 0, (v & 0x1FFF) as usize * 8)
+}
+
+/// What the fragments of one outbound datagram share, before translation
+/// (RFC 791): inside namespace, source, destination, IP ID and protocol.
+type OutFragKey = (u64, Ipv4Addr, Ipv4Addr, u16, u8);
+
+fn out_frag_key(ns: u64, pkt: &[u8]) -> OutFragKey {
+    (
+        ns,
+        Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]),
+        Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]),
+        u16::from_be_bytes([pkt[4], pkt[5]]),
+        pkt[9],
+    )
 }
 
 /// What the fragments of one inbound datagram share: source, IP ID and
@@ -3511,5 +3562,42 @@ mod tests {
         assert_eq!(mapped(&nat), 0);
         nat.inside().send(Packet::from_slice(&p)).unwrap();
         assert_eq!(src_port(&o.lock().unwrap()[1]), 20000);
+    }
+
+    #[test]
+    fn outbound_later_fragments_need_a_translated_first_one() {
+        let (nat, _i, o) = setup();
+        let mut d = build_udp(INSIDE, 5000, REMOTE, 53, &[0x55; 24]);
+        crate::nat::l4::fill_v4_l4_checksum(&mut d, 20);
+
+        // A later fragment with no first one ahead of it goes nowhere,
+        // however long it waits.
+        let (_, stray) = split(&d, 16, 0x0101);
+        nat.inside().send(Packet::from_slice(&stray)).unwrap();
+        nat.sweep_at(Instant::now() + Duration::from_secs(60));
+        assert!(o.lock().unwrap().is_empty(), "stray fragment sent");
+
+        // Nor does one whose first fragment could not be translated (too
+        // short to hold the whole TCP header).
+        let t = build_tcp(INSIDE, 40000, REMOTE, 80, 0x02);
+        let (bad1, bad2) = split(&t, 8, 0x0202);
+        nat.inside().send(Packet::from_slice(&bad1)).unwrap();
+        nat.inside().send(Packet::from_slice(&bad2)).unwrap();
+        assert!(o.lock().unwrap().is_empty(), "orphaned fragment sent");
+
+        // One that overtakes its first fragment waits for it.
+        let (f1, f2) = split(&d, 16, 0x0303);
+        nat.inside().send(Packet::from_slice(&f2)).unwrap();
+        assert!(o.lock().unwrap().is_empty());
+        nat.inside().send(Packet::from_slice(&f1)).unwrap();
+        let out = o.lock().unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(frag_info(&out[0]).1, 0);
+        assert_eq!(&out[1][12..16], &PUBLIC.octets());
+        assert_eq!(&out[1][20..], &f2[20..]);
+        assert!(crate::nat::l4::v4_l4_checksum_ok(
+            &join(&out[0], &out[1]),
+            20
+        ));
     }
 }
