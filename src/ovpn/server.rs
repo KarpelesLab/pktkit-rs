@@ -8,9 +8,10 @@
 //! handed to the configured callbacks.
 //!
 //! Concurrency follows the crate conventions: one reader thread for UDP and one
-//! acceptor thread for TCP (plus a thread per TCP connection). Peers live in
-//! `Arc<Mutex<Peer>>` so the reader threads and the adapter's send path can
-//! both reach them.
+//! acceptor thread for TCP (plus a reader and a writer thread per TCP
+//! connection). Peers live in `Arc<Mutex<Peer>>` so the reader threads and
+//! the adapter's send path can both reach them. Nothing but a connection's
+//! own writer ever blocks on a TCP socket.
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
@@ -70,7 +71,8 @@ pub struct ServerConfig {
     /// Most peers (UDP and TCP together) held at once; a client hard reset
     /// beyond it is dropped. Default 1024.
     pub max_peers: usize,
-    /// Most TCP connections served at once; each has a thread. Default 256.
+    /// Most TCP connections served at once; each has two threads, a reader
+    /// and a writer. Default 256.
     pub max_tcp_connections: usize,
     /// Each peer's timers: handshake window, keepalive, renegotiation.
     /// Defaults to OpenVPN's (see [`PeerTimers`]).
@@ -126,13 +128,54 @@ struct PeerEntry {
     peer: Mutex<Peer>,
     transport: Transport,
     addr: SocketAddr,
-    // For TCP peers, the write half (length-prefixed). For UDP, None (the
+    // For TCP peers, the connection's outbound queue. For UDP, None (the
     // server writes via the shared UDP socket).
-    tcp: Option<Mutex<TcpStream>>,
+    tcp: Option<TcpOut>,
     /// Whether on_connect was fired for the peer and not yet matched by an
     /// on_disconnect: the callbacks pair, so only such a peer is reported
     /// gone.
     connected: AtomicBool,
+}
+
+/// Most frames queued for one TCP connection; past it, frames are dropped
+/// (OpenVPN's `tcp-queue-limit`, default 64). Control packets lost that way
+/// are retransmitted, data packets are the tunnel's own business.
+const TCP_QUEUE_LIMIT: usize = 64;
+
+/// The sending side of a TCP connection: a bounded queue drained by a
+/// writer thread of its own.
+///
+/// Senders -- the maintenance thread ticking every peer, the UDP reader
+/// running callbacks that send to peers, the connection's own reader -- must
+/// never block on the socket (OpenVPN never blocks its event loop on a
+/// write either): one client that stops reading would stall them all. So a
+/// frame is only queued, and dropped when the queue is full.
+struct TcpOut {
+    queue: mpsc::SyncSender<Vec<u8>>,
+    /// For shutting the connection down.
+    stream: TcpStream,
+}
+
+impl TcpOut {
+    /// Start the writer for `stream`. A write blocked past `write_timeout`
+    /// means the client has stopped reading for good: the writer then
+    /// closes the connection, which ends its reader and the peer.
+    fn spawn(stream: TcpStream, write_timeout: Option<Duration>) -> io::Result<TcpOut> {
+        stream.set_write_timeout(write_timeout)?;
+        let w = stream.try_clone()?;
+        let (queue, rx) = mpsc::sync_channel::<Vec<u8>>(TCP_QUEUE_LIMIT);
+        // Ends when the entry, and with it the queue, is dropped, or when
+        // a write fails (after the connection was shut down, for one).
+        thread::spawn(move || {
+            while let Ok(frame) = rx.recv() {
+                if (&w).write_all(&frame).is_err() {
+                    let _ = w.shutdown(std::net::Shutdown::Both);
+                    return;
+                }
+            }
+        });
+        Ok(TcpOut { queue, stream })
+    }
 }
 
 /// An OpenVPN server.
@@ -385,7 +428,7 @@ impl Server {
         key: PeerKey,
         transport: Transport,
         addr: SocketAddr,
-        tcp: Option<TcpStream>,
+        tcp: Option<TcpOut>,
     ) -> Option<Arc<PeerEntry>> {
         let mut peers = self.peers.write().unwrap();
         if let Some(e) = peers.get(&key) {
@@ -409,7 +452,7 @@ impl Server {
             peer: Mutex::new(peer),
             transport,
             addr,
-            tcp: tcp.map(Mutex::new),
+            tcp,
             connected: AtomicBool::new(false),
         });
         peers.insert(key, entry.clone());
@@ -430,7 +473,7 @@ impl Server {
             return;
         }
         if let Some(w) = &entry.tcp {
-            let _ = w.lock().unwrap().shutdown(std::net::Shutdown::Both);
+            let _ = w.stream.shutdown(std::net::Shutdown::Both);
         }
         if entry.connected.swap(false, Ordering::SeqCst)
             && let Some(cb) = &self.cfg.on_disconnect
@@ -518,7 +561,17 @@ impl Server {
                     let mut frame = Vec::with_capacity(2 + dgram.len());
                     frame.extend_from_slice(&len.to_be_bytes());
                     frame.extend_from_slice(dgram);
-                    w.lock().unwrap().write_all(&frame)
+                    match w.queue.try_send(frame) {
+                        Ok(()) => Ok(()),
+                        Err(mpsc::TrySendError::Full(_)) => Err(io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            "TCP send queue full, packet dropped",
+                        )),
+                        Err(mpsc::TrySendError::Disconnected(_)) => Err(io::Error::new(
+                            io::ErrorKind::NotConnected,
+                            "TCP connection closed",
+                        )),
+                    }
                 } else {
                     Err(io::Error::new(io::ErrorKind::NotConnected, "no tcp stream"))
                 }
@@ -613,18 +666,22 @@ fn tcp_conn(server: &Weak<Server>, stream: TcpStream, addr: SocketAddr) {
     if let Some(stale) = s.get_peer(&key) {
         s.remove_entry(&stale);
     }
-    let Some(entry) = s.create_peer(key, Transport::Tcp, addr, Some(write_half)) else {
-        return;
-    };
-    s.dispatch(&entry, &first);
-    drop(s);
     // From here the peer's own timers decide when the client is gone -- the
     // handshake window before it authenticates, ping-restart after -- and
     // dropping the peer closes the connection. The read timeout is only a
     // backstop, and there is none without keepalive: a quiet client may
-    // then stay as long as it likes, as with OpenVPN.
+    // then stay as long as it likes, as with OpenVPN. A write blocked that
+    // long means a client that stopped reading: it has given up on us too.
     let idle = (!timers.keepalive_timeout.is_zero())
         .then(|| (timers.keepalive_timeout * 2).max(timers.handshake_window));
+    let Ok(out) = TcpOut::spawn(write_half, idle) else {
+        return;
+    };
+    let Some(entry) = s.create_peer(key, Transport::Tcp, addr, Some(out)) else {
+        return;
+    };
+    s.dispatch(&entry, &first);
+    drop(s);
     let _ = reader.get_ref().set_read_timeout(idle);
 
     while let Some(data) = read_frame(&mut reader) {
@@ -939,13 +996,44 @@ mod tests {
             peer: Mutex::new(peer),
             transport: Transport::Tcp,
             addr,
-            tcp: Some(Mutex::new(s)),
+            tcp: Some(TcpOut::spawn(s, None).unwrap()),
             connected: AtomicBool::new(false),
         });
         assert!(server.send_raw(&entry, &vec![0u8; 70_000]).is_err());
         server.send_raw(&entry, b"ok").unwrap();
         assert_eq!(tcp_recv(&mut client).unwrap(), b"ok");
         server.close();
+    }
+
+    /// Sending to a TCP client that has stopped reading must not block:
+    /// the maintenance thread (every peer's timers) and the UDP reader
+    /// (through callbacks sending to peers) write to TCP peers too, so one
+    /// stalled client would freeze everybody.
+    #[test]
+    fn a_tcp_client_that_stops_reading_does_not_block_senders() {
+        let server = test_server();
+        let mut c = tcp_client(&server);
+        tcp_send(&mut c, &client_reset(*b"CLIENT01"));
+        tcp_recv(&mut c).unwrap();
+        let addr = c.local_addr().unwrap();
+        let entry = server
+            .get_peer(&PeerKey::new(addr, Transport::Tcp))
+            .unwrap();
+
+        // Far more than any socket buffers hold, which the client never
+        // reads.
+        let (tx, rx) = mpsc::channel();
+        let s = server.clone();
+        thread::spawn(move || {
+            let frame = vec![0u8; 60_000];
+            for _ in 0..2000 {
+                let _ = s.send_raw(&entry, &frame);
+            }
+            let _ = tx.send(());
+        });
+        let done = rx.recv_timeout(Duration::from_secs(10));
+        server.close();
+        assert!(done.is_ok(), "send_raw blocked on a stalled TCP client");
     }
 
     /// A TCP connection is its own peer: only one connection can hold an
@@ -962,14 +1050,15 @@ mod tests {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let _old_client = TcpStream::connect(l.local_addr().unwrap()).unwrap();
         let (old, _) = l.accept().unwrap();
-        old.shutdown(std::net::Shutdown::Both).unwrap();
+        let old = TcpOut::spawn(old, None).unwrap();
+        old.stream.shutdown(std::net::Shutdown::Both).unwrap();
         let on_auth: OnAuth = Arc::new(|_| Err(io::Error::other("unused")));
         let peer = Peer::new(crate::ovpn::tests::server_config(), [1; 8], on_auth).unwrap();
         let stale = Arc::new(PeerEntry {
             peer: Mutex::new(peer),
             transport: Transport::Tcp,
             addr,
-            tcp: Some(Mutex::new(old)),
+            tcp: Some(old),
             connected: AtomicBool::new(false),
         });
         server
