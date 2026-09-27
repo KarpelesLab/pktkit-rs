@@ -10,7 +10,7 @@ use crate::sys::if_hw_addr;
 use crate::{DeviceStats, Frame, L2Device, L2Handler, MacAddr, Result};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// `PACKET_OUTGOING`: the frame was sent by this host, not received.
@@ -24,7 +24,9 @@ pub struct Socket {
     /// since reused for something else.
     fd: Arc<OwnedFd>,
     interface: String,
-    ifindex: u32,
+    /// The index bound to. The reader re-binds, and updates this, when the
+    /// interface is deleted and one of the same name appears in its place.
+    ifindex: Arc<AtomicU32>,
     mac: MacAddr,
     mtu: usize,
     promiscuous: bool,
@@ -55,10 +57,7 @@ impl Socket {
             ));
         }
         let ifindex = crate::sys::if_index(&cfg.interface)?;
-
-        // ETH_P_ALL in network byte order: the kernel compares the protocol
-        // field of the frame against it, and that field is big-endian.
-        let proto = (libc::ETH_P_ALL as u16).to_be() as libc::c_int;
+        let proto = eth_p_all();
         // Protocol 0 at creation, ETH_P_ALL only at bind, as libpcap does: a
         // socket created with a protocol starts receiving from *every*
         // interface at once, and whatever arrives before `bind` narrows it
@@ -91,7 +90,7 @@ impl Socket {
         let sock = Arc::new(Socket {
             fd: Arc::new(fd),
             interface: cfg.interface.clone(),
-            ifindex,
+            ifindex: Arc::new(AtomicU32::new(ifindex)),
             mac,
             mtu,
             promiscuous: cfg.promiscuous,
@@ -113,6 +112,12 @@ impl Socket {
     pub fn mtu(&self) -> usize {
         self.mtu
     }
+}
+
+/// `ETH_P_ALL` in network byte order: the kernel compares the protocol field
+/// of the frame against it, and that field is big-endian.
+fn eth_p_all() -> libc::c_int {
+    (libc::ETH_P_ALL as u16).to_be() as libc::c_int
 }
 
 /// `PACKET_AUXDATA`: per-frame metadata as a control message, the only place
@@ -143,6 +148,11 @@ fn spawn_reader(sock: &Arc<Socket>, inbound_only: bool) {
     let handler = sock.handler.clone();
     let closed = sock.closed.clone();
     let stats = sock.stats.clone();
+    let rebind = Rebinder {
+        interface: sock.interface.clone(),
+        ifindex: sock.ifindex.clone(),
+        promiscuous: sock.promiscuous,
+    };
     // Room for a jumbo frame plus its header, behind headroom for a VLAN tag.
     // Grown if the kernel hands us anything larger.
     let mut buf = vec![0u8; super::VLAN_TAG_LEN + 65_536];
@@ -150,6 +160,13 @@ fn spawn_reader(sock: &Arc<Socket>, inbound_only: bool) {
     std::thread::spawn(move || {
         // u64s for the alignment `cmsghdr` needs; room for one auxdata.
         let mut control = [0u64; 8];
+        // Set when an error says the interface may have gone away, and kept
+        // until a frame arrives: each empty wakeup until then looks at
+        // whether the binding survived. Not cleared on finding it intact,
+        // since deleting a live interface is NETDEV_DOWN (which is when the
+        // ENETDOWN comes) and only then NETDEV_UNREGISTER, which orphans the
+        // socket silently; a check that ran between the two would pass.
+        let mut check_binding = false;
         while !closed.load(Ordering::Acquire) {
             let mut from: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
             let data = &mut buf[super::VLAN_TAG_LEN..];
@@ -171,6 +188,10 @@ fn spawn_reader(sock: &Arc<Socket>, inbound_only: bool) {
             let n = unsafe { libc::recvmsg(fd.as_raw_fd(), &mut msg, libc::MSG_TRUNC) };
             if n < 0 {
                 let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                check_binding |= signals_link_loss(errno);
+                if check_binding {
+                    rebind.recover(&fd);
+                }
                 match classify_recv_error(errno) {
                     RecvFailure::Retry => continue,
                     RecvFailure::Backoff => {
@@ -184,6 +205,8 @@ fn spawn_reader(sock: &Arc<Socket>, inbound_only: bool) {
                     }
                 }
             }
+            // A frame came in: the socket is hooked to a live device.
+            check_binding = false;
             let n = n as usize;
             if n > buf.len() - super::VLAN_TAG_LEN {
                 // A GRO or BIG TCP super-frame larger than the buffer. Half of
@@ -215,6 +238,94 @@ fn spawn_reader(sock: &Arc<Socket>, inbound_only: bool) {
     });
 }
 
+/// Whether `errno` from `recvmsg` can mean the bound interface went away.
+fn signals_link_loss(errno: i32) -> bool {
+    matches!(errno, libc::ENETDOWN | libc::ENODEV | libc::ENXIO)
+}
+
+/// Re-attaches the socket when its interface is deleted and comes back.
+///
+/// A link going down and up needs nothing: `packet_notifier` unhooks the
+/// socket on `NETDEV_DOWN` and hooks it again on `NETDEV_UP`. But on
+/// `NETDEV_UNREGISTER` it also sets the socket's bound index to -1, and a
+/// re-created interface of the same name (a restarted VPN, a veth pair set up
+/// again) gets a new index, so the kernel never hooks the socket to it: reads
+/// just time out, forever. The one sign is the `ENETDOWN` that `recvmsg`
+/// reports once. After it, and on each empty wakeup until a frame arrives,
+/// `getsockname` tells the two cases apart, and an orphaned socket is bound
+/// again, by name, once the name resolves.
+///
+/// The MAC address and MTU stay those read at open.
+struct Rebinder {
+    interface: String,
+    ifindex: Arc<AtomicU32>,
+    promiscuous: bool,
+}
+
+impl Rebinder {
+    /// Look at the binding and re-bind if it was lost. A socket that cannot
+    /// be queried is left alone: its fd is past saving, and the reader's next
+    /// `recvmsg` says so.
+    fn recover(&self, fd: &OwnedFd) {
+        let Some(bound) = bound_ifindex(fd) else {
+            return;
+        };
+        let Rebind::To(index) =
+            rebind_decision(bound, || crate::sys::if_index(&self.interface).ok())
+        else {
+            return;
+        };
+        if bind_to_interface(fd, index, eth_p_all()).is_err() {
+            return; // tried again on the next wakeup
+        }
+        // The kernel dropped the membership along with the old device.
+        if self.promiscuous {
+            let _ = set_promiscuous(fd, index, true);
+        }
+        self.ifindex.store(index, Ordering::Release);
+    }
+}
+
+/// What to do about a socket whose kernel binding reads `bound`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rebind {
+    /// Still bound to a live index; a link that is down comes back by itself.
+    StillBound,
+    /// Orphaned, and the interface has not come back yet.
+    Wait,
+    /// Orphaned, and the interface is back under this index.
+    To(u32),
+}
+
+/// See [`Rebinder`]. `by_name` resolves the interface's current index, and is
+/// only asked when the socket has lost its binding.
+fn rebind_decision(bound: i32, by_name: impl FnOnce() -> Option<u32>) -> Rebind {
+    if bound > 0 {
+        return Rebind::StillBound;
+    }
+    match by_name() {
+        Some(index) => Rebind::To(index),
+        None => Rebind::Wait,
+    }
+}
+
+/// The interface index the kernel has the socket bound to: -1 once that
+/// interface has been unregistered. `None` if the socket cannot be queried.
+fn bound_ifindex(fd: &OwnedFd) -> Option<i32> {
+    // SAFETY: all-zero is a valid sockaddr_ll.
+    let mut addr: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t;
+    // SAFETY: `addr` is a live, writable sockaddr_ll of `len` bytes.
+    let r = unsafe {
+        libc::getsockname(
+            fd.as_raw_fd(),
+            &mut addr as *mut libc::sockaddr_ll as *mut libc::sockaddr,
+            &mut len,
+        )
+    };
+    (r == 0).then_some(addr.sll_ifindex)
+}
+
 /// What the reader thread does after `recvmsg` fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecvFailure {
@@ -235,8 +346,9 @@ const RECV_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis
 /// The one the reader must survive is `ENETDOWN`: when the bound interface
 /// goes down, `packet_notifier` unhooks the socket and reports `ENETDOWN`
 /// through `sk_err`, and on the way back up it re-registers the socket on its
-/// own. A reader that took that for the end of the socket would leave the
-/// device deaf for good once the link returned. Only errors that say the fd
+/// own (a deleted and re-created interface is [`Rebinder`]'s job). A reader
+/// that took that for the end of the socket would leave the device deaf for
+/// good once the link returned. Only errors that say the fd
 /// is not a usable socket end the thread; anything else is waited out, and
 /// `close` still stops the loop.
 fn classify_recv_error(errno: i32) -> RecvFailure {
@@ -325,7 +437,7 @@ impl L2Device for Socket {
         if self.promiscuous {
             // Best-effort: the membership is dropped anyway when the socket is
             // closed, so a failure here is not worth propagating.
-            let _ = set_promiscuous(&self.fd, self.ifindex, false);
+            let _ = set_promiscuous(&self.fd, self.ifindex.load(Ordering::Acquire), false);
         }
         Ok(())
     }
@@ -478,6 +590,27 @@ mod tests {
     fn only_a_broken_fd_ends_the_reader() {
         for errno in [libc::EBADF, libc::ENOTSOCK, libc::EFAULT, libc::EINVAL] {
             assert_eq!(classify_recv_error(errno), RecvFailure::Fatal, "{errno}");
+        }
+    }
+
+    /// Only a socket the kernel has orphaned is re-bound, and only once its
+    /// interface is back.
+    #[test]
+    fn only_an_orphaned_socket_is_rebound() {
+        let never = || -> Option<u32> { panic!("looked up a bound socket") };
+        assert_eq!(rebind_decision(7, never), Rebind::StillBound);
+        assert_eq!(rebind_decision(-1, || None), Rebind::Wait);
+        assert_eq!(rebind_decision(-1, || Some(12)), Rebind::To(12));
+        assert_eq!(rebind_decision(0, || Some(12)), Rebind::To(12));
+    }
+
+    #[test]
+    fn link_loss_errors_prompt_a_binding_check() {
+        for errno in [libc::ENETDOWN, libc::ENODEV, libc::ENXIO] {
+            assert!(signals_link_loss(errno), "{errno}");
+        }
+        for errno in [libc::EAGAIN, libc::EINTR, libc::ENOBUFS] {
+            assert!(!signals_link_loss(errno), "{errno}");
         }
     }
 
