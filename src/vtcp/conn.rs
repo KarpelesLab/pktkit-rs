@@ -26,7 +26,9 @@ use super::recvbuf::RecvBuf;
 use super::rto::{MAX_RTO, RtoState};
 use super::segment::{Segment, flags};
 use super::sendbuf::SendBuf;
-use super::seqspace::{seq_after, seq_after_eq, seq_before_eq, seq_in_range};
+use super::seqspace::{
+    seq_after, seq_after_eq, seq_before_eq, seq_in_range, seq_in_range_inclusive,
+};
 
 // --- Tunables -------------------------------------------------------------
 
@@ -202,6 +204,12 @@ pub struct Conn {
     fin_pending: bool,
     pending_fin_seq: u32,
 
+    // Our own FIN. close() only queues it: it goes out once every byte
+    // written before it has been sent, since the FIN takes the sequence
+    // number right after the last data byte.
+    fin_queued: bool,
+    fin_sent: bool,
+
     // Persist (zero-window probing).
     persist_deadline: std::option::Option<Instant>,
     persist_backoff: Duration,
@@ -276,6 +284,8 @@ impl Conn {
             sack_ok: false,
             fin_pending: false,
             pending_fin_seq: 0,
+            fin_queued: false,
+            fin_sent: false,
             persist_deadline: None,
             persist_backoff: Duration::ZERO,
             time_wait_deadline: None,
@@ -567,6 +577,16 @@ impl Conn {
         if let Some(s) = self.send_buf.as_mut() {
             s.advance_sent(1); // FIN consumes 1 seq
         }
+        self.fin_queued = false;
+        self.fin_sent = true;
+        if self.rto_deadline.is_none() {
+            self.start_rto();
+        }
+    }
+
+    /// True once the peer has acknowledged our FIN (and so all data before it).
+    fn fin_acked(&self) -> bool {
+        self.fin_sent && self.send_buf.as_ref().is_some_and(|s| s.unacked() == 0)
     }
 
     // --- HandleSegment dispatcher (RFC 9293 §3.10.7) ----------------------
@@ -628,10 +648,12 @@ impl Conn {
         }
         let seg_len = seg.seg_len();
         if seg_len == 0 {
-            if rcv_wnd == 0 {
-                return seg.seq == rcv_nxt;
-            }
-            return seq_in_range(seg.seq, rcv_nxt, rcv_nxt.wrapping_add(rcv_wnd));
+            // RFC 9293 wants SEG.SEQ < RCV.NXT+RCV.WND, but a peer that has
+            // filled our window sends its ACKs at exactly the right edge. If
+            // part of that data was lost, rejecting them would also discard
+            // the ACK field until the retransmission lands (Linux accepts
+            // them too).
+            return seq_in_range_inclusive(seg.seq, rcv_nxt, rcv_nxt.wrapping_add(rcv_wnd));
         }
         if rcv_wnd == 0 {
             return false;
@@ -856,6 +878,10 @@ impl Conn {
             self.start_keepalive();
         }
         self.signal_established();
+        if self.fin_queued {
+            self.state = State::FinWait1;
+            self.flush_send_queue();
+        }
         self.handle_data_state(seg)
     }
 
@@ -889,14 +915,7 @@ impl Conn {
                 self.pending_fin_seq = fin_seq;
                 need_ack = true;
             }
-        } else if self.state == State::FinWait1
-            && seg.has_flag(flags::ACK)
-            && self
-                .send_buf
-                .as_ref()
-                .map(|s| seg.ack == s.nxt())
-                .unwrap_or(false)
-        {
+        } else if self.state == State::FinWait1 && self.fin_acked() {
             self.state = State::FinWait2;
         }
 
@@ -913,8 +932,7 @@ impl Conn {
                 self.signal_fin_recvd();
             }
             State::FinWait1 => {
-                let unacked = self.send_buf.as_ref().map(|s| s.unacked()).unwrap_or(0);
-                if unacked == 0 {
+                if self.fin_acked() {
                     self.state = State::TimeWait;
                     self.stop_rto();
                     self.start_time_wait();
@@ -942,8 +960,13 @@ impl Conn {
     }
 
     fn handle_closing(&mut self, seg: &Segment) -> Vec<Vec<u8>> {
-        let snd_nxt = self.send_buf.as_ref().map(|s| s.nxt()).unwrap_or(0);
-        if seg.has_flag(flags::ACK) && seg.ack == snd_nxt {
+        // Data and the FIN may still be in flight (or not yet sent), so ACKs
+        // here need the full treatment, not just a check for the FIN's.
+        if seg.has_flag(flags::ACK) {
+            self.process_ack(seg.ack, &seg.options);
+            self.snd_wnd = (seg.window as u32) << self.snd_wnd_shift;
+        }
+        if self.fin_acked() {
             self.state = State::TimeWait;
             self.stop_rto();
             self.start_time_wait();
@@ -953,8 +976,11 @@ impl Conn {
     }
 
     fn handle_last_ack(&mut self, seg: &Segment) -> Vec<Vec<u8>> {
-        let snd_nxt = self.send_buf.as_ref().map(|s| s.nxt()).unwrap_or(0);
-        if seg.has_flag(flags::ACK) && seg.ack == snd_nxt {
+        if seg.has_flag(flags::ACK) {
+            self.process_ack(seg.ack, &seg.options);
+            self.snd_wnd = (seg.window as u32) << self.snd_wnd_shift;
+        }
+        if self.fin_acked() {
             self.tear_down(State::Closed);
         }
         self.take_outgoing()
@@ -989,7 +1015,7 @@ impl Conn {
                 let flight = self.send_buf.as_ref().unwrap().unacked() as u32;
                 let snd_nxt = self.send_buf.as_ref().unwrap().nxt();
                 self.cc.on_fast_retransmit(flight, snd_nxt);
-                self.retransmit();
+                let _ = self.retransmit();
             }
             if self.sack_ok {
                 let blocks = get_sack_blocks(opts);
@@ -1035,13 +1061,15 @@ impl Conn {
         self.flush_send_queue();
     }
 
-    fn retransmit(&mut self) {
+    /// Resend the oldest unacknowledged data. Returns false when there is
+    /// none (at most the FIN is outstanding).
+    fn retransmit(&mut self) -> bool {
         let data: Vec<u8> = {
             let s = self.send_buf.as_ref().unwrap();
             s.retransmit_data(self.mss as usize).to_vec()
         };
         if data.is_empty() {
-            return;
+            return false;
         }
         let una = self.send_buf.as_ref().unwrap().una();
         let rcv_nxt = self.recv_buf.as_ref().unwrap().nxt();
@@ -1059,6 +1087,7 @@ impl Conn {
         self.queue_seg(seg);
         self.rto.invalidate_timing();
         self.start_rto();
+        true
     }
 
     fn flush_send_queue(&mut self) {
@@ -1079,8 +1108,12 @@ impl Conn {
             let avail = (eff_wnd - unacked) as usize;
             let n = avail.min(self.mss as usize).min(pending);
 
-            // Sender SWS avoidance: avoid tiny segments.
-            if n < self.mss as usize && self.send_buf.as_ref().unwrap().unacked() > 0 {
+            // Sender SWS avoidance: avoid tiny segments. Once closing, nothing
+            // more will be written to coalesce with, so send what there is.
+            if n < self.mss as usize
+                && self.send_buf.as_ref().unwrap().unacked() > 0
+                && !self.fin_queued
+            {
                 break;
             }
 
@@ -1112,6 +1145,16 @@ impl Conn {
             if self.send_buf.as_ref().unwrap().unacked() > 0 && self.rto_deadline.is_none() {
                 self.start_rto();
             }
+        }
+
+        if self.fin_queued
+            && self.send_buf.as_ref().unwrap().pending() == 0
+            && matches!(
+                self.state,
+                State::FinWait1 | State::Closing | State::LastAck
+            )
+        {
+            self.queue_fin();
         }
 
         // Zero-window probing.
@@ -1255,25 +1298,30 @@ impl Conn {
                 };
                 self.queue_seg(synack);
             }
-            State::Established | State::CloseWait => {
-                self.retransmit();
-            }
-            State::FinWait1 | State::LastAck => {
-                // Retransmit FIN. queueFIN advances NXT by 1 — but on retransmit we don't
-                // want to advance again. Build it inline.
-                let snd_nxt = self.send_buf.as_ref().unwrap().una();
-                let rcv_nxt = self.recv_buf.as_ref().unwrap().nxt();
-                let mut seg = Segment {
-                    src_port: self.cfg.local_port,
-                    dst_port: self.cfg.remote_port,
-                    seq: snd_nxt,
-                    ack: rcv_nxt,
-                    flags: flags::FIN | flags::ACK,
-                    window: self.rcv_window(),
-                    ..Default::default()
-                };
-                self.add_options(&mut seg);
-                self.queue_seg(seg);
+            State::Established
+            | State::CloseWait
+            | State::FinWait1
+            | State::Closing
+            | State::LastAck => {
+                // Data before the FIN goes first; the FIN is resent on its own
+                // once only it is outstanding.
+                let resent = self.retransmit();
+                if !resent && self.fin_sent && !self.fin_acked() {
+                    // queue_fin advances NXT by 1, which a retransmit must not do.
+                    let fin_seq = self.send_buf.as_ref().unwrap().nxt().wrapping_sub(1);
+                    let rcv_nxt = self.recv_buf.as_ref().unwrap().nxt();
+                    let mut seg = Segment {
+                        src_port: self.cfg.local_port,
+                        dst_port: self.cfg.remote_port,
+                        seq: fin_seq,
+                        ack: rcv_nxt,
+                        flags: flags::FIN | flags::ACK,
+                        window: self.rcv_window(),
+                        ..Default::default()
+                    };
+                    self.add_options(&mut seg);
+                    self.queue_seg(seg);
+                }
             }
             _ => {}
         }
@@ -1284,6 +1332,12 @@ impl Conn {
         if self.snd_wnd > 0 {
             self.stop_persist();
             self.flush_send_queue();
+            return;
+        }
+        if self.send_buf.as_ref().is_none_or(|s| s.pending() == 0) {
+            // Nothing new to probe with; bytes already in flight are the
+            // RTO's to resend.
+            self.stop_persist();
             return;
         }
         // 1-byte window probe.
@@ -1309,6 +1363,11 @@ impl Conn {
                 };
                 self.queue_seg(seg);
                 self.send_buf.as_mut().unwrap().advance_sent(data.len());
+                // The probe byte is real data: if it or its ACK is lost, only
+                // the RTO will send it again.
+                if self.rto_deadline.is_none() {
+                    self.start_rto();
+                }
             }
         }
         self.persist_backoff = self.persist_backoff.saturating_mul(2);
@@ -1355,11 +1414,27 @@ impl Conn {
     /// queue into `buf`. Returns the number of bytes read, or `Ok(0)` when
     /// no data is currently available. Use [`Conn::fin_received`] / [`Conn::is_closed`]
     /// to distinguish "would block" from EOF.
+    ///
+    /// A read that reopens a closed receive window queues a window update,
+    /// sent with the next [`Conn::tick`] or [`Conn::take_outgoing`]; without
+    /// it the peer would wait on its persist timer.
     pub fn read(&mut self, buf: &mut [u8]) -> usize {
+        let was_closed = self.rcv_window() == 0;
         let Some(rb) = self.recv_buf.as_mut() else {
             return 0;
         };
-        rb.read(buf)
+        let n = rb.read(buf);
+        if n > 0
+            && was_closed
+            && self.rcv_window() > 0
+            && matches!(
+                self.state,
+                State::Established | State::FinWait1 | State::FinWait2
+            )
+        {
+            self.queue_ack();
+        }
+        n
     }
 
     /// Non-blocking write: appends as much data as the send buffer can take
@@ -1384,27 +1459,32 @@ impl Conn {
         if self.closed {
             return Vec::new();
         }
+        // The FIN is only queued: flush_send_queue sends it after whatever
+        // data is still waiting on the window or on SWS avoidance.
         match self.state {
             State::Established => {
-                self.flush_send_queue();
                 self.state = State::FinWait1;
-                self.queue_fin();
-                self.start_rto();
+                self.fin_queued = true;
+                self.flush_send_queue();
             }
             State::CloseWait => {
                 self.state = State::LastAck;
-                self.queue_fin();
-                self.start_rto();
+                self.fin_queued = true;
+                self.flush_send_queue();
             }
             State::SynSent => {
                 self.tear_down(State::Closed);
             }
             State::SynReceived => {
-                self.state = State::FinWait1;
-                self.queue_fin();
-                self.start_rto();
+                // RFC 9293 §3.10.4: a FIN now would move SND.NXT past what
+                // the handshake's ACK acknowledges; send it once established.
+                self.fin_queued = true;
             }
-            State::FinWait1 | State::FinWait2 => {
+            State::FinWait1
+            | State::FinWait2
+            | State::Closing
+            | State::LastAck
+            | State::TimeWait => {
                 // Already closing.
             }
             _ => {
@@ -1619,5 +1699,483 @@ mod tests {
         assert_eq!(pkts.len(), 1);
         let rst = parse(&pkts[0]);
         assert!(rst.has_flag(flags::RST));
+    }
+
+    fn established(port: u16) -> (Conn, Conn) {
+        let mut client = Conn::new(cfg(port, 80));
+        let mut server = Conn::new(cfg(80, port));
+        drive_handshake(&mut client, &mut server);
+        (client, server)
+    }
+
+    /// Feed `pkts` to `to`, returning everything it sends in reply.
+    fn deliver(to: &mut Conn, pkts: &[Vec<u8>]) -> Vec<Vec<u8>> {
+        pkts.iter()
+            .flat_map(|p| to.handle_segment(&parse(p)))
+            .collect()
+    }
+
+    fn fire_rto(c: &mut Conn) -> Vec<Vec<u8>> {
+        assert!(c.rto_deadline.is_some(), "RTO not armed");
+        c.rto_deadline = Some(Instant::now());
+        c.tick()
+    }
+
+    fn read_all(c: &mut Conn) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut buf = [0u8; 1024];
+        loop {
+            let n = c.read(&mut buf);
+            if n == 0 {
+                return out;
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+    }
+
+    // A write held back by sender SWS avoidance must go out before the FIN,
+    // not be overtaken by it.
+    #[test]
+    fn close_sends_held_back_data_before_fin() {
+        let (mut client, mut server) = established(40010);
+        let (_, first) = client.write(&[1u8; 100]);
+        assert_eq!(first.len(), 1);
+        let (n, held) = client.write(b"close-frame");
+        assert_eq!(n, 11);
+        assert!(held.is_empty(), "small write should wait for the ACK");
+
+        let pkts = client.close();
+        assert_eq!(client.state(), State::FinWait1);
+        assert_eq!(pkts.len(), 2);
+        let data = parse(&pkts[0]);
+        let fin = parse(&pkts[1]);
+        assert_eq!(data.payload, b"close-frame");
+        assert!(!data.has_flag(flags::FIN));
+        assert!(fin.has_flag(flags::FIN));
+        assert_eq!(fin.seq, data.seq.wrapping_add(11));
+
+        let mut all = first;
+        all.extend(pkts);
+        let acks = deliver(&mut server, &all);
+        assert!(server.fin_received());
+        let got = read_all(&mut server);
+        assert_eq!(got.len(), 111);
+        assert_eq!(&got[100..], b"close-frame");
+
+        deliver(&mut client, &acks);
+        assert_eq!(client.state(), State::FinWait2);
+    }
+
+    // Data waiting on the peer's window: the FIN has to wait too, and ACKs of
+    // the data alone must not be taken for an ACK of the FIN.
+    #[test]
+    fn close_waits_for_window_limited_data() {
+        let (mut client, mut server) = established(40011);
+        client.snd_wnd = 50;
+        let (n, pkts) = client.write(&[7u8; 100]);
+        assert_eq!(n, 100);
+        assert_eq!(pkts.len(), 1);
+        assert_eq!(parse(&pkts[0]).payload.len(), 50);
+
+        assert!(
+            client.close().is_empty(),
+            "FIN must not overtake queued data"
+        );
+        assert_eq!(client.state(), State::FinWait1);
+
+        let acks = deliver(&mut server, &pkts);
+        let rest = deliver(&mut client, &acks);
+        assert_eq!(client.state(), State::FinWait1);
+        assert_eq!(rest.len(), 2);
+        assert_eq!(parse(&rest[0]).payload.len(), 50);
+        assert!(parse(&rest[1]).has_flag(flags::FIN));
+
+        let acks = deliver(&mut server, &rest);
+        assert_eq!(read_all(&mut server), vec![7u8; 100]);
+        assert!(server.fin_received());
+        deliver(&mut client, &acks);
+        assert_eq!(client.state(), State::FinWait2);
+    }
+
+    // The passive closer (CLOSE-WAIT → LAST-ACK) has the same ordering
+    // constraint, and a second close() must not abandon the connection.
+    #[test]
+    fn last_ack_sends_held_back_data_before_fin() {
+        let (mut client, mut server) = established(40012);
+        let fin = client.close();
+        let acks = deliver(&mut server, &fin);
+        deliver(&mut client, &acks);
+        assert_eq!(server.state(), State::CloseWait);
+
+        let (_, first) = server.write(&[3u8; 100]);
+        let (_, held) = server.write(b"tail");
+        assert!(held.is_empty());
+        let pkts = server.close();
+        assert_eq!(server.state(), State::LastAck);
+        assert!(server.close().is_empty());
+        assert_eq!(server.state(), State::LastAck);
+        assert_eq!(pkts.len(), 2);
+        assert_eq!(parse(&pkts[0]).payload, b"tail");
+        assert!(parse(&pkts[1]).has_flag(flags::FIN));
+
+        let mut all = first;
+        all.extend(pkts);
+        let acks = deliver(&mut client, &all);
+        assert_eq!(client.state(), State::TimeWait);
+        let got = read_all(&mut client);
+        assert_eq!(got.len(), 104);
+        assert_eq!(&got[100..], b"tail");
+
+        deliver(&mut server, &acks);
+        assert!(server.is_closed());
+    }
+
+    // After a timeout the oldest unacknowledged data is resent; a FIN at
+    // SND.UNA would tell the peer the stream ends before that data.
+    #[test]
+    fn rto_retransmits_data_before_fin() {
+        let (mut client, mut server) = established(40013);
+        let (_, lost_data) = client.write(b"payload");
+        let lost_fin = client.close();
+        assert_eq!(lost_data.len() + lost_fin.len(), 2);
+
+        let re = fire_rto(&mut client);
+        assert_eq!(re.len(), 1);
+        let seg = parse(&re[0]);
+        assert_eq!(seg.payload, b"payload");
+        assert!(!seg.has_flag(flags::FIN));
+
+        let acks = deliver(&mut server, &re);
+        assert!(!server.fin_received());
+        deliver(&mut client, &acks);
+        assert_eq!(client.state(), State::FinWait1);
+
+        let re = fire_rto(&mut client);
+        assert_eq!(re.len(), 1);
+        let fin = parse(&re[0]);
+        assert!(fin.has_flag(flags::FIN));
+        assert_eq!(fin.seq, seg.seq.wrapping_add(7));
+
+        let acks = deliver(&mut server, &re);
+        assert!(server.fin_received());
+        assert_eq!(read_all(&mut server), b"payload");
+        deliver(&mut client, &acks);
+        assert_eq!(client.state(), State::FinWait2);
+    }
+
+    // close() in SYN-RECEIVED: sending the FIN at once would move SND.NXT
+    // past what the handshake ACK acknowledges, and the ACK would draw a RST.
+    #[test]
+    fn close_in_syn_received_sends_fin_after_handshake() {
+        let mut client = Conn::new(cfg(40014, 80));
+        let mut server = Conn::new(cfg(80, 40014));
+        let syn = client.connect();
+        let synack = server.accept_syn(&parse(&syn[0]));
+        assert!(server.close().is_empty());
+
+        let ack = deliver(&mut client, &synack);
+        let out = deliver(&mut server, &ack);
+        assert_eq!(server.state(), State::FinWait1);
+        assert_eq!(out.len(), 1);
+        let fin = parse(&out[0]);
+        assert!(fin.has_flag(flags::FIN));
+        assert!(!fin.has_flag(flags::RST));
+
+        let acks = deliver(&mut client, &out);
+        assert_eq!(client.state(), State::CloseWait);
+        deliver(&mut server, &acks);
+        assert_eq!(server.state(), State::FinWait2);
+    }
+
+    // Both sides close with data still held back: the FINs cross, so each
+    // side passes through CLOSING, and must still deliver its tail.
+    #[test]
+    fn simultaneous_close_with_held_back_data() {
+        let (mut a, mut b) = established(40015);
+        let (_, a1) = a.write(&[1u8; 100]);
+        let (_, b1) = b.write(&[2u8; 100]);
+        a.write(b"a-tail");
+        b.write(b"b-tail");
+        let mut a_out = a1;
+        a_out.extend(a.close());
+        let mut b_out = b1;
+        b_out.extend(b.close());
+
+        // The FINs and the tails cross in flight.
+        let from_b = deliver(&mut b, &a_out);
+        let from_a = deliver(&mut a, &b_out);
+        deliver(&mut a, &from_b);
+        deliver(&mut b, &from_a);
+
+        for c in [&a, &b] {
+            assert!(
+                matches!(c.state(), State::TimeWait | State::Closed),
+                "{:?}",
+                c.state()
+            );
+        }
+        let got_a = read_all(&mut a);
+        let got_b = read_all(&mut b);
+        assert_eq!(&got_a[100..], b"b-tail");
+        assert_eq!(&got_b[100..], b"a-tail");
+    }
+
+    // A zero-window probe carries the last byte before the FIN. If the
+    // probe's ACK is lost, the RTO has to resend it: the persist timer has
+    // no unsent data left to probe with.
+    #[test]
+    fn lost_ack_of_last_probe_byte_is_recovered() {
+        let (mut client, mut server) = established(40016);
+        client.snd_wnd = 0;
+        let (_, none) = client.write(b"x");
+        assert!(none.is_empty());
+        assert!(client.close().is_empty());
+
+        client.persist_deadline = Some(Instant::now());
+        let probe = client.tick();
+        assert_eq!(probe.len(), 1);
+        assert_eq!(parse(&probe[0]).payload, b"x");
+        let _lost_ack = deliver(&mut server, &probe);
+
+        // Persist has nothing left to send; the RTO resends the byte.
+        client.persist_deadline = client.persist_deadline.map(|_| Instant::now());
+        assert!(client.tick().is_empty());
+        let re = fire_rto(&mut client);
+        assert_eq!(parse(&re[0]).payload, b"x");
+
+        let ack = deliver(&mut server, &re);
+        let fin = deliver(&mut client, &ack);
+        assert!(parse(&fin[0]).has_flag(flags::FIN));
+        deliver(&mut server, &fin);
+        assert!(server.fin_received());
+        assert_eq!(read_all(&mut server), b"x");
+    }
+
+    // Draining a full receive buffer must advertise the reopened window
+    // rather than leave the sender to its persist timer.
+    #[test]
+    fn read_reopening_window_sends_update() {
+        let (mut client, mut server) = established(40017);
+        let (n, mut pkts) = client.write(&[9u8; 4096]);
+        assert_eq!(n, 4096);
+        let mut last_window = None;
+        while !pkts.is_empty() {
+            let acks = deliver(&mut server, &pkts);
+            last_window = acks.last().map(|a| parse(a).window);
+            pkts = deliver(&mut client, &acks);
+        }
+        assert_eq!(last_window, Some(0));
+
+        let mut buf = [0u8; 4096];
+        assert_eq!(server.read(&mut buf), 4096);
+        let update = server.take_outgoing();
+        assert_eq!(update.len(), 1);
+        assert!(parse(&update[0]).window > 0);
+    }
+
+    // The peer filled our whole window and its first segment was lost: its
+    // pure ACKs now carry SEQ at the right edge. Their ACK field still counts.
+    #[test]
+    fn ack_at_right_edge_of_window_is_processed() {
+        let small = |local, remote| {
+            let mut c = cfg(local, remote);
+            c.mss = 1024;
+            c.recv_buf_size = 2048;
+            c
+        };
+        let mut client = Conn::new(small(40018, 80));
+        let mut server = Conn::new(small(80, 40018));
+        drive_handshake(&mut client, &mut server);
+
+        let (n, fill) = client.write(&[5u8; 2048]);
+        assert_eq!((n, fill.len()), (2048, 2));
+        deliver(&mut server, &fill[1..]); // the first segment is lost
+
+        let (_, pong) = server.write(b"pong");
+        let edge_ack = client.handle_segment(&parse(&pong[0]));
+        let seg = parse(&edge_ack[0]);
+        assert_eq!(seg.payload.len(), 0);
+        assert_eq!(
+            seg.seq
+                .wrapping_sub(server.recv_buf.as_ref().unwrap().nxt()),
+            2048,
+            "the ACK should sit exactly at the server's right edge"
+        );
+
+        deliver(&mut server, &edge_ack);
+        assert_eq!(server.send_buf.as_ref().unwrap().unacked(), 0);
+    }
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    struct Side {
+        conn: Conn,
+        to_send: Vec<u8>,
+        written: usize,
+        received: Vec<u8>,
+        close_called: bool,
+    }
+
+    /// Both ends stream data over a link that drops, duplicates and reorders
+    /// segments, then close. Every byte must arrive, in order, before EOF,
+    /// and both ends must finish the close handshake.
+    fn lossy_run(seed: u64) {
+        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        let (ts, sack) = (rng.below(2) == 0, rng.below(2) == 0);
+        let small = |port| {
+            let mut c = cfg(port, 80);
+            c.enable_timestamps = ts;
+            c.enable_sack = sack;
+            c.mss = 536;
+            c.no_window_scaling = !ts;
+            c.send_buf_size = 2048;
+            c.recv_buf_size = 2048;
+            c
+        };
+        let mut a = Conn::new(small(40100));
+        let mut b = Conn::new({
+            let mut c = small(80);
+            c.remote_port = 40100;
+            c
+        });
+        drive_handshake(&mut a, &mut b);
+
+        let mut sides = [a, b].map(|conn| {
+            let len = rng.below(20_000) as usize;
+            Side {
+                conn,
+                to_send: (0..len).map(|_| rng.next() as u8).collect(),
+                written: 0,
+                received: Vec::new(),
+                close_called: false,
+            }
+        });
+        // links[i] carries segments sent by side i.
+        let mut links: [Vec<Vec<u8>>; 2] = [Vec::new(), Vec::new()];
+
+        let done = |s: &[Side; 2]| {
+            s.iter().all(|x| {
+                x.close_called
+                    && x.conn.fin_received()
+                    && matches!(x.conn.state(), State::TimeWait | State::Closed)
+            })
+        };
+
+        for step in 0..200_000 {
+            if done(&sides) {
+                break;
+            }
+            let i = rng.below(2) as usize;
+            match rng.below(10) {
+                // App writes a random chunk, then closes once all is written.
+                0..=1 => {
+                    let s = &mut sides[i];
+                    if s.written < s.to_send.len() {
+                        let end = (s.written + 1 + rng.below(1500) as usize).min(s.to_send.len());
+                        let (n, out) = s.conn.write(&s.to_send[s.written..end]);
+                        s.written += n;
+                        links[i].extend(out);
+                    } else if !s.close_called && rng.below(4) == 0 {
+                        s.close_called = true;
+                        links[i].extend(s.conn.close());
+                    }
+                }
+                // App reads a random amount.
+                2..=3 => {
+                    let s = &mut sides[i];
+                    let mut buf = vec![0u8; 1 + rng.below(1500) as usize];
+                    let n = s.conn.read(&mut buf);
+                    s.received.extend_from_slice(&buf[..n]);
+                    links[i].extend(s.conn.take_outgoing());
+                }
+                // Network delivers, drops, duplicates or reorders.
+                4..=8 => {
+                    if links[i].is_empty() {
+                        continue;
+                    }
+                    let k = if rng.below(5) == 0 {
+                        rng.below(links[i].len() as u64) as usize
+                    } else {
+                        0
+                    };
+                    let pkt = links[i].remove(k);
+                    let fate = rng.below(20);
+                    if fate < 2 {
+                        continue; // dropped
+                    }
+                    if fate == 2 {
+                        links[i].insert(0, pkt.clone());
+                    }
+                    let out = sides[1 - i].conn.handle_segment(&parse(&pkt));
+                    links[1 - i].extend(out);
+                }
+                // Time passes: fire whatever timer is armed.
+                _ => {
+                    if !links[0].is_empty() || !links[1].is_empty() {
+                        continue;
+                    }
+                    let c = &mut sides[i].conn;
+                    let now = Instant::now();
+                    if c.rto_deadline.is_some() {
+                        c.rto_deadline = Some(now);
+                    }
+                    if c.persist_deadline.is_some() {
+                        c.persist_deadline = Some(now);
+                    }
+                    links[i].extend(c.tick());
+                }
+            }
+            assert!(
+                !sides[0].conn.is_closed() || sides[0].conn.fin_received(),
+                "seed {seed} step {step}: side 0 torn down early"
+            );
+        }
+
+        for s in &mut sides {
+            s.received.extend(read_all(&mut s.conn));
+        }
+        assert!(
+            done(&sides),
+            "seed {seed}: did not finish: {:?} / {:?}",
+            sides[0].conn,
+            sides[1].conn
+        );
+        assert!(
+            sides[1].received == sides[0].to_send,
+            "seed {seed}: a→b stream corrupted"
+        );
+        assert!(
+            sides[0].received == sides[1].to_send,
+            "seed {seed}: b→a stream corrupted"
+        );
+    }
+
+    // VTCP_SEED=n replays one failing seed; VTCP_FUZZ_SEEDS=n widens the
+    // sweep (worth running in release mode).
+    #[test]
+    fn lossy_link_delivers_everything_before_close() {
+        let env = |k| {
+            std::env::var(k)
+                .ok()
+                .map(|v: String| v.parse::<u64>().unwrap())
+        };
+        let seeds = match env("VTCP_SEED") {
+            Some(s) => s..s + 1,
+            None => 0..env("VTCP_FUZZ_SEEDS").unwrap_or(500),
+        };
+        for seed in seeds {
+            lossy_run(seed);
+        }
     }
 }
