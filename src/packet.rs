@@ -903,18 +903,26 @@ impl Packet {
     /// a fragment (the transport header is incomplete), a truncated packet, or
     /// an IPv4 UDP datagram carrying checksum 0, which RFC 768 defines as
     /// "not computed".
+    ///
+    /// A UDP checksum covers the datagram as its Length field gives it, not
+    /// whatever follows in the IP payload (Ethernet padding, say). A Length
+    /// that runs past the payload, or is shorter than the header, fails.
     pub fn verify_transport_checksum(&self) -> Option<bool> {
         let proto = self.transport_protocol();
         let (src, dst) = (self.src_addr()?, self.pseudo_header_dst()?);
         if self.is_fragment() {
             return None;
         }
-        let payload = self.transport_payload();
+        let mut payload = self.transport_payload();
         match proto {
             Protocol::TCP if payload.len() >= 20 => {}
             Protocol::UDP if payload.len() >= 8 => {
                 if payload[6..8] == [0, 0] && self.version() == 4 {
                     return None;
+                }
+                match udp_len(payload) {
+                    Some(len) => payload = &payload[..len],
+                    None => return Some(false),
                 }
             }
             Protocol::ICMPV6 if payload.len() >= 4 => {}
@@ -928,7 +936,8 @@ impl Packet {
 
     /// Recompute the transport checksum (TCP, UDP, ICMPv4 or ICMPv6) in place.
     ///
-    /// Returns `true` if a checksum was written. Call this after rewriting
+    /// Returns `true` if a checksum was written; not for a UDP datagram whose
+    /// Length field is shorter than its header or longer than the payload. Call this after rewriting
     /// addresses or ports when an incremental update is not convenient.
     pub fn recompute_transport_checksum(&mut self) -> bool {
         let proto = self.transport_protocol();
@@ -946,9 +955,17 @@ impl Packet {
             Protocol::ICMP | Protocol::ICMPV6 => 2,
             _ => return false,
         };
-        let payload = self.transport_payload_mut();
+        let mut payload = self.transport_payload_mut();
         if payload.len() < field + 2 {
             return false;
+        }
+        // Only the datagram the UDP Length describes is summed; there is
+        // no right checksum for one whose Length does not fit.
+        if proto == Protocol::UDP {
+            match udp_len(payload) {
+                Some(len) => payload = &mut payload[..len],
+                None => return false,
+            }
         }
         payload[field] = 0;
         payload[field + 1] = 0;
@@ -1181,6 +1198,14 @@ impl fmt::Debug for Packet {
             .field("proto", &self.transport_protocol())
             .finish()
     }
+}
+
+/// The Length field of the UDP header at the start of `udp`, if it is one a
+/// datagram can have: at least the 8-byte header, and no more than `udp`
+/// holds.
+fn udp_len(udp: &[u8]) -> Option<usize> {
+    let len = u16::from_be_bytes([*udp.get(4)?, *udp.get(5)?]) as usize;
+    (8..=udp.len()).contains(&len).then_some(len)
 }
 
 #[cfg(test)]
@@ -1649,5 +1674,34 @@ mod tests {
         let off = p.len() - udp.len();
         let at_hop = transport_checksum(Protocol::UDP, src.into(), hop.into(), &udp);
         assert_eq!(u16::from_be_bytes([p[off + 6], p[off + 7]]), at_hop);
+    }
+
+    #[test]
+    fn udp_checksum_covers_the_udp_length_only() {
+        let (src, dst) = (Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 2));
+        let udp = crate::build::build_udp(src.into(), dst.into(), 1000, 2000, b"hello");
+        let want = u16::from_be_bytes([udp[6], udp[7]]);
+        // Bytes after the datagram but inside the IP payload.
+        let mut body = udp.clone();
+        body.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        let mut p = crate::build::build_ipv4(src, dst, Protocol::UDP, 64, &body);
+        assert_eq!(
+            Packet::from_slice(&p).verify_transport_checksum(),
+            Some(true),
+            "summed past the UDP length"
+        );
+        assert!(Packet::from_mut(&mut p).recompute_transport_checksum());
+        assert_eq!(u16::from_be_bytes([p[26], p[27]]), want);
+
+        // A Length running past the payload, or inside the header, is bad.
+        for bad in [udp.len() as u16 + 5, 7] {
+            let mut p = p.clone();
+            p[24..26].copy_from_slice(&bad.to_be_bytes());
+            assert_eq!(
+                Packet::from_slice(&p).verify_transport_checksum(),
+                Some(false)
+            );
+            assert!(!Packet::from_mut(&mut p).recompute_transport_checksum());
+        }
     }
 }
