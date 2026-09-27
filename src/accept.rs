@@ -103,6 +103,10 @@ trait DoneSignalThread: Send + Sync + 'static {
 /// Like [`serve`], but the acceptor returns `(device, optional done signal)`
 /// pairs so cleanup can be triggered when the connection drops. Use this when
 /// your acceptor implementation knows when a peer disconnects.
+///
+/// Each done signal is waited on from its own thread, so this is absent on
+/// targets without threads (`wasm32`).
+#[cfg(not(target_family = "wasm"))]
 pub fn serve_with_done<A>(acceptor: &A, connector: &dyn L2Connector) -> Result<()>
 where
     A: L2AcceptorWithDone + ?Sized,

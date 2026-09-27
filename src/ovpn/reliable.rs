@@ -12,9 +12,10 @@
 //! `ServerConnection` reads from and writes to — there is no TCP socket below
 //! the TLS, only this layer.
 
+use crate::time::Instant;
 use std::collections::HashMap;
 use std::io;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::Opcode;
 use super::consts::{CONTROL_CHANNEL_MTU, TLS_RELIABLE_N_REC_BUFFERS};

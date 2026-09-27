@@ -1,9 +1,10 @@
+use crate::time::Instant;
 use crate::{Frame, HubCounters, HubStats, L2Device, Result};
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// How long a learned address survives without being seen again.
 const MAC_AGING: Duration = Duration::from_secs(5 * 60);

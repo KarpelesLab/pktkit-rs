@@ -167,7 +167,8 @@ fn listen_accept_and_bidirectional_data() {
         client.send(Packet::from_slice(&ip)).unwrap();
     }
 
-    // accept() blocks until the accept-waiter enqueues the established conn.
+    // The handshake completed inline, which queued the connection on the
+    // listener.
     let mut accepted = listener.accept().expect("accept");
     assert_eq!(
         accepted.peer_addr(),
@@ -200,4 +201,64 @@ fn listen_accept_and_bidirectional_data() {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(&got, b"pong from server");
+}
+
+fn client(last_octet: u8) -> Arc<pktkit::vclient::Client> {
+    let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, last_octet));
+    pktkit::vclient::Client::new(
+        pktkit::vclient::ClientConfig::default().prefix(IpPrefix::new(ip, 24)),
+    )
+}
+
+/// The shape wasm uses: nothing waits, nothing runs in the background. Two
+/// clients wired back to back complete the handshake synchronously, the
+/// listener hands over the connection as soon as it is established, and
+/// every call answers `WouldBlock` rather than waiting.
+#[test]
+fn nonblocking_dial_accept_and_data() {
+    use std::io::ErrorKind::WouldBlock;
+
+    let (a, b) = (client(1), client(2));
+    let listener = b.listen_tcp(LISTEN_PORT).unwrap();
+    listener.set_nonblocking(true);
+    assert_eq!(listener.accept().unwrap_err().kind(), WouldBlock);
+
+    pktkit::connect_l3(a.clone(), b.clone());
+    let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), LISTEN_PORT);
+    let conn = a.dial_tcp_nonblocking(dst).unwrap();
+    assert!(
+        conn.poll_connect().unwrap(),
+        "handshake runs inline over a direct wire"
+    );
+
+    let accepted = listener.accept().expect("established connection is queued");
+    accepted.set_nonblocking(true);
+    let mut buf = [0u8; 64];
+    assert_eq!(accepted.read(&mut buf).unwrap_err().kind(), WouldBlock);
+
+    assert_eq!(conn.write(b"hello").unwrap(), 5);
+    assert_eq!(accepted.read(&mut buf).unwrap(), 5);
+    assert_eq!(&buf[..5], b"hello");
+
+    accepted.write(b"bye").unwrap();
+    accepted.close().unwrap();
+    let n = conn.read(&mut buf).unwrap();
+    assert_eq!(&buf[..n], b"bye");
+    assert_eq!(conn.read(&mut buf).unwrap(), 0, "FIN reads as EOF");
+    a.tick();
+    b.tick();
+}
+
+#[test]
+fn nonblocking_dial_reports_progress() {
+    use std::io::ErrorKind::WouldBlock;
+
+    // No wire: the SYN goes nowhere, so the handshake stays in progress.
+    let a = client(1);
+    let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), LISTEN_PORT);
+    let conn = a.dial_tcp_nonblocking(dst).unwrap();
+    assert!(!conn.poll_connect().unwrap());
+    assert_eq!(conn.write(b"early").unwrap_err().kind(), WouldBlock);
+    let mut buf = [0u8; 8];
+    assert_eq!(conn.read(&mut buf).unwrap_err().kind(), WouldBlock);
 }

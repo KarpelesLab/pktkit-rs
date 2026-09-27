@@ -2,11 +2,12 @@
 
 use crate::Result;
 use crate::slirp::packet::build_udp_packet6;
+use crate::time::Instant;
 use std::io::ErrorKind;
 use std::net::{Ipv6Addr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 pub(crate) type SendFn = Arc<dyn Fn(&[u8]) -> Result<()> + Send + Sync>;
 

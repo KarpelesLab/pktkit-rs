@@ -6,8 +6,9 @@
 
 use crate::nat::helper::{Expectation, Helper, NatMapping, PROTO_UDP, PacketHelper};
 use crate::nat::nat::Nat;
+use crate::time::Instant;
 use std::net::{IpAddr, Ipv4Addr};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const TFTP_EXPECT_TIMEOUT: Duration = Duration::from_secs(60);
 

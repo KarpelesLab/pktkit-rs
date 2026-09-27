@@ -72,12 +72,14 @@ mod pool;
 mod protocol;
 mod rand;
 mod stats;
+pub mod time;
 #[cfg(feature = "wg")]
 mod zeroize;
 
+#[cfg(not(target_family = "wasm"))]
+pub use accept::serve_with_done;
 pub use accept::{
     Cleanup, Done, DoneSignal, L2Acceptor, L2AcceptorWithDone, L2Connector, L3Connector, serve,
-    serve_with_done,
 };
 pub use checksum::{
     checksum, combine_checksums, incremental_update, pseudo_header_checksum, transport_checksum,
@@ -148,7 +150,9 @@ pub mod impair;
 #[cfg_attr(docsrs, doc(cfg(feature = "pcap")))]
 pub mod pcap;
 
-#[cfg(feature = "qemu")]
+// Built on host sockets and a reader thread per connection; wasm has
+// neither, so the module is absent there (like `xdp` off Linux).
+#[cfg(all(feature = "qemu", not(target_family = "wasm")))]
 #[cfg_attr(docsrs, doc(cfg(feature = "qemu")))]
 pub mod qemu;
 
@@ -174,7 +178,8 @@ pub mod afxdp;
 #[cfg_attr(docsrs, doc(cfg(feature = "vtcp")))]
 pub mod vtcp;
 
-#[cfg(feature = "slirp")]
+// A NAT onto the host's own sockets, pumped by threads: absent on wasm.
+#[cfg(all(feature = "slirp", not(target_family = "wasm")))]
 #[cfg_attr(docsrs, doc(cfg(feature = "slirp")))]
 pub mod slirp;
 

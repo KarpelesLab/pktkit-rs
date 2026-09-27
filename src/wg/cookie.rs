@@ -10,6 +10,7 @@
 //!   responder's under-load filter.
 
 use crate::Result;
+use crate::time::Instant;
 use crate::wg::constants::{
     BLAKE2S_128_SIZE, COOKIE_REFRESH_TIME, MESSAGE_COOKIE_REPLY_SIZE, MESSAGE_COOKIE_REPLY_TYPE,
     NoisePublicKey,
@@ -18,7 +19,6 @@ use crate::wg::crypto::{
     blake2s_mac_128, calculate_cookie_key, calculate_mac1_key, ct_eq, fill_random, xaead_open,
     xaead_seal,
 };
-use std::time::Instant;
 
 /// Responder-side cookie validator + reply generator.
 pub(crate) struct CookieChecker {

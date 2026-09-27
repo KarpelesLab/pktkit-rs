@@ -272,7 +272,7 @@ impl Server {
             if self.closed.load(Ordering::SeqCst) {
                 return;
             }
-            let now = std::time::Instant::now();
+            let now = crate::time::Instant::now();
             // Snapshot the entries so we don't hold the peers lock while
             // ticking (which takes each peer's own lock and may send).
             let entries: Vec<Arc<PeerEntry>> =

@@ -380,7 +380,8 @@ fn retransmit_fires_when_ack_withheld() {
     use super::Opcode;
     use super::packet_ctrl::ControlPacket;
     use super::reliable::RETRANSMIT_INITIAL;
-    use std::time::{Duration, Instant};
+    use crate::time::Instant;
+    use std::time::Duration;
 
     let mut server = Peer::new(server_config(), *b"SERVERID", auth_hook()).unwrap();
     let mut client = TestClient::new(*b"CLIENTID");

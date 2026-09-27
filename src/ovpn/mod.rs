@@ -22,6 +22,7 @@
 //! - Full PUSH_REPLY option negotiation beyond ifconfig/ping/comp-lzo.
 //! - Idle-peer reaping / keepalive ping generation.
 
+#[cfg(not(target_family = "wasm"))]
 mod adapter;
 mod addr;
 mod consts;
@@ -34,15 +35,18 @@ mod peer;
 mod pkcs5;
 mod prf;
 mod reliable;
+#[cfg(not(target_family = "wasm"))]
 mod server;
 #[cfg(test)]
 mod tests;
 mod window;
 
+#[cfg(not(target_family = "wasm"))]
 pub use adapter::{Adapter, AdapterConfig, Connector};
 pub use addr::{PeerKey, Transport};
 pub use consts::{AES, CBC, CipherBlockMethod, CipherCryptoAlg, GCM};
 pub use opcode::Opcode;
 pub use options::Options;
 pub use peer::{AuthInfo, OnAuth, Peer, PeerConfig, PeerOutput};
+#[cfg(not(target_family = "wasm"))]
 pub use server::{OnConnect, OnData, OnDisconnect, Server, ServerConfig};

@@ -4,8 +4,6 @@
 //! second count offset by the magic constant `4611686018427387914`, followed
 //! by a 4-byte big-endian nanosecond field.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use crate::wg::constants::TAI64N_TIMESTAMP_SIZE;
 
 // The TAI64 base offset (2^62 + leap seconds at 1970-01-01). Matches the value
@@ -14,14 +12,12 @@ const TAI64N_BASE: u64 = 4_611_686_018_427_387_914;
 
 /// Return the current wall time as a TAI64N-encoded 12-byte buffer.
 ///
-/// The current time is read from the system clock (`SystemTime::now`). If the
+/// The current time is read from the system clock. If the
 /// system clock is before the Unix epoch (unusual but possible), seconds are
 /// clamped to 0 — handshakes from such hosts will fail the monotonicity check
 /// at the peer, which is the right behaviour.
 pub(crate) fn tai64n_now() -> [u8; TAI64N_TIMESTAMP_SIZE] {
-    let dur = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
+    let dur = crate::time::unix_now();
     encode_tai64n(dur.as_secs(), dur.subsec_nanos())
 }
 

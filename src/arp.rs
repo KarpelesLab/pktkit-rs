@@ -7,10 +7,11 @@
 //! - [`build_packet`] / [`parse`] encode and decode the 28-byte ARP body.
 
 use crate::MacAddr;
+use crate::time::Instant;
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 pub const OP_REQUEST: u16 = 1;
 pub const OP_REPLY: u16 = 2;
@@ -71,8 +72,13 @@ impl Table {
     }
 }
 
-/// Buffers packets waiting for ARP/NDP resolution and drops stale queues
-/// every second via a background thread.
+/// Buffers packets waiting for ARP/NDP resolution. A queue older than
+/// [`PENDING_TIMEOUT`] is dropped, so the next packet for that target
+/// solicits again.
+///
+/// Stale queues are pruned whenever a packet is queued; where threads are
+/// available a background thread also sweeps every second, so memory held for
+/// targets that never answer is released even when traffic stops.
 pub struct Pending {
     inner: Arc<Mutex<HashMap<Ipv4Addr, PendingEntry>>>,
     stop: Arc<Mutex<bool>>,
@@ -97,29 +103,35 @@ impl Default for Pending {
     }
 }
 
+fn prune(map: &mut HashMap<Ipv4Addr, PendingEntry>, now: Instant) {
+    map.retain(|_, e| {
+        e.created
+            .map(|c| now.duration_since(c) <= PENDING_TIMEOUT)
+            .unwrap_or(true)
+    });
+}
+
 impl Pending {
-    /// Build a new pending-queue, spawning a background cleanup thread.
+    /// Build a new pending-queue, spawning a background cleanup thread where
+    /// the target has threads.
     pub fn new() -> Pending {
         let inner = Arc::new(Mutex::new(HashMap::<Ipv4Addr, PendingEntry>::new()));
         let stop = Arc::new(Mutex::new(false));
 
-        let inner_bg = inner.clone();
-        let stop_bg = stop.clone();
-        std::thread::spawn(move || {
-            loop {
-                std::thread::sleep(Duration::from_secs(1));
-                if *stop_bg.lock().unwrap() {
-                    return;
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let inner_bg = inner.clone();
+            let stop_bg = stop.clone();
+            std::thread::spawn(move || {
+                loop {
+                    std::thread::sleep(Duration::from_secs(1));
+                    if *stop_bg.lock().unwrap() {
+                        return;
+                    }
+                    prune(&mut inner_bg.lock().unwrap(), Instant::now());
                 }
-                let now = Instant::now();
-                let mut map = inner_bg.lock().unwrap();
-                map.retain(|_, e| {
-                    e.created
-                        .map(|c| now.duration_since(c) <= PENDING_TIMEOUT)
-                        .unwrap_or(true)
-                });
-            }
-        });
+            });
+        }
 
         Pending { inner, stop }
     }
@@ -127,11 +139,13 @@ impl Pending {
     /// Buffer `pkt` for `ip`. Returns `true` when this is the first packet
     /// queued for `ip` — i.e. the caller should send an ARP solicitation now.
     pub fn enqueue(&self, ip: Ipv4Addr, pkt: &[u8]) -> bool {
+        let now = Instant::now();
         let mut map = self.inner.lock().unwrap();
+        prune(&mut map, now);
         let entry = map.entry(ip).or_default();
         let first = entry.created.is_none();
         if first {
-            entry.created = Some(Instant::now());
+            entry.created = Some(now);
         }
         if entry.packets.len() < PENDING_MAX_PKTS {
             entry.packets.push(pkt.to_vec());
@@ -204,6 +218,24 @@ pub fn parse(payload: &[u8]) -> Option<(u16, MacAddr, Ipv4Addr, MacAddr, Ipv4Add
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_pending_queue_solicits_again() {
+        let p = Pending::new();
+        let ip = Ipv4Addr::new(10, 0, 0, 9);
+        assert!(p.enqueue(ip, b"one"));
+        assert!(!p.enqueue(ip, b"two"), "still waiting on the first request");
+
+        // Age the queue past the timeout without sleeping. Without threads
+        // nothing sweeps it, so enqueue itself must notice.
+        let old = Instant::now() - PENDING_TIMEOUT - Duration::from_millis(1);
+        p.inner.lock().unwrap().get_mut(&ip).unwrap().created = Some(old);
+        assert!(
+            p.enqueue(ip, b"three"),
+            "a stale queue must be re-solicited"
+        );
+        assert_eq!(p.drain(ip), vec![b"three".to_vec()]);
+    }
 
     #[test]
     fn build_parse_roundtrip() {

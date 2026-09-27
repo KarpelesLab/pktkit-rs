@@ -7,12 +7,13 @@
 //! caller wants `Concurrency > 1`, they can call `serve` from multiple threads
 //! sharing the same `UdpSocket`).
 
+use crate::time::Instant;
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::Result;
 use crate::wg::NoisePublicKey;

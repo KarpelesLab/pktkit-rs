@@ -14,10 +14,11 @@
 
 use crate::nat::helper::{Expectation, Helper, NatMapping, PROTO_TCP, PacketHelper};
 use crate::nat::nat::Nat;
+use crate::time::Instant;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const PPTP_PORT: u16 = 1723;
 const PPTP_MAGIC_COOKIE: u32 = 0x1A2B_3C4D;

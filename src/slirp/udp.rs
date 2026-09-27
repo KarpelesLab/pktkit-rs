@@ -7,11 +7,12 @@
 
 use crate::Result;
 use crate::slirp::packet::build_udp_packet4;
+use crate::time::Instant;
 use std::io::ErrorKind;
 use std::net::{Ipv4Addr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// A function that delivers a constructed IPv4 packet to the virtual client.
 pub(crate) type SendFn = Arc<dyn Fn(&[u8]) -> Result<()> + Send + Sync>;

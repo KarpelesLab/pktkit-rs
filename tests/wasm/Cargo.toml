@@ -1,0 +1,20 @@
+[package]
+name = "pktkit-wasm-smoke"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+# A wasm module that exercises pktkit the way an embedder must on a target
+# with no threads: every timer is driven from the host. `run.mjs` loads it
+# under Node, supplying the imports a browser page would.
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies.pktkit]
+path = "../.."
+features = ["vclient", "impair", "wg", "l2adapter", "dhcp", "pcap"]
+
+# Keep this crate out of the parent package's build.
+[workspace]
+members = ["."]

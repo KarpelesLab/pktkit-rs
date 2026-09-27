@@ -7,12 +7,14 @@
 //! `UdpConn` by 4-tuple. This is the building block the (tunnel-routed) DNS
 //! path uses and mirrors the Go `vclient` `udpConn`.
 
+use crate::time::Instant;
 use crate::{Packet, Protocol, checksum};
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// 4-tuple key for a connected UDP socket, from the client's point of view.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
@@ -41,6 +43,7 @@ impl UdpState {
 pub struct UdpConn {
     state: Arc<UdpState>,
     read_timeout: Mutex<Option<Duration>>,
+    nonblocking: AtomicBool,
     stack: Arc<UdpStack>,
 }
 
@@ -65,6 +68,12 @@ impl UdpConn {
         *self.read_timeout.lock().unwrap() = t;
     }
 
+    /// Switch between blocking and non-blocking [`recv`](Self::recv). On
+    /// `wasm32` it never waits, whatever this is set to.
+    pub fn set_nonblocking(&self, nonblocking: bool) {
+        self.nonblocking.store(nonblocking, Ordering::Relaxed);
+    }
+
     /// Send a datagram to the connected remote.
     pub fn send(&self, buf: &[u8]) -> io::Result<usize> {
         let pkt = wrap_udp(
@@ -79,7 +88,8 @@ impl UdpConn {
     }
 
     /// Receive the next datagram from the connected remote, blocking until one
-    /// arrives or the read timeout elapses.
+    /// arrives or the read timeout elapses. In non-blocking mode, returns
+    /// [`WouldBlock`](io::ErrorKind::WouldBlock) when none is queued.
     pub fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         let deadline = self
             .read_timeout
@@ -92,6 +102,13 @@ impl UdpConn {
                 let n = dgram.len().min(buf.len());
                 buf[..n].copy_from_slice(&dgram[..n]);
                 return Ok(n);
+            }
+            // Without threads nothing could deliver a datagram while we wait.
+            if cfg!(target_family = "wasm") || self.nonblocking.load(Ordering::Relaxed) {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "no datagram queued",
+                ));
             }
             match deadline {
                 Some(d) => {
@@ -156,6 +173,7 @@ impl UdpStack {
         UdpConn {
             state,
             read_timeout: Mutex::new(None),
+            nonblocking: AtomicBool::new(false),
             stack: self.clone(),
         }
     }

@@ -7,16 +7,24 @@
 //! the segments the engine emits are wrapped back into IP and pushed out the
 //! client's L3 handler. A single tick thread per client drives RTO / keepalive
 //! timers for every connection.
+//!
+//! Without threads (`wasm32`) nothing can block and nothing runs in the
+//! background: every handle behaves as if non-blocking, returning
+//! [`WouldBlock`](io::ErrorKind::WouldBlock) where it would have waited, and
+//! the timers run when the caller invokes [`Client::tick`](super::Client::tick).
 
+use crate::time::Instant;
+#[cfg(not(target_family = "wasm"))]
+use crate::vtcp::State;
 use crate::vtcp::segment::flags;
-use crate::vtcp::{Conn, ConnConfig, State, segment::Segment};
+use crate::vtcp::{Conn, ConnConfig, segment::Segment};
 use crate::{IpPrefix, Packet, Protocol, checksum};
 use std::collections::{HashMap, VecDeque};
 use std::io::{self};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// 4-tuple identifying a connection from the client's point of view.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
@@ -37,23 +45,82 @@ pub(crate) struct ConnState {
     signal: Condvar,
     /// Sink for fully-framed IP packets the engine wants to transmit.
     sink: Arc<dyn Fn(&[u8]) + Send + Sync>,
+    /// Set once the handshake has completed, so a connection that later
+    /// closes is not mistaken for one that was refused.
+    connected: AtomicBool,
+    /// For a passively opened connection, the listener whose accept queue it
+    /// joins when the handshake completes.
+    pending_accept: Mutex<Option<Arc<ListenerState>>>,
 }
 
 impl ConnState {
+    fn new(
+        key: ConnKey,
+        local_ip: IpAddr,
+        conn: Conn,
+        sink: Arc<dyn Fn(&[u8]) + Send + Sync>,
+        pending_accept: Option<Arc<ListenerState>>,
+    ) -> Arc<ConnState> {
+        Arc::new(ConnState {
+            key,
+            local_ip,
+            conn: Mutex::new(conn),
+            signal: Condvar::new(),
+            sink,
+            connected: AtomicBool::new(false),
+            pending_accept: Mutex::new(pending_accept),
+        })
+    }
+
     fn wrap_and_send(&self, segments: Vec<Vec<u8>>) {
         for seg in segments {
             let pkt = wrap_segment(self.local_ip, self.key.remote, &seg);
             (self.sink)(&pkt);
         }
     }
+
+    /// Record a completed handshake and, for an inbound connection, hand it
+    /// to its listener. Called after every segment, without the conn lock.
+    fn after_segment(self: &Arc<Self>) {
+        if self.connected.load(Ordering::Acquire) {
+            return;
+        }
+        if !self.conn.lock().unwrap().state().is_synchronized() {
+            return;
+        }
+        self.connected.store(true, Ordering::Release);
+        let Some(listener) = self.pending_accept.lock().unwrap().take() else {
+            return;
+        };
+        if listener.closed.load(Ordering::Acquire) {
+            return;
+        }
+        let mut q = listener.queue.lock().unwrap();
+        if q.len() < ACCEPT_QUEUE_CAP {
+            q.push_back(TcpConn::new(self.clone()));
+            listener.signal.notify_one();
+        }
+    }
 }
 
-/// A blocking TCP stream over the virtual network.
+/// Whether a handle may wait. On targets without threads nothing could ever
+/// wake it, so it never does.
+#[inline]
+fn may_block(nonblocking: &AtomicBool) -> bool {
+    !cfg!(target_family = "wasm") && !nonblocking.load(Ordering::Relaxed)
+}
+
+fn would_block(what: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::WouldBlock, what)
+}
+
+/// A TCP stream over the virtual network, blocking by default.
 ///
 /// Dropping the handle initiates a graceful close.
 pub struct TcpConn {
     state: Arc<ConnState>,
     read_timeout: Mutex<Option<Duration>>,
+    nonblocking: AtomicBool,
 }
 
 impl core::fmt::Debug for TcpConn {
@@ -69,6 +136,7 @@ impl TcpConn {
         TcpConn {
             state,
             read_timeout: Mutex::new(None),
+            nonblocking: AtomicBool::new(false),
         }
     }
 
@@ -87,8 +155,37 @@ impl TcpConn {
         *self.read_timeout.lock().unwrap() = t;
     }
 
-    /// Write all of `buf`, blocking until the engine accepts it. Returns the
-    /// number of bytes queued (always `buf.len()` on success).
+    /// Switch between blocking and non-blocking mode, as
+    /// [`std::net::TcpStream::set_nonblocking`]. In non-blocking mode
+    /// [`read`](Self::read) and [`write`](Self::write) return
+    /// [`WouldBlock`](io::ErrorKind::WouldBlock) instead of waiting. On
+    /// `wasm32` the handle never waits, whatever this is set to.
+    pub fn set_nonblocking(&self, nonblocking: bool) {
+        self.nonblocking.store(nonblocking, Ordering::Relaxed);
+    }
+
+    /// Check on a connection opened with
+    /// [`Client::dial_tcp_nonblocking`](super::Client::dial_tcp_nonblocking):
+    /// `Ok(true)` once the handshake has completed, `Ok(false)` while it is
+    /// still in progress, and `ConnectionRefused` if it failed.
+    pub fn poll_connect(&self) -> io::Result<bool> {
+        if self.state.connected.load(Ordering::Acquire) {
+            return Ok(true);
+        }
+        if self.state.conn.lock().unwrap().is_closed() {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "connection reset during handshake",
+            ));
+        }
+        Ok(false)
+    }
+
+    /// Write `buf`. In blocking mode this waits until the engine has accepted
+    /// all of it and returns `buf.len()`; in non-blocking mode it takes what
+    /// the send buffer has room for, and returns
+    /// [`WouldBlock`](io::ErrorKind::WouldBlock) if that is nothing (including
+    /// while the handshake is still in progress).
     pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
         let mut written = 0;
         while written < buf.len() {
@@ -104,6 +201,8 @@ impl TcpConn {
             if n > 0 {
                 self.state.wrap_and_send(segs);
                 written += n;
+            } else if !may_block(&self.nonblocking) {
+                break;
             } else {
                 // Send window full — wait for an ACK to open it.
                 let conn = self.state.conn.lock().unwrap();
@@ -114,11 +213,15 @@ impl TcpConn {
                     .unwrap();
             }
         }
+        if written == 0 && !buf.is_empty() {
+            return Err(would_block("send buffer full"));
+        }
         Ok(written)
     }
 
     /// Read into `buf`, blocking until data is available or the peer closes.
-    /// Returns 0 at end of stream.
+    /// Returns 0 at end of stream. In non-blocking mode, returns
+    /// [`WouldBlock`](io::ErrorKind::WouldBlock) when nothing is buffered.
     pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
         let deadline = self
             .read_timeout
@@ -129,17 +232,26 @@ impl TcpConn {
         loop {
             let n = conn.read(buf);
             if n > 0 {
+                // Reading can open the receive window; tell the peer now
+                // rather than on the next tick, which on wasm is whenever
+                // the caller gets round to it.
+                let segs = conn.take_outgoing();
+                drop(conn);
+                self.state.wrap_and_send(segs);
                 return Ok(n);
             }
             if conn.fin_received() || conn.is_closed() {
                 return Ok(0); // clean EOF
+            }
+            if !may_block(&self.nonblocking) {
+                return Err(would_block("no data buffered"));
             }
             // Block until inbound data arrives or we time out.
             match deadline {
                 Some(d) => {
                     let now = Instant::now();
                     if now >= d {
-                        return Err(io::Error::new(io::ErrorKind::WouldBlock, "read timeout"));
+                        return Err(would_block("read timeout"));
                     }
                     let (c, _) = self.state.signal.wait_timeout(conn, d - now).unwrap();
                     conn = c;
@@ -199,6 +311,7 @@ const ACCEPT_QUEUE_CAP: usize = 128;
 pub struct Listener {
     state: Arc<ListenerState>,
     stack: std::sync::Weak<TcpStack>,
+    nonblocking: AtomicBool,
 }
 
 impl core::fmt::Debug for Listener {
@@ -215,7 +328,15 @@ impl Listener {
         SocketAddr::new(self.state.local_ip, self.state.local_port)
     }
 
-    /// Block until an inbound connection completes its handshake and return it.
+    /// Switch between blocking and non-blocking [`accept`](Self::accept). On
+    /// `wasm32` accept never waits, whatever this is set to.
+    pub fn set_nonblocking(&self, nonblocking: bool) {
+        self.nonblocking.store(nonblocking, Ordering::Relaxed);
+    }
+
+    /// Block until an inbound connection completes its handshake and return
+    /// it. In non-blocking mode, returns [`WouldBlock`](io::ErrorKind::WouldBlock)
+    /// when none is waiting.
     pub fn accept(&self) -> io::Result<TcpConn> {
         let mut q = self.state.queue.lock().unwrap();
         loop {
@@ -224,6 +345,9 @@ impl Listener {
             }
             if self.state.closed.load(Ordering::Acquire) {
                 return Err(io::Error::other("listener closed"));
+            }
+            if !may_block(&self.nonblocking) {
+                return Err(would_block("no pending connection"));
             }
             q = self.state.signal.wait(q).unwrap();
         }
@@ -255,6 +379,8 @@ pub(crate) struct TcpStack {
     listeners: Mutex<HashMap<u16, Arc<ListenerState>>>,
     sink: Arc<dyn Fn(&[u8]) + Send + Sync>,
     next_port: Mutex<u16>,
+    // Read only by the tick thread, which wasm does not have.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
     stop: Arc<Mutex<bool>>,
 }
 
@@ -267,19 +393,23 @@ impl TcpStack {
             next_port: Mutex::new(49152),
             stop: Arc::new(Mutex::new(false)),
         });
-        // Tick thread: drive timers for all connections every 100ms.
-        let weak = Arc::downgrade(&stack);
-        let stop = stack.stop.clone();
-        std::thread::spawn(move || {
-            loop {
-                std::thread::sleep(Duration::from_millis(100));
-                if *stop.lock().unwrap() {
-                    return;
+        // Tick thread: drive timers for all connections every 100ms. Without
+        // threads the caller drives them through `Client::tick`.
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let weak = Arc::downgrade(&stack);
+            let stop = stack.stop.clone();
+            std::thread::spawn(move || {
+                loop {
+                    std::thread::sleep(Duration::from_millis(100));
+                    if *stop.lock().unwrap() {
+                        return;
+                    }
+                    let Some(stack) = weak.upgrade() else { return };
+                    stack.tick_all();
                 }
-                let Some(stack) = weak.upgrade() else { return };
-                stack.tick_all();
-            }
-        });
+            });
+        }
         stack
     }
 
@@ -290,7 +420,7 @@ impl TcpStack {
         port
     }
 
-    fn tick_all(&self) {
+    pub fn tick_all(&self) {
         let conns: Vec<Arc<ConnState>> = self.conns.lock().unwrap().values().cloned().collect();
         let mut dead = Vec::new();
         for cs in conns {
@@ -314,13 +444,8 @@ impl TcpStack {
         }
     }
 
-    /// Dial a remote endpoint, blocking until the handshake completes or fails.
-    pub fn dial(
-        &self,
-        local_ip: IpAddr,
-        remote: SocketAddr,
-        connect_timeout: Duration,
-    ) -> io::Result<TcpConn> {
+    /// Open a connection and send the SYN, without waiting for the answer.
+    pub fn start_dial(&self, local_ip: IpAddr, remote: SocketAddr) -> Arc<ConnState> {
         let local_port = self.alloc_port();
         let mss = if remote.is_ipv6() { 1440 } else { 1460 };
         let cfg = ConnConfig {
@@ -338,13 +463,7 @@ impl TcpStack {
             remote: remote.ip(),
             remote_port: remote.port(),
         };
-        let state = Arc::new(ConnState {
-            key,
-            local_ip,
-            conn: Mutex::new(conn),
-            signal: Condvar::new(),
-            sink: self.sink.clone(),
-        });
+        let state = ConnState::new(key, local_ip, conn, self.sink.clone(), None);
         self.conns.lock().unwrap().insert(key, state.clone());
 
         // Send SYN.
@@ -353,6 +472,26 @@ impl TcpStack {
             conn.connect()
         };
         state.wrap_and_send(segs);
+        state
+    }
+
+    /// Open a connection and hand it back at once, still handshaking.
+    pub fn dial_nonblocking(&self, local_ip: IpAddr, remote: SocketAddr) -> TcpConn {
+        let conn = TcpConn::new(self.start_dial(local_ip, remote));
+        conn.set_nonblocking(true);
+        conn
+    }
+
+    /// Dial a remote endpoint, blocking until the handshake completes or fails.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn dial(
+        &self,
+        local_ip: IpAddr,
+        remote: SocketAddr,
+        connect_timeout: Duration,
+    ) -> io::Result<TcpConn> {
+        let state = self.start_dial(local_ip, remote);
+        let key = state.key;
 
         // Wait for ESTABLISHED.
         let deadline = Instant::now() + connect_timeout;
@@ -400,6 +539,7 @@ impl TcpStack {
         Ok(Listener {
             state,
             stack: Arc::downgrade(self),
+            nonblocking: AtomicBool::new(false),
         })
     }
 
@@ -434,6 +574,7 @@ impl TcpStack {
                 conn.handle_segment(&seg)
             };
             state.wrap_and_send(segs);
+            state.after_segment();
             state.signal.notify_all();
             return true;
         }
@@ -449,9 +590,9 @@ impl TcpStack {
         false
     }
 
-    /// Passively open a connection for an inbound SYN, send the SYN-ACK, and
-    /// spawn a waiter that enqueues the [`TcpConn`] to the listener once the
-    /// handshake reaches ESTABLISHED.
+    /// Passively open a connection for an inbound SYN and send the SYN-ACK.
+    /// The connection joins `listener`'s accept queue once the handshake
+    /// completes (see [`ConnState::after_segment`]).
     fn accept_syn(
         self: &Arc<Self>,
         listener: Arc<ListenerState>,
@@ -476,46 +617,9 @@ impl TcpStack {
         };
         let mut conn = Conn::new(cfg);
         let synack = conn.accept_syn(syn);
-        let state = Arc::new(ConnState {
-            key,
-            local_ip,
-            conn: Mutex::new(conn),
-            signal: Condvar::new(),
-            sink: self.sink.clone(),
-        });
+        let state = ConnState::new(key, local_ip, conn, self.sink.clone(), Some(listener));
         self.conns.lock().unwrap().insert(key, state.clone());
         state.wrap_and_send(synack);
-
-        // Wait for ESTABLISHED off the dispatch path, then enqueue.
-        let waiter_state = state.clone();
-        let stop = self.stop.clone();
-        std::thread::spawn(move || {
-            let mut conn = waiter_state.conn.lock().unwrap();
-            loop {
-                match conn.state() {
-                    State::Established => break,
-                    State::Closed => return,
-                    _ => {}
-                }
-                if *stop.lock().unwrap() {
-                    return;
-                }
-                let (c, _) = waiter_state
-                    .signal
-                    .wait_timeout(conn, Duration::from_millis(200))
-                    .unwrap();
-                conn = c;
-            }
-            drop(conn);
-            if listener.closed.load(Ordering::Acquire) {
-                return;
-            }
-            let mut q = listener.queue.lock().unwrap();
-            if q.len() < ACCEPT_QUEUE_CAP {
-                q.push_back(TcpConn::new(waiter_state));
-                listener.signal.notify_one();
-            }
-        });
     }
 
     pub fn shutdown(&self) {

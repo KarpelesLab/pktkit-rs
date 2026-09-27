@@ -5,6 +5,10 @@
 //! connections opened via [`Client::dial_tcp`] are driven by a per-client
 //! [`TcpStack`](super::tcp); inbound IP packets the client receives are
 //! demultiplexed to the matching connection.
+//!
+//! On `wasm32` there are no threads to wait on or to run timers from: the
+//! blocking calls are absent, the handles never block, and the caller runs
+//! the timers with [`Client::tick`].
 
 use super::tcp::{self, TcpConn, TcpStack};
 use super::udp::{UdpConn, UdpStack};
@@ -12,6 +16,7 @@ use crate::{IpPrefix, L3Device, L3Handler, Packet, Result};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
+#[cfg(not(target_family = "wasm"))]
 use std::time::Duration;
 
 /// Knobs for [`Client`].
@@ -85,31 +90,51 @@ impl Client {
 
     /// Open a connected UDP socket to `addr` over the virtual network.
     pub fn dial_udp(&self, addr: SocketAddr) -> Result<UdpConn> {
-        let prefix = self.addr();
-        let local_ip = tcp::local_ip_for(prefix, addr.ip()).ok_or_else(|| {
+        let local_ip = self.local_ip_for(addr)?;
+        Ok(self.udp.dial(local_ip, addr))
+    }
+
+    /// Open a TCP connection to `addr` without waiting for the handshake.
+    ///
+    /// The returned [`TcpConn`] is in non-blocking mode; check
+    /// [`TcpConn::poll_connect`] (or just try to write) to find out when it is
+    /// up. This is how to connect on `wasm32`, where
+    /// [`dial_tcp`](Self::dial_tcp) is not available.
+    pub fn dial_tcp_nonblocking(&self, addr: SocketAddr) -> Result<TcpConn> {
+        let local_ip = self.local_ip_for(addr)?;
+        Ok(self.tcp.dial_nonblocking(local_ip, addr))
+    }
+
+    /// Run the TCP timers: retransmission, persist, keepalive, TIME-WAIT,
+    /// and delayed ACKs.
+    ///
+    /// Where threads exist a background thread already does this every
+    /// 100 ms, and calling it as well is harmless. On `wasm32` nothing else
+    /// will, so call it on a timer — every 100 ms or so, as that thread does.
+    pub fn tick(&self) {
+        self.tcp.tick_all();
+    }
+
+    fn local_ip_for(&self, addr: SocketAddr) -> Result<IpAddr> {
+        tcp::local_ip_for(self.addr(), addr.ip()).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "no local address in the right family for this destination",
             )
-        })?;
-        Ok(self.udp.dial(local_ip, addr))
+        })
     }
 
     /// Open a TCP connection to `addr`, blocking until the handshake
     /// completes (or `timeout` elapses).
+    #[cfg(not(target_family = "wasm"))]
     pub fn dial_tcp(&self, addr: SocketAddr) -> Result<TcpConn> {
         self.dial_tcp_timeout(addr, Duration::from_secs(10))
     }
 
     /// Like [`dial_tcp`](Self::dial_tcp) with an explicit connect timeout.
+    #[cfg(not(target_family = "wasm"))]
     pub fn dial_tcp_timeout(&self, addr: SocketAddr, timeout: Duration) -> Result<TcpConn> {
-        let prefix = self.addr();
-        let local_ip = tcp::local_ip_for(prefix, addr.ip()).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "no local address in the right family for this destination",
-            )
-        })?;
+        let local_ip = self.local_ip_for(addr)?;
         self.tcp.dial(local_ip, addr, timeout)
     }
 
@@ -119,7 +144,9 @@ impl Client {
     }
 
     /// Resolve `host` using the configured DNS servers (via the host's real
-    /// UDP sockets — see [`Resolver`](super::Resolver)).
+    /// UDP sockets — see [`Resolver`](super::Resolver)). Absent on `wasm32`,
+    /// which has no host sockets.
+    #[cfg(not(target_family = "wasm"))]
     pub fn resolve(&self, host: &str) -> Result<Vec<IpAddr>> {
         let dns = self.cfg.lock().unwrap().dns.clone();
         if dns.is_empty() {

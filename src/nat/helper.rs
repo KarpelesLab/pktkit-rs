@@ -5,8 +5,8 @@
 //! `NATMapping`, `Expectation`, `PortForward`.
 
 use crate::Packet;
+use crate::time::Instant;
 use std::net::{IpAddr, Ipv4Addr};
-use std::time::Instant;
 
 /// IP protocol numbers used throughout the NAT.
 pub(crate) const PROTO_ICMP: u8 = 1;

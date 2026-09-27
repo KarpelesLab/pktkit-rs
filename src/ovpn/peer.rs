@@ -196,7 +196,7 @@ impl Peer {
     /// once per retransmit interval (~1s) — for each live peer. Returns the
     /// datagrams to re-send in [`PeerOutput`]`::send`; if a packet exhausts its
     /// retries the connection is abandoned and `PeerOutput::close` is set.
-    pub fn tick(&mut self, now: std::time::Instant) -> io::Result<PeerOutput> {
+    pub fn tick(&mut self, now: crate::time::Instant) -> io::Result<PeerOutput> {
         let mut out = PeerOutput::default();
         let tick = self.reliable.tick(now);
         out.send = tick.resend;

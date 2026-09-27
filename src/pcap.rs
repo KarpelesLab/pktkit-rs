@@ -85,7 +85,7 @@ impl<W: Write> PcapWriter<W> {
 
     /// Append a record timestamped now.
     pub fn write(&mut self, data: &[u8]) -> Result<()> {
-        self.write_at(data, SystemTime::now())
+        self.write_at(data, crate::time::system_now())
     }
 
     /// Append a record with an explicit timestamp.

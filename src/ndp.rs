@@ -2,10 +2,11 @@
 //! for IPv6.
 
 use crate::MacAddr;
+use crate::time::Instant;
 use std::collections::HashMap;
 use std::net::Ipv6Addr;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 pub const NS_TYPE: u8 = 135;
 pub const NA_TYPE: u8 = 136;

@@ -75,6 +75,48 @@ That includes [fullrust](https://github.com/KarpelesLab/fullrust)'s
 `afxdp` work there too, making their syscalls directly; `tuntap` and
 `afpacket` are the unsupported stubs.
 
+### WebAssembly
+
+`full` also builds for `wasm32-unknown-unknown` (browsers, and hosts that
+supply their own imports) and `wasm32-wasip1`. There are no threads or host
+sockets there, so the crate works as a sans-I/O stack that the embedder drives:
+
+- **Absent:** `slirp` and `qemu`, which are built on host sockets, and the
+  socket-owning `wg::Server` / `wg::Adapter` and `ovpn::Server` /
+  `ovpn::Adapter`. `vclient`'s `Resolver` and HTTP client are also absent, and
+  so are `vclient`'s blocking `dial_tcp` and `serve_with_done`. The sans-I/O
+  cores (`wg::Handler`, `ovpn::Peer`, `nat`, `vtcp`, the codecs) are all
+  there.
+- **Nothing blocks.** `vclient`'s `TcpConn`, `UdpConn` and `Listener` return
+  `ErrorKind::WouldBlock` where they would have waited. Open connections with
+  `Client::dial_tcp_nonblocking` and check `TcpConn::poll_connect`.
+- **You run the timers.** Work that a background thread does elsewhere is a
+  method you call on a timer: `vclient::Client::tick` (TCP retransmits and
+  keepalives, about every 100 ms), `ImpairL2::poll` / `ImpairL3::poll`
+  (each returns when the next message is due), `dhcp::Client::tick` or
+  `L2Adapter::tick` (lease renewal), `wg::Handler::maintenance` and
+  `nat::Nat::sweep`.
+
+On `wasm32-unknown-unknown` the clock and the entropy come from the page.
+Supply these imports when you instantiate the module (each one is only
+required if the build uses it):
+
+```js
+const imports = {
+  pktkit: {
+    now_ms: () => performance.now(), // monotonic clock, used by every timer
+    unix_ms: () => Date.now(),       // wall clock: pcap timestamps, TCP ISNs, WireGuard TAI64N
+  },
+  purecrypto: {                      // `wg` / `ovpn` only
+    random_get: (ptr, len) =>
+      crypto.getRandomValues(new Uint8Array(memory.buffer, ptr, len)),
+  },
+};
+```
+
+WASI provides a clock and `random_get` natively, so nothing extra is needed
+there.
+
 ### Dependency policy
 
 `pktkit` depends on:

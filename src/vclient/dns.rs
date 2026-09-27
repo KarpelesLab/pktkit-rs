@@ -10,8 +10,15 @@
 //! host's real sockets and is handy for tests and for resolving the tunnel
 //! endpoints themselves.
 
+// The resolver needs host UDP sockets, which wasm does not have. The codec
+// still builds there (the fuzz targets use it), with nothing to call it.
+#![cfg_attr(target_family = "wasm", allow(dead_code))]
+
+#[cfg(not(target_family = "wasm"))]
 use std::io;
+#[cfg(not(target_family = "wasm"))]
 use std::net::{IpAddr, SocketAddr, UdpSocket};
+#[cfg(not(target_family = "wasm"))]
 use std::time::Duration;
 
 /// DNS record type we know how to ask for.
@@ -156,6 +163,7 @@ pub mod wire {
 }
 
 /// Configure a [`Resolver`].
+#[cfg(not(target_family = "wasm"))]
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct ResolverConfig {
@@ -165,6 +173,7 @@ pub struct ResolverConfig {
     pub timeout: Duration,
 }
 
+#[cfg(not(target_family = "wasm"))]
 setters! {
     ResolverConfig {
         set servers: Vec<SocketAddr>;
@@ -172,6 +181,7 @@ setters! {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl Default for ResolverConfig {
     fn default() -> Self {
         ResolverConfig {
@@ -182,11 +192,13 @@ impl Default for ResolverConfig {
 }
 
 /// A DNS resolver over real UDP sockets.
+#[cfg(not(target_family = "wasm"))]
 #[derive(Debug, Clone)]
 pub struct Resolver {
     cfg: ResolverConfig,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl Resolver {
     /// New resolver with explicit config.
     pub fn new(cfg: ResolverConfig) -> Resolver {

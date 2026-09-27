@@ -33,7 +33,15 @@
 //! Packets are released in deadline order, so jitter reorders traffic exactly
 //! as a real link does: a packet drawn a short delay overtakes one drawn a long
 //! one. With `jitter` at zero, order is preserved.
+//!
+//! # Without threads
+//!
+//! Delayed messages are normally released by a background thread. `wasm32`
+//! has no threads, so there nothing leaves the delay queue until
+//! [`ImpairL2::poll`] / [`ImpairL3::poll`] is called; each call returns how
+//! long until the next message is due, which is when to call it again.
 
+use crate::time::Instant;
 use crate::{
     DeviceStats, Frame, IpPrefix, L2Device, L2Handler, L3Device, L3Handler, MacAddr, Packet, Result,
 };
@@ -41,7 +49,7 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// How badly to treat traffic crossing a link.
 ///
@@ -232,6 +240,7 @@ impl Engine {
 
     /// Spawn the release thread. `deliver` is called once per message, at or
     /// after its deadline, from that thread.
+    #[cfg(not(target_family = "wasm"))]
     fn spawn<F>(self: &Arc<Self>, deliver: F) -> JoinHandle<()>
     where
         F: Fn(Direction, &[u8]) + Send + 'static,
@@ -240,6 +249,7 @@ impl Engine {
         std::thread::spawn(move || engine.run(deliver))
     }
 
+    #[cfg(not(target_family = "wasm"))]
     fn run<F>(&self, deliver: F)
     where
         F: Fn(Direction, &[u8]),
@@ -371,6 +381,25 @@ impl Engine {
     fn queued(&self) -> usize {
         self.queue.lock().unwrap().len()
     }
+
+    /// Pop every message whose deadline has passed, in release order.
+    fn take_due(&self) -> Vec<Queued> {
+        let now = Instant::now();
+        let mut q = self.queue.lock().unwrap();
+        let mut due = Vec::new();
+        while matches!(q.heap.peek(), Some(Reverse(h)) if h.at <= now) {
+            due.push(q.heap.pop().unwrap().0);
+        }
+        due
+    }
+
+    /// How long until the next queued message is due.
+    fn until_next(&self) -> Option<Duration> {
+        let q = self.queue.lock().unwrap();
+        q.heap
+            .peek()
+            .map(|Reverse(h)| h.at.saturating_duration_since(Instant::now()))
+    }
 }
 
 fn push(q: &mut Queue, at: Instant, dir: Direction, data: Vec<u8>) {
@@ -380,6 +409,7 @@ fn push(q: &mut Queue, at: Instant, dir: Direction, data: Vec<u8>) {
 }
 
 /// Wait for the queue to drain, up to `timeout`.
+#[cfg(not(target_family = "wasm"))]
 fn drain(engine: &Engine, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -425,13 +455,16 @@ macro_rules! impaired_device {
                 // The release thread and the wrapped device's handler both
                 // reach back into the wrapper. Weak references keep that from
                 // becoming a cycle that leaks the whole chain.
-                let weak: Weak<$name> = Arc::downgrade(&me);
-                let worker = engine.spawn(move |dir, data| {
-                    if let Some(me) = weak.upgrade() {
-                        me.deliver(dir, data);
-                    }
-                });
-                *me.worker.lock().unwrap() = Some(worker);
+                #[cfg(not(target_family = "wasm"))]
+                {
+                    let weak: Weak<$name> = Arc::downgrade(&me);
+                    let worker = engine.spawn(move |dir, data| {
+                        if let Some(me) = weak.upgrade() {
+                            me.deliver(dir, data);
+                        }
+                    });
+                    *me.worker.lock().unwrap() = Some(worker);
+                }
 
                 let weak: Weak<$name> = Arc::downgrade(&me);
                 me.inner.set_handler(Arc::new(move |m: &$msg| {
@@ -462,9 +495,24 @@ macro_rules! impaired_device {
                 self.engine.queued()
             }
 
+            /// Deliver every message whose release time has passed, and
+            /// return how long until the next one is due (`None` when the
+            /// queue is empty).
+            ///
+            /// Where threads exist the release thread does this on its own.
+            /// On `wasm32` it is the only way messages leave the queue:
+            /// call it again after the returned delay.
+            pub fn poll(&self) -> Option<Duration> {
+                for item in self.engine.take_due() {
+                    self.deliver(item.dir, &item.data);
+                }
+                self.engine.until_next()
+            }
+
             /// Block until the delay queue is empty or `timeout` elapses.
             /// Returns whether it drained. Intended for tests, which otherwise
             /// have to guess how long a delayed packet needs.
+            #[cfg(not(target_family = "wasm"))]
             pub fn wait_idle(&self, timeout: Duration) -> bool {
                 drain(&self.engine, timeout)
             }
@@ -655,6 +703,24 @@ mod tests {
             "delivered after {:?}",
             start.elapsed()
         );
+    }
+
+    #[test]
+    fn poll_reports_the_next_deadline_and_releases_due_messages() {
+        let (wire, link) = wrap(Impairment {
+            delay: Duration::from_millis(40),
+            ..Default::default()
+        });
+        assert_eq!(link.poll(), None, "nothing queued");
+        link.send(Frame::from_slice(&frame(3))).unwrap();
+        let wait = link.poll().expect("one message pending");
+        assert!(wait <= Duration::from_millis(40), "{wait:?}");
+
+        std::thread::sleep(Duration::from_millis(60));
+        // The release thread may have got there first; either way, once poll
+        // has run the message is out and nothing remains.
+        assert_eq!(link.poll(), None);
+        assert_eq!(wire.count(), 1);
     }
 
     #[test]

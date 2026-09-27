@@ -6,8 +6,9 @@
 //! window scaling, SACK, or timestamps (the 32-bit ISS isn't wide enough).
 //! This matches the Linux behavior.
 
+use crate::time::Instant;
 use std::sync::Mutex;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use crate::rand;
 
@@ -141,10 +142,7 @@ fn rotate_if_needed(inner: &mut Inner) {
 }
 
 fn now_unix_seconds() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    crate::time::unix_now().as_secs()
 }
 
 /// Cookie layout (32 bits):

@@ -34,6 +34,7 @@
 //! The `crypto` submodule wraps these into the KDF/AEAD helpers the handshake
 //! and transport layers use.
 
+#[cfg(not(target_family = "wasm"))]
 mod adapter;
 mod constants;
 mod cookie;
@@ -42,10 +43,12 @@ mod handler;
 mod handshake;
 mod multihandler;
 mod replay;
+#[cfg(not(target_family = "wasm"))]
 mod server;
 mod time;
 mod transport;
 
+#[cfg(not(target_family = "wasm"))]
 pub use adapter::{Adapter, AdapterConfig};
 pub use constants::{
     COOKIE_REFRESH_TIME, NOISE_PRESHARED_KEY_SIZE, NOISE_PRIVATE_KEY_SIZE, NOISE_PUBLIC_KEY_SIZE,
@@ -56,5 +59,6 @@ pub use crypto::{generate_preshared_key, generate_private_key};
 pub use handler::{Config, Handler, PacketResult, PacketType, PeerInfo, UnknownPeerFn};
 pub use multihandler::{MultiHandler, MultiPacketResult};
 pub use replay::SlidingWindow;
+#[cfg(not(target_family = "wasm"))]
 pub use server::{OnPacketFn, OnPeerConnectedFn, Server, ServerConfig};
 pub use transport::{EncryptError, encrypted_size};

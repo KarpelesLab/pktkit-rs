@@ -1,13 +1,14 @@
 //! DHCP server. Hands out leases on an Ethernet network.
 
 use super::wire;
+use crate::time::Instant;
 use crate::{
     EtherType, Frame, L2Device, L2Handler, MacAddr, Protocol, Result, build_frame, checksum,
 };
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const MAX_LEASES: usize = 1024;
 const DEFAULT_LEASE: Duration = Duration::from_secs(3600);

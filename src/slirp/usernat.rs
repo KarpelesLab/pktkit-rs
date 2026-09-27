@@ -33,13 +33,14 @@ use crate::vtcp::segment::{Segment, flags as tcp_flags};
 use crate::vtcp::{Conn, ConnConfig, State as VtcpState};
 use crate::{IpPrefix, Result, connect_l3};
 
+use crate::time::Instant;
 use std::collections::HashMap;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 struct Key {
@@ -1339,12 +1340,12 @@ mod tests {
         L3Device::send(&*s, Packet::from_slice(&dgram)).unwrap();
 
         // Poll for the echoed response.
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline = crate::time::Instant::now() + Duration::from_secs(2);
         loop {
             if !captured.lock().unwrap().is_empty() {
                 break;
             }
-            if std::time::Instant::now() > deadline {
+            if crate::time::Instant::now() > deadline {
                 panic!("no response received");
             }
             thread::sleep(Duration::from_millis(10));

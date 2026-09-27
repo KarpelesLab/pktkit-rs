@@ -105,6 +105,34 @@ jobs:
       # and fail this job for reasons no change in this repo could fix.
       - run: cargo check --all-features
 
+  wasm:
+    name: WebAssembly (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [wasm32-unknown-unknown, wasm32-wasip1]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            tests/wasm
+      # No threads, no host sockets, and on unknown-unknown no clock: std
+      # stubs all of those with functions that fail at run time, so a clean
+      # build proves little on its own. The smoke module then runs under Node
+      # (preinstalled on the runner) with the host driving every timer.
+      - name: Build (all features)
+        run: cargo build --target ${{ matrix.target }} --features full
+      - name: Smoke test under Node
+        run: |
+          cargo build --release --manifest-path tests/wasm/Cargo.toml --target ${{ matrix.target }}
+          node tests/wasm/run.mjs tests/wasm/target/${{ matrix.target }}/release/pktkit_wasm_smoke.wasm
+
   fullrust:
     name: Build + test (fullrust, libc-free Linux)
     runs-on: ubuntu-latest

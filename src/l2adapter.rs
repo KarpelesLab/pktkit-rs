@@ -155,6 +155,17 @@ impl L2Adapter {
         }
     }
 
+    /// Drive the DHCP lease renewal. Only needed on targets without threads
+    /// (`wasm32`), where nothing runs in the background; see
+    /// [`dhcp::Client::tick`](crate::dhcp::Client::tick).
+    #[cfg(feature = "dhcp")]
+    pub fn tick(&self) {
+        let client = self.dhcp.lock().unwrap().clone();
+        if let Some(c) = client {
+            c.tick();
+        }
+    }
+
     // --- Internals ---------------------------------------------------------
 
     fn send_l2(&self, f: &Frame) {

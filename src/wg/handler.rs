@@ -5,12 +5,13 @@
 //! the per-peer sessions. It is the synchronous core of the implementation —
 //! all I/O happens in [`super::server::Server`].
 
+use crate::time::Instant;
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::Result;
 use crate::wg::constants::{

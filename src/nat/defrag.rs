@@ -5,9 +5,10 @@
 //! datagram is covered.
 
 use crate::checksum;
+use crate::time::Instant;
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 pub(crate) const DEFRAG_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const DEFRAG_MAX_ENTRIES: usize = 256;

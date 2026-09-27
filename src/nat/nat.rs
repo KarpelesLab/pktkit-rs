@@ -12,12 +12,13 @@ use crate::nat::helper::{
     Expectation, Helper, LocalHelper, NatMapping, PROTO_ICMP, PROTO_TCP, PROTO_UDP, PacketHelper,
     PortForward,
 };
+use crate::time::Instant;
 use crate::{IpPrefix, L3Connector, L3Device, L3Handler, Packet, Result, checksum, connect_l3};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const NAT_PORT_MIN: u16 = 10000;
 const NAT_PORT_MAX: u16 = 65535;

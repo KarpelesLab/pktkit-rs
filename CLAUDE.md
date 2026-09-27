@@ -61,6 +61,20 @@ Whatever you add, do not bloat the dependency footprint.
 - Adapters that own L3 → L2 wiring set the L3 device's handler in their
   constructor (via `Arc::downgrade(&self)` to avoid a cycle).
 
+## wasm
+
+- The crate builds for `wasm32-unknown-unknown` and `wasm32-wasip1`, and CI
+  checks both. Neither target has threads or host sockets, and on
+  `wasm32-unknown-unknown` std's `Instant::now` / `SystemTime::now` panic.
+- Read time through `crate::time`: `crate::time::Instant` (which is
+  `std::time::Instant` everywhere else), and `crate::time::system_now()` /
+  `unix_now()` instead of `SystemTime::now()`.
+- Anything that would `thread::spawn`, sleep, or wait on a `Condvar` needs a
+  path that works without threads, under `#[cfg(not(target_family =
+  "wasm"))]`. Timers become a public `tick`/`poll` method that the caller
+  drives. Blocking calls return `WouldBlock`. Code built on host sockets is
+  compiled out on wasm.
+
 ## Error handling
 
 - Use `crate::Result<T> = std::io::Result<T>` throughout. Map other
@@ -95,7 +109,7 @@ For reading the old code, and for the parts of it still worth bringing over.
 | `atomic.Pointer[func(...)]`       | `Arc<Mutex<Option<Handler>>>` (close enough)        |
 | `chan struct{}`                   | `Arc<(Mutex<bool>, Condvar)>` or `AtomicBool`       |
 | `time.Duration`                   | `std::time::Duration`                               |
-| `time.Now()`                      | `std::time::Instant::now()`                         |
+| `time.Now()`                      | `crate::time::Instant::now()` (see *wasm*)          |
 | `crypto/rand.Read`                | `purecrypto::rng::OsRng` (gated features)            |
 | `math/rand.Uint32`                | `crate::rand::u32()` (non-crypto)                   |
 | `net.IP`                          | `std::net::IpAddr`                                  |

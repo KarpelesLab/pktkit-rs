@@ -12,8 +12,9 @@
 //! the handshake; congestion control plugs in via the [`CongestionController`]
 //! trait. Anything not yet handled is flagged with `TODO(vtcp)`.
 
+use crate::time::Instant;
 use std::net::SocketAddr;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use crate::rand;
 
@@ -1670,10 +1671,7 @@ impl Conn {
 // --- Helpers ---------------------------------------------------------------
 
 fn wallclock_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    crate::time::unix_now().as_millis() as u64
 }
 
 // Silence a noisy lint on `seq_in_range` not currently exercised; the helper

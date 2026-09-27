@@ -27,13 +27,14 @@
 
 use crate::nat::helper::{Helper, LocalHelper, PROTO_TCP, PROTO_UDP, PortForward};
 use crate::nat::nat::Nat;
+use crate::time::Instant;
 use crate::vtcp::segment::Segment;
 use crate::vtcp::{Conn, ConnConfig};
 use crate::{Packet, Protocol, checksum, combine_checksums, pseudo_header_checksum};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const SSDP_PORT: u16 = 1900;
 const SSDP_MCAST: Ipv4Addr = Ipv4Addr::new(239, 255, 255, 250);

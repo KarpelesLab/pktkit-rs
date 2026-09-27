@@ -5,9 +5,10 @@
 
 use crate::nat::helper::{Expectation, Helper, NatMapping, PROTO_TCP, PacketHelper};
 use crate::nat::nat::Nat;
+use crate::time::Instant;
 use crate::{Protocol, checksum, combine_checksums, pseudo_header_checksum};
 use std::net::{IpAddr, Ipv4Addr};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const FTP_EXPECT_TIMEOUT: Duration = Duration::from_secs(60);
 

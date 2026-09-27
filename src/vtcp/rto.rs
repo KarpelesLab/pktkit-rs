@@ -1,6 +1,7 @@
 //! RTO calculation (RFC 6298) with Karn's algorithm.
 
-use std::time::{Duration, Instant};
+use crate::time::Instant;
+use std::time::Duration;
 
 use super::seqspace::seq_after;
 

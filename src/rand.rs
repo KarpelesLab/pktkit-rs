@@ -9,7 +9,6 @@
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 static GLOBAL: AtomicU64 = AtomicU64::new(0x12345678abcdef01);
 
@@ -19,10 +18,7 @@ thread_local! {
 
 #[inline]
 fn seed_now() -> u64 {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
+    let nanos = crate::time::unix_now().as_nanos() as u64;
     let counter = GLOBAL.fetch_add(0x9E3779B97F4A7C15, Ordering::Relaxed);
     let tid = std::thread::current().id();
     let tid_hash = {

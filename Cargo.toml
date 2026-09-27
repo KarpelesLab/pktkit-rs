@@ -12,9 +12,9 @@ documentation = "https://docs.rs/pktkit"
 readme = "README.md"
 keywords = ["networking", "packet", "tcp", "wireguard", "tun"]
 categories = ["network-programming", "virtualization"]
-# The fuzzing harness is a separate crate that depends on this one; it has no
-# business in the published package.
-exclude = ["fuzz", ".github"]
+# The fuzzing harness and the wasm smoke test are separate crates that depend
+# on this one; they have no business in the published package.
+exclude = ["fuzz", "tests/wasm", ".github"]
 
 [features]
 # By default we ship only the core: Frame, Packet, hubs, pipes, traits.
@@ -120,6 +120,14 @@ libc = { version = "0.2", optional = true }
 # is off so a build pulls only the modules the enabled pktkit features name --
 # `wg` does not compile the TLS stack, and `ovpn` does not compile ML-DSA.
 purecrypto = { version = "0.9", optional = true, default-features = false, features = ["std", "linux-getrandom"] }
+
+# WASI has a CSPRNG (`random_get`), but purecrypto only binds it on request.
+# Asking here, per target, means `wg` and `ovpn` build on WASI without callers
+# having to know about a transitive feature. Same crate, so nothing is added to
+# the tree. (`wasm32-unknown-unknown` gets entropy from a host import instead;
+# see the README.)
+[target.'cfg(target_os = "wasi")'.dependencies]
+purecrypto = { version = "0.9", optional = true, default-features = false, features = ["wasi-getrandom"] }
 
 [dev-dependencies]
 # Tests may exercise OS sockets; nothing extra needed beyond std.

@@ -8,6 +8,7 @@
 
 use crate::nat::helper::{PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP};
 use crate::nat::nat::{NAT_ICMP_TIMEOUT, NAT_TCP_FIN_GRACE, NAT_TCP_TIMEOUT, NAT_UDP_TIMEOUT};
+use crate::time::Instant;
 use crate::{
     IpPrefix, L3Device, L3Handler, Packet, Protocol, Result, checksum, combine_checksums,
     pseudo_header_checksum,
@@ -15,7 +16,7 @@ use crate::{
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const IPV6_HEADER_LEN: usize = 40;
 const IPV4_MIN_HEADER: usize = 20;

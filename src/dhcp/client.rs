@@ -6,9 +6,11 @@
 //!
 //! Construction does no I/O. Call [`Client::start`] to begin discovery and
 //! [`Client::handle_packet`] for each UDP-port-68 payload received on the
-//! same network. Renewal is driven by an internal timer thread.
+//! same network. Renewal is driven by an internal timer thread; on targets
+//! without threads (`wasm32`), call [`Client::tick`] periodically instead.
 
 use super::wire;
+use crate::time::Instant;
 use crate::{EtherType, Frame, IpPrefix, MacAddr, Protocol, checksum};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Arc, Mutex};
@@ -65,6 +67,8 @@ struct Inner {
     offered_ip: Option<Ipv4Addr>,
     server_ip: Option<Ipv4Addr>,
     lease: Duration,
+    /// When a bound lease is due for renewal (T1, half the lease).
+    renew_at: Option<Instant>,
     stop: bool,
 }
 
@@ -102,6 +106,7 @@ impl Client {
                 offered_ip: None,
                 server_ip: None,
                 lease: Duration::ZERO,
+                renew_at: None,
                 stop: false,
             })),
         }
@@ -164,6 +169,7 @@ impl Client {
                     } else {
                         None
                     };
+                    i.renew_at = after.map(|d| Instant::now() + d);
                     (Action::None, after)
                 }
                 State::Requesting | State::Renewing if p.msg_type == wire::MSG_NAK => {
@@ -181,9 +187,19 @@ impl Client {
             Action::None => {}
         }
 
+        #[cfg(not(target_family = "wasm"))]
         if let Some(after) = send_renew_after {
             self.spawn_renew_timer(after);
         }
+        #[cfg(target_family = "wasm")]
+        let _ = send_renew_after;
+    }
+
+    /// Send the lease renewal if it has come due. A background thread does
+    /// this on its own where threads exist; on `wasm32` the caller drives it,
+    /// and anything from once a second to once a minute is plenty.
+    pub fn tick(&self) {
+        renew_if_due(&self.inner, &*self.transport, self.mac);
     }
 
     fn send_discover(&self) {
@@ -220,39 +236,48 @@ impl Client {
         self.transport.send_broadcast(Frame::from_slice(&frame));
     }
 
+    #[cfg(not(target_family = "wasm"))]
     fn spawn_renew_timer(&self, after: Duration) {
         let weak_inner = Arc::downgrade(&self.inner);
         let transport = self.transport.clone();
         let mac = self.mac;
         std::thread::spawn(move || {
             std::thread::sleep(after);
-            let Some(inner) = weak_inner.upgrade() else {
-                return;
-            };
-            let (client_ip, server_ip) = {
-                let mut i = inner.lock().unwrap();
-                if i.stop || i.state != State::Bound {
-                    return;
-                }
-                i.state = State::Renewing;
-                match (i.offered_ip, i.server_ip) {
-                    (Some(c), Some(s)) => (c, s),
-                    _ => return,
-                }
-            };
-            // Build & send renew. We can't reuse Client::send_renew because
-            // we've borrowed weak_inner; inline the same logic here.
-            let xid = inner.lock().unwrap().xid;
-            let mut b = wire::Builder::new(1, xid, mac);
-            b.message_type(wire::MSG_REQUEST).ciaddr(client_ip).option(
-                wire::OPT_PARAM_REQUEST,
-                &[wire::OPT_SUBNET_MASK, wire::OPT_ROUTER, wire::OPT_DNS],
-            );
-            let dhcp = b.finish();
-            let frame = wrap_unicast(mac, client_ip, server_ip, &dhcp);
-            transport.send_unicast(server_ip, Frame::from_slice(&frame));
+            if let Some(inner) = weak_inner.upgrade() {
+                renew_if_due(&inner, &*transport, mac);
+            }
         });
     }
+}
+
+/// Move a bound lease to RENEWING and unicast the REQUEST, once `renew_at`
+/// has passed. A later ACK pushes `renew_at` out, so a timer armed for an
+/// older lease finds nothing due and does not renew twice.
+fn renew_if_due(inner: &Mutex<Inner>, transport: &dyn ClientTransport, mac: MacAddr) {
+    let (xid, client_ip, server_ip) = {
+        let mut i = inner.lock().unwrap();
+        if i.stop || i.state != State::Bound {
+            return;
+        }
+        match i.renew_at {
+            Some(at) if at <= Instant::now() => {}
+            _ => return,
+        }
+        let (Some(c), Some(s)) = (i.offered_ip, i.server_ip) else {
+            return;
+        };
+        i.renew_at = None;
+        i.state = State::Renewing;
+        (i.xid, c, s)
+    };
+    let mut b = wire::Builder::new(1, xid, mac);
+    b.message_type(wire::MSG_REQUEST).ciaddr(client_ip).option(
+        wire::OPT_PARAM_REQUEST,
+        &[wire::OPT_SUBNET_MASK, wire::OPT_ROUTER, wire::OPT_DNS],
+    );
+    let dhcp = b.finish();
+    let frame = wrap_unicast(mac, client_ip, server_ip, &dhcp);
+    transport.send_unicast(server_ip, Frame::from_slice(&frame));
 }
 
 enum Action {
@@ -390,6 +415,32 @@ mod tests {
         let bound = r.bound.lock().unwrap().expect("should have bound");
         assert_eq!(bound.0.bits(), 24);
         assert_eq!(bound.1, Some(Ipv4Addr::new(192, 168, 1, 1)));
+    }
+
+    #[test]
+    fn tick_renews_once_due() {
+        let r = Arc::new(Recorder {
+            mac: "02:00:00:00:00:01".parse().unwrap(),
+            ..Default::default()
+        });
+        let c = Client::new(ArcTransport(r.clone()), ClientConfig::default());
+        c.start();
+        let xid = c.inner.lock().unwrap().xid;
+        c.handle_packet(&make_offer(xid, r.mac));
+        c.handle_packet(&make_ack(xid, r.mac));
+        let sent = r.sent.lock().unwrap().len();
+
+        // Half of a one-hour lease is not up yet.
+        c.tick();
+        assert_eq!(r.sent.lock().unwrap().len(), sent);
+
+        c.inner.lock().unwrap().renew_at = Some(Instant::now());
+        c.tick();
+        assert_eq!(r.sent.lock().unwrap().len(), sent + 1, "renewal REQUEST");
+        assert_eq!(c.inner.lock().unwrap().state, State::Renewing);
+
+        c.tick();
+        assert_eq!(r.sent.lock().unwrap().len(), sent + 1, "renews only once");
     }
 
     // Helper: wrap an Arc<Recorder> as a ClientTransport.

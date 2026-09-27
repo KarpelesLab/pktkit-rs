@@ -11,9 +11,10 @@
 
 use crate::nat::helper::{Expectation, Helper, NatMapping, PROTO_TCP, PROTO_UDP, PacketHelper};
 use crate::nat::nat::Nat;
+use crate::time::Instant;
 use crate::{Protocol, checksum, combine_checksums, pseudo_header_checksum};
 use std::net::{IpAddr, Ipv4Addr};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const SIP_PORT: u16 = 5060;
 const SIP_RTP_TIMEOUT: Duration = Duration::from_secs(120);

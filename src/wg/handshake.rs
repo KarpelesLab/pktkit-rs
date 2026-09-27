@@ -4,11 +4,11 @@
 //! Ported from `wg/handshake.go`. The state machine follows the WireGuard
 //! whitepaper §5.4 directly; comments mark each Noise token.
 
+use crate::time::Instant;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use std::time::Instant;
 
 use crate::zeroize::zeroize;
 

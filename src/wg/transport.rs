@@ -4,9 +4,9 @@
 //! wire layout sit in one place. They are called by `Handler::process_packet`
 //! and `Handler::encrypt`.
 
+use crate::time::Instant;
 use std::io;
 use std::sync::atomic::Ordering;
-use std::time::Instant;
 
 use crate::Result;
 use crate::wg::constants::{
