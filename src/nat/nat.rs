@@ -39,6 +39,10 @@ const MAX_EXPECTATIONS: usize = 1024;
 /// registers alongside it (SIP and H.323 media), by which time the remote
 /// it announced the port to has connected, and is tracked, or never will.
 const ALG_OPEN_WINDOW: Duration = Duration::from_secs(120);
+/// ICMP errors the NAT originates, per second and in a burst (RFC 1812
+/// §4.3.2.8 wants them rate-limited).
+const ICMP_RATE: u32 = 100;
+const ICMP_BURST: u32 = 50;
 
 /// Key into the forward connection table.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -150,6 +154,9 @@ pub struct Nat {
 
     /// When packet handling next sweeps (see [`SWEEP_INTERVAL`]).
     next_sweep: Mutex<Instant>,
+
+    /// Gates the ICMP errors the NAT sends itself.
+    icmp_limit: crate::icmp::RateLimiter,
 }
 
 struct NatInner {
@@ -275,6 +282,7 @@ impl Nat {
             frags: Mutex::new(FragTable::default()),
             out_frags: Mutex::new(FragTable::default()),
             next_sweep: Mutex::new(Instant::now() + SWEEP_INTERVAL),
+            icmp_limit: crate::icmp::RateLimiter::new(ICMP_RATE, ICMP_BURST),
         })
     }
 
@@ -925,13 +933,42 @@ impl Nat {
     ) -> Option<Expectation> {
         let now = Instant::now();
         let pos = inner.expectations.iter().position(|e| {
-            now <= e.expires
-                && e.proto == proto
-                && e.outside_port == outside_port
-                && (e.remote_ip.is_unspecified() || e.remote_ip == remote_ip)
-                && (e.remote_port == 0 || e.remote_port == remote_port)
+            expectation_matches(e, now, proto, outside_port, remote_ip, remote_port)
         })?;
         Some(inner.expectations.remove(pos))
+    }
+
+    /// Whether an inbound TCP/UDP packet from `remote` to outside port
+    /// `rk` would be translated: whether the NAT would forward it, rather
+    /// than be its destination. Changes nothing.
+    fn would_translate_locked(inner: &NatInner, rk: NatRevKey, remote: SocketAddrV4) -> bool {
+        let now = Instant::now();
+        inner.reverse.contains_key(&rk)
+            || inner
+                .forwards
+                .get(&rk)
+                .is_some_and(|f| f.expires.is_none_or(|e| e >= now))
+            || inner.expectations.iter().any(|e| {
+                expectation_matches(e, now, rk.proto, rk.port, *remote.ip(), remote.port())
+            })
+    }
+
+    /// Answer `pkt`, whose TTL ran out here, with a Time Exceeded from
+    /// `from`, handed to `send`, unless RFC 1812 forbids one or the rate
+    /// limit is spent.
+    fn time_exceeded(&self, pkt: &[u8], from: Ipv4Addr, send: impl Fn(&Packet)) {
+        if let Some(err) = crate::icmp::time_exceeded(Packet::from_slice(pkt), IpAddr::V4(from))
+            && self.icmp_limit.allow()
+        {
+            send(Packet::from_slice(&err));
+        }
+    }
+
+    /// [`time_exceeded`](Self::time_exceeded) for a packet from outside.
+    fn time_exceeded_outside(&self, pkt: &[u8]) {
+        if let Some(me) = self.outside_addr() {
+            self.time_exceeded(pkt, me, |p| self.outside.deliver(p));
+        }
     }
 
     fn match_forward(inner: &mut NatInner, proto: u8, outside_port: u16) -> Option<&PortForward> {
@@ -1196,6 +1233,20 @@ impl Nat {
             return;
         }
 
+        // The NAT forwards what it translates, so, as any router must (RFC
+        // 1812 §5.3.1), it spends a hop of it, and owes the sender a Time
+        // Exceeded when none is left. A ping to the public address is the
+        // NAT's own to answer (see `outbound_icmp`), so forwards nothing.
+        // Hairpinned traffic spends its hop on the way back in.
+        let own_ping =
+            pkt[9] == PROTO_ICMP && pkt.get(ihl) == Some(&8) && Some(dst_ip) == self.outside_addr();
+        if pkt[8] <= 1 && !own_ping {
+            if let Some(me) = self.inside_addr() {
+                self.time_exceeded(pkt, me, |p| self.send_ns(ns, p));
+            }
+            return;
+        }
+
         // A later fragment has no ports to find a mapping by. It may only
         // follow a first fragment that was translated; otherwise any inside
         // host could send anything out from the public address, with no
@@ -1250,6 +1301,7 @@ impl Nat {
             self.inbound(&out, None);
             return;
         }
+        spend_hop(&mut out);
         self.outside.deliver(Packet::from_slice(&out));
     }
 
@@ -1369,6 +1421,7 @@ impl Nat {
             self.inbound(&out, fmax);
             return true;
         }
+        spend_hop(&mut out);
         emit(&out, fmax, |p| self.outside.deliver(p));
         true
     }
@@ -1439,6 +1492,7 @@ impl Nat {
 
         update_ip_checksum(&mut out, old_src_ip, new_src_ip);
         update_icmp_checksum(&mut out, ihl, old_id, outside_port);
+        spend_hop(&mut out);
 
         emit(&out, fmax, |p| self.outside.deliver(p));
         true
@@ -1529,6 +1583,7 @@ impl Nat {
             self.inbound(&out, None);
             return;
         }
+        spend_hop(&mut out);
         self.outside.deliver(Packet::from_slice(&out));
     }
 
@@ -1570,6 +1625,11 @@ impl Nat {
         }
         let (more, offset) = frag_info(pkt);
         if offset != 0 {
+            // Out of hops, it goes no further; only the first fragment of a
+            // datagram is answered (RFC 1812 §4.3.2.7).
+            if pkt[8] <= 1 {
+                return;
+            }
             let key = frag_key(pkt);
             let target = self.frags.lock().unwrap().later(key, pkt, Instant::now());
             if let Some(target) = target {
@@ -1604,6 +1664,7 @@ impl Nat {
         let old: [u8; 4] = out[16..20].try_into().unwrap();
         out[16..20].copy_from_slice(&inside_ip.octets());
         update_ip_checksum(&mut out, old, inside_ip.octets());
+        spend_hop(&mut out);
         self.send_ns(ns, Packet::from_slice(&out));
     }
 
@@ -1628,6 +1689,16 @@ impl Nat {
             proto,
             port: dst_port,
         };
+        // Out of hops: if the NAT would have forwarded it, the sender is
+        // owed a Time Exceeded, as from any router; otherwise the packet
+        // was for the NAT itself, which has nothing to say.
+        if pkt[8] <= 1 {
+            let remote = SocketAddrV4::new(src_ip, src_port);
+            if Self::would_translate_locked(&self.inner.lock().unwrap(), rk, remote) {
+                self.time_exceeded_outside(pkt);
+            }
+            return None;
+        }
         let now = Instant::now();
         let (mapping_key, outside_port, tracked) = {
             let mut inner = self.inner.lock().unwrap();
@@ -1677,6 +1748,7 @@ impl Nat {
         };
 
         let mut out = pkt.to_vec();
+        spend_hop(&mut out);
         let old_dst_ip: [u8; 4] = out[16..20].try_into().unwrap();
         let new_dst_ip = mapping_key.ip.octets();
         out[16..20].copy_from_slice(&new_dst_ip);
@@ -1760,6 +1832,11 @@ impl Nat {
                 let mapping_key = {
                     let mut inner = self.inner.lock().unwrap();
                     let k = inner.reverse.get(&rk).copied()?;
+                    if pkt[8] <= 1 {
+                        drop(inner);
+                        self.time_exceeded_outside(pkt);
+                        return None;
+                    }
                     if let Some(m) = inner.mappings.get_mut(&k) {
                         let peer =
                             SocketAddrV4::new(Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]), 0);
@@ -1768,6 +1845,7 @@ impl Nat {
                     k
                 };
                 let mut out = pkt.to_vec();
+                spend_hop(&mut out);
                 let old_dst_ip: [u8; 4] = out[16..20].try_into().unwrap();
                 let new_dst_ip = mapping_key.ip.octets();
                 out[16..20].copy_from_slice(&new_dst_ip);
@@ -1793,7 +1871,8 @@ impl Nat {
     /// the inside endpoint, with every checksum that covers them patched.
     fn inbound_icmp_error(&self, pkt: &[u8], outer_ihl: usize, fmax: Option<FragMax>) {
         let emb_off = outer_ihl + 8;
-        if pkt.len() < emb_off + 20 {
+        // Out of hops it goes no further, and no error answers an error.
+        if pkt.len() < emb_off + 20 || pkt[8] <= 1 {
             return;
         }
         // The outer checksum is recomputed below; check it first, so a
@@ -1847,6 +1926,7 @@ impl Nat {
         };
 
         let mut out = pkt.to_vec();
+        spend_hop(&mut out);
         let old_outer_dst: [u8; 4] = out[16..20].try_into().unwrap();
         let inside_ip = mapping_key.ip.octets();
         out[16..20].copy_from_slice(&inside_ip);
@@ -2106,6 +2186,33 @@ pub(crate) fn update_l4_checksum(
     );
     csum = checksum_adjust(csum, old_port, new_port);
     pkt[csum_off..csum_off + 2].copy_from_slice(&csum.to_be_bytes());
+}
+
+/// Take one off an IPv4 packet's TTL, which the caller has checked is more
+/// than one, patching the header checksum to match (RFC 1624).
+fn spend_hop(pkt: &mut [u8]) {
+    let old = u16::from_be_bytes([pkt[8], pkt[9]]);
+    pkt[8] = pkt[8].saturating_sub(1);
+    let new = u16::from_be_bytes([pkt[8], pkt[9]]);
+    let csum = checksum_adjust(u16::from_be_bytes([pkt[10], pkt[11]]), old, new);
+    pkt[10..12].copy_from_slice(&csum.to_be_bytes());
+}
+
+/// Whether expectation `e` is live and admits a connection from
+/// `remote_ip:remote_port` to outside port `outside_port`.
+fn expectation_matches(
+    e: &Expectation,
+    now: Instant,
+    proto: u8,
+    outside_port: u16,
+    remote_ip: Ipv4Addr,
+    remote_port: u16,
+) -> bool {
+    now <= e.expires
+        && e.proto == proto
+        && e.outside_port == outside_port
+        && (e.remote_ip.is_unspecified() || e.remote_ip == remote_ip)
+        && (e.remote_port == 0 || e.remote_port == remote_port)
 }
 
 /// The More Fragments flag and fragment offset (in bytes) of an IPv4 packet.
@@ -3205,13 +3312,104 @@ mod tests {
         assert_eq!(&e[16..20], &INSIDE.octets());
         assert_eq!(checksum(&e[20..]), 0, "outer ICMP checksum");
         let inner = &e[28..];
-        // The quoted datagram is exactly what the inside host sent.
-        assert_eq!(inner, &p[..]);
+        // The quoted datagram is what the inside host sent, less the hop
+        // the NAT took from it on the way out.
+        let mut want = p.clone();
+        spend_hop(&mut want);
+        assert_eq!(inner, &want[..]);
         assert_eq!(checksum(&inner[..20]), 0, "inner IP checksum");
         assert!(
             crate::nat::l4::v4_l4_checksum_ok(inner, 20),
             "inner UDP checksum"
         );
+    }
+
+    #[test]
+    fn forwarding_spends_a_hop_each_way() {
+        let (nat, i, o) = setup();
+        let p = build_udp(INSIDE, 5000, REMOTE, 53, b"query");
+        nat.inside().send(Packet::from_slice(&p)).unwrap();
+        let sent = o.lock().unwrap()[0].clone();
+        assert_eq!(sent[8], 63);
+        assert_eq!(checksum(&sent[..20]), 0, "IP checksum");
+
+        let mut r = build_udp(REMOTE, 53, PUBLIC, src_port(&sent), b"answer");
+        r[8] = 2;
+        r[10..12].copy_from_slice(&[0, 0]);
+        let ic = checksum(&r[..20]);
+        r[10..12].copy_from_slice(&ic.to_be_bytes());
+        nat.outside().send(Packet::from_slice(&r)).unwrap();
+        let got = i.lock().unwrap()[0].clone();
+        assert_eq!(got[8], 1);
+        assert_eq!(checksum(&got[..20]), 0, "IP checksum");
+    }
+
+    /// Set a packet's TTL, keeping its header checksum valid.
+    fn with_ttl(mut p: Vec<u8>, ttl: u8) -> Vec<u8> {
+        p[8] = ttl;
+        p[10..12].copy_from_slice(&[0, 0]);
+        let ic = checksum(&p[..20]);
+        p[10..12].copy_from_slice(&ic.to_be_bytes());
+        p
+    }
+
+    #[test]
+    fn expiring_ttl_is_answered_not_forwarded() {
+        let (nat, i, o) = setup();
+        // Outbound: the inside host hears back from the NAT's inside
+        // address.
+        let p = with_ttl(build_udp(INSIDE, 5000, REMOTE, 53, b"query"), 1);
+        nat.inside().send(Packet::from_slice(&p)).unwrap();
+        assert!(o.lock().unwrap().is_empty());
+        {
+            let got = i.lock().unwrap();
+            assert_eq!(got.len(), 1);
+            assert_eq!(&got[0][12..16], &[10, 0, 0, 1]);
+            assert_eq!(&got[0][16..20], &INSIDE.octets());
+            assert_eq!((got[0][20], got[0][21]), (11, 0), "Time Exceeded");
+        }
+        i.lock().unwrap().clear();
+
+        // Inbound, on a mapping: the remote hears back from the public
+        // address.
+        let p = build_udp(INSIDE, 5000, REMOTE, 53, b"query");
+        nat.inside().send(Packet::from_slice(&p)).unwrap();
+        let port = src_port(&o.lock().unwrap()[0]);
+        o.lock().unwrap().clear();
+        let r = with_ttl(build_udp(REMOTE, 53, PUBLIC, port, b"answer"), 1);
+        nat.outside().send(Packet::from_slice(&r)).unwrap();
+        assert!(i.lock().unwrap().is_empty());
+        {
+            let got = o.lock().unwrap();
+            assert_eq!(got.len(), 1);
+            assert_eq!(&got[0][12..16], &PUBLIC.octets());
+            assert_eq!(&got[0][16..20], &REMOTE.octets());
+            assert_eq!((got[0][20], got[0][21]), (11, 0), "Time Exceeded");
+        }
+        o.lock().unwrap().clear();
+
+        // Inbound to a port nothing is behind: the NAT was the destination,
+        // not a router on the way, and says nothing.
+        let r = with_ttl(build_udp(REMOTE, 53, PUBLIC, port ^ 1, b"answer"), 1);
+        nat.outside().send(Packet::from_slice(&r)).unwrap();
+        assert!(o.lock().unwrap().is_empty());
+        assert!(i.lock().unwrap().is_empty());
+
+        // A ping to the NAT itself with one hop left is still answered.
+        let ping = with_ttl(build_icmp_echo(INSIDE, PUBLIC, 7, 1), 1);
+        nat.inside().send(Packet::from_slice(&ping)).unwrap();
+        assert_eq!(i.lock().unwrap()[0][20], 0, "Echo Reply");
+    }
+
+    #[test]
+    fn time_exceeded_is_rate_limited() {
+        let (nat, i, _o) = setup();
+        let p = with_ttl(build_udp(INSIDE, 5000, REMOTE, 53, b"query"), 1);
+        for _ in 0..(ICMP_BURST * 4) {
+            nat.inside().send(Packet::from_slice(&p)).unwrap();
+        }
+        let n = i.lock().unwrap().len();
+        assert!(n >= 1 && n < (ICMP_BURST * 2) as usize, "{n} errors sent");
     }
 
     #[test]
@@ -3263,13 +3461,16 @@ mod tests {
 
         let out = o.lock().unwrap();
         assert_eq!(out.len(), 2);
+        let mut want = r.clone();
+        spend_hop(&mut want);
         for e in out.iter() {
             assert_eq!(&e[12..16], &PUBLIC.octets(), "outer source");
             assert_eq!(&e[16..20], &REMOTE.octets());
             assert_eq!(checksum(&e[..20]), 0, "outer IP checksum");
             assert_eq!(checksum(&e[20..]), 0, "outer ICMP checksum");
-            // The quoted datagram is what the remote sent.
-            assert_eq!(&e[28..], &r[..]);
+            // The quoted datagram is what the remote sent, as it reached
+            // the inside, a hop shorter.
+            assert_eq!(&e[28..], &want[..]);
         }
     }
 
