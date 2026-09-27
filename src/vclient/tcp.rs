@@ -20,7 +20,7 @@ use crate::{IpPrefix, Packet, Protocol, checksum};
 use std::collections::{HashMap, VecDeque};
 use std::io::{self};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -48,7 +48,7 @@ pub(crate) struct ConnState {
     connected: AtomicBool,
     /// For a passively opened connection, the listener whose accept queue it
     /// joins when the handshake completes.
-    pending_accept: Mutex<Option<Arc<ListenerState>>>,
+    pending_accept: Mutex<Option<PendingAccept>>,
     /// Why the connection ended, when that was not a clean close: reads
     /// report it instead of an end of stream.
     error: Mutex<Option<io::ErrorKind>>,
@@ -60,7 +60,7 @@ impl ConnState {
         local_ip: IpAddr,
         conn: Conn,
         sink: Arc<dyn Fn(&[u8]) + Send + Sync>,
-        pending_accept: Option<Arc<ListenerState>>,
+        pending_accept: Option<PendingAccept>,
     ) -> Arc<ConnState> {
         Arc::new(ConnState {
             key,
@@ -96,9 +96,11 @@ impl ConnState {
         if !self.connected.load(Ordering::Acquire) {
             return true;
         }
-        let Some(listener) = self.pending_accept.lock().unwrap().take() else {
+        // Dropped on the way out, which frees its half-open slot.
+        let Some(pending) = self.pending_accept.lock().unwrap().take() else {
             return true;
         };
+        let listener = &pending.listener;
         // Checked under the queue lock, which `Listener::close` also takes
         // to drain the queue, so nothing is queued on a closed listener.
         let mut q = listener.queue.lock().unwrap();
@@ -375,6 +377,26 @@ pub(crate) struct ListenerState {
     queue: Mutex<VecDeque<TcpConn>>,
     signal: Condvar,
     closed: AtomicBool,
+    /// Connections to this listener still in SYN-RECEIVED, bounded by
+    /// [`HALF_OPEN_CAP`]. Kept as a count because each SYN checks it: walking
+    /// the whole connection table instead would make a SYN flood cost time
+    /// in proportion to every connection the client holds.
+    half_open: AtomicUsize,
+}
+
+/// A passively opened connection's claim on its listener: the accept queue
+/// it joins once its handshake completes and, until then, one of the
+/// listener's half-open slots, which dropping this gives back. Dropping it
+/// covers every way out of SYN-RECEIVED alike: the handshake completing,
+/// the peer resetting, the SYN-ACKs giving up, the client shutting down.
+pub(crate) struct PendingAccept {
+    listener: Arc<ListenerState>,
+}
+
+impl Drop for PendingAccept {
+    fn drop(&mut self) {
+        self.listener.half_open.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 const ACCEPT_QUEUE_CAP: usize = 128;
@@ -395,6 +417,20 @@ impl ListenerState {
 
     fn local_ip(&self) -> IpAddr {
         self.own.lock().unwrap().addr()
+    }
+
+    /// Take a half-open slot for a new connection, if the backlog has one.
+    /// Checked and taken in one step, so SYNs racing on several threads
+    /// cannot overrun the cap between them.
+    fn reserve_half_open(self: &Arc<Self>) -> Option<PendingAccept> {
+        self.half_open
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < HALF_OPEN_CAP).then_some(n + 1)
+            })
+            .ok()?;
+        Some(PendingAccept {
+            listener: self.clone(),
+        })
     }
 
     /// Mark closed, reset what was waiting to be accepted, and wake `accept`.
@@ -557,6 +593,10 @@ impl TcpStack {
         if conns.get(&state.key).is_some_and(|c| Arc::ptr_eq(c, state)) {
             conns.remove(&state.key);
         }
+        drop(conns);
+        // A connection that never completed its handshake gives its
+        // half-open slot back now, not whenever the last clone of it goes.
+        state.pending_accept.lock().unwrap().take();
     }
 
     /// Open a connection and send the SYN, without waiting for the answer.
@@ -678,6 +718,7 @@ impl TcpStack {
             queue: Mutex::new(VecDeque::new()),
             signal: Condvar::new(),
             closed: AtomicBool::new(false),
+            half_open: AtomicUsize::new(0),
         });
         listeners.insert(port, state.clone());
         Ok(Listener {
@@ -773,8 +814,8 @@ impl TcpStack {
             if let Some(listener) = listener {
                 // A full backlog drops the SYN, as Linux does: the peer
                 // retransmits, and by then a slot may have freed up.
-                if self.half_open(&listener) < HALF_OPEN_CAP {
-                    self.accept_syn(listener, dst, src, &seg);
+                if let Some(pending) = listener.reserve_half_open() {
+                    self.accept_syn(pending, dst, src, &seg);
                 }
                 return true;
             }
@@ -810,29 +851,12 @@ impl TcpStack {
         true
     }
 
-    /// Connections `listener` holds whose handshake has not completed.
-    fn half_open(&self, listener: &Arc<ListenerState>) -> usize {
-        self.conns
-            .lock()
-            .unwrap()
-            .values()
-            .filter(|c| {
-                !c.connected.load(Ordering::Acquire)
-                    && c.pending_accept
-                        .lock()
-                        .unwrap()
-                        .as_ref()
-                        .is_some_and(|l| Arc::ptr_eq(l, listener))
-            })
-            .count()
-    }
-
     /// Passively open a connection for an inbound SYN and send the SYN-ACK.
-    /// The connection joins `listener`'s accept queue once the handshake
-    /// completes (see [`ConnState::after_segment`]).
+    /// The connection joins `pending`'s listener's accept queue once the
+    /// handshake completes (see [`ConnState::after_segment`]).
     fn accept_syn(
         self: &Arc<Self>,
-        listener: Arc<ListenerState>,
+        pending: PendingAccept,
         local_ip: IpAddr,
         remote: IpAddr,
         syn: &Segment,
@@ -854,7 +878,7 @@ impl TcpStack {
         };
         let mut conn = Conn::new(cfg);
         let synack = conn.accept_syn(syn);
-        let state = ConnState::new(key, local_ip, conn, self.sink.clone(), Some(listener));
+        let state = ConnState::new(key, local_ip, conn, self.sink.clone(), Some(pending));
         {
             // A SYN racing `shutdown` past `handle_inbound`'s own check must
             // not leave a connection behind once the table has been drained.
@@ -1139,6 +1163,62 @@ mod tests {
             stack.handle_inbound(Packet::from_slice(&inbound(syn)), IpAddr::V4(US));
         }
         assert_eq!(stack.conns.lock().unwrap().len(), HALF_OPEN_CAP);
+    }
+
+    /// The half-open count is kept per listener, not recounted from the
+    /// connection table: every way out of SYN-RECEIVED must give the slot
+    /// back, or the listener would lock itself out.
+    #[test]
+    fn half_open_slots_are_given_back() {
+        let (stack, out) = capturing_stack();
+        let listener = stack.listen(own(US), 80).unwrap();
+        listener.set_nonblocking(true);
+        let syn = |port: u16| Segment {
+            src_port: port,
+            dst_port: 80,
+            seq: 1,
+            flags: flags::SYN,
+            window: 65535,
+            ..Default::default()
+        };
+        let feed = |seg: Segment| {
+            stack.handle_inbound(Packet::from_slice(&inbound(seg)), IpAddr::V4(US));
+        };
+        let last_sent = || {
+            Segment::parse(Packet::from_slice(out.lock().unwrap().last().unwrap()).payload())
+                .unwrap()
+        };
+        // A handshake that completes frees its slot.
+        feed(syn(4000));
+        assert_eq!(listener.state.half_open.load(Ordering::Acquire), 1);
+        let synack = last_sent();
+        feed(Segment {
+            src_port: 4000,
+            dst_port: 80,
+            seq: 2,
+            ack: synack.seq.wrapping_add(1),
+            flags: flags::ACK,
+            window: 65535,
+            ..Default::default()
+        });
+        assert!(listener.accept().is_ok());
+        assert_eq!(listener.state.half_open.load(Ordering::Acquire), 0);
+        // So does one the peer resets.
+        feed(syn(4001));
+        assert_eq!(listener.state.half_open.load(Ordering::Acquire), 1);
+        feed(Segment {
+            src_port: 4001,
+            dst_port: 80,
+            seq: 2,
+            flags: flags::RST,
+            ..Default::default()
+        });
+        stack.tick_all();
+        assert_eq!(listener.state.half_open.load(Ordering::Acquire), 0);
+        // And every one the client drops when it shuts down.
+        feed(syn(4002));
+        stack.shutdown();
+        assert_eq!(listener.state.half_open.load(Ordering::Acquire), 0);
     }
 
     #[test]
