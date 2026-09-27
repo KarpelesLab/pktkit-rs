@@ -157,6 +157,9 @@ pub struct Nat {
 
     /// Gates the ICMP errors the NAT sends itself.
     icmp_limit: crate::icmp::RateLimiter,
+    /// Gates the echo replies the NAT sends to pings from outside, apart
+    /// from the errors, so that a ping flood cannot silence those.
+    echo_limit: crate::icmp::RateLimiter,
 }
 
 struct NatInner {
@@ -283,6 +286,7 @@ impl Nat {
             out_frags: Mutex::new(FragTable::default()),
             next_sweep: Mutex::new(Instant::now() + SWEEP_INTERVAL),
             icmp_limit: crate::icmp::RateLimiter::new(ICMP_RATE, ICMP_BURST),
+            echo_limit: crate::icmp::RateLimiter::new(ICMP_RATE, ICMP_BURST),
         })
     }
 
@@ -1862,6 +1866,19 @@ impl Nat {
                 self.inbound_icmp_error(pkt, ihl, fmax);
                 None
             }
+            // A ping to the public address is for the NAT: no inside host
+            // owns that address for ICMP (a request names no port to
+            // forward by), and every host answers pings (RFC 1122
+            // §3.2.2.6). Replies are rate-limited, so the NAT cannot be
+            // made to spend unbounded effort on them.
+            8 if whole => {
+                if let Some(reply) = echo_reply(pkt, ihl)
+                    && self.echo_limit.allow()
+                {
+                    emit(&reply, fmax, |p| self.outside.deliver(p));
+                }
+                None
+            }
             _ => None,
         }
     }
@@ -3410,6 +3427,31 @@ mod tests {
         }
         let n = i.lock().unwrap().len();
         assert!(n >= 1 && n < (ICMP_BURST * 2) as usize, "{n} errors sent");
+    }
+
+    #[test]
+    fn ping_to_the_public_address_from_outside_is_answered() {
+        let (nat, i, o) = setup();
+        let ping = build_icmp_echo(REMOTE, PUBLIC, 0x1234, 7);
+        nat.outside().send(Packet::from_slice(&ping)).unwrap();
+        assert!(i.lock().unwrap().is_empty(), "no inside host owns it");
+        let got = o.lock().unwrap().clone();
+        assert_eq!(got.len(), 1);
+        let r = &got[0];
+        assert_eq!(&r[12..16], &PUBLIC.octets());
+        assert_eq!(&r[16..20], &REMOTE.octets());
+        assert_eq!(r[20], 0, "Echo Reply");
+        assert_eq!(&r[24..28], &ping[24..28], "identifier and sequence");
+        assert_eq!(checksum(&r[..20]), 0);
+        assert_eq!(checksum(&r[20..]), 0);
+
+        // A flood is answered only up to the rate limit.
+        o.lock().unwrap().clear();
+        for _ in 0..(ICMP_BURST * 4) {
+            nat.outside().send(Packet::from_slice(&ping)).unwrap();
+        }
+        let n = o.lock().unwrap().len();
+        assert!(n < (ICMP_BURST * 2) as usize, "{n} replies");
     }
 
     #[test]
