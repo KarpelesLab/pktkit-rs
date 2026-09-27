@@ -45,6 +45,8 @@ pub const DEFAULT_RECV_BUF: usize = 1 << 20;
 pub const MAX_RETRIES: u32 = 8;
 /// 2*MSL — shortened from RFC default for virtual environments.
 pub const TIME_WAIT_DURATION: Duration = Duration::from_secs(2);
+/// Floor for the Early Retransmit delay, as in Linux's delayed ER.
+const ER_MIN_DELAY: Duration = Duration::from_millis(2);
 
 pub const DEFAULT_KEEPALIVE_IDLE: Duration = Duration::from_secs(300);
 pub const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
@@ -213,6 +215,9 @@ pub struct Conn {
     /// Extra room beyond cwnd for Limited Transmit (RFC 3042): one segment
     /// per duplicate ACK, for the first two.
     limited_transmit: u32,
+    /// When a pending Early Retransmit goes out, unless a new ACK comes
+    /// first (RFC 5827 §6's delay against reordering).
+    er_deadline: std::option::Option<Instant>,
 
     // Window scaling (RFC 7323).
     snd_wnd_shift: u8,
@@ -333,6 +338,7 @@ impl Conn {
             dup_acks: 0,
             high_rxt: 0,
             limited_transmit: 0,
+            er_deadline: None,
             snd_wnd_shift: 0,
             rcv_wnd_shift: rcv_shift,
             wscale_ok: false,
@@ -1256,6 +1262,7 @@ impl Conn {
         let acked = self.send_buf.as_mut().unwrap().acknowledge(ack);
         self.retries = 0;
         self.dup_acks = 0;
+        self.er_deadline = None;
         self.limited_transmit = 0;
         // An ACK short of the recovery point means the segment after it was
         // lost too. Resend it now; waiting would cost an RTO per hole.
@@ -1330,11 +1337,18 @@ impl Conn {
         let oseg = flight.div_ceil(mss);
         let can_send_new = sb.pending() > 0 && self.snd_wnd > flight;
         let early = oseg < 4 && !can_send_new && self.dup_acks >= oseg.saturating_sub(1).max(1);
-        if threshold_reached || early {
-            self.limited_transmit = 0;
-            self.cc.on_fast_retransmit(flight, snd_nxt);
-            self.high_rxt = self.send_buf.as_ref().unwrap().una();
-            let _ = self.retransmit();
+        if threshold_reached {
+            self.fast_retransmit(flight, snd_nxt);
+        } else if early {
+            // With so few duplicates, a segment merely reordered looks lost.
+            // Wait a quarter of an RTT for it (RFC 5827 §6, and Linux's
+            // delayed ER); a new ACK in the meantime cancels. tick() sends
+            // it, so the delay is at least the caller's tick interval --
+            // still well short of the RTO this saves.
+            if self.er_deadline.is_none() {
+                let delay = (self.rto.srtt() / 4).max(ER_MIN_DELAY);
+                self.er_deadline = Some(Instant::now() + delay);
+            }
         } else if self.dup_acks <= 2 {
             // Limited Transmit (RFC 3042): a new segment for each of the
             // first two duplicates keeps ACKs coming, so a small window can
@@ -1342,6 +1356,29 @@ impl Conn {
             self.limited_transmit = self.dup_acks * mss;
             self.flush_send_queue();
         }
+    }
+
+    /// Enter fast recovery (RFC 5681 §3.2) and resend the first hole.
+    fn fast_retransmit(&mut self, flight: u32, snd_nxt: u32) {
+        self.limited_transmit = 0;
+        self.er_deadline = None;
+        self.cc.on_fast_retransmit(flight, snd_nxt);
+        self.high_rxt = self.send_buf.as_ref().unwrap().una();
+        let _ = self.retransmit();
+    }
+
+    /// The Early Retransmit delay ran out with no new ACK: the segment
+    /// was lost after all, unless recovery has started since.
+    fn on_er_timeout(&mut self) {
+        self.er_deadline = None;
+        let Some(sb) = self.send_buf.as_ref() else {
+            return;
+        };
+        if self.dup_acks == 0 || self.cc.in_recovery() || sb.unacked() == 0 {
+            return;
+        }
+        let (flight, snd_nxt) = (sb.unacked() as u32, sb.nxt());
+        self.fast_retransmit(flight, snd_nxt);
     }
 
     /// Resend the oldest unacknowledged data. Returns false when there is
@@ -1538,6 +1575,14 @@ impl Conn {
     pub fn tick(&mut self) -> Vec<Vec<u8>> {
         let now = Instant::now();
 
+        // Early Retransmit, ahead of the RTO: its retransmission restarts
+        // the RTO, which then has nothing to do.
+        if let Some(d) = self.er_deadline
+            && now >= d
+            && !self.closed
+        {
+            self.on_er_timeout();
+        }
         // RTO.
         if let Some(d) = self.rto_deadline
             && now >= d
@@ -1611,6 +1656,7 @@ impl Conn {
         let flight = self.send_buf.as_ref().map_or(0, |s| s.unacked() as u32);
         self.cc.on_retransmit_timeout(flight, repeated);
         self.dup_acks = 0;
+        self.er_deadline = None;
         self.limited_transmit = 0;
         if let Some(sb) = self.send_buf.as_mut() {
             sb.clear_sacked();
@@ -1873,6 +1919,7 @@ impl Conn {
         self.state = new_state;
         self.closed = new_state == State::Closed;
         self.stop_rto();
+        self.er_deadline = None;
         self.stop_keepalive();
         self.stop_persist();
         self.time_wait_deadline = None;
@@ -2690,6 +2737,9 @@ mod tests {
                     if c.persist_deadline.is_some() {
                         c.persist_deadline = Some(now);
                     }
+                    if c.er_deadline.is_some() {
+                        c.er_deadline = Some(now);
+                    }
                     links[i].extend(c.tick());
                 }
             }
@@ -2860,9 +2910,36 @@ mod tests {
         assert_eq!(segs.len(), 3);
         let dups = deliver(&mut server, &segs[1..]);
         assert_eq!(dups.len(), 2);
-        let out = deliver(&mut client, &dups);
+        assert!(deliver(&mut client, &dups).is_empty(), "ER is delayed");
+        let out = fire_er(&mut client);
         assert_eq!(seqs(&out), vec![parse(&segs[0]).seq]);
         deliver(&mut server, &out);
+        assert_eq!(read_all(&mut server).len(), 3000);
+    }
+
+    fn fire_er(c: &mut Conn) -> Vec<Vec<u8>> {
+        assert!(c.er_deadline.is_some(), "early retransmit not pending");
+        c.er_deadline = Some(Instant::now());
+        c.tick()
+    }
+
+    /// The first segment was only reordered: it arrives during the Early
+    /// Retransmit delay, and its ACK cancels the retransmission (RFC 5827
+    /// §6), which would have been spurious and halved cwnd.
+    #[test]
+    fn early_retransmit_waits_out_reordering() {
+        let mut client = Conn::new(big(40340, 80));
+        let mut server = Conn::new(big(80, 40340));
+        drive_handshake(&mut client, &mut server);
+        warm_up(&mut client, &mut server);
+        let (_, segs) = client.write(&[5; 3000]);
+        let dups = deliver(&mut server, &segs[1..]);
+        assert!(deliver(&mut client, &dups).is_empty());
+        let late = deliver(&mut server, &segs[..1]);
+        deliver(&mut client, &late);
+        assert!(client.er_deadline.is_none());
+        assert!(client.tick().is_empty());
+        assert!(!client.cc.in_recovery());
         assert_eq!(read_all(&mut server).len(), 3000);
     }
 
