@@ -413,6 +413,24 @@ enum Chunked {
     Trailer,
 }
 
+/// Append `data` to `body`, whose length the caller keeps within `max`.
+/// Growth still doubles, for linear time, but stops at `max`: left to
+/// `Vec`'s own doubling, a body just past half the limit would take twice
+/// the limit in capacity, and the limit is what bounds the memory a
+/// server can make the client hold.
+fn grow_body(body: &mut Vec<u8>, data: &[u8], max: usize) {
+    let need = body.len() + data.len();
+    if need > body.capacity() {
+        let target = body
+            .capacity()
+            .saturating_mul(2)
+            .max(need)
+            .min(max.max(need));
+        body.reserve_exact(target - body.len());
+    }
+    body.extend_from_slice(data);
+}
+
 /// An incremental HTTP/1.1 response parser: bytes are fed as they arrive,
 /// each one examined a bounded number of times, so reading a large or
 /// slowly arriving response costs time linear in its size.
@@ -553,14 +571,14 @@ impl ResponseReader {
                 if rest.len() > self.max_body - self.body.len() {
                     return Err(too_large());
                 }
-                self.body.extend_from_slice(rest);
+                grow_body(&mut self.body, rest, self.max_body);
                 self.pos = self.buf.len();
                 Ok(false)
             }
             Framing::Length(left) => {
                 let take = (self.buf.len() - self.pos).min(*left);
-                self.body
-                    .extend_from_slice(&self.buf[self.pos..self.pos + take]);
+                let data = &self.buf[self.pos..self.pos + take];
+                grow_body(&mut self.body, data, self.max_body);
                 self.pos += take;
                 *left -= take;
                 Ok(*left == 0)
@@ -599,8 +617,8 @@ impl ResponseReader {
                         // Take what is here so the buffer need not hold the
                         // whole chunk.
                         let take = (self.buf.len() - self.pos).min(*left);
-                        self.body
-                            .extend_from_slice(&self.buf[self.pos..self.pos + take]);
+                        let data = &self.buf[self.pos..self.pos + take];
+                        grow_body(&mut self.body, data, self.max_body);
                         self.pos += take;
                         *left -= take;
                         if *left > 0 {
@@ -971,6 +989,29 @@ mod tests {
     }
 
     /// Feed `raw` in pieces of `step` bytes, then close.
+    /// The body limit bounds the memory the body takes, not just its length:
+    /// `Vec` doubling would otherwise take a body just past half the limit
+    /// to twice the limit in capacity.
+    #[test]
+    fn body_capacity_stays_within_the_limit() {
+        const MAX: usize = 1_000_000;
+        for head in [
+            "HTTP/1.1 200 OK\r\n\r\n".to_string(),
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {MAX}\r\n\r\n"),
+        ] {
+            let mut r = ResponseReader::new(false, MAX);
+            assert!(r.feed(head.as_bytes()).unwrap().is_none());
+            let chunk = [b'x'; 1000];
+            for _ in 0..MAX / 1000 - 1 {
+                assert!(r.feed(&chunk).unwrap().is_none());
+                assert!(r.body.capacity() <= MAX, "{}", r.body.capacity());
+            }
+            let done = r.feed(&chunk).unwrap();
+            let cap = done.map_or(r.body.capacity(), |resp| resp.body.capacity());
+            assert!(cap <= MAX, "{cap}");
+        }
+    }
+
     fn read_response(raw: &[u8], step: usize) -> io::Result<Response> {
         let mut r = ResponseReader::new(false, DEFAULT_MAX_RESPONSE_BODY);
         for piece in raw.chunks(step) {
