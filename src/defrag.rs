@@ -8,6 +8,8 @@
 //!
 //! - at most [`MAX_DATAGRAMS`] datagrams in progress, the oldest evicted
 //!   first, each at most 64 KiB in at most [`MAX_PIECES`] fragments;
+//! - at most [`MAX_BYTES`] of payload buffers across them, again evicting
+//!   the oldest first;
 //! - a datagram not completed within [`REASSEMBLY_TIMEOUT`] is discarded;
 //! - fragments that overlap what is already held, other than an exact
 //!   repeat, discard the whole datagram (RFC 5722; for IPv4 it is the same
@@ -23,6 +25,13 @@ use std::time::Duration;
 
 /// Datagrams in progress at once, per stack.
 pub(crate) const MAX_DATAGRAMS: usize = 64;
+
+/// Payload buffer bytes (allocated capacity) held across all datagrams in
+/// progress. The datagram count alone would allow 64 buffers of up to
+/// 64 KiB each; Linux's default budget per network namespace
+/// (`ipfrag_high_thresh`) is 4 MiB for far more traffic than these stacks
+/// see, and 1 MiB still leaves room for 16 maximum-size datagrams at once.
+pub(crate) const MAX_BYTES: usize = 1 << 20;
 
 /// Fragments held for one datagram. Keeping them sorted costs an insertion
 /// into a `Vec` per fragment, which is quadratic in their number: without
@@ -82,6 +91,9 @@ struct Piece<'a> {
 #[derive(Default)]
 pub(crate) struct Reassembler {
     partial: HashMap<Key, Partial>,
+    /// Sum of the `data` capacities in `partial`, checked against
+    /// [`MAX_BYTES`].
+    bytes: usize,
 }
 
 impl Reassembler {
@@ -182,8 +194,14 @@ impl Reassembler {
     }
 
     fn push(&mut self, now: Instant, p: Piece<'_>) -> Option<(Vec<u8>, Vec<u8>)> {
-        self.partial
-            .retain(|_, d| now.duration_since(d.started) < REASSEMBLY_TIMEOUT);
+        let bytes = &mut self.bytes;
+        self.partial.retain(|_, d| {
+            let keep = now.duration_since(d.started) < REASSEMBLY_TIMEOUT;
+            if !keep {
+                *bytes -= d.data.capacity();
+            }
+            keep
+        });
 
         let end = p.offset + p.data.len();
         // Every fragment but the last carries a multiple of 8 bytes, and
@@ -191,17 +209,12 @@ impl Reassembler {
         let malformed =
             (p.more && (!p.data.len().is_multiple_of(8) || p.data.is_empty())) || end > MAX_PAYLOAD;
         if malformed {
-            self.partial.remove(&p.key);
+            self.discard(&p.key);
             return None;
         }
 
         if !self.partial.contains_key(&p.key) && self.partial.len() >= MAX_DATAGRAMS {
-            let oldest = self
-                .partial
-                .iter()
-                .min_by_key(|(_, d)| d.started)
-                .map(|(k, _)| *k)?;
-            self.partial.remove(&oldest);
+            self.evict_oldest(&p.key);
         }
         let d = self.partial.entry(p.key).or_insert_with(|| Partial {
             started: now,
@@ -213,19 +226,54 @@ impl Reassembler {
             last_piece_final: false,
         });
 
-        if !d.accept(&p, end) {
-            self.partial.remove(&p.key);
+        let before = d.data.capacity();
+        let accepted = d.accept(&p, end);
+        self.bytes = self.bytes - before + d.data.capacity();
+        let complete = d.total.filter(|&t| d.received == t);
+        if !accepted {
+            self.discard(&p.key);
             return None;
         }
-        let total = d.total?;
-        if d.received != total {
+        if complete.is_none() {
+            // Over budget: the oldest datagrams go, then this one if it is
+            // still too much on its own.
+            while self.bytes > MAX_BYTES && self.evict_oldest(&p.key) {}
+            if self.bytes > MAX_BYTES {
+                self.discard(&p.key);
+            }
             return None;
         }
+        let total = complete?;
         let d = self.partial.remove(&p.key)?;
+        self.bytes -= d.data.capacity();
         let header = d.header?;
         let mut data = d.data;
         data.truncate(total);
         Some((header, data))
+    }
+
+    fn discard(&mut self, key: &Key) {
+        if let Some(d) = self.partial.remove(key) {
+            self.bytes -= d.data.capacity();
+        }
+    }
+
+    /// Drop the oldest datagram in progress other than `keep`; `false` if
+    /// there is none.
+    fn evict_oldest(&mut self, keep: &Key) -> bool {
+        let oldest = self
+            .partial
+            .iter()
+            .filter(|(k, _)| *k != keep)
+            .min_by_key(|(_, d)| d.started)
+            .map(|(k, _)| *k);
+        match oldest {
+            Some(k) => {
+                self.discard(&k);
+                true
+            }
+            None => false,
+        }
     }
 
     #[cfg(test)]
@@ -280,6 +328,13 @@ impl Partial {
             return false;
         }
         if self.data.len() < end {
+            // Grow geometrically, but never past the largest datagram: the
+            // capacity is what counts against MAX_BYTES.
+            let want = self.total.unwrap_or(end).max(end);
+            if self.data.capacity() < want {
+                let cap = (self.data.capacity() * 2).clamp(want, MAX_PAYLOAD.max(want));
+                self.data.reserve_exact(cap - self.data.len());
+            }
             self.data.resize(end, 0);
         }
         self.data[p.offset..end].copy_from_slice(p.data);
@@ -564,6 +619,40 @@ mod tests {
             r.push_v4(now, 0, &frags[0], 20);
         }
         assert_eq!(r.in_progress(), MAX_DATAGRAMS);
+    }
+
+    #[test]
+    fn bytes_in_progress_are_bounded() {
+        let mut r = Reassembler::default();
+        let now = Instant::now();
+        // One fragment near the 64 KiB end of each datagram makes each
+        // hold a buffer of nearly that size.
+        for id in 0..MAX_DATAGRAMS as u16 {
+            let mut f = v4_datagram(8);
+            f[4..6].copy_from_slice(&id.to_be_bytes());
+            f[6..8].copy_from_slice(&(0x2000u16 | 8000).to_be_bytes());
+            assert!(r.push_v4(now, 0, &f, 20).is_none());
+            let held: usize = r.partial.values().map(|d| d.data.capacity()).sum();
+            assert!(held <= MAX_BYTES, "{held} bytes held");
+            assert_eq!(held, r.bytes);
+        }
+        assert!(r.in_progress() < MAX_DATAGRAMS);
+
+        // Completing or discarding datagrams gives their bytes back.
+        let mut r = Reassembler::default();
+        let dgram = v4_datagram(3000);
+        push_all(&mut r, &split(&dgram, 1000)).expect("reassembled");
+        assert_eq!(r.bytes, 0);
+        let frags = split(&dgram, 1000);
+        r.push_v4(now, 0, &frags[0], 20);
+        assert!(r.bytes > 0);
+        let later = now + REASSEMBLY_TIMEOUT + Duration::from_secs(1);
+        r.push_v4(later, 1, &frags[1], 20);
+        r.push_v4(later, 1, &frags[1], 20);
+        let mut bad = frags[1].clone();
+        bad[30] ^= 1;
+        r.push_v4(later, 1, &bad, 20);
+        assert_eq!((r.in_progress(), r.bytes), (0, 0));
     }
 
     #[test]
