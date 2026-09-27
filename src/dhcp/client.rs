@@ -63,9 +63,11 @@ pub trait ClientTransport: Send + Sync + 'static {
     fn on_bound(&self, prefix: IpPrefix, gateway: Option<Ipv4Addr>);
 
     /// Called when the bound lease is gone: it expired without being
-    /// renewed, or the server refused to extend it (DHCPNAK). The address
+    /// renewed, the server refused to extend it (DHCPNAK), or the client
+    /// was stopped, released or restarted while holding it. The address
     /// from [`on_bound`](Self::on_bound) must no longer be used (RFC 2131
-    /// §4.4.5). The client goes back to discovery by itself.
+    /// §4.4.5). After an expiry or a NAK the client goes back to discovery
+    /// by itself.
     fn on_lease_lost(&self) {}
 
     /// Whether this transport can check an address for conflicts before
@@ -84,6 +86,11 @@ pub trait ClientTransport: Send + Sync + 'static {
     fn begin_probe(&self, ip: Ipv4Addr) {
         let _ = ip;
     }
+
+    /// The check under way ended without binding the address: the client
+    /// stopped or started over. Whatever was noted about the address being
+    /// probed can be forgotten.
+    fn end_probe(&self) {}
 
     /// Send one ARP probe for `ip`: an ARP request from our MAC with sender
     /// address 0.0.0.0 and target `ip` (RFC 5227 §2.1.1). The client sends a
@@ -226,6 +233,12 @@ enum Out {
         ip: Ipv4Addr,
         first: bool,
     },
+    /// Give the lease back (RFC 2131 §4.4.6).
+    Release {
+        xid: u32,
+        ip: Ipv4Addr,
+        server: Ipv4Addr,
+    },
     /// The ACKed address is in use by someone else (RFC 2131 §4.4.1).
     Decline {
         xid: u32,
@@ -310,11 +323,15 @@ impl Client {
     }
 
     fn begin(&self, timer_thread: bool) {
-        let (out, run) = {
+        let (out, run, left) = {
             let mut i = self.shared.inner.lock().unwrap();
+            let left = Left::of(i.state);
             i.run += 1;
-            (i.restart(Instant::now()), i.run)
+            (i.restart(Instant::now()), i.run, left)
         };
+        // Starting over drops any lease held: the transport has to stop
+        // using its address, or it would keep it past the lease.
+        self.shared.left(left);
         #[cfg(not(target_family = "wasm"))]
         if timer_thread {
             spawn_timer(&self.shared, run);
@@ -323,14 +340,50 @@ impl Client {
         self.shared.send(out);
     }
 
-    /// Cancel any pending operations.
+    /// Cancel any pending operations. A lease held is given up:
+    /// [`on_lease_lost`](ClientTransport::on_lease_lost) is called, since
+    /// nothing would renew it any more and the address must not outlive it.
+    ///
+    /// The server is not told; it keeps the address for this client until
+    /// the lease runs out, so a restart is likely to get it back. RFC 2131
+    /// §4.4.6 leaves a DHCPRELEASE to the client's discretion: use
+    /// [`release`](Self::release) to send one.
     pub fn stop(&self) {
-        let mut i = self.shared.inner.lock().unwrap();
-        i.run += 1;
-        i.state = State::Init;
-        i.lease = None;
-        i.pending = None;
-        i.next_tx = None;
+        self.halt(false);
+    }
+
+    /// Hand the lease back to the server with a DHCPRELEASE (RFC 2131
+    /// §4.4.6), then stop as [`stop`](Self::stop) does. Without a bound
+    /// lease, or a server identifier to address it to, nothing is sent.
+    pub fn release(&self) {
+        self.halt(true);
+    }
+
+    fn halt(&self, release: bool) {
+        let (left, out) = {
+            let mut i = self.shared.inner.lock().unwrap();
+            let left = Left::of(i.state);
+            let out = match (release && left.lease, i.offered_ip, i.server_ip) {
+                (true, Some(ip), Some(server)) => Some(Out::Release {
+                    xid: crate::rand::u32(),
+                    ip,
+                    server,
+                }),
+                _ => None,
+            };
+            i.run += 1;
+            i.state = State::Init;
+            i.lease = None;
+            i.pending = None;
+            i.next_tx = None;
+            (left, out)
+        };
+        // The RELEASE goes out first, from the address it gives up: once
+        // the transport hears the lease is lost it may unconfigure it.
+        if let Some(out) = out {
+            self.shared.send(out);
+        }
+        self.shared.left(left);
     }
 
     /// Process an inbound DHCP UDP payload (full BOOTP message).
@@ -424,7 +477,35 @@ impl Client {
     }
 }
 
+/// What a client leaving a state (to stop, or to start over) has to wind up.
+#[derive(Copy, Clone)]
+struct Left {
+    /// A lease was held, and is now lost.
+    lease: bool,
+    /// An address check was under way.
+    probe: bool,
+}
+
+impl Left {
+    fn of(state: State) -> Left {
+        Left {
+            lease: matches!(state, State::Bound | State::Renewing | State::Rebinding),
+            probe: state == State::Probing,
+        }
+    }
+}
+
 impl Shared {
+    /// Tell the transport what leaving a state gave up. No lock held.
+    fn left(&self, left: Left) {
+        if left.probe {
+            self.transport.end_probe();
+        }
+        if left.lease {
+            self.transport.on_lease_lost();
+        }
+    }
+
     fn tick(&self, now: Instant) {
         // Asked with no lock held, like every other transport call.
         let probing = {
@@ -499,6 +580,17 @@ impl Shared {
                     self.transport.begin_probe(ip);
                 }
                 self.transport.send_probe(ip)
+            }
+            // RFC 2131 Table 5: a RELEASE carries the address in ciaddr and
+            // the server identifier, and is unicast to that server.
+            Out::Release { xid, ip, server } => {
+                let mut b = wire::Builder::new(1, xid, mac);
+                b.message_type(wire::MSG_RELEASE)
+                    .ciaddr(ip)
+                    .ipv4_option(wire::OPT_SERVER_ID, server);
+                let frame = wrap_unicast(mac, ip, server, &b.finish());
+                self.transport
+                    .send_unicast(server, Frame::from_slice(&frame));
             }
             // RFC 2131 Table 5: the declined address and the server go in
             // options; ciaddr stays zero, since the client has no address.
@@ -785,8 +877,9 @@ mod tests {
         probing: bool,
         probes: Mutex<Vec<Ipv4Addr>>,
         conflict: Mutex<bool>,
-        /// Checks started with `begin_probe`.
+        /// Checks started with `begin_probe`, and ended with `end_probe`.
         checks: Mutex<u32>,
+        ended: Mutex<u32>,
     }
     impl ClientTransport for Recorder {
         fn mac(&self) -> MacAddr {
@@ -1127,6 +1220,48 @@ mod tests {
     }
 
     #[test]
+    fn stopping_or_restarting_gives_the_lease_up() {
+        let (r, c) = bound();
+        c.stop();
+        assert_eq!(*r.lost.lock().unwrap(), 1, "address kept past stop");
+        assert!(r.bound.lock().unwrap().is_none());
+        assert!(sent(&r).is_empty(), "stop() is not a release");
+        c.stop();
+        assert_eq!(*r.lost.lock().unwrap(), 1, "lost twice");
+
+        let (r, c) = bound();
+        tick_after(&c, Duration::from_secs(1801));
+        assert_eq!(state(&c), State::Renewing);
+        c.begin(false);
+        assert_eq!(*r.lost.lock().unwrap(), 1, "address kept past restart");
+
+        // Stopping mid-check ends the check.
+        let (r, c) = probing();
+        c.stop();
+        assert_eq!(*r.ended.lock().unwrap(), 1);
+        assert_eq!(*r.lost.lock().unwrap(), 0, "nothing was bound");
+    }
+
+    #[test]
+    fn release_hands_the_lease_back_to_its_server() {
+        let (r, c) = bound();
+        c.release();
+        let got = sent(&r);
+        assert_eq!(got.len(), 1);
+        let (unicast, ciaddr, p) = &got[0];
+        assert!(unicast);
+        assert_eq!(p.msg_type, wire::MSG_RELEASE);
+        assert_eq!(*ciaddr, IP);
+        assert_eq!(p.server_id, Some(Ipv4Addr::new(192, 168, 1, 1)));
+        assert_eq!(*r.lost.lock().unwrap(), 1);
+        assert_eq!(state(&c), State::Init);
+
+        // Nothing to release when nothing is bound.
+        c.release();
+        assert!(sent(&r).is_empty());
+    }
+
+    #[test]
     fn transport_may_call_back_into_the_client() {
         // A transport that asks the client for its state when bound.
         struct Reentrant(Arc<Mutex<Option<std::sync::Weak<Client>>>>, MacAddr);
@@ -1184,6 +1319,9 @@ mod tests {
         }
         fn begin_probe(&self, _ip: Ipv4Addr) {
             *self.0.checks.lock().unwrap() += 1;
+        }
+        fn end_probe(&self) {
+            *self.0.ended.lock().unwrap() += 1;
         }
         fn send_probe(&self, ip: Ipv4Addr) {
             self.0.probes.lock().unwrap().push(ip);

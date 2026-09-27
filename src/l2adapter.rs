@@ -148,14 +148,22 @@ impl L2Adapter {
                 mac: Some(self.mac),
             },
         ));
-        *self.dhcp.lock().unwrap() = Some(client.clone());
+        // A client already running is stopped, not just forgotten: its
+        // lease would otherwise stay configured with nothing renewing it.
+        let old = self.dhcp.lock().unwrap().replace(client.clone());
+        if let Some(old) = old {
+            old.stop();
+        }
         client.start();
     }
 
-    /// Stop the DHCP client.
+    /// Stop the DHCP client, giving up its lease (see
+    /// [`dhcp::Client::stop`](crate::dhcp::Client::stop)).
     #[cfg(feature = "dhcp")]
     pub fn stop_dhcp(&self) {
-        if let Some(c) = self.dhcp.lock().unwrap().take() {
+        // Taken out first: stopping calls back into the adapter.
+        let client = self.dhcp.lock().unwrap().take();
+        if let Some(c) = client {
             c.stop();
         }
     }
@@ -610,6 +618,11 @@ impl crate::dhcp::ClientTransport for AdapterDhcpTransport {
     fn begin_probe(&self, ip: Ipv4Addr) {
         if let Some(a) = self.weak.upgrade() {
             *a.probe.lock().unwrap() = Some((ip, false));
+        }
+    }
+    fn end_probe(&self) {
+        if let Some(a) = self.weak.upgrade() {
+            *a.probe.lock().unwrap() = None;
         }
     }
     fn send_probe(&self, ip: Ipv4Addr) {
@@ -1191,6 +1204,37 @@ mod tests {
         t.begin_probe(ip2);
         t.send_probe(ip2);
         assert!(!t.probe_conflict(ip2));
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn stopping_dhcp_mid_check_forgets_the_probe() {
+        let (_pipe, adapter, out) = rig("0.0.0.0/0");
+        adapter.start_dhcp();
+        let client = adapter.dhcp.lock().unwrap().clone().unwrap();
+        let discover = take(&out);
+        let xid = crate::dhcp::wire::Parsed::from_bytes(&discover[0][42..])
+            .unwrap()
+            .xid;
+        let reply = |t| {
+            let mut b = crate::dhcp::wire::Builder::new(2, xid, adapter.mac);
+            b.yiaddr(Ipv4Addr::new(10, 0, 0, 50))
+                .message_type(t)
+                .ipv4_option(
+                    crate::dhcp::wire::OPT_SUBNET_MASK,
+                    [255, 255, 255, 0].into(),
+                )
+                .u32_option(crate::dhcp::wire::OPT_LEASE_TIME, 3600)
+                .ipv4_option(crate::dhcp::wire::OPT_SERVER_ID, [10, 0, 0, 1].into());
+            b.finish()
+        };
+        client.handle_packet(&reply(crate::dhcp::wire::MSG_OFFER));
+        client.handle_packet(&reply(crate::dhcp::wire::MSG_ACK));
+        assert!(adapter.probe.lock().unwrap().is_some(), "not probing");
+        drop(client);
+
+        adapter.stop_dhcp();
+        assert!(adapter.probe.lock().unwrap().is_none(), "probe state kept");
     }
 
     #[cfg(feature = "dhcp")]
