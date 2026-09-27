@@ -82,6 +82,12 @@ pub struct Adapter {
     closed: AtomicBool,
 }
 
+impl Drop for Adapter {
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
+}
+
 impl std::fmt::Debug for Adapter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Adapter").field("addr", &self.addr).finish()
@@ -248,10 +254,13 @@ impl Adapter {
     }
 
     /// Spawn the server loop in a background thread. Returns a join handle.
-    /// The thread exits cleanly once [`Adapter::close`] is called.
+    /// The thread exits cleanly once [`Adapter::close`] is called, or the
+    /// adapter is dropped.
     pub fn spawn_serve(self: &Arc<Self>, conn: UdpSocket) -> thread::JoinHandle<Result<()>> {
-        let me = self.clone();
-        thread::spawn(move || me.server.serve(Arc::new(conn)))
+        // Only the server: holding the adapter would keep it alive, and so
+        // the thread and socket, however long after the caller let go.
+        let server = self.server.clone();
+        thread::spawn(move || server.serve(Arc::new(conn)))
     }
 
     /// Authorize (or refresh) a peer. In multi-handler mode this authorizes
@@ -783,5 +792,33 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
         a.close().unwrap();
+    }
+
+    /// Dropping the adapter without close() still stops the thread
+    /// spawn_serve started, and lets go of the server and its socket.
+    #[test]
+    fn dropping_the_adapter_stops_serving() {
+        let hub = L3Hub::new();
+        let a = Adapter::new(AdapterConfig::new(
+            crate::wg::generate_private_key().unwrap(),
+            Arc::new(Arc::new(hub)),
+            "10.0.0.1/24".parse().unwrap(),
+        ))
+        .unwrap();
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let t = a.spawn_serve(sock);
+        let server = Arc::downgrade(&a.server);
+        let adapter = Arc::downgrade(&a);
+        drop(a);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !t.is_finished() || server.upgrade().is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "still serving after the adapter was dropped"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(adapter.upgrade().is_none());
+        t.join().unwrap().unwrap();
     }
 }

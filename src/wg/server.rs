@@ -223,7 +223,8 @@ impl Server {
         // Spawn the maintenance thread. It lives as long as this call:
         // however the read loop ends, `_stop` tells it to go, rather than
         // leaving it to send keepalives for a server that no longer reads.
-        let me = self.clone();
+        // It holds the server weakly, so it never keeps one alive.
+        let weak = Arc::downgrade(self);
         let interval = self.maintenance_interval;
         let done = self.done.clone();
         let stop = Arc::new(AtomicBool::new(false));
@@ -234,6 +235,7 @@ impl Server {
                 let mut last = Instant::now();
                 while !done.load(Ordering::SeqCst) && !stop.load(Ordering::SeqCst) {
                     thread::sleep(TIMER_TICK);
+                    let Some(me) = weak.upgrade() else { break };
                     me.run_timers();
                     if last.elapsed() >= interval {
                         if let Some(mh) = me.multi_handler.as_ref() {
@@ -248,8 +250,7 @@ impl Server {
         self.threads.lock().expect("threads lock").push(maint);
 
         // Reader: run inline (blocking) so caller's `serve` is the read loop.
-        let me = self.clone();
-        me.read_loop(conn);
+        self.read_loop(conn);
         Ok(())
     }
 
@@ -954,5 +955,22 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// The maintenance thread does not keep its server alive.
+    #[test]
+    fn the_maintenance_thread_holds_the_server_weakly() {
+        let h = Handler::new(Config::default()).unwrap();
+        let s = Server::new(ServerConfig::default().handler(h)).unwrap();
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+        let s2 = s.clone();
+        let serve = thread::spawn(move || s2.serve(sock));
+        while s.threads.lock().unwrap().is_empty() {
+            thread::sleep(Duration::from_millis(1));
+        }
+        // Ours and the one serve runs on; not a third for the thread.
+        assert_eq!(Arc::strong_count(&s), 2);
+        s.close().unwrap();
+        serve.join().unwrap().unwrap();
     }
 }
