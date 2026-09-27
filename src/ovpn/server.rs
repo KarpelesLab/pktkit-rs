@@ -593,12 +593,36 @@ impl Server {
         tcp: Option<TcpOut>,
         stateless: Option<([u8; 8], [u8; 8])>,
     ) -> Option<Arc<PeerEntry>> {
-        let mut peers = self.peers.write().unwrap();
-        if let Some(e) = peers.get(&key) {
-            return Some(e.clone());
+        let admit = |peers: &HashMap<PeerKey, Arc<PeerEntry>>| match peers.get(&key) {
+            Some(e) => Err(Some(e.clone())),
+            None if peers.len() >= self.cfg.max_peers => Err(None),
+            None => Ok(()),
+        };
+        if let Err(found) = admit(&self.peers.read().unwrap()) {
+            return found;
         }
-        if peers.len() >= self.cfg.max_peers {
-            return None;
+        // Built with no lock held: it runs the TLS library on the caller's
+        // config, and a panic under the table's write lock would poison it
+        // for every client. A panic costs this client only.
+        let peer =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.build_peer(stateless)))
+                .ok()??;
+        // Another thread may have added this peer, or filled the table,
+        // meanwhile; the peer just built is then dropped.
+        let mut peers = self.peers.write().unwrap();
+        if let Err(found) = admit(&peers) {
+            return found;
+        }
+        let entry = Arc::new(PeerEntry::new(peer, transport, addr, tcp));
+        peers.insert(key, entry.clone());
+        Some(entry)
+    }
+
+    /// A new peer, as [`create_peer`](Self::create_peer) adds it.
+    fn build_peer(&self, stateless: Option<([u8; 8], [u8; 8])>) -> Option<Peer> {
+        #[cfg(test)]
+        if tests::PANIC_BUILDING_PEER.with(std::cell::Cell::get) {
+            panic!("building the peer panics (test)");
         }
         let local_id = match stateless {
             Some((ours, _)) => ours,
@@ -622,9 +646,7 @@ impl Server {
         if let Some((_, theirs)) = stateless {
             peer.open_after_stateless_reset(theirs).ok()?;
         }
-        let entry = Arc::new(PeerEntry::new(peer, transport, addr, tcp));
-        peers.insert(key, entry.clone());
-        Some(entry)
+        Some(peer)
     }
 
     /// Drop `entry` from the peer table -- only if it is still the entry
@@ -2258,6 +2280,37 @@ mod tests {
                 break;
             }
         }
+        server.close();
+    }
+
+    thread_local! {
+        /// Makes create_peer panic while building the peer, on this thread.
+        pub(super) static PANIC_BUILDING_PEER: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+
+    /// Building a peer runs the TLS library on a caller-supplied config; a
+    /// panic there must cost that one client only, not poison the peer
+    /// table for every other.
+    #[test]
+    fn a_panic_building_a_peer_does_not_poison_the_table() {
+        let server = test_server();
+        let key = |port| PeerKey::new(SocketAddr::from(([192, 0, 2, 1], port)), Transport::Udp);
+        let create = |port| {
+            server.create_peer(
+                key(port),
+                Transport::Udp,
+                key(port).socket_addr(),
+                None,
+                None,
+            )
+        };
+        PANIC_BUILDING_PEER.with(|p| p.set(true));
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| create(1)));
+        PANIC_BUILDING_PEER.with(|p| p.set(false));
+        assert!(matches!(r, Ok(None)), "the panic escaped");
+        assert!(!server.peers.is_poisoned());
+        assert!(create(2).is_some());
         server.close();
     }
 
