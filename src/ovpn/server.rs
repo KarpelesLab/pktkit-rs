@@ -442,11 +442,18 @@ impl Server {
             }
             Transport::Tcp => {
                 if let Some(w) = &entry.tcp {
-                    let mut w = w.lock().unwrap();
-                    let len = (dgram.len() as u16).to_be_bytes();
-                    w.write_all(&len)?;
-                    w.write_all(dgram)?;
-                    Ok(())
+                    // The frame length is 16 bits; a truncated one would
+                    // desynchronise the stream for good.
+                    let len = u16::try_from(dgram.len()).map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "packet too large for a TCP frame",
+                        )
+                    })?;
+                    let mut frame = Vec::with_capacity(2 + dgram.len());
+                    frame.extend_from_slice(&len.to_be_bytes());
+                    frame.extend_from_slice(dgram);
+                    w.lock().unwrap().write_all(&frame)
                 } else {
                     Err(io::Error::new(io::ErrorKind::NotConnected, "no tcp stream"))
                 }
@@ -797,6 +804,32 @@ mod tests {
             std::thread::sleep(Duration::from_millis(100));
         }
         panic!("server threads kept the server alive");
+    }
+
+    /// OpenVPN over TCP frames each packet with a 16-bit length. A larger
+    /// packet cannot be framed; truncating its length would desync the
+    /// stream, so it is refused and the stream stays usable.
+    #[test]
+    fn oversized_tcp_frame_is_refused() {
+        let server = test_server();
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (s, addr) = l.accept().unwrap();
+        let on_auth: OnAuth = Arc::new(|_| Err(io::Error::other("unused")));
+        let peer = Peer::new(crate::ovpn::tests::server_config(), [1; 8], on_auth).unwrap();
+        let entry = Arc::new(PeerEntry {
+            peer: Mutex::new(peer),
+            transport: Transport::Tcp,
+            addr,
+            tcp: Some(Mutex::new(s)),
+        });
+        assert!(server.send_raw(&entry, &vec![0u8; 70_000]).is_err());
+        server.send_raw(&entry, b"ok").unwrap();
+        assert_eq!(tcp_recv(&mut client).unwrap(), b"ok");
+        server.close();
     }
 
     #[test]
