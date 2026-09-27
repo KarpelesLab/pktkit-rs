@@ -222,11 +222,13 @@ impl TcpConn {
     /// the [write timeout](Self::set_write_timeout) returns what it had
     /// written, or `WouldBlock` if nothing.
     pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
+        // A timeout that runs past what an Instant can hold (such as
+        // `Duration::MAX`) would panic when added; it is no deadline at all.
         let deadline = self
             .write_timeout
             .lock()
             .unwrap()
-            .map(|t| Instant::now() + t);
+            .and_then(|t| Instant::now().checked_add(t));
         let mut written = 0;
         while written < buf.len() {
             let mut conn = self.state.conn.lock().unwrap();
@@ -276,7 +278,7 @@ impl TcpConn {
             .read_timeout
             .lock()
             .unwrap()
-            .map(|t| Instant::now() + t);
+            .and_then(|t| Instant::now().checked_add(t));
         let mut conn = self.state.conn.lock().unwrap();
         loop {
             let n = conn.read(buf);
@@ -604,7 +606,9 @@ impl TcpStack {
         // Wait for the handshake. The peer may have sent data or even closed
         // by the time we look, so any synchronized state (or a completed
         // handshake since torn down) counts, not just ESTABLISHED.
-        let deadline = Instant::now() + connect_timeout;
+        // No deadline for a timeout past what an Instant can hold: the SYN
+        // retransmissions giving up still end the wait.
+        let deadline = Instant::now().checked_add(connect_timeout);
         let mut conn = state.conn.lock().unwrap();
         loop {
             if state.connected.load(Ordering::Acquire) || conn.state().is_synchronized() {
@@ -618,6 +622,10 @@ impl TcpStack {
                     "connection reset during handshake",
                 ));
             }
+            let Some(deadline) = deadline else {
+                conn = state.signal.wait(conn).unwrap();
+                continue;
+            };
             let now = Instant::now();
             if now >= deadline {
                 drop(conn);
@@ -1162,6 +1170,35 @@ mod tests {
         let start = std::time::Instant::now();
         assert_eq!(conn.read(&mut []).unwrap(), 0);
         assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    /// A timeout too long for an `Instant` to reach means no deadline; it
+    /// must not panic computing one.
+    #[test]
+    fn huge_timeouts_mean_no_deadline() {
+        let (stack, _out) = capturing_stack();
+        let state = stack
+            .start_dial(IpAddr::V4(US), SocketAddr::from((PEER, 80)))
+            .unwrap();
+        let conn = TcpConn::new(state);
+        conn.set_nonblocking(true);
+        conn.set_read_timeout(Some(Duration::MAX));
+        conn.set_write_timeout(Some(Duration::MAX));
+        let err = conn.read(&mut [0; 4]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        let err = conn.write(b"x").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+
+        // A dial with no deadline waits until the connection ends.
+        let s = stack.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            s.shutdown();
+        });
+        let err = stack
+            .dial(IpAddr::V4(US), SocketAddr::from((PEER, 81)), Duration::MAX)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
     }
 
     #[test]

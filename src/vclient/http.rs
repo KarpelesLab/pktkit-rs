@@ -177,13 +177,10 @@ impl Client {
             Err(_) => self.resolve(&req.host)?,
         };
 
-        let deadline = Instant::now() + req.timeout;
-        let remaining = || {
-            deadline
-                .checked_duration_since(Instant::now())
-                .filter(|d| !d.is_zero())
-                .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "HTTP request timed out"))
-        };
+        // A timeout too long for an Instant to reach (`Duration::MAX`)
+        // would panic when added: it is no deadline at all.
+        let deadline = Instant::now().checked_add(req.timeout);
+        let remaining = || super::time_left(deadline, "HTTP request timed out");
         // A timed-out read or write reports WouldBlock, as std's do.
         let timed_out = |e: io::Error| {
             if e.kind() == io::ErrorKind::WouldBlock {
@@ -200,7 +197,7 @@ impl Client {
         // forever. Each write gets only what is left of the deadline.
         let mut sent = 0;
         while sent < wire.len() {
-            conn.set_write_timeout(Some(remaining()?));
+            conn.set_write_timeout(remaining()?);
             match conn.write(&wire[sent..]).map_err(timed_out)? {
                 0 => return Err(io::ErrorKind::WriteZero.into()),
                 n => sent += n,
@@ -215,7 +212,7 @@ impl Client {
         );
         let mut buf = [0u8; 16 * 1024];
         loop {
-            conn.set_read_timeout(Some(remaining()?));
+            conn.set_read_timeout(remaining()?);
             let n = conn.read(&mut buf).map_err(timed_out)?;
             if n == 0 {
                 return reader.finish();
@@ -230,12 +227,13 @@ impl Client {
     /// skipping any in a family the client has no address in: a resolver
     /// lists A before AAAA, and an IPv6-only client must still reach a
     /// dual-stack host. Each attempt gets an even share of what is left
-    /// before `deadline`, so one blackholed address cannot use it all.
+    /// before `deadline`, so one blackholed address cannot use it all;
+    /// without one, each waits until its handshake succeeds or gives up.
     fn dial_any(
         &self,
         addrs: &[IpAddr],
         port: u16,
-        deadline: Instant,
+        deadline: Option<Instant>,
     ) -> io::Result<super::TcpConn> {
         let prefix = crate::L3Device::addr(self);
         let usable: Vec<IpAddr> = addrs
@@ -248,11 +246,10 @@ impl Client {
             "no address for host in the client's address family",
         );
         for (i, ip) in usable.iter().enumerate() {
-            let left = deadline
-                .checked_duration_since(Instant::now())
-                .filter(|d| !d.is_zero())
-                .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "HTTP request timed out"))?;
-            let share = left / (usable.len() - i) as u32;
+            let share = match super::time_left(deadline, "HTTP request timed out")? {
+                Some(left) => left / (usable.len() - i) as u32,
+                None => Duration::MAX,
+            };
             match self.dial_tcp_timeout(SocketAddr::new(*ip, port), share) {
                 Ok(conn) => return Ok(conn),
                 Err(e) => last = e,
@@ -1296,7 +1293,7 @@ mod tests {
 
     #[test]
     fn dials_the_first_reachable_address_of_the_clients_family() {
-        let deadline = || Instant::now() + Duration::from_secs(2);
+        let deadline = || Some(Instant::now() + Duration::from_secs(2));
         let v4: IpAddr = "10.0.0.1".parse().unwrap();
         let v6: IpAddr = "fd00::1".parse().unwrap();
 
@@ -1321,6 +1318,20 @@ mod tests {
 
         // Nothing in the client's family at all.
         assert!(client.dial_any(&[v6], 80, deadline()).is_err());
+    }
+
+    #[test]
+    fn a_huge_timeout_means_no_deadline() {
+        let client = Client::new(
+            super::super::ClientConfig::default()
+                .prefix(crate::IpPrefix::new("10.0.0.2".parse().unwrap(), 24)),
+        );
+        servers_at(&client, Vec::new());
+        let req = Request::get("http://10.0.0.1/")
+            .unwrap()
+            .timeout(Duration::MAX);
+        let err = client.http(&req).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
     }
 
     /// A folded line continues the field before it (RFC 9112 §5.2): it is

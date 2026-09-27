@@ -37,6 +37,25 @@ pub use http::{DEFAULT_HTTP_TIMEOUT, DEFAULT_MAX_RESPONSE_BODY, Request, Respons
 pub use tcp::{Listener, TcpConn};
 pub use udp::UdpConn;
 
+/// What is left before `deadline`, as a socket timeout: `None` (wait for
+/// ever) when there is no deadline, which is what a timeout too long for an
+/// `Instant` to reach gives, and `TimedOut` with `what` once it has passed.
+/// Sockets refuse a zero timeout, so the last instant counts as passed.
+#[cfg(not(target_family = "wasm"))]
+fn time_left(
+    deadline: Option<crate::time::Instant>,
+    what: &'static str,
+) -> std::io::Result<Option<std::time::Duration>> {
+    let Some(deadline) = deadline else {
+        return Ok(None);
+    };
+    deadline
+        .checked_duration_since(crate::time::Instant::now())
+        .filter(|d| !d.is_zero())
+        .map(Some)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, what))
+}
+
 /// Identification for the IPv4 datagrams the client sends. They go out
 /// without DF, so they may be fragmented on the way, and the ID is what
 /// tells one datagram's fragments from another's: it must differ between

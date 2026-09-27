@@ -231,6 +231,11 @@ fn query_id() -> u16 {
     h.finish() as u16
 }
 
+#[cfg(not(target_family = "wasm"))]
+fn time_left(deadline: Option<Instant>) -> io::Result<Option<Duration>> {
+    super::time_left(deadline, "DNS query timed out")
+}
+
 /// A DNS resolver over real UDP sockets.
 #[cfg(not(target_family = "wasm"))]
 #[derive(Debug, Clone)]
@@ -320,15 +325,11 @@ impl Resolver {
         sock.send(&query)?;
 
         // One deadline for the whole exchange: stray datagrams must not
-        // extend it.
-        let deadline = Instant::now() + self.cfg.timeout;
+        // extend it. A timeout past what an Instant can hold is none.
+        let deadline = Instant::now().checked_add(self.cfg.timeout);
         let mut buf = [0u8; 1500];
         loop {
-            let left = deadline
-                .checked_duration_since(Instant::now())
-                .filter(|d| !d.is_zero())
-                .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "DNS query timed out"))?;
-            sock.set_read_timeout(Some(left))?;
+            sock.set_read_timeout(time_left(deadline)?)?;
             let n = match sock.recv(&mut buf) {
                 Ok(n) => n,
                 Err(e)
@@ -372,18 +373,16 @@ impl Resolver {
         server: SocketAddr,
         query: &[u8],
         id: u16,
-        deadline: Instant,
+        deadline: Option<Instant>,
     ) -> io::Result<Vec<IpAddr>> {
         use std::io::{Read, Write};
 
-        let left = || {
-            deadline
-                .checked_duration_since(Instant::now())
-                .filter(|d| !d.is_zero())
-                .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "DNS query timed out"))
+        let left = || time_left(deadline);
+        let mut s = match left()? {
+            Some(t) => std::net::TcpStream::connect_timeout(&server, t)?,
+            None => std::net::TcpStream::connect(server)?,
         };
-        let mut s = std::net::TcpStream::connect_timeout(&server, left()?)?;
-        s.set_write_timeout(Some(left()?))?;
+        s.set_write_timeout(left()?)?;
         let mut msg = Vec::with_capacity(2 + query.len());
         msg.extend_from_slice(&(query.len() as u16).to_be_bytes());
         msg.extend_from_slice(query);
@@ -394,7 +393,7 @@ impl Resolver {
         // give each read only what is left of the deadline.
         let mut read = |mut buf: &mut [u8]| -> io::Result<()> {
             while !buf.is_empty() {
-                s.set_read_timeout(Some(left()?))?;
+                s.set_read_timeout(left()?)?;
                 match s.read(buf) {
                     Ok(0) => {
                         return Err(io::Error::new(
@@ -570,9 +569,10 @@ mod tests {
             server.send_to(&resp, from).unwrap();
         });
 
+        // A timeout too long for an Instant to reach is no deadline.
         let r = Resolver::new(ResolverConfig {
             servers: vec![server_addr],
-            timeout: Duration::from_secs(2),
+            timeout: Duration::MAX,
         });
         let ips = r.query("anything.test", RecordType::A).unwrap();
         assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))]);

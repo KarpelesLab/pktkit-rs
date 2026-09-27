@@ -149,7 +149,7 @@ impl UdpConn {
             .read_timeout
             .lock()
             .unwrap()
-            .map(|t| Instant::now() + t);
+            .and_then(|t| Instant::now().checked_add(t));
         let mut rx = self.state.rx.lock().unwrap();
         loop {
             if let Some(dgram) = rx.pop_front() {
@@ -431,6 +431,22 @@ mod tests {
         let mut buf = [0u8; 16];
         let n = conn.recv(&mut buf).unwrap();
         assert_eq!(&buf[..n], b"answer");
+    }
+
+    #[test]
+    fn a_huge_read_timeout_means_no_deadline() {
+        let sink: Arc<dyn Fn(&[u8]) + Send + Sync> = Arc::new(|_b: &[u8]| {});
+        let stack = UdpStack::new(sink);
+        let conn = stack
+            .dial(
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+                SocketAddr::from(([10, 0, 0, 1], 53)),
+            )
+            .unwrap();
+        conn.set_read_timeout(Some(Duration::MAX));
+        conn.set_nonblocking(true);
+        let err = conn.recv(&mut [0; 4]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
     }
 
     #[test]
