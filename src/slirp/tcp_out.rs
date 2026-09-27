@@ -321,7 +321,14 @@ impl TcpOutConn {
                 let n = conn.read(&mut buf);
                 if n > 0 {
                     (n, false)
-                } else if conn.fin_received() || conn.is_closed() {
+                } else if conn.is_closed() {
+                    // Reset, or our timers gave up: nothing will ever reach
+                    // the client again, so the remote→client pump must not
+                    // stay parked in a read the server may never end.
+                    drop(conn);
+                    self.close();
+                    return;
+                } else if conn.fin_received() {
                     (0, true)
                 } else {
                     // Block until data arrives, the client FINs, or we close.

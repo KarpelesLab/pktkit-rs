@@ -304,9 +304,15 @@ impl Stack {
                     }
                 }
                 if !dead_out.is_empty() {
-                    let mut t = inner.tcp.lock().expect("poisoned");
-                    for k in dead_out {
-                        t.remove(&k);
+                    let gone: Vec<Arc<TcpOutConn>> = {
+                        let mut t = inner.tcp.lock().expect("poisoned");
+                        dead_out.iter().filter_map(|k| t.remove(k)).collect()
+                    };
+                    // Closing shuts the real socket, which is what ends a
+                    // pump still blocked reading it; outside the table lock,
+                    // as close() may emit and so re-enter `send`.
+                    for c in gone {
+                        c.close();
                     }
                 }
                 let out6: Vec<(Key6, Arc<TcpOutConn>)> = inner
@@ -324,9 +330,15 @@ impl Stack {
                     }
                 }
                 if !dead_out6.is_empty() {
-                    let mut t = inner.tcp6.lock().expect("poisoned");
-                    for k in dead_out6 {
-                        t.remove(&k);
+                    let gone: Vec<Arc<TcpOutConn>> = {
+                        let mut t = inner.tcp6.lock().expect("poisoned");
+                        dead_out6.iter().filter_map(|k| t.remove(k)).collect()
+                    };
+                    // Closing shuts the real socket, which is what ends a
+                    // pump still blocked reading it; outside the table lock,
+                    // as close() may emit and so re-enter `send`.
+                    for c in gone {
+                        c.close();
                     }
                 }
                 drop(inner);
@@ -1831,6 +1843,49 @@ mod tests {
             done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
             "shutdown deadlocked against the blocked writer"
         );
+    }
+
+    #[test]
+    fn client_reset_tears_the_whole_bridge_down() {
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+
+        // A server that neither sends nor closes: only the bridge closing
+        // its socket can end the remote→client pump's read.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (held_tx, held_rx) = mpsc::channel();
+        thread::spawn(move || {
+            if let Ok((s, _)) = listener.accept() {
+                let _ = held_tx.send(s);
+            }
+        });
+
+        let stack = Stack::new();
+        let client = Ipv4Addr::new(10, 0, 0, 5);
+        let server = Ipv4Addr::new(127, 0, 0, 1);
+        let vc = wire_vtcp_client(&stack, client, server, 50003, port);
+        let syn = vc.lock().unwrap().connect();
+        inject_segs(&stack, client, server, syn);
+        wait_for("ESTABLISHED", || {
+            vc.lock().unwrap().state() == VtcpState::Established
+        });
+        let mut held = held_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let bridge = stack.inner.tcp.lock().unwrap().values().next().cloned();
+        let bridge = bridge.expect("bridge registered");
+
+        let rst = vc.lock().unwrap().abort();
+        inject_segs(&stack, client, server, rst);
+
+        // The pumps let go of the bridge, and the real socket is closed
+        // outright rather than half-closed.
+        wait_for("the pump threads to exit", || {
+            Arc::strong_count(&bridge) == 1
+        });
+        assert!(stack.inner.tcp.lock().unwrap().is_empty());
+        held.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut buf = [0u8; 16];
+        assert_eq!(std::io::Read::read(&mut held, &mut buf).unwrap(), 0);
     }
 
     #[test]
