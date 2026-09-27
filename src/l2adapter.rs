@@ -59,6 +59,10 @@ pub struct L2Adapter {
 
     #[cfg(feature = "dhcp")]
     dhcp: Mutex<Option<Arc<crate::dhcp::Client>>>,
+    /// The address the DHCP client is probing before it binds, and whether
+    /// anyone has turned out to be using it.
+    #[cfg(feature = "dhcp")]
+    probe: Mutex<Option<(Ipv4Addr, bool)>>,
 
     // Self-Arc, for use by closures that need to refer back to us.
     weak_self: Mutex<Weak<L2Adapter>>,
@@ -98,6 +102,8 @@ impl L2Adapter {
             ndp_pending: ArpPending::new(),
             #[cfg(feature = "dhcp")]
             dhcp: Mutex::new(None),
+            #[cfg(feature = "dhcp")]
+            probe: Mutex::new(None),
             weak_self: Mutex::new(Weak::new()),
         });
         *a.weak_self.lock().unwrap() = Arc::downgrade(&a);
@@ -333,6 +339,17 @@ impl L2Adapter {
             None => return,
         };
         let (op, sender_mac, sender_ip, _, target_ip) = p;
+
+        // RFC 5227 §2.1.1: while probing, the address is taken if anyone
+        // sends ARP from it, or probes for it too. Our own probe coming back
+        // (a hub floods broadcasts to every port) is neither.
+        #[cfg(feature = "dhcp")]
+        if sender_mac != self.mac
+            && let Some((ip, conflict)) = self.probe.lock().unwrap().as_mut()
+            && (sender_ip == *ip || (sender_ip.is_unspecified() && target_ip == *ip))
+        {
+            *conflict = true;
+        }
         let our_addr = match self.l3.addr().addr() {
             IpAddr::V4(a) if !a.is_unspecified() => Some(a),
             _ => None,
@@ -554,8 +571,42 @@ impl crate::dhcp::ClientTransport for AdapterDhcpTransport {
         }
         a.send_l2(Frame::from_slice(&buf));
     }
+    fn can_probe(&self) -> bool {
+        true
+    }
+    fn send_probe(&self, ip: Ipv4Addr) {
+        let Some(a) = self.weak.upgrade() else {
+            return;
+        };
+        {
+            let mut probe = a.probe.lock().unwrap();
+            if probe.is_none_or(|(p, _)| p != ip) {
+                *probe = Some((ip, false));
+            }
+        }
+        // Sender address zero: the probe must not teach anyone's cache an
+        // address we do not have yet.
+        let payload = arp::build_packet(
+            arp::OP_REQUEST,
+            a.mac,
+            Ipv4Addr::UNSPECIFIED,
+            MacAddr::zero(),
+            ip,
+        );
+        let frame = build_frame(MacAddr::broadcast(), a.mac, EtherType::ARP, &payload);
+        a.send_l2(Frame::from_slice(&frame));
+    }
+    fn probe_conflict(&self, ip: Ipv4Addr) -> bool {
+        self.weak.upgrade().is_some_and(|a| {
+            a.probe
+                .lock()
+                .unwrap()
+                .is_some_and(|(p, conflict)| p == ip && conflict)
+        })
+    }
     fn on_bound(&self, prefix: IpPrefix, gateway: Option<Ipv4Addr>) {
         if let Some(a) = self.weak.upgrade() {
+            *a.probe.lock().unwrap() = None;
             let _ = a.l3.set_addr(prefix);
             if let Some(gw) = gateway {
                 a.set_gateway_v4(gw);
@@ -976,6 +1027,60 @@ mod tests {
             .send(Frame::from_slice(&tagged(&arp, 0x6000)))
             .unwrap();
         assert_eq!(take(&out).len(), 1, "priority-tagged ARP ignored");
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn dhcp_probe_detects_an_address_in_use() {
+        use crate::dhcp::ClientTransport;
+        let (_pipe, adapter, out) = rig("0.0.0.0/0");
+        let t = AdapterDhcpTransport {
+            weak: Arc::downgrade(&adapter),
+        };
+        assert!(t.can_probe());
+        let ip = Ipv4Addr::new(10, 0, 0, 50);
+
+        t.send_probe(ip);
+        let sent = take(&out);
+        assert_eq!(sent.len(), 1);
+        let f = Frame::from_slice(&sent[0]);
+        assert_eq!(f.dst_mac(), Some(MacAddr::broadcast()));
+        let (op, sm, si, _, ti) = arp::parse(f.payload()).unwrap();
+        assert_eq!(
+            (op, sm, si, ti),
+            (arp::OP_REQUEST, adapter.mac, Ipv4Addr::UNSPECIFIED, ip)
+        );
+        assert!(!t.probe_conflict(ip));
+
+        // Our own probe, looped back, is not a conflict; a stranger's
+        // traffic for other addresses is not either.
+        adapter.send(f).unwrap();
+        let other = MacAddr([2, 0, 0, 0, 0, 9]);
+        arp_in(
+            &adapter,
+            arp::OP_REQUEST,
+            other,
+            [10, 0, 0, 7],
+            [10, 0, 0, 1],
+        );
+        assert!(!t.probe_conflict(ip));
+
+        // Someone answers for it.
+        arp_in(&adapter, arp::OP_REPLY, other, [10, 0, 0, 50], [0, 0, 0, 0]);
+        assert!(t.probe_conflict(ip));
+
+        // Another host probing for the same address also counts.
+        let ip2 = Ipv4Addr::new(10, 0, 0, 51);
+        t.send_probe(ip2);
+        assert!(!t.probe_conflict(ip2));
+        arp_in(
+            &adapter,
+            arp::OP_REQUEST,
+            other,
+            [0, 0, 0, 0],
+            [10, 0, 0, 51],
+        );
+        assert!(t.probe_conflict(ip2));
     }
 
     #[test]

@@ -11,6 +11,11 @@
 //! lease expires — happens in [`Client::tick`]. Where threads exist, `start`
 //! runs a background thread that calls it; on `wasm32` call it yourself,
 //! about once a second.
+//!
+//! A transport that can send ARP (the `L2Adapter`'s
+//! does) lets the client check a newly granted address before using it: a
+//! few seconds of ARP probes after the DHCPACK, and a DHCPDECLINE if anyone
+//! turns out to hold it (RFC 2131 §2.2, RFC 5227).
 
 use super::wire;
 use crate::time::Instant;
@@ -62,6 +67,31 @@ pub trait ClientTransport: Send + Sync + 'static {
     /// from [`on_bound`](Self::on_bound) must no longer be used (RFC 2131
     /// §4.4.5). The client goes back to discovery by itself.
     fn on_lease_lost(&self) {}
+
+    /// Whether this transport can check an address for conflicts before
+    /// the client binds it (RFC 2131 §2.2, §4.4.1), with
+    /// [`send_probe`](Self::send_probe) and
+    /// [`probe_conflict`](Self::probe_conflict). Asked once, when the
+    /// [`Client`] is built. The default, `false`, binds without checking.
+    fn can_probe(&self) -> bool {
+        false
+    }
+
+    /// Send one ARP probe for `ip`: an ARP request from our MAC with sender
+    /// address 0.0.0.0 and target `ip` (RFC 5227 §2.1.1). The client sends a
+    /// few, a second apart, between the DHCPACK and binding.
+    fn send_probe(&self, ip: Ipv4Addr) {
+        let _ = ip;
+    }
+
+    /// True if, since the first [`send_probe`](Self::send_probe) for `ip`,
+    /// another station has shown it is using `ip`: any ARP whose sender
+    /// address is `ip`, or another host's probe for it (RFC 5227 §2.1.1).
+    /// The client then sends a DHCPDECLINE and starts over.
+    fn probe_conflict(&self, ip: Ipv4Addr) -> bool {
+        let _ = ip;
+        false
+    }
 }
 
 /// First retransmission delay and its ceiling (RFC 2131 §4.1: 4 s, doubled
@@ -74,6 +104,15 @@ const MAX_REQUESTS: u32 = 5;
 /// Floor on the retransmission interval while RENEWING or REBINDING
 /// (RFC 2131 §4.4.5).
 const MIN_RENEW_RETRANSMIT: Duration = Duration::from_secs(60);
+/// RFC 5227 §1.1: probes sent before claiming an address, the gap between
+/// them, and how long to listen after the last. The RFC draws the gap from
+/// one to two seconds; a fixed second keeps the whole check near four.
+const PROBE_NUM: u32 = 3;
+const PROBE_INTERVAL: Duration = Duration::from_secs(1);
+const ANNOUNCE_WAIT: Duration = Duration::from_secs(2);
+/// RFC 2131 §3.1.5: after declining an address, wait at least ten seconds
+/// before starting over, so a conflict does not turn into a storm.
+const DECLINE_WAIT: Duration = Duration::from_secs(10);
 /// How often the background thread looks for due timers. Well under the
 /// ±1 s jitter the retransmission delays already carry.
 #[cfg(not(target_family = "wasm"))]
@@ -84,6 +123,8 @@ enum State {
     Init,
     Selecting,
     Requesting,
+    /// ACKed, but checking with ARP that nobody else uses the address.
+    Probing,
     Bound,
     Renewing,
     Rebinding,
@@ -107,8 +148,11 @@ struct Inner {
     lease: Option<LeaseTimers>,
     /// When to retransmit the outstanding DISCOVER or REQUEST.
     next_tx: Option<Instant>,
-    /// Retransmissions of the outstanding message so far.
+    /// Retransmissions of the outstanding message so far; while PROBING,
+    /// probes sent.
     tries: u32,
+    /// While PROBING: what to bind once the address proves free.
+    pending: Option<(IpPrefix, Option<Ipv4Addr>, Option<LeaseTimers>)>,
     /// Bumped by every start and stop, so the timer thread of an earlier run
     /// knows to exit.
     run: u64,
@@ -122,9 +166,24 @@ impl Inner {
         self.offered_ip = None;
         self.server_ip = None;
         self.lease = None;
+        self.pending = None;
         self.tries = 0;
         self.next_tx = Some(now + backoff(0));
         Out::Discover(self.xid)
+    }
+
+    /// Bind what a DHCPACK granted.
+    fn bind(
+        &mut self,
+        prefix: IpPrefix,
+        router: Option<Ipv4Addr>,
+        lease: Option<LeaseTimers>,
+    ) -> Event {
+        self.state = State::Bound;
+        self.next_tx = None;
+        self.pending = None;
+        self.lease = lease;
+        Event::Bound(prefix, router)
     }
 }
 
@@ -149,6 +208,14 @@ enum Out {
         xid: u32,
         ip: Ipv4Addr,
     },
+    /// ARP probe for an address about to be bound.
+    Probe(Ipv4Addr),
+    /// The ACKed address is in use by someone else (RFC 2131 §4.4.1).
+    Decline {
+        xid: u32,
+        ip: Ipv4Addr,
+        server: Option<Ipv4Addr>,
+    },
 }
 
 /// What to tell the transport, also after the lock is released.
@@ -160,6 +227,8 @@ enum Event {
 struct Shared {
     transport: Arc<dyn ClientTransport>,
     mac: MacAddr,
+    /// [`ClientTransport::can_probe`], asked once.
+    can_probe: bool,
     inner: Mutex<Inner>,
 }
 
@@ -191,10 +260,12 @@ impl Client {
     {
         let transport: Arc<dyn ClientTransport> = Arc::new(transport);
         let mac = config.mac.unwrap_or_else(|| transport.mac());
+        let can_probe = transport.can_probe();
         Client {
             shared: Arc::new(Shared {
                 transport,
                 mac,
+                can_probe,
                 inner: Mutex::new(Inner {
                     state: State::Init,
                     xid: 0,
@@ -203,6 +274,7 @@ impl Client {
                     lease: None,
                     next_tx: None,
                     tries: 0,
+                    pending: None,
                     run: 0,
                 }),
             }),
@@ -240,6 +312,7 @@ impl Client {
         i.run += 1;
         i.state = State::Init;
         i.lease = None;
+        i.pending = None;
         i.next_tx = None;
     }
 
@@ -276,14 +349,23 @@ impl Client {
                 (State::Requesting | State::Renewing | State::Rebinding, wire::MSG_ACK) => {
                     let bits = p.subnet_mask.map(wire::mask_bits).unwrap_or(24);
                     let prefix = IpPrefix::new(IpAddr::V4(p.yiaddr), bits);
-                    i.state = State::Bound;
+                    let fresh = i.state == State::Requesting;
                     i.offered_ip = Some(p.yiaddr);
                     if p.server_id.is_some() {
                         i.server_ip = p.server_id;
                     }
-                    i.next_tx = None;
-                    i.lease = lease_timers(now, p.lease_time);
-                    (Some(Event::Bound(prefix, p.router)), None)
+                    let lease = lease_timers(now, p.lease_time);
+                    // A newly granted address is checked before use (RFC
+                    // 2131 §4.4.1); one being renewed is ours already.
+                    if fresh && self.shared.can_probe {
+                        i.state = State::Probing;
+                        i.pending = Some((prefix, p.router, lease));
+                        i.tries = 1;
+                        i.next_tx = Some(now + PROBE_INTERVAL);
+                        (None, Some(Out::Probe(p.yiaddr)))
+                    } else {
+                        (Some(i.bind(prefix, p.router, lease)), None)
+                    }
                 }
                 (State::Requesting, wire::MSG_NAK) => (None, Some(i.restart(now))),
                 (State::Renewing | State::Rebinding, wire::MSG_NAK) => {
@@ -309,9 +391,17 @@ impl Client {
 
 impl Shared {
     fn tick(&self, now: Instant) {
+        // Asked with no lock held, like every other transport call.
+        let probing = {
+            let i = self.inner.lock().unwrap();
+            (i.state == State::Probing)
+                .then_some(i.offered_ip)
+                .flatten()
+        };
+        let conflict = probing.is_some_and(|ip| self.transport.probe_conflict(ip));
         let (event, out) = {
             let mut i = self.inner.lock().unwrap();
-            step(&mut i, now)
+            step(&mut i, now, conflict)
         };
         self.notify(event);
         if let Some(out) = out {
@@ -369,15 +459,57 @@ impl Shared {
                 let frame = wrap_unicast(mac, ip, Ipv4Addr::BROADCAST, &b.finish());
                 self.transport.send_broadcast(Frame::from_slice(&frame));
             }
+            Out::Probe(ip) => self.transport.send_probe(ip),
+            // RFC 2131 Table 5: the declined address and the server go in
+            // options; ciaddr stays zero, since the client has no address.
+            Out::Decline { xid, ip, server } => {
+                let mut b = wire::Builder::new(1, xid, mac);
+                b.message_type(wire::MSG_DECLINE)
+                    .ipv4_option(wire::OPT_REQUESTED_IP, ip);
+                if let Some(s) = server {
+                    b.ipv4_option(wire::OPT_SERVER_ID, s);
+                }
+                let frame = wrap_for_broadcast(mac, &b.finish());
+                self.transport.send_broadcast(Frame::from_slice(&frame));
+            }
         }
     }
 }
 
-/// The state machine's timed transitions.
-fn step(i: &mut Inner, now: Instant) -> (Option<Event>, Option<Out>) {
+/// The state machine's timed transitions. `conflict` is the transport's
+/// answer, while PROBING, to whether someone else has the address.
+fn step(i: &mut Inner, now: Instant, conflict: bool) -> (Option<Event>, Option<Out>) {
     let due = |at: Option<Instant>| at.is_some_and(|at| at <= now);
     match i.state {
         State::Init => (None, None),
+        State::Probing => {
+            let Some(ip) = i.offered_ip else {
+                return (None, Some(i.restart(now)));
+            };
+            if conflict {
+                let (xid, server) = (i.xid, i.server_ip);
+                let _ = i.restart(now);
+                i.next_tx = Some(now + DECLINE_WAIT);
+                return (None, Some(Out::Decline { xid, ip, server }));
+            }
+            if !due(i.next_tx) {
+                return (None, None);
+            }
+            if i.tries < PROBE_NUM {
+                i.tries += 1;
+                let wait = if i.tries == PROBE_NUM {
+                    ANNOUNCE_WAIT
+                } else {
+                    PROBE_INTERVAL
+                };
+                i.next_tx = Some(now + wait);
+                return (None, Some(Out::Probe(ip)));
+            }
+            let Some((prefix, router, lease)) = i.pending else {
+                return (None, Some(i.restart(now)));
+            };
+            (Some(i.bind(prefix, router, lease)), None)
+        }
         State::Selecting => {
             if !due(i.next_tx) {
                 return (None, None);
@@ -567,6 +699,10 @@ mod tests {
         bound: Mutex<Option<(IpPrefix, Option<Ipv4Addr>)>>,
         lost: Mutex<u32>,
         mac: MacAddr,
+        /// Probing support, the probes sent, and whether one was answered.
+        probing: bool,
+        probes: Mutex<Vec<Ipv4Addr>>,
+        conflict: Mutex<bool>,
     }
     impl ClientTransport for Recorder {
         fn mac(&self) -> MacAddr {
@@ -849,5 +985,74 @@ mod tests {
         fn on_lease_lost(&self) {
             self.0.on_lease_lost()
         }
+        fn can_probe(&self) -> bool {
+            self.0.probing
+        }
+        fn send_probe(&self, ip: Ipv4Addr) {
+            self.0.probes.lock().unwrap().push(ip);
+        }
+        fn probe_conflict(&self, _ip: Ipv4Addr) -> bool {
+            *self.0.conflict.lock().unwrap()
+        }
+    }
+
+    fn probing() -> (Arc<Recorder>, Client) {
+        let r = Arc::new(Recorder {
+            mac: "02:00:00:00:00:01".parse().unwrap(),
+            probing: true,
+            ..Default::default()
+        });
+        let c = Client::new(ArcTransport(r.clone()), ClientConfig::default());
+        c.begin(false);
+        c.handle_packet(&make_offer(xid(&c), r.mac));
+        c.handle_packet(&make_ack(xid(&c), r.mac));
+        sent(&r);
+        (r, c)
+    }
+
+    #[test]
+    fn the_address_is_probed_before_it_is_bound() {
+        let (r, c) = probing();
+        let ip = Ipv4Addr::new(192, 168, 1, 100);
+        assert!(r.bound.lock().unwrap().is_none(), "bound before probing");
+        assert_eq!(*r.probes.lock().unwrap(), vec![ip]);
+
+        tick_after(&c, Duration::from_millis(1100));
+        tick_after(&c, Duration::from_millis(2200));
+        assert_eq!(r.probes.lock().unwrap().len(), 3, "RFC 5227 PROBE_NUM");
+        assert!(r.bound.lock().unwrap().is_none());
+
+        // ANNOUNCE_WAIT after the last probe with no answer: it is ours.
+        tick_after(&c, Duration::from_millis(4300));
+        assert_eq!(r.bound.lock().unwrap().unwrap().0.addr(), IpAddr::V4(ip));
+        assert_eq!(state(&c), State::Bound);
+        assert!(sent(&r).is_empty());
+    }
+
+    #[test]
+    fn a_conflict_is_declined_and_discovery_restarts_after_a_pause() {
+        let (r, c) = probing();
+        *r.conflict.lock().unwrap() = true;
+        tick_after(&c, Duration::from_millis(500));
+
+        assert!(
+            r.bound.lock().unwrap().is_none(),
+            "bound a conflicting address"
+        );
+        let got = sent(&r);
+        assert_eq!(got.len(), 1);
+        let d = &got[0].2;
+        assert_eq!(d.msg_type, wire::MSG_DECLINE);
+        assert_eq!(d.requested_ip, Some(Ipv4Addr::new(192, 168, 1, 100)));
+        assert_eq!(d.server_id, Some(Ipv4Addr::new(192, 168, 1, 1)));
+        assert_eq!(d.ciaddr, Ipv4Addr::UNSPECIFIED);
+        assert_eq!(state(&c), State::Selecting);
+
+        // RFC 2131 §3.1.5: at least ten seconds before trying again.
+        *r.conflict.lock().unwrap() = false;
+        tick_after(&c, Duration::from_secs(9));
+        assert!(sent(&r).is_empty());
+        tick_after(&c, Duration::from_secs(11));
+        assert_eq!(sent(&r)[0].2.msg_type, wire::MSG_DISCOVER);
     }
 }

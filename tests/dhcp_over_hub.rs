@@ -32,12 +32,11 @@ fn adapter_obtains_lease_from_server_over_hub() {
     let adapter = L2Adapter::new_arc(pipe.clone(), L2AdapterConfig::default());
     let _adapter_handle = hub.connect_arc(adapter.clone() as Arc<dyn L2Device>);
 
-    // Kick off DHCP. The whole DISCOVER/OFFER/REQUEST/ACK exchange runs
-    // synchronously through the hub's flooding, so by the time start_dhcp
-    // returns the lease is (almost certainly) bound. Allow a brief grace
-    // period in case the timer thread is involved.
+    // Kick off DHCP. The DISCOVER/OFFER/REQUEST/ACK exchange runs
+    // synchronously through the hub's flooding; then the timer thread probes
+    // the address with ARP for about four seconds (RFC 5227) before binding.
     adapter.start_dhcp();
-    for _ in 0..50 {
+    for _ in 0..1000 {
         if pipe.addr().is_valid() {
             break;
         }
