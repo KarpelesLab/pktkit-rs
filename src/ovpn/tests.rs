@@ -1346,6 +1346,36 @@ fn push_request_flood_does_not_grow_the_send_queue() {
     );
 }
 
+/// Timers are the caller's to set, and a huge one means "never", not a
+/// panic on the first deadline computed from it.
+#[test]
+fn huge_timers_do_not_panic() {
+    let timers = PeerTimers::default()
+        .handshake_window(Duration::MAX)
+        .keepalive_interval(Duration::MAX)
+        .keepalive_timeout(Duration::MAX)
+        .renegotiate_interval(Duration::MAX)
+        .transition_window(Duration::MAX);
+    let mut server = Peer::new(server_config(), *b"SERVERID", auth_hook())
+        .unwrap()
+        .with_timers(timers);
+    let mut client = TestClient::new(*b"CLIENTID");
+    let k0 = connect(&mut server, &mut client);
+    let first = vec![client.renegotiate(1)];
+    let k1 = connect_from(&mut server, &mut client, first);
+    let later = Instant::now() + Duration::from_secs(365 * 24 * 3600);
+    let out = server.tick(later).unwrap();
+    assert!(!out.close, "{:?}", out.error);
+    assert_eq!(
+        deliver_on(&mut server, &k1, 1, 1, b"k1"),
+        Some(b"k1".to_vec())
+    );
+    assert_eq!(
+        deliver_on(&mut server, &k0, 0, 1, b"k0"),
+        Some(b"k0".to_vec())
+    );
+}
+
 // --- helpers ----------------------------------------------------------------
 
 /// Exchange what `client` has queued with `server` until both go quiet;

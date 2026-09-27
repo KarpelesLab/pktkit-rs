@@ -531,13 +531,35 @@ impl Server {
             });
     }
 
+    /// Run `f` on the peer of `entry`, under its lock. A panic in it, or a
+    /// lock some earlier panic poisoned, means the peer's state can no
+    /// longer be trusted: the peer is removed, and `None` returned. Either
+    /// way the thread goes on -- the UDP reader and the maintenance thread
+    /// serve every client, and must not die with one.
+    fn with_peer<R>(&self, entry: &Arc<PeerEntry>, f: impl FnOnce(&mut Peer) -> R) -> Option<R> {
+        let res = match entry.peer.lock() {
+            Ok(mut peer) => {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut peer))).ok()
+            }
+            Err(_) => None,
+        };
+        // Not under the peer's lock: removal may fire on_disconnect, which
+        // may call back into the server for this peer.
+        if res.is_none() {
+            self.remove_entry(entry);
+        }
+        res
+    }
+
     fn tick_peers(&self) {
         let now = crate::time::Instant::now();
         // Snapshot the entries so we don't hold the peers lock while
         // ticking (which takes each peer's own lock and may send).
         let entries: Vec<Arc<PeerEntry>> = self.peers.read().unwrap().values().cloned().collect();
         for entry in entries {
-            let out = entry.peer.lock().unwrap().tick(now);
+            let Some(out) = self.with_peer(&entry, |p| p.tick(now)) else {
+                continue;
+            };
             let Ok(out) = out else {
                 self.remove_entry(&entry);
                 continue;
@@ -627,15 +649,10 @@ impl Server {
 
     /// Run one inbound datagram through the peer and act on the output.
     fn dispatch(&self, entry: &Arc<PeerEntry>, data: &[u8]) {
-        let out = {
-            let mut peer = entry.peer.lock().unwrap();
-            match peer.handle_packet(data) {
-                Ok(o) => o,
-                // A dropped datagram; only `out.close` ends the session.
-                Err(_) => return,
-            }
-        };
-        self.apply(entry, out);
+        // An `Err` is a dropped datagram; only `out.close` ends the session.
+        if let Some(Ok(out)) = self.with_peer(entry, |p| p.handle_packet(data)) {
+            self.apply(entry, out);
+        }
     }
 
     /// Check credentials the peer handed out, then complete its
@@ -648,8 +665,7 @@ impl Server {
     /// send_to_peer. OpenVPN defers authentication the same way
     /// (KS_AUTH_DEFERRED).
     fn start_auth(&self, entry: &Arc<PeerEntry>, req: AuthRequest) {
-        let schedule = {
-            let peer = entry.peer.lock().unwrap();
+        let schedule = self.with_peer(entry, |peer| {
             let mut auth = entry.auth.lock().unwrap();
             // Credentials no longer awaited -- a client restarting drops
             // the key exchange that presented them -- need no call. Pruned
@@ -657,8 +673,8 @@ impl Server {
             auth.queued.retain(|r| peer.awaits(r));
             auth.queued.push_back(req);
             !std::mem::replace(&mut auth.scheduled, true)
-        };
-        if schedule {
+        });
+        if schedule == Some(true) {
             self.schedule_auth(entry);
         }
     }
@@ -701,8 +717,9 @@ impl Server {
             };
             for req in reqs {
                 let refused = Err(io::Error::other("no thread to check credentials on"));
-                let out = entry.peer.lock().unwrap().complete_auth(&req, refused);
-                self.apply(&entry, out);
+                if let Some(out) = self.with_peer(&entry, |p| p.complete_auth(&req, refused)) {
+                    self.apply(&entry, out);
+                }
             }
         }
     }
@@ -720,8 +737,9 @@ impl Server {
             self.announce(entry, key, cfg);
         }
 
-        if let Some(payload) = out.deliver {
-            let layer = entry.peer.lock().unwrap().layer();
+        if let Some(payload) = out.deliver
+            && let Some(layer) = self.with_peer(entry, |p| p.layer())
+        {
             callback(|| (self.cfg.on_data)(key, layer, &payload));
         }
 
@@ -773,7 +791,9 @@ impl Server {
             .get(key)
             .cloned()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "unknown peer"))?;
-        let dgram = entry.peer.lock().unwrap().send_data(payload)?;
+        let dgram = self
+            .with_peer(&entry, |p| p.send_data(payload))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "peer failed"))??;
         self.send_raw(&entry, &dgram)
     }
 
@@ -911,8 +931,12 @@ fn tcp_conn(server: &Weak<Server>, stream: TcpStream, addr: SocketAddr) {
     // backstop, and there is none without keepalive: a quiet client may
     // then stay as long as it likes, as with OpenVPN. A write blocked that
     // long means a client that stopped reading: it has given up on us too.
-    let idle = (!timers.keepalive_timeout.is_zero())
-        .then(|| (timers.keepalive_timeout * 2).max(timers.handshake_window));
+    let idle = (!timers.keepalive_timeout.is_zero()).then(|| {
+        timers
+            .keepalive_timeout
+            .saturating_mul(2)
+            .max(timers.handshake_window)
+    });
     let Ok(out) = TcpOut::spawn(write_half, idle) else {
         return;
     };
@@ -1003,7 +1027,7 @@ fn run_auth(server: &Weak<Server>, next: &Weak<PeerEntry>) {
         return;
     };
     let removed = entry.link.lock().unwrap().removed;
-    if removed || !entry.peer.lock().unwrap().awaits(&req) {
+    if removed || s.with_peer(&entry, |p| p.awaits(&req)) != Some(true) {
         return;
     }
     let on_auth = s.cfg.on_auth.clone();
@@ -1023,8 +1047,9 @@ fn run_auth(server: &Weak<Server>, next: &Weak<PeerEntry>) {
     if entry.link.lock().unwrap().removed {
         return;
     }
-    let out = entry.peer.lock().unwrap().complete_auth(&req, verdict);
-    s.apply(&entry, out);
+    if let Some(out) = s.with_peer(&entry, |p| p.complete_auth(&req, verdict)) {
+        s.apply(&entry, out);
+    }
 }
 
 /// A TCP connection's place in `tcp_streams`, given back when dropped.
@@ -2244,6 +2269,79 @@ mod tests {
             "third peer must be refused"
         );
         assert_eq!(server.peers.read().unwrap().len(), 2);
+        server.close();
+    }
+
+    fn server_with(timers: PeerTimers) -> Arc<Server> {
+        let on_auth: OnAuth = Arc::new(|_| Err(io::Error::other("no auth in this test")));
+        let on_data: OnData = Arc::new(|_, _, _| {});
+        let cfg = ServerConfig::new(
+            crate::ovpn::tests::server_config(),
+            "127.0.0.1:0".parse().unwrap(),
+            on_auth,
+            on_data,
+        )
+        .timers(timers);
+        Server::new(cfg).unwrap()
+    }
+
+    /// Timers too long for a deadline to be computed from them mean
+    /// "never": they must not panic the threads serving every client.
+    #[test]
+    fn huge_timers_do_not_stop_the_server() {
+        let server = server_with(
+            PeerTimers::default()
+                .handshake_window(Duration::MAX)
+                .keepalive_interval(Duration::MAX)
+                .keepalive_timeout(Duration::MAX)
+                .renegotiate_interval(Duration::MAX)
+                .transition_window(Duration::MAX),
+        );
+        assert!(open_udp(&udp_client(&server), *b"CLIENT01").1);
+
+        let mut tcp = tcp_client(&server);
+        tcp_send(&mut tcp, &client_reset(*b"CLIENT02"));
+        let reply = tcp_recv(&mut tcp).expect("TCP client answered");
+        assert_eq!(
+            ControlPacket::parse(&reply).unwrap().opcode,
+            Opcode::CONTROL_HARD_RESET_SERVER_V2
+        );
+
+        // Let the maintenance thread tick everyone, then check the UDP
+        // reader still serves.
+        thread::sleep(Duration::from_millis(1500));
+        assert!(open_udp(&udp_client(&server), *b"CLIENT03").1);
+        server.close();
+    }
+
+    /// A peer whose lock was poisoned -- something panicked holding it --
+    /// is dropped; the threads that serve every client carry on.
+    #[test]
+    fn a_poisoned_peer_is_dropped_and_the_server_survives() {
+        let server = server_with(PeerTimers::default());
+        let clients = [udp_client(&server), udp_client(&server)];
+        assert!(open_udp(&clients[0], *b"CLIENT01").1);
+        assert!(open_udp(&clients[1], *b"CLIENT02").1);
+        let entries: Vec<Arc<PeerEntry>> = server.peers.read().unwrap().values().cloned().collect();
+        for e in &entries {
+            let e = e.clone();
+            let _ = thread::spawn(move || {
+                let _held = e.peer.lock().unwrap();
+                panic!("poisoning the peer's lock");
+            })
+            .join();
+        }
+
+        // The maintenance tick meets them...
+        server.tick_peers();
+        assert_eq!(server.peers.read().unwrap().len(), 0);
+        // ...or the UDP reader does, dispatching a datagram to one.
+        let e = &entries[1];
+        let key = PeerKey::new(e.addr, e.transport);
+        server.peers.write().unwrap().insert(key, e.clone());
+        server.handle_udp(&client_reset(*b"CLIENT02"), e.addr);
+        assert_eq!(server.peers.read().unwrap().len(), 0);
+        assert!(open_udp(&udp_client(&server), *b"CLIENT03").1);
         server.close();
     }
 }

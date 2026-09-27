@@ -441,7 +441,7 @@ impl Peer {
                 // with no successor.
                 let e = io::Error::new(io::ErrorKind::TimedOut, "data channel key expired");
                 self.fail_session(slot, &mut out, Some(e));
-            } else if !s.primary.kx_done && now >= s.primary.must_negotiate {
+            } else if !s.primary.kx_done && s.primary.must_negotiate.is_some_and(|t| now >= t) {
                 let e = io::Error::new(
                     io::ErrorKind::TimedOut,
                     "key negotiation did not complete within the handshake window",
@@ -461,7 +461,7 @@ impl Peer {
         }
 
         if self.active.is_some() {
-            let restart = self.timers.keepalive_timeout * 2;
+            let restart = self.timers.keepalive_timeout.saturating_mul(2);
             if !restart.is_zero() && now.saturating_duration_since(self.last_recv) >= restart {
                 out.close = true;
                 out.error = Some(io::Error::new(
@@ -755,7 +755,7 @@ impl Peer {
         // install it (ssl.c tls_select_encryption_key and its
         // auth_deferred_expire); until then the previous key, if any, is used.
         let primary_ready = session.primary.data.is_some()
-            && (now >= session.primary.send_from
+            && (session.primary.send_from.is_some_and(|t| now >= t)
                 || !session.lame.as_ref().is_some_and(|k| k.data.is_some()));
         let ks = if primary_ready {
             &mut session.primary
@@ -825,12 +825,14 @@ struct KeyState {
     /// Key-method-2 exchange scratch (read incrementally from the TLS stream).
     ctrl_buf: Vec<u8>,
     kx_done: bool,
-    /// The key exchange must complete by then.
-    must_negotiate: Instant,
+    /// The key exchange must complete by then; `None` if the handshake
+    /// window is too long for a deadline to be computed: never.
+    must_negotiate: Option<Instant>,
     /// When the key exchange completed.
     established: Option<Instant>,
-    /// Send with this key only from then on, if an older one is usable.
-    send_from: Instant,
+    /// Send with this key only from then on, if an older one is usable;
+    /// `None`: not while the older one is.
+    send_from: Option<Instant>,
     /// The key stops being used then (set once it is superseded).
     must_die: Option<Instant>,
     /// Server random material (r1||r2) generated for the key exchange and
@@ -914,9 +916,9 @@ impl KeyState {
             reliable,
             ctrl_buf: Vec::new(),
             kx_done: false,
-            must_negotiate: now + timers.handshake_window,
+            must_negotiate: now.checked_add(timers.handshake_window),
             established: None,
-            send_from: now + defer,
+            send_from: now.checked_add(defer),
             must_die: None,
             server_random: [0u8; 64],
             auth_pending: None,
@@ -1016,8 +1018,12 @@ impl Session {
         self.next_key_id = if key_id >= 7 { 1 } else { key_id + 1 };
         let mut old = std::mem::replace(&mut self.primary, ks);
         if old.data.is_some() {
-            let die = now + timers.transition_window;
-            old.must_die = Some(old.must_die.map_or(die, |t| t.min(die)));
+            // A transition window too long to add up is no deadline at all.
+            let die = now.checked_add(timers.transition_window);
+            old.must_die = match (old.must_die, die) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
             self.lame = Some(old);
         }
         Ok(reset)
