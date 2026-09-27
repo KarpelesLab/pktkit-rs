@@ -181,6 +181,9 @@ pub struct Conn {
     send_buf: std::option::Option<SendBuf>,
     recv_buf: std::option::Option<RecvBuf>,
     snd_wnd: u32, // remote advertised window (already scaled)
+    /// MAX.SND.WND (RFC 5961 §5): the largest window the peer has offered,
+    /// which bounds how far below SND.UNA a genuine ACK can be.
+    max_snd_wnd: u32,
     mss: u16,
     cc: Box<dyn CongestionController>,
 
@@ -292,6 +295,7 @@ impl Conn {
             send_buf: None,
             recv_buf: None,
             snd_wnd: DEFAULT_WINDOW_SIZE as u32,
+            max_snd_wnd: 0,
             mss,
             cc,
             rto: RtoState::new(),
@@ -910,7 +914,7 @@ impl Conn {
             // RFC 7323 §2.2: the window in a SYN or SYN-ACK is never
             // scaled. Scaling it made the first real ACK look like a window
             // change, so it could not count as a duplicate.
-            self.snd_wnd = seg.window as u32;
+            self.set_snd_wnd(seg.window as u32);
             self.cc = make_cc(self.cfg.congestion, self.mss as u32);
             self.rto.ack_received(seg.ack);
             self.state = State::Established;
@@ -936,7 +940,7 @@ impl Conn {
             self.cfg.recv_buf_size,
         ));
         // A SYN's window is never scaled (RFC 7323 §2.2).
-        self.snd_wnd = seg.window as u32;
+        self.set_snd_wnd(seg.window as u32);
         self.state = State::SynReceived;
         self.retries = 0;
         self.stop_rto();
@@ -983,7 +987,7 @@ impl Conn {
         self.send_buf.as_mut().unwrap().acknowledge(seg.ack);
         self.retries = 0;
         self.stop_rto();
-        self.snd_wnd = (seg.window as u32) << self.snd_wnd_shift;
+        self.set_snd_wnd((seg.window as u32) << self.snd_wnd_shift);
         self.state = State::Established;
         if self.cfg.keepalive {
             self.start_keepalive();
@@ -1004,8 +1008,8 @@ impl Conn {
             return self.take_outgoing();
         }
 
-        if seg.has_flag(flags::ACK) {
-            self.process_ack(seg);
+        if seg.has_flag(flags::ACK) && !self.process_ack(seg) {
+            return self.take_outgoing();
         }
 
         if !seg.payload.is_empty() {
@@ -1128,18 +1132,30 @@ impl Conn {
         self.snd_wl = Some((seg.seq, seg.ack));
         let wnd = (seg.window as u32) << self.snd_wnd_shift;
         let changed = wnd != self.snd_wnd;
-        self.snd_wnd = wnd;
+        self.set_snd_wnd(wnd);
         changed
     }
 
-    fn process_ack(&mut self, seg: &Segment) {
+    fn set_snd_wnd(&mut self, wnd: u32) {
+        self.snd_wnd = wnd;
+        self.max_snd_wnd = self.max_snd_wnd.max(wnd);
+    }
+
+    /// Process the ACK field. Returns false if the segment must be dropped
+    /// without looking at its data or FIN.
+    fn process_ack(&mut self, seg: &Segment) -> bool {
         let ack = seg.ack;
         let opts = &seg.options;
         let una = self.send_buf.as_ref().unwrap().una();
         let snd_nxt = self.send_buf.as_ref().unwrap().nxt();
-        if seq_after(ack, snd_nxt) {
+        // RFC 9293 §3.10.7.4 drops a segment acknowledging what was never
+        // sent, and RFC 5961 §5.2 one acknowledging further back than any
+        // window the peer offered: neither can come from the peer, and a
+        // blind attacker who guessed only the SEQ would get its payload in.
+        let oldest = una.wrapping_sub(self.max_snd_wnd.min(1 << 30));
+        if seq_after(ack, snd_nxt) || seq_before(ack, oldest) {
             self.queue_ack();
-            return;
+            return false;
         }
         // The window comes first: the flush below must see this segment's.
         let wnd_changed = self.update_send_window(seg);
@@ -1169,7 +1185,7 @@ impl Conn {
                 }
                 self.flush_send_queue();
             }
-            return;
+            return true;
         }
 
         let acked = self.send_buf.as_mut().unwrap().acknowledge(ack);
@@ -1222,6 +1238,7 @@ impl Conn {
         }
 
         self.flush_send_queue();
+        true
     }
 
     fn on_dup_ack(&mut self, snd_nxt: u32) {
@@ -2827,6 +2844,53 @@ mod tests {
         let blocks = get_sack_blocks(&last.options);
         assert_eq!(blocks.len(), 4, "{blocks:?}");
         assert_eq!(blocks[0].left, parse(&segs[7]).seq, "newest first");
+    }
+
+    /// A data segment from `server` to `client` carrying `ack`.
+    fn data_with_ack(client: &Conn, server: &Conn, ack: u32, payload: &[u8], fin: bool) -> Segment {
+        Segment {
+            src_port: server.cfg.local_port,
+            dst_port: client.cfg.local_port,
+            seq: client.recv_buf.as_ref().unwrap().nxt(),
+            ack,
+            flags: flags::ACK | if fin { flags::FIN } else { 0 },
+            window: 4096,
+            payload: payload.to_vec(),
+            ..Default::default()
+        }
+    }
+
+    // RFC 9293 §3.10.7.4: an ACK for something not yet sent gets an ACK
+    // back and the segment is dropped, data and FIN included. Accepting the
+    // payload would let a blind attacker who guessed only the SEQ inject it.
+    #[test]
+    fn ack_of_unsent_data_drops_the_segment() {
+        let (mut client, server) = established(40250);
+        let nxt = client.send_buf.as_ref().unwrap().nxt();
+        let seg = data_with_ack(&client, &server, nxt.wrapping_add(1000), b"evil", true);
+        let out = client.handle_segment(&seg);
+        assert_eq!(out.len(), 1);
+        assert_eq!(parse(&out[0]).ack, seg.seq, "the ACK must not cover it");
+        assert!(read_all(&mut client).is_empty());
+        assert!(!client.fin_received());
+        assert_eq!(client.state(), State::Established);
+    }
+
+    // RFC 5961 §5.2: an ACK more than MAX.SND.WND below SND.UNA cannot come
+    // from the peer; drop the segment and send a challenge ACK.
+    #[test]
+    fn ack_far_below_snd_una_drops_the_segment() {
+        let (mut client, server) = established(40251);
+        let una = client.send_buf.as_ref().unwrap().una();
+        let seg = data_with_ack(&client, &server, una.wrapping_sub(100_000), b"evil", false);
+        let out = client.handle_segment(&seg);
+        assert_eq!(out.len(), 1);
+        assert!(read_all(&mut client).is_empty());
+
+        // An old ACK within the window is fine: the data is taken.
+        let seg = data_with_ack(&client, &server, una.wrapping_sub(1000), b"good", false);
+        client.handle_segment(&seg);
+        assert_eq!(read_all(&mut client), b"good");
     }
 
     #[test]
