@@ -85,6 +85,10 @@ pub struct L2Adapter {
     /// anyone has turned out to be using it.
     #[cfg(feature = "dhcp")]
     probe: Mutex<Option<(Ipv4Addr, bool)>>,
+    /// The source address and MAC of the last DHCP server message: where a
+    /// unicast to that server goes, kept apart from the ARP cache.
+    #[cfg(feature = "dhcp")]
+    dhcp_server: Mutex<Option<(Ipv4Addr, MacAddr)>>,
 
     /// ARP and NDP messages from other stations claiming one of our
     /// addresses (RFC 5227 §2.4).
@@ -140,6 +144,8 @@ impl L2Adapter {
             dhcp: Mutex::new(None),
             #[cfg(feature = "dhcp")]
             probe: Mutex::new(None),
+            #[cfg(feature = "dhcp")]
+            dhcp_server: Mutex::new(None),
             conflicts: AtomicU64::new(0),
             // A whole queue's worth at once, so one failed resolution is
             // reported in full.
@@ -359,6 +365,11 @@ impl L2Adapter {
                             if let Some(c) = dhcp
                                 && c.is_active()
                             {
+                                if let (Some(mac), Some(ip)) = (f.src_mac(), pkt.ipv4_src_addr())
+                                    && udp[0..2] == 67u16.to_be_bytes()
+                                {
+                                    *self.dhcp_server.lock().unwrap() = Some((ip, mac));
+                                }
                                 c.handle_packet(&udp[8..]);
                                 return;
                             }
@@ -852,12 +863,28 @@ impl crate::dhcp::ClientTransport for AdapterDhcpTransport {
             a.send_l2(frame);
         }
     }
-    fn send_unicast(&self, _dst_ip: Ipv4Addr, frame: &Frame) {
+    fn send_unicast(&self, dst_ip: Ipv4Addr, frame: &Frame) {
         let Some(a) = self.weak.upgrade() else {
             return;
         };
-        // Routed like the host's own traffic: to the server, or to the
-        // gateway if the server is off our subnet, ARPing for it (and
+        // An on-link server is sent to at the MAC its own messages came
+        // from. ARP could name another station: a virtual LAN may give the
+        // DHCP server the router's address, and then the router answers
+        // the ARP but would not hand the message on. Only the message goes
+        // there; the ARP cache is not told, so the router keeps the
+        // address for everything else.
+        let known = *a.dhcp_server.lock().unwrap();
+        if let Some((ip, mac)) = known
+            && ip == dst_ip
+            && a.on_link_v4(ip)
+        {
+            let mut buf = frame.as_bytes().to_vec();
+            buf[0..6].copy_from_slice(&mac.octets());
+            a.send_l2(Frame::from_slice(&buf));
+            return;
+        }
+        // Otherwise routed like the host's own traffic: to the server, or
+        // to the gateway if the server is off our subnet, ARPing for it (and
         // queueing the message) on a miss. Sent to the broadcast MAC, a
         // datagram for a unicast address would be discarded by a host
         // following RFC 1122 §3.3.6.
@@ -1960,6 +1987,40 @@ mod tests {
         let sent = take(&out);
         assert_eq!(sent.len(), 1, "RELEASE lost with the lease");
         assert_eq!(Frame::from_slice(&sent[0]).dst_mac(), Some(server_mac));
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn dhcp_unicasts_go_where_the_server_answered_from() {
+        use crate::dhcp::ClientTransport;
+        let (pipe, adapter, out) = rig("0.0.0.0/0");
+        adapter.start_dhcp();
+        let t = AdapterDhcpTransport {
+            weak: Arc::downgrade(&adapter),
+        };
+        // The DHCP server shares the router's address, and answers no ARP.
+        let (us, server) = (Ipv4Addr::new(10, 0, 0, 5), Ipv4Addr::new(10, 0, 0, 1));
+        let server_mac = MacAddr([2, 0xdd, 0, 0, 0, 1]);
+        let udp = crate::build::build_udp(server.into(), us.into(), 67, 68, &[0; 240]);
+        let reply = crate::build::build_ipv4(server, us, Protocol::UDP, 64, &udp);
+        let f = build_frame(adapter.mac, server_mac, EtherType::IPV4, &reply);
+        adapter.send(Frame::from_slice(&f)).unwrap();
+        adapter.stop_dhcp();
+        t.on_bound("10.0.0.5/24".parse().unwrap(), Some(server));
+        take(&out);
+
+        t.send_unicast(
+            server,
+            Frame::from_slice(&dhcp_unicast(&adapter, us, server)),
+        );
+        let sent = take(&out);
+        assert_eq!(sent.len(), 1, "not sent at once");
+        assert_eq!(Frame::from_slice(&sent[0]).dst_mac(), Some(server_mac));
+        // Everything else for that address still goes by ARP: the router's.
+        assert_eq!(adapter.arp.lookup(server), None, "ARP cache told");
+        pipe.inject(Packet::from_slice(&v4_packet(us.octets(), server.octets())))
+            .unwrap();
+        assert_eq!(solicited(&take(&out)), [IpAddr::V4(server)]);
     }
 
     #[test]
