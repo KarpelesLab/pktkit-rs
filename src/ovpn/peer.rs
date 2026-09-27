@@ -224,6 +224,10 @@ const PACKET_ID_WRAP_TRIGGER: u32 = 0xFF00_0000;
 /// renegotiation to finish before the bound itself is reached.
 const AEAD_USAGE_LIMIT: u64 = ((1 << 36) - 1) / 8 * 7;
 
+/// The bound itself: an AES-GCM key that has protected this much is used
+/// no more, whether or not a successor is ready.
+const AEAD_HARD_LIMIT: u64 = (1 << 36) - 1;
+
 /// How long a rejected session lingers to deliver AUTH_FAILED (OpenVPN's
 /// scheduled exit after send_auth_failed).
 const AUTH_FAILED_EXIT: Duration = Duration::from_secs(5);
@@ -459,6 +463,13 @@ impl Peer {
                 );
                 self.fail_key(slot, &mut out, e);
             }
+        }
+
+        if let Some(s) = self.active.as_mut()
+            && s.retire_exhausted_keys()
+        {
+            let e = io::Error::other("data channel key reached its AES-GCM usage limit");
+            self.fail_session(Slot::Active, &mut out, Some(e));
         }
 
         let timers = self.timers;
@@ -773,6 +784,9 @@ impl Peer {
             .find(|k| k.key_id == key_id)
             .and_then(|k| k.data.as_mut())
             .ok_or_else(|| invalid("data packet for an unknown key id"))?;
+        if opts.cipher_block == super::GCM && dk.aead_exhausted() {
+            return Err(invalid("data channel key reached its AES-GCM usage limit"));
+        }
 
         let mut buf = data.to_vec();
         let dec = data::decrypt(opts, &dk.keys, &mut buf)?
@@ -819,6 +833,9 @@ impl Peer {
         };
         let key_id = ks.key_id;
         let dk = ks.data.as_mut().expect("checked above");
+        if opts.cipher_block == super::GCM && dk.aead_exhausted() {
+            return Err(invalid("data channel key reached its AES-GCM usage limit"));
+        }
         // The packet id is the GCM nonce prefix: wrapping it would reuse a
         // nonce under the same key. OpenVPN (packet_id_send_update) refuses
         // to send once the id space is spent; only a new key resets it, and
@@ -926,8 +943,19 @@ impl DataKeys {
     /// (crypto.h aead_usage_limit_reached): blocks plus packets, in
     /// either direction.
     fn aead_limit_reached(&self) -> bool {
-        self.enc_blocks + u64::from(self.out_pid) > AEAD_USAGE_LIMIT
-            || self.dec_blocks + u64::from(self.in_pid) > AEAD_USAGE_LIMIT
+        self.aead_usage() > AEAD_USAGE_LIMIT
+    }
+
+    /// Whether the key has reached the AES-GCM bound itself.
+    fn aead_exhausted(&self) -> bool {
+        self.aead_usage() >= AEAD_HARD_LIMIT
+    }
+
+    /// Blocks plus packets, in whichever direction has seen more.
+    fn aead_usage(&self) -> u64 {
+        let enc = self.enc_blocks.saturating_add(u64::from(self.out_pid));
+        let dec = self.dec_blocks.saturating_add(u64::from(self.in_pid));
+        enc.max(dec)
     }
 }
 
@@ -1039,18 +1067,40 @@ impl Session {
         let (Some(established), Some(data)) = (k.established, k.data.as_ref()) else {
             return false;
         };
-        // A key we fell back to after a failed renegotiation just runs out
-        // its transition window.
-        if k.must_die.is_some() || self.auth_failed.is_some() {
+        if self.auth_failed.is_some() {
             return false;
+        }
+        let used_up =
+            data.out_pid >= PACKET_ID_WRAP_TRIGGER || (self.is_gcm() && data.aead_limit_reached());
+        // A key we fell back to after a failed renegotiation just runs out
+        // its transition window -- unless it cannot safely last that long:
+        // then the renegotiation is tried again.
+        if k.must_die.is_some() {
+            return used_up;
         }
         let by_age = !timers.renegotiate_interval.is_zero()
             && now.saturating_duration_since(established) >= timers.renegotiate_interval;
-        let aead = self
-            .opts
+        by_age || used_up
+    }
+
+    /// Whether the data channel runs AES-GCM, which has a usage limit.
+    fn is_gcm(&self) -> bool {
+        self.opts
             .as_ref()
-            .is_some_and(|o| o.cipher_block == super::GCM);
-        by_age || data.out_pid >= PACKET_ID_WRAP_TRIGGER || (aead && data.aead_limit_reached())
+            .is_some_and(|o| o.cipher_block == super::GCM)
+    }
+
+    /// Stop using AES-GCM keys that reached the bound itself. Whether the
+    /// session is left without a usable key, and must end.
+    fn retire_exhausted_keys(&mut self) -> bool {
+        if !self.is_gcm() {
+            return false;
+        }
+        let exhausted = |k: &KeyState| k.data.as_ref().is_some_and(DataKeys::aead_exhausted);
+        if self.lame.as_ref().is_some_and(exhausted) {
+            self.lame = None;
+        }
+        exhausted(&self.primary)
     }
 
     /// Start negotiating the next key (ssl.c key_state_soft_reset): the
@@ -1726,6 +1776,51 @@ mod tests {
         let pkt = data::encrypt(&opts, &keys, 0, 1, b"x", fill_random).unwrap();
         assert!(p.handle_packet(&pkt).unwrap().deliver.is_some());
         assert!(soft_reset(&p.tick(Instant::now()).unwrap()));
+    }
+
+    /// A key fallen back to after a failed renegotiation normally just
+    /// runs out its transition window; one that has reached its AES-GCM
+    /// usage limit must still be renegotiated, not used on regardless.
+    #[test]
+    fn a_fallback_key_past_its_usage_limit_is_renegotiated() {
+        let mut p = keyed_peer().with_timers(
+            PeerTimers::default()
+                .renegotiate_interval(Duration::ZERO)
+                .keepalive_interval(Duration::ZERO),
+        );
+        let far = Instant::now() + Duration::from_secs(3600);
+        let s = p.active.as_mut().unwrap();
+        s.primary.must_die = Some(far);
+        assert!(p.tick(Instant::now()).unwrap().send.is_empty());
+        let dk = p.active.as_mut().unwrap().primary.data.as_mut().unwrap();
+        dk.enc_blocks = AEAD_USAGE_LIMIT + 1;
+        let out = p.tick(Instant::now()).unwrap();
+        assert!(
+            out.send.iter().any(|d| {
+                ControlPacket::parse(d).is_ok_and(|p| p.opcode == Opcode::CONTROL_SOFT_RESET_V1)
+            }),
+            "no renegotiation"
+        );
+    }
+
+    /// At the AES-GCM bound itself a key is used no more, in either
+    /// direction, and a session left with nothing else is closed.
+    #[test]
+    fn an_exhausted_gcm_key_ends_the_session() {
+        let quiet = PeerTimers::default()
+            .renegotiate_interval(Duration::ZERO)
+            .keepalive_interval(Duration::ZERO);
+        let mut p = keyed_peer().with_timers(quiet);
+        let dk = p.active.as_mut().unwrap().primary.data.as_mut().unwrap();
+        dk.dec_blocks = AEAD_HARD_LIMIT;
+        let opts = p.active.as_ref().unwrap().opts.clone().unwrap();
+        let keys = PeerKeys::from_expansion(&[7u8; 256]);
+        let pkt = data::encrypt(&opts, &keys, 0, 1, b"x", fill_random).unwrap();
+        assert!(p.handle_packet(&pkt).is_err());
+        assert!(p.send_data(b"x").is_err());
+        let out = p.tick(Instant::now()).unwrap();
+        assert!(out.close);
+        assert!(out.error.is_some());
     }
 
     #[test]
