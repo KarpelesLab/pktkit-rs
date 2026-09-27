@@ -1548,7 +1548,6 @@ fn try_parse_key_exchange(buf: &[u8]) -> io::Result<Option<(KeyExchange, usize)>
         username,
         password,
         peer_info,
-        peer_info_raw,
     };
     Ok(Some((kx, used)))
 }
@@ -1638,7 +1637,10 @@ fn build_kx_reply(server_random: &[u8; 64], kx: &KeyExchange) -> Vec<u8> {
     write_control_string(&mut buf, &kx.options_server);
     write_control_string(&mut buf, ""); // username
     write_control_string(&mut buf, ""); // password
-    write_control_string(&mut buf, &kx.peer_info_raw);
+    // Our own peer info, which is nothing (write_empty_string, as OpenVPN
+    // writes when it has none to push): echoing the client's would claim
+    // its version and platform as ours, and send back whatever it put there.
+    buf.extend_from_slice(&0u16.to_be_bytes());
     buf
 }
 
@@ -1659,7 +1661,6 @@ struct KeyExchange {
     username: String,
     password: String,
     peer_info: std::collections::HashMap<String, String>,
-    peer_info_raw: String,
 }
 
 /// Read a control string at `pos`: a big-endian u16 length followed by that

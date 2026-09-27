@@ -1401,6 +1401,30 @@ fn lame_duck_key_keeps_its_control_channel() {
     assert_eq!(key0(&out), 0, "acknowledged, so no longer retransmitted");
 }
 
+/// The server's key-method-2 reply carries its own peer info, not the
+/// client's echoed back: that would claim the client's version and
+/// platform as the server's, and hand back whatever the client put there.
+#[test]
+fn server_does_not_echo_the_client_peer_info() {
+    let mut server = Peer::new(server_config(), *b"SERVERID", auth_hook()).unwrap();
+    let mut client = TestClient::new(*b"CLIENTID");
+    client.kx.peer_info = Some("IV_VER=2.6.8\nIV_PLAT=linux\nUV_SECRET=hunter2\n".into());
+    connect(&mut server, &mut client);
+    // [0:4][key method:1][random:64], then the options string, username,
+    // password and peer info, each a u16 length and its bytes.
+    let buf = client.control_text();
+    let mut pos = 4 + 1 + 64;
+    let mut strings = Vec::new();
+    for _ in 0..4 {
+        let len = u16::from_be_bytes([buf[pos], buf[pos + 1]]) as usize;
+        strings.push(buf[pos + 2..pos + 2 + len].to_vec());
+        pos += 2 + len;
+    }
+    let peer_info = String::from_utf8_lossy(&strings[3]);
+    assert!(!peer_info.contains("UV_SECRET"), "{peer_info:?}");
+    assert!(!peer_info.contains("IV_PLAT=linux"), "{peer_info:?}");
+}
+
 /// Have the client ask for its config and lose the server's reply, leaving
 /// a control packet on `server` that is never acknowledged.
 fn lose_a_control_reply(server: &mut Peer, client: &mut TestClient) {
