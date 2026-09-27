@@ -326,7 +326,7 @@ mod tests {
     /// passes: the loop must wait it out, not stop accepting for good.
     #[test]
     fn serve_retries_transient_accept_errors() {
-        #[cfg(unix)]
+        #[cfg(not(windows))]
         let emfile = std::io::Error::from_raw_os_error(24);
         #[cfg(windows)]
         let emfile = std::io::Error::from_raw_os_error(10024);
