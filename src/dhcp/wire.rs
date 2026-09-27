@@ -31,6 +31,7 @@ pub const OPT_REBINDING_TIME: u8 = 59;
 pub const OPT_MESSAGE_TYPE: u8 = 53;
 pub const OPT_SERVER_ID: u8 = 54;
 pub const OPT_PARAM_REQUEST: u8 = 55;
+pub const OPT_OVERLOAD: u8 = 52;
 pub const OPT_END: u8 = 255;
 
 /// BOOTP minimum size (header + cookie + a few bytes of options).
@@ -108,24 +109,24 @@ impl Parsed {
             },
             ..Default::default()
         };
-        let mut opts = &b[240..];
-        while !opts.is_empty() {
-            let code = opts[0];
-            if code == OPT_END {
-                break;
-            }
-            if code == OPT_PAD {
-                opts = &opts[1..];
-                continue;
-            }
-            if opts.len() < 2 {
-                break;
-            }
-            let len = opts[1] as usize;
-            if opts.len() < 2 + len {
-                break;
-            }
-            let data = &opts[2..2 + len];
+        // RFC 3396: an option may come as several instances, which are one
+        // option once concatenated; and option 52 may move options into the
+        // file and sname fields, read after the options field in that order.
+        let mut opts: Vec<(u8, Vec<u8>)> = Vec::new();
+        collect_options(&b[240..], &mut opts);
+        let overload = opts
+            .iter()
+            .find(|(c, _)| *c == OPT_OVERLOAD)
+            .and_then(|(_, d)| d.first().copied())
+            .unwrap_or(0);
+        if overload & 1 != 0 {
+            collect_options(&b[108..236], &mut opts);
+        }
+        if overload & 2 != 0 {
+            collect_options(&b[44..108], &mut opts);
+        }
+        for (code, data) in &opts {
+            let (code, data, len) = (*code, &data[..], data.len());
             match code {
                 OPT_MESSAGE_TYPE if len >= 1 => p.msg_type = data[0],
                 OPT_SUBNET_MASK if len == 4 => {
@@ -158,9 +159,33 @@ impl Parsed {
                 }
                 _ => {}
             }
-            opts = &opts[2 + len..];
         }
         Some(p)
+    }
+}
+
+/// Walk one option area into `out`, joining the instances of each option
+/// (RFC 3396 §7). Stops at END, or at an option that runs off the area.
+fn collect_options(mut area: &[u8], out: &mut Vec<(u8, Vec<u8>)>) {
+    while let Some(&code) = area.first() {
+        if code == OPT_END {
+            break;
+        }
+        if code == OPT_PAD {
+            area = &area[1..];
+            continue;
+        }
+        let Some(&len) = area.get(1) else {
+            break;
+        };
+        let Some(data) = area.get(2..2 + len as usize) else {
+            break;
+        };
+        match out.iter_mut().find(|(c, _)| *c == code) {
+            Some((_, d)) => d.extend_from_slice(data),
+            None => out.push((code, data.to_vec())),
+        }
+        area = &area[2 + len as usize..];
     }
 }
 
@@ -205,12 +230,24 @@ impl Builder {
         self
     }
 
-    /// Append an option with `len` bytes of `data`.
+    /// Append an option carrying `data`.
+    ///
+    /// Data longer than the 255 bytes one length octet can describe goes
+    /// out as consecutive instances of the option, which the receiver joins
+    /// back together (RFC 3396); a single one would state a wrapped length
+    /// and garble every option after it.
     pub fn option(&mut self, code: u8, data: &[u8]) -> &mut Self {
-        self.buf.push(code);
-        self.buf.push(data.len() as u8);
-        self.buf.extend_from_slice(data);
-        self.off += 2 + data.len();
+        let mut chunks = data.chunks(255).peekable();
+        if chunks.peek().is_none() {
+            self.buf.extend_from_slice(&[code, 0]);
+            self.off += 2;
+        }
+        for chunk in chunks {
+            self.buf.push(code);
+            self.buf.push(chunk.len() as u8);
+            self.buf.extend_from_slice(chunk);
+            self.off += 2 + chunk.len();
+        }
         self
     }
 
@@ -306,6 +343,39 @@ mod tests {
     #[test]
     fn parse_rejects_short() {
         assert!(Parsed::from_bytes(&[0u8; 100]).is_none());
+    }
+
+    #[test]
+    fn an_option_longer_than_255_bytes_is_split_and_rejoined() {
+        // 64 DNS servers are 256 bytes: one past what a length octet holds.
+        let dns: Vec<Ipv4Addr> = (0..64).map(|i| Ipv4Addr::new(10, 0, 0, i)).collect();
+        let mut b = Builder::new(2, 1, MacAddr::zero());
+        b.message_type(MSG_ACK).ipv4_list_option(OPT_DNS, &dns);
+        let pkt = b.finish();
+        // RFC 3396: consecutive instances, each at most 255 bytes.
+        assert_eq!(pkt[243], OPT_DNS);
+        assert_eq!(pkt[244], 255);
+        assert_eq!(Parsed::from_bytes(&pkt).unwrap().dns, dns);
+    }
+
+    #[test]
+    fn options_overloaded_into_file_and_sname_are_parsed() {
+        let mut b = Builder::new(2, 1, MacAddr::zero());
+        b.message_type(MSG_OFFER).option(OPT_OVERLOAD, &[3]);
+        let mut pkt = b.finish();
+        // RFC 2131 §4.1 / RFC 3396: options field, then file, then sname.
+        pkt[108..116].copy_from_slice(&[OPT_SERVER_ID, 4, 10, 0, 0, 1, OPT_END, 0]);
+        pkt[44..51].copy_from_slice(&[OPT_LEASE_TIME, 4, 0, 0, 0x0e, 0x10, OPT_END]);
+        let p = Parsed::from_bytes(&pkt).unwrap();
+        assert_eq!(p.server_id, Some(Ipv4Addr::new(10, 0, 0, 1)));
+        assert_eq!(p.lease_time, Some(3600));
+
+        // Without the overload option, those fields are a name and a path.
+        let mut b = Builder::new(2, 1, MacAddr::zero());
+        b.message_type(MSG_OFFER);
+        let mut pkt = b.finish();
+        pkt[108..116].copy_from_slice(&[OPT_SERVER_ID, 4, 10, 0, 0, 1, OPT_END, 0]);
+        assert_eq!(Parsed::from_bytes(&pkt).unwrap().server_id, None);
     }
 
     #[test]
