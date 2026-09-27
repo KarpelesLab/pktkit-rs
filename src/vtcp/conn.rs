@@ -504,6 +504,11 @@ impl Conn {
             our_iss.wrapping_add(1),
         ));
         self.recv_buf = Some(RecvBuf::new(remote_seq, self.cfg.recv_buf_size));
+        // The completing ACK's window is not passed in; without a seed,
+        // MAX.SND.WND of zero would drop every reordered older ACK until
+        // the next window update.
+        let wnd = self.snd_wnd;
+        self.set_snd_wnd(wnd);
         self.state = State::Established;
         self.signal_established();
 
@@ -3342,6 +3347,27 @@ mod tests {
         deliver(&mut b, &a_synack);
         assert_eq!(a.state(), State::Established);
         assert_eq!(read_all(&mut a), b"early");
+    }
+
+    // A connection accepted from a SYN cookie still takes a reordered
+    // segment whose ACK is a little behind SND.UNA.
+    #[test]
+    fn cookie_connection_accepts_slightly_old_ack() {
+        let mut c = Conn::new(cfg(80, 40350));
+        c.accept_cookie(1001, 5000, 1460, b"");
+        let una = c.send_buf.as_ref().unwrap().una();
+        let seg = Segment {
+            src_port: 40350,
+            dst_port: 80,
+            seq: 1001,
+            ack: una.wrapping_sub(10),
+            flags: flags::ACK,
+            window: 4096,
+            payload: b"hi".to_vec(),
+            ..Default::default()
+        };
+        c.handle_segment(&seg);
+        assert_eq!(read_all(&mut c), b"hi");
     }
 
     // RFC 6528: a new connection on the same 4-tuple starts just past the
