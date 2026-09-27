@@ -311,8 +311,9 @@ impl Peer {
     /// Because the crate is caller-driven (no per-peer background thread), the
     /// server/[`Adapter`](super::Adapter) must call this on a timer — roughly
     /// once per retransmit interval (~1s) — for each live peer. Returns the
-    /// datagrams to re-send in [`PeerOutput`]`::send`; if a packet exhausts its
-    /// retries the connection is abandoned and `PeerOutput::close` is set.
+    /// datagrams to re-send in [`PeerOutput`]`::send`. As in OpenVPN, a
+    /// packet is retried for as long as its key lives: a lost ACK alone never
+    /// ends a session.
     ///
     /// The same tick runs the peer's other timers: a session that has not
     /// completed its key exchange within the handshake window is abandoned,
@@ -345,9 +346,6 @@ impl Peer {
                 // with no successor.
                 let e = io::Error::new(io::ErrorKind::TimedOut, "data channel key expired");
                 self.fail_session(slot, &mut out, Some(e));
-            } else if tick.timed_out {
-                let e = io::Error::new(io::ErrorKind::TimedOut, "control packet never ACKed");
-                self.fail_key(slot, &mut out, e);
             } else if !s.primary.kx_done && now >= s.primary.must_negotiate {
                 let e = io::Error::new(
                     io::ErrorKind::TimedOut,

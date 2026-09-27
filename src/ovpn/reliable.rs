@@ -25,10 +25,12 @@ use super::packet_ctrl::ControlPacket;
 /// reliable layer starts at ~1s and backs off exponentially.
 pub const RETRANSMIT_INITIAL: Duration = Duration::from_secs(1);
 /// Cap on the backed-off retransmit interval (OpenVPN clamps around here).
+///
+/// There is no cap on the number of attempts: like OpenVPN's reliable_send,
+/// a packet is retried for as long as its key lives. What gives up on an
+/// unresponsive client is the handshake window, for a key still
+/// negotiating, and ping-restart for an established one.
 pub const RETRANSMIT_MAX_INTERVAL: Duration = Duration::from_secs(8);
-/// Maximum number of retransmit attempts before the packet is abandoned and
-/// the caller is told to tear the connection down.
-pub const RETRANSMIT_MAX_ATTEMPTS: u32 = 8;
 
 /// Outcome of feeding one control packet into the reliable layer.
 #[derive(Debug, Default)]
@@ -49,15 +51,11 @@ struct Unacked {
     attempts: u32,
 }
 
-/// Outcome of a retransmission tick: datagrams to resend and whether the
-/// connection has exhausted its retries and should be closed.
+/// Outcome of a retransmission tick: datagrams to resend.
 #[derive(Debug, Default)]
 pub struct TickOutcome {
     /// Re-serialized control datagrams to put back on the wire.
     pub resend: Vec<Vec<u8>>,
-    /// True if some packet blew past [`RETRANSMIT_MAX_ATTEMPTS`]; the caller
-    /// should tear the connection down.
-    pub timed_out: bool,
 }
 
 /// Reliable transport state for one peer.
@@ -284,9 +282,7 @@ impl Reliable {
     /// Drive retransmission timers. For every unacknowledged outgoing packet
     /// whose retransmit deadline (`last_sent + backoff(attempts)`) has passed
     /// at `now`, re-serialize it, bump its attempt count, double its backoff,
-    /// and reset its send time. Packets that exceed
-    /// [`RETRANSMIT_MAX_ATTEMPTS`] are dropped and flagged via
-    /// [`TickOutcome::timed_out`] so the caller can close the connection.
+    /// and reset its send time.
     ///
     /// This is the caller-driven equivalent of OpenVPN's per-packet
     /// retransmit timer: there is no background thread, so the server (or the
@@ -313,12 +309,7 @@ impl Reliable {
 
         for pid in due {
             let u = self.unacked.get_mut(&pid).expect("pid just collected");
-            if u.attempts >= RETRANSMIT_MAX_ATTEMPTS {
-                outcome.timed_out = true;
-                self.unacked.remove(&pid);
-                continue;
-            }
-            u.attempts += 1;
+            u.attempts = u.attempts.saturating_add(1);
             u.last_sent = now;
             // Re-send the packet exactly as first framed (no ACKs piggybacked).
             outcome.resend.push(u.pkt.to_bytes(&[]));
@@ -471,13 +462,11 @@ mod tests {
         // Before the deadline: nothing to resend.
         let early = r.tick(start + RETRANSMIT_INITIAL - Duration::from_millis(1));
         assert!(early.resend.is_empty());
-        assert!(!early.timed_out);
 
         // Past the deadline: the original packet comes back out verbatim.
         let late = r.tick(start + RETRANSMIT_INITIAL + Duration::from_millis(1));
         assert_eq!(late.resend.len(), 1);
         assert_eq!(late.resend[0], p.to_bytes(&[]));
-        assert!(!late.timed_out);
     }
 
     #[test]
@@ -518,26 +507,17 @@ mod tests {
         assert_eq!(r.tick(t3).resend.len(), 1);
     }
 
+    /// Retransmission never gives up (reliable.c has no retry limit); it
+    /// settles at the capped interval.
     #[test]
-    fn retries_cap_and_signal_timeout() {
+    fn retransmits_forever_at_the_capped_interval() {
         let mut r = Reliable::new(local());
         let _p = r.build_control(b"x");
         let mut t = Instant::now();
-        let mut timed_out = false;
-        // Advance well past each (growing) deadline until the packet is dropped.
-        for _ in 0..(RETRANSMIT_MAX_ATTEMPTS + 4) {
-            t += RETRANSMIT_MAX_INTERVAL * 2;
-            let out = r.tick(t);
-            if out.timed_out {
-                timed_out = true;
-                break;
-            }
+        for _ in 0..100 {
+            t += RETRANSMIT_MAX_INTERVAL;
+            assert_eq!(r.tick(t).resend.len(), 1);
         }
-        assert!(timed_out, "packet should eventually time out");
-        // Once timed out the packet is gone; further ticks are quiet.
-        assert_eq!(r.unacked_count(), 0);
-        let after = r.tick(t + RETRANSMIT_MAX_INTERVAL * 2);
-        assert!(after.resend.is_empty());
-        assert!(!after.timed_out);
+        assert_eq!(r.unacked_count(), 1);
     }
 }

@@ -1116,6 +1116,68 @@ fn client_may_renegotiate_after_a_failed_attempt() {
     );
 }
 
+/// Have the client ask for its config and lose the server's reply, leaving
+/// a control packet on `server` that is never acknowledged.
+fn lose_a_control_reply(server: &mut Peer, client: &mut TestClient) {
+    for d in client.send_control(b"PUSH_REQUEST\0") {
+        let out = server.handle_packet(&d).unwrap();
+        assert!(!out.send.is_empty(), "server answers PUSH_REQUEST");
+    }
+}
+
+/// Tick `server` once a second for `secs` seconds from `start`, returning
+/// how many datagrams it retransmitted in the last minute.
+fn tick_for(server: &mut Peer, start: Instant, secs: u64) -> usize {
+    let mut late = 0;
+    for s in 1..=secs {
+        let out = server.tick(start + Duration::from_secs(s)).unwrap();
+        assert!(!out.close, "closed at {s}s: {:?}", out.error);
+        if s + 60 > secs {
+            late += out.send.len();
+        }
+    }
+    late
+}
+
+/// Once a key is negotiated, an unacknowledged control packet is retried
+/// for as long as the session lives (reliable.c has no retry limit): only
+/// ping-restart ends an established session, not a lost ACK.
+#[test]
+fn unacked_control_packet_does_not_end_an_established_session() {
+    let mut server = Peer::new(server_config(), *b"SERVERID", auth_hook())
+        .unwrap()
+        .with_timers(quiet_timers());
+    let mut client = TestClient::new(*b"CLIENTID");
+    let keys = connect(&mut server, &mut client);
+    lose_a_control_reply(&mut server, &mut client);
+    let resent = tick_for(&mut server, Instant::now(), 300);
+    assert!(resent > 0, "still retransmitting");
+    assert_eq!(
+        deliver(&mut server, &keys, 1, b"alive"),
+        Some(b"alive".to_vec())
+    );
+}
+
+/// The same after a renegotiation: a lost ACK on the new key must not
+/// throw it away and bring the previous key back, which the client has
+/// moved on from.
+#[test]
+fn unacked_control_packet_does_not_undo_a_renegotiation() {
+    let mut server = Peer::new(server_config(), *b"SERVERID", auth_hook())
+        .unwrap()
+        .with_timers(quiet_timers());
+    let mut client = TestClient::new(*b"CLIENTID");
+    connect(&mut server, &mut client);
+    let first = vec![client.renegotiate(1)];
+    let k1 = connect_from(&mut server, &mut client, first);
+    lose_a_control_reply(&mut server, &mut client);
+    tick_for(&mut server, Instant::now(), 300);
+    assert_eq!(
+        deliver_on(&mut server, &k1, 1, 1, b"k1"),
+        Some(b"k1".to_vec())
+    );
+}
+
 // --- helpers ----------------------------------------------------------------
 
 /// Exchange what `client` has queued with `server` until both go quiet;
