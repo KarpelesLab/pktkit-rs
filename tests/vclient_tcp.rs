@@ -262,3 +262,73 @@ fn nonblocking_dial_reports_progress() {
     let mut buf = [0u8; 8];
     assert_eq!(conn.read(&mut buf).unwrap_err().kind(), WouldBlock);
 }
+
+/// Route `client`'s packets to a raw `vtcp::Conn` server on
+/// `SERVER_IP:SERVER_PORT`, created on the first SYN. Once the handshake
+/// completes, `on_established` runs on the server and its segments are sent.
+fn raw_server(
+    client: &Arc<pktkit::vclient::Client>,
+    on_established: impl Fn(&mut Conn) -> Vec<Vec<u8>> + Send + Sync + 'static,
+) -> Arc<Mutex<Option<Conn>>> {
+    let server: Arc<Mutex<Option<Conn>>> = Arc::new(Mutex::new(None));
+    let srv_for_handler = server.clone();
+    let weak = Arc::downgrade(client);
+    client.set_handler(Arc::new(move |pkt: &Packet| {
+        let Ok(seg) = Segment::parse(pkt.payload()) else {
+            return Ok(());
+        };
+        let out = {
+            let mut srv = srv_for_handler.lock().unwrap();
+            match srv.as_mut() {
+                None => {
+                    let mut c = Conn::new(
+                        ConnConfig::default()
+                            .local_port(SERVER_PORT)
+                            .remote_port(seg.src_port),
+                    );
+                    let out = c.accept_syn(&seg);
+                    *srv = Some(c);
+                    out
+                }
+                Some(c) => {
+                    let was = c.state();
+                    let mut out = c.handle_segment(&seg);
+                    if was != pktkit::vtcp::State::Established
+                        && c.state() == pktkit::vtcp::State::Established
+                    {
+                        out.extend(on_established(c));
+                    }
+                    out
+                }
+            }
+        };
+        if let Some(client) = weak.upgrade() {
+            for s in out {
+                let _ = client.send(Packet::from_slice(&wrap(SERVER_IP, CLIENT_IP, &s)));
+            }
+        }
+        Ok(())
+    }));
+    server
+}
+
+/// A server that answers the handshake, sends a little and closes at once:
+/// by the time the dialer looks, the connection is already in CLOSE-WAIT.
+#[test]
+fn dial_succeeds_when_the_server_closes_straight_away() {
+    let client = client(2);
+    let _server = raw_server(&client, |c| {
+        let mut out = c.write(b"bye").1;
+        out.extend(c.close());
+        out
+    });
+    let mut conn = client
+        .dial_tcp_timeout(
+            SocketAddr::new(IpAddr::V4(SERVER_IP), SERVER_PORT),
+            Duration::from_secs(2),
+        )
+        .expect("a handshake that completed is a successful dial");
+    let mut got = Vec::new();
+    std::io::Read::read_to_end(&mut conn, &mut got).unwrap();
+    assert_eq!(got, b"bye");
+}

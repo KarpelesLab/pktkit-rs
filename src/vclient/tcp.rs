@@ -14,8 +14,6 @@
 //! the timers run when the caller invokes [`Client::tick`](super::Client::tick).
 
 use crate::time::Instant;
-#[cfg(not(target_family = "wasm"))]
-use crate::vtcp::State;
 use crate::vtcp::segment::flags;
 use crate::vtcp::{Conn, ConnConfig, segment::Segment};
 use crate::{IpPrefix, Packet, Protocol, checksum};
@@ -493,20 +491,22 @@ impl TcpStack {
         let state = self.start_dial(local_ip, remote);
         let key = state.key;
 
-        // Wait for ESTABLISHED.
+        // Wait for the handshake. The peer may have sent data or even closed
+        // by the time we look, so any synchronized state (or a completed
+        // handshake since torn down) counts, not just ESTABLISHED.
         let deadline = Instant::now() + connect_timeout;
         let mut conn = state.conn.lock().unwrap();
         loop {
-            match conn.state() {
-                State::Established => return Ok(TcpConn::new(state.clone())),
-                State::Closed => {
-                    self.conns.lock().unwrap().remove(&key);
-                    return Err(io::Error::new(
-                        io::ErrorKind::ConnectionRefused,
-                        "connection reset during handshake",
-                    ));
-                }
-                _ => {}
+            if state.connected.load(Ordering::Acquire) || conn.state().is_synchronized() {
+                return Ok(TcpConn::new(state.clone()));
+            }
+            if conn.is_closed() {
+                drop(conn);
+                self.conns.lock().unwrap().remove(&key);
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "connection reset during handshake",
+                ));
             }
             let now = Instant::now();
             if now >= deadline {
