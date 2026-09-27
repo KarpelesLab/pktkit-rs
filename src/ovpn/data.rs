@@ -61,10 +61,27 @@ pub fn encrypt(
     payload: &[u8],
     rng: impl FnOnce(&mut [u8]) -> io::Result<()>,
 ) -> io::Result<Vec<u8>> {
-    if opts.cipher_crypto == CipherCryptoAlg::Aes && opts.cipher_block == CipherBlockMethod::Gcm {
+    check_supported(opts)?;
+    if opts.cipher_block == CipherBlockMethod::Gcm {
         return encrypt_gcm(opts, keys, pid, payload);
     }
     encrypt_cbc(opts, keys, pid, payload, rng)
+}
+
+/// Refuse a data channel this implementation will not run: anything but
+/// AES, and AES-CBC without an HMAC. OpenVPN would allow both (`cipher
+/// none`, `auth none`) with a warning; here they would mean an unencrypted
+/// or unauthenticated tunnel, so they are a policy error.
+pub(crate) fn check_supported(opts: &Options) -> io::Result<()> {
+    if opts.cipher_crypto != CipherCryptoAlg::Aes {
+        return Err(invalid("refusing an unencrypted data channel"));
+    }
+    match opts.cipher_block {
+        CipherBlockMethod::Gcm => Ok(()),
+        CipherBlockMethod::Cbc if opts.auth != AuthHash::None => Ok(()),
+        CipherBlockMethod::Cbc => Err(invalid("refusing AES-CBC without an HMAC")),
+        CipherBlockMethod::None => Err(invalid("no cipher mode")),
+    }
 }
 
 /// Decrypt a full data packet (`data[0]` is the opcode byte). On AEAD/HMAC
@@ -75,10 +92,9 @@ pub fn decrypt<'a>(
     keys: &PeerKeys,
     data: &'a mut [u8],
 ) -> io::Result<Option<Decrypted<'a>>> {
-    if opts.cipher_crypto == CipherCryptoAlg::Aes
-        && opts.cipher_block == CipherBlockMethod::Gcm
-        && opts.auth == AuthHash::None
-    {
+    check_supported(opts)?;
+    // GCM has no separate digest, whatever `auth` the client's options named.
+    if opts.cipher_block == CipherBlockMethod::Gcm {
         return decrypt_gcm(opts, keys, data);
     }
     decrypt_cbc(opts, keys, data)
@@ -224,17 +240,13 @@ fn encrypt_cbc(
     body.extend_from_slice(&padded);
 
     let id = Opcode::DATA_V1.0 << P_OPCODE_SHIFT;
-    let mut out = Vec::new();
-    if opts.auth != AuthHash::None {
-        let n = opts.auth.size();
-        let mac = hmac_compute(opts.auth, &keys.hmac_encrypt[..n], &body);
-        out.push(id);
-        out.extend_from_slice(&mac[..n]);
-        out.extend_from_slice(&body);
-    } else {
-        out.push(id);
-        out.extend_from_slice(&body);
-    }
+    // check_supported guarantees an HMAC.
+    let n = opts.auth.size();
+    let mac = hmac_compute(opts.auth, &keys.hmac_encrypt[..n], &body);
+    let mut out = Vec::with_capacity(1 + n + body.len());
+    out.push(id);
+    out.extend_from_slice(&mac[..n]);
+    out.extend_from_slice(&body);
     Ok(out)
 }
 
@@ -244,29 +256,16 @@ fn decrypt_cbc<'a>(
     data: &'a mut [u8],
 ) -> io::Result<Option<Decrypted<'a>>> {
     let nbytes = cipher_key_bytes(opts);
-    // data[0] is the opcode byte.
-    let mut pos = 1usize;
-
-    if opts.auth != AuthHash::None {
-        let n = opts.auth.size();
-        if data.len() < 1 + n {
-            return Err(invalid("CBC packet too short for HMAC"));
-        }
-        let mut got = [0u8; 32];
-        got[..n].copy_from_slice(&data[1..1 + n]);
-        let body = &data[1 + n..];
-        let mac = hmac_compute(opts.auth, &keys.hmac_decrypt[..n], body);
-        // Constant-time compare via the hmac crate's verify would need the
-        // Mac state; a direct compare is acceptable here (drop on mismatch).
-        if !ct_eq(&got[..n], &mac[..n]) {
-            return Ok(None);
-        }
-        pos = 1 + n;
+    // [opcode:1][hmac:n][iv:16][ct..]; check_supported guarantees an HMAC.
+    let n = opts.auth.size();
+    if data.len() < 1 + n {
+        return Err(invalid("CBC packet too short for HMAC"));
     }
-
-    if opts.cipher_block != CipherBlockMethod::Cbc {
-        return Err(invalid("unsupported cipher block method for decrypt"));
+    let mac = hmac_compute(opts.auth, &keys.hmac_decrypt[..n], &data[1 + n..]);
+    if !ct_eq(&data[1..1 + n], &mac[..n]) {
+        return Ok(None);
     }
+    let pos = 1 + n;
 
     // [iv:16][ciphertext..].
     if data.len() < pos + 16 {
@@ -282,7 +281,10 @@ fn decrypt_cbc<'a>(
 
     let ct = &mut data[ct_start..];
     cbc_decrypt(&keys.cipher_decrypt[..nbytes], &iv, ct)?;
-    let unpadded_len = pkcs5::trim(ct).len();
+    // Authenticated, so bad padding is a broken peer, not an oracle.
+    let unpadded_len = pkcs5::unpad(ct, 16)
+        .ok_or_else(|| invalid("bad CBC padding"))?
+        .len();
     let plain = &data[ct_start..ct_start + unpadded_len];
 
     // plain = [pid:4][compression:1][payload..].
@@ -576,6 +578,66 @@ mod tests {
             let d = decrypt(&opts, &rk, &mut pkt).unwrap().unwrap();
             assert_eq!(d.payload, b"no framing");
         }
+    }
+
+    /// CBC without an HMAC is unauthenticated: refuse it in both directions.
+    #[test]
+    fn cbc_without_hmac_is_refused() {
+        let (sk, rk) = key_pair();
+        let mut opts = cbc_opts(256);
+        opts.auth = AuthHash::None;
+        assert!(encrypt(&opts, &sk, 1, b"x", rng_zero).is_err());
+        let mut pkt = encrypt(&cbc_opts(256), &sk, 1, b"x", rng_zero).unwrap();
+        // Strip the HMAC to make a packet an auth-less peer would send.
+        pkt.drain(1..33);
+        assert!(decrypt(&opts, &rk, &mut pkt).is_err());
+    }
+
+    /// `[null-cipher]` would mean sending the tunnel in the clear.
+    #[test]
+    fn null_cipher_is_refused() {
+        let (sk, rk) = key_pair();
+        let opts = Options {
+            cipher_crypto: CipherCryptoAlg::None,
+            ..cbc_opts(256)
+        };
+        assert!(encrypt(&opts, &sk, 1, b"x", rng_zero).is_err());
+        let mut pkt = encrypt(&cbc_opts(256), &sk, 1, b"x", rng_zero).unwrap();
+        assert!(decrypt(&opts, &rk, &mut pkt).is_err());
+    }
+
+    /// The HMAC authenticates the ciphertext, so bad padding means a broken
+    /// peer; the packet is dropped rather than delivered truncated.
+    #[test]
+    fn cbc_bad_padding_is_dropped() {
+        let (sk, rk) = key_pair();
+        let opts = cbc_opts(128);
+        let mut block = vec![0, 0, 0, 1, COMP_NONE];
+        block.extend_from_slice(&[b'p'; 6]);
+        block.extend_from_slice(&[5, 5, 5, 2, 5]); // claims 5, is not
+        let iv = [7u8; 16];
+        cbc_encrypt(&sk.cipher_encrypt[..16], &iv, &mut block).unwrap();
+        let mut body = iv.to_vec();
+        body.extend_from_slice(&block);
+        let mac = hmac_compute(AuthHash::Sha256, &sk.hmac_encrypt[..32], &body);
+        let mut wire = vec![Opcode::DATA_V1.to_byte(0)];
+        wire.extend_from_slice(&mac);
+        wire.extend_from_slice(&body);
+        assert!(!matches!(decrypt(&opts, &rk, &mut wire), Ok(Some(_))));
+    }
+
+    /// GCM ignores the HMAC digest setting in both directions (the client's
+    /// options may name one), as encrypt already did.
+    #[test]
+    fn gcm_does_not_depend_on_auth() {
+        let (sk, rk) = key_pair();
+        let opts = Options {
+            auth: AuthHash::Sha1,
+            ..gcm_opts(256)
+        };
+        let mut pkt = encrypt(&opts, &sk, 1, b"gcm", rng_zero).unwrap();
+        let d = decrypt(&opts, &rk, &mut pkt).unwrap().unwrap();
+        assert_eq!(d.payload, b"gcm");
     }
 
     #[test]

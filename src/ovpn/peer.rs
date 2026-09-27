@@ -888,6 +888,7 @@ fn try_parse_key_exchange(buf: &[u8]) -> io::Result<Option<(KeyExchange, usize)>
     // it and ignore the rest rather than insisting it round-trips.
     let mut opts = Options::parse(&options_string).map_err(invalid)?;
     opts.is_server = false;
+    data::check_supported(&opts)?;
     // The PUSH_REPLY carries `comp-lzo no`, which puts the client on
     // stub framing (every packet starts with the no-compression byte)
     // whatever it had configured, so both directions frame.

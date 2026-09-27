@@ -814,6 +814,24 @@ fn real_client_options_string_is_accepted() {
     );
 }
 
+/// A client asking for a data channel without encryption, or CBC without
+/// an HMAC, is refused: the server will not run an unauthenticated tunnel.
+#[test]
+fn insecure_data_channel_is_refused() {
+    for opts in [
+        "V4,dev-type tun,cipher AES-256-CBC,auth [null-digest],keysize 256,key-method 2,tls-client",
+        "V4,dev-type tun,cipher [null-cipher],auth SHA256,keysize 128,key-method 2,tls-client",
+    ] {
+        let mut server = Peer::new(server_config(), *b"SERVERID", auth_hook()).unwrap();
+        let mut client = TestClient::new(*b"CLIENTID");
+        client.kx.options = opts.into();
+        assert!(drive_handshake(&mut server, &mut client));
+        send_client_key_material(&mut client);
+        assert!(pump(&mut server, &mut client), "{opts}: must be refused");
+        assert!(server.peer_config().is_none());
+    }
+}
+
 // --- helpers ----------------------------------------------------------------
 
 /// Exchange what `client` has queued with `server` until both go quiet;

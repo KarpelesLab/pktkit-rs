@@ -14,22 +14,16 @@ pub fn pad(data: &[u8], block_size: usize) -> Vec<u8> {
     out
 }
 
-/// Strip PKCS#7 padding, returning the unpadded slice.
-///
-/// Mirrors the Go upstream which trims `data[len-1]` bytes without verifying
-/// that the trailing bytes all match (`// TODO ensure trimmed bytes are indeed
-/// padding`). Returns the input unchanged if it is empty or the padding length
-/// is invalid (zero or larger than the buffer), which is safer than the Go
-/// version's unchecked slice.
-pub fn trim(data: &[u8]) -> &[u8] {
-    if data.is_empty() {
-        return data;
+/// Strip PKCS#7 padding, returning the unpadded slice, or `None` if `data`
+/// does not end in valid padding for `block_size`: a length of 1 to
+/// `block_size`, every padding byte equal to it.
+pub fn unpad(data: &[u8], block_size: usize) -> Option<&[u8]> {
+    let padding = *data.last()? as usize;
+    if padding == 0 || padding > block_size || padding > data.len() {
+        return None;
     }
-    let padding = data[data.len() - 1] as usize;
-    if padding == 0 || padding > data.len() {
-        return data;
-    }
-    &data[..data.len() - padding]
+    let (plain, pad) = data.split_at(data.len() - padding);
+    pad.iter().all(|&b| b as usize == padding).then_some(plain)
 }
 
 #[cfg(test)]
@@ -61,9 +55,19 @@ mod tests {
         for size in [1usize, 7, 15, 16, 31, 33] {
             let input: Vec<u8> = (0..size).map(|i| i as u8).collect();
             let padded = pad(&input, 16);
-            let trimmed = trim(&padded);
+            let trimmed = unpad(&padded, 16).unwrap();
             assert_eq!(trimmed.len(), size, "size {size}");
             assert_eq!(trimmed, &input[..], "size {size}");
         }
+    }
+
+    #[test]
+    fn unpad_rejects_malformed_padding() {
+        assert_eq!(unpad(&[], 16), None);
+        assert_eq!(unpad(&[1, 2, 0], 16), None); // zero length
+        assert_eq!(unpad(&[1, 2, 3, 3, 2, 3], 16), None); // bytes disagree
+        assert_eq!(unpad(&[17; 32], 16), None); // longer than a block
+        assert_eq!(unpad(&[4, 4, 4], 16), None); // longer than the data
+        assert_eq!(unpad(&[9, 2, 2], 16), Some(&[9][..]));
     }
 }
