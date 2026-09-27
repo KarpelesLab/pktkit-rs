@@ -247,7 +247,7 @@ fn read_loop(dev: Arc<DevFd>, handler: Arc<HandlerSlot<L3Handler>>) {
     // TODO(tuntap): needs macOS to verify the live read path.
     // The 4-byte protocol-family header, then the packet.
     let mut buf = msg_buffer(4 + MAX_MTU);
-    while let Some(n) = dev.read(&mut buf) {
+    while let Ok(Some(n)) = dev.read(&mut buf) {
         // Nothing past the header is no packet; a read that filled the buffer
         // is the front of one too long for it.
         if n <= 4 || !is_whole(n, &buf) {

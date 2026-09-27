@@ -269,9 +269,19 @@ fn open_tuntap(name: &str, flags: i32) -> Result<(OwnedFd, String)> {
 /// tag was offloaded.
 const MAX_TAP_FRAME: usize = MAX_MTU + 14 + 4;
 
+/// The next message's length, or `None` to stop reading. A read that failed
+/// has closed the device (see [`DevFd::read`]); it counts as an error, so a
+/// device that died on its own can be told from one closed on purpose.
+fn read_or_record(dev: &DevFd, buf: &mut [u8], stats: &DeviceStats) -> Option<usize> {
+    dev.read(buf).unwrap_or_else(|_| {
+        stats.record_error();
+        None
+    })
+}
+
 fn read_loop_l3(dev: Arc<DevFd>, handler: Arc<HandlerSlot<L3Handler>>, stats: Arc<DeviceStats>) {
     let mut buf = msg_buffer(MAX_MTU);
-    while let Some(n) = dev.read(&mut buf) {
+    while let Some(n) = read_or_record(&dev, &mut buf, &stats) {
         if !is_whole(n, &buf) {
             // Half a packet is worse than none.
             stats.record_rx_drop();
@@ -289,7 +299,7 @@ fn read_loop_l2(dev: Arc<DevFd>, handler: Arc<HandlerSlot<L2Handler>>, stats: Ar
     // 65536 bytes, as this was, cut the last few bytes off a frame at the
     // largest MTU, and handed on what was left as if it were the frame.
     let mut buf = msg_buffer(MAX_TAP_FRAME);
-    while let Some(n) = dev.read(&mut buf) {
+    while let Some(n) = read_or_record(&dev, &mut buf, &stats) {
         if n < 14 || !is_whole(n, &buf) {
             stats.record_rx_drop();
             continue;

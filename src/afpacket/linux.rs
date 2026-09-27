@@ -200,7 +200,12 @@ fn spawn_reader(sock: &Arc<Socket>, inbound_only: bool) {
                         continue;
                     }
                     RecvFailure::Fatal => {
+                        // Nothing more will come from this socket. Mark it
+                        // closed, so `send` says so instead of trying a fd
+                        // that is past saving, and so it is visible that the
+                        // device is gone rather than merely quiet.
                         stats.record_error();
+                        closed.store(true, Ordering::Release);
                         return;
                     }
                 }

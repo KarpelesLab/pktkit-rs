@@ -90,14 +90,33 @@ impl DevFd {
     }
 
     /// Block until one message has been read into `buf` and return its
-    /// length; `None` once the device is closed or has failed.
-    pub(super) fn read(&self, buf: &mut [u8]) -> Option<usize> {
+    /// length; `Ok(None)` once the device is closed.
+    ///
+    /// An error means the device failed under us: the interface was deleted
+    /// (`ip link del` leaves the fd answering `EBADFD`), or the fd broke some
+    /// other way. Nothing more will come from it, so the device is closed
+    /// here as if [`DevFd::close`] had been called, and a `send` reports it
+    /// gone, as it would after a close, rather than whatever errno the dead
+    /// fd happens to give.
+    pub(super) fn read(&self, buf: &mut [u8]) -> Result<Option<usize>> {
+        let r = self.read_inner(buf);
+        if r.is_err() {
+            // `read_inner` has let go of the read lock that `close` waits on.
+            self.close();
+        }
+        r
+    }
+
+    fn read_inner(&self, buf: &mut [u8]) -> Result<Option<usize>> {
         loop {
             if self.closed.load(Ordering::Acquire) {
-                return None;
+                return Ok(None);
             }
             let guard = self.fd.read().unwrap();
-            let fd = guard.as_ref()?.as_raw_fd();
+            let Some(fd) = guard.as_ref() else {
+                return Ok(None);
+            };
+            let fd = fd.as_raw_fd();
             let mut fds = [
                 libc::pollfd {
                     fd,
@@ -113,30 +132,37 @@ impl DevFd {
             // SAFETY: two live pollfds; the kernel writes only `revents`.
             let r = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
             if r < 0 {
-                if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::Interrupted {
                     continue;
                 }
-                return None;
+                return Err(e);
             }
             if fds[1].revents != 0 || self.closed.load(Ordering::Acquire) {
-                return None;
+                return Ok(None);
             }
             if fds[0].revents == 0 {
                 continue;
             }
+            // POLLERR / POLLHUP fall through to the read, which reports what
+            // went wrong.
             // SAFETY: `buf` is writable for its length, and the fd stays open
             // while we hold the read lock.
             let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
             if n < 0 {
-                match io::Error::last_os_error().kind() {
+                let e = io::Error::last_os_error();
+                match e.kind() {
                     io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock => continue,
-                    _ => return None,
+                    _ => return Err(e),
                 }
             }
             if n == 0 {
-                return None;
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "tuntap: device reported end of file",
+                ));
             }
-            return Some(n as usize);
+            return Ok(Some(n as usize));
         }
     }
 }
@@ -256,7 +282,7 @@ mod tests {
         let (dev, peer) = device();
         peer.send(b"hello").unwrap();
         let mut buf = [0u8; 64];
-        assert_eq!(dev.read(&mut buf), Some(5));
+        assert_eq!(dev.read(&mut buf).unwrap(), Some(5));
         assert_eq!(&buf[..5], b"hello");
         dev.write_all(b"back").unwrap();
         let mut got = [0u8; 8];
@@ -269,16 +295,16 @@ mod tests {
         let mut buf = msg_buffer(8);
         // Exactly the most the buffer is for: whole.
         peer.send(&[1; 8]).unwrap();
-        let n = dev.read(&mut buf).unwrap();
+        let n = dev.read(&mut buf).unwrap().unwrap();
         assert_eq!(n, 8);
         assert!(is_whole(n, &buf));
         // Longer: the kernel cuts it short, and nothing but the length shows.
         peer.send(&[2; 20]).unwrap();
-        let n = dev.read(&mut buf).unwrap();
+        let n = dev.read(&mut buf).unwrap().unwrap();
         assert!(!is_whole(n, &buf), "a truncated read passed as whole");
         // The next message is unaffected.
         peer.send(&[3; 5]).unwrap();
-        let n = dev.read(&mut buf).unwrap();
+        let n = dev.read(&mut buf).unwrap().unwrap();
         assert!(is_whole(n, &buf));
         assert_eq!(&buf[..n], &[3; 5]);
     }
@@ -289,7 +315,7 @@ mod tests {
         let d = dev.clone();
         let reader = std::thread::spawn(move || {
             let mut buf = [0u8; 64];
-            d.read(&mut buf)
+            d.read(&mut buf).unwrap()
         });
         // Let the reader block in poll.
         std::thread::sleep(Duration::from_millis(50));
@@ -313,11 +339,29 @@ mod tests {
         let d = dev.clone();
         let reader = std::thread::spawn(move || {
             let mut buf = [0u8; 64];
-            let first = d.read(&mut buf);
+            let first = d.read(&mut buf).unwrap();
             d.close();
-            (first, d.read(&mut buf))
+            (first, d.read(&mut buf).unwrap())
         });
         assert_eq!(reader.join().unwrap(), (Some(3), None));
+    }
+
+    #[test]
+    fn a_failed_device_is_closed_so_send_reports_it_gone() {
+        // A directory polls readable and then fails every read (EISDIR),
+        // standing in for a TUN fd whose interface was deleted.
+        let dir = std::fs::File::open("/").unwrap();
+        let dev = DevFd::new(OwnedFd::from(dir)).unwrap();
+        let mut buf = [0u8; 64];
+        assert!(dev.read(&mut buf).is_err());
+        assert!(dev.closed().load(Ordering::Acquire));
+        assert_eq!(
+            dev.write_all(b"x").unwrap_err().kind(),
+            io::ErrorKind::NotConnected
+        );
+        // Further reads see a closed device, not a fresh error.
+        assert_eq!(dev.read(&mut buf).unwrap(), None);
+        assert!(!dev.close(), "already closed by the failure");
     }
 
     #[test]
