@@ -278,11 +278,7 @@ impl TcpStream {
     /// number of bytes queued: `buf.len()`, or what was written before the
     /// [write timeout](Self::set_write_timeout) (`WouldBlock` if nothing).
     pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
-        let deadline = self
-            .write_timeout
-            .lock()
-            .expect("poisoned")
-            .map(|t| Instant::now() + t);
+        let deadline = deadline_after(*self.write_timeout.lock().expect("poisoned"));
         let mut written = 0;
         while written < buf.len() {
             let mut conn = self.state.conn.lock().expect("poisoned");
@@ -334,11 +330,7 @@ impl TcpStream {
         if buf.is_empty() {
             return Ok(0);
         }
-        let deadline = self
-            .read_timeout
-            .lock()
-            .expect("poisoned")
-            .map(|t| Instant::now() + t);
+        let deadline = deadline_after(*self.read_timeout.lock().expect("poisoned"));
         let mut conn = self.state.conn.lock().expect("poisoned");
         loop {
             let n = conn.read(buf);
@@ -409,6 +401,13 @@ impl Drop for TcpStream {
         self.state.wrap_and_send(segs);
         self.state.signal.notify_all();
     }
+}
+
+/// The deadline `timeout` from now, or `None` (no deadline) for no timeout
+/// or one too long for an `Instant` to hold: `Instant + Duration` panics on
+/// overflow, and a caller passing `Duration::MAX` means "wait forever".
+fn deadline_after(timeout: Option<Duration>) -> Option<Instant> {
+    timeout.and_then(|t| Instant::now().checked_add(t))
 }
 
 /// Helper used by the stack's tick thread: drive timers for one connection and
@@ -544,6 +543,26 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("read(&mut []) blocked");
         assert_eq!(got, Ok(0));
+    }
+
+    /// A timeout too long for an `Instant` means no deadline, not a panic.
+    #[test]
+    fn a_huge_timeout_waits_instead_of_panicking() {
+        let mut peer = peer();
+        let (state, out) = accepted(&mut peer);
+        let stream = TcpStream::new(state.clone());
+        stream.set_read_timeout(Some(Duration::MAX));
+        stream.set_write_timeout(Some(Duration::MAX));
+        assert_eq!(stream.write(b"ping").unwrap(), 4);
+        pump(&state, &out, &mut peer);
+        let mut got = [0u8; 8];
+        assert_eq!(peer.read(&mut got), 4);
+        for seg in peer.write(b"pong").1 {
+            state.deliver(&Segment::parse(&seg).unwrap());
+        }
+        let mut buf = [0u8; 8];
+        assert_eq!(stream.read(&mut buf).unwrap(), 4);
+        assert_eq!(&buf[..4], b"pong");
     }
 
     /// A write that the peer's closed window holds back gives up at the
