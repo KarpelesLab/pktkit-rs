@@ -3,8 +3,8 @@
 //! - [`Table`] is the resolver cache: lookups, learning, capped at 4096 entries
 //!   (a full cache evicts the entry closest to expiry),
 //!   entries age out after 5 minutes.
-//! - [`Pending`] buffers packets awaiting resolution, up to 16 per target, and
-//!   discards stale queues after 3 seconds.
+//! - [`Pending`] buffers packets awaiting resolution, up to 16 per target and
+//!   256 targets, and discards stale queues after 3 seconds.
 //! - [`build_packet`] / [`parse`] encode and decode the 28-byte ARP body.
 
 use crate::MacAddr;
@@ -21,6 +21,8 @@ pub const OP_REPLY: u16 = 2;
 pub const DEFAULT_TTL: Duration = Duration::from_secs(5 * 60);
 pub const PENDING_TIMEOUT: Duration = Duration::from_secs(3);
 pub const PENDING_MAX_PKTS: usize = 16;
+/// Most destinations that may be awaiting resolution at once.
+pub const PENDING_MAX_TARGETS: usize = 256;
 pub const MAX_ENTRIES: usize = 4096;
 
 #[derive(Copy, Clone, Debug)]
@@ -155,10 +157,19 @@ impl<K: Eq + Hash + Copy + Send + 'static> Pending<K> {
 
     /// Buffer `pkt` for `ip`. Returns `true` when this is the first packet
     /// queued for `ip` — i.e. the caller should send an ARP solicitation now.
+    ///
+    /// Once [`PENDING_MAX_TARGETS`] destinations are waiting, a packet for
+    /// yet another one is dropped and `false` returned, so nothing is
+    /// solicited: someone sweeping a large subnet would otherwise have us
+    /// hold a queue, and broadcast a request, for every address in it
+    /// (RFC 6583 §4).
     pub fn enqueue(&self, ip: K, pkt: &[u8]) -> bool {
         let now = Instant::now();
         let mut map = self.inner.lock().unwrap();
         prune(&mut map, now);
+        if !map.contains_key(&ip) && map.len() >= PENDING_MAX_TARGETS {
+            return false;
+        }
         let entry = map.entry(ip).or_default();
         let first = entry.created.is_none();
         if first {
@@ -315,6 +326,22 @@ mod tests {
         assert_eq!(t.lookup(new), Some(m), "a full cache refused a neighbour");
         assert_eq!(t.lookup(old), None);
         assert_eq!(t.inner.lock().unwrap().len(), MAX_ENTRIES);
+    }
+
+    #[test]
+    fn pending_destinations_are_capped() {
+        let p = Pending::new();
+        for i in 0..PENDING_MAX_TARGETS as u32 {
+            assert!(p.enqueue(Ipv4Addr::from(0x0a00_0000 + i), b"x"));
+        }
+        let extra = Ipv4Addr::new(10, 1, 0, 0);
+        assert!(!p.enqueue(extra, b"x"), "solicited past the cap");
+        assert!(!p.contains(extra));
+        assert!(p.drain(extra).is_empty());
+        // Destinations already waiting still take packets.
+        assert!(!p.enqueue(Ipv4Addr::from(0x0a00_0000), b"y"));
+        assert_eq!(p.drain(Ipv4Addr::from(0x0a00_0000)).len(), 2);
+        assert_eq!(p.inner.lock().unwrap().len(), PENDING_MAX_TARGETS - 1);
     }
 
     #[test]
