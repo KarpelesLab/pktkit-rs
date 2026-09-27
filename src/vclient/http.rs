@@ -630,19 +630,25 @@ fn take_line<'a>(buf: &'a [u8], pos: &mut usize) -> io::Result<Option<&'a [u8]>>
 /// Status, reason, header fields, and the `Set-Cookie` values.
 type Head = (u16, String, BTreeMap<String, String>, Vec<String>);
 
+/// Parse a response head. It is bytes, not text: field values and the
+/// reason phrase may carry obs-text (RFC 9110 §5.5, RFC 9112 §4), octets
+/// above 0x7F in no particular encoding, and one such octet must not cost
+/// the whole response. They are decoded as UTF-8 where they are that, and
+/// replaced where not.
 fn parse_head(head: &[u8]) -> Result<Head, &'static str> {
-    let text = std::str::from_utf8(head).map_err(|_| "non-utf8 headers")?;
-    let mut lines = text.split("\r\n");
+    let mut lines = CrlfLines(head);
     let status_line = lines.next().ok_or("empty response")?;
     // HTTP/1.1 200 OK
-    let mut sp = status_line.splitn(3, ' ');
+    let mut sp = status_line.splitn(3, |&b| b == b' ');
     let _version = sp.next().ok_or("no version")?;
-    let status: u16 = sp
-        .next()
-        .ok_or("no status")?
-        .parse()
-        .map_err(|_| "bad status")?;
-    let reason = sp.next().unwrap_or("").to_string();
+    let status = sp.next().ok_or("no status")?;
+    if status.len() != 3 || !status.iter().all(u8::is_ascii_digit) {
+        return Err("bad status");
+    }
+    let status = status
+        .iter()
+        .fold(0u16, |n, d| n * 10 + u16::from(d - b'0'));
+    let reason = String::from_utf8_lossy(sp.next().unwrap_or(b"")).into_owned();
 
     let mut headers = BTreeMap::new();
     let mut set_cookies = Vec::new();
@@ -650,25 +656,63 @@ fn parse_head(head: &[u8]) -> Result<Head, &'static str> {
         if line.is_empty() {
             break;
         }
-        if let Some((k, v)) = line.split_once(':') {
-            if k.trim().eq_ignore_ascii_case("set-cookie") {
-                set_cookies.push(v.trim().to_string());
-                headers.insert("set-cookie".to_string(), v.trim().to_string());
+        if let Some(colon) = line.iter().position(|&b| b == b':') {
+            let k = String::from_utf8_lossy(trim_ows(&line[..colon])).to_ascii_lowercase();
+            let v = String::from_utf8_lossy(trim_ows(&line[colon + 1..])).into_owned();
+            if k == "set-cookie" {
+                set_cookies.push(v.clone());
+                headers.insert(k, v);
                 continue;
             }
             // A repeated field is the list of its values (RFC 9110 §5.3),
             // so a second Content-Length is checked against the first
             // rather than silently replacing it.
             headers
-                .entry(k.trim().to_ascii_lowercase())
+                .entry(k)
                 .and_modify(|all: &mut String| {
                     all.push_str(", ");
-                    all.push_str(v.trim());
+                    all.push_str(&v);
                 })
-                .or_insert_with(|| v.trim().to_string());
+                .or_insert(v);
         }
     }
     Ok((status, reason, headers, set_cookies))
+}
+
+/// The CRLF-separated lines of a head.
+struct CrlfLines<'a>(&'a [u8]);
+
+impl<'a> Iterator for CrlfLines<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<&'a [u8]> {
+        if self.0.is_empty() {
+            return None;
+        }
+        let rest = self.0;
+        match find_subsequence(rest, b"\r\n") {
+            Some(i) => {
+                self.0 = &rest[i + 2..];
+                Some(&rest[..i])
+            }
+            None => {
+                self.0 = &[];
+                Some(rest)
+            }
+        }
+    }
+}
+
+/// `s` without the optional whitespace (SP, HTAB) around it (RFC 9110
+/// §5.6.3).
+fn trim_ows(mut s: &[u8]) -> &[u8] {
+    while let [b' ' | b'\t', rest @ ..] = s {
+        s = rest;
+    }
+    while let [rest @ .., b' ' | b'\t'] = s {
+        s = rest;
+    }
+    s
 }
 
 /// The body length a Content-Length value gives (RFC 9112 §6.3): digits
@@ -1225,6 +1269,28 @@ mod tests {
 
         // Nothing in the client's family at all.
         assert!(client.dial_any(&[v6], 80, deadline()).is_err());
+    }
+
+    /// Octets above 0x7F (obs-text) in a field value or the reason phrase
+    /// are decoded, lossily where they are not UTF-8, not refused.
+    #[test]
+    fn obs_text_does_not_reject_the_response() {
+        let raw = b"HTTP/1.1 200 D\xe9j\xe0 vu\r\nX-Latin: caf\xe9\r\nX-Utf8: caf\xc3\xa9\r\nContent-Length: 2\r\n\r\nok";
+        let r = read_response(raw, raw.len()).unwrap();
+        assert_eq!(r.status, 200);
+        assert_eq!(r.reason, "D\u{fffd}j\u{fffd} vu");
+        assert_eq!(r.header("x-latin"), Some("caf\u{fffd}"));
+        assert_eq!(r.header("x-utf8"), Some("caf\u{e9}"));
+        assert_eq!(r.body, b"ok");
+    }
+
+    #[test]
+    fn status_code_is_three_digits() {
+        for bad in ["+20", "2000", "20", "abc", ""] {
+            let raw = format!("HTTP/1.1 {bad} OK\r\n\r\n");
+            assert!(parse_head(raw.as_bytes()).is_err(), "{bad:?}");
+        }
+        assert_eq!(parse_head(b"HTTP/1.1 404\r\n\r\n").unwrap().0, 404);
     }
 
     /// Cookies stay whole: RFC 9110 §5.3 does not let `Set-Cookie` fields
