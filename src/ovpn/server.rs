@@ -22,7 +22,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak, mpsc};
+use std::sync::{Arc, Condvar, Mutex, PoisonError, RwLock, Weak, mpsc};
 use std::thread::{self, ThreadId};
 use std::time::Duration;
 
@@ -241,6 +241,85 @@ struct KeyEvents {
     queue: VecDeque<Event>,
     /// A thread is making this key's calls.
     running: bool,
+    /// on_connect was made and not yet matched by an on_disconnect. Once
+    /// the server is closed, a connect is no longer reported; this keeps
+    /// the disconnect queued behind it from being reported either.
+    up: bool,
+}
+
+/// The callers' code running on the server's threads -- on_auth, on_data,
+/// and the making of a key's on_connect / on_disconnect calls -- so close()
+/// can wait for it, and none starts once close() has begun. Shared by the
+/// calls under way rather than borrowed from the server: an auth worker
+/// holds no reference to the server while on_auth runs.
+#[derive(Default)]
+struct Calls {
+    state: Mutex<CallState>,
+    /// Signalled as each call ends.
+    ended: Condvar,
+}
+
+#[derive(Default)]
+struct CallState {
+    closed: bool,
+    /// The thread of each call under way, once per call: a callback may
+    /// cause another on its own thread.
+    running: Vec<ThreadId>,
+}
+
+impl Calls {
+    fn state(&self) -> std::sync::MutexGuard<'_, CallState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Count a call in, unless the server is closed. `even_closed` is for
+    /// the calls close() itself causes: the on_disconnect of each peer.
+    fn begin(self: &Arc<Self>, even_closed: bool) -> Option<CallGuard> {
+        let mut st = self.state();
+        if st.closed && !even_closed {
+            return None;
+        }
+        st.running.push(thread::current().id());
+        Some(CallGuard(self.clone()))
+    }
+
+    fn is_closed(&self) -> bool {
+        self.state().closed
+    }
+
+    /// Wait until no call is under way on another thread than this one --
+    /// whose calls, if close() was called from one, only go on once it
+    /// returns -- or until `deadline`.
+    fn wait(&self, deadline: crate::time::Instant) {
+        let me = thread::current().id();
+        let mut st = self.state();
+        while st.running.iter().any(|t| *t != me) {
+            let left = deadline.saturating_duration_since(crate::time::Instant::now());
+            if left.is_zero() {
+                return;
+            }
+            st = self
+                .ended
+                .wait_timeout(st, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+    }
+}
+
+/// A call under way, counted out when dropped.
+struct CallGuard(Arc<Calls>);
+
+impl Drop for CallGuard {
+    fn drop(&mut self) {
+        let me = thread::current().id();
+        let mut st = self.0.state();
+        if let Some(i) = st.running.iter().position(|t| *t == me) {
+            st.running.swap_remove(i);
+        }
+        drop(st);
+        self.0.ended.notify_all();
+    }
 }
 
 /// Most frames queued for one TCP connection; past it, frames are dropped
@@ -314,9 +393,11 @@ pub struct Server {
     /// Peers with authentications to run, and the workers running them.
     auth: Mutex<AuthPool>,
     /// on_connect / on_disconnect calls owed, by key. A key is here only
-    /// while it has calls queued or running. Taken under a peer's `link`
-    /// lock, never the other way round.
+    /// while it has calls queued or running, or was reported connected.
+    /// Taken under a peer's `link` lock, never the other way round.
     events: Mutex<HashMap<PeerKey, KeyEvents>>,
+    /// Callbacks under way, for close() to wait for.
+    calls: Arc<Calls>,
 }
 
 /// The threads calling on_auth: at most `max_auth_threads`, started as
@@ -370,6 +451,11 @@ const POLL: Duration = Duration::from_millis(100);
 /// UDP reader is itself stuck -- on a lock close()'s caller holds, say.
 const LOOP_EXIT_WAIT: Duration = Duration::from_secs(1);
 
+/// How long close() waits for callbacks under way on other threads: an
+/// on_auth waiting on its backend, an on_connect stuck on a lock close()'s
+/// caller holds.
+const CALL_EXIT_WAIT: Duration = Duration::from_secs(1);
+
 /// The server, if it still exists and is not closed.
 fn live(server: &Weak<Server>) -> Option<Arc<Server>> {
     server
@@ -414,6 +500,7 @@ impl Server {
             loops: Mutex::new(Vec::new()),
             auth: Mutex::default(),
             events: Mutex::default(),
+            calls: Arc::default(),
         });
 
         // Should a thread fail to start, returning drops the server, which
@@ -453,14 +540,23 @@ impl Server {
     /// both listening sockets, and drop all peers. The UDP and TCP ports are
     /// free for reuse once this returns.
     ///
-    /// It waits for the UDP reader to finish what it is doing, callbacks
-    /// included, so do not call it holding a lock a callback takes: the
-    /// wait then gives up after a second, and the ports are only released
-    /// once the callback returns.
+    /// No callback starts once close() has begun, but for the on_disconnect
+    /// of each peer reported connected, which close() makes itself. It
+    /// waits for the callbacks already running -- on_auth, on_data,
+    /// on_connect, on_disconnect, and the UDP reader with whatever it is
+    /// doing -- so that once it returns, none runs any more.
+    ///
+    /// Do not call it holding a lock a callback takes: each wait then gives
+    /// up after a second, the callback finishing after close() returned
+    /// (and the ports only released once it has). Called from a callback,
+    /// it does not wait for that callback, nor for those queued behind it
+    /// on its thread -- such as the on_disconnect of the peer an
+    /// on_connect is for, made once on_connect returns.
     pub fn close(&self) {
         if self.closed.swap(true, Ordering::SeqCst) {
             return;
         }
+        self.calls.state().closed = true;
         // The reader only borrows the socket for a read, so this leaves it
         // open until that read returns, within a poll interval.
         self.udp.write().unwrap().take();
@@ -492,6 +588,8 @@ impl Server {
         for k in peers {
             self.run_events(k);
         }
+        self.calls
+            .wait(crate::time::Instant::now() + CALL_EXIT_WAIT);
     }
 
     fn handle_udp(&self, data: &[u8], src: SocketAddr) {
@@ -732,6 +830,9 @@ impl Server {
     /// queued behind the running one, rather than deadlocking or cutting
     /// in.
     fn run_events(&self, key: PeerKey) {
+        // Counted in before looking at the queue, so that close() waits for
+        // a thread that is about to make calls it queued.
+        let _call = self.calls.begin(true);
         let mut all = self.events.lock().unwrap();
         match all.get_mut(&key) {
             Some(k) if !k.running => k.running = true,
@@ -740,9 +841,20 @@ impl Server {
         loop {
             let k = all.get_mut(&key).expect("a running key stays queued");
             let Some(ev) = k.queue.pop_front() else {
-                all.remove(&key);
+                k.running = false;
+                if !k.up {
+                    all.remove(&key);
+                }
                 return;
             };
+            let run = match ev {
+                Event::Connect(_) => !self.calls.is_closed(),
+                Event::Disconnect => k.up,
+            };
+            if !run {
+                continue;
+            }
+            k.up = matches!(ev, Event::Connect(_));
             // With no lock held: a callback may call back into the server.
             drop(all);
             match ev {
@@ -863,6 +975,7 @@ impl Server {
 
         if let Some(payload) = out.deliver
             && let Some(layer) = self.with_peer(entry, |p| p.layer())
+            && let Some(_call) = self.calls.begin(false)
         {
             callback(|| (self.cfg.on_data)(key, layer, &payload));
         }
@@ -1142,6 +1255,9 @@ fn run_auth(server: &Weak<Server>, next: &Weak<PeerEntry>) {
         return;
     }
     let on_auth = s.cfg.on_auth.clone();
+    let Some(_call) = s.calls.begin(false) else {
+        return;
+    };
     // Only weak references while on_auth runs: the entry holds a TCP
     // connection's queue, whose writer thread and socket live as long as
     // it does, and a stuck on_auth must not keep a peer that has gone
@@ -2346,6 +2462,131 @@ mod tests {
             *events.lock().unwrap(),
             vec!["connect", "disconnect", "connect", "disconnect"]
         );
+    }
+
+    /// close() waits for an on_connect running on another thread, and
+    /// makes that peer's on_disconnect before returning: a caller tearing
+    /// down what the callbacks set up once close() returns finds nothing
+    /// still arriving.
+    #[test]
+    fn close_waits_for_a_running_on_connect() {
+        let events = Events::default();
+        let (entered_tx, entered) = mpsc::channel::<()>();
+        let entered_tx = Mutex::new(entered_tx);
+        let server = recording_server(&events, move |_| {
+            let _ = entered_tx.lock().unwrap().send(());
+            thread::sleep(Duration::from_millis(300));
+        });
+        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let key = PeerKey::new(addr, Transport::Udp);
+        let entry = server
+            .create_peer(key, Transport::Udp, addr, None, None)
+            .unwrap();
+        let (s, e) = (server.clone(), entry.clone());
+        let t = thread::spawn(move || s.apply(&e, connected_output()));
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        server.close();
+        let at_close = events.lock().unwrap().clone();
+        t.join().unwrap();
+        assert_eq!(at_close, vec!["connect", "disconnect"]);
+    }
+
+    /// Nothing reaches on_data once close() has returned.
+    #[test]
+    fn no_data_is_delivered_after_close() {
+        let delivered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let d = delivered.clone();
+        let on_data: OnData = Arc::new(move |_, _, _| {
+            d.fetch_add(1, Ordering::SeqCst);
+        });
+        let cfg = ServerConfig::new(
+            crate::ovpn::tests::server_config(),
+            "127.0.0.1:0".parse().unwrap(),
+            auth_ok(),
+            on_data,
+        );
+        let server = Server::new(cfg).unwrap();
+        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let key = PeerKey::new(addr, Transport::Udp);
+        let entry = server
+            .create_peer(key, Transport::Udp, addr, None, None)
+            .unwrap();
+        let data = || PeerOutput {
+            deliver: Some(vec![0x45; 20]),
+            ..PeerOutput::default()
+        };
+        server.apply(&entry, data());
+        assert_eq!(delivered.load(Ordering::SeqCst), 1);
+        // A connection thread still dispatching what it read before
+        // close() shut it down.
+        server.close();
+        server.apply(&entry, data());
+        assert_eq!(delivered.load(Ordering::SeqCst), 1);
+    }
+
+    /// close() waits for an on_auth under way, so that no verdict of the
+    /// auth backend lands after it returned.
+    #[test]
+    fn close_waits_for_a_running_on_auth() {
+        let entered = Arc::new(AtomicBool::new(false));
+        let returned = Arc::new(AtomicBool::new(false));
+        let (e, r) = (entered.clone(), returned.clone());
+        let ok = auth_ok();
+        let on_auth: OnAuth = Arc::new(move |info| {
+            e.store(true, Ordering::SeqCst);
+            thread::sleep(Duration::from_millis(300));
+            r.store(true, Ordering::SeqCst);
+            ok(info)
+        });
+        let on_data: OnData = Arc::new(|_, _, _| {});
+        let cfg = ServerConfig::new(
+            crate::ovpn::tests::server_config(),
+            "127.0.0.1:0".parse().unwrap(),
+            on_auth,
+            on_data,
+        );
+        let server = Server::new(cfg).unwrap();
+        let sock = udp_client(&server);
+        drive_to_auth(
+            &sock,
+            &mut TestClient::new(*b"CLIENTID"),
+            Duration::ZERO,
+            &|| entered.load(Ordering::SeqCst),
+        );
+        assert!(wait_for(|| entered.load(Ordering::SeqCst)));
+        server.close();
+        assert!(
+            returned.load(Ordering::SeqCst),
+            "close() returned during on_auth"
+        );
+    }
+
+    /// close() called from a callback does not wait for that callback --
+    /// it would wait for itself -- and the peer the callback is for is
+    /// still reported gone, once the callback returns.
+    #[test]
+    fn close_from_a_callback_does_not_wait_for_it() {
+        let events = Events::default();
+        let slot: Arc<Mutex<Weak<Server>>> = Arc::default();
+        let s2 = slot.clone();
+        let server = recording_server(&events, move |_| {
+            if let Some(s) = s2.lock().unwrap().upgrade() {
+                s.close();
+            }
+        });
+        *slot.lock().unwrap() = Arc::downgrade(&server);
+        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let key = PeerKey::new(addr, Transport::Udp);
+        let entry = server
+            .create_peer(key, Transport::Udp, addr, None, None)
+            .unwrap();
+        let start = std::time::Instant::now();
+        server.apply(&entry, connected_output());
+        assert!(
+            start.elapsed() < CALL_EXIT_WAIT,
+            "close() waited for itself"
+        );
+        assert_eq!(*events.lock().unwrap(), vec!["connect", "disconnect"]);
     }
 
     fn auth_ok() -> OnAuth {
