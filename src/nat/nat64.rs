@@ -9,7 +9,7 @@
 use crate::nat::frag::FragTable;
 use crate::nat::helper::{PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP};
 use crate::nat::l4::csum_replace;
-use crate::nat::nat::frag_info;
+use crate::nat::nat::{SWEEP_INTERVAL, frag_info};
 use crate::nat::track::Peers;
 use crate::time::Instant;
 use crate::{
@@ -74,6 +74,8 @@ pub struct Nat64 {
     /// Inbound fragmented datagrams: the inside host each one's first
     /// fragment went to, by source, IP ID and protocol.
     frags: Mutex<FragTable<(Ipv4Addr, u16, u8), Ipv6Addr>>,
+    /// When packet handling next sweeps.
+    next_sweep: Mutex<Instant>,
 }
 
 struct Nat64Inner {
@@ -111,6 +113,7 @@ impl Nat64 {
             self_ref: Mutex::new(Weak::new()),
             next_id: AtomicU16::new(crate::rand::u32() as u16),
             frags: Mutex::new(FragTable::default()),
+            next_sweep: Mutex::new(Instant::now() + SWEEP_INTERVAL),
         });
         *nat.self_ref.lock().unwrap() = Arc::downgrade(&nat);
         inside.set_parent(Arc::downgrade(&nat));
@@ -136,15 +139,35 @@ impl Nat64 {
         }
     }
 
-    /// Sweep expired connections — called by the user on a timer.
+    /// Drop idle mappings and stale fragment state.
+    ///
+    /// Optional: packet handling sweeps every 30 seconds anyway, and port
+    /// allocation reclaims idle mappings when the pool runs out. Call it on
+    /// a timer to release state while no traffic flows, or to expire
+    /// mappings closer to their timeouts.
     pub fn sweep(&self) {
         self.sweep_at(Instant::now());
     }
 
+    /// Sweep if the sweep interval has passed since the last time.
+    fn maybe_sweep(&self) {
+        let now = Instant::now();
+        {
+            let mut next = self.next_sweep.lock().unwrap();
+            if now < *next {
+                return;
+            }
+            *next = now + SWEEP_INTERVAL;
+        }
+        self.sweep_at(now);
+    }
+
     fn sweep_at(&self, now: Instant) {
         self.frags.lock().unwrap().expire(now);
-        let mut inner = self.inner.lock().unwrap();
-        let inner = &mut *inner;
+        Self::expire_locked(&mut self.inner.lock().unwrap(), now);
+    }
+
+    fn expire_locked(inner: &mut Nat64Inner, now: Instant) {
         inner.mappings.retain(|k, m| {
             if m.peers.expire(k.proto, m.last_active, now) {
                 inner.reverse.remove(&Nat64RevKey {
@@ -177,6 +200,7 @@ impl Nat64 {
     // ---------- Outbound (IPv6 -> IPv4) ----------
 
     fn handle_outbound(&self, pkt: &[u8]) {
+        self.maybe_sweep();
         if pkt.len() < IPV6_HEADER_LEN || pkt[0] >> 4 != 6 {
             return;
         }
@@ -593,6 +617,7 @@ impl Nat64 {
     // ---------- Inbound (IPv4 -> IPv6) ----------
 
     fn handle_inbound(&self, pkt: &[u8]) {
+        self.maybe_sweep();
         if pkt.len() < IPV4_MIN_HEADER || pkt[0] >> 4 != 4 {
             return;
         }
@@ -1019,7 +1044,16 @@ impl Nat64 {
         }
     }
 
+    /// A free outside port. When none is left, idle mappings are reclaimed
+    /// first, so a caller that never sweeps does not lose the pool to them.
     fn alloc_port_locked(inner: &mut Nat64Inner) -> Option<u16> {
+        Self::scan_port_locked(inner).or_else(|| {
+            Self::expire_locked(inner, Instant::now());
+            Self::scan_port_locked(inner)
+        })
+    }
+
+    fn scan_port_locked(inner: &mut Nat64Inner) -> Option<u16> {
         let start = inner.next_port;
         loop {
             let p = inner.next_port;
@@ -1363,6 +1397,7 @@ fn v6_pointer_to_v4(p: u32) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nat::track::UDP_TIMEOUT;
     use crate::{IpPrefix, L3Device, Packet};
     use std::sync::Mutex as StdMutex;
 
@@ -1835,6 +1870,43 @@ mod tests {
         r[28..32].copy_from_slice(b"resp");
         crate::nat::l4::fill_v4_l4_checksum(&mut r, 20);
         r
+    }
+
+    #[test]
+    fn idle_mappings_go_without_sweep() {
+        let (nat, _inside, outside) = wired();
+        let pool = usize::from(NAT_PORT_MAX - NAT_PORT_MIN) + 1;
+        let client: Ipv6Addr = CLIENT.parse().unwrap();
+        for i in 0..pool {
+            let ip = Ipv6Addr::from(u128::from(client) + 1 + (i / 60000) as u128);
+            let k = Nat64Key {
+                proto: PROTO_UDP,
+                ip,
+                port: 1 + (i % 60000) as u16,
+            };
+            assert!(nat.get_or_create_mapping(k).is_some());
+        }
+        let age = |nat: &Nat64| {
+            let then = Instant::now() - UDP_TIMEOUT - std::time::Duration::from_secs(1);
+            for m in nat.inner.lock().unwrap().mappings.values_mut() {
+                m.last_active = then;
+                m.peers
+                    .backdate(UDP_TIMEOUT + std::time::Duration::from_secs(1));
+            }
+        };
+        // Full: nothing gets out, until the idle mappings are reclaimed.
+        age(&nat);
+        send_udp(&nat, &outside);
+        assert_eq!(outside.lock().unwrap().len(), 1);
+        assert_eq!(nat.inner.lock().unwrap().mappings.len(), 1);
+
+        // Packet handling also sweeps on its own now and then.
+        age(&nat);
+        *nat.next_sweep.lock().unwrap() = Instant::now();
+        nat.outside()
+            .send(Packet::from_slice(&v4_reply(ROUTER, 1)))
+            .unwrap();
+        assert!(nat.inner.lock().unwrap().mappings.is_empty());
     }
 
     #[test]

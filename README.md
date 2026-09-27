@@ -96,9 +96,9 @@ sockets there, so the crate works as a sans-I/O stack that the embedder drives:
   keepalives, about every 100 ms), `ImpairL2::poll` / `ImpairL3::poll`
   (each returns when the next message is due), `dhcp::Client::tick` or
   `L2Adapter::tick` (DHCP retransmission, renewal and expiry),
-  `wg::Handler::poll_timers` (handshake retries, rekeys and keepalives),
-  `wg::Handler::maintenance` and
-  `nat::Nat::sweep`.
+  `wg::Handler::poll_timers` (handshake retries, rekeys and keepalives) and
+  `wg::Handler::maintenance`. (`nat::Nat::sweep` is optional: the NAT also
+  expires idle mappings as packets pass through it.)
 
 On `wasm32-unknown-unknown` the clock and the entropy come from the page.
 Supply these imports when you instantiate the module (each one is only

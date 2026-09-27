@@ -213,6 +213,14 @@ impl Peers {
         self.map.contains_key(peer)
     }
 
+    /// Make every remote look idle for `by` longer.
+    #[cfg(test)]
+    pub(crate) fn backdate(&mut self, by: Duration) {
+        for p in self.map.values_mut() {
+            p.last -= by;
+        }
+    }
+
     /// Forget remotes idle past their timeout, and report whether the whole
     /// mapping (last active at `last_active`) is now idle and may go.
     pub(crate) fn expire(&mut self, proto: u8, last_active: Instant, now: Instant) -> bool {

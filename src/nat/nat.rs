@@ -23,9 +23,14 @@ use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
 const NAT_PORT_MIN: u16 = 10000;
 const NAT_PORT_MAX: u16 = 65535;
+/// How often packet handling sweeps idle mappings, lapsed expectations and
+/// forwards, so they go even if nobody calls [`Nat::sweep`]. A mapping thus
+/// outlives its timeout by at most this much.
+pub(crate) const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 /// Cap on pending expectations. ALGs add them on packets remote peers
 /// control (TFTP requests, SDP offers), so the table must not grow unbounded.
 const MAX_EXPECTATIONS: usize = 1024;
@@ -111,6 +116,9 @@ pub struct Nat {
     /// host each one's first fragment went to, keyed by source, IP ID and
     /// protocol, so the rest can follow.
     frags: Mutex<FragTable<(Ipv4Addr, u16, u8), (u64, Ipv4Addr)>>,
+
+    /// When packet handling next sweeps (see [`SWEEP_INTERVAL`]).
+    next_sweep: Mutex<Instant>,
 }
 
 struct NatInner {
@@ -165,6 +173,7 @@ impl Nat {
             self_ref: Mutex::new(Weak::new()),
             seqadj_used: AtomicBool::new(false),
             frags: Mutex::new(FragTable::default()),
+            next_sweep: Mutex::new(Instant::now() + SWEEP_INTERVAL),
         });
         *nat.self_ref.lock().unwrap() = Arc::downgrade(&nat);
         // Wire each side back to the NAT.
@@ -575,7 +584,16 @@ impl Nat {
         inner.mappings.get_mut(&k)
     }
 
+    /// A free outside port. When none is left, idle mappings are reclaimed
+    /// first, so a caller that never sweeps does not lose the pool to them.
     fn alloc_port_locked(inner: &mut NatInner) -> Option<u16> {
+        Self::scan_port_locked(inner).or_else(|| {
+            Self::expire_locked(inner, Instant::now());
+            Self::scan_port_locked(inner)
+        })
+    }
+
+    fn scan_port_locked(inner: &mut NatInner) -> Option<u16> {
         let now = Instant::now();
         let start = inner.next_port;
         loop {
@@ -594,8 +612,16 @@ impl Nat {
         }
     }
 
-    /// An even outside port that is free along with the next one.
+    /// An even outside port that is free along with the next one, reclaiming
+    /// idle mappings if there is none.
     fn alloc_pair_locked(inner: &mut NatInner) -> Option<u16> {
+        Self::scan_pair_locked(inner).or_else(|| {
+            Self::expire_locked(inner, Instant::now());
+            Self::scan_pair_locked(inner)
+        })
+    }
+
+    fn scan_pair_locked(inner: &mut NatInner) -> Option<u16> {
         let now = Instant::now();
         let pairs = (NAT_PORT_MAX - NAT_PORT_MIN).div_ceil(2);
         // Start at the next even port; the range starts even, so a pair
@@ -761,15 +787,42 @@ impl Nat {
         }
     }
 
-    /// Sweep stale entries — call on a timer if you want strict TTL behaviour.
-    /// (We omit the maintenance thread; callers can spawn one if needed.)
+    /// Drop idle mappings, lapsed expectations and port forwards, and stale
+    /// fragment state.
+    ///
+    /// Optional: packet handling sweeps every 30 seconds anyway, and port
+    /// allocation reclaims idle mappings when the pool runs out. Call it on a
+    /// timer to release state while no traffic flows, or to expire entries
+    /// closer to their timeouts.
     pub fn sweep(&self) {
         self.sweep_at(Instant::now());
     }
 
+    /// Sweep if [`SWEEP_INTERVAL`] has passed since the last time.
+    fn maybe_sweep(&self) {
+        let now = Instant::now();
+        {
+            let mut next = self.next_sweep.lock().unwrap();
+            if now < *next {
+                return;
+            }
+            *next = now + SWEEP_INTERVAL;
+        }
+        self.sweep_at(now);
+    }
+
     fn sweep_at(&self, now: Instant) {
-        let mut inner = self.inner.lock().unwrap();
-        let inner = &mut *inner;
+        Self::expire_locked(&mut self.inner.lock().unwrap(), now);
+        self.frags.lock().unwrap().expire(now);
+        // Also sweep the defragger if enabled.
+        if let Some(d) = self.defragger.lock().unwrap().clone() {
+            d.sweep();
+        }
+    }
+
+    /// Drop idle mappings, and lapsed expectations and forwards, which all
+    /// hold outside ports.
+    fn expire_locked(inner: &mut NatInner, now: Instant) {
         inner.mappings.retain(|k, m| {
             if m.peers.expire(k.proto, m.last_active, now) {
                 inner.reverse.remove(&NatRevKey {
@@ -791,11 +844,6 @@ impl Nat {
         for rk in lapsed {
             inner.forwards.remove(&rk);
             Self::remove_mapping_at_locked(inner, rk);
-        }
-        self.frags.lock().unwrap().expire(now);
-        // Also sweep the defragger if enabled.
-        if let Some(d) = self.defragger.lock().unwrap().clone() {
-            d.sweep();
         }
     }
 
@@ -833,6 +881,7 @@ impl Nat {
     // ---------- Outbound (inside -> outside) ----------
 
     fn handle_outbound(&self, ns: u64, pkt_in: &[u8]) {
+        self.maybe_sweep();
         let owned;
         let (pkt, fmax): (&[u8], _) = if let Some(d) = self.defragger.lock().unwrap().clone() {
             match d.reassemble(pkt_in) {
@@ -1191,6 +1240,7 @@ impl Nat {
     // ---------- Inbound (outside -> inside) ----------
 
     fn handle_inbound(&self, pkt_in: &[u8]) {
+        self.maybe_sweep();
         let owned;
         let (pkt, fmax): (&[u8], _) = if let Some(d) = self.defragger.lock().unwrap().clone() {
             match d.reassemble(pkt_in) {
@@ -1931,9 +1981,9 @@ fn update_icmp_checksum(pkt: &mut [u8], ihl: usize, old_id: u16, new_id: u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nat::track::UDP_TIMEOUT;
     use crate::{IpPrefix, L3Device, Packet};
     use std::sync::Mutex as StdMutex;
-    use std::time::Duration;
 
     fn pfx(s: &str) -> IpPrefix {
         s.parse().unwrap()
@@ -2696,8 +2746,46 @@ mod tests {
         let then = Instant::now() - by;
         for m in nat.inner.lock().unwrap().mappings.values_mut() {
             m.last_active = then;
+            m.peers.backdate(by);
         }
         then
+    }
+
+    #[test]
+    fn exhausted_pool_reclaims_idle_mappings_without_sweep() {
+        let nat = Nat::new(pfx("10.0.0.1/24"), pfx("203.0.113.1/24"));
+        let pool = usize::from(NAT_PORT_MAX - NAT_PORT_MIN) + 1;
+        for i in 0..pool {
+            let ip = Ipv4Addr::from(u32::from(INSIDE) + (i / 60000) as u32);
+            assert!(
+                nat.create_mapping(PROTO_UDP, ip, 1 + (i % 60000) as u16)
+                    .is_some()
+            );
+        }
+        assert!(nat.create_mapping(PROTO_UDP, REMOTE, 1).is_none(), "full");
+        // Every mapping has been idle past its timeout; nobody swept.
+        age_mappings(&nat, UDP_TIMEOUT + Duration::from_secs(1));
+        assert!(nat.create_mapping(PROTO_UDP, REMOTE, 1).is_some());
+        assert!(
+            nat.create_mapping_pair_in(0, PROTO_UDP, REMOTE, (2, 3))
+                .is_some()
+        );
+        assert_eq!(mapped(&nat), 3);
+    }
+
+    #[test]
+    fn packet_handling_sweeps_periodically() {
+        let (nat, _i, o) = setup();
+        let p = build_udp(INSIDE, 5000, REMOTE, 53, b"q");
+        nat.inside().send(Packet::from_slice(&p)).unwrap();
+        age_mappings(&nat, UDP_TIMEOUT + Duration::from_secs(1));
+        *nat.next_sweep.lock().unwrap() = Instant::now();
+        let p = build_udp(INSIDE, 5001, REMOTE, 53, b"q");
+        nat.inside().send(Packet::from_slice(&p)).unwrap();
+        assert_eq!(o.lock().unwrap().len(), 2);
+        // Only the new mapping is left.
+        assert_eq!(mapped(&nat), 1);
+        assert_eq!(nat.inner.lock().unwrap().reverse.len(), 1);
     }
 
     #[test]
