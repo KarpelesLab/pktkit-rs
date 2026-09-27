@@ -905,7 +905,9 @@ struct Entry {
 pub struct Capture {
     maps: CaptureMaps,
     prog: Program,
-    link: Link,
+    /// `None` once [`Capture::detach`] has taken the program off.
+    link: Mutex<Option<Link>>,
+    mode: Mode,
     cfg: CaptureConfig,
     /// What the caller added, kept so a rule can be added to a prefix without
     /// reading the trie back.
@@ -932,7 +934,8 @@ impl Capture {
         Ok(Capture {
             maps,
             prog,
-            link,
+            mode: link.mode(),
+            link: Mutex::new(Some(link)),
             cfg,
             entries: Mutex::new(Vec::new()),
         })
@@ -941,7 +944,16 @@ impl Capture {
     /// The mode the program attached in.
     #[inline]
     pub fn mode(&self) -> Mode {
-        self.link.mode()
+        self.mode
+    }
+
+    /// Take the program off the interface now rather than when this is
+    /// dropped, e.g. once the sockets it redirects to have stopped reading.
+    /// The maps and the capture set stay as they are, but nothing is diverted
+    /// any more. Idempotent.
+    pub fn detach(&self) {
+        // Dropping the link is what detaches it.
+        drop(self.link.lock().unwrap().take());
     }
 
     /// The XSKMAP an AF_XDP socket registers itself in.

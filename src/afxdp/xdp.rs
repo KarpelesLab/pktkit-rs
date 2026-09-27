@@ -747,8 +747,20 @@ impl crate::L2Device for Device {
 
     fn close(&self) -> Result<()> {
         self.inner.closed.store(true, Ordering::Release);
-        // Mappings, fds and the XDP attachment are released when the last Arc
-        // drops. The poll loops observe `closed` and exit.
+        // The poll loops observe `closed` and exit, so from here on nothing
+        // reads the sockets. Anything still redirected to them would sit in
+        // their RX rings until the device is dropped, black-holing every
+        // captured prefix, so our own program is taken off now: its slots in
+        // the XSKMAP first, which on its own makes a 5.3+ program pass the
+        // traffic, then the attachment. Mappings and fds are released when
+        // the last Arc drops. An external program is its owner's to detach;
+        // the kernel clears our sockets from its XSKMAP when they close.
+        if let Some(c) = &self.inner.capture {
+            for s in &self.inner.sockets {
+                let _ = c.xskmap().delete(&s.queue_id.to_ne_bytes());
+            }
+            c.detach();
+        }
         Ok(())
     }
 }
