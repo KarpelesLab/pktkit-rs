@@ -372,40 +372,7 @@ impl Stack {
     /// the maintenance thread.
     pub fn shutdown(&self) -> Result<()> {
         self.inner.closed.store(true, Ordering::Release);
-        if let Ok(mut t) = self.inner.tcp.lock() {
-            for (_, c) in t.drain() {
-                c.close();
-            }
-        }
-        if let Ok(mut t) = self.inner.tcp6.lock() {
-            for (_, c) in t.drain() {
-                c.close();
-            }
-        }
-        if let Ok(mut u) = self.inner.udp.lock() {
-            for (_, c) in u.drain() {
-                c.close();
-            }
-        }
-        if let Ok(mut u) = self.inner.udp6.lock() {
-            for (_, c) in u.drain() {
-                c.close();
-            }
-        }
-        if let Ok(mut t) = self.inner.virt_tcp.lock() {
-            for (_, state) in t.drain() {
-                let segs = state.conn.lock().expect("poisoned").abort();
-                state.wrap_and_send(segs);
-                state.signal.notify_all();
-            }
-        }
-        if let Ok(mut t) = self.inner.virt_tcp6.lock() {
-            for (_, state) in t.drain() {
-                let segs = state.conn.lock().expect("poisoned").abort();
-                state.wrap_and_send(segs);
-                state.signal.notify_all();
-            }
-        }
+        Self::close_flows(&self.inner, |_| true);
         Ok(())
     }
 
@@ -1094,70 +1061,47 @@ impl Stack {
     }
 
     fn cleanup_namespace(inner: &Arc<Inner>, ns: u64) {
-        // Drop all per-namespace flows.
-        if let Ok(mut t) = inner.virt_tcp.lock() {
-            t.retain(|k, state| {
-                if k.ns == ns {
-                    let segs = state.conn.lock().expect("poisoned").abort();
-                    state.wrap_and_send(segs);
-                    state.signal.notify_all();
-                    false
-                } else {
-                    true
-                }
-            });
+        Self::close_flows(inner, |k| k == ns);
+    }
+
+    /// Remove every flow whose namespace matches `which` and tear it down.
+    ///
+    /// The flows are taken out of their tables first and closed afterwards:
+    /// closing sends RSTs through the handler, and a handler that answers
+    /// synchronously re-enters `send`, which needs those same table locks.
+    fn close_flows(inner: &Arc<Inner>, which: impl Fn(u64) -> bool) {
+        fn take<K: Copy + Eq + std::hash::Hash, V>(
+            m: &Mutex<HashMap<K, V>>,
+            ns: impl Fn(&K) -> u64,
+            which: &impl Fn(u64) -> bool,
+        ) -> Vec<V> {
+            let Ok(mut t) = m.lock() else {
+                return Vec::new();
+            };
+            let keys: Vec<K> = t.keys().filter(|k| which(ns(k))).copied().collect();
+            keys.iter().filter_map(|k| t.remove(k)).collect()
         }
-        if let Ok(mut t) = inner.virt_tcp6.lock() {
-            t.retain(|k, state| {
-                if k.ns == ns {
-                    let segs = state.conn.lock().expect("poisoned").abort();
-                    state.wrap_and_send(segs);
-                    state.signal.notify_all();
-                    false
-                } else {
-                    true
-                }
-            });
+        let virt: Vec<Arc<ConnState>> = take(&inner.virt_tcp, |k| k.ns, &which)
+            .into_iter()
+            .chain(take(&inner.virt_tcp6, |k| k.ns, &which))
+            .collect();
+        for state in virt {
+            let segs = state.conn.lock().expect("poisoned").abort();
+            state.wrap_and_send(segs);
+            state.signal.notify_all();
         }
-        if let Ok(mut t) = inner.tcp.lock() {
-            t.retain(|k, c| {
-                if k.ns == ns {
-                    c.close();
-                    false
-                } else {
-                    true
-                }
-            });
+        for c in take(&inner.tcp, |k| k.ns, &which).into_iter().chain(take(
+            &inner.tcp6,
+            |k| k.ns,
+            &which,
+        )) {
+            c.close();
         }
-        if let Ok(mut t) = inner.tcp6.lock() {
-            t.retain(|k, c| {
-                if k.ns == ns {
-                    c.close();
-                    false
-                } else {
-                    true
-                }
-            });
+        for c in take(&inner.udp, |k| k.ns, &which) {
+            c.close();
         }
-        if let Ok(mut u) = inner.udp.lock() {
-            u.retain(|k, c| {
-                if k.ns == ns {
-                    c.close();
-                    false
-                } else {
-                    true
-                }
-            });
-        }
-        if let Ok(mut u) = inner.udp6.lock() {
-            u.retain(|k, c| {
-                if k.ns == ns {
-                    c.close();
-                    false
-                } else {
-                    true
-                }
-            });
+        for c in take(&inner.udp6, |k| k.ns, &which) {
+            c.close();
         }
     }
 }
@@ -1675,6 +1619,109 @@ mod tests {
         assert_eq!(seg.ack, 7001);
         assert_eq!(seg.src_port, port);
         assert_eq!(seg.dst_port, 40001);
+    }
+
+    /// Wire a `vtcp::Conn` as the virtual client of `stack`: segments the
+    /// stack emits for it are fed in, and its replies injected back.
+    fn wire_vtcp_client(
+        stack: &Arc<Stack>,
+        client: Ipv4Addr,
+        server: Ipv4Addr,
+        cport: u16,
+        sport: u16,
+    ) -> Arc<Mutex<Conn>> {
+        let conn = Arc::new(Mutex::new(Conn::new(ConnConfig {
+            local_port: cport,
+            remote_port: sport,
+            mss: 1460,
+            ..Default::default()
+        })));
+        let stack_for_handler = Arc::downgrade(stack);
+        let conn_for_handler = conn.clone();
+        stack.set_handler(Arc::new(move |p: &Packet| {
+            let bytes = p.as_bytes();
+            if bytes.len() < 40 || bytes[9] != 6 {
+                return Ok(());
+            }
+            let Ok(seg) = Segment::parse(&bytes[20..]) else {
+                return Ok(());
+            };
+            // Never hold the client lock while injecting: the stack may emit
+            // (and so re-enter this handler) from inside `send`.
+            let replies = conn_for_handler.lock().unwrap().handle_segment(&seg);
+            if let Some(stack) = stack_for_handler.upgrade() {
+                for r in replies {
+                    let ip = crate::slirp::packet::build_packet4(client, server, &r);
+                    let _ = stack.send(Packet::from_slice(&ip));
+                }
+            }
+            Ok(())
+        }));
+        conn
+    }
+
+    fn inject_segs(stack: &Stack, client: Ipv4Addr, server: Ipv4Addr, segs: Vec<Vec<u8>>) {
+        for s in segs {
+            let ip = crate::slirp::packet::build_packet4(client, server, &s);
+            let _ = stack.send(Packet::from_slice(&ip));
+        }
+    }
+
+    #[test]
+    fn shutdown_unblocks_bridge_stuck_writing_to_remote() {
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+
+        // A real server that accepts and then never reads, so the bridge's
+        // writes to it eventually block.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (held_tx, held_rx) = mpsc::channel();
+        thread::spawn(move || {
+            if let Ok((s, _)) = listener.accept() {
+                let _ = held_tx.send(s);
+            }
+        });
+
+        let stack = Stack::new();
+        let client = Ipv4Addr::new(10, 0, 0, 5);
+        let server = Ipv4Addr::new(127, 0, 0, 1);
+        let vc = wire_vtcp_client(&stack, client, server, 50002, port);
+        let syn = vc.lock().unwrap().connect();
+        inject_segs(&stack, client, server, syn);
+        wait_for("ESTABLISHED", || {
+            vc.lock().unwrap().state() == VtcpState::Established
+        });
+        let _held = held_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        // Push until nothing more fits anywhere: the real socket's buffers,
+        // then the bridge's vtcp receive buffer, then ours.
+        let chunk = vec![0x5au8; 64 * 1024];
+        let mut last_progress = Instant::now();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while last_progress.elapsed() < Duration::from_millis(500) {
+            assert!(Instant::now() < deadline, "the remote never pushed back");
+            let (n, segs) = vc.lock().unwrap().write(&chunk);
+            inject_segs(&stack, client, server, segs);
+            if n > 0 {
+                last_progress = Instant::now();
+            } else {
+                let segs = vc.lock().unwrap().tick();
+                inject_segs(&stack, client, server, segs);
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let s2 = stack.clone();
+        thread::spawn(move || {
+            let _ = s2.shutdown();
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "shutdown deadlocked against the blocked writer"
+        );
     }
 
     /// Drive a real `vtcp::Conn` as the virtual client through the outbound NAT

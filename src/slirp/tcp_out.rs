@@ -32,7 +32,7 @@ use crate::vtcp::{Conn, ConnConfig};
 use std::io::{Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -51,9 +51,12 @@ pub(crate) struct TcpOutConn {
     /// Virtual-side connection state (shared with the byte-pump threads and the
     /// stack's tick thread). Reuses the inbound accept-path machinery.
     state: Arc<ConnState>,
-    /// Real upstream socket (write half / shutdown handle). The read half was
-    /// cloned out for the remote→client pump thread.
-    remote: Mutex<Option<TcpStream>>,
+    /// Real upstream socket, set once the dial succeeds. The client→remote
+    /// pump writes through it while `close` may shut it down from another
+    /// thread, so it sits behind no lock: a shutdown is exactly what unblocks
+    /// a write stuck on a peer that stopped reading. The read half was cloned
+    /// out for the remote→client pump thread.
+    remote: OnceLock<TcpStream>,
     /// Set once the bridge has been torn down (RST/abort or both-ways close).
     closed: Arc<AtomicBool>,
     /// The client's SYN, kept while the real destination is being dialed and
@@ -119,7 +122,7 @@ impl TcpOutConn {
                 signal: Condvar::new(),
                 sink,
             }),
-            remote: Mutex::new(None),
+            remote: OnceLock::new(),
             closed: Arc::new(AtomicBool::new(false)),
             syn: Mutex::new(Some(syn.clone())),
         })
@@ -165,7 +168,7 @@ impl TcpOutConn {
                 return;
             }
         };
-        *self.remote.lock().expect("poisoned") = Some(remote);
+        let _ = self.remote.set(remote);
         // close() sets `closed` before it shuts the socket down, so either it
         // sees the socket stored above or this sees the flag.
         if self.closed.load(Ordering::SeqCst) {
@@ -227,9 +230,7 @@ impl TcpOutConn {
 
     /// Shut down the real socket (or a half of it). Tolerates a missing socket.
     fn shutdown_remote(&self, how: Shutdown) {
-        if let Ok(g) = self.remote.lock()
-            && let Some(s) = g.as_ref()
-        {
+        if let Some(s) = self.remote.get() {
             let _ = s.shutdown(how);
         }
     }
@@ -329,12 +330,9 @@ impl TcpOutConn {
                 return;
             }
             if n > 0 {
-                let res = {
-                    let mut g = self.remote.lock().expect("poisoned");
-                    match g.as_mut() {
-                        Some(s) => s.write_all(&buf[..n]),
-                        None => Ok(()),
-                    }
+                let res = match self.remote.get() {
+                    Some(mut s) => s.write_all(&buf[..n]),
+                    None => Ok(()),
                 };
                 if res.is_err() {
                     // Real socket gone: RST the virtual client and tear down.
@@ -362,11 +360,7 @@ impl TcpOutConn {
 impl Drop for TcpOutConn {
     fn drop(&mut self) {
         self.closed.store(true, Ordering::Release);
-        if let Ok(g) = self.remote.lock()
-            && let Some(s) = g.as_ref()
-        {
-            let _ = s.shutdown(Shutdown::Both);
-        }
+        self.shutdown_remote(Shutdown::Both);
     }
 }
 
