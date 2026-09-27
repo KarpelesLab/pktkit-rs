@@ -239,7 +239,9 @@ impl Server {
     fn allocate(&self, mac: MacAddr) -> Option<Ipv4Addr> {
         let now = Instant::now();
         if let Some(ip) = self.cfg.static_leases.get(&mac).copied() {
-            return Some(ip);
+            // A reservation off our subnet could never be ACKed (see
+            // `commit`); offering it would only start the same loop.
+            return self.on_our_subnet(ip).then_some(ip);
         }
         let mut leases = self.live_leases(now);
         let held = self.held_by_others(&leases, mac);
@@ -386,11 +388,18 @@ impl Server {
     }
 
     /// Whether `ip` is one of the addresses this server hands out: in the
-    /// configured range, and not one the subnet already uses for something
-    /// else, however the range was drawn.
+    /// configured range, on the server's subnet, and not one the subnet
+    /// already uses for something else, however the range was drawn.
+    ///
+    /// An address off the subnet is refused by [`commit`](Self::commit)
+    /// whatever the pool says; offering one would have the client request
+    /// it, be NAKed, and discover again, forever.
     fn in_pool(&self, ip: Ipv4Addr) -> bool {
         let raw = u32::from(ip);
         if raw < u32::from(self.cfg.range_start) || raw > u32::from(self.cfg.range_end) {
+            return false;
+        }
+        if !self.on_our_subnet(ip) {
             return false;
         }
         if ip == self.cfg.server_ip || Some(ip) == self.cfg.router {
@@ -885,6 +894,31 @@ mod tests {
         s.handle_dhcp(&init_reboot(Ipv4Addr::new(10, 0, 0, 255)));
         s.handle_dhcp(&init_reboot(Ipv4Addr::new(10, 0, 0, 254)));
         assert!(replies(&r).iter().all(|p| p.msg_type != wire::MSG_ACK));
+    }
+
+    #[test]
+    fn nothing_off_our_subnet_is_offered() {
+        // A range running past the end of the /24.
+        let cfg = ServerConfig::new(
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(10, 0, 0, 254),
+            Ipv4Addr::new(10, 0, 1, 5),
+        );
+        let (s, r) = recording(cfg);
+        let a = MacAddr([2, 0, 0, 0, 0, 0xa]);
+        assert_eq!(bound_lease(&s, &r, a), Ipv4Addr::new(10, 0, 0, 254));
+        // .255 is the broadcast, and 10.0.1.x is another network: the
+        // client would be NAKed on its REQUEST and start over, forever.
+        s.handle_dhcp(&build_discover(2, MacAddr([2, 0, 0, 0, 0, 0xb])));
+        assert!(replies(&r).is_empty(), "offered an address off the subnet");
+
+        // Nor is a reservation off the subnet offered.
+        let mac = MacAddr([2, 0, 0, 0, 0, 0xc]);
+        let mut cfg = one_address_pool();
+        cfg.static_leases.insert(mac, Ipv4Addr::new(192, 168, 9, 9));
+        let (s, r) = recording(cfg);
+        s.handle_dhcp(&build_discover(3, mac));
+        assert!(replies(&r).is_empty());
     }
 
     fn decline(mac: MacAddr, ip: Option<Ipv4Addr>, server: Option<Ipv4Addr>) -> Vec<u8> {
