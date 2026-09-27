@@ -99,7 +99,7 @@ pub use l4::{FiveTuple, IcmpMessage, TcpFlags, TcpSegment, UdpDatagram};
 pub use mac::{BROADCAST_MAC, MacAddr};
 pub use packet::Packet;
 pub use pipe::{PipeL2, PipeL3};
-pub use pool::{BufferPool, DEFAULT_MAX_POOLED, DEFAULT_MTU};
+pub use pool::{BufferPool, DEFAULT_MAX_BUF_CAPACITY, DEFAULT_MAX_POOLED, DEFAULT_MTU};
 pub use protocol::Protocol;
 pub use stats::{DeviceStats, HubCounters, HubStats, Stats};
 

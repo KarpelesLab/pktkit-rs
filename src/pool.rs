@@ -9,6 +9,12 @@ pub const DEFAULT_MTU: usize = 1536;
 /// spike pin its peak memory forever.
 pub const DEFAULT_MAX_POOLED: usize = 1024;
 
+/// Largest buffer capacity a pool made with [`BufferPool::new`] takes back:
+/// one maximum-size IP datagram. A bigger buffer handed to
+/// [`free`](BufferPool::free) is dropped instead of pooled, so a single
+/// oversized allocation cannot make every pooled slot pin its size.
+pub const DEFAULT_MAX_BUF_CAPACITY: usize = 64 * 1024;
+
 /// A thread-safe buffer pool for packet/frame storage.
 ///
 /// Buffers are recycled to minimise allocator pressure on the data plane.
@@ -30,6 +36,7 @@ pub const DEFAULT_MAX_POOLED: usize = 1024;
 pub struct BufferPool {
     free: Mutex<Vec<Vec<u8>>>,
     max_pooled: usize,
+    max_capacity: usize,
 }
 
 impl core::fmt::Debug for BufferPool {
@@ -38,6 +45,7 @@ impl core::fmt::Debug for BufferPool {
         f.debug_struct("BufferPool")
             .field("free", &n)
             .field("max_pooled", &self.max_pooled)
+            .field("max_capacity", &self.max_capacity)
             .finish()
     }
 }
@@ -58,9 +66,17 @@ impl BufferPool {
     /// when the pool is full are simply dropped — this bounds memory in
     /// adversarial workloads.
     pub fn with_cap(max_pooled: usize) -> BufferPool {
+        Self::with_limits(max_pooled, DEFAULT_MAX_BUF_CAPACITY)
+    }
+
+    /// Create a pool capped at `max_pooled` retained buffers, each of at
+    /// most `max_capacity` bytes of capacity. Worst-case retained memory is
+    /// about `max_pooled * max_capacity`.
+    pub fn with_limits(max_pooled: usize, max_capacity: usize) -> BufferPool {
         BufferPool {
             free: Mutex::new(Vec::new()),
             max_pooled,
+            max_capacity,
         }
     }
 
@@ -79,7 +95,16 @@ impl BufferPool {
     /// Return a buffer obtained from [`alloc`](Self::alloc) to the pool.
     /// Only its storage is kept: the length goes back to zero, since the
     /// bytes past it may never have been initialised.
+    ///
+    /// A buffer whose capacity exceeds the pool's per-buffer limit
+    /// ([`DEFAULT_MAX_BUF_CAPACITY`] unless made
+    /// [`with_limits`](Self::with_limits)) is dropped: pooling it would keep
+    /// that peak allocation alive for as long as the pool lives, and the
+    /// buffer cap alone does not bound bytes.
     pub fn free(&self, mut buf: Vec<u8>) {
+        if buf.capacity() > self.max_capacity {
+            return;
+        }
         buf.clear();
         let mut free = self.free.lock().unwrap();
         if free.len() < self.max_pooled {
@@ -133,6 +158,19 @@ mod tests {
         p.free(b);
         let pooled = p.free.lock().unwrap();
         assert!(pooled[0].len() <= 1, "length covers uninitialised memory");
+    }
+
+    #[test]
+    fn free_drops_oversized_buffers() {
+        let p = BufferPool::new();
+        p.free(Vec::with_capacity(DEFAULT_MAX_BUF_CAPACITY + 1));
+        assert!(p.free.lock().unwrap().is_empty(), "oversized buffer pooled");
+        p.free(Vec::with_capacity(DEFAULT_MTU));
+        assert_eq!(p.free.lock().unwrap().len(), 1);
+
+        let small = BufferPool::with_limits(4, 2048);
+        small.free(Vec::with_capacity(4096));
+        assert!(small.free.lock().unwrap().is_empty());
     }
 
     #[test]
