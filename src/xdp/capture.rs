@@ -27,6 +27,14 @@
 //! means "the DNS service *at* that address", whichever way the packet is
 //! travelling.
 //!
+//! Prefixes nest. A packet is judged on the rules of every prefix in the set
+//! that contains its address, so a narrower prefix adds to a broader one
+//! rather than overriding it: `Port(UDP, 53)` on `10.0.0.1/32` takes nothing
+//! away from an [`Rule::Any`] on `10.0.0.0/24`. The trie only ever returns
+//! the longest match, so each entry is written with the rules it inherits
+//! from the broader prefixes around it, and together they count against
+//! [`CaptureConfig::max_rules_per_prefix`].
+//!
 //! ARP and neighbor discovery follow the rules too. Only a prefix with an
 //! [`Rule::Any`] entry has its ARP and neighbor solicitations captured: a
 //! narrower rule means the address is shared with the host stack, which then
@@ -1005,19 +1013,19 @@ impl Capture {
                         ),
                     ));
                 }
-                let mut rules = held[i].rules.clone();
-                rules.push(rule);
-                self.write(prefix, &rules)?;
-                held[i].rules = rules;
+                let mut new = held.clone();
+                new[i].rules.push(rule);
+                self.commit(&mut held, new, prefix)?;
             }
             None => {
                 let prefixes: Vec<IpPrefix> = held.iter().map(|e| e.prefix).collect();
                 check_coverage(&prefixes, prefix)?;
-                self.write(prefix, &[rule])?;
-                held.push(Entry {
+                let mut new = held.clone();
+                new.push(Entry {
                     prefix,
                     rules: vec![rule],
                 });
+                self.commit(&mut held, new, prefix)?;
             }
         }
         Ok(())
@@ -1028,17 +1036,13 @@ impl Capture {
     pub fn remove(&self, prefix: IpPrefix) -> Result<bool> {
         let prefix = prefix.masked();
         let mut held = self.entries.lock().unwrap();
-        // The kernel first: if the delete fails the prefix is still being
-        // captured, and the record has to go on saying so.
-        let removed = self.map_for(prefix).delete(lpm_key(prefix).as_bytes())?;
-        let had = match held.iter().position(|e| e.prefix == prefix) {
-            Some(i) => {
-                held.remove(i);
-                true
-            }
-            None => false,
+        let Some(i) = held.iter().position(|e| e.prefix == prefix) else {
+            return self.map_for(prefix).delete(lpm_key(prefix).as_bytes());
         };
-        Ok(had || removed)
+        let mut new = held.clone();
+        new.remove(i);
+        self.commit(&mut held, new, prefix)?;
+        Ok(true)
     }
 
     /// Stop capturing what `rule` selects for `prefix`, leaving its other
@@ -1052,16 +1056,77 @@ impl Capture {
         let Some(r) = held[i].rules.iter().position(|r| *r == rule) else {
             return Ok(false);
         };
-        let mut rules = held[i].rules.clone();
-        rules.remove(r);
-        if rules.is_empty() {
-            self.map_for(prefix).delete(lpm_key(prefix).as_bytes())?;
-            held.remove(i);
-        } else {
-            self.write(prefix, &rules)?;
-            held[i].rules = rules;
+        let mut new = held.clone();
+        new[i].rules.remove(r);
+        if new[i].rules.is_empty() {
+            new.remove(i);
         }
+        self.commit(&mut held, new, prefix)?;
         Ok(true)
+    }
+
+    /// Bring the tries from `held` to `new`, which differ only in `changed`,
+    /// and on success make `new` the record.
+    ///
+    /// What changes in the kernel is `changed`'s own entry and those of the
+    /// prefixes nested inside it, whose inherited rules follow it. All of
+    /// them are checked against the rule limit before anything is written,
+    /// and if a write fails the ones already made are put back, so the tries
+    /// and the record keep agreeing.
+    fn commit(&self, held: &mut Vec<Entry>, new: Vec<Entry>, changed: IpPrefix) -> Result<()> {
+        let mut affected: Vec<IpPrefix> = held
+            .iter()
+            .chain(&new)
+            .map(|e| e.prefix)
+            .filter(|p| *p != changed && encloses(changed, *p))
+            .collect();
+        affected.sort_by_key(|p| (std::cmp::Reverse(p.bits()), p.addr()));
+        affected.dedup();
+        affected.push(changed);
+
+        let max = usize::from(self.cfg.max_rules_per_prefix);
+        let mut plan = Vec::with_capacity(affected.len());
+        for p in affected {
+            let before = effective_rules(held, p);
+            let after = effective_rules(&new, p);
+            if let Some(rules) = &after
+                && rules.len() > max
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "xdp: {p} would hold {} rules counting those it inherits from \
+                         broader prefixes, over the configured maximum of {max}",
+                        rules.len()
+                    ),
+                ));
+            }
+            if before != after {
+                plan.push((p, before, after));
+            }
+        }
+
+        for (n, (p, _, after)) in plan.iter().enumerate() {
+            if let Err(e) = self.apply(*p, after.as_deref()) {
+                for (p, before, _) in &plan[..n] {
+                    let _ = self.apply(*p, before.as_deref());
+                }
+                return Err(e);
+            }
+        }
+        *held = new;
+        Ok(())
+    }
+
+    /// Write `prefix`'s trie entry, or delete it for `None`.
+    fn apply(&self, prefix: IpPrefix, rules: Option<&[Rule]>) -> Result<()> {
+        match rules {
+            Some(rules) => self.write(prefix, rules),
+            None => self
+                .map_for(prefix)
+                .delete(lpm_key(prefix).as_bytes())
+                .map(drop),
+        }
     }
 
     /// True if `addr` is matched by the capture set under any rule.
@@ -1069,9 +1134,10 @@ impl Capture {
         Ok(!self.rules_for(addr)?.is_empty())
     }
 
-    /// The rules the kernel-side set applies to `addr`: those of the longest
-    /// prefix containing it, or none if nothing does. They come back in the
-    /// order the program walks them, which has any [`Rule::Any`] first.
+    /// The rules the kernel-side set applies to `addr`: those of every prefix
+    /// containing it, or none if nothing does. They come back in the order
+    /// the program walks them, which has any [`Rule::Any`] first; with one,
+    /// it is all there is, since it decides the packet by itself.
     pub fn rules_for(&self, addr: IpAddr) -> Result<Vec<Rule>> {
         let full = IpPrefix::new(addr, if addr.is_ipv4() { 32 } else { 128 });
         let mut out = vec![0u8; value_size(self.cfg.max_rules_per_prefix) as usize];
@@ -1124,6 +1190,35 @@ impl Capture {
             &self.maps.v6
         }
     }
+}
+
+/// True if `outer` contains every address of `inner`.
+fn encloses(outer: IpPrefix, inner: IpPrefix) -> bool {
+    outer.is_v4() == inner.is_v4() && outer.bits() <= inner.bits() && outer.contains(inner.addr())
+}
+
+/// What `prefix`'s trie entry has to hold for `entries`: its own rules and
+/// those of every broader prefix around it, since the trie hands the program
+/// only the longest match. `None` if `prefix` is not in `entries`.
+fn effective_rules(entries: &[Entry], prefix: IpPrefix) -> Option<Vec<Rule>> {
+    let own = entries.iter().find(|e| e.prefix == prefix)?;
+    let mut rules = own.rules.clone();
+    let mut outer: Vec<&Entry> = entries
+        .iter()
+        .filter(|e| e.prefix != prefix && encloses(e.prefix, prefix))
+        .collect();
+    outer.sort_by_key(|e| std::cmp::Reverse(e.prefix.bits()));
+    for r in outer.iter().flat_map(|e| &e.rules) {
+        if !rules.contains(r) {
+            rules.push(*r);
+        }
+    }
+    // Any decides the packet on its own; the rest could never be reached,
+    // and would only count against the limit.
+    if rules.contains(&Rule::Any) {
+        rules = vec![Rule::Any];
+    }
+    Some(rules)
 }
 
 /// `ff02::1:ffXX:XXXX` for `addr`, per RFC 4291 §2.7.1.
@@ -2032,6 +2127,70 @@ mod tests {
 
     const REDIRECT: u32 = Action::REDIRECT.0;
     const PASS: u32 = Action::PASS.0;
+
+    fn entry(prefix: IpPrefix, rules: &[Rule]) -> Entry {
+        Entry {
+            prefix,
+            rules: rules.to_vec(),
+        }
+    }
+
+    #[test]
+    fn a_narrower_prefix_inherits_a_broader_any() {
+        let dns = Rule::Port(UDP, 53);
+        let held = [
+            entry(v4([10, 0, 0, 0], 24), &[Rule::Any]),
+            entry(v4([10, 0, 0, 1], 32), &[dns]),
+        ];
+        assert_eq!(
+            effective_rules(&held, v4([10, 0, 0, 1], 32)),
+            Some(vec![Rule::Any])
+        );
+        assert_eq!(
+            effective_rules(&held, v4([10, 0, 0, 0], 24)),
+            Some(vec![Rule::Any])
+        );
+        assert_eq!(effective_rules(&held, v4([10, 0, 0, 2], 32)), None);
+
+        // Through the program: TCP to the /32 is still captured by the /24.
+        let cfg = CaptureConfig::default();
+        let set: Vec<(IpPrefix, Vec<Rule>)> = held
+            .iter()
+            .map(|e| (e.prefix, effective_rules(&held, e.prefix).unwrap()))
+            .collect();
+        let set: Vec<(IpPrefix, &[Rule])> = set.iter().map(|(p, r)| (*p, &r[..])).collect();
+        let f = ipv4(TCP, [192, 0, 2, 1], [10, 0, 0, 1], &ports(1000, 80));
+        assert_eq!(verdict(&cfg, &set, &f), REDIRECT);
+    }
+
+    #[test]
+    fn inherited_rules_add_up_most_specific_first() {
+        let held = [
+            entry(v4([10, 0, 0, 0], 8), &[Rule::Proto(Protocol::GRE)]),
+            entry(v4([10, 0, 0, 0], 24), &[Rule::Proto(Protocol::ICMP)]),
+            entry(v4([10, 0, 0, 1], 32), &[Rule::Port(UDP, 53)]),
+            // Not around the /32: no say in it.
+            entry(v4([10, 0, 1, 0], 24), &[Rule::Any]),
+        ];
+        assert_eq!(
+            effective_rules(&held, v4([10, 0, 0, 1], 32)),
+            Some(vec![
+                Rule::Port(UDP, 53),
+                Rule::Proto(Protocol::ICMP),
+                Rule::Proto(Protocol::GRE),
+            ])
+        );
+    }
+
+    #[test]
+    fn encloses_is_family_aware() {
+        assert!(encloses(v4([10, 0, 0, 0], 8), v4([10, 1, 2, 3], 32)));
+        assert!(encloses(v4([10, 0, 0, 0], 8), v4([10, 0, 0, 0], 8)));
+        assert!(!encloses(v4([10, 1, 2, 3], 32), v4([10, 0, 0, 0], 8)));
+        assert!(!encloses(v4([11, 0, 0, 0], 8), v4([10, 1, 2, 3], 32)));
+        let v6 = IpPrefix::new("::".parse().unwrap(), 1);
+        assert!(!encloses(v6, v4([0, 0, 0, 0], 32)));
+    }
 
     fn eth(ethertype: u16, payload: &[u8]) -> Vec<u8> {
         let mut f = vec![0x02, 0, 0, 0, 0, 1, 0x02, 0, 0, 0, 0, 2];
