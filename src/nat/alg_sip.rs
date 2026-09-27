@@ -94,50 +94,77 @@ impl SipHelper {
             (&outside_hp, &inside_hp, &outside_addr, &inside_addr)
         };
 
-        let mut new_payload = payload.to_vec();
-        // Headers carrying IP:port (more specific) first, then bare IP.
-        for prefix in [
-            b"Via:".as_slice(),
-            b"v:".as_slice(),
-            b"Contact:".as_slice(),
-            b"m:".as_slice(),
-        ] {
-            new_payload =
-                sip_rewrite_header(&new_payload, prefix, hp_from.as_bytes(), hp_to.as_bytes());
-        }
-        for prefix in [
-            b"Via:".as_slice(),
-            b"v:".as_slice(),
-            b"Contact:".as_slice(),
-            b"m:".as_slice(),
-        ] {
-            new_payload = sip_rewrite_header(
-                &new_payload,
-                prefix,
-                addr_from.as_bytes(),
-                addr_to.as_bytes(),
-            );
-        }
+        let rewrite_message = |msg: &[u8]| -> Vec<u8> {
+            let mut new_payload = msg.to_vec();
+            // Headers carrying IP:port (more specific) first, then bare IP.
+            for prefix in [
+                b"Via:".as_slice(),
+                b"v:".as_slice(),
+                b"Contact:".as_slice(),
+                b"m:".as_slice(),
+            ] {
+                new_payload =
+                    sip_rewrite_header(&new_payload, prefix, hp_from.as_bytes(), hp_to.as_bytes());
+            }
+            for prefix in [
+                b"Via:".as_slice(),
+                b"v:".as_slice(),
+                b"Contact:".as_slice(),
+                b"m:".as_slice(),
+            ] {
+                new_payload = sip_rewrite_header(
+                    &new_payload,
+                    prefix,
+                    addr_from.as_bytes(),
+                    addr_to.as_bytes(),
+                );
+            }
 
-        // SDP body, separated from headers by a blank line.
-        if let Some(sdp_start) = find_subslice(&new_payload, b"\r\n\r\n") {
-            let header_part = &new_payload[..sdp_start];
-            let lower = header_part.to_ascii_lowercase();
-            if find_subslice(&lower, b"content-type: application/sdp").is_some()
-                || find_subslice(&lower, b"c: application/sdp").is_some()
-            {
-                let sdp_body = new_payload[sdp_start + 4..].to_vec();
-                let new_sdp = if outbound {
-                    rewrite_sdp_outbound(nat, m.namespace, &sdp_body, &outside_addr, inside_ip)
-                } else {
-                    sip_rewrite_sdp_addr(&sdp_body, &outside_addr, &inside_addr)
-                };
-                if new_sdp != sdp_body {
-                    let mut headers = new_payload[..sdp_start + 4].to_vec();
-                    new_payload = sip_update_content_length(&mut headers, &new_sdp);
+            // SDP body, separated from headers by a blank line.
+            if let Some(sdp_start) = find_subslice(&new_payload, b"\r\n\r\n") {
+                let header_part = &new_payload[..sdp_start];
+                let lower = header_part.to_ascii_lowercase();
+                if find_subslice(&lower, b"content-type: application/sdp").is_some()
+                    || find_subslice(&lower, b"c: application/sdp").is_some()
+                {
+                    let sdp_body = new_payload[sdp_start + 4..].to_vec();
+                    let new_sdp = if outbound {
+                        rewrite_sdp_outbound(nat, m.namespace, &sdp_body, &outside_addr, inside_ip)
+                    } else {
+                        sip_rewrite_sdp_addr(&sdp_body, &outside_addr, &inside_addr)
+                    };
+                    if new_sdp != sdp_body {
+                        let mut headers = new_payload[..sdp_start + 4].to_vec();
+                        new_payload = sip_update_content_length(&mut headers, &new_sdp);
+                    }
                 }
             }
-        }
+            new_payload
+        };
+
+        let new_payload = if proto == PROTO_TCP {
+            // A TCP segment may carry several messages, or part of one:
+            // each ends where its Content-Length says (RFC 3261 §18.3), and
+            // is rewritten on its own, so one's body is never taken for
+            // another's headers, nor its Content-Length set over both.
+            let messages = sip_messages(payload);
+            let mut out = Vec::with_capacity(payload.len());
+            let mut at = 0;
+            for r in messages {
+                out.extend_from_slice(&payload[at..r.start]);
+                out.extend_from_slice(&rewrite_message(&payload[r.clone()]));
+                at = r.end;
+            }
+            // What is left is a message continued in the next segment, or
+            // the tail of one begun in an earlier one. Its addresses may be
+            // split between segments, and its body length is not known, so
+            // it goes on untouched: better unrewritten than corrupted.
+            out.extend_from_slice(&payload[at..]);
+            out
+        } else {
+            // A datagram holds one message; its body runs to the end of it.
+            rewrite_message(payload)
+        };
 
         if new_payload == payload {
             return pkt;
@@ -374,6 +401,60 @@ fn sip_update_content_length(headers: &mut Vec<u8>, sdp_body: &[u8]) -> Vec<u8> 
     result.extend_from_slice(headers);
     result.extend_from_slice(sdp_body);
     result
+}
+
+/// Where the complete SIP messages at the start of a TCP segment's payload
+/// lie. A message counts only if it starts the payload (or follows a
+/// complete one, keep-alives aside), its headers end within it, and so does
+/// the body its Content-Length gives, which a stream transport requires
+/// (RFC 3261 §18.3, §20.14).
+fn sip_messages(payload: &[u8]) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    loop {
+        // CRLFs between messages are keep-alives (RFC 5626 §3.5.1).
+        while payload[at..].starts_with(b"\r\n") {
+            at += 2;
+        }
+        let msg = &payload[at..];
+        // A segment picking up in the middle of a message does not start
+        // with a request or status line.
+        let first = &msg[..find_subslice(msg, b"\r\n").unwrap_or(msg.len())];
+        if !(first.starts_with(b"SIP/2.0 ") || first.ends_with(b" SIP/2.0")) {
+            return out;
+        }
+        let Some(hdr_end) = find_subslice(msg, b"\r\n\r\n") else {
+            return out;
+        };
+        let Some(len) = content_length(&msg[..hdr_end]) else {
+            return out;
+        };
+        let end = match (hdr_end + 4).checked_add(len) {
+            Some(end) if end <= msg.len() => end,
+            _ => return out,
+        };
+        out.push(at..at + end);
+        at += end;
+    }
+}
+
+/// The value of the `Content-Length` (compact form `l`) header among
+/// `headers`, the message head without its terminating blank line.
+fn content_length(headers: &[u8]) -> Option<usize> {
+    split_subslice(headers, b"\r\n")
+        .iter()
+        .skip(1)
+        .find_map(|line| {
+            let colon = line.iter().position(|&b| b == b':')?;
+            let name = line[..colon].trim_ascii();
+            if !(name.eq_ignore_ascii_case(b"content-length") || name.eq_ignore_ascii_case(b"l")) {
+                return None;
+            }
+            std::str::from_utf8(line[colon + 1..].trim_ascii())
+                .ok()?
+                .parse()
+                .ok()
+        })
 }
 
 // ---- small byte-slice helpers (std-only) ----
@@ -764,6 +845,94 @@ Content-Length: 0\r\n\r\n";
         );
         let out = h.process_outbound(&nat, pkt.clone(), &m);
         assert_eq!(out, pkt);
+    }
+
+    /// Run `body` from 10.0.0.5:5060 through the ALG as one TCP segment and
+    /// return the payload that comes out.
+    fn tcp_through_alg(body: &[u8]) -> Vec<u8> {
+        let nat = Nat::new(pfx("10.0.0.1/24"), pfx("203.0.113.1/24"));
+        let mut p = vec![0u8; 40];
+        p[0] = 0x45;
+        p[2..4].copy_from_slice(&((40 + body.len()) as u16).to_be_bytes());
+        p[8] = 64;
+        p[9] = PROTO_TCP;
+        p[12..16].copy_from_slice(&[10, 0, 0, 5]);
+        p[16..20].copy_from_slice(&[198, 51, 100, 9]);
+        let ic = checksum(&p[..20]);
+        p[10..12].copy_from_slice(&ic.to_be_bytes());
+        p[20..22].copy_from_slice(&5060u16.to_be_bytes());
+        p[22..24].copy_from_slice(&5060u16.to_be_bytes());
+        p[32] = 0x50;
+        p[33] = 0x18;
+        p.extend_from_slice(body);
+        crate::nat::l4::fill_v4_l4_checksum(&mut p, 20);
+        let m = NatMapping::new(
+            PROTO_TCP,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)),
+            5060,
+            20000,
+        );
+        let out = SipHelper::new().process_outbound(&nat, p, &m);
+        assert!(crate::nat::l4::v4_l4_checksum_ok(&out, 20));
+        payload_of(&out).to_vec()
+    }
+
+    fn invite(sdp: &str) -> String {
+        format!(
+            "INVITE sip:bob@example.com SIP/2.0\r\n\
+Via: SIP/2.0/TCP 10.0.0.5:5060\r\n\
+Content-Type: application/sdp\r\n\
+Content-Length: {}\r\n\r\n{}",
+            sdp.len(),
+            sdp
+        )
+    }
+
+    #[test]
+    fn each_sip_message_in_a_tcp_segment_is_rewritten_on_its_own() {
+        let sdp = "v=0\r\nc=IN IP4 10.0.0.5\r\nm=audio 8000 RTP/AVP 0\r\n";
+        let second = "OPTIONS sip:bob@example.com SIP/2.0\r\n\
+Via: SIP/2.0/TCP 10.0.0.5:5060\r\n\
+Content-Type: text/plain\r\n\
+Content-Length: 21\r\n\r\nc=IN IP4 10.0.0.5\r\nxy";
+        let body = format!("{}\r\n\r\n{}", invite(sdp), second);
+        let out = String::from_utf8(tcp_through_alg(body.as_bytes())).unwrap();
+
+        let at = out.find("OPTIONS ").unwrap();
+        let (first, rest) = out.split_at(at);
+        let first = first.strip_suffix("\r\n\r\n").expect("keep-alive kept");
+        // The INVITE: its SDP translated, its Content-Length its own.
+        let (head, first_body) = first.split_once("\r\n\r\n").unwrap();
+        assert!(first_body.starts_with("v=0\r\nc=IN IP4 203.0.113.1\r\nm=audio "));
+        assert!(first_body.ends_with(" RTP/AVP 0\r\n"), "{first_body}");
+        assert!(
+            head.ends_with(&format!("\r\nContent-Length: {}", first_body.len())),
+            "{head}"
+        );
+        // The second message: its headers translated, its body its own.
+        assert_eq!(
+            rest,
+            second.replace("TCP 10.0.0.5:5060", "TCP 203.0.113.1:20000")
+        );
+    }
+
+    #[test]
+    fn sip_message_split_across_tcp_segments_is_left_alone() {
+        let sdp = "v=0\r\nc=IN IP4 10.0.0.5\r\nm=audio 8000 RTP/AVP 0\r\n";
+        let whole = invite(sdp);
+        // Headers and the start of the body; the rest comes next segment.
+        let part = &whole[..whole.len() - 20];
+        assert_eq!(tcp_through_alg(part.as_bytes()), part.as_bytes());
+        // The next segment, the body's tail, is no message to rewrite.
+        let tail = &whole[whole.len() - 20..];
+        assert_eq!(tcp_through_alg(tail.as_bytes()), tail.as_bytes());
+        // A complete message before a partial one is still translated.
+        let both = format!("{}{}", whole, part);
+        let out = tcp_through_alg(both.as_bytes());
+        assert!(out.ends_with(part.as_bytes()));
+        assert!(String::from_utf8_lossy(&out).starts_with(
+            "INVITE sip:bob@example.com SIP/2.0\r\nVia: SIP/2.0/TCP 203.0.113.1:20000\r\n"
+        ));
     }
 
     #[test]
