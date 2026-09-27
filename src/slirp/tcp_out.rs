@@ -16,7 +16,8 @@
 //!
 //! - **remote→client**: read from the real socket, `Conn::write` the bytes
 //!   (blocking on the send window via the shared `Condvar`), and flush the
-//!   resulting segments. On EOF, `Conn::close()` sends a FIN to the client.
+//!   resulting segments. On EOF, `Conn::close()` sends a FIN to the client;
+//!   on a reset from the server, the client is reset too.
 //! - **client→remote**: `Conn::read` data delivered by the engine (blocking on
 //!   the same `Condvar`) and `write_all` it to the real socket. When the client
 //!   half-closes (FIN), the real socket's write side is shut down.
@@ -31,7 +32,7 @@ use crate::time::Instant;
 use crate::vtcp::segment::Segment;
 use crate::vtcp::{Conn, ConnConfig, State};
 
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -403,8 +404,9 @@ impl TcpOutConn {
     }
 
     /// remote→client pump: copy bytes from the real socket into the engine's
-    /// send buffer, blocking on the send window when it is full. On EOF or
-    /// error, gracefully close the virtual side (FIN) and tear the bridge down.
+    /// send buffer, blocking on the send window when it is full. On EOF,
+    /// gracefully close the virtual side (FIN); on a reset or other error,
+    /// reset it and tear the bridge down.
     fn pump_remote_to_client(self: Arc<Self>, mut remote_read: TcpStream) {
         let mut buf = vec![0u8; 32 * 1024];
         loop {
@@ -414,7 +416,22 @@ impl TcpOutConn {
             let n = match remote_read.read(&mut buf) {
                 Ok(0) => break, // remote EOF
                 Ok(n) => n,
-                Err(_) => break, // remote error
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        ErrorKind::Interrupted | ErrorKind::WouldBlock | ErrorKind::TimedOut
+                    ) =>
+                {
+                    continue;
+                }
+                Err(_) => {
+                    // The server reset the connection (or it failed some
+                    // other way): the stream did not end whole, so the
+                    // client gets a reset too. A FIN would pass what it
+                    // has received off as the entire transfer.
+                    self.close();
+                    return;
+                }
             };
             if !self.write_all_to_engine(&buf[..n]) {
                 // Virtual side closed underneath us; abandon.
@@ -422,7 +439,7 @@ impl TcpOutConn {
                 return;
             }
         }
-        // Remote closed (or errored): send FIN to the client.
+        // Remote closed: send FIN to the client.
         let mut conn = self.state.conn.lock().expect("poisoned");
         let segs = conn.close();
         self.state.emit(conn, segs);

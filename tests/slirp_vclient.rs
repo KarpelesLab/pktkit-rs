@@ -94,3 +94,33 @@ fn a_burst_of_dials_to_a_slow_acceptor_is_not_reset() {
         &errors[..errors.len().min(5)]
     );
 }
+
+/// A host server that aborts mid-stream reaches the guest as a reset: a
+/// clean end of stream would pass the truncated transfer off as whole.
+#[test]
+fn a_server_reset_reaches_the_guest_as_a_reset() {
+    let (_stack, client) = topology();
+    let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = server.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let (mut s, _) = server.accept().unwrap();
+        let _ = s.write_all(&vec![7u8; 200_000]);
+        // Closing a socket with received data left unread resets the
+        // connection (RFC 2525 §2.17): an abort std alone can make.
+        let mut b = [0u8; 1];
+        let _ = s.peek(&mut b);
+        drop(s);
+    });
+    let mut c = client
+        .dial_tcp(SocketAddr::from(([127, 0, 0, 1], port)))
+        .unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10)));
+    c.write_all(b"unread").unwrap();
+    let mut got = Vec::new();
+    let r = c.read_to_end(&mut got);
+    assert!(
+        r.is_err(),
+        "an aborted transfer read as a clean end of stream after {} bytes",
+        got.len()
+    );
+}
