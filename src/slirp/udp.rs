@@ -22,6 +22,24 @@ pub(crate) type SendFn = Arc<dyn Fn(&[u8]) -> Result<()> + Send + Sync>;
 /// reader cooperatively rather than by closing the fd out from under it.
 const READ_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// Whether a `recv` error on a connected UDP socket leaves it usable.
+///
+/// Besides the read timeout, these are ICMP errors the kernel reports for an
+/// *earlier* datagram (port or host unreachable): the destination may well
+/// answer the next one, as it does once a restarting server is back up.
+pub(crate) fn is_transient(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        ErrorKind::WouldBlock
+            | ErrorKind::TimedOut
+            | ErrorKind::Interrupted
+            | ErrorKind::ConnectionRefused
+            | ErrorKind::ConnectionReset
+            | ErrorKind::HostUnreachable
+            | ErrorKind::NetworkUnreachable
+    )
+}
+
 pub(crate) struct UdpConn {
     c_src_ip: Ipv4Addr,
     c_src_port: u16,
@@ -69,12 +87,14 @@ impl UdpConn {
                     Ok(n) if n > 0 => n,
                     Ok(_) => continue,
                     // Timeout: loop back and re-check the stop flag.
-                    Err(e)
-                        if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut =>
-                    {
-                        continue;
+                    Err(e) if is_transient(&e) => continue,
+                    Err(_) => {
+                        // Mark the flow dead so the next datagram from the
+                        // client opens a fresh one instead of feeding a flow
+                        // that can no longer answer.
+                        closed.store(true, Ordering::Relaxed);
+                        return;
                     }
-                    Err(_) => return,
                 };
                 let conn = match weak.upgrade() {
                     Some(c) => c,
@@ -117,6 +137,11 @@ impl UdpConn {
         if let Ok(mut t) = self.last_act.lock() {
             *t = Instant::now();
         }
+    }
+
+    /// True once the flow has been closed or its reader has died.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Relaxed)
     }
 
     pub(crate) fn close(&self) {

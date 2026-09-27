@@ -210,13 +210,13 @@ impl Stack {
                 if let Ok(mut u) = inner.udp.lock() {
                     u.retain(|_, conn| {
                         let last = conn.last_act.lock().map(|t| *t).unwrap_or(now);
-                        now.duration_since(last) < UDP_IDLE
+                        !conn.is_closed() && now.duration_since(last) < UDP_IDLE
                     });
                 }
                 if let Ok(mut u) = inner.udp6.lock() {
                     u.retain(|_, conn| {
                         let last = conn.last_act.lock().map(|t| *t).unwrap_or(now);
-                        now.duration_since(last) < UDP_IDLE
+                        !conn.is_closed() && now.duration_since(last) < UDP_IDLE
                     });
                 }
                 drop(inner);
@@ -729,9 +729,9 @@ impl Stack {
         // Look up or create.
         let conn = {
             let mut t = inner.udp.lock().expect("poisoned");
-            if let Some(c) = t.get(&key) {
+            if let Some(c) = t.get(&key).filter(|c| !c.is_closed()) {
                 c.clone()
-            } else if t.len() >= MAX_UDP_FLOWS {
+            } else if t.len() >= MAX_UDP_FLOWS && !t.contains_key(&key) {
                 return Ok(()); // table full: drop, as a full conntrack table would
             } else {
                 let weak = Arc::downgrade(inner);
@@ -1005,9 +1005,9 @@ impl Stack {
         };
         let conn = {
             let mut t = inner.udp6.lock().expect("poisoned");
-            if let Some(c) = t.get(&key) {
+            if let Some(c) = t.get(&key).filter(|c| !c.is_closed()) {
                 c.clone()
-            } else if t.len() >= MAX_UDP_FLOWS {
+            } else if t.len() >= MAX_UDP_FLOWS && !t.contains_key(&key) {
                 return Ok(()); // table full: drop, as a full conntrack table would
             } else {
                 let weak = Arc::downgrade(inner);
@@ -1719,6 +1719,41 @@ mod tests {
             done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
             "shutdown deadlocked against the blocked writer"
         );
+    }
+
+    #[test]
+    fn udp_flow_survives_port_unreachable() {
+        // A port nothing listens on yet.
+        let port = UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let stack = Stack::new();
+        let captured = capture(&stack);
+        let dgram = build_udp_v4_packet(
+            Ipv4Addr::new(10, 0, 0, 5),
+            41500,
+            Ipv4Addr::new(127, 0, 0, 1),
+            port,
+            b"early",
+        );
+        // The kernel answers with port unreachable, which the flow's socket
+        // reports as ECONNREFUSED on its next recv.
+        L3Device::send(&*stack, Packet::from_slice(&dgram)).unwrap();
+        thread::sleep(Duration::from_millis(200));
+
+        // The server comes up on that port; the same flow must now work.
+        let server = UdpSocket::bind(("127.0.0.1", port)).unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        L3Device::send(&*stack, Packet::from_slice(&dgram)).unwrap();
+        let mut buf = [0u8; 64];
+        let (n, from) = server.recv_from(&mut buf).unwrap();
+        server.send_to(&buf[..n], from).unwrap();
+        wait_for("the reply", || !captured.lock().unwrap().is_empty());
+        assert_eq!(&captured.lock().unwrap()[0][28..], b"early");
     }
 
     #[test]

@@ -2,8 +2,8 @@
 
 use crate::Result;
 use crate::slirp::packet::build_udp_packet6;
+use crate::slirp::udp::is_transient;
 use crate::time::Instant;
-use std::io::ErrorKind;
 use std::net::{Ipv6Addr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -62,12 +62,14 @@ impl UdpConn6 {
                     Ok(n) if n > 0 => n,
                     Ok(_) => continue,
                     // Timeout: loop back and re-check the stop flag.
-                    Err(e)
-                        if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut =>
-                    {
-                        continue;
+                    Err(e) if is_transient(&e) => continue,
+                    Err(_) => {
+                        // Mark the flow dead so the next datagram from the
+                        // client opens a fresh one instead of feeding a flow
+                        // that can no longer answer.
+                        closed.store(true, Ordering::Relaxed);
+                        return;
                     }
-                    Err(_) => return,
                 };
                 let conn = match weak.upgrade() {
                     Some(c) => c,
@@ -107,6 +109,11 @@ impl UdpConn6 {
         if let Ok(mut t) = self.last_act.lock() {
             *t = Instant::now();
         }
+    }
+
+    /// True once the flow has been closed or its reader has died.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Relaxed)
     }
 
     pub(crate) fn close(&self) {
