@@ -1,9 +1,11 @@
 //! Receiver-side reassembly buffer with SACK reporting.
 
 use super::options::SackBlock;
-use super::seqspace::{seq_after, seq_after_eq, seq_before, seq_before_eq};
+use super::seqspace::{seq_after, seq_before, seq_before_eq};
 
-/// Cap on the number of out-of-order entries — anti-OOM.
+/// Cap on the number of out-of-order ranges. Adjacent and overlapping
+/// segments merge into one range, so this counts holes in the stream, not
+/// segments; the bytes they hold are bounded by the window.
 const MAX_OOO_ENTRIES: usize = 128;
 
 #[derive(Debug, Clone)]
@@ -68,8 +70,11 @@ impl RecvBuf {
         }
 
         // Trim past the right edge of the window, which also bounds the
-        // in-order and out-of-order data together to `window_size`.
-        if self.window_size > 0 {
+        // in-order and out-of-order data together to `window_size`. Without a
+        // window, in-order data is taken as it comes, but out-of-order data
+        // is still held to the 65535 bytes advertised: nothing else bounds
+        // the reassembly queue.
+        if self.window_size > 0 || seq != self.nxt {
             let right_edge = self.nxt.wrapping_add(self.window());
             if seq_after(end_seq, right_edge) {
                 let trim = end_seq.wrapping_sub(right_edge) as usize;
@@ -90,8 +95,14 @@ impl RecvBuf {
             return slice.len();
         }
 
-        if self.ooo.len() < MAX_OOO_ENTRIES {
-            self.insert_ooo(seq, slice);
+        self.insert_ooo(seq, slice);
+        if self.ooo.len() > MAX_OOO_ENTRIES {
+            // Too many holes. Give up the range furthest from RCV.NXT, as
+            // Linux's tcp_prune_ofo_queue does: it is the last one the
+            // stream will need. Dropping it reneges on anything SACKed
+            // there, which RFC 2018 allows; the sender keeps it until it is
+            // cumulatively acknowledged.
+            self.ooo.pop();
         }
         0
     }
@@ -104,7 +115,10 @@ impl RecvBuf {
         let existing = std::mem::take(&mut self.ooo);
         for e in existing {
             let e_end = e.seq.wrapping_add(e.data.len() as u32);
-            if seq_after_eq(e.seq, end_seq) {
+            // Ranges that merely touch are merged as well as overlapping
+            // ones. Kept apart, every segment arriving behind a single loss
+            // would take an entry of its own.
+            if seq_after(e.seq, end_seq) {
                 if !inserted {
                     merged.push(OooEntry {
                         seq,
@@ -113,10 +127,10 @@ impl RecvBuf {
                     inserted = true;
                 }
                 merged.push(e);
-            } else if seq_after_eq(seq, e_end) {
+            } else if seq_after(seq, e_end) {
                 merged.push(e);
             } else {
-                // Overlap — extend our range to cover e.
+                // Overlap or adjacency — extend our range to cover e.
                 if seq_before(e.seq, seq) {
                     let prefix_len = seq.wrapping_sub(e.seq) as usize;
                     let mut prefix = e.data[..prefix_len].to_vec();
@@ -255,6 +269,72 @@ mod tests {
         assert_eq!(r.nxt(), 1100);
         assert_eq!(r.readable(), 100);
         assert_eq!(r.window(), 0);
+    }
+
+    #[test]
+    fn contiguous_segments_behind_a_hole_are_all_kept() {
+        // One lost segment followed by a full default window of contiguous
+        // ones: far more segments than MAX_OOO_ENTRIES, but a single range.
+        const MSS: usize = 1460;
+        const SEGS: usize = 700;
+        let mut r = RecvBuf::new(0, 1 << 20);
+        for i in 1..=SEGS {
+            r.insert((i * MSS) as u32, &[i as u8; MSS]);
+        }
+        assert_eq!(r.sack_blocks().len(), 1, "one contiguous range");
+        assert_eq!(r.insert(0, &[0; MSS]), MSS);
+        assert_eq!(
+            r.nxt(),
+            ((SEGS + 1) * MSS) as u32,
+            "nothing past the hole was dropped"
+        );
+        assert!(!r.has_ooo());
+    }
+
+    #[test]
+    fn adjacent_ranges_merge_from_either_side() {
+        let mut r = RecvBuf::new(0, 0);
+        r.insert(20, b"cccc"); // 20..24
+        r.insert(10, b"aaaaa"); // 10..15, separate
+        r.insert(15, b"bbbbb"); // 15..20 joins both neighbours
+        assert_eq!(r.sack_blocks().len(), 1);
+        assert_eq!(
+            (r.sack_blocks()[0].left, r.sack_blocks()[0].right),
+            (10, 24)
+        );
+        r.insert(0, b"0123456789");
+        let mut buf = [0u8; 32];
+        let n = r.read(&mut buf);
+        assert_eq!(&buf[..n], b"0123456789aaaaabbbbbcccc");
+    }
+
+    #[test]
+    fn too_many_holes_drops_the_furthest_range() {
+        let mut r = RecvBuf::new(0, 1 << 20);
+        // Every other segment: each one is its own hole.
+        for i in 0..=MAX_OOO_ENTRIES {
+            r.insert((i * 20 + 10) as u32, &[1; 10]);
+        }
+        assert_eq!(r.ooo.len(), MAX_OOO_ENTRIES);
+        assert_eq!(
+            r.ooo.last().unwrap().seq,
+            ((MAX_OOO_ENTRIES - 1) * 20 + 10) as u32
+        );
+        // A segment adjacent to an existing range still gets in.
+        r.insert(20, &[1; 10]);
+        assert_eq!(r.ooo.len(), MAX_OOO_ENTRIES - 1);
+    }
+
+    #[test]
+    fn unbounded_mode_holds_ooo_to_the_advertised_window() {
+        let mut r = RecvBuf::new(0, 0);
+        assert_eq!(r.insert(100, &[1; 70_000]), 0);
+        let held: usize = r.ooo.iter().map(|e| e.data.len()).sum();
+        assert_eq!(held, 65535 - 100);
+        // In-order data is still taken whole.
+        assert_eq!(r.insert(0, &[1; 100]), 100);
+        assert_eq!(r.nxt(), 65535, "the held range joined the stream");
+        assert_eq!(r.insert(r.nxt(), &[1; 100_000]), 100_000);
     }
 
     #[test]
