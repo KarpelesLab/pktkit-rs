@@ -43,6 +43,14 @@ pub const DEFAULT_RECV_BUF: usize = 1 << 20;
 
 /// Maximum retransmission attempts before declaring the connection dead.
 pub const MAX_RETRIES: u32 = 8;
+/// Zero-window probes a [released](Conn::release) connection sends before
+/// giving up, answered or not (Linux's `tcp_orphan_retries`, 8 by default).
+/// A connection with an application behind it probes a peer that keeps
+/// answering for as long as it takes (RFC 9293 §3.8.6.1); one that nobody
+/// will ever write to or read from again would otherwise be kept alive for
+/// good by a peer that never opens its window. With the probe interval
+/// doubling from the RTO up to [`MAX_RTO`], that is a few minutes.
+pub const ORPHAN_RETRIES: u32 = 8;
 /// Default TIME-WAIT length. RFC 9293 asks for 2*MSL (4 minutes); this is
 /// Linux's 60 s, long enough for a delayed segment of the old connection to
 /// die out before a new one can take its 4-tuple. A new connection that
@@ -306,6 +314,8 @@ pub struct Conn {
     /// is what tells a receiver that is only slow to read from a dead one
     /// (Linux's `icsk_probes_out`).
     probes_out: u32,
+    /// Zero-window probes sent since the release, answered or not.
+    orphan_probes: u32,
 
     // TIME-WAIT.
     time_wait_deadline: std::option::Option<Instant>,
@@ -405,6 +415,7 @@ impl Conn {
             persist_deadline: None,
             persist_backoff: Duration::ZERO,
             probes_out: 0,
+            orphan_probes: 0,
             time_wait_deadline: None,
             keepalive_deadline: None,
             keepalive_sent: 0,
@@ -2068,11 +2079,10 @@ impl Conn {
             // serviced a little late (a coarse tick) puts more than MAX_RTO
             // between an answer and the next timeout of a peer that
             // answered every probe at once.
-            if self.probes_out >= MAX_RETRIES {
+            if self.probes_exhausted() {
                 self.tear_down(State::Closed);
                 return;
             }
-            self.probes_out += 1;
         } else {
             self.retries += 1;
             if self.retries > MAX_RETRIES {
@@ -2154,6 +2164,23 @@ impl Conn {
         self.start_rto();
     }
 
+    /// Count a zero-window probe about to be sent; true if the connection
+    /// should give up instead. Unanswered probes are limited like
+    /// retransmissions; once released, answered ones are limited too (see
+    /// [`ORPHAN_RETRIES`]).
+    fn probes_exhausted(&mut self) -> bool {
+        if self.probes_out >= MAX_RETRIES
+            || (self.released.is_some() && self.orphan_probes >= ORPHAN_RETRIES)
+        {
+            return true;
+        }
+        self.probes_out += 1;
+        if self.released.is_some() {
+            self.orphan_probes += 1;
+        }
+        false
+    }
+
     fn on_persist_timeout(&mut self) {
         if self.snd_wnd > 0 {
             self.stop_persist();
@@ -2175,11 +2202,10 @@ impl Conn {
         // allows unanswered retransmissions. An answer, even one that still
         // shuts the window, resets the count, so a peer that is merely not
         // reading is probed for as long as it takes.
-        if self.probes_out >= MAX_RETRIES {
+        if self.probes_exhausted() {
             self.tear_down(State::Closed);
             return;
         }
-        self.probes_out += 1;
         // Bytes in flight from before the window closed are probed with
         // one of them, from SND.UNA (RFC 9293 §3.8.6.1); the RTO repairs
         // them as well.
@@ -4121,6 +4147,49 @@ mod tests {
         assert!(!client.is_closed());
         fire_persist(&mut client);
         assert!(client.is_closed());
+    }
+
+    /// Released, nobody will write or read again: a peer that answers
+    /// every probe but never opens its window must not keep the
+    /// connection forever (Linux's tcp_orphan_retries), on either timer.
+    #[test]
+    fn released_connection_gives_up_on_a_zero_window() {
+        // Persist timer: nothing in flight.
+        let (mut client, server) = established(40277);
+        client.snd_wnd = 0;
+        client.write(b"abcdef");
+        let una = client.send_buf.as_ref().unwrap().una();
+        client.release();
+        for _ in 0..ORPHAN_RETRIES {
+            assert!(!client.is_closed());
+            assert_eq!(fire_persist(&mut client).len(), 1);
+            client.handle_segment(&bare_ack(&client, &server, una, 0));
+        }
+        fire_persist(&mut client);
+        assert!(client.is_closed(), "orphan probed a zero window forever");
+
+        // Retransmission timer: data in flight when the window closed.
+        let (mut client, server) = established(40278);
+        client.write(b"data the peer cannot take");
+        let una = client.send_buf.as_ref().unwrap().una();
+        let zero_window_ack = Segment {
+            src_port: 80,
+            dst_port: 40278,
+            seq: server.send_buf.as_ref().unwrap().nxt(),
+            ack: una,
+            flags: flags::ACK,
+            window: 0,
+            ..Default::default()
+        };
+        client.handle_segment(&zero_window_ack);
+        client.release();
+        for _ in 0..ORPHAN_RETRIES {
+            assert!(!client.is_closed());
+            fire_rto(&mut client);
+            client.handle_segment(&zero_window_ack);
+        }
+        fire_rto(&mut client);
+        assert!(client.is_closed(), "orphan probed a zero window forever");
     }
 
     /// RFC 9293 §3.10.7.4: with a zero receive window no segment is
