@@ -673,9 +673,18 @@ impl Nat {
             return;
         }
 
-        // Local helper interception (packets to the NAT's own inside IP).
+        // Local helper interception: packets to the NAT's own inside IP, and
+        // multicast and broadcast (SSDP discovery goes to 239.255.255.250).
+        // The latter are scoped to the inside network and are never
+        // translated out.
         let dst_ip = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
-        if Some(dst_ip) == self.inside_addr() && self.handle_local(ns, Packet::from_slice(pkt)) {
+        let group = dst_ip.is_multicast() || dst_ip.is_broadcast();
+        if (group || Some(dst_ip) == self.inside_addr())
+            && self.handle_local(ns, Packet::from_slice(pkt))
+        {
+            return;
+        }
+        if group {
             return;
         }
 
@@ -835,9 +844,6 @@ impl Nat {
         };
 
         if pkt.len() < 20 || pkt[0] >> 4 != 4 {
-            return;
-        }
-        if self.handle_local(0, Packet::from_slice(pkt)) {
             return;
         }
         let ihl = (pkt[0] & 0x0F) as usize * 4;

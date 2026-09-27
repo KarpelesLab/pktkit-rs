@@ -82,6 +82,11 @@ pub trait PacketHelper: Helper {
 /// A helper that consumes packets addressed to the NAT itself (e.g. UPnP
 /// control endpoints, SSDP discovery). Returns `true` if the packet was
 /// handled and should not flow further.
+///
+/// It sees packets from the inside sent to the NAT's inside address or to a
+/// multicast or broadcast address. Nothing from the outside reaches it: a
+/// local service answering there would let any Internet host make the NAT
+/// send packets into the inside network.
 pub trait LocalHelper: Helper {
     fn handle_local(&self, nat: &super::nat::Nat, pkt: &Packet) -> bool;
 

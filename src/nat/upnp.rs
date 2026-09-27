@@ -1143,10 +1143,9 @@ mod tests {
             Ok(())
         }));
 
-        // Build an M-SEARCH from inside client to 239.255.255.250:1900.
-        // (The NAT's outbound dispatch only routes packets addressed to the
-        // inside IP into handle_local — matching the Go upstream — so we invoke
-        // the helper directly to exercise the SSDP responder.)
+        // Build an M-SEARCH from inside client to 239.255.255.250:1900 and
+        // hand it to the helper directly (see
+        // `inside_msearch_is_answered_through_the_nat` for the NAT path).
         let payload = b"M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n\
 MAN: \"ssdp:discover\"\r\nST: urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\n\r\n";
         let pkt = build_udp_packet(
@@ -1388,5 +1387,61 @@ Content-Length: {len}\r\n\r\n",
         );
         assert_eq!(res.status, 200, "body: {}", res.body);
         assert!(nat.list_port_forwards().is_empty());
+    }
+
+    fn msearch(src: Ipv4Addr) -> Vec<u8> {
+        let payload = b"M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n\
+MAN: \"ssdp:discover\"\r\nST: upnp:rootdevice\r\n\r\n";
+        build_udp_packet(src, 40000, SSDP_MCAST, SSDP_PORT, payload)
+    }
+
+    fn wired() -> (
+        Arc<Nat>,
+        Arc<StdMutex<Vec<Vec<u8>>>>,
+        Arc<StdMutex<Vec<Vec<u8>>>>,
+    ) {
+        let nat = Nat::new(pfx("10.0.0.1/24"), pfx("203.0.113.1/24"));
+        nat.add_local_helper(Arc::new(UPnPHelper::new(UPnPConfig::default())));
+        let inside = Arc::new(StdMutex::new(Vec::<Vec<u8>>::new()));
+        let outside = Arc::new(StdMutex::new(Vec::<Vec<u8>>::new()));
+        let i = inside.clone();
+        nat.inside().set_handler(Arc::new(move |p| {
+            i.lock().unwrap().push(p.as_bytes().to_vec());
+            Ok(())
+        }));
+        let o = outside.clone();
+        nat.outside().set_handler(Arc::new(move |p| {
+            o.lock().unwrap().push(p.as_bytes().to_vec());
+            Ok(())
+        }));
+        (nat, inside, outside)
+    }
+
+    #[test]
+    fn inside_msearch_is_answered_through_the_nat() {
+        let (nat, inside, outside) = wired();
+        let client = Ipv4Addr::new(10, 0, 0, 50);
+        nat.inside()
+            .send(crate::Packet::from_slice(&msearch(client)))
+            .unwrap();
+        let got = inside.lock().unwrap();
+        assert_eq!(got.len(), 1, "expected an SSDP reply");
+        assert_eq!(&got[0][16..20], &client.octets());
+        assert!(
+            outside.lock().unwrap().is_empty(),
+            "multicast leaked outside"
+        );
+    }
+
+    #[test]
+    fn outside_msearch_is_ignored() {
+        let (nat, inside, _outside) = wired();
+        // Spoofed to make the NAT fire a reply at an inside host.
+        nat.outside()
+            .send(crate::Packet::from_slice(&msearch(Ipv4Addr::new(
+                10, 0, 0, 50,
+            ))))
+            .unwrap();
+        assert!(inside.lock().unwrap().is_empty());
     }
 }
