@@ -26,7 +26,7 @@ const DEFAULT_PORT_MAC_LIMIT: usize = 1024;
 /// topology is therefore unbounded *recursion*, not a broadcast storm -- it
 /// overflows the stack and aborts the process rather than merely wasting
 /// bandwidth. This bounds the chain instead.
-const DEFAULT_MAX_FORWARD_DEPTH: u32 = 16;
+pub(crate) const DEFAULT_MAX_FORWARD_DEPTH: u32 = 16;
 
 static PORT_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -39,17 +39,18 @@ thread_local! {
     /// Nested forwarding depth for the current thread, across every hub.
     ///
     /// Global rather than per-hub on purpose: a loop that runs A -> B -> A is
-    /// caught by the same counter as one that runs A -> B -> C -> A.
+    /// caught by the same counter as one that runs A -> B -> C -> A. `L3Hub`
+    /// shares it too, so a loop through a mix of L2 and L3 hubs is bounded.
     static FORWARD_DEPTH: Cell<u32> = const { Cell::new(0) };
 }
 
 /// Increments the thread's forwarding depth and restores it on drop, so a
 /// panicking handler cannot leave the counter stuck high.
-struct DepthGuard;
+pub(crate) struct DepthGuard;
 
 impl DepthGuard {
     /// Enter one level of forwarding, or `None` if `max` is already reached.
-    fn enter(max: u32) -> Option<DepthGuard> {
+    pub(crate) fn enter(max: u32) -> Option<DepthGuard> {
         FORWARD_DEPTH.with(|d| {
             if d.get() >= max {
                 None

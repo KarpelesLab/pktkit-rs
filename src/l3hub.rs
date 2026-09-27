@@ -1,6 +1,14 @@
+use crate::icmp::{self, RateLimiter};
+use crate::l2hub::{DEFAULT_MAX_FORWARD_DEPTH, DepthGuard};
 use crate::{Cleanup, HubCounters, HubStats, L3Device, L3Handler, Packet, Result};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+
+/// RFC 4443 §2.4(f) wants generated errors rate-limited; this is a modest
+/// ceiling for a software router.
+const ICMP_RATE: u32 = 100;
+const ICMP_BURST: u32 = 50;
 
 struct Port {
     dev: Arc<dyn L3Device>,
@@ -24,10 +32,16 @@ fn next_port_id() -> u64 {
 ///
 /// A packet that matches no prefix and has no default route is dropped, and
 /// [`stats`](Self::stats) is where that shows up.
+///
+/// Like a router, the hub decrements the TTL / hop limit of every packet it
+/// forwards and drops those that run out, answering with ICMP Time Exceeded
+/// once [`set_icmp_source`](Self::set_icmp_source) gives it an address.
 pub struct L3Hub {
     ports: RwLock<Vec<Arc<Port>>>,
     default_route: Mutex<Option<u64>>,
     stats: HubStats,
+    icmp_source: Mutex<(Option<Ipv4Addr>, Option<Ipv6Addr>)>,
+    icmp_limit: RateLimiter,
 }
 
 impl Default for L3Hub {
@@ -50,6 +64,8 @@ impl L3Hub {
             ports: RwLock::new(Vec::new()),
             default_route: Mutex::new(None),
             stats: HubStats::new(),
+            icmp_source: Mutex::new((None, None)),
+            icmp_limit: RateLimiter::new(ICMP_RATE, ICMP_BURST),
         }
     }
 
@@ -104,8 +120,34 @@ impl L3Hub {
         }
     }
 
+    /// Source address for the ICMP Time Exceeded the hub sends when a
+    /// packet's TTL / hop limit runs out in it, one per address family.
+    ///
+    /// The hub owns no address of its own, so until one is set here an
+    /// expiring packet is dropped without a word: `traceroute` then sees a
+    /// silent hop rather than a reply from an address nobody configured.
+    pub fn set_icmp_source(&self, addr: IpAddr) {
+        let mut src = self.icmp_source.lock().unwrap();
+        match addr {
+            IpAddr::V4(a) => src.0 = Some(a),
+            IpAddr::V6(a) => src.1 = Some(a),
+        }
+    }
+
     fn route(&self, pkt: &Packet, source_id: u64) {
         self.stats.record_received();
+
+        // Forwarding is a synchronous call chain, so a routing loop between
+        // hubs is recursion. The TTL bounds it too, but only at up to 255
+        // frames deep, which is enough to overflow a small thread stack.
+        let _depth = match DepthGuard::enter(DEFAULT_MAX_FORWARD_DEPTH) {
+            Some(g) => g,
+            None => {
+                self.stats.record_dropped();
+                return;
+            }
+        };
+
         if !pkt.is_valid() {
             self.stats.record_dropped();
             return;
@@ -126,6 +168,18 @@ impl L3Hub {
             self.stats.record_dropped();
             return;
         }
+
+        // RFC 1812 §5.3.1 / RFC 8200 §3: a router decrements the TTL / hop
+        // limit of what it forwards, and discards what reaches zero -- that
+        // is what finally ends a routing loop.
+        let mut buf = pkt.to_vec();
+        let fwd = Packet::from_mut(&mut buf);
+        if !fwd.decrement_hop_limit() {
+            self.stats.record_dropped();
+            self.time_exceeded(pkt, &ports, source_id);
+            return;
+        }
+        let pkt: &Packet = fwd;
 
         if pkt.is_broadcast() || pkt.is_multicast() {
             let mut sent = 0u64;
@@ -161,7 +215,10 @@ impl L3Hub {
             return;
         }
 
-        if let Some(default_id) = *self.default_route.lock().unwrap() {
+        // Copied out rather than matched on the guard: the send below may
+        // re-enter this hub, which would then deadlock on the lock.
+        let default_route = *self.default_route.lock().unwrap();
+        if let Some(default_id) = default_route {
             for p in &ports {
                 if p.id == default_id && p.id != source_id {
                     let _ = p.dev.send(pkt);
@@ -173,6 +230,32 @@ impl L3Hub {
 
         // Nowhere to send it: no matching prefix and no usable default route.
         self.stats.record_dropped();
+    }
+
+    /// Tell the sender of an expired packet, if the hub has an address to
+    /// speak from. `icmp::time_exceeded` refuses the cases RFC 1812 §4.3.2.7
+    /// and RFC 4443 §2.4 forbid (errors about errors, multicast, ...).
+    fn time_exceeded(&self, orig: &Packet, ports: &[Arc<Port>], source_id: u64) {
+        let src = *self.icmp_source.lock().unwrap();
+        let from: IpAddr = match orig.version() {
+            4 => match src.0 {
+                Some(a) => a.into(),
+                None => return,
+            },
+            _ => match src.1 {
+                Some(a) => a.into(),
+                None => return,
+            },
+        };
+        let Some(reply) = icmp::time_exceeded(orig, from) else {
+            return;
+        };
+        if !self.icmp_limit.allow() {
+            return;
+        }
+        if let Some(p) = ports.iter().find(|p| p.id == source_id) {
+            let _ = p.dev.send(Packet::from_slice(&reply));
+        }
     }
 
     fn disconnect(&self, id: u64) {
@@ -413,5 +496,127 @@ mod tests {
         let s = hub.stats();
         assert_eq!((s.received, s.forwarded, s.dropped), (1, 1, 0));
         assert_eq!(b.inner.lock().unwrap().len(), 1);
+    }
+
+    /// One end of a cable between two hubs: what it is asked to send comes out
+    /// of the other end's handler, synchronously, as a link between two
+    /// in-process routers does.
+    #[derive(Default)]
+    struct CableEnd {
+        handler: Mutex<Option<L3Handler>>,
+        peer: Mutex<std::sync::Weak<CableEnd>>,
+        sent: AtomicU64,
+    }
+    impl L3Device for CableEnd {
+        fn set_handler(&self, h: L3Handler) {
+            *self.handler.lock().unwrap() = Some(h);
+        }
+        fn send(&self, p: &Packet) -> Result<()> {
+            self.sent.fetch_add(1, Ordering::Relaxed);
+            let peer = self.peer.lock().unwrap().upgrade();
+            let h = peer.and_then(|p| p.handler.lock().unwrap().clone());
+            if let Some(h) = h {
+                h(p)?;
+            }
+            Ok(())
+        }
+        fn addr(&self) -> IpPrefix {
+            IpPrefix::default()
+        }
+        fn set_addr(&self, _p: IpPrefix) -> Result<()> {
+            Ok(())
+        }
+        fn close(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn cable() -> (Arc<CableEnd>, Arc<CableEnd>) {
+        let a = Arc::new(CableEnd::default());
+        let b = Arc::new(CableEnd::default());
+        *a.peer.lock().unwrap() = Arc::downgrade(&b);
+        *b.peer.lock().unwrap() = Arc::downgrade(&a);
+        (a, b)
+    }
+
+    fn udp4(src: [u8; 4], dst: [u8; 4], ttl: u8) -> Vec<u8> {
+        let (s, d) = (std::net::Ipv4Addr::from(src), std::net::Ipv4Addr::from(dst));
+        let udp = crate::build::build_udp(s.into(), d.into(), 1, 2, b"x");
+        crate::build::build_ipv4(s, d, crate::Protocol::UDP, ttl, &udp)
+    }
+
+    #[test]
+    fn two_hubs_defaulting_to_each_other_do_not_loop_forever() {
+        let h1 = Arc::new(L3Hub::new());
+        let h2 = Arc::new(L3Hub::new());
+        // Two links, each hub defaulting out a different one, so no hub ever
+        // sends a packet back out the port it came in on.
+        let (e1, e2) = cable();
+        let (f1, f2) = cable();
+        let e1d: Arc<dyn L3Device> = e1.clone();
+        let f2d: Arc<dyn L3Device> = f2.clone();
+        let _c1 = h1.connect_arc(e1d.clone());
+        let _c2 = h2.connect_arc(e2.clone() as Arc<dyn L3Device>);
+        let _c3 = h1.connect_arc(f1.clone() as Arc<dyn L3Device>);
+        let _c4 = h2.connect_arc(f2d.clone());
+        h1.set_default_route(&e1d);
+        h2.set_default_route(&f2d);
+        let host = Arc::new(PipeL3::new("10.0.0.1/24".parse().unwrap()));
+        let _ch = h1.connect_arc(host.clone() as Arc<dyn L3Device>);
+
+        // TTL 255 is the worst case: without a decrement or a depth bound
+        // this recurses until the stack overflows.
+        let buf = udp4([10, 0, 0, 1], [8, 8, 8, 8], 255);
+        host.inject(Packet::from_slice(&buf)).unwrap();
+
+        let hops = e1.sent.load(Ordering::Relaxed) + e2.sent.load(Ordering::Relaxed);
+        assert!(hops < 64, "the packet bounced {hops} times");
+    }
+
+    #[test]
+    fn forwarding_decrements_ttl_and_expiry_answers_time_exceeded() {
+        let hub = Arc::new(L3Hub::new());
+        let a = sink("10.0.0.1/24");
+        let b = sink("10.0.1.1/24");
+        let ha = hub.connect(a.clone());
+        let _hb = hub.connect(b.clone());
+        hub.set_icmp_source("10.0.0.254".parse().unwrap());
+
+        let pkt = udp4([10, 0, 0, 1], [10, 0, 1, 9], 64);
+        hub.route(Packet::from_slice(&pkt), ha.id);
+        let got = b.inner.lock().unwrap()[0].clone();
+        let got = Packet::from_slice(&got);
+        assert_eq!(got.ipv4_ttl(), 63);
+        assert!(got.verify_ipv4_checksum());
+
+        // TTL 1 must not be forwarded; the sender hears Time Exceeded.
+        let expiring = udp4([10, 0, 0, 1], [10, 0, 1, 9], 1);
+        hub.route(Packet::from_slice(&expiring), ha.id);
+        assert_eq!(count(&b), 1, "an expiring packet is not forwarded");
+        let replies = a.inner.lock().unwrap().clone();
+        assert_eq!(replies.len(), 1);
+        let r = Packet::from_slice(&replies[0]);
+        assert_eq!(r.transport_protocol(), crate::Protocol::ICMP);
+        assert_eq!(r.src_addr(), Some("10.0.0.254".parse().unwrap()));
+        assert_eq!(r.transport_payload()[0], crate::l4::icmpv4::TIME_EXCEEDED);
+    }
+
+    #[test]
+    fn ipv6_forwarding_decrements_hop_limit() {
+        let hub = Arc::new(L3Hub::new());
+        let a = sink("2001:db8::1/64");
+        let b = sink("2001:db8:1::1/64");
+        let ha = hub.connect(a.clone());
+        let _hb = hub.connect(b.clone());
+        let (s, d): (std::net::Ipv6Addr, std::net::Ipv6Addr) = (
+            "2001:db8::1".parse().unwrap(),
+            "2001:db8:1::9".parse().unwrap(),
+        );
+        let udp = crate::build::build_udp(s.into(), d.into(), 1, 2, b"x");
+        let pkt = crate::build::build_ipv6(s, d, crate::Protocol::UDP, 1, &udp);
+        hub.route(Packet::from_slice(&pkt), ha.id);
+        assert_eq!(count(&b), 0, "hop limit 1 expires here");
+        // No ICMP source configured: dropped quietly.
+        assert_eq!(count(&a), 0);
     }
 }
