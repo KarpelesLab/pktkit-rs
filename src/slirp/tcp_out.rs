@@ -26,8 +26,9 @@
 
 use crate::Result;
 use crate::slirp::tcp_stream::{ConnState, Endpoints};
+use crate::time::Instant;
 use crate::vtcp::segment::Segment;
-use crate::vtcp::{Conn, ConnConfig};
+use crate::vtcp::{Conn, ConnConfig, State};
 
 use std::io::{Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream};
@@ -61,6 +62,9 @@ pub(crate) struct TcpOutConn {
     /// The client's SYN, kept while the real destination is being dialed and
     /// taken once the dial finishes.
     syn: Mutex<Option<Segment>>,
+    /// When the stack's tick first saw the virtual side in TIME-WAIT; the
+    /// oldest go first when there are too many.
+    time_wait_since: OnceLock<Instant>,
 }
 
 impl TcpOutConn {
@@ -119,6 +123,7 @@ impl TcpOutConn {
             remote: OnceLock::new(),
             closed: Arc::new(AtomicBool::new(false)),
             syn: Mutex::new(Some(syn.clone())),
+            time_wait_since: OnceLock::new(),
         })
     }
 
@@ -218,6 +223,15 @@ impl TcpOutConn {
         &self.state
     }
 
+    /// If the virtual side is in TIME-WAIT, since when (first asked at
+    /// `now`).
+    pub(crate) fn time_wait_since(&self, now: Instant) -> Option<Instant> {
+        if self.state.conn.lock().expect("poisoned").state() != State::TimeWait {
+            return None;
+        }
+        Some(*self.time_wait_since.get_or_init(|| now))
+    }
+
     /// True once the bridge has fully torn down.
     pub(crate) fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire) || self.state.conn.lock().expect("poisoned").is_closed()
@@ -229,7 +243,14 @@ impl TcpOutConn {
         if self.closed.swap(true, Ordering::SeqCst) {
             return;
         }
-        let segs = self.state.conn.lock().expect("poisoned").abort();
+        let segs = {
+            let mut conn = self.state.conn.lock().expect("poisoned");
+            // In TIME-WAIT both sides have already finished; a RST would
+            // only reach a peer that has moved on.
+            let finished = conn.state() == State::TimeWait;
+            let segs = conn.abort();
+            if finished { Vec::new() } else { segs }
+        };
         self.state.wrap_and_send(segs);
         self.state.signal.notify_all();
         self.shutdown_remote(Shutdown::Both);

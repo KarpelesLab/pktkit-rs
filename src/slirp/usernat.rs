@@ -69,7 +69,13 @@ const MAX_VIRT_TCP_CONNS: usize = 10_000;
 /// and two pump threads, and any guest can open them, so this bounds the
 /// threads a guest can make the host create (with [`MAX_UDP_FLOWS`], about
 /// 12k in all).
-const MAX_OUTBOUND_TCP: usize = 2048;
+const MAX_OUTBOUND_TCP: usize = if cfg!(test) { 8 } else { 2048 };
+
+/// Cap on outbound TCP bridges in TIME-WAIT, per address family. They hold
+/// no thread and are not counted against [`MAX_OUTBOUND_TCP`], so a server
+/// that closes first cannot use them up; past this cap the oldest are
+/// dropped early, as Linux does past `tcp_max_tw_buckets`.
+const MAX_TIME_WAIT: usize = if cfg!(test) { 4 } else { 8192 };
 
 /// Cap on outbound TCP dials in flight at once. A dial to a destination that
 /// drops SYNs holds a thread for up to the connect timeout; SYNs past the cap
@@ -92,6 +98,10 @@ struct Inner {
     // with a server-side vtcp::Conn and bridges to a real socket (`TcpOutConn`).
     tcp: Mutex<HashMap<Key, Arc<TcpOutConn>>>,
     tcp6: Mutex<HashMap<Key6, Arc<TcpOutConn>>>,
+    /// How many of the `tcp` / `tcp6` entries are in TIME-WAIT, as of the
+    /// last tick: those do not count against [`MAX_OUTBOUND_TCP`].
+    tcp_time_wait: AtomicUsize,
+    tcp6_time_wait: AtomicUsize,
     udp: Mutex<HashMap<Key, Arc<UdpConn>>>,
     udp6: Mutex<HashMap<Key6, Arc<UdpConn6>>>,
     // Inbound virtual TCP connections accepted by a Listener (vtcp-backed).
@@ -183,6 +193,8 @@ impl Stack {
             handler: Mutex::new(None),
             tcp: Mutex::new(HashMap::new()),
             tcp6: Mutex::new(HashMap::new()),
+            tcp_time_wait: AtomicUsize::new(0),
+            tcp6_time_wait: AtomicUsize::new(0),
             udp: Mutex::new(HashMap::new()),
             udp6: Mutex::new(HashMap::new()),
             virt_tcp: Mutex::new(HashMap::new()),
@@ -289,58 +301,8 @@ impl Stack {
 
                 // Outbound NAT bridges: tick the virtual-side engine; reap when the
                 // bridge has fully torn down.
-                let out: Vec<(Key, Arc<TcpOutConn>)> = inner
-                    .tcp
-                    .lock()
-                    .expect("poisoned")
-                    .iter()
-                    .map(|(k, v)| (*k, v.clone()))
-                    .collect();
-                let mut dead_out = Vec::new();
-                for (k, c) in out {
-                    tick_conn(c.state());
-                    if c.is_closed() {
-                        dead_out.push(k);
-                    }
-                }
-                if !dead_out.is_empty() {
-                    let gone: Vec<Arc<TcpOutConn>> = {
-                        let mut t = inner.tcp.lock().expect("poisoned");
-                        dead_out.iter().filter_map(|k| t.remove(k)).collect()
-                    };
-                    // Closing shuts the real socket, which is what ends a
-                    // pump still blocked reading it; outside the table lock,
-                    // as close() may emit and so re-enter `send`.
-                    for c in gone {
-                        c.close();
-                    }
-                }
-                let out6: Vec<(Key6, Arc<TcpOutConn>)> = inner
-                    .tcp6
-                    .lock()
-                    .expect("poisoned")
-                    .iter()
-                    .map(|(k, v)| (*k, v.clone()))
-                    .collect();
-                let mut dead_out6 = Vec::new();
-                for (k, c) in out6 {
-                    tick_conn(c.state());
-                    if c.is_closed() {
-                        dead_out6.push(k);
-                    }
-                }
-                if !dead_out6.is_empty() {
-                    let gone: Vec<Arc<TcpOutConn>> = {
-                        let mut t = inner.tcp6.lock().expect("poisoned");
-                        dead_out6.iter().filter_map(|k| t.remove(k)).collect()
-                    };
-                    // Closing shuts the real socket, which is what ends a
-                    // pump still blocked reading it; outside the table lock,
-                    // as close() may emit and so re-enter `send`.
-                    for c in gone {
-                        c.close();
-                    }
-                }
+                tick_outbound(&inner.tcp, &inner.tcp_time_wait);
+                tick_outbound(&inner.tcp6, &inner.tcp6_time_wait);
                 drop(inner);
             }
         });
@@ -615,7 +577,7 @@ impl Stack {
 
         // SYN → dial the real destination and bridge it to a server-side
         // vtcp::Conn terminating the virtual side.
-        if inner.tcp.lock().expect("poisoned").len() >= MAX_OUTBOUND_TCP
+        if !outbound_slot_free(&inner.tcp, &inner.tcp_time_wait)
             || inner.pending_dials.load(Ordering::Acquire) >= MAX_PENDING_DIALS
         {
             return Ok(()); // silently drop; client will retransmit
@@ -943,7 +905,7 @@ impl Stack {
             return Ok(());
         }
 
-        if inner.tcp6.lock().expect("poisoned").len() >= MAX_OUTBOUND_TCP
+        if !outbound_slot_free(&inner.tcp6, &inner.tcp6_time_wait)
             || inner.pending_dials.load(Ordering::Acquire) >= MAX_PENDING_DIALS
         {
             return Ok(()); // silently drop; client will retransmit
@@ -1213,6 +1175,72 @@ impl L3Connector for Stack {
             }
             Ok(())
         }))
+    }
+}
+
+/// Whether a new outbound bridge may be opened in `table`. Bridges in
+/// TIME-WAIT hold no thread and are bounded on their own, by
+/// [`MAX_TIME_WAIT`]; the hard stop covers the entries that entered
+/// TIME-WAIT, or left it, since the tick last counted them.
+fn outbound_slot_free<K>(
+    table: &Mutex<HashMap<K, Arc<TcpOutConn>>>,
+    time_wait: &AtomicUsize,
+) -> bool {
+    let len = table.lock().expect("poisoned").len();
+    len < MAX_OUTBOUND_TCP + MAX_TIME_WAIT
+        && len.saturating_sub(time_wait.load(Ordering::Acquire)) < MAX_OUTBOUND_TCP
+}
+
+/// Drive the timers of every outbound bridge in `table`, reap those that
+/// have torn down, and keep those in TIME-WAIT within [`MAX_TIME_WAIT`] by
+/// dropping the oldest early.
+fn tick_outbound<K: Copy + Eq + std::hash::Hash>(
+    table: &Mutex<HashMap<K, Arc<TcpOutConn>>>,
+    time_wait: &AtomicUsize,
+) {
+    let out: Vec<(K, Arc<TcpOutConn>)> = table
+        .lock()
+        .expect("poisoned")
+        .iter()
+        .map(|(k, v)| (*k, v.clone()))
+        .collect();
+    let now = Instant::now();
+    let mut dead = Vec::new();
+    let mut waiting = Vec::new();
+    for (k, c) in out {
+        tick_conn(c.state());
+        if c.is_closed() {
+            dead.push((k, c));
+        } else if let Some(since) = c.time_wait_since(now) {
+            waiting.push((since, k, c));
+        }
+    }
+    if waiting.len() > MAX_TIME_WAIT {
+        waiting.sort_by_key(|w| w.0);
+        let excess = waiting.len() - MAX_TIME_WAIT;
+        dead.extend(waiting.drain(..excess).map(|(_, k, c)| (k, c)));
+    }
+    time_wait.store(waiting.len(), Ordering::Release);
+    if dead.is_empty() {
+        return;
+    }
+    let gone: Vec<Arc<TcpOutConn>> = {
+        let mut t = table.lock().expect("poisoned");
+        dead.into_iter()
+            // A new connection may have taken the 4-tuple over meanwhile.
+            .filter_map(|(k, c)| {
+                t.get(&k)
+                    .is_some_and(|x| Arc::ptr_eq(x, &c))
+                    .then(|| t.remove(&k))
+                    .flatten()
+            })
+            .collect()
+    };
+    // Closing shuts the real socket, which is what ends a pump still
+    // blocked reading it; outside the table lock, as close() may emit and
+    // so re-enter `send`.
+    for c in gone {
+        c.close();
     }
 }
 
@@ -1886,6 +1914,90 @@ mod tests {
         held.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let mut buf = [0u8; 16];
         assert_eq!(std::io::Read::read(&mut held, &mut buf).unwrap(), 0);
+    }
+
+    #[test]
+    fn time_wait_bridges_do_not_hold_live_connection_slots() {
+        use std::net::TcpListener;
+
+        // A server that closes first, which leaves each bridge in TIME-WAIT.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            for s in listener.incoming() {
+                drop(s);
+            }
+        });
+
+        let stack = Stack::new();
+        let client = Ipv4Addr::new(10, 0, 0, 5);
+        let server = Ipv4Addr::new(127, 0, 0, 1);
+        type Clients = Arc<Mutex<HashMap<u16, Arc<Mutex<Conn>>>>>;
+        let clients: Clients = Arc::new(Mutex::new(HashMap::new()));
+        let weak = Arc::downgrade(&stack);
+        let routes = clients.clone();
+        stack.set_handler(Arc::new(move |p: &Packet| {
+            let bytes = p.as_bytes();
+            let Ok(seg) = Segment::parse(&bytes[20..]) else {
+                return Ok(());
+            };
+            let conn = routes.lock().unwrap().get(&seg.dst_port).cloned();
+            let Some(conn) = conn else { return Ok(()) };
+            let replies = conn.lock().unwrap().handle_segment(&seg);
+            if let Some(stack) = weak.upgrade() {
+                inject_segs(&stack, client, server, replies);
+            }
+            Ok(())
+        }));
+
+        let open = |cport: u16| {
+            let conn = Arc::new(Mutex::new(Conn::new(ConnConfig {
+                local_port: cport,
+                remote_port: port,
+                mss: 1460,
+                ..Default::default()
+            })));
+            clients.lock().unwrap().insert(cport, conn.clone());
+            let syn = conn.lock().unwrap().connect();
+            inject_segs(&stack, client, server, syn);
+            conn
+        };
+        let bridges_in_time_wait = || {
+            let t = stack.inner.tcp.lock().unwrap();
+            t.values()
+                .filter(|c| c.state().conn.lock().unwrap().state() == VtcpState::TimeWait)
+                .count()
+        };
+
+        // More connections than there are live slots, each closed by the
+        // server and then by the client.
+        for i in 0..(MAX_OUTBOUND_TCP + MAX_TIME_WAIT) as u16 {
+            let conn = open(51000 + i);
+            wait_for(&format!("the server's FIN on connection {i}"), || {
+                // A SYN dropped before the stack counted the last TIME-WAIT
+                // entry is retransmitted.
+                let segs = conn.lock().unwrap().tick();
+                inject_segs(&stack, client, server, segs);
+                conn.lock().unwrap().fin_received()
+            });
+            let fin = conn.lock().unwrap().close();
+            inject_segs(&stack, client, server, fin);
+            // The client closes once the bridge ACKs its FIN, which puts the
+            // bridge in TIME-WAIT.
+            wait_for("TIME-WAIT", || conn.lock().unwrap().is_closed());
+        }
+
+        // Another connection still gets through, and the TIME-WAIT entries
+        // themselves stay bounded.
+        let conn = open(52000);
+        wait_for("ESTABLISHED", || {
+            let segs = conn.lock().unwrap().tick();
+            inject_segs(&stack, client, server, segs);
+            conn.lock().unwrap().is_established()
+        });
+        wait_for("TIME-WAIT to be bounded", || {
+            bridges_in_time_wait() <= MAX_TIME_WAIT
+        });
     }
 
     #[test]
