@@ -155,6 +155,15 @@ impl<K: Eq + Hash + Copy + Send + 'static> Pending<K> {
         first
     }
 
+    /// True while packets are waiting for `ip`: a resolution is under way.
+    pub fn contains(&self, ip: K) -> bool {
+        let map = self.inner.lock().unwrap();
+        map.get(&ip).is_some_and(|e| {
+            e.created
+                .is_some_and(|c| Instant::now().duration_since(c) <= PENDING_TIMEOUT)
+        })
+    }
+
     /// Remove and return every packet waiting for `ip`.
     pub fn drain(&self, ip: K) -> Vec<Vec<u8>> {
         self.inner

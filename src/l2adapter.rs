@@ -212,11 +212,9 @@ impl L2Adapter {
                     }
                 }
 
-                // Intercept NDP. RFC 4861 §6.1.1: hop limit must be 255.
                 if pkt.version() == 6
                     && pkt.ipv6_next_header() == Protocol::ICMPV6
-                    && pkt.ipv6_hop_limit() == 255
-                    && self.handle_ndp(pkt)
+                    && self.handle_ndp(pkt, f.src_mac())
                 {
                     return;
                 }
@@ -352,63 +350,85 @@ impl L2Adapter {
         self.send_l2(Frame::from_slice(&frame));
     }
 
-    fn handle_ndp(&self, pkt: &Packet) -> bool {
+    /// Terminate Neighbor Solicitations and Advertisements, which are the
+    /// adapter's business; returns `false` for any other ICMPv6, which goes
+    /// on to the L3 device. `frame_src` is the Ethernet sender.
+    fn handle_ndp(&self, pkt: &Packet, frame_src: Option<MacAddr>) -> bool {
         let icmp = pkt.ipv6_payload();
-        if icmp.len() < 4 {
+        if icmp.is_empty() || (icmp[0] != ndp::NS_TYPE && icmp[0] != ndp::NA_TYPE) {
             return false;
         }
-        let src = match pkt.ipv6_src_addr() {
-            Some(a) => a,
-            None => return false,
+        // From here the message is consumed either way: one failing the
+        // checks of RFC 4861 §7.1 is silently discarded, not passed on.
+        let (Some(src), Some(dst)) = (pkt.ipv6_src_addr(), pkt.ipv6_dst_addr()) else {
+            return true;
         };
-        match icmp[0] {
-            ndp::NS_TYPE => {
-                if icmp.len() < 24 {
-                    return false;
-                }
-                let mut t = [0u8; 16];
-                t.copy_from_slice(&icmp[8..24]);
-                let target = Ipv6Addr::from(t);
-
-                // Learn sender unless source is unspecified (DAD).
-                if !src.is_unspecified()
-                    && let Some(src_mac) = ndp::parse_option(&icmp[24..], ndp::OPT_SOURCE_LINK_ADDR)
-                {
-                    self.learn_neighbor(src, src_mac);
-                }
-
-                let ll = ndp::link_local_from_mac(self.mac);
-                let dev_addr = match self.l3.addr().addr() {
-                    IpAddr::V6(a) => Some(a),
-                    _ => None,
-                };
-                if target == ll || dev_addr == Some(target) {
-                    if src.is_unspecified() {
-                        // DAD: respond to all-nodes multicast.
-                        let all_nodes: Ipv6Addr = "ff02::1".parse().unwrap();
-                        self.send_neighbor_advertisement(all_nodes, target, false);
-                    } else {
-                        self.send_neighbor_advertisement(src, target, true);
-                    }
-                }
-                true
-            }
-            ndp::NA_TYPE => {
-                if icmp.len() < 24 {
-                    return false;
-                }
-                let mut t = [0u8; 16];
-                t.copy_from_slice(&icmp[8..24]);
-                let target = Ipv6Addr::from(t);
-                if let Some(target_mac) = ndp::parse_option(&icmp[24..], ndp::OPT_TARGET_LINK_ADDR)
-                {
-                    self.learn_neighbor(target, target_mac);
-                }
-                true
-            }
-            ndp::RS_TYPE | ndp::RA_TYPE => false, // pass through to L3
-            _ => false,
+        // A hop limit of 255 proves the sender is on-link: a router would
+        // have decremented it.
+        if pkt.ipv6_hop_limit() != 255
+            || icmp.len() < 24
+            || icmp[1] != 0
+            || ndp::icmpv6_checksum(src, dst, icmp) != 0
+        {
+            return true;
         }
+        let mut t = [0u8; 16];
+        t.copy_from_slice(&icmp[8..24]);
+        let target = Ipv6Addr::from(t);
+        let opts = &icmp[24..];
+        if target.is_multicast() || !ndp::options_valid(opts) {
+            return true;
+        }
+
+        if icmp[0] == ndp::NS_TYPE {
+            let slla = ndp::parse_option(opts, ndp::OPT_SOURCE_LINK_ADDR);
+            if src.is_unspecified() {
+                // Duplicate Address Detection: only to a solicited-node
+                // group, and with no address of the sender's to offer.
+                if dst != ndp::solicited_node_multicast(target) || slla.is_some() {
+                    return true;
+                }
+            } else if let Some(mac) = slla {
+                self.learn_neighbor(src, mac);
+            }
+
+            let dev_addr = match self.l3.addr().addr() {
+                IpAddr::V6(a) => Some(a),
+                _ => None,
+            };
+            if target == ndp::link_local_from_mac(self.mac) || dev_addr == Some(target) {
+                if src.is_unspecified() {
+                    // DAD: answer to all-nodes (RFC 4861 §7.2.4).
+                    let all_nodes = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
+                    let mac = MacAddr([0x33, 0x33, 0, 0, 0, 1]);
+                    self.send_neighbor_advertisement(all_nodes, mac, target, false);
+                } else if let Some(mac) = slla.or_else(|| self.ndp.lookup(src)).or(frame_src) {
+                    // Without a source link-layer option the sender is still
+                    // right there: it is the frame's own source.
+                    self.send_neighbor_advertisement(src, mac, target, true);
+                }
+            }
+            return true;
+        }
+
+        let solicited = icmp[4] & 0x40 != 0;
+        let override_ = icmp[4] & 0x20 != 0;
+        if solicited && dst.is_multicast() {
+            return true;
+        }
+        let Some(mac) = ndp::parse_option(opts, ndp::OPT_TARGET_LINK_ADDR) else {
+            return true;
+        };
+        // RFC 4861 §7.2.5: without the Override flag an advertisement may
+        // fill in an address being resolved but not replace a known one;
+        // and one for an address nobody here asked about is not cached.
+        match self.ndp.lookup(target) {
+            Some(known) if known != mac && !override_ => {}
+            Some(_) => self.learn_neighbor(target, mac),
+            None if self.ndp_pending.contains(target) => self.learn_neighbor(target, mac),
+            None => {}
+        }
+        true
     }
 
     /// Cache a neighbour's MAC and send whatever was waiting for it,
@@ -432,14 +452,14 @@ impl L2Adapter {
         self.send_l2(Frame::from_slice(&frame));
     }
 
-    fn send_neighbor_advertisement(&self, dst_addr: Ipv6Addr, target: Ipv6Addr, solicited: bool) {
+    fn send_neighbor_advertisement(
+        &self,
+        dst_addr: Ipv6Addr,
+        dst_mac: MacAddr,
+        target: Ipv6Addr,
+        solicited: bool,
+    ) {
         let src = target;
-        let dst_mac = if let Some(m) = self.ndp.lookup(dst_addr) {
-            m
-        } else {
-            let d = dst_addr.octets();
-            MacAddr([0x33, 0x33, d[12], d[13], d[14], d[15]])
-        };
         let mut payload = ndp::build_na(self.mac, target, solicited);
         let ip = ndp::wrap_icmpv6(src, dst_addr, &mut payload);
         let frame = build_frame(dst_mac, self.mac, EtherType::IPV6, &ip);
@@ -757,5 +777,72 @@ mod tests {
         let f = Frame::from_slice(&sent[0]);
         // RFC 1112 §6.4: the low 23 bits into 01:00:5e:00:00:00.
         assert_eq!(f.dst_mac(), Some(MacAddr([0x01, 0x00, 0x5e, 0x01, 2, 3])));
+    }
+
+    /// An NS from the peer for our address, as a frame.
+    fn ns_for_us(adapter: &L2Adapter, ns: &mut [u8]) -> Vec<u8> {
+        ndp_frame(adapter, PEER_MAC, peer_ip(), our_ip(), ns)
+    }
+
+    #[test]
+    fn ndp_with_a_bad_checksum_or_code_is_ignored() {
+        let (_pipe, adapter, out) = rig("2001:db8::5/64");
+
+        let mut ns = ndp::build_ns(PEER_MAC, our_ip());
+        let mut f = ns_for_us(&adapter, &mut ns);
+        f[14 + 40 + 2] ^= 0xff;
+        adapter.send(Frame::from_slice(&f)).unwrap();
+
+        let mut ns = ndp::build_ns(PEER_MAC, our_ip());
+        ns[1] = 1; // code
+        let f = ns_for_us(&adapter, &mut ns);
+        adapter.send(Frame::from_slice(&f)).unwrap();
+
+        assert!(take(&out).is_empty(), "answered an invalid NS");
+        assert_eq!(adapter.ndp.lookup(peer_ip()), None, "learnt from it");
+    }
+
+    #[test]
+    fn advertisement_without_override_keeps_the_cached_address() {
+        let (_pipe, adapter, _out) = rig("2001:db8::5/64");
+        adapter.ndp.set(peer_ip(), PEER_MAC, ndp::DEFAULT_TTL);
+
+        let other = MacAddr([2, 0, 0, 0, 0, 0x77]);
+        let mut na = ndp::build_na(other, peer_ip(), false);
+        na[4] &= !0x20; // O clear
+        let f = ndp_frame(&adapter, other, peer_ip(), our_ip(), &mut na);
+        adapter.send(Frame::from_slice(&f)).unwrap();
+        assert_eq!(adapter.ndp.lookup(peer_ip()), Some(PEER_MAC));
+
+        // With the flag, it does replace it.
+        let mut na = ndp::build_na(other, peer_ip(), false);
+        let f = ndp_frame(&adapter, other, peer_ip(), our_ip(), &mut na);
+        adapter.send(Frame::from_slice(&f)).unwrap();
+        assert_eq!(adapter.ndp.lookup(peer_ip()), Some(other));
+    }
+
+    #[test]
+    fn unsolicited_advertisement_for_a_stranger_is_not_cached() {
+        let (_pipe, adapter, _out) = rig("2001:db8::5/64");
+        let mut na = ndp::build_na(PEER_MAC, peer_ip(), false);
+        let f = ndp_frame(&adapter, PEER_MAC, peer_ip(), our_ip(), &mut na);
+        adapter.send(Frame::from_slice(&f)).unwrap();
+        assert_eq!(adapter.ndp.lookup(peer_ip()), None);
+    }
+
+    #[test]
+    fn unicast_solicitation_without_source_address_is_answered_to_the_sender() {
+        let (_pipe, adapter, out) = rig("2001:db8::5/64");
+        let mut ns = ndp::build_ns(PEER_MAC, our_ip())[..24].to_vec();
+        let f = ns_for_us(&adapter, &mut ns);
+        adapter.send(Frame::from_slice(&f)).unwrap();
+
+        let sent = take(&out);
+        assert_eq!(sent.len(), 1);
+        let f = Frame::from_slice(&sent[0]);
+        assert_eq!(f.dst_mac(), Some(PEER_MAC), "sent to a multicast MAC");
+        let na = Packet::from_slice(f.payload());
+        assert_eq!(na.ipv6_payload()[0], ndp::NA_TYPE);
+        assert_eq!(na.ipv6_dst_addr(), Some(peer_ip()));
     }
 }

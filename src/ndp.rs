@@ -190,6 +190,22 @@ pub fn wrap_icmpv6(src: Ipv6Addr, dst: Ipv6Addr, icmp_payload: &mut [u8]) -> Vec
     ip
 }
 
+/// True if `opts` is a well-formed NDP option list: every option has a
+/// non-zero length and fits (RFC 4861 §7.1).
+pub fn options_valid(mut opts: &[u8]) -> bool {
+    while !opts.is_empty() {
+        if opts.len() < 2 {
+            return false;
+        }
+        let l = opts[1] as usize * 8;
+        if l == 0 || l > opts.len() {
+            return false;
+        }
+        opts = &opts[l..];
+    }
+    true
+}
+
 /// Scan an NDP option list for `opt_type` and return the 6-byte link-layer
 /// address it carries, if any.
 pub fn parse_option(mut opts: &[u8], opt_type: u8) -> Option<MacAddr> {
