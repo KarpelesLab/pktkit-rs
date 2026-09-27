@@ -153,14 +153,24 @@ pub(crate) fn x25519_public(sk: &NoisePrivateKey) -> NoisePublicKey {
     NoisePublicKey(x25519(&sk.0, &BASE_POINT))
 }
 
-/// Diffie-Hellman: `sk * pk`. Returns 32 bytes (the shared u-coordinate).
+/// Diffie-Hellman: `sk * pk`, the shared u-coordinate.
 ///
-/// This is the raw primitive: a small-order peer key yields all zeros rather
-/// than an error. WireGuard's Noise transcript binds the result into the
-/// chaining key, so a degenerate share makes the handshake fail to
-/// authenticate rather than needing a separate check here.
-pub(crate) fn x25519_dh(sk: &NoisePrivateKey, pk: &NoisePublicKey) -> [u8; 32] {
-    x25519(&sk.0, &pk.0)
+/// A small-order `pk` gives all zeros whatever `sk` is, which is an error
+/// here, as in the reference implementations. The transcript does not catch
+/// it on its own: if a peer's static key is small-order, the static-static
+/// term is zero on both sides and so is known to anyone, and an attacker who
+/// knows only the responder's public key can complete an initiation as that
+/// peer.
+pub(crate) fn x25519_dh(sk: &NoisePrivateKey, pk: &NoisePublicKey) -> Result<[u8; 32]> {
+    let shared = x25519(&sk.0, &pk.0);
+    // Constant time: the result is a secret whenever it is not zero.
+    if shared.iter().fold(0u8, |acc, b| acc | b) == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "X25519 with a small-order public key",
+        ));
+    }
+    Ok(shared)
 }
 
 /// Generate a fresh, clamped Curve25519 private key from OS randomness.
@@ -384,8 +394,8 @@ mod tests {
         let pk_a = x25519_public(&sk_a);
         let pk_b = x25519_public(&sk_b);
 
-        let shared_ab = x25519_dh(&sk_a, &pk_b);
-        let shared_ba = x25519_dh(&sk_b, &pk_a);
+        let shared_ab = x25519_dh(&sk_a, &pk_b).unwrap();
+        let shared_ba = x25519_dh(&sk_b, &pk_a).unwrap();
         assert_eq!(shared_ab, shared_ba);
         // It also shouldn't be all-zero for honest random keys.
         assert!(!shared_ab.iter().all(|&b| b == 0));
@@ -489,7 +499,7 @@ mod tests {
     fn x25519_matches_rfc7748_section_5_2() {
         let scalar = hex32("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4");
         let u = hex32("e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c");
-        let got = x25519_dh(&NoisePrivateKey(scalar), &NoisePublicKey(u));
+        let got = x25519_dh(&NoisePrivateKey(scalar), &NoisePublicKey(u)).unwrap();
         assert_eq!(
             got,
             hex32("c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552")
@@ -518,8 +528,8 @@ mod tests {
         );
 
         let shared = hex32("4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742");
-        assert_eq!(x25519_dh(&alice_sk, &bob_pk), shared);
-        assert_eq!(x25519_dh(&bob_sk, &alice_pk), shared);
+        assert_eq!(x25519_dh(&alice_sk, &bob_pk).unwrap(), shared);
+        assert_eq!(x25519_dh(&bob_sk, &alice_pk).unwrap(), shared);
     }
 
     #[test]

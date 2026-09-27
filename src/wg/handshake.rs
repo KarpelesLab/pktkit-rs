@@ -110,7 +110,7 @@ pub(crate) fn initiate_handshake(h: &Handler, peer_key: &NoisePublicKey) -> Resu
     };
 
     // Precompute static-static DH (used twice: now and again after the response).
-    let temp_ss = x25519_dh(&client_priv, peer_key);
+    let temp_ss = x25519_dh(&client_priv, peer_key)?;
     hs.precomputed_static_static.copy_from_slice(&temp_ss);
     let mut temp_ss = temp_ss; // shadow so we can zeroize
     zeroize(&mut temp_ss);
@@ -130,7 +130,7 @@ pub(crate) fn initiate_handshake(h: &Handler, peer_key: &NoisePublicKey) -> Resu
     mix_key(&mut hs.chain_key, &ck_save, &eph_pub.0);
 
     // DH: eph_priv * peer_static
-    let mut temp_ss = x25519_dh(&hs.local_ephemeral, peer_key);
+    let mut temp_ss = x25519_dh(&hs.local_ephemeral, peer_key)?;
     let mut key = [0u8; CHACHAPOLY_KEY_SIZE];
     let mut ck_next = [0u8; BLAKE2S_256_SIZE];
     crate::wg::crypto::kdf2(&mut ck_next, key_blake(&mut key), &hs.chain_key, &temp_ss);
@@ -200,7 +200,10 @@ pub(crate) fn initiate_handshake(h: &Handler, peer_key: &NoisePublicKey) -> Resu
 /// Noise transcript, installs the freshly derived keypair into the session,
 /// and returns a single keepalive frame to confirm the session is up.
 pub(crate) fn process_handshake_response(h: &Handler, data: &[u8]) -> Result<PacketResult> {
-    if data.len() < MESSAGE_RESPONSE_SIZE {
+    // Exact sizes, as the reference requires: the fields are read at fixed
+    // offsets from the front while the MACs are checked from the back, and
+    // only an exact length makes those the same bytes.
+    if data.len() != MESSAGE_RESPONSE_SIZE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "response too short",
@@ -250,13 +253,13 @@ pub(crate) fn process_handshake_response(h: &Handler, data: &[u8]) -> Result<Pac
     mix_key(&mut hs.chain_key, &ck_save, &server_eph_pub.0);
 
     // ee: client_eph * server_eph
-    let mut temp = x25519_dh(&hs.local_ephemeral, &server_eph_pub);
+    let mut temp = x25519_dh(&hs.local_ephemeral, &server_eph_pub)?;
     let ck_save = hs.chain_key;
     mix_key(&mut hs.chain_key, &ck_save, &temp);
     zeroize(&mut temp);
 
     // se: client_static * server_eph
-    let mut temp = x25519_dh(h.private_key(), &server_eph_pub);
+    let mut temp = x25519_dh(h.private_key(), &server_eph_pub)?;
     let ck_save = hs.chain_key;
     mix_key(&mut hs.chain_key, &ck_save, &temp);
     zeroize(&mut temp);
@@ -353,7 +356,7 @@ pub(crate) fn process_handshake_initiation(
     data: &[u8],
     remote_addr: &SocketAddr,
 ) -> Result<PacketResult> {
-    if data.len() < MESSAGE_INITIATION_SIZE {
+    if data.len() != MESSAGE_INITIATION_SIZE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "initiation too short",
@@ -376,7 +379,7 @@ pub(crate) fn process_handshake_initiation(
                 .try_into()
                 .unwrap(),
         );
-        let src = ip_bytes(remote_addr);
+        let src = source_bytes(remote_addr);
         let mac2_ok =
             !is_zero(&data[INIT_OFF_MAC2..INIT_OFF_END]) && h.cookie_check_mac2(data, &src);
         if !mac2_ok {
@@ -439,7 +442,7 @@ pub(crate) fn process_handshake_initiation(
 
     // Decrypt the client's static public key.
     let mut k = [0u8; CHACHAPOLY_KEY_SIZE];
-    let mut temp_ss = x25519_dh(&server_priv, &remote_eph);
+    let mut temp_ss = x25519_dh(&server_priv, &remote_eph)?;
     let mut t0 = [0u8; BLAKE2S_256_SIZE];
     let mut t1 = [0u8; BLAKE2S_256_SIZE];
     crate::wg::crypto::kdf2(&mut t0, &mut t1, &hs.chain_key, &temp_ss);
@@ -463,7 +466,7 @@ pub(crate) fn process_handshake_initiation(
     mix_hash(&mut hs.hash, &h_save, enc_static);
 
     // Static-static DH.
-    let mut temp_ss = x25519_dh(&server_priv, &hs.remote_static);
+    let mut temp_ss = x25519_dh(&server_priv, &hs.remote_static)?;
     hs.precomputed_static_static.copy_from_slice(&temp_ss);
     let mut t0 = [0u8; BLAKE2S_256_SIZE];
     let mut t1 = [0u8; BLAKE2S_256_SIZE];
@@ -511,13 +514,13 @@ pub(crate) fn process_handshake_initiation(
     mix_key(&mut hs.chain_key, &ck_save, &eph_pub.0);
 
     // ee: local_eph * remote_eph
-    let mut temp = x25519_dh(&hs.local_ephemeral, &hs.remote_ephemeral);
+    let mut temp = x25519_dh(&hs.local_ephemeral, &hs.remote_ephemeral)?;
     let ck_save = hs.chain_key;
     mix_key(&mut hs.chain_key, &ck_save, &temp);
     zeroize(&mut temp);
 
     // se: local_eph * remote_static
-    let mut temp = x25519_dh(&hs.local_ephemeral, &hs.remote_static);
+    let mut temp = x25519_dh(&hs.local_ephemeral, &hs.remote_static)?;
     let ck_save = hs.chain_key;
     mix_key(&mut hs.chain_key, &ck_save, &temp);
     zeroize(&mut temp);
@@ -597,7 +600,7 @@ pub(crate) fn process_handshake_initiation(
 // === Cookie reply (initiator-side parse only — minimal) ====================
 
 pub(crate) fn process_cookie_reply(h: &Handler, data: &[u8]) -> Result<PacketResult> {
-    if data.len() < crate::wg::constants::MESSAGE_COOKIE_REPLY_SIZE {
+    if data.len() != crate::wg::constants::MESSAGE_COOKIE_REPLY_SIZE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "cookie reply too short",
@@ -630,11 +633,16 @@ pub(crate) fn process_cookie_reply(h: &Handler, data: &[u8]) -> Result<PacketRes
 }
 
 /// Source-address bytes for cookie derivation: 4 for v4, 16 for v6.
-fn ip_bytes(addr: &SocketAddr) -> Vec<u8> {
-    match addr.ip() {
+/// What a cookie is bound to: the source IP and port (whitepaper §5.4.7).
+/// With the IP alone, every host behind one NAT address could reuse a
+/// cookie minted for any of them.
+fn source_bytes(addr: &SocketAddr) -> Vec<u8> {
+    let mut out = match addr.ip() {
         std::net::IpAddr::V4(a) => a.octets().to_vec(),
         std::net::IpAddr::V6(a) => a.octets().to_vec(),
-    }
+    };
+    out.extend_from_slice(&addr.port().to_be_bytes());
+    out
 }
 
 // === MAC1 check ============================================================

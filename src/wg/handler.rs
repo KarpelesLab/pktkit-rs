@@ -255,7 +255,18 @@ impl Handler {
     /// Add (or refresh) an authorized peer with a preshared key.
     pub fn add_peer_with_psk(&self, peer_key: NoisePublicKey, psk: NoisePresharedKey) {
         let mut peers = self.peers.write().expect("peers lock");
-        peers.insert(peer_key, PeerEntry::new(peer_key, psk, true));
+        match peers.get_mut(&peer_key) {
+            // Update in place: replacing the entry would forget the peer's
+            // last initiation timestamp, and a captured initiation could
+            // then be replayed once.
+            Some(p) => {
+                p.preshared_key = psk;
+                p.has_psk = true;
+            }
+            None => {
+                peers.insert(peer_key, PeerEntry::new(peer_key, psk, true));
+            }
+        }
     }
 
     /// Remove a peer and tear down all session state belonging to it.
@@ -943,6 +954,39 @@ mod tests {
 
         let ka = a.process_packet(&resp.response, &addr).unwrap();
         assert_eq!(ka.ty, PacketType::HandshakeResponse);
+    }
+
+    /// A small-order peer key makes the static-static DH zero on both sides
+    /// and so known to anyone; the handshake must refuse it.
+    #[test]
+    fn small_order_peer_keys_are_refused() {
+        let a = Handler::new(Config::default()).unwrap();
+        let zero = NoisePublicKey::zero();
+        a.add_peer(zero);
+        assert!(a.initiate_handshake(&zero).is_err());
+    }
+
+    /// Re-adding a peer with a PSK keeps its last initiation timestamp, so a
+    /// captured initiation still cannot be replayed.
+    #[test]
+    fn re_adding_a_peer_keeps_its_replay_state() {
+        let (a, b) = pair();
+        let addr = loopback();
+        let init = a.initiate_handshake(&b.public_key()).unwrap();
+        b.process_packet(&init, &addr).unwrap();
+        b.add_peer_with_psk(a.public_key(), NoisePresharedKey::zero());
+        assert!(
+            b.process_packet(&init, &addr).is_err(),
+            "replayed initiation accepted"
+        );
+    }
+
+    #[test]
+    fn handshake_messages_must_be_exact_size() {
+        let (a, b) = pair();
+        let mut init = a.initiate_handshake(&b.public_key()).unwrap();
+        init.push(0);
+        assert!(b.process_packet(&init, &loopback()).is_err());
     }
 
     #[test]

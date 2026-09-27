@@ -79,3 +79,28 @@ fn cookie_mac2_is_source_bound() {
     let res = responder.process_packet(&init2, &addr_b).unwrap();
     assert_eq!(res.ty, PacketType::CookieReply);
 }
+
+#[test]
+fn cookie_is_bound_to_the_source_port_too() {
+    // Whitepaper §5.4.7: the cookie covers IP and port, so a second host
+    // behind the same NAT address cannot reuse the first one's cookie.
+    let responder = Handler::new(Config::default().load_threshold(0)).unwrap();
+    let initiator = Handler::new(Config::default()).unwrap();
+    responder.add_peer(initiator.public_key());
+    initiator.add_peer(responder.public_key());
+
+    let addr_a: SocketAddr = "203.0.113.7:51820".parse().unwrap();
+    let addr_b: SocketAddr = "203.0.113.7:40000".parse().unwrap();
+
+    let init1 = initiator
+        .initiate_handshake(&responder.public_key())
+        .unwrap();
+    let reply = responder.process_packet(&init1, &addr_a).unwrap();
+    initiator.process_packet(&reply.response, &addr_a).unwrap();
+
+    let init2 = initiator
+        .initiate_handshake(&responder.public_key())
+        .unwrap();
+    let res = responder.process_packet(&init2, &addr_b).unwrap();
+    assert_eq!(res.ty, PacketType::CookieReply);
+}
