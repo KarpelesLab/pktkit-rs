@@ -15,7 +15,7 @@
 
 use crate::time::Instant;
 use crate::vtcp::segment::flags;
-use crate::vtcp::{Conn, ConnConfig, segment::Segment};
+use crate::vtcp::{Conn, ConnConfig, State, SynCookies, segment::Segment};
 use crate::{IpPrefix, Packet, Protocol, checksum};
 use std::collections::{HashMap, VecDeque};
 use std::io::{self};
@@ -52,6 +52,9 @@ pub(crate) struct ConnState {
     /// Why the connection ended, when that was not a clean close: reads
     /// report it instead of an end of stream.
     error: Mutex<Option<io::ErrorKind>>,
+    /// When the connection was opened: bounds how long a passive one may
+    /// sit in SYN-RECEIVED (see [`SYN_RECEIVED_TIMEOUT`]).
+    opened: Instant,
 }
 
 impl ConnState {
@@ -71,6 +74,7 @@ impl ConnState {
             connected: AtomicBool::new(false),
             pending_accept: Mutex::new(pending_accept),
             error: Mutex::new(None),
+            opened: Instant::now(),
         })
     }
 
@@ -382,6 +386,13 @@ pub(crate) struct ListenerState {
     /// the whole connection table instead would make a SYN flood cost time
     /// in proportion to every connection the client holds.
     half_open: AtomicUsize,
+    /// Answers SYNs statelessly once the half-open backlog is full.
+    cookies: SynCookies,
+    /// When the last cookie went out. Only an ACK arriving soon enough after
+    /// that is checked for one (as Linux does): otherwise any stray ACK to
+    /// the port would be a guess at a 24-bit MAC, and a lucky one would open
+    /// a connection nobody asked for.
+    cookie_sent: Mutex<Option<Instant>>,
 }
 
 /// A passively opened connection's claim on its listener: the accept queue
@@ -391,11 +402,16 @@ pub(crate) struct ListenerState {
 /// the peer resetting, the SYN-ACKs giving up, the client shutting down.
 pub(crate) struct PendingAccept {
     listener: Arc<ListenerState>,
+    /// False for a connection opened from a SYN cookie, which skipped
+    /// SYN-RECEIVED and so never held a slot.
+    half_open: bool,
 }
 
 impl Drop for PendingAccept {
     fn drop(&mut self) {
-        self.listener.half_open.fetch_sub(1, Ordering::AcqRel);
+        if self.half_open {
+            self.listener.half_open.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 }
 
@@ -405,6 +421,21 @@ const ACCEPT_QUEUE_CAP: usize = 128;
 /// backlog bounds them: each SYN would otherwise mint a connection that
 /// lives until its SYN-ACKs give up.
 const HALF_OPEN_CAP: usize = 128;
+
+/// How long a passively opened connection may stay in SYN-RECEIVED. vtcp
+/// retransmits a SYN-ACK up to its full retry count, doubling from 1 s to
+/// its 60 s ceiling, which holds a half-open slot for about four minutes
+/// and sends nine SYN-ACKs to whatever address a SYN claimed to come from:
+/// a spoofed SYN flood would lock the listener out and use it as a
+/// reflector. 63 s is what Linux's `tcp_synack_retries` default of 5 gives
+/// (retransmissions at 1, 3, 7, 15 and 31 s, then one more RTO), so a real
+/// peer whose ACKs are being lost still gets as long as it would there.
+const SYN_RECEIVED_TIMEOUT: Duration = Duration::from_secs(63);
+
+/// How long after the last cookie went out an ACK is still checked for one:
+/// a cookie is valid for 64 to 128 s (two counter periods of vtcp's
+/// `SynCookies`).
+const COOKIE_WINDOW: Duration = Duration::from_secs(128);
 
 impl ListenerState {
     /// Whether a SYN to `dst` is for this listener: only if it is to the
@@ -430,7 +461,20 @@ impl ListenerState {
             .ok()?;
         Some(PendingAccept {
             listener: self.clone(),
+            half_open: true,
         })
+    }
+
+    /// Whether an ACK arriving now might complete a cookie handshake.
+    fn cookies_recent(&self) -> bool {
+        self.cookie_sent
+            .lock()
+            .unwrap()
+            .is_some_and(|t| Instant::now().saturating_duration_since(t) < COOKIE_WINDOW)
+    }
+
+    fn queue_full(&self) -> bool {
+        self.queue.lock().unwrap().len() >= ACCEPT_QUEUE_CAP
     }
 
     /// Mark closed, reset what was waiting to be accepted, and wake `accept`.
@@ -561,9 +605,26 @@ impl TcpStack {
     }
 
     pub fn tick_all(&self) {
+        self.tick_at(Instant::now());
+    }
+
+    /// Run the timers, with `now` deciding which half-open connections have
+    /// run out of time (the engine's own timers read the clock themselves).
+    fn tick_at(&self, now: Instant) {
         let conns: Vec<Arc<ConnState>> = self.conns.lock().unwrap().values().cloned().collect();
         for cs in conns {
             let mut conn = cs.conn.lock().unwrap();
+            if conn.state() == State::SynReceived
+                && now.saturating_duration_since(cs.opened) >= SYN_RECEIVED_TIMEOUT
+            {
+                // Given up silently, as Linux drops an expired request: a
+                // RST would be one more packet to an address that may well
+                // be spoofed, and nobody has seen this connection yet.
+                let _ = conn.abort();
+                drop(conn);
+                self.forget(&cs);
+                continue;
+            }
             let ended = conn.fin_received();
             let segs = conn.tick();
             let closed = conn.is_closed();
@@ -618,13 +679,12 @@ impl TcpStack {
                 })
         })?;
         drop(listeners);
-        let mss = if remote.is_ipv6() { 1440 } else { 1460 };
         let cfg = ConnConfig {
             local_addr: Some(SocketAddr::new(local_ip, local_port)),
             remote_addr: Some(remote),
             local_port,
             remote_port: remote.port(),
-            mss,
+            mss: mss_for(remote.ip()),
             keepalive: true,
             ..Default::default()
         };
@@ -719,6 +779,8 @@ impl TcpStack {
             signal: Condvar::new(),
             closed: AtomicBool::new(false),
             half_open: AtomicUsize::new(0),
+            cookies: SynCookies::new(),
+            cookie_sent: Mutex::new(None),
         });
         listeners.insert(port, state.clone());
         Ok(Listener {
@@ -812,11 +874,37 @@ impl TcpStack {
                 .filter(|l| l.accepts(dst, ours))
                 .cloned();
             if let Some(listener) = listener {
-                // A full backlog drops the SYN, as Linux does: the peer
-                // retransmits, and by then a slot may have freed up.
                 if let Some(pending) = listener.reserve_half_open() {
                     self.accept_syn(pending, dst, src, &seg);
+                } else if !listener.queue_full() {
+                    // The backlog is full, which is what a SYN flood looks
+                    // like: answer with a cookie and keep no state, so the
+                    // flood cannot lock out peers that really connect. A
+                    // full accept queue drops the SYN instead, as Linux
+                    // does: a cookie would only lead to a reset.
+                    let synack = listener
+                        .cookies
+                        .generate_syn_ack(&seg, dst, src, mss_for(src));
+                    *listener.cookie_sent.lock().unwrap() = Some(Instant::now());
+                    (self.sink)(&wrap_segment(dst, src, &synack.marshal()));
                 }
+                return true;
+            }
+        }
+
+        // No connection, but maybe the ACK completing a cookie handshake.
+        if seg.has_flag(flags::ACK) && !seg.has_flag(flags::SYN) && !seg.has_flag(flags::RST) {
+            let listener = self
+                .listeners
+                .lock()
+                .unwrap()
+                .get(&seg.dst_port)
+                .filter(|l| l.accepts(dst, ours) && l.cookies_recent())
+                .cloned();
+            if let Some(listener) = listener
+                && let Some((mss, _)) = listener.cookies.validate_ack(&seg, dst, src)
+            {
+                self.accept_cookie(listener, dst, src, &seg, mss);
                 return true;
             }
         }
@@ -861,34 +949,54 @@ impl TcpStack {
         remote: IpAddr,
         syn: &Segment,
     ) {
-        let mss = if remote.is_ipv6() { 1440 } else { 1460 };
-        let cfg = ConnConfig {
-            local_addr: Some(SocketAddr::new(local_ip, syn.dst_port)),
-            remote_addr: Some(SocketAddr::new(remote, syn.src_port)),
-            local_port: syn.dst_port,
-            remote_port: syn.src_port,
-            mss,
-            keepalive: true,
-            ..Default::default()
-        };
-        let key = ConnKey {
-            local_port: syn.dst_port,
-            remote,
-            remote_port: syn.src_port,
-        };
-        let mut conn = Conn::new(cfg);
+        let mut conn = Conn::new(passive_config(local_ip, remote, syn));
         let synack = conn.accept_syn(syn);
+        let key = passive_key(remote, syn);
         let state = ConnState::new(key, local_ip, conn, self.sink.clone(), Some(pending));
-        {
-            // A SYN racing `shutdown` past `handle_inbound`'s own check must
-            // not leave a connection behind once the table has been drained.
-            let mut conns = self.conns.lock().unwrap();
-            if self.check_open().is_err() {
-                return;
-            }
-            conns.insert(key, state.clone());
+        if self.register(key, &state) {
+            state.wrap_and_send(synack);
         }
-        state.wrap_and_send(synack);
+    }
+
+    /// Open a connection from the ACK completing a cookie handshake, which
+    /// [`SynCookies::validate_ack`] accepted with `mss`, and hand it to
+    /// `listener` at once: the handshake is already over.
+    fn accept_cookie(
+        self: &Arc<Self>,
+        listener: Arc<ListenerState>,
+        local_ip: IpAddr,
+        remote: IpAddr,
+        ack: &Segment,
+        mss: u16,
+    ) {
+        let mut conn = Conn::new(passive_config(local_ip, remote, ack));
+        let segs = conn.accept_cookie(ack, ack.ack.wrapping_sub(1), mss);
+        let key = passive_key(remote, ack);
+        let pending = PendingAccept {
+            listener,
+            half_open: false,
+        };
+        let state = ConnState::new(key, local_ip, conn, self.sink.clone(), Some(pending));
+        state.connected.store(true, Ordering::Release);
+        if !self.register(key, &state) {
+            return;
+        }
+        state.wrap_and_send(segs);
+        if !state.after_segment() {
+            self.forget(&state);
+        }
+    }
+
+    /// Put a passively opened connection in the table. A SYN racing
+    /// `shutdown` past `handle_inbound`'s own check must not leave a
+    /// connection behind once the table has been drained.
+    fn register(&self, key: ConnKey, state: &Arc<ConnState>) -> bool {
+        let mut conns = self.conns.lock().unwrap();
+        if self.check_open().is_err() {
+            return false;
+        }
+        conns.insert(key, state.clone());
+        true
     }
 
     /// Close everything: listeners stop, connections are reset, and every
@@ -914,6 +1022,33 @@ impl TcpStack {
             ));
         }
         Ok(())
+    }
+}
+
+/// The MSS we advertise to `remote`: what fits a 1500-byte MTU.
+fn mss_for(remote: IpAddr) -> u16 {
+    if remote.is_ipv6() { 1440 } else { 1460 }
+}
+
+/// Configuration for a connection opened by `seg`, the peer's SYN or the
+/// ACK completing a cookie handshake.
+fn passive_config(local_ip: IpAddr, remote: IpAddr, seg: &Segment) -> ConnConfig {
+    ConnConfig {
+        local_addr: Some(SocketAddr::new(local_ip, seg.dst_port)),
+        remote_addr: Some(SocketAddr::new(remote, seg.src_port)),
+        local_port: seg.dst_port,
+        remote_port: seg.src_port,
+        mss: mss_for(remote),
+        keepalive: true,
+        ..Default::default()
+    }
+}
+
+fn passive_key(remote: IpAddr, seg: &Segment) -> ConnKey {
+    ConnKey {
+        local_port: seg.dst_port,
+        remote,
+        remote_port: seg.src_port,
     }
 }
 
@@ -1219,6 +1354,106 @@ mod tests {
         feed(syn(4002));
         stack.shutdown();
         assert_eq!(listener.state.half_open.load(Ordering::Acquire), 0);
+    }
+
+    fn syn_from(port: u16) -> Segment {
+        Segment {
+            src_port: port,
+            dst_port: 80,
+            seq: 1,
+            flags: flags::SYN,
+            window: 65535,
+            ..Default::default()
+        }
+    }
+
+    fn last_sent(out: &Mutex<Vec<Vec<u8>>>) -> Segment {
+        let out = out.lock().unwrap();
+        Segment::parse(Packet::from_slice(out.last().unwrap()).payload()).unwrap()
+    }
+
+    /// A SYN flood that fills the backlog must not lock real peers out:
+    /// past it, SYNs are answered with cookies, and a cookie's ACK opens
+    /// the connection.
+    #[test]
+    fn a_full_backlog_answers_with_syn_cookies() {
+        let (stack, out) = capturing_stack();
+        let listener = stack.listen(own(US), 80).unwrap();
+        listener.set_nonblocking(true);
+        let feed = |seg: Segment| {
+            stack.handle_inbound(Packet::from_slice(&inbound(seg)), IpAddr::V4(US));
+        };
+        for port in 0..HALF_OPEN_CAP as u16 {
+            feed(syn_from(10000 + port));
+        }
+        out.lock().unwrap().clear();
+
+        feed(syn_from(20000));
+        assert_eq!(out.lock().unwrap().len(), 1, "the SYN went unanswered");
+        let synack = last_sent(&out);
+        assert_eq!(synack.flags, flags::SYN | flags::ACK);
+        assert_eq!(synack.dst_port, 20000);
+        assert_eq!(stack.conns.lock().unwrap().len(), HALF_OPEN_CAP);
+
+        // An ACK that does not carry the cookie is refused.
+        out.lock().unwrap().clear();
+        feed(Segment {
+            src_port: 20000,
+            dst_port: 80,
+            seq: 2,
+            ack: synack.seq.wrapping_add(2),
+            flags: flags::ACK,
+            window: 65535,
+            ..Default::default()
+        });
+        assert_eq!(last_sent(&out).flags, flags::RST);
+        assert!(listener.accept().is_err());
+
+        // The one that does opens the connection, data and all.
+        feed(Segment {
+            src_port: 20000,
+            dst_port: 80,
+            seq: 2,
+            ack: synack.seq.wrapping_add(1),
+            flags: flags::ACK | flags::PSH,
+            window: 65535,
+            payload: b"hello".to_vec(),
+            ..Default::default()
+        });
+        let conn = listener
+            .accept()
+            .expect("the cookie's ACK was not accepted");
+        assert_eq!(conn.peer_addr().port(), 20000);
+        let mut buf = [0; 8];
+        conn.set_nonblocking(true);
+        assert_eq!(conn.read(&mut buf).unwrap(), 5);
+        assert_eq!(&buf[..5], b"hello");
+        assert_eq!(
+            listener.state.half_open.load(Ordering::Acquire),
+            HALF_OPEN_CAP
+        );
+    }
+
+    /// A SYN-RECEIVED connection gives up after Linux's five SYN-ACK
+    /// retransmissions' worth of time, not vtcp's full retry count: a
+    /// spoofed SYN would otherwise hold its slot for four minutes.
+    #[test]
+    fn half_open_connections_expire() {
+        let (stack, out) = capturing_stack();
+        let listener = stack.listen(own(US), 80).unwrap();
+        stack.handle_inbound(Packet::from_slice(&inbound(syn_from(4000))), IpAddr::V4(US));
+        assert_eq!(stack.conns.lock().unwrap().len(), 1);
+        let start = Instant::now();
+        stack.tick_at(start + Duration::from_secs(62));
+        assert_eq!(stack.conns.lock().unwrap().len(), 1);
+        out.lock().unwrap().clear();
+        stack.tick_at(start + Duration::from_secs(64));
+        assert!(stack.conns.lock().unwrap().is_empty(), "still half open");
+        assert_eq!(listener.state.half_open.load(Ordering::Acquire), 0);
+        assert!(
+            out.lock().unwrap().is_empty(),
+            "sent a RST to a SYN's source"
+        );
     }
 
     #[test]
