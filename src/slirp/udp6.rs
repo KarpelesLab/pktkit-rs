@@ -52,7 +52,7 @@ impl UdpConn6 {
         });
 
         let weak = Arc::downgrade(&conn);
-        std::thread::spawn(move || {
+        super::spawn_flow_thread(move || {
             // Room for the largest datagram, so none is silently cut short.
             let mut buf = vec![0u8; 65535];
             loop {
@@ -93,7 +93,7 @@ impl UdpConn6 {
                 }
                 drop(conn);
             }
-        });
+        })?;
         Ok(conn)
     }
 

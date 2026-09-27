@@ -39,6 +39,21 @@ mod udp;
 mod udp6;
 mod usernat;
 
+/// Stack reserved for each per-flow thread (dials, byte pumps, UDP readers).
+/// Their buffers live on the heap, so std's default of 2 MiB per thread only
+/// inflates the address space a guest can make us reserve.
+const FLOW_THREAD_STACK: usize = 128 * 1024;
+
+/// Spawn a per-flow thread. Unlike `thread::spawn`, a refusal from the OS (a
+/// guest opening flows until the host runs out of threads) is an error to
+/// drop the flow over, not a panic on the packet path.
+fn spawn_flow_thread<F: FnOnce() + Send + 'static>(f: F) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .stack_size(FLOW_THREAD_STACK)
+        .spawn(f)
+        .map(|_| ())
+}
+
 pub use listener::Listener;
 pub use listener6::Listener6;
 pub use tcp_stream::TcpStream;

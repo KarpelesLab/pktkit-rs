@@ -65,6 +65,12 @@ struct Key6 {
 /// constant of the same name.
 const MAX_VIRT_TCP_CONNS: usize = 10_000;
 
+/// Cap on outbound TCP bridges per address family. Each holds a real socket
+/// and two pump threads, and any guest can open them, so this bounds the
+/// threads a guest can make the host create (with [`MAX_UDP_FLOWS`], about
+/// 12k in all).
+const MAX_OUTBOUND_TCP: usize = 2048;
+
 /// Cap on outbound TCP dials in flight at once. A dial to a destination that
 /// drops SYNs holds a thread for up to the connect timeout; SYNs past the cap
 /// are dropped, and the client's retransmissions try again later.
@@ -73,7 +79,7 @@ const MAX_PENDING_DIALS: usize = 256;
 /// Cap on UDP flows per address family. Each one holds a real socket and a
 /// reader thread, and any new 4-tuple from the virtual network opens one.
 /// Small under test so the cap itself can be exercised.
-const MAX_UDP_FLOWS: usize = if cfg!(test) { 8 } else { 4096 };
+const MAX_UDP_FLOWS: usize = if cfg!(test) { 8 } else { 2048 };
 
 /// Time a UDP flow may sit idle before its socket is reaped.
 const UDP_IDLE: Duration = Duration::from_secs(60);
@@ -584,7 +590,7 @@ impl Stack {
 
         // SYN → dial the real destination and bridge it to a server-side
         // vtcp::Conn terminating the virtual side.
-        if inner.tcp.lock().expect("poisoned").len() >= MAX_VIRT_TCP_CONNS
+        if inner.tcp.lock().expect("poisoned").len() >= MAX_OUTBOUND_TCP
             || inner.pending_dials.load(Ordering::Acquire) >= MAX_PENDING_DIALS
         {
             return Ok(()); // silently drop; client will retransmit
@@ -889,7 +895,7 @@ impl Stack {
             return Ok(());
         }
 
-        if inner.tcp6.lock().expect("poisoned").len() >= MAX_VIRT_TCP_CONNS
+        if inner.tcp6.lock().expect("poisoned").len() >= MAX_OUTBOUND_TCP
             || inner.pending_dials.load(Ordering::Acquire) >= MAX_PENDING_DIALS
         {
             return Ok(()); // silently drop; client will retransmit

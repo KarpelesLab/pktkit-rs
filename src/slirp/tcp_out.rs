@@ -33,7 +33,6 @@ use std::io::{Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::thread;
 use std::time::Duration;
 
 /// MSS advertised on the virtual side (mirrors the Go constants).
@@ -136,12 +135,19 @@ impl TcpOutConn {
         on_done: impl FnOnce() + Send + 'static,
     ) {
         let bridge = self.clone();
-        thread::spawn(move || {
+        // Runs `on_done` however the dial ends, even if its thread never
+        // starts: a failed spawn drops the closure, and with it this guard.
+        let done = OnDrop(Some(on_done));
+        let spawned = super::spawn_flow_thread(move || {
+            let _done = done;
             let res = TcpStream::connect_timeout(&dest, CONNECT_TIMEOUT)
                 .and_then(|s| s.try_clone().map(|r| (s, r)));
             bridge.finish_dial(res);
-            on_done();
         });
+        if let Err(e) = spawned {
+            // Refuse the client as for an unreachable destination.
+            self.clone().finish_dial(Err(e));
+        }
     }
 
     fn finish_dial(self: Arc<Self>, res: std::io::Result<(TcpStream, TcpStream)>) {
@@ -174,10 +180,16 @@ impl TcpOutConn {
 
         // remote → client: real socket bytes become vtcp writes (→ segments).
         let b_r = self.clone();
-        thread::spawn(move || b_r.pump_remote_to_client(remote_read));
+        let reader = super::spawn_flow_thread(move || b_r.pump_remote_to_client(remote_read));
         // client → remote: vtcp-delivered bytes are written to the real socket.
         let b_w = self.clone();
-        thread::spawn(move || b_w.pump_client_to_remote());
+        if reader.is_err() || super::spawn_flow_thread(move || b_w.pump_client_to_remote()).is_err()
+        {
+            // Out of threads: a bridge with half its pumps would stall, so
+            // reset both sides instead.
+            self.close();
+            return;
+        }
 
         self.state.wrap_and_send(synack);
     }
@@ -352,6 +364,17 @@ impl TcpOutConn {
     }
 }
 
+/// Calls its function when dropped.
+struct OnDrop<F: FnOnce()>(Option<F>);
+
+impl<F: FnOnce()> Drop for OnDrop<F> {
+    fn drop(&mut self) {
+        if let Some(f) = self.0.take() {
+            f();
+        }
+    }
+}
+
 impl Drop for TcpOutConn {
     fn drop(&mut self) {
         self.closed.store(true, Ordering::Release);
@@ -407,6 +430,23 @@ pub(crate) fn build_refused_rst(src_port: u16, dst_port: u16, client_seq: u32) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A dial whose thread never starts still reports that it is done: the
+    /// spawn drops the unrun closure, and the guard inside fires then.
+    #[test]
+    fn the_done_guard_fires_when_the_closure_is_dropped_unrun() {
+        use std::sync::atomic::AtomicUsize;
+        let n = Arc::new(AtomicUsize::new(0));
+        let n2 = n.clone();
+        let done = OnDrop(Some(move || {
+            n2.fetch_add(1, Ordering::SeqCst);
+        }));
+        let closure = move || {
+            let _done = done;
+        };
+        drop(closure);
+        assert_eq!(n.load(Ordering::SeqCst), 1);
+    }
     use crate::vtcp::segment::flags;
 
     #[test]
