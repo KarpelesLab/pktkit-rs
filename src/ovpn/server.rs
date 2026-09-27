@@ -577,10 +577,14 @@ impl Server {
     fn start_auth(&self, entry: &Arc<PeerEntry>, req: AuthRequest) {
         let on_auth = self.cfg.on_auth.clone();
         let server = self.me.clone();
-        let entry = entry.clone();
+        // Only a weak reference while on_auth runs: the entry holds a TCP
+        // connection's queue, whose writer thread and socket live as long
+        // as it does, and a stuck on_auth must not keep a peer that has
+        // gone meanwhile. The request carries all on_auth needs.
+        let entry = Arc::downgrade(entry);
         thread::spawn(move || {
             let verdict = on_auth(&req.info);
-            let Some(s) = live(&server) else {
+            let (Some(s), Some(entry)) = (live(&server), entry.upgrade()) else {
                 return;
             };
             // A peer dropped meanwhile stays dropped.
@@ -1519,6 +1523,76 @@ mod tests {
         server.close();
         assert!(in_auth.is_ok(), "on_auth deadlocked calling send_to_peer");
         assert!(answered.is_ok(), "server stalled while on_auth ran");
+    }
+
+    /// Start connecting a test client over TCP on a thread of its own; the
+    /// returned handle shuts the connection down.
+    fn connect_tcp_in_background(server: &Server) -> (TcpStream, thread::JoinHandle<()>) {
+        let sock = tcp_client(server);
+        sock.set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let handle = sock.try_clone().unwrap();
+        let t = thread::spawn(move || {
+            let (mut w, mut r) = (sock.try_clone().unwrap(), sock);
+            let mut client = TestClient::new(*b"CLIENTID");
+            // The test closes the connection mid-handshake.
+            let mut send = |d: &[u8]| {
+                let _ = w.write_all(&(d.len() as u16).to_be_bytes());
+                let _ = w.write_all(d);
+            };
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                connect_via(&mut client, &mut send, &mut || tcp_recv(&mut r).ok())
+            }));
+        });
+        (handle, t)
+    }
+
+    /// A stuck on_auth must not keep a gone peer alive: once its TCP
+    /// connection closes, the entry -- and with it the connection's writer
+    /// thread and socket -- goes, verdict or not.
+    #[test]
+    fn a_stuck_on_auth_does_not_keep_a_removed_peer() {
+        let (entered_tx, entered) = mpsc::channel::<()>();
+        let (release, release_rx) = mpsc::channel::<()>();
+        let entered_tx = Mutex::new(entered_tx);
+        let release_rx = Mutex::new(release_rx);
+        let ok = auth_ok();
+        let on_auth: OnAuth = Arc::new(move |info| {
+            let _ = entered_tx.lock().unwrap().send(());
+            let _ = release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10));
+            ok(info)
+        });
+        let on_data: OnData = Arc::new(|_, _, _| {});
+        let cfg = ServerConfig::new(
+            crate::ovpn::tests::server_config(),
+            "127.0.0.1:0".parse().unwrap(),
+            on_auth,
+            on_data,
+        );
+        let server = Server::new(cfg).unwrap();
+        let (sock, client) = connect_tcp_in_background(&server);
+        let key = PeerKey::new(sock.local_addr().unwrap(), Transport::Tcp);
+        entered
+            .recv_timeout(Duration::from_secs(10))
+            .expect("on_auth called");
+        let entry = Arc::downgrade(&server.get_peer(&key).unwrap());
+
+        sock.shutdown(std::net::Shutdown::Both).unwrap();
+        let _ = client.join();
+        let mut gone = false;
+        for _ in 0..50 {
+            if server.get_peer(&key).is_none() && entry.upgrade().is_none() {
+                gone = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let _ = release.send(());
+        server.close();
+        assert!(gone, "the auth thread kept the removed peer alive");
     }
 
     /// on_disconnect pairs with on_connect: a peer that never authenticated
