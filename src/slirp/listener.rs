@@ -71,11 +71,12 @@ impl Listener {
     /// Enqueue a freshly-established connection. Returns `false` if the queue
     /// is full or the listener is closed (the caller should abort the conn).
     pub(crate) fn enqueue(&self, state: Arc<ConnState>) -> bool {
-        if self.closed.load(Ordering::Acquire) {
-            return false;
-        }
+        // Checked under the queue lock, which `close` also takes to set the
+        // flag and drain the queue: checked before it, a close could slip in
+        // between and leave this connection queued where nobody will ever
+        // accept or reset it.
         let mut q = self.queue.lock().expect("poisoned");
-        if q.len() >= ACCEPT_QUEUE_CAP {
+        if self.closed.load(Ordering::Acquire) || q.len() >= ACCEPT_QUEUE_CAP {
             return false;
         }
         q.push_back(state);
@@ -109,16 +110,18 @@ impl Listener {
     /// queued-but-unaccepted connections. Dropping the last handle does the
     /// same.
     pub fn close(&self) -> Result<()> {
-        self.closed.store(true, Ordering::Release);
+        // Abort connections still sitting in the queue. The flag is set
+        // under the queue lock, so `enqueue` either sees it or has already
+        // queued what is drained here.
+        let drained: Vec<Arc<ConnState>> = {
+            let mut q = self.queue.lock().expect("poisoned");
+            self.closed.store(true, Ordering::Release);
+            q.drain(..).collect()
+        };
         let unregister = self.unregister.lock().expect("poisoned").take();
         if let Some(f) = unregister {
             f();
         }
-        // Abort connections still sitting in the queue.
-        let drained: Vec<Arc<ConnState>> = {
-            let mut q = self.queue.lock().expect("poisoned");
-            q.drain(..).collect()
-        };
         for state in drained {
             let segs = state.conn.lock().expect("poisoned").abort();
             state.wrap_and_send(segs);
@@ -193,5 +196,21 @@ mod tests {
         let l = Listener::new("10.0.0.1:80".parse().unwrap());
         l.close().unwrap();
         assert!(l.accept().is_err());
+    }
+
+    /// A close landing while `enqueue` waits for the queue lock must stop
+    /// it: `close` drains the queue only once, so anything queued after
+    /// that is never accepted nor reset.
+    #[test]
+    fn enqueue_checks_closed_under_the_queue_lock() {
+        let l = Arc::new(Listener::new("10.0.0.1:80".parse().unwrap()));
+        let held = l.queue.lock().unwrap();
+        let l2 = l.clone();
+        let t = std::thread::spawn(move || l2.enqueue(dummy_state()));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        l.closed.store(true, Ordering::Release);
+        drop(held);
+        assert!(!t.join().unwrap(), "queued on a closed listener");
+        assert!(l.queue.lock().unwrap().is_empty());
     }
 }
