@@ -4948,4 +4948,257 @@ mod tests {
             lossy_run(seed);
         }
     }
+
+    /// What a [`stress_run`] varies per seed.
+    #[derive(Debug)]
+    struct StressCfg {
+        buf: usize,
+        mss: u16,
+        ts: [bool; 2],
+        sack: [bool; 2],
+        wscale: [bool; 2],
+        loss_pct: u64,
+        blackout: bool,
+    }
+
+    impl StressCfg {
+        fn new(seed: u64) -> Self {
+            let mut r = Rng(splitmix(seed ^ 0xABCDEF) | 1);
+            let mut pair = || [r.below(2) == 0, r.below(2) == 0];
+            let (ts, sack, wscale) = (pair(), pair(), pair());
+            Self {
+                buf: [4096, 65536, 1 << 18, 1 << 20][r.below(4) as usize],
+                mss: [536, 1000, 1460][r.below(3) as usize],
+                ts,
+                sack,
+                wscale,
+                loss_pct: [0, 2, 10, 30][r.below(4) as usize],
+                blackout: r.below(2) == 0,
+            }
+        }
+    }
+
+    fn splitmix(mut z: u64) -> u64 {
+        z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// Loss-recovery bookkeeping that must hold after every event.
+    fn check_invariants(c: &Conn, ctx: &dyn Fn() -> String) {
+        let Some(sb) = c.send_buf.as_ref() else {
+            return;
+        };
+        if !c.state.is_synchronized() {
+            return;
+        }
+        let (una, nxt) = (sb.una(), sb.nxt());
+        assert!(seq_before_eq(una, nxt), "{}: SND.UNA past SND.NXT", ctx());
+        if let Some(r) = c.rto_recover {
+            assert!(seq_after_eq(r, una), "{}: recover below SND.UNA", ctx());
+            assert!(seq_before_eq(r, nxt), "{}: recover past SND.NXT", ctx());
+            assert!(
+                seq_before_eq(c.high_rxt, r) || !seq_after(c.high_rxt, una),
+                "{}: HighRxt past recover",
+                ctx()
+            );
+            assert!(
+                c.in_flight() as usize <= sb.unacked(),
+                "{}: in_flight {} > unacked {}",
+                ctx(),
+                c.in_flight(),
+                sb.unacked()
+            );
+        }
+        if let Some(r) = c.timeout_recover {
+            assert!(seq_before_eq(r, nxt), "{}: recover past SND.NXT", ctx());
+        }
+    }
+
+    /// A harsher [`lossy_run`]: buffers up to a megabyte (so window
+    /// scaling), each side choosing SACK, timestamps and window scaling on
+    /// its own, loss rates up to 30%, blackouts that drop everything for a
+    /// while, and timers that fire while segments are still in flight.
+    /// Every byte must arrive, in order, and both ends must close.
+    fn stress_run(seed: u64) {
+        let sc = StressCfg::new(seed);
+        let mut rng = Rng(splitmix(seed) | 1);
+        let mk = |local, remote, i: usize| {
+            cfg(local, remote)
+                .enable_timestamps(sc.ts[i])
+                .enable_sack(sc.sack[i])
+                .mss(sc.mss)
+                .no_window_scaling(!sc.wscale[i])
+                .send_buf_size(sc.buf)
+                .recv_buf_size(sc.buf)
+        };
+        let mut a = Conn::new(mk(40300, 80, 0));
+        let b = Conn::new(mk(80, 40300, 1));
+        let syn = a.connect();
+        let max_len = (sc.buf as u64 * 2).min(400_000);
+        let mut sides = [a, b].map(|conn| {
+            let len = rng.below(max_len) as usize;
+            Side {
+                conn,
+                to_send: (0..len).map(|_| rng.next() as u8).collect(),
+                written: 0,
+                received: Vec::new(),
+                close_called: false,
+            }
+        });
+        let mut links: [Vec<Vec<u8>>; 2] = [syn, Vec::new()];
+        let done = |s: &[Side; 2]| {
+            s.iter().all(|x| {
+                x.close_called
+                    && x.conn.fin_received()
+                    && matches!(x.conn.state(), State::TimeWait | State::Closed)
+            })
+        };
+        let mut blackout = [0u32; 2];
+        let mut step = 0;
+        while !done(&sides) {
+            step += 1;
+            assert!(
+                step < 3_000_000,
+                "seed {seed} {sc:?}: stuck: {:?} / {:?} (written {}/{} {}/{}, received {} {})",
+                sides[0].conn,
+                sides[1].conn,
+                sides[0].written,
+                sides[0].to_send.len(),
+                sides[1].written,
+                sides[1].to_send.len(),
+                sides[0].received.len(),
+                sides[1].received.len(),
+            );
+            let ctx = || format!("seed {seed} step {step}");
+            let i = rng.below(2) as usize;
+            match rng.below(12) {
+                0..=1 => {
+                    let s = &mut sides[i];
+                    if s.written < s.to_send.len() {
+                        let end = (s.written + 1 + rng.below(20_000) as usize).min(s.to_send.len());
+                        let (n, out) = s.conn.write(&s.to_send[s.written..end]);
+                        s.written += n;
+                        links[i].extend(out);
+                    } else if !s.close_called
+                        && !matches!(s.conn.state(), State::Closed | State::SynSent)
+                        && rng.below(4) == 0
+                    {
+                        s.close_called = true;
+                        links[i].extend(s.conn.close());
+                    }
+                }
+                2..=3 => {
+                    let s = &mut sides[i];
+                    let mut buf = vec![0u8; 1 + rng.below(30_000) as usize];
+                    let n = s.conn.read(&mut buf);
+                    s.received.extend_from_slice(&buf[..n]);
+                    links[i].extend(s.conn.take_outgoing());
+                }
+                4..=10 => {
+                    if links[i].is_empty() {
+                        continue;
+                    }
+                    let k = if rng.below(8) == 0 {
+                        rng.below(links[i].len().min(20) as u64) as usize
+                    } else {
+                        0
+                    };
+                    let pkt = links[i].remove(k);
+                    // As in lossy_run, the link stops losing while either end
+                    // is halfway to giving up, so giving up is the engine's
+                    // fault, not the dice's.
+                    let struggling = sides.iter().any(|s| s.conn.unanswered() >= MAX_RETRIES / 2);
+                    if sc.blackout && !struggling && blackout[i] == 0 && rng.below(3000) == 0 {
+                        blackout[i] = 1 + rng.below(200) as u32;
+                    }
+                    if blackout[i] > 0 {
+                        blackout[i] -= 1;
+                        if !struggling {
+                            continue;
+                        }
+                    }
+                    let fate = rng.below(100);
+                    if fate < sc.loss_pct && !struggling {
+                        continue;
+                    }
+                    if fate == 99 {
+                        links[i].insert(0, pkt.clone());
+                    }
+                    let seg = parse(&pkt);
+                    let peer = &mut sides[1 - i].conn;
+                    let out = if peer.state() == State::Closed
+                        && !peer.is_closed()
+                        && seg.flags & (flags::SYN | flags::ACK) == flags::SYN
+                    {
+                        peer.accept_syn(&seg)
+                    } else {
+                        peer.handle_segment(&seg)
+                    };
+                    check_invariants(peer, &ctx);
+                    links[1 - i].extend(out);
+                }
+                _ => {
+                    // Time passes: usually once the links are quiet, but
+                    // now and then with segments still in flight, which is
+                    // how a timer beats an ACK on a real network.
+                    let calm = sides.iter().all(|s| s.conn.unanswered() < 2);
+                    let busy = !links[0].is_empty() || !links[1].is_empty();
+                    if busy && (rng.below(8) != 0 || !calm) {
+                        continue;
+                    }
+                    // The clock does not really move, so neither would the
+                    // challenge-ACK throttle's; a timer firing stands for
+                    // more time than its interval, on both ends.
+                    for s in sides.iter_mut() {
+                        s.conn.last_oow_ack = None;
+                    }
+                    let c = &mut sides[i].conn;
+                    let now = Instant::now();
+                    for d in [
+                        &mut c.rto_deadline,
+                        &mut c.persist_deadline,
+                        &mut c.er_deadline,
+                    ] {
+                        if d.is_some() {
+                            *d = Some(now);
+                        }
+                    }
+                    links[i].extend(c.tick());
+                    check_invariants(c, &ctx);
+                }
+            }
+        }
+        for s in &mut sides {
+            s.received.extend(read_all(&mut s.conn));
+        }
+        assert!(
+            sides[1].received == sides[0].to_send,
+            "seed {seed} {sc:?}: a to b stream corrupted"
+        );
+        assert!(
+            sides[0].received == sides[1].to_send,
+            "seed {seed} {sc:?}: b to a stream corrupted"
+        );
+    }
+
+    // VTCP_SEED=n replays one seed, VTCP_FUZZ_SEEDS=n widens the sweep, as
+    // for lossy_link_delivers_everything_before_close; each seed here costs
+    // far more, so the default sweep is smaller.
+    #[test]
+    fn stressed_link_delivers_everything_before_close() {
+        let env = |k| {
+            std::env::var(k)
+                .ok()
+                .map(|v: String| v.parse::<u64>().unwrap())
+        };
+        let seeds = match env("VTCP_SEED") {
+            Some(s) => s..s + 1,
+            None => 0..env("VTCP_FUZZ_SEEDS").unwrap_or(200),
+        };
+        for seed in seeds {
+            stress_run(seed);
+        }
+    }
 }
