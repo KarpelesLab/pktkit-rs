@@ -11,8 +11,10 @@
 //! require a real macOS host + root and are marked
 //! `// TODO(tuntap): needs macOS to verify`.
 
-use super::reader::{DevFd, HandlerSlot, MAX_MTU, is_whole, msg_buffer};
-use crate::{Frame, IpPrefix, L2Device, L2Handler, L3Device, L3Handler, MacAddr, Packet, Result};
+use super::reader::{DevFd, HandlerSlot, MAX_MTU, is_whole, msg_buffer, read_or_record};
+use crate::{
+    DeviceStats, Frame, IpPrefix, L2Device, L2Handler, L3Device, L3Handler, MacAddr, Packet, Result,
+};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::{Arc, Mutex};
@@ -36,6 +38,7 @@ pub struct Tun {
     name: String,
     handler: Arc<HandlerSlot<L3Handler>>,
     addr: Mutex<IpPrefix>,
+    stats: Arc<DeviceStats>,
 }
 
 impl core::fmt::Debug for Tun {
@@ -52,16 +55,19 @@ impl Tun {
         let (fd, name) = open_utun()?;
         let dev = Arc::new(DevFd::new(fd)?);
         let handler: Arc<HandlerSlot<L3Handler>> = Arc::new(HandlerSlot::new());
+        let stats = Arc::new(DeviceStats::new());
 
         let dev_t = dev.clone();
         let handler_t = handler.clone();
-        std::thread::spawn(move || read_loop(dev_t, handler_t));
+        let stats_t = stats.clone();
+        std::thread::spawn(move || read_loop(dev_t, handler_t, stats_t));
 
         Ok(Tun {
             dev,
             name,
             handler,
             addr: Mutex::new(IpPrefix::default()),
+            stats,
         })
     }
 
@@ -85,6 +91,7 @@ impl L3Device for Tun {
             4 => libc::AF_INET as u32,
             6 => libc::AF_INET6 as u32,
             _ => {
+                self.stats.record_tx_drop();
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "unknown IP version",
@@ -94,7 +101,17 @@ impl L3Device for Tun {
         let mut framed = Vec::with_capacity(4 + bytes.len());
         framed.extend_from_slice(&proto.to_be_bytes());
         framed.extend_from_slice(bytes);
-        self.dev.write_all(&framed)
+        match self.dev.write_all(&framed) {
+            Ok(()) => {
+                self.stats.record_tx(bytes.len());
+                Ok(())
+            }
+            Err(e) => {
+                self.stats.record_error();
+                self.stats.record_tx_drop();
+                Err(e)
+            }
+        }
     }
     fn addr(&self) -> IpPrefix {
         *self.addr.lock().unwrap()
@@ -110,6 +127,9 @@ impl L3Device for Tun {
             self.handler.wake();
         }
         Ok(())
+    }
+    fn stats(&self) -> Option<&DeviceStats> {
+        Some(&self.stats)
     }
 }
 
@@ -190,34 +210,50 @@ fn open_utun() -> Result<(OwnedFd, String)> {
         return Err(io::Error::last_os_error());
     }
 
-    // Try unit numbers 0..256 until connect() succeeds.
-    let mut chosen_unit = None;
-    for unit in 0u32..256 {
-        let mut addr: libc::sockaddr_ctl = unsafe { std::mem::zeroed() };
-        addr.sc_len = std::mem::size_of::<libc::sockaddr_ctl>() as u8;
-        addr.sc_family = libc::AF_SYSTEM as u8;
-        addr.ss_sysaddr = libc::AF_SYS_CONTROL as u16;
-        addr.sc_id = info.ctl_id;
-        addr.sc_unit = unit;
-        let rc = unsafe {
-            libc::connect(
-                owned.as_raw_fd(),
-                &addr as *const _ as *const libc::sockaddr,
-                std::mem::size_of::<libc::sockaddr_ctl>() as libc::socklen_t,
-            )
-        };
-        if rc == 0 {
-            chosen_unit = Some(unit);
-            break;
-        }
+    // sc_unit 0 lets the kernel pick the first free unit; asking for unit
+    // N+1 would instead name utunN, and fail if that one is taken.
+    let mut addr: libc::sockaddr_ctl = unsafe { std::mem::zeroed() };
+    addr.sc_len = std::mem::size_of::<libc::sockaddr_ctl>() as u8;
+    addr.sc_family = libc::AF_SYSTEM as u8;
+    addr.ss_sysaddr = libc::AF_SYS_CONTROL as u16;
+    addr.sc_id = info.ctl_id;
+    addr.sc_unit = 0;
+    let rc = unsafe {
+        libc::connect(
+            owned.as_raw_fd(),
+            &addr as *const _ as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_ctl>() as libc::socklen_t,
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
     }
-    let unit = chosen_unit
-        .ok_or_else(|| io::Error::new(io::ErrorKind::AddrNotAvailable, "no available utun unit"))?;
 
-    // getsockopt(UTUN_OPT_IFNAME) for the assigned name; fall back to utunN.
-    let name = getsockopt_ifname(owned.as_raw_fd()).unwrap_or_else(|| format!("utun{unit}"));
+    // getsockopt(UTUN_OPT_IFNAME) for the assigned name; failing that, derive
+    // it from the unit the kernel picked, which the peer address reports.
+    let name = getsockopt_ifname(owned.as_raw_fd())
+        .or_else(|| peer_unit(owned.as_raw_fd()).and_then(utun_name))
+        .ok_or_else(|| io::Error::other("utun: cannot learn interface name"))?;
 
     Ok((owned, name))
+}
+
+/// The interface a utun control unit is: `sc_unit` N is `utun(N-1)`, since
+/// unit 0 in a connect means "any". `None` for 0.
+fn utun_name(sc_unit: u32) -> Option<String> {
+    sc_unit.checked_sub(1).map(|n| format!("utun{n}"))
+}
+
+/// The `sc_unit` the control socket `fd` is connected to.
+fn peer_unit(fd: i32) -> Option<u32> {
+    let mut addr: libc::sockaddr_ctl = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_ctl>() as libc::socklen_t;
+    // SAFETY: `addr` is writable for `len` bytes, which caps what is copied.
+    let r = unsafe { libc::getpeername(fd, &mut addr as *mut _ as *mut libc::sockaddr, &mut len) };
+    if r < 0 || (len as usize) < std::mem::size_of::<libc::sockaddr_ctl>() {
+        return None;
+    }
+    Some(addr.sc_unit)
 }
 
 fn getsockopt_ifname(fd: i32) -> Option<String> {
@@ -243,20 +279,35 @@ fn getsockopt_ifname(fd: i32) -> Option<String> {
     Some(String::from_utf8_lossy(&buf[..end]).into_owned())
 }
 
-fn read_loop(dev: Arc<DevFd>, handler: Arc<HandlerSlot<L3Handler>>) {
+fn read_loop(dev: Arc<DevFd>, handler: Arc<HandlerSlot<L3Handler>>, stats: Arc<DeviceStats>) {
     // TODO(tuntap): needs macOS to verify the live read path.
     // The 4-byte protocol-family header, then the packet.
     let mut buf = msg_buffer(4 + MAX_MTU);
-    while let Ok(Some(n)) = dev.read(&mut buf) {
+    while let Some(n) = read_or_record(&dev, &mut buf, &stats) {
         // Nothing past the header is no packet; a read that filled the buffer
         // is the front of one too long for it.
         if n <= 4 || !is_whole(n, &buf) {
+            stats.record_rx_drop();
             continue;
         }
+        stats.record_rx(n - 4);
         let Some(h) = handler.wait(dev.closed()) else {
             return;
         };
         // Strip the 4-byte protocol-family header.
         let _ = h(Packet::from_slice(&buf[4..n]));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn utun_unit_n_is_interface_n_minus_one() {
+        assert_eq!(utun_name(1).as_deref(), Some("utun0"));
+        assert_eq!(utun_name(4).as_deref(), Some("utun3"));
+        // 0 asks the kernel to pick; it names no interface.
+        assert_eq!(utun_name(0), None);
     }
 }

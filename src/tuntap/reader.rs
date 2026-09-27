@@ -13,7 +13,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, RwLock};
 
-use crate::Result;
+use crate::{DeviceStats, Result};
 
 /// The device fd, shared by the device and its reader thread.
 pub(super) struct DevFd {
@@ -165,6 +165,16 @@ impl DevFd {
             return Ok(Some(n as usize));
         }
     }
+}
+
+/// The next message's length, or `None` to stop reading. A read that failed
+/// has closed the device (see [`DevFd::read`]); it counts as an error, so a
+/// device that died on its own can be told from one closed on purpose.
+pub(super) fn read_or_record(dev: &DevFd, buf: &mut [u8], stats: &DeviceStats) -> Option<usize> {
+    dev.read(buf).unwrap_or_else(|_| {
+        stats.record_error();
+        None
+    })
 }
 
 /// The largest MTU the kernel lets an interface have (`ETH_MAX_MTU`, and the

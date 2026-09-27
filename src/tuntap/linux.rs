@@ -4,7 +4,7 @@
 //! handed to the handler is the read scratch and is only valid for the
 //! duration of the call (mirroring the rest of the crate).
 
-use super::reader::{DevFd, HandlerSlot, MAX_MTU, is_whole, msg_buffer};
+use super::reader::{DevFd, HandlerSlot, MAX_MTU, is_whole, msg_buffer, read_or_record};
 use crate::sys::if_hw_addr;
 use crate::{
     DeviceStats, Frame, IpPrefix, L2Device, L2Handler, L3Device, L3Handler, MacAddr, Packet, Result,
@@ -268,16 +268,6 @@ fn open_tuntap(name: &str, flags: i32) -> Result<(OwnedFd, String)> {
 /// Ethernet header and the 802.1Q tag the kernel puts back into a frame whose
 /// tag was offloaded.
 const MAX_TAP_FRAME: usize = MAX_MTU + 14 + 4;
-
-/// The next message's length, or `None` to stop reading. A read that failed
-/// has closed the device (see [`DevFd::read`]); it counts as an error, so a
-/// device that died on its own can be told from one closed on purpose.
-fn read_or_record(dev: &DevFd, buf: &mut [u8], stats: &DeviceStats) -> Option<usize> {
-    dev.read(buf).unwrap_or_else(|_| {
-        stats.record_error();
-        None
-    })
-}
 
 fn read_loop_l3(dev: Arc<DevFd>, handler: Arc<HandlerSlot<L3Handler>>, stats: Arc<DeviceStats>) {
     let mut buf = msg_buffer(MAX_MTU);
