@@ -37,7 +37,8 @@ pub type OnData = Arc<dyn Fn(PeerKey, u8, &[u8]) + Send + Sync>;
 
 /// Callback fired once a peer completes authentication, with its pushed config.
 /// A client that reconnects from the same address is reported as a
-/// disconnect followed by a new connect.
+/// disconnect followed by a new connect. See [`ServerConfig::on_connect`]
+/// for how the calls for one key are ordered.
 pub type OnConnect = Arc<dyn Fn(PeerKey, &PeerConfig) + Send + Sync>;
 
 /// Callback fired when a peer disconnects / is reaped. It pairs with
@@ -72,8 +73,28 @@ pub struct ServerConfig {
     /// Decrypted-payload sink.
     pub on_data: OnData,
     /// Optional connect notification.
+    ///
+    /// For any one [`PeerKey`], on_connect and on_disconnect calls never
+    /// overlap and always alternate: connect, disconnect, connect, ...
+    /// -- whichever sessions they are for, and however those sessions
+    /// come and go. So a caller keeping state per key (as [`Adapter`]
+    /// does) never sees a late on_disconnect for an old session after the
+    /// on_connect of the one that took the key over.
+    ///
+    /// To keep that order without holding one client's thread up while
+    /// another callback for the same key runs, a call that would overlap is
+    /// queued, and made by the thread running the current one once it
+    /// returns: a callback may be made on another thread than the one that
+    /// handled the client's packet, and after the call that caused it has
+    /// returned. That includes a callback calling back into the server --
+    /// removing the peer from inside on_connect reports it gone once
+    /// on_connect returns. For the same reason on_data may see a session's
+    /// first payloads before its on_connect has been made.
+    ///
+    /// [`Adapter`]: super::Adapter
     pub on_connect: Option<OnConnect>,
-    /// Optional disconnect notification.
+    /// Optional disconnect notification; ordered with on_connect as
+    /// described there.
     pub on_disconnect: Option<OnDisconnect>,
     /// Most peers (UDP and TCP together) held at once; a client beyond it is
     /// not served. Default 1024.
@@ -157,10 +178,11 @@ struct PeerEntry {
     // For TCP peers, the connection's outbound queue. For UDP, None (the
     // server writes via the shared UDP socket).
     tcp: Option<TcpOut>,
-    /// What on_connect / on_disconnect have said of the peer. One lock for
+    /// What on_connect / on_disconnect are to say of the peer. One lock for
     /// removal and the connect transition, so a verdict landing as the
     /// peer is removed either reports it connected before the removal
-    /// sees it, or not at all.
+    /// sees it, or not at all. The calls are queued (see `Server::post`)
+    /// under it, so they are queued in the order they were decided.
     link: Mutex<Link>,
     /// Authentications waiting for an on_auth call.
     auth: Mutex<PeerAuth>,
@@ -180,12 +202,9 @@ struct PeerAuth {
 struct Link {
     /// Out of the peer table: never reported connected again.
     removed: bool,
-    /// on_connect was fired and not yet matched by an on_disconnect: the
+    /// on_connect was queued and not yet matched by an on_disconnect: the
     /// callbacks pair, so only such a peer is reported gone.
     connected: bool,
-    /// on_connect is running. A removal meanwhile leaves the matching
-    /// on_disconnect to the thread running it, so the two come in order.
-    announcing: bool,
 }
 
 impl PeerEntry {
@@ -200,13 +219,28 @@ impl PeerEntry {
         }
     }
 
-    /// Mark the entry removed; whether on_disconnect is to be fired for it
-    /// now.
-    fn mark_removed(&self) -> bool {
-        let mut l = self.link.lock().unwrap();
-        l.removed = true;
-        !l.announcing && std::mem::take(&mut l.connected)
+    fn key(&self) -> PeerKey {
+        PeerKey::new(self.addr, self.transport)
     }
+}
+
+/// A callback owed for a key.
+enum Event {
+    Connect(PeerConfig),
+    Disconnect,
+}
+
+/// The on_connect / on_disconnect calls owed for one key, made one at a
+/// time and in order -- by whichever thread finds none running. A key's
+/// sessions may be served by different threads (a slow on_connect on an
+/// auth worker, the next session's removal on the UDP reader): made where
+/// they were decided, a replaced session's on_disconnect could come after
+/// the on_connect of the one replacing it.
+#[derive(Default)]
+struct KeyEvents {
+    queue: VecDeque<Event>,
+    /// A thread is making this key's calls.
+    running: bool,
 }
 
 /// Most frames queued for one TCP connection; past it, frames are dropped
@@ -279,6 +313,10 @@ pub struct Server {
     initial_limit: Mutex<RateLimit>,
     /// Peers with authentications to run, and the workers running them.
     auth: Mutex<AuthPool>,
+    /// on_connect / on_disconnect calls owed, by key. A key is here only
+    /// while it has calls queued or running. Taken under a peer's `link`
+    /// lock, never the other way round.
+    events: Mutex<HashMap<PeerKey, KeyEvents>>,
 }
 
 /// The threads calling on_auth: at most `max_auth_threads`, started as
@@ -375,6 +413,7 @@ impl Server {
             closed: AtomicBool::new(false),
             loops: Mutex::new(Vec::new()),
             auth: Mutex::default(),
+            events: Mutex::default(),
         });
 
         // Should a thread fail to start, returning drops the server, which
@@ -445,13 +484,13 @@ impl Server {
             .write()
             .unwrap()
             .drain()
-            .filter(|(_, e)| e.mark_removed())
-            .map(|(k, _)| k)
+            .map(|(k, e)| {
+                self.mark_removed(&e);
+                k
+            })
             .collect();
-        if let Some(cb) = &self.cfg.on_disconnect {
-            for k in peers {
-                callback(|| cb(k));
-            }
+        for k in peers {
+            self.run_events(k);
         }
     }
 
@@ -653,7 +692,7 @@ impl Server {
     /// for its key, as a caller may hold a stale one -- and close its TCP
     /// connection, which ends the thread serving it.
     fn remove_entry(&self, entry: &Arc<PeerEntry>) {
-        let key = PeerKey::new(entry.addr, entry.transport);
+        let key = entry.key();
         let removed = {
             let mut peers = self.peers.write().unwrap();
             let current = peers.get(&key).is_some_and(|e| Arc::ptr_eq(e, entry));
@@ -665,10 +704,60 @@ impl Server {
         if let Some(w) = &entry.tcp {
             let _ = w.stream.shutdown(std::net::Shutdown::Both);
         }
-        if entry.mark_removed()
-            && let Some(cb) = &self.cfg.on_disconnect
-        {
-            callback(|| cb(key));
+        self.mark_removed(entry);
+        self.run_events(key);
+    }
+
+    /// Mark the entry removed, queueing its on_disconnect if it was
+    /// reported connected. The caller then runs the key's events.
+    fn mark_removed(&self, entry: &PeerEntry) {
+        let mut l = entry.link.lock().unwrap();
+        l.removed = true;
+        if std::mem::take(&mut l.connected) {
+            self.post(entry.key(), [Event::Disconnect]);
+        }
+    }
+
+    /// Queue callbacks for `key`. Called under the peer's `link` lock, so
+    /// that they are queued in the order they were decided.
+    fn post(&self, key: PeerKey, events: impl IntoIterator<Item = Event>) {
+        let mut all = self.events.lock().unwrap();
+        all.entry(key).or_default().queue.extend(events);
+    }
+
+    /// Make the calls queued for `key`, unless another thread is making
+    /// them already: it then makes these too, once its current one
+    /// returns. So a callback that comes back into the server for its own
+    /// key -- removing the peer from inside on_connect -- finds its call
+    /// queued behind the running one, rather than deadlocking or cutting
+    /// in.
+    fn run_events(&self, key: PeerKey) {
+        let mut all = self.events.lock().unwrap();
+        match all.get_mut(&key) {
+            Some(k) if !k.running => k.running = true,
+            _ => return,
+        }
+        loop {
+            let k = all.get_mut(&key).expect("a running key stays queued");
+            let Some(ev) = k.queue.pop_front() else {
+                all.remove(&key);
+                return;
+            };
+            // With no lock held: a callback may call back into the server.
+            drop(all);
+            match ev {
+                Event::Connect(cfg) => {
+                    if let Some(cb) = &self.cfg.on_connect {
+                        callback(|| cb(key, &cfg));
+                    }
+                }
+                Event::Disconnect => {
+                    if let Some(cb) = &self.cfg.on_disconnect {
+                        callback(|| cb(key));
+                    }
+                }
+            }
+            all = self.events.lock().unwrap();
         }
     }
 
@@ -761,7 +850,7 @@ impl Server {
 
     /// Act on what the peer produced: send, report, deliver, close.
     fn apply(&self, entry: &Arc<PeerEntry>, mut out: PeerOutput) {
-        let key = PeerKey::new(entry.addr, entry.transport);
+        let key = entry.key();
         for dgram in &out.send {
             let _ = self.send_raw(entry, dgram);
         }
@@ -788,33 +877,20 @@ impl Server {
     /// Report a session that has just authenticated: on_connect, unless the
     /// peer was removed meanwhile.
     fn announce(&self, entry: &PeerEntry, key: PeerKey, cfg: &PeerConfig) {
-        // A new session taking over from one that was reported connected
-        // ends that connection first. The flag, not `out.replaced`,
-        // decides: the old session may have failed on its own before this
-        // one authenticated.
-        let replaced = {
+        {
             let mut l = entry.link.lock().unwrap();
             if l.removed {
                 return;
             }
-            l.announcing = true;
-            std::mem::replace(&mut l.connected, true)
-        };
-        if replaced && let Some(cb) = &self.cfg.on_disconnect {
-            callback(|| cb(key));
+            // A new session taking over from one that was reported
+            // connected ends that connection first. The flag, not
+            // `out.replaced`, decides: the old session may have failed on
+            // its own before this one authenticated.
+            let replaced = std::mem::replace(&mut l.connected, true);
+            let gone = replaced.then_some(Event::Disconnect);
+            self.post(key, gone.into_iter().chain([Event::Connect(cfg.clone())]));
         }
-        if let Some(cb) = &self.cfg.on_connect {
-            callback(|| cb(key, cfg));
-        }
-        // A removal while the callbacks ran left its on_disconnect to us.
-        let gone = {
-            let mut l = entry.link.lock().unwrap();
-            l.announcing = false;
-            l.removed && std::mem::take(&mut l.connected)
-        };
-        if gone && let Some(cb) = &self.cfg.on_disconnect {
-            callback(|| cb(key));
-        }
+        self.run_events(key);
     }
 
     /// Encrypt and send a data-channel payload to a peer identified by `key`.
@@ -2225,6 +2301,53 @@ mod tests {
         );
     }
 
+    /// A client reconnecting from the same address while its old session's
+    /// on_connect is still running (a slow one, on an auth worker): the old
+    /// session's on_disconnect comes before the new one's on_connect, not
+    /// after it -- a caller keeping state per key would otherwise drop the
+    /// new session's on the late disconnect.
+    #[test]
+    fn a_key_is_reported_gone_before_its_next_session_connects() {
+        let events = Events::default();
+        let (entered_tx, entered) = mpsc::channel::<()>();
+        let (release, release_rx) = mpsc::channel::<()>();
+        let (entered_tx, release_rx) = (Mutex::new(entered_tx), Mutex::new(release_rx));
+        let first = AtomicBool::new(true);
+        let server = recording_server(&events, move |_| {
+            if first.swap(false, Ordering::SeqCst) {
+                let _ = entered_tx.lock().unwrap().send(());
+                let _ = release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5));
+            }
+        });
+        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let key = PeerKey::new(addr, Transport::Udp);
+        let old = server
+            .create_peer(key, Transport::Udp, addr, None, None)
+            .unwrap();
+        let (s, e) = (server.clone(), old.clone());
+        let slow = thread::spawn(move || s.apply(&e, connected_output()));
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        server.remove_entry(&old);
+        let new = server
+            .create_peer(key, Transport::Udp, addr, None, None)
+            .unwrap();
+        server.apply(&new, connected_output());
+        release.send(()).unwrap();
+        slow.join().unwrap();
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec!["connect", "disconnect", "connect"]
+        );
+        server.close();
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec!["connect", "disconnect", "connect", "disconnect"]
+        );
+    }
+
     fn auth_ok() -> OnAuth {
         Arc::new(|_| {
             Ok(PeerConfig::new(
@@ -2357,7 +2480,7 @@ mod tests {
             Arc::new(PeerEntry::new(peer, Transport::Udp, addr, None))
         };
         let removed = entry();
-        removed.mark_removed();
+        server.mark_removed(&removed);
         server.schedule_auth(&removed);
         for _ in 0..20 {
             server.schedule_auth(&entry());
