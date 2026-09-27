@@ -134,8 +134,8 @@ impl L2Adapter {
             mac,
             l3: dev.clone(),
             l2_handler: Mutex::new(None),
-            gateway_v4: Mutex::new(cfg.gateway_v4),
-            gateway_v6: Mutex::new(cfg.gateway_v6),
+            gateway_v4: Mutex::new(None),
+            gateway_v6: Mutex::new(None),
             arp: ArpTable::new(),
             arp_pending: ArpPending::new(),
             ndp: NdpTable::new(),
@@ -153,6 +153,8 @@ impl L2Adapter {
             weak_self: Mutex::new(Weak::new()),
         });
         *a.weak_self.lock().unwrap() = Arc::downgrade(&a);
+        a.set_gw_v4(cfg.gateway_v4);
+        a.set_gw_v6(cfg.gateway_v6);
 
         // Wire the L3 device's outbound packets back through us.
         let weak = Arc::downgrade(&a);
@@ -189,12 +191,27 @@ impl L2Adapter {
     /// running, the next binding or lost lease replaces it (see
     /// [`L2AdapterConfig::gateway_v4`]).
     pub fn set_gateway_v4(&self, gw: Ipv4Addr) {
-        *self.gateway_v4.lock().unwrap() = Some(gw);
+        self.set_gw_v4(Some(gw));
     }
 
     /// Set the IPv6 default gateway used for off-link NDP.
     pub fn set_gateway_v6(&self, gw: Ipv6Addr) {
-        *self.gateway_v6.lock().unwrap() = Some(gw);
+        self.set_gw_v6(Some(gw));
+    }
+
+    /// Every off-link packet goes through the gateway, so its neighbour
+    /// entry is pinned: a cache filled by made-up neighbours must not push
+    /// it out.
+    fn set_gw_v4(&self, gw: Option<Ipv4Addr>) {
+        let mut g = self.gateway_v4.lock().unwrap();
+        *g = gw;
+        self.arp.pin(gw);
+    }
+
+    fn set_gw_v6(&self, gw: Option<Ipv6Addr>) {
+        let mut g = self.gateway_v6.lock().unwrap();
+        *g = gw;
+        self.ndp.pin(gw);
     }
 
     // --- DHCP --------------------------------------------------------------
@@ -954,7 +971,7 @@ impl crate::dhcp::ClientTransport for AdapterDhcpTransport {
             let _ = a.l3.set_addr(prefix);
             // The lease is the whole configuration: one naming no router
             // means there is none, not that the last lease's still applies.
-            *a.gateway_v4.lock().unwrap() = gateway;
+            a.set_gw_v4(gateway);
         }
     }
     fn on_lease_lost(&self) {
@@ -966,7 +983,7 @@ impl crate::dhcp::ClientTransport for AdapterDhcpTransport {
                 let _ =
                     a.l3.set_addr(IpPrefix::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0));
             }
-            *a.gateway_v4.lock().unwrap() = None;
+            a.set_gw_v4(None);
             a.forget_ipv4_neighbours(true);
         }
     }
@@ -1396,6 +1413,37 @@ mod tests {
         assert_eq!(f.ether_type(), EtherType::IPV4);
         assert_eq!(f.dst_mac(), Some(real));
         assert_eq!(adapter.arp.lookup(Ipv4Addr::new(10, 0, 0, 6)), Some(real));
+    }
+
+    #[test]
+    fn a_solicitation_flood_does_not_evict_the_router() {
+        let (pipe, adapter, out) = rig("2001:db8::5/64");
+        let gw: Ipv6Addr = "fe80::1".parse().unwrap();
+        let gw_mac = MacAddr([2, 0, 0, 0, 0, 1]);
+        adapter.set_gateway_v6(gw);
+        let mut ns = ndp::build_ns(gw_mac, our_ip());
+        let f = ndp_frame(&adapter, gw_mac, gw, our_ip(), &mut ns);
+        adapter.send(Frame::from_slice(&f)).unwrap();
+        assert_eq!(adapter.ndp.lookup(gw), Some(gw_mac));
+
+        // NSes for us from made-up link-local senders, each with a source
+        // link-layer address, overflow the cache.
+        for i in 0..2 * ndp::MAX_ENTRIES as u32 {
+            let src = Ipv6Addr::from(0xfe80_u128 << 112 | 0x10_0000 | i as u128);
+            let mac = MacAddr([2, 0xee, 0, (i >> 16) as u8, (i >> 8) as u8, i as u8]);
+            let mut ns = ndp::build_ns(mac, our_ip());
+            let f = ndp_frame(&adapter, mac, src, our_ip(), &mut ns);
+            adapter.send(Frame::from_slice(&f)).unwrap();
+        }
+        take(&out);
+
+        assert_eq!(adapter.ndp.lookup(gw), Some(gw_mac), "router evicted");
+        let far: Ipv6Addr = "2001:db9::1".parse().unwrap();
+        pipe.inject(Packet::from_slice(&v6_packet(our_ip(), far)))
+            .unwrap();
+        let sent = take(&out);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(Frame::from_slice(&sent[0]).dst_mac(), Some(gw_mac));
     }
 
     #[test]

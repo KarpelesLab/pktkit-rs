@@ -3,8 +3,10 @@
 //! - [`Table`] is the neighbour cache, shared with NDP: lookups, learning,
 //!   and Neighbour Unreachability Detection (RFC 4861 §7.3), so a neighbour
 //!   that stops answering -- or moves to another MAC -- is found out within
-//!   seconds of being used. Capped at 4096 entries (a full cache evicts the
-//!   entry closest to expiry); entries unused for 5 minutes age out.
+//!   seconds of being used. Capped at 4096 entries: a full cache is cut back
+//!   by an eighth, entries learnt unasked and closest to expiry first, and
+//!   never the [pinned](Table::pin) router; entries unused for 5 minutes age
+//!   out.
 //! - [`Pending`] buffers packets awaiting resolution, the newest 16 per target and
 //!   256 targets, and times the solicitations: three, a second apart, before
 //!   resolution fails and the packets are handed back to be reported.
@@ -35,6 +37,12 @@ pub const PENDING_MAX_PKTS: usize = 16;
 /// Most destinations that may be awaiting resolution at once.
 pub const PENDING_MAX_TARGETS: usize = 256;
 pub const MAX_ENTRIES: usize = 4096;
+/// What a full cache is cut back to. Evicting a batch, rather than one entry
+/// per insert, pays for the scan that picks the victims once per
+/// `MAX_ENTRIES - LOW_WATER` new neighbours: a flood of made-up senders
+/// would otherwise have every one of its packets scan the whole cache,
+/// under the lock every send takes.
+const LOW_WATER: usize = MAX_ENTRIES - MAX_ENTRIES / 8;
 
 /// How long a neighbour stays REACHABLE after a confirmation (RFC 4861 §10
 /// REACHABLE_TIME).
@@ -68,6 +76,11 @@ struct Entry {
     /// last heard from. An entry in use never gets there: it is probed and
     /// either confirmed or dropped first.
     expires: Instant,
+    /// Ever confirmed by an answer to our own solicitation (or installed
+    /// with [`Table::set`]), rather than only learnt from what a neighbour
+    /// chose to send. Anyone can mint entries of the second kind, so a
+    /// full cache evicts those first.
+    resolved: bool,
 }
 
 impl Entry {
@@ -116,13 +129,23 @@ pub enum Resolved {
 /// when.
 #[derive(Debug)]
 pub struct Table<K = Ipv4Addr> {
-    inner: Mutex<HashMap<K, Entry>>,
+    inner: Mutex<Cache<K>>,
+}
+
+#[derive(Debug)]
+struct Cache<K> {
+    map: HashMap<K, Entry>,
+    /// Never evicted to make room.
+    pinned: Option<K>,
 }
 
 impl<K: Eq + Hash + Copy> Default for Table<K> {
     fn default() -> Self {
         Table {
-            inner: Mutex::new(HashMap::new()),
+            inner: Mutex::new(Cache {
+                map: HashMap::new(),
+                pinned: None,
+            }),
         }
     }
 }
@@ -133,11 +156,21 @@ impl<K: Eq + Hash + Copy> Table<K> {
         Table::default()
     }
 
+    /// Never evict `ip` to make room in a full cache: the default router,
+    /// through which all off-link traffic goes. Anyone on the link can fill
+    /// the cache with made-up neighbours, and losing the router's entry to
+    /// them would stall everything until it is resolved again. `None`
+    /// unpins. Only room-making is affected: the entry still ages out, and
+    /// NUD still drops it if the router stops answering.
+    pub fn pin(&self, ip: Option<K>) {
+        self.inner.lock().unwrap().pinned = ip;
+    }
+
     /// Look up `ip`, returning its MAC if an entry exists. This only looks:
     /// it neither counts as using the entry nor moves its state on.
     pub fn lookup(&self, ip: K) -> Option<MacAddr> {
         let now = Instant::now();
-        let mut t = self.inner.lock().unwrap();
+        let t = &mut self.inner.lock().unwrap().map;
         match t.get(&ip).copied() {
             Some(e) if !e.gone(now) => Some(e.mac),
             Some(_) => {
@@ -155,7 +188,7 @@ impl<K: Eq + Hash + Copy> Table<K> {
     }
 
     pub(crate) fn resolve_at(&self, ip: K, now: Instant) -> Resolved {
-        let mut t = self.inner.lock().unwrap();
+        let t = &mut self.inner.lock().unwrap().map;
         let Some(e) = t.get_mut(&ip) else {
             return Resolved::Miss;
         };
@@ -196,7 +229,7 @@ impl<K: Eq + Hash + Copy> Table<K> {
     /// their last probe are forgotten, as are entries long stale.
     pub fn poll(&self, now: Instant) -> Vec<(K, MacAddr)> {
         let mut probes = Vec::new();
-        self.inner.lock().unwrap().retain(|ip, e| {
+        self.inner.lock().unwrap().map.retain(|ip, e| {
             match e.state {
                 Nud::Delay(until) if until <= now => {
                     e.state = Nud::Probe {
@@ -222,7 +255,7 @@ impl<K: Eq + Hash + Copy> Table<K> {
 
     /// Forget every entry, as when the network they were learnt on is left.
     pub fn clear(&self) {
-        self.inner.lock().unwrap().clear();
+        self.inner.lock().unwrap().map.clear();
     }
 
     /// Install or refresh an entry, confirmed reachable (for `ttl` or
@@ -230,15 +263,16 @@ impl<K: Eq + Hash + Copy> Table<K> {
     pub fn set(&self, ip: K, mac: MacAddr, ttl: Duration) {
         let now = Instant::now();
         let mut t = self.inner.lock().unwrap();
-        if !t.contains_key(&ip) && t.len() >= MAX_ENTRIES {
-            make_room(&mut t, now);
+        if !t.map.contains_key(&ip) && t.map.len() >= MAX_ENTRIES {
+            t.make_room(now);
         }
-        t.insert(
+        t.map.insert(
             ip,
             Entry {
                 mac,
                 state: Nud::Reachable(now + ttl.min(REACHABLE_TIME)),
                 expires: now + ttl,
+                resolved: true,
             },
         );
     }
@@ -270,7 +304,7 @@ impl<K: Eq + Hash + Copy> Table<K> {
             Nud::Stale
         };
         let expires = now + DEFAULT_TTL;
-        match t.get_mut(&ip) {
+        match t.map.get_mut(&ip) {
             Some(e) if !e.gone(now) => {
                 if e.mac != mac && !override_ {
                     if matches!(e.state, Nud::Reachable(until) if until > now) {
@@ -283,17 +317,19 @@ impl<K: Eq + Hash + Copy> Table<K> {
                 }
                 e.mac = mac;
                 e.expires = expires;
+                e.resolved |= solicited;
             }
             _ => {
-                if !t.contains_key(&ip) && t.len() >= MAX_ENTRIES {
-                    make_room(&mut t, now);
+                if !t.map.contains_key(&ip) && t.map.len() >= MAX_ENTRIES {
+                    t.make_room(now);
                 }
-                t.insert(
+                t.map.insert(
                     ip,
                     Entry {
                         mac,
                         state,
                         expires,
+                        resolved: solicited,
                     },
                 );
             }
@@ -301,16 +337,34 @@ impl<K: Eq + Hash + Copy> Table<K> {
     }
 }
 
-/// Free a slot in a full cache. Entries gone stale go first; failing that,
-/// the one closest to expiring -- the least recently heard from. Refusing
-/// the new entry instead would let anyone who fills the cache with made-up
-/// senders keep every real neighbour out of it for good.
-fn make_room<K: Eq + Hash + Copy>(t: &mut HashMap<K, Entry>, now: Instant) {
-    t.retain(|_, e| !e.gone(now));
-    if t.len() >= MAX_ENTRIES
-        && let Some(oldest) = t.iter().min_by_key(|(_, e)| e.expires).map(|(k, _)| *k)
-    {
-        t.remove(&oldest);
+impl<K: Eq + Hash + Copy> Cache<K> {
+    /// Cut a full cache back to [`LOW_WATER`]. Entries gone stale go first;
+    /// then those learnt unasked before those we resolved ourselves, the
+    /// closest to expiring -- the least recently heard from -- first; the
+    /// pinned router never. Refusing the new entry instead would let anyone
+    /// who fills the cache with made-up senders keep every real neighbour
+    /// out of it for good.
+    fn make_room(&mut self, now: Instant) {
+        self.map.retain(|_, e| !e.gone(now));
+        let Some(excess) = self.map.len().checked_sub(LOW_WATER).filter(|&n| n > 0) else {
+            return;
+        };
+        let pinned = self.pinned;
+        let mut victims: Vec<_> = self
+            .map
+            .iter()
+            .filter(|(k, _)| Some(**k) != pinned)
+            .map(|(k, e)| (e.resolved, e.expires, *k))
+            .collect();
+        let n = excess.min(victims.len());
+        if n == 0 {
+            return;
+        }
+        // Linear, not a sort: only which ones go matters, not their order.
+        victims.select_nth_unstable_by_key(n - 1, |v| (v.0, v.1));
+        for (_, _, k) in &victims[..n] {
+            self.map.remove(k);
+        }
     }
 }
 
@@ -726,7 +780,49 @@ mod tests {
         t.set(new, m, DEFAULT_TTL);
         assert_eq!(t.lookup(new), Some(m), "a full cache refused a neighbour");
         assert_eq!(t.lookup(old), None);
-        assert_eq!(t.inner.lock().unwrap().len(), MAX_ENTRIES);
+    }
+
+    #[test]
+    fn a_full_cache_is_cut_back_in_one_batch() {
+        let t = Table::new();
+        let m = MacAddr([0xaa; 6]);
+        for i in 0..MAX_ENTRIES as u32 {
+            t.update(Ipv4Addr::from(0x0a01_0000 + i), m, false, true);
+        }
+        t.update(Ipv4Addr::new(10, 2, 0, 1), m, false, true);
+        // The next MAX_ENTRIES - LOW_WATER - 1 new neighbours find room
+        // without scanning the cache again.
+        assert_eq!(t.inner.lock().unwrap().map.len(), LOW_WATER + 1);
+    }
+
+    #[test]
+    fn a_flood_evicts_neither_the_router_nor_neighbours_we_resolved() {
+        let t = Table::new();
+        let m = MacAddr([0xaa; 6]);
+        let t0 = Instant::now();
+        let gw = Ipv4Addr::new(10, 0, 0, 1);
+        let peer = Ipv4Addr::new(10, 0, 0, 2);
+        t.pin(Some(gw));
+        // Learnt first, so closest to expiry of all.
+        t.update_at(gw, m, false, true, t0);
+        t.update_at(peer, m, true, true, t0);
+        // Unasked-for neighbours, every one newer, many times the cache.
+        for i in 0..3 * MAX_ENTRIES as u32 {
+            let at = t0 + Duration::from_millis(1 + i as u64 / 64);
+            t.update_at(Ipv4Addr::from(0x0a10_0000 + i), m, false, true, at);
+        }
+        assert_eq!(t.lookup(gw), Some(m), "the router was evicted");
+        assert_eq!(t.lookup(peer), Some(m), "a resolved neighbour was evicted");
+        assert!(t.inner.lock().unwrap().map.len() <= MAX_ENTRIES);
+
+        // Unpinned, the router goes like anyone else.
+        let t = Table::new();
+        t.update_at(gw, m, false, true, t0);
+        for i in 0..MAX_ENTRIES as u32 {
+            let at = t0 + Duration::from_millis(1);
+            t.update_at(Ipv4Addr::from(0x0a10_0000 + i), m, false, true, at);
+        }
+        assert_eq!(t.lookup(gw), None);
     }
 
     #[test]
