@@ -18,6 +18,8 @@ use std::time::Duration;
 pub struct Response {
     pub status: u16,
     pub reason: String,
+    /// Header fields by lowercase name. A field sent more than once maps to
+    /// its values joined by `", "`, the list they stand for.
     pub headers: BTreeMap<String, String>,
     pub body: Vec<u8>,
 }
@@ -364,11 +366,7 @@ impl ResponseReader {
         } else if headers.contains_key("transfer-encoding") {
             Framing::ToEof
         } else if let Some(cl) = headers.get("content-length") {
-            Framing::Length(
-                cl.trim()
-                    .parse()
-                    .map_err(|_| invalid("bad Content-Length"))?,
-            )
+            Framing::Length(content_length(cl).ok_or_else(|| invalid("bad Content-Length"))?)
         } else {
             Framing::ToEof
         };
@@ -510,10 +508,37 @@ fn parse_head(head: &[u8]) -> Result<(u16, String, BTreeMap<String, String>), &'
             break;
         }
         if let Some((k, v)) = line.split_once(':') {
-            headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+            // A repeated field is the list of its values (RFC 9110 §5.3),
+            // so a second Content-Length is checked against the first
+            // rather than silently replacing it.
+            headers
+                .entry(k.trim().to_ascii_lowercase())
+                .and_modify(|all: &mut String| {
+                    all.push_str(", ");
+                    all.push_str(v.trim());
+                })
+                .or_insert_with(|| v.trim().to_string());
         }
     }
     Ok((status, reason, headers))
+}
+
+/// The body length a Content-Length value gives (RFC 9112 §6.3): digits
+/// only, and a list only when every element is the same length.
+fn content_length(value: &str) -> Option<usize> {
+    let mut len = None;
+    for part in value.split(',') {
+        let part = part.trim();
+        if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let n: usize = part.parse().ok()?;
+        if len.is_some_and(|l| l != n) {
+            return None;
+        }
+        len = Some(n);
+    }
+    len
 }
 
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -616,6 +641,34 @@ mod tests {
             assert_eq!(r.reason, "OK");
             assert_eq!(r.body, b"hello");
             assert_eq!(r.header("content-length"), Some("5"));
+        }
+    }
+
+    #[test]
+    fn content_length_is_validated_per_rfc_9112() {
+        let with = |cl: &str| {
+            let raw = format!("HTTP/1.1 200 OK\r\n{cl}\r\n\r\nhello, world");
+            read_response(raw.as_bytes(), raw.len())
+        };
+        // One value, or a list of identical ones, is a length.
+        for ok in [
+            "Content-Length: 5",
+            "Content-Length: 5, 5",
+            "Content-Length: 5\r\nContent-Length: 5",
+        ] {
+            assert_eq!(with(ok).unwrap().body, b"hello", "{ok:?}");
+        }
+        // Conflicting values, a sign, or anything but digits is an error.
+        for bad in [
+            "Content-Length: 5\r\nContent-Length: 12",
+            "Content-Length: 5, 12",
+            "Content-Length: +5",
+            "Content-Length: -5",
+            "Content-Length: 0x5",
+            "Content-Length: ",
+            "Content-Length: 5,",
+        ] {
+            assert!(with(bad).is_err(), "{bad:?}");
         }
     }
 
