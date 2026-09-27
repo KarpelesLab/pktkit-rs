@@ -352,7 +352,7 @@ impl Resolver {
             if resp[2] & 0x02 != 0 {
                 // TC: the answer did not fit in a datagram, and what came
                 // is not all of it. Ask again over TCP (RFC 7766 §5).
-                return self.query_tcp(server, &query, id);
+                return self.query_tcp(server, &query, id, deadline);
             }
             return wire::parse_response(resp, id)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e));
@@ -360,11 +360,17 @@ impl Resolver {
     }
 
     /// Send `query` to `server` over TCP, each message behind its two-byte
-    /// length (RFC 1035 §4.2.2), within a timeout of its own.
-    fn query_tcp(&self, server: SocketAddr, query: &[u8], id: u16) -> io::Result<Vec<IpAddr>> {
+    /// length (RFC 1035 §4.2.2), by `deadline`: the same one as the UDP
+    /// query this retries, so one server never costs more than the timeout.
+    fn query_tcp(
+        &self,
+        server: SocketAddr,
+        query: &[u8],
+        id: u16,
+        deadline: Instant,
+    ) -> io::Result<Vec<IpAddr>> {
         use std::io::{Read, Write};
 
-        let deadline = Instant::now() + self.cfg.timeout;
         let left = || {
             deadline
                 .checked_duration_since(Instant::now())
@@ -377,14 +383,37 @@ impl Resolver {
         msg.extend_from_slice(&(query.len() as u16).to_be_bytes());
         msg.extend_from_slice(query);
         s.write_all(&msg)?;
-        let mut read = |buf: &mut [u8]| -> io::Result<()> {
-            s.set_read_timeout(Some(left()?))?;
-            s.read_exact(buf).map_err(|e| match e.kind() {
-                io::ErrorKind::WouldBlock => {
-                    io::Error::new(io::ErrorKind::TimedOut, "DNS query timed out")
+        // A read timeout bounds each recv, not read_exact as a whole: a
+        // server trickling one byte per timeout would hold the query for as
+        // many timeouts as the length it announced. So read in a loop, and
+        // give each read only what is left of the deadline.
+        let mut read = |mut buf: &mut [u8]| -> io::Result<()> {
+            while !buf.is_empty() {
+                s.set_read_timeout(Some(left()?))?;
+                match s.read(buf) {
+                    Ok(0) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "DNS server closed the connection",
+                        ));
+                    }
+                    Ok(n) => buf = &mut buf[n..],
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "DNS query timed out",
+                        ));
+                    }
+                    Err(e) => return Err(e),
                 }
-                _ => e,
-            })
+            }
+            Ok(())
         };
         let mut len = [0u8; 2];
         read(&mut len)?;
@@ -628,6 +657,55 @@ mod tests {
         );
         let ips = r.query("big.test", RecordType::A).unwrap();
         assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))]);
+    }
+
+    /// A TCP server that trickles its answer a byte at a time, each just
+    /// inside the read timeout, still cannot hold the query past its
+    /// deadline.
+    #[test]
+    fn a_trickling_tcp_answer_does_not_extend_the_timeout() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let (udp, tcp) = loop {
+            let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+            if let Ok(tcp) = TcpListener::bind(udp.local_addr().unwrap()) {
+                break (udp, tcp);
+            }
+        };
+        let server_addr = udp.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1500];
+            let (n, from) = udp.recv_from(&mut buf).unwrap();
+            let mut tc = buf[..n].to_vec();
+            tc[2..4].copy_from_slice(&0x8380u16.to_be_bytes());
+            udp.send_to(&tc, from).unwrap();
+            let (mut s, _) = tcp.accept().unwrap();
+            let mut len = [0u8; 2];
+            let _ = s.read_exact(&mut len);
+            let mut q = vec![0u8; u16::from_be_bytes(len) as usize];
+            let _ = s.read_exact(&mut q);
+            // Announce the largest answer, then send it one byte at a time.
+            let _ = s.write_all(&u16::MAX.to_be_bytes());
+            for _ in 0..200 {
+                if s.write_all(&[0]).is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+        let r = Resolver::new(
+            ResolverConfig::default()
+                .servers(vec![server_addr])
+                .timeout(Duration::from_millis(400)),
+        );
+        let start = std::time::Instant::now();
+        assert!(r.query("slow.test", RecordType::A).is_err());
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "took {:?}",
+            start.elapsed()
+        );
     }
 
     #[test]

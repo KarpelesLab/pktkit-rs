@@ -139,7 +139,9 @@ fn would_block(what: &str) -> io::Error {
 
 /// A TCP stream over the virtual network, blocking by default.
 ///
-/// Dropping the handle initiates a graceful close.
+/// Dropping the handle closes the connection gracefully, unless received
+/// data was left unread: then, as a host stack does (RFC 2525 §2.17), the
+/// peer gets a reset.
 pub struct TcpConn {
     state: Arc<ConnState>,
     read_timeout: Mutex<Option<Duration>>,

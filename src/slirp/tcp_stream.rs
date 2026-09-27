@@ -226,8 +226,9 @@ impl ConnState {
 /// A blocking, accepted TCP stream over the virtual network.
 ///
 /// Returned by [`Listener::accept`](super::Listener::accept). Implements
-/// [`std::io::Read`] + [`std::io::Write`]; dropping it initiates a graceful
-/// close.
+/// [`std::io::Read`] + [`std::io::Write`]. Dropping it closes the
+/// connection gracefully, unless received data was left unread: then, as a
+/// host stack does (RFC 2525 §2.17), the peer gets a reset.
 pub struct TcpStream {
     state: Arc<ConnState>,
     read_timeout: Mutex<Option<Duration>>,

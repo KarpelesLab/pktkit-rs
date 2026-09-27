@@ -55,6 +55,9 @@ struct Partial {
     received: usize,
     /// Payload length, known once the last fragment has arrived.
     total: Option<usize>,
+    /// The piece ending at `total` came with "more fragments" clear (it
+    /// did not if an empty last fragment fixed the total after it).
+    last_piece_final: bool,
 }
 
 /// Where a fragment goes in its datagram.
@@ -198,6 +201,7 @@ impl Reassembler {
             pieces: Vec::new(),
             received: 0,
             total: None,
+            last_piece_final: false,
         });
 
         if !d.accept(&p, end) {
@@ -248,7 +252,15 @@ impl Partial {
             .chain(self.pieces.get(i));
         for &(s, e) in neighbours {
             if s < end.max(p.offset + 1) && p.offset < e {
-                return s == p.offset && e == end && self.data[s..e] == *p.data;
+                // A repeat must say the same about "more fragments" as the
+                // original: final only if the original was. Otherwise a
+                // copy of an early fragment with MF clear would cut the
+                // datagram short at its end.
+                let was_final = self.last_piece_final && self.total == Some(e);
+                return s == p.offset
+                    && e == end
+                    && self.data[s..e] == *p.data
+                    && p.more != was_final;
             }
         }
         if p.data.is_empty() {
@@ -263,6 +275,7 @@ impl Partial {
             self.header = Some(h.clone());
         }
         self.pieces.insert(i, (p.offset, end));
+        self.last_piece_final |= !p.more;
         self.received += p.data.len();
         true
     }
@@ -428,6 +441,72 @@ mod tests {
         bad[30] ^= 0xFF;
         assert!(r.push_v4(now, 0, &bad, 20).is_none());
         assert_eq!(r.in_progress(), 0);
+    }
+
+    /// Flip "more fragments" on a fragment (the checksum is not checked).
+    fn with_more(f: &[u8], more: bool) -> Vec<u8> {
+        let mut f = f.to_vec();
+        if more {
+            f[6] |= 0x20;
+        } else {
+            f[6] &= !0x20;
+        }
+        f
+    }
+
+    #[test]
+    fn v4_repeat_must_agree_on_more_fragments() {
+        let dgram = v4_datagram(3000);
+        let frags = split(&dgram, 1000);
+        let now = Instant::now();
+
+        // A copy of the first fragment claiming to be the last would
+        // otherwise complete the datagram at its own end.
+        let mut r = Reassembler::default();
+        assert!(r.push_v4(now, 0, &frags[0], 20).is_none());
+        assert!(
+            r.push_v4(now, 0, &with_more(&frags[0], false), 20)
+                .is_none()
+        );
+        assert_eq!(r.in_progress(), 0);
+
+        // Nor may a copy of the last fragment say more follow.
+        let last = frags.len() - 1;
+        let mut r = Reassembler::default();
+        assert!(r.push_v4(now, 0, &frags[last], 20).is_none());
+        assert!(
+            r.push_v4(now, 0, &with_more(&frags[last], true), 20)
+                .is_none()
+        );
+        assert_eq!(r.in_progress(), 0);
+
+        // A faithful repeat of the last fragment is still fine.
+        let mut r = Reassembler::default();
+        assert!(r.push_v4(now, 0, &frags[last], 20).is_none());
+        assert!(r.push_v4(now, 0, &frags[last], 20).is_none());
+        assert_eq!(push_all(&mut r, &frags[..last]).unwrap()[20..], dgram[20..]);
+    }
+
+    #[test]
+    fn v4_repeat_before_an_empty_last_fragment_is_tolerated() {
+        let dgram = v4_datagram(2000);
+        let mut frags = split(&dgram, 1000);
+        let last = frags.len() - 1;
+        let end = frags[last].clone();
+        frags[last] = with_more(&end, true);
+        // An empty fragment at the end carries the "last" flag instead.
+        let off = u16::from_be_bytes([end[6], end[7]]) & 0x1FFF;
+        let end_units = off as usize + (end.len() - 20) / 8;
+        let mut empty = end[..20].to_vec();
+        empty[2..4].copy_from_slice(&20u16.to_be_bytes());
+        empty[6..8].copy_from_slice(&(end_units as u16).to_be_bytes());
+        let now = Instant::now();
+        let mut r = Reassembler::default();
+        assert!(r.push_v4(now, 0, &frags[last], 20).is_none());
+        assert!(r.push_v4(now, 0, &empty, 20).is_none());
+        assert!(r.push_v4(now, 0, &frags[last], 20).is_none());
+        assert_eq!(r.in_progress(), 1);
+        assert_eq!(push_all(&mut r, &frags[..last]).unwrap()[20..], dgram[20..]);
     }
 
     #[test]

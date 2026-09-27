@@ -15,12 +15,18 @@ use std::time::Duration;
 
 /// A parsed HTTP response.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Response {
     pub status: u16,
     pub reason: String,
     /// Header fields by lowercase name. A field sent more than once maps to
-    /// its values joined by `", "`, the list they stand for.
+    /// its values joined by `", "`, the list they stand for — except
+    /// `set-cookie`, which maps to its last value: see `set_cookies`.
     pub headers: BTreeMap<String, String>,
+    /// Every `Set-Cookie` field, in order. Cookies cannot be joined into
+    /// one list (their values contain commas, as in `Expires=`), so RFC 9110
+    /// §5.3 keeps them apart.
+    pub set_cookies: Vec<String>,
     pub body: Vec<u8>,
 }
 
@@ -339,7 +345,7 @@ struct ResponseReader {
     buf: Vec<u8>,
     /// Where the header terminator search resumes.
     scan: usize,
-    head: Option<(u16, String, BTreeMap<String, String>)>,
+    head: Option<Head>,
     framing: Framing,
     /// Start of the unconsumed body bytes in `buf`.
     pos: usize,
@@ -404,7 +410,8 @@ impl ResponseReader {
             return Ok(false);
         };
         let end = from + i + 4;
-        let (status, reason, headers) = parse_head(&self.buf[self.pos..end]).map_err(invalid)?;
+        let (status, reason, headers, set_cookies) =
+            parse_head(&self.buf[self.pos..end]).map_err(invalid)?;
         self.pos = end;
         self.scan = end;
         if (100..200).contains(&status) && status != 101 {
@@ -428,7 +435,7 @@ impl ResponseReader {
         } else {
             Framing::ToEof
         };
-        self.head = Some((status, reason, headers));
+        self.head = Some((status, reason, headers, set_cookies));
         Ok(true)
     }
 
@@ -523,11 +530,12 @@ impl ResponseReader {
     }
 
     fn take(&mut self) -> Response {
-        let (status, reason, headers) = self.head.take().expect("head parsed");
+        let (status, reason, headers, set_cookies) = self.head.take().expect("head parsed");
         Response {
             status,
             reason,
             headers,
+            set_cookies,
             body: std::mem::take(&mut self.body),
         }
     }
@@ -546,7 +554,10 @@ fn take_line<'a>(buf: &'a [u8], pos: &mut usize) -> io::Result<Option<&'a [u8]>>
     }
 }
 
-fn parse_head(head: &[u8]) -> Result<(u16, String, BTreeMap<String, String>), &'static str> {
+/// Status, reason, header fields, and the `Set-Cookie` values.
+type Head = (u16, String, BTreeMap<String, String>, Vec<String>);
+
+fn parse_head(head: &[u8]) -> Result<Head, &'static str> {
     let text = std::str::from_utf8(head).map_err(|_| "non-utf8 headers")?;
     let mut lines = text.split("\r\n");
     let status_line = lines.next().ok_or("empty response")?;
@@ -561,11 +572,17 @@ fn parse_head(head: &[u8]) -> Result<(u16, String, BTreeMap<String, String>), &'
     let reason = sp.next().unwrap_or("").to_string();
 
     let mut headers = BTreeMap::new();
+    let mut set_cookies = Vec::new();
     for line in lines {
         if line.is_empty() {
             break;
         }
         if let Some((k, v)) = line.split_once(':') {
+            if k.trim().eq_ignore_ascii_case("set-cookie") {
+                set_cookies.push(v.trim().to_string());
+                headers.insert("set-cookie".to_string(), v.trim().to_string());
+                continue;
+            }
             // A repeated field is the list of its values (RFC 9110 §5.3),
             // so a second Content-Length is checked against the first
             // rather than silently replacing it.
@@ -578,7 +595,7 @@ fn parse_head(head: &[u8]) -> Result<(u16, String, BTreeMap<String, String>), &'
                 .or_insert_with(|| v.trim().to_string());
         }
     }
-    Ok((status, reason, headers))
+    Ok((status, reason, headers, set_cookies))
 }
 
 /// The body length a Content-Length value gives (RFC 9112 §6.3): digits
@@ -1002,5 +1019,19 @@ mod tests {
 
         // Nothing in the client's family at all.
         assert!(client.dial_any(&[v6], 80, deadline()).is_err());
+    }
+
+    /// Cookies stay whole: RFC 9110 §5.3 does not let `Set-Cookie` fields
+    /// be joined, and their `Expires=` dates contain commas.
+    #[test]
+    fn set_cookie_fields_are_kept_apart() {
+        let raw = b"HTTP/1.1 200 OK\r\nSet-Cookie: a=1; Expires=Wed, 21 Oct 2026 07:28:00 GMT\r\nX-Y: 1\r\nSet-Cookie: b=2\r\nX-Y: 2\r\n\r\n";
+        let (_, _, headers, cookies) = parse_head(raw).unwrap();
+        assert_eq!(
+            cookies,
+            vec!["a=1; Expires=Wed, 21 Oct 2026 07:28:00 GMT", "b=2"]
+        );
+        assert_eq!(headers["set-cookie"], "b=2");
+        assert_eq!(headers["x-y"], "1, 2", "other repeated fields still join");
     }
 }
