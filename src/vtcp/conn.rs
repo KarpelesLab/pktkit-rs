@@ -2063,6 +2063,10 @@ mod tests {
         });
         // links[i] carries segments sent by side i.
         let mut links: [Vec<Vec<u8>>; 2] = [Vec::new(), Vec::new()];
+        // Loss comes in short bursts only: enough back-to-back losses make
+        // the engine give up after MAX_RETRIES, which is correct but would
+        // make the run's outcome luck rather than behaviour.
+        let mut drop_run = [0u32; 2];
 
         let done = |s: &[Side; 2]| {
             s.iter().all(|x| {
@@ -2111,9 +2115,11 @@ mod tests {
                     };
                     let pkt = links[i].remove(k);
                     let fate = rng.below(20);
-                    if fate < 2 {
-                        continue; // dropped
+                    if fate < 2 && drop_run[i] < 3 {
+                        drop_run[i] += 1;
+                        continue;
                     }
+                    drop_run[i] = 0;
                     if fate == 2 {
                         links[i].insert(0, pkt.clone());
                     }
