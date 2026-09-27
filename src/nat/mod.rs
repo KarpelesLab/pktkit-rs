@@ -46,4 +46,5 @@ pub use defrag::Defragger;
 pub use helper::{Expectation, Helper, LocalHelper, NatMapping, PacketHelper, PortForward};
 pub use nat::Nat;
 pub use nat64::Nat64;
+pub use track::NatLimits;
 pub use upnp::{SoapResult, UPnPConfig, UPnPHelper};

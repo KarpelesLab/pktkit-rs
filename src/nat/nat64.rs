@@ -10,7 +10,7 @@ use crate::nat::frag::FragTable;
 use crate::nat::helper::{PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP};
 use crate::nat::l4::csum_replace;
 use crate::nat::nat::{SWEEP_INTERVAL, frag_info};
-use crate::nat::track::Peers;
+use crate::nat::track::{HostQuota, MappingHold, NatLimits, PeerQuotas, Peers, Quota};
 use crate::time::Instant;
 use crate::{
     IpPrefix, L3Device, L3Handler, Packet, Protocol, Result, checksum, transport_checksum,
@@ -50,6 +50,8 @@ struct Mapping {
     outside_port: u16,
     last_active: Instant,
     peers: Peers,
+    /// Counts the mapping against its inside host's quota while it lives.
+    _hold: MappingHold,
 }
 
 impl Mapping {
@@ -96,6 +98,12 @@ struct Nat64Inner {
     mappings: HashMap<Nat64Key, Mapping>,
     reverse: HashMap<Nat64RevKey, Nat64Key>,
     next_port: u16,
+    /// What each inside host holds; an entry goes once nothing refers to
+    /// it.
+    hosts: HashMap<Ipv6Addr, Arc<HostQuota>>,
+    /// Remotes tracked over all mappings.
+    peer_quota: Arc<Quota>,
+    limits: NatLimits,
 }
 
 impl std::fmt::Debug for Nat64 {
@@ -125,6 +133,9 @@ impl Nat64 {
                 mappings: HashMap::new(),
                 reverse: HashMap::new(),
                 next_port: NAT_PORT_MIN,
+                hosts: HashMap::new(),
+                peer_quota: Arc::new(Quota::new(NatLimits::default().max_peers)),
+                limits: NatLimits::default(),
             }),
             next_id: AtomicU16::new(crate::rand::u32() as u16),
             frags: Mutex::new(FragTable::default()),
@@ -173,6 +184,17 @@ impl Nat64 {
             IpAddr::V6(a) => Some(a),
             IpAddr::V4(_) => None,
         }
+    }
+
+    /// Set the caps on what inside hosts may hold (see [`NatLimits`]).
+    /// Lowering one takes nothing away; it holds back what comes next.
+    pub fn set_limits(&self, limits: NatLimits) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.peer_quota.set_max(limits.max_peers);
+        for h in inner.hosts.values() {
+            h.set_limits(&limits);
+        }
+        inner.limits = limits;
     }
 
     pub fn inside(&self) -> Arc<dyn L3Device> {
@@ -234,6 +256,7 @@ impl Nat64 {
                 true
             }
         });
+        inner.hosts.retain(|_, h| Arc::strong_count(h) > 1);
     }
 
     /// Send a translated IPv4 packet on the outside, unless it is addressed
@@ -1139,12 +1162,26 @@ impl Nat64 {
             m.last_active = Instant::now();
             return Some((m.outside_port, false));
         }
-        let port = Self::alloc_port_locked(&mut inner)?;
+        // The host's quota first: a host at its cap must not cost the
+        // others a reclaim sweep.
+        let inner = &mut *inner;
+        let limits = &inner.limits;
+        let host = inner
+            .hosts
+            .entry(k.ip)
+            .or_insert_with(|| Arc::new(HostQuota::new(limits)))
+            .clone();
+        let hold = MappingHold::take(&host, false)?;
+        let port = Self::alloc_port_locked(inner)?;
         let m = Mapping {
             key: k,
             outside_port: port,
             last_active: Instant::now(),
-            peers: Peers::default(),
+            peers: Peers::new(PeerQuotas {
+                global: inner.peer_quota.clone(),
+                host,
+            }),
+            _hold: hold,
         };
         inner.reverse.insert(
             Nat64RevKey {
@@ -2063,6 +2100,7 @@ mod tests {
     #[test]
     fn idle_mappings_go_without_sweep() {
         let (nat, _inside, outside) = wired();
+        nat.set_limits(NatLimits::default().max_mappings_per_host(0));
         let pool = usize::from(NAT_PORT_MAX - NAT_PORT_MIN) + 1;
         let client: Ipv6Addr = CLIENT.parse().unwrap();
         for i in 0..pool {
@@ -2095,6 +2133,32 @@ mod tests {
             .send(Packet::from_slice(&v4_reply(ROUTER, 1)))
             .unwrap();
         assert!(nat.inner.lock().unwrap().mappings.is_empty());
+    }
+
+    #[test]
+    fn one_host_cannot_take_every_port() {
+        let (nat, _inside, outside) = wired();
+        nat.set_limits(NatLimits::default().max_mappings_per_host(2).max_peers(3));
+        let client: Ipv6Addr = CLIENT.parse().unwrap();
+        for sport in 1..=3 {
+            for r in 1..=2 {
+                let dst = wkp(Ipv4Addr::new(8, 8, 8, r));
+                let pkt = build_v6_udp(client, sport, dst, 53, b"q");
+                nat.inside().send(Packet::from_slice(&pkt)).unwrap();
+            }
+        }
+        // The third source port is over the host's cap; of the four
+        // remotes the other two reached, three are tracked.
+        assert_eq!(outside.lock().unwrap().len(), 4);
+        let inner = nat.inner.lock().unwrap();
+        assert_eq!(inner.mappings.len(), 2);
+        assert_eq!(inner.peer_quota.used(), 3);
+        drop(inner);
+
+        let other: Ipv6Addr = "2001:db8::6".parse().unwrap();
+        let pkt = build_v6_udp(other, 1, wkp(SERVER), 53, b"q");
+        nat.inside().send(Packet::from_slice(&pkt)).unwrap();
+        assert_eq!(outside.lock().unwrap().len(), 5);
     }
 
     #[test]

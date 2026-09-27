@@ -13,7 +13,7 @@ use crate::nat::helper::{
     Expectation, Helper, LocalHelper, NatMapping, PROTO_ICMP, PROTO_TCP, PROTO_UDP, PacketHelper,
     PortForward,
 };
-use crate::nat::track::{Peers, SeqAdj};
+use crate::nat::track::{HostQuota, MappingHold, NatLimits, PeerQuotas, Peers, Quota, SeqAdj};
 use crate::time::Instant;
 use crate::{
     IpPrefix, L3Connector, L3Device, L3Handler, Packet, Result, checksum, connect_l3,
@@ -76,17 +76,26 @@ struct Mapping {
     /// Until when an ALG opened a plain outbound mapping as `open` would
     /// (see [`ALG_OPEN_WINDOW`]).
     open_until: Option<Instant>,
+    /// Counts the mapping against its inside host's quota while it lives.
+    _hold: MappingHold,
 }
 
 impl Mapping {
-    fn new(key: NatKey, outside_port: u16, now: Instant) -> Mapping {
+    fn new(
+        key: NatKey,
+        outside_port: u16,
+        now: Instant,
+        hold: MappingHold,
+        peers: Peers,
+    ) -> Mapping {
         Mapping {
             key,
             outside_port,
             last_active: now,
-            peers: Peers::default(),
+            peers,
             open: false,
             open_until: None,
+            _hold: hold,
         }
     }
 
@@ -171,6 +180,12 @@ struct NatInner {
     /// The last [`PortForward::id`] handed out.
     forward_id: u64,
     expectations: Vec<Expectation>,
+    /// What each inside host, by namespace and address, holds; an entry
+    /// goes once nothing refers to it.
+    hosts: HashMap<(u64, Ipv4Addr), Arc<HostQuota>>,
+    /// Remotes tracked over all mappings.
+    peer_quota: Arc<Quota>,
+    limits: NatLimits,
 }
 
 /// Port forwards, by outside port and by the inside endpoint each leads to
@@ -276,6 +291,9 @@ impl Nat {
                 forwards: Forwards::default(),
                 forward_id: 0,
                 expectations: Vec::new(),
+                hosts: HashMap::new(),
+                peer_quota: Arc::new(Quota::new(NatLimits::default().max_peers)),
+                limits: NatLimits::default(),
             }),
             defragger: Mutex::new(None),
             ns_counter: AtomicU64::new(0),
@@ -328,6 +346,27 @@ impl Nat {
             IpAddr::V4(a) => Some(a),
             _ => None,
         }
+    }
+
+    /// Set the caps on what inside hosts may hold (see [`NatLimits`]).
+    /// Lowering one takes nothing away; it holds back what comes next.
+    pub fn set_limits(&self, limits: NatLimits) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.peer_quota.set_max(limits.max_peers);
+        for h in inner.hosts.values() {
+            h.set_limits(&limits);
+        }
+        inner.limits = limits;
+    }
+
+    /// Whether `ip` may be translated as the source of an inside host:
+    /// one on the inside network, and not the NAT itself nor a broadcast
+    /// address. Anything else is spoofed, or from a network the NAT was
+    /// not set up to serve.
+    fn inside_source_ok(&self, ip: Ipv4Addr) -> bool {
+        self.inside.addr().contains(IpAddr::V4(ip))
+            && Some(ip) != self.inside_addr()
+            && !self.is_inside_broadcast(ip)
     }
 
     /// Enable IPv4 defragmentation (off by default).
@@ -708,11 +747,18 @@ impl Nat {
             _ => return None,
         }
         let p = Self::alloc_pair_locked(&mut inner)?;
-        for (k, port) in [(k1, p), (k2, p + 1)] {
-            inner.reverse.insert(NatRevKey { proto, port }, k);
-            let mut m = Mapping::new(k, port, now);
+        let m1 = Self::new_mapping_locked(&mut inner, k1, p, now, false)?;
+        let m2 = Self::new_mapping_locked(&mut inner, k2, p + 1, now, false)?;
+        for mut m in [m1, m2] {
+            inner.reverse.insert(
+                NatRevKey {
+                    proto,
+                    port: m.outside_port,
+                },
+                m.key,
+            );
             m.open = true;
-            inner.mappings.insert(k, m);
+            inner.mappings.insert(m.key, m);
         }
         Some(p)
     }
@@ -730,6 +776,31 @@ impl Nat {
     }
 
     // -- Internal --------------------------------------------------------
+
+    /// A new mapping of inside endpoint `k` to outside port `port`,
+    /// counted against its host's quotas. Refused if the host is at its
+    /// cap, unless `force`: a port forward or an expectation is a mapping
+    /// the NAT was told to make.
+    fn new_mapping_locked(
+        inner: &mut NatInner,
+        k: NatKey,
+        port: u16,
+        now: Instant,
+        force: bool,
+    ) -> Option<Mapping> {
+        let limits = &inner.limits;
+        let host = inner
+            .hosts
+            .entry((k.ns, k.ip))
+            .or_insert_with(|| Arc::new(HostQuota::new(limits)))
+            .clone();
+        let hold = MappingHold::take(&host, force)?;
+        let peers = Peers::new(PeerQuotas {
+            global: inner.peer_quota.clone(),
+            host,
+        });
+        Some(Mapping::new(k, port, now, hold, peers))
+    }
 
     /// Drop whatever mapping owns outside port `rk`, in both tables.
     fn remove_mapping_at_locked(inner: &mut NatInner, rk: NatRevKey) {
@@ -802,7 +873,9 @@ impl Nat {
             };
             inner.reverse.remove(&old_rk);
         }
-        let mut m = Mapping::new(k, rk.port, Instant::now());
+        let Some(mut m) = Self::new_mapping_locked(inner, k, rk.port, Instant::now(), true) else {
+            return false;
+        };
         m.open = true;
         inner.mappings.insert(k, m);
         inner.reverse.insert(rk, k);
@@ -823,7 +896,7 @@ impl Nat {
         // port. From a dynamic one, the first packet in on the forward would
         // move the mapping there and strand that dynamic session's replies.
         if let Some(port) = Self::forward_port_for_locked(inner, k, now) {
-            let mut m = Mapping::new(k, port, now);
+            let mut m = Self::new_mapping_locked(inner, k, port, now, true)?;
             m.open = true;
             inner.reverse.insert(
                 NatRevKey {
@@ -836,8 +909,11 @@ impl Nat {
             return inner.mappings.get_mut(&k);
         }
 
+        // The host's quota first: a host at its cap must not cost the
+        // others a reclaim sweep.
+        let mut m = Self::new_mapping_locked(inner, k, 0, now, false)?;
         let port = Self::alloc_port_locked(inner)?;
-        let m = Mapping::new(k, port, now);
+        m.outside_port = port;
         inner.reverse.insert(
             NatRevKey {
                 proto: k.proto,
@@ -1148,6 +1224,8 @@ impl Nat {
             inner.forwards.remove(&rk);
             Self::remove_mapping_at_locked(inner, rk);
         }
+        // A host nothing counts against any more.
+        inner.hosts.retain(|_, h| Arc::strong_count(h) > 1);
     }
 
     fn cleanup_namespace(&self, ns: u64) {
@@ -1234,6 +1312,9 @@ impl Nat {
             {
                 emit(&reply, fmax, |p| self.send_ns(ns, p));
             }
+            return;
+        }
+        if !self.inside_source_ok(Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15])) {
             return;
         }
 
@@ -3195,6 +3276,7 @@ mod tests {
     #[test]
     fn exhausted_pool_reclaims_idle_mappings_without_sweep() {
         let nat = Nat::new(pfx("10.0.0.1/24"), pfx("203.0.113.1/24"));
+        nat.set_limits(NatLimits::default().max_mappings_per_host(0));
         let pool = usize::from(NAT_PORT_MAX - NAT_PORT_MIN) + 1;
         for i in 0..pool {
             let ip = Ipv4Addr::from(u32::from(INSIDE) + (i / 60000) as u32);
@@ -3212,6 +3294,82 @@ mod tests {
                 .is_some()
         );
         assert_eq!(mapped(&nat), 3);
+    }
+
+    #[test]
+    fn one_host_cannot_take_every_port() {
+        let (nat, _i, o) = setup();
+        nat.set_limits(NatLimits::default().max_mappings_per_host(3));
+        let other = Ipv4Addr::new(10, 0, 0, 6);
+        for port in 1..=4 {
+            let p = build_udp(INSIDE, port, REMOTE, 53, b"q");
+            nat.inside().send(Packet::from_slice(&p)).unwrap();
+        }
+        assert_eq!(
+            o.lock().unwrap().len(),
+            3,
+            "the fourth flow is over the cap"
+        );
+        // Another host is not held back, and a forward to the capped host
+        // still gets its mapping.
+        let p = build_udp(other, 1, REMOTE, 53, b"q");
+        nat.inside().send(Packet::from_slice(&p)).unwrap();
+        nat.add_port_forward(PortForward::new(PROTO_UDP, 7000, INSIDE, 7000))
+            .unwrap();
+        let p = build_udp(REMOTE, 53, PUBLIC, 7000, b"in");
+        nat.outside().send(Packet::from_slice(&p)).unwrap();
+        assert_eq!(mapped(&nat), 5);
+        assert_eq!(o.lock().unwrap().len(), 4);
+
+        // Once the host's mappings idle out, it may open new ones.
+        nat.remove_port_forward(PROTO_UDP, 7000);
+        age_mappings(&nat, UDP_TIMEOUT + Duration::from_secs(1));
+        nat.sweep();
+        let p = build_udp(INSIDE, 9, REMOTE, 53, b"q");
+        nat.inside().send(Packet::from_slice(&p)).unwrap();
+        assert_eq!(o.lock().unwrap().len(), 5);
+        // Hosts with nothing left are forgotten.
+        assert_eq!(nat.inner.lock().unwrap().hosts.len(), 1);
+    }
+
+    #[test]
+    fn tracked_remotes_are_capped_across_mappings() {
+        let (nat, _i, o) = setup();
+        nat.set_limits(NatLimits::default().max_peers(10).max_peers_per_host(6));
+        let other = Ipv4Addr::new(10, 0, 0, 6);
+        for host in [INSIDE, other] {
+            for sport in [1000, 1001] {
+                for r in 0..8u8 {
+                    let dst = Ipv4Addr::new(198, 51, 100, r);
+                    let p = build_udp(host, sport, dst, 53, b"q");
+                    nat.inside().send(Packet::from_slice(&p)).unwrap();
+                }
+            }
+        }
+        // Every datagram went out; only 6 + 4 remotes are tracked.
+        assert_eq!(o.lock().unwrap().len(), 32);
+        let inner = nat.inner.lock().unwrap();
+        assert_eq!(inner.peer_quota.used(), 10);
+        let per_host: Vec<usize> = [INSIDE, other]
+            .iter()
+            .map(|ip| inner.hosts[&(0, *ip)].peers.used())
+            .collect();
+        assert_eq!(per_host, [6, 4]);
+    }
+
+    #[test]
+    fn spoofed_inside_sources_are_not_translated() {
+        let (nat, _i, o) = setup();
+        for src in [
+            Ipv4Addr::new(192, 168, 7, 7),
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(10, 0, 0, 255),
+        ] {
+            let p = build_udp(src, 1000, REMOTE, 53, b"q");
+            nat.inside().send(Packet::from_slice(&p)).unwrap();
+        }
+        assert!(o.lock().unwrap().is_empty());
+        assert_eq!(mapped(&nat), 0);
     }
 
     #[test]

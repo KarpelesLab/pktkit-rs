@@ -6,6 +6,8 @@ use crate::nat::helper::{PROTO_ICMP, PROTO_TCP, PROTO_UDP};
 use crate::time::Instant;
 use std::collections::HashMap;
 use std::net::SocketAddrV4;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 /// RFC 5382 REQ-5: an established TCP connection must not be dropped for
@@ -24,7 +26,179 @@ pub(crate) const ICMP_TIMEOUT: Duration = Duration::from_secs(60);
 /// clients; past the cap, new remotes still get through but are not tracked,
 /// and the mapping's own idle timer covers them. With no record to hold a
 /// sequence adjustment, ALGs may not change the length of their TCP payloads.
+/// [`NatLimits`] caps them across mappings too.
 const MAX_PEERS: usize = 1024;
+
+/// Default for [`NatLimits::max_mappings_per_host`].
+const DEFAULT_MAX_MAPPINGS_PER_HOST: usize = 16384;
+/// Default for [`NatLimits::max_peers_per_host`].
+const DEFAULT_MAX_PEERS_PER_HOST: usize = 65536;
+/// Default for [`NatLimits::max_peers`].
+const DEFAULT_MAX_PEERS: usize = 262_144;
+
+/// Caps on the state a [`Nat`](super::Nat) or [`Nat64`](super::Nat64)
+/// keeps, so that no inside host, nor the remotes it talks to, can grow it
+/// without bound or take what the other hosts need (RFC 6888 REQ-3 and
+/// REQ-4). 0 means unlimited.
+///
+/// Past a cap on remotes, traffic still flows, but the new remote is not
+/// tracked: it does not keep the mapping alive, ICMP errors about it are
+/// not passed on, and ALGs may not resize its TCP payloads. Past the cap
+/// on mappings, a host's new flows are dropped until old ones idle out.
+///
+/// The defaults allow one host 16384 mappings (under a third of the port
+/// pool) and 65536 tracked remotes, and 262144 remotes in all, some 20 MB.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct NatLimits {
+    /// Most mappings, each holding an outside port, one inside host may
+    /// have. Those made for port forwards and ALG expectations count, but
+    /// are never refused. Default: 16384.
+    pub max_mappings_per_host: usize,
+    /// Most remotes tracked for one inside host, over all its mappings.
+    /// Default: 65536.
+    pub max_peers_per_host: usize,
+    /// Most remotes tracked in all. Default: 262144.
+    pub max_peers: usize,
+}
+
+setters! {
+    NatLimits {
+        set max_mappings_per_host: usize;
+        set max_peers_per_host: usize;
+        set max_peers: usize;
+    }
+}
+
+impl Default for NatLimits {
+    fn default() -> Self {
+        NatLimits {
+            max_mappings_per_host: DEFAULT_MAX_MAPPINGS_PER_HOST,
+            max_peers_per_host: DEFAULT_MAX_PEERS_PER_HOST,
+            max_peers: DEFAULT_MAX_PEERS,
+        }
+    }
+}
+
+/// A count of something held against a cap (0 = none), shared by the
+/// records that hold it so that each gives its share back when dropped.
+/// Only ever changed under the owning NAT's lock; the atomics just make it
+/// shareable.
+#[derive(Debug, Default)]
+pub(crate) struct Quota {
+    used: AtomicUsize,
+    max: AtomicUsize,
+}
+
+impl Quota {
+    pub(crate) fn new(max: usize) -> Quota {
+        Quota {
+            used: AtomicUsize::new(0),
+            max: AtomicUsize::new(max),
+        }
+    }
+
+    pub(crate) fn set_max(&self, max: usize) {
+        self.max.store(max, Ordering::Relaxed);
+    }
+
+    /// Take one, if that stays within the cap.
+    pub(crate) fn take(&self) -> bool {
+        let max = self.max.load(Ordering::Relaxed);
+        self.used
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |u| {
+                (max == 0 || u < max).then_some(u + 1)
+            })
+            .is_ok()
+    }
+
+    /// Take one whatever the cap.
+    pub(crate) fn force(&self) {
+        self.used.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn give(&self, n: usize) {
+        self.used.fetch_sub(n, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn used(&self) -> usize {
+        self.used.load(Ordering::Relaxed)
+    }
+}
+
+/// What one inside host holds.
+#[derive(Debug, Default)]
+pub(crate) struct HostQuota {
+    pub(crate) mappings: Quota,
+    pub(crate) peers: Quota,
+}
+
+impl HostQuota {
+    pub(crate) fn new(limits: &NatLimits) -> HostQuota {
+        HostQuota {
+            mappings: Quota::new(limits.max_mappings_per_host),
+            peers: Quota::new(limits.max_peers_per_host),
+        }
+    }
+
+    pub(crate) fn set_limits(&self, limits: &NatLimits) {
+        self.mappings.set_max(limits.max_mappings_per_host);
+        self.peers.set_max(limits.max_peers_per_host);
+    }
+}
+
+/// One mapping's hold on its inside host's quota: counts it as a mapping
+/// for as long as it lives.
+#[derive(Debug)]
+pub(crate) struct MappingHold(Arc<HostQuota>);
+
+impl MappingHold {
+    /// Count a new mapping for `host`, refused past its cap unless
+    /// `force`.
+    pub(crate) fn take(host: &Arc<HostQuota>, force: bool) -> Option<MappingHold> {
+        if force {
+            host.mappings.force();
+        } else if !host.mappings.take() {
+            return None;
+        }
+        Some(MappingHold(host.clone()))
+    }
+}
+
+impl Drop for MappingHold {
+    fn drop(&mut self) {
+        self.0.mappings.give(1);
+    }
+}
+
+/// The quotas a mapping's remotes count against: its inside host's and the
+/// NAT's.
+#[derive(Debug, Clone)]
+pub(crate) struct PeerQuotas {
+    pub(crate) global: Arc<Quota>,
+    pub(crate) host: Arc<HostQuota>,
+}
+
+impl PeerQuotas {
+    fn take(&self) -> bool {
+        if !self.host.peers.take() {
+            return false;
+        }
+        if !self.global.take() {
+            self.host.peers.give(1);
+            return false;
+        }
+        true
+    }
+
+    fn give(&self, n: usize) {
+        if n > 0 {
+            self.host.peers.give(n);
+            self.global.give(n);
+        }
+    }
+}
 
 const TCP_FIN: u8 = 0x01;
 const TCP_SYN: u8 = 0x02;
@@ -129,9 +303,26 @@ impl Peer {
 #[derive(Debug, Default)]
 pub(crate) struct Peers {
     map: HashMap<SocketAddrV4, Peer>,
+    /// What each tracked remote counts against; none in unit tests.
+    quotas: Option<PeerQuotas>,
+}
+
+impl Drop for Peers {
+    fn drop(&mut self) {
+        if let Some(q) = &self.quotas {
+            q.give(self.map.len());
+        }
+    }
 }
 
 impl Peers {
+    pub(crate) fn new(quotas: PeerQuotas) -> Peers {
+        Peers {
+            map: HashMap::new(),
+            quotas: Some(quotas),
+        }
+    }
+
     /// Record a packet between the mapping and `peer`. `outbound` is true for
     /// a packet from the inside host; `tcp_flags` carries the TCP flags byte
     /// for TCP.
@@ -148,6 +339,9 @@ impl Peers {
             // nothing and must not end anyone's session; the inside host
             // judges it by its sequence number.
             if (!outbound && flags & TCP_RST != 0) || self.map.len() >= MAX_PEERS {
+                return;
+            }
+            if self.quotas.as_ref().is_some_and(|q| !q.take()) {
                 return;
             }
             self.map.insert(
@@ -224,8 +418,12 @@ impl Peers {
     /// Forget remotes idle past their timeout, and report whether the whole
     /// mapping (last active at `last_active`) is now idle and may go.
     pub(crate) fn expire(&mut self, proto: u8, last_active: Instant, now: Instant) -> bool {
+        let before = self.map.len();
         self.map
             .retain(|_, p| now.saturating_duration_since(p.last) <= p.timeout(proto));
+        if let Some(q) = &self.quotas {
+            q.give(before - self.map.len());
+        }
         if !self.map.is_empty() {
             return false;
         }
@@ -337,6 +535,43 @@ mod tests {
         a.record(u32::MAX - 5, 10);
         assert_eq!(a.seq(4), 14);
         assert_eq!(a.ack(14), 4);
+    }
+
+    #[test]
+    fn remotes_count_against_host_and_global_quotas() {
+        let now = Instant::now();
+        let global = Arc::new(Quota::new(5));
+        let host = Arc::new(HostQuota::new(&NatLimits::default().max_peers_per_host(3)));
+        let q = PeerQuotas {
+            global: global.clone(),
+            host: host.clone(),
+        };
+        let mut a = Peers::new(q.clone());
+        for port in 1..=4 {
+            a.note(peer(port), true, None, now);
+        }
+        // The host's cap stops the fourth.
+        assert!(a.contains(&peer(3)) && !a.contains(&peer(4)));
+        assert_eq!((host.peers.used(), global.used()), (3, 3));
+
+        let other = Arc::new(HostQuota::new(&NatLimits::default()));
+        let mut b = Peers::new(PeerQuotas {
+            global: global.clone(),
+            host: other.clone(),
+        });
+        for port in 1..=4 {
+            b.note(peer(port), true, None, now);
+        }
+        // The global cap stops the third, and gives back what the host
+        // took for it.
+        assert!(b.contains(&peer(2)) && !b.contains(&peer(3)));
+        assert_eq!((other.peers.used(), global.used()), (2, 5));
+
+        // Expiry and dropping give the counts back.
+        assert!(a.expire(PROTO_UDP, now, now + UDP_TIMEOUT * 2));
+        assert_eq!((host.peers.used(), global.used()), (0, 2));
+        drop(b);
+        assert_eq!((other.peers.used(), global.used()), (0, 0));
     }
 
     #[test]
