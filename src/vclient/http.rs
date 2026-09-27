@@ -119,21 +119,19 @@ impl Client {
         let mut conn = self.dial_tcp(SocketAddr::new(ip, req.port))?;
         conn.write_all(&req.serialize())?;
 
-        // Read the whole response (Connection: close → read to EOF).
-        let mut raw = Vec::new();
-        let mut buf = [0u8; 4096];
+        // Read until the response's own framing says it is complete, or to
+        // EOF when it has none (we ask for `Connection: close`).
+        let mut reader = ResponseReader::new(req.method.eq_ignore_ascii_case("HEAD"));
+        let mut buf = [0u8; 16 * 1024];
         loop {
             let n = conn.read(&mut buf)?;
             if n == 0 {
-                break;
+                return reader.finish();
             }
-            raw.extend_from_slice(&buf[..n]);
-            // If we already have a full response with known length, stop early.
-            if let Some(resp) = try_parse_complete(&raw) {
+            if let Some(resp) = reader.feed(&buf[..n])? {
                 return Ok(resp);
             }
         }
-        parse_response(&raw)
     }
 
     /// Convenience: GET `url`.
@@ -205,64 +203,245 @@ fn host_header(host: &str, port: u16) -> String {
     }
 }
 
-/// If `raw` contains a complete response (headers + full body per
-/// Content-Length / chunked), parse it; otherwise return None.
-fn try_parse_complete(raw: &[u8]) -> Option<Response> {
-    let header_end = find_subsequence(raw, b"\r\n\r\n")? + 4;
-    let head = &raw[..header_end];
-    let (status, reason, headers) = parse_head(head).ok()?;
+/// Largest response head accepted; a peer that never ends its headers must
+/// not grow the buffer without bound.
+const MAX_HEAD: usize = 64 * 1024;
 
-    if let Some(te) = headers.get("transfer-encoding")
-        && te.eq_ignore_ascii_case("chunked")
-    {
-        let body = decode_chunked(&raw[header_end..])?;
-        return Some(Response {
+/// Longest chunk-size or trailer line accepted in a chunked body.
+const MAX_CHUNK_LINE: usize = 4096;
+
+fn invalid(msg: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, msg.to_string())
+}
+
+/// How the body of a response is delimited (RFC 9112 §6.3).
+enum Framing {
+    /// Exactly this many bytes.
+    Length(usize),
+    Chunked(Chunked),
+    /// Everything until the connection closes.
+    ToEof,
+}
+
+/// Where a chunked decoder stands.
+enum Chunked {
+    /// Expecting a chunk-size line.
+    Size,
+    /// Inside a chunk, with this many data bytes left (then its CRLF).
+    Data(usize),
+    /// After the last chunk: trailer lines, up to an empty one.
+    Trailer,
+}
+
+/// An incremental HTTP/1.1 response parser: bytes are fed as they arrive,
+/// each one examined a bounded number of times, so reading a large or
+/// slowly arriving response costs time linear in its size.
+struct ResponseReader {
+    head_request: bool,
+    buf: Vec<u8>,
+    /// Where the header terminator search resumes.
+    scan: usize,
+    head: Option<(u16, String, BTreeMap<String, String>)>,
+    framing: Framing,
+    /// Start of the unconsumed body bytes in `buf`.
+    pos: usize,
+    body: Vec<u8>,
+}
+
+impl ResponseReader {
+    fn new(head_request: bool) -> ResponseReader {
+        ResponseReader {
+            head_request,
+            buf: Vec::new(),
+            scan: 0,
+            head: None,
+            framing: Framing::ToEof,
+            pos: 0,
+            body: Vec::new(),
+        }
+    }
+
+    /// Add received bytes. Returns the response once it is complete.
+    fn feed(&mut self, data: &[u8]) -> io::Result<Option<Response>> {
+        self.buf.extend_from_slice(data);
+        loop {
+            if self.head.is_none() && !self.parse_head()? {
+                return Ok(None);
+            }
+            if self.advance_body()? {
+                return Ok(Some(self.take()));
+            }
+            if self.head.is_some() {
+                return Ok(None);
+            }
+            // An interim (1xx) response was skipped; parse the next head.
+        }
+    }
+
+    /// The connection has closed: the response is complete only if its
+    /// framing says so, or if it had none.
+    fn finish(mut self) -> io::Result<Response> {
+        let eof = |what: &str| io::Error::new(io::ErrorKind::UnexpectedEof, what.to_string());
+        if self.head.is_none() {
+            return Err(eof("connection closed before the response headers"));
+        }
+        match self.framing {
+            Framing::ToEof => {
+                self.body.extend_from_slice(&self.buf[self.pos..]);
+                Ok(self.take())
+            }
+            Framing::Length(_) => Err(eof("connection closed before the whole body arrived")),
+            Framing::Chunked(_) => Err(eof("connection closed inside a chunked body")),
+        }
+    }
+
+    /// Look for the end of the head and parse it. `false` if not there yet.
+    fn parse_head(&mut self) -> io::Result<bool> {
+        let from = self.scan.saturating_sub(3).max(self.pos);
+        let Some(i) = find_subsequence(&self.buf[from..], b"\r\n\r\n") else {
+            if self.buf.len() - self.pos > MAX_HEAD {
+                return Err(invalid("response headers too large"));
+            }
+            self.scan = self.buf.len();
+            return Ok(false);
+        };
+        let end = from + i + 4;
+        let (status, reason, headers) = parse_head(&self.buf[self.pos..end]).map_err(invalid)?;
+        self.pos = end;
+        self.scan = end;
+        if (100..200).contains(&status) && status != 101 {
+            // Interim response (100 Continue, 103 Early Hints): the real one
+            // follows.
+            return Ok(true);
+        }
+        let chunked = headers.get("transfer-encoding").is_some_and(|te| {
+            te.rsplit(',')
+                .next()
+                .is_some_and(|last| last.trim().eq_ignore_ascii_case("chunked"))
+        });
+        self.framing = if self.head_request || status == 204 || status == 304 {
+            Framing::Length(0)
+        } else if chunked {
+            Framing::Chunked(Chunked::Size)
+        } else if headers.contains_key("transfer-encoding") {
+            Framing::ToEof
+        } else if let Some(cl) = headers.get("content-length") {
+            Framing::Length(
+                cl.trim()
+                    .parse()
+                    .map_err(|_| invalid("bad Content-Length"))?,
+            )
+        } else {
+            Framing::ToEof
+        };
+        self.head = Some((status, reason, headers));
+        Ok(true)
+    }
+
+    /// Consume what the framing allows. `true` once the body is complete.
+    fn advance_body(&mut self) -> io::Result<bool> {
+        if self.head.is_none() {
+            return Ok(false); // skipped an interim response
+        }
+        match &mut self.framing {
+            Framing::ToEof => Ok(false),
+            Framing::Length(n) => {
+                let have = self.buf.len() - self.pos;
+                if have < *n {
+                    return Ok(false);
+                }
+                let end = self.pos + *n;
+                self.body.extend_from_slice(&self.buf[self.pos..end]);
+                self.pos = end;
+                Ok(true)
+            }
+            Framing::Chunked(state) => loop {
+                match state {
+                    Chunked::Size => {
+                        let Some(line) = take_line(&self.buf, &mut self.pos)? else {
+                            return Ok(false);
+                        };
+                        // Chunk extensions follow a ';'.
+                        let hex = line.split(|&b| b == b';').next().unwrap_or(&[]);
+                        let hex = std::str::from_utf8(hex)
+                            .map_err(|_| invalid("bad chunk size"))?
+                            .trim();
+                        let size = usize::from_str_radix(hex, 16)
+                            .map_err(|_| invalid("bad chunk size"))?;
+                        *state = if size == 0 {
+                            Chunked::Trailer
+                        } else {
+                            Chunked::Data(size)
+                        };
+                    }
+                    Chunked::Data(left) => {
+                        let have = self.buf.len() - self.pos;
+                        if have < *left + 2 {
+                            // Take what is here so the buffer need not hold
+                            // the whole chunk.
+                            let take = have.min(*left);
+                            self.body
+                                .extend_from_slice(&self.buf[self.pos..self.pos + take]);
+                            self.pos += take;
+                            *left -= take;
+                            if *left > 0 || have < 2 + take {
+                                self.compact();
+                                return Ok(false);
+                            }
+                        }
+                        let end = self.pos + *left;
+                        self.body.extend_from_slice(&self.buf[self.pos..end]);
+                        if &self.buf[end..end + 2] != b"\r\n" {
+                            return Err(invalid("chunk not followed by CRLF"));
+                        }
+                        self.pos = end + 2;
+                        *state = Chunked::Size;
+                    }
+                    Chunked::Trailer => {
+                        let Some(line) = take_line(&self.buf, &mut self.pos)? else {
+                            return Ok(false);
+                        };
+                        if line.is_empty() {
+                            return Ok(true);
+                        }
+                    }
+                }
+            },
+        }
+    }
+
+    /// Drop consumed body bytes so a long chunked body does not stay
+    /// buffered twice.
+    fn compact(&mut self) {
+        if self.pos > 64 * 1024 {
+            self.buf.drain(..self.pos);
+            self.scan = self.scan.saturating_sub(self.pos);
+            self.pos = 0;
+        }
+    }
+
+    fn take(&mut self) -> Response {
+        let (status, reason, headers) = self.head.take().expect("head parsed");
+        Response {
             status,
             reason,
             headers,
-            body,
-        });
-    }
-    if let Some(cl) = headers.get("content-length") {
-        let len: usize = cl.trim().parse().ok()?;
-        if raw.len() >= header_end + len {
-            return Some(Response {
-                status,
-                reason,
-                headers,
-                body: raw[header_end..header_end + len].to_vec(),
-            });
+            body: std::mem::take(&mut self.body),
         }
-        return None; // more body to come
     }
-    None // no length info — must read to EOF
 }
 
-/// Parse a full response buffer (called after EOF for Connection: close).
-fn parse_response(raw: &[u8]) -> io::Result<Response> {
-    let header_end = find_subsequence(raw, b"\r\n\r\n")
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no header terminator"))?
-        + 4;
-    let (status, reason, headers) = parse_head(&raw[..header_end])
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-    let body = if headers
-        .get("transfer-encoding")
-        .map(|te| te.eq_ignore_ascii_case("chunked"))
-        .unwrap_or(false)
-    {
-        decode_chunked(&raw[header_end..])
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad chunked body"))?
-    } else {
-        raw[header_end..].to_vec()
-    };
-
-    Ok(Response {
-        status,
-        reason,
-        headers,
-        body,
-    })
+/// Take one CRLF-terminated line starting at `*pos`, if it is all there.
+fn take_line<'a>(buf: &'a [u8], pos: &mut usize) -> io::Result<Option<&'a [u8]>> {
+    let rest = &buf[*pos..];
+    match find_subsequence(rest, b"\r\n") {
+        Some(i) => {
+            *pos += i + 2;
+            Ok(Some(&rest[..i]))
+        }
+        None if rest.len() > MAX_CHUNK_LINE => Err(invalid("chunk line too long")),
+        None => Ok(None),
+    }
 }
 
 fn parse_head(head: &[u8]) -> Result<(u16, String, BTreeMap<String, String>), &'static str> {
@@ -289,31 +468,6 @@ fn parse_head(head: &[u8]) -> Result<(u16, String, BTreeMap<String, String>), &'
         }
     }
     Ok((status, reason, headers))
-}
-
-fn decode_chunked(mut data: &[u8]) -> Option<Vec<u8>> {
-    let mut out = Vec::new();
-    loop {
-        let nl = find_subsequence(data, b"\r\n")?;
-        let size_str = std::str::from_utf8(&data[..nl]).ok()?;
-        // Chunk size may carry extensions after ';'.
-        let size_hex = size_str.split(';').next().unwrap_or("").trim();
-        let size = usize::from_str_radix(size_hex, 16).ok()?;
-        data = &data[nl + 2..];
-        if size == 0 {
-            break;
-        }
-        if data.len() < size {
-            return None;
-        }
-        out.extend_from_slice(&data[..size]);
-        data = &data[size..];
-        // Skip trailing CRLF after the chunk data.
-        if data.len() >= 2 {
-            data = &data[2..];
-        }
-    }
-    Some(out)
 }
 
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -396,34 +550,103 @@ mod tests {
         assert!(s.ends_with("\r\n\r\nabc"));
     }
 
+    /// Feed `raw` in pieces of `step` bytes, then close.
+    fn read_response(raw: &[u8], step: usize) -> io::Result<Response> {
+        let mut r = ResponseReader::new(false);
+        for piece in raw.chunks(step) {
+            if let Some(resp) = r.feed(piece)? {
+                return Ok(resp);
+            }
+        }
+        r.finish()
+    }
+
     #[test]
     fn parse_content_length_response() {
         let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
-        let r = try_parse_complete(raw).unwrap();
-        assert_eq!(r.status, 200);
-        assert_eq!(r.reason, "OK");
-        assert_eq!(r.body, b"hello");
-        assert_eq!(r.header("content-length"), Some("5"));
+        for step in [1, 3, raw.len()] {
+            let r = read_response(raw, step).unwrap();
+            assert_eq!(r.status, 200);
+            assert_eq!(r.reason, "OK");
+            assert_eq!(r.body, b"hello");
+            assert_eq!(r.header("content-length"), Some("5"));
+        }
+    }
+
+    #[test]
+    fn complete_before_eof_when_length_known() {
+        let mut r = ResponseReader::new(false);
+        let resp = r
+            .feed(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi")
+            .unwrap();
+        assert_eq!(resp.unwrap().body, b"hi");
     }
 
     #[test]
     fn parse_chunked_response() {
         let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
-                    5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
-        let r = try_parse_complete(raw).unwrap();
-        assert_eq!(r.body, b"hello world");
+                    5;ext=1\r\nhello\r\n6\r\n world\r\n0\r\nTrailer: x\r\n\r\n";
+        for step in [1, 2, 7, raw.len()] {
+            assert_eq!(read_response(raw, step).unwrap().body, b"hello world");
+        }
     }
 
     #[test]
-    fn incomplete_content_length_returns_none() {
+    fn short_content_length_body_is_an_error() {
         let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nshort";
-        assert!(try_parse_complete(raw).is_none());
+        let e = read_response(raw, raw.len()).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn incomplete_chunked_body_is_an_error() {
+        for raw in [
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel"[..],
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n",
+        ] {
+            assert!(read_response(raw, raw.len()).is_err());
+        }
+        let bad = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhiXX0\r\n\r\n";
+        assert!(read_response(bad, bad.len()).is_err());
+    }
+
+    #[test]
+    fn eof_before_headers_is_an_error() {
+        assert!(read_response(b"HTTP/1.1 200 OK\r\n", 100).is_err());
     }
 
     #[test]
     fn parse_to_eof_when_no_length() {
         let raw = b"HTTP/1.1 200 OK\r\nServer: x\r\n\r\nbody-to-eof";
-        let r = parse_response(raw).unwrap();
+        let r = read_response(raw, 4).unwrap();
         assert_eq!(r.body, b"body-to-eof");
+    }
+
+    #[test]
+    fn interim_and_bodyless_responses() {
+        let raw = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 204 No Content\r\n\r\n";
+        let mut r = ResponseReader::new(false);
+        assert_eq!(r.feed(raw).unwrap().unwrap().status, 204);
+
+        let mut r = ResponseReader::new(true);
+        let head = b"HTTP/1.1 200 OK\r\nContent-Length: 99\r\n\r\n";
+        assert!(r.feed(head).unwrap().unwrap().body.is_empty());
+    }
+
+    #[test]
+    fn large_chunked_body_parses_in_linear_time() {
+        let mut raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        let chunk = vec![b'x'; 1000];
+        for _ in 0..8000 {
+            raw.extend_from_slice(b"3e8\r\n");
+            raw.extend_from_slice(&chunk);
+            raw.extend_from_slice(b"\r\n");
+        }
+        raw.extend_from_slice(b"0\r\n\r\n");
+        let start = std::time::Instant::now();
+        let r = read_response(&raw, 4096).unwrap();
+        assert_eq!(r.body.len(), 8_000_000);
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
     }
 }
