@@ -113,11 +113,21 @@ impl Quota {
     /// Take one, if that stays within the cap.
     pub(crate) fn take(&self) -> bool {
         let max = self.max.load(Ordering::Relaxed);
-        self.used
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |u| {
-                (max == 0 || u < max).then_some(u + 1)
-            })
-            .is_ok()
+        let mut used = self.used.load(Ordering::Relaxed);
+        loop {
+            if max != 0 && used >= max {
+                return false;
+            }
+            match self.used.compare_exchange_weak(
+                used,
+                used + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(now) => used = now,
+            }
+        }
     }
 
     /// Take one whatever the cap.
