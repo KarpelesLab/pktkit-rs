@@ -46,8 +46,10 @@ setters! {
 /// The callbacks run with no client lock held, so they may call back into
 /// the [`Client`].
 ///
-/// They are made one at a time, in the order of the state changes behind
-/// them: an `on_bound` never overtakes the `on_lease_lost` of a
+/// The calls that act on the client's behalf -- the sends, `on_bound`,
+/// `on_lease_lost` and the probe calls `begin_probe`, `send_probe` and
+/// `end_probe` -- are made one at a time, in the order of the state changes
+/// behind them: an `on_bound` never overtakes the `on_lease_lost` of a
 /// [`stop`](Client::stop) that came after it. So a call into the client
 /// made from a callback, or from another thread while one is running, has
 /// its own callbacks made after that one returns, by whichever thread is
@@ -56,6 +58,13 @@ setters! {
 /// wind it up ([`on_lease_lost`](Self::on_lease_lost),
 /// [`end_probe`](Self::end_probe), a DHCPRELEASE or DHCPDECLINE); so
 /// `on_lease_lost` can come without the `on_bound` it would have followed.
+///
+/// The questions are outside that order. [`mac`](Self::mac) (unless the
+/// config names one) and [`can_probe`](Self::can_probe) are asked once, by
+/// [`Client::new`]. [`probe_conflict`](Self::probe_conflict) is asked by
+/// every [`tick`](Client::tick) during a check, directly: it can run while
+/// another thread is inside one of the calls above, or from inside one that
+/// calls `tick`. It should only look at what the transport has seen.
 pub trait ClientTransport: Send + Sync + 'static {
     /// MAC to use as the client identifier and Ethernet source.
     fn mac(&self) -> MacAddr;
@@ -360,6 +369,12 @@ impl Client {
 
     /// Begin DHCP discovery, and where threads exist, the thread that runs
     /// [`tick`](Self::tick).
+    ///
+    /// On a client already running this starts over from discovery, and a
+    /// lease held is given up first, as [`stop`](Self::stop) gives it up:
+    /// [`on_lease_lost`](ClientTransport::on_lease_lost) is called, and the
+    /// server is not told. A check of an offered address under way ends
+    /// with [`end_probe`](ClientTransport::end_probe).
     pub fn start(&self) {
         self.begin(cfg!(not(target_family = "wasm")));
     }
