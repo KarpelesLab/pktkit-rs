@@ -109,6 +109,12 @@ fn may_reply_with(orig: &Packet, err: Option<IcmpError>) -> bool {
     }
     // Never answer an error with an error.
     let proto = orig.transport_protocol();
+    // A walk that ends on an extension header gave up inside the chain
+    // (truncated, or longer than the walker follows): whatever comes after
+    // may be an ICMPv6 error, and RFC 4443 §2.4(e.1) forbids answering one.
+    if orig.version() == 6 && crate::packet::is_ipv6_ext_header(proto.as_u8()) {
+        return false;
+    }
     if proto == Protocol::ICMP || proto == Protocol::ICMPV6 {
         let payload = orig.transport_payload();
         if payload.len() >= 4 {
@@ -565,5 +571,41 @@ mod tests {
         // Idle time refills up to the burst, not beyond.
         let later = t0 + Duration::from_secs(60);
         assert!(l.allow_at(later) && l.allow_at(later) && !l.allow_at(later));
+    }
+
+    /// An ICMPv6 Destination Unreachable behind `n` Destination Options
+    /// headers.
+    fn v6_error_behind(n: usize) -> Vec<u8> {
+        let a: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let b: Ipv6Addr = "2001:db8::2".parse().unwrap();
+        let mut chain = Vec::new();
+        for i in 0..n {
+            let nh = if i + 1 == n { 58 } else { 60 };
+            // Next header, length 0, then a PadN filling the 8 octets.
+            chain.extend_from_slice(&[nh, 0, 1, 4, 0, 0, 0, 0]);
+        }
+        chain.extend_from_slice(&[icmpv6::DEST_UNREACHABLE, 0, 0, 0, 0, 0, 0, 0]);
+        chain.extend_from_slice(&[0; 40]); // the quoted packet, as it were
+        build_ipv6(a, b, Protocol(60), 64, &chain)
+    }
+
+    #[test]
+    fn no_error_about_an_error_hidden_behind_many_extension_headers() {
+        let from: IpAddr = "2001:db8::fe".parse::<Ipv6Addr>().unwrap().into();
+        // Few enough to walk: recognised as an error.
+        let buf = v6_error_behind(3);
+        assert_eq!(
+            Packet::from_slice(&buf).transport_protocol(),
+            Protocol::ICMPV6
+        );
+        assert!(time_exceeded(Packet::from_slice(&buf), from).is_none());
+
+        // More than the walker follows: what it is cannot be told, so
+        // RFC 4443 §2.4(e.1) cannot be ruled out.
+        let buf = v6_error_behind(crate::packet::MAX_EXT_HEADERS + 2);
+        assert!(
+            time_exceeded(Packet::from_slice(&buf), from).is_none(),
+            "answered what may be an ICMPv6 error"
+        );
     }
 }

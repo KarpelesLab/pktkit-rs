@@ -23,6 +23,23 @@ mod ext {
     pub const SHIM6: u8 = 140;
 }
 
+/// True for the extension headers [`skip_ipv6_ext`] walks through. When the
+/// walk reports one of these, it stopped *inside* the chain -- truncated, or
+/// longer than [`MAX_EXT_HEADERS`] -- and the upper-layer protocol is unknown.
+pub(crate) fn is_ipv6_ext_header(p: u8) -> bool {
+    matches!(
+        p,
+        ext::HOPOPT
+            | ext::ROUTING
+            | ext::FRAGMENT
+            | ext::AH
+            | ext::DEST_OPTS
+            | ext::MOBILITY
+            | ext::HIP
+            | ext::SHIM6
+    )
+}
+
 /// Walk the IPv6 extension header chain.
 ///
 /// Starting from `next_header` at byte `offset`, follow the chain until a
