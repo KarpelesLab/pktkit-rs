@@ -52,11 +52,13 @@ pub(crate) struct TcpOutConn {
     /// stack's tick thread). Reuses the inbound accept-path machinery.
     state: Arc<ConnState>,
     /// Real upstream socket, set once the dial succeeds. The client→remote
-    /// pump writes through it while `close` may shut it down from another
-    /// thread, so it sits behind no lock: a shutdown is exactly what unblocks
-    /// a write stuck on a peer that stopped reading. The read half was cloned
-    /// out for the remote→client pump thread.
-    remote: OnceLock<TcpStream>,
+    /// pump writes through a clone of the `Arc` taken under the lock and
+    /// written without it, so `close` can still shut the socket down from
+    /// another thread: a shutdown is exactly what unblocks a write stuck on a
+    /// peer that stopped reading. The read half was cloned out for the
+    /// remote→client pump thread. Taken out (closing the descriptor) once the
+    /// bridge reaches TIME-WAIT, where nothing needs it any more.
+    pub(super) remote: Mutex<Option<Arc<TcpStream>>>,
     /// Set once the bridge has been torn down (RST/abort or both-ways close).
     closed: Arc<AtomicBool>,
     /// The client's SYN, kept while the real destination is being dialed and
@@ -120,7 +122,7 @@ impl TcpOutConn {
 
         Arc::new(TcpOutConn {
             state: ConnState::new(endpoints, Conn::new(cfg), sink),
-            remote: OnceLock::new(),
+            remote: Mutex::new(None),
             closed: Arc::new(AtomicBool::new(false)),
             syn: Mutex::new(Some(syn.clone())),
             time_wait_since: OnceLock::new(),
@@ -183,7 +185,7 @@ impl TcpOutConn {
                 return;
             }
         };
-        let _ = self.remote.set(remote);
+        *self.remote.lock().expect("poisoned") = Some(Arc::new(remote));
         // close() sets `closed` before it shuts the socket down, so either it
         // sees the socket stored above or this sees the flag.
         if self.closed.load(Ordering::SeqCst) {
@@ -242,7 +244,14 @@ impl TcpOutConn {
         if self.state.conn.lock().expect("poisoned").state() != State::TimeWait {
             return None;
         }
-        Some(*self.time_wait_since.get_or_init(|| now))
+        Some(*self.time_wait_since.get_or_init(|| {
+            // Both sides have finished, so the real socket is done with.
+            // Holding it for the whole of TIME-WAIT would let a guest keep
+            // a host descriptor open per parked bridge (up to MAX_TIME_WAIT
+            // per family), enough to run the process out of them.
+            self.remote.lock().expect("poisoned").take();
+            now
+        }))
     }
 
     /// True once the bridge has fully torn down.
@@ -271,7 +280,8 @@ impl TcpOutConn {
 
     /// Shut down the real socket (or a half of it). Tolerates a missing socket.
     fn shutdown_remote(&self, how: Shutdown) {
-        if let Some(s) = self.remote.get() {
+        let s = self.remote.lock().expect("poisoned").clone();
+        if let Some(s) = s {
             let _ = s.shutdown(how);
         }
     }
@@ -378,8 +388,9 @@ impl TcpOutConn {
                 return;
             }
             if n > 0 {
-                let res = match self.remote.get() {
-                    Some(mut s) => s.write_all(&buf[..n]),
+                let remote = self.remote.lock().expect("poisoned").clone();
+                let res = match remote {
+                    Some(s) => (&*s).write_all(&buf[..n]),
                     None => Ok(()),
                 };
                 if res.is_err() {

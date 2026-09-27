@@ -2123,6 +2123,14 @@ mod tests {
         wait_for("TIME-WAIT to be bounded", || {
             bridges_in_time_wait() <= MAX_TIME_WAIT
         });
+        // A parked bridge has closed its real socket: host descriptors are
+        // bounded by live connections, not by TIME-WAIT.
+        wait_for("TIME-WAIT bridges to release their sockets", || {
+            let t = stack.inner.tcp.lock().unwrap();
+            t.values()
+                .filter(|c| c.state().conn.lock().unwrap().state() == VtcpState::TimeWait)
+                .all(|c| c.remote.lock().unwrap().is_none())
+        });
     }
 
     #[test]
