@@ -1,4 +1,5 @@
-//! IPv6 ICMP handling: echo replies.
+//! IPv6 ICMP handling: echo replies, and the errors the stack reports to the
+//! guest.
 //!
 //! Mirrors `slirp/icmpv6.go`. Router/Neighbor Discovery is intentionally
 //! ignored — slirp operates above L2.
@@ -53,6 +54,26 @@ pub(crate) fn build_icmpv6_echo_reply(
     pkt[24..40].copy_from_slice(&src_ip.octets());
     pkt[40..].copy_from_slice(&reply_icmp);
     Some(pkt)
+}
+
+/// Build a Destination Unreachable / Port Unreachable (type 1, code 4) from
+/// `from` to `to`, quoting `orig`: the start of the refused packet, its IPv6
+/// header included (RFC 4443 §3.1).
+pub(crate) fn build_icmpv6_port_unreachable(from: Ipv6Addr, to: Ipv6Addr, orig: &[u8]) -> Vec<u8> {
+    let icmp_len = 8 + orig.len();
+    let mut p = vec![0u8; 40 + icmp_len];
+    p[0] = 0x60;
+    p[4..6].copy_from_slice(&(icmp_len as u16).to_be_bytes());
+    p[6] = 58;
+    p[7] = 64;
+    p[8..24].copy_from_slice(&from.octets());
+    p[24..40].copy_from_slice(&to.octets());
+    p[40] = 1;
+    p[41] = 4;
+    p[48..].copy_from_slice(orig);
+    let cs = ipv6_pseudo_checksum(from, to, 58, icmp_len as u32, &p[40..]);
+    p[42..44].copy_from_slice(&cs.to_be_bytes());
+    p
 }
 
 #[cfg(test)]

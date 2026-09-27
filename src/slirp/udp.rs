@@ -3,9 +3,11 @@
 //! Each (srcIP, srcPort, dstIP, dstPort) tuple gets a real OS-level UDP
 //! socket dialed to the destination. A background reader thread reads
 //! responses and injects them back to the virtual client as IPv4+UDP
-//! packets.
+//! packets. A destination port that refuses the flow's datagrams is
+//! reported back as an ICMP port unreachable.
 
 use crate::Result;
+use crate::slirp::icmpv4::build_icmpv4_port_unreachable;
 use crate::slirp::packet::{build_udp_packet4, fit_link};
 use crate::time::Instant;
 use std::io::ErrorKind;
@@ -21,6 +23,52 @@ pub(crate) type SendFn = Arc<dyn Fn(&[u8]) -> Result<()> + Send + Sync>;
 /// stop flag. `std::net::UdpSocket` exposes no `shutdown(2)`, so we wake the
 /// reader cooperatively rather than by closing the fd out from under it.
 const READ_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Least time between two ICMP errors one flow sends the guest, as a host
+/// rate-limits them (RFC 1812 §4.3.2.8, RFC 4443 §2.4 (f)). With the cap on
+/// flows this bounds them all.
+const ICMP_ERROR_GAP: Duration = Duration::from_millis(100);
+
+/// What an ICMP error for a refused datagram quotes of it: as much as fits
+/// in a 576-byte datagram (RFC 1812 §4.3.2.3), past the 28 bytes of IPv4 and
+/// ICMP headers.
+const QUOTE_V4: usize = 576 - 28;
+
+/// What a flow needs to answer the refusal of its datagrams (the kernel's
+/// ICMP port unreachable, reported on the connected socket as
+/// `ECONNREFUSED`) with an ICMP error of its own to the guest.
+#[derive(Default)]
+pub(crate) struct Refusals {
+    /// The start of the guest's latest datagram, IP header included. The
+    /// socket reports a refusal on the call after the datagram it concerns,
+    /// so which one it was is not known; any datagram of the flow carries
+    /// the addresses and ports the guest matches the error to.
+    quote: Vec<u8>,
+    last_error: Option<Instant>,
+}
+
+impl Refusals {
+    /// Keep the start of `pkt`, the guest's datagram about to be sent.
+    pub(crate) fn record(&mut self, pkt: &[u8], max: usize) {
+        self.quote.clear();
+        self.quote.extend_from_slice(&pkt[..pkt.len().min(max)]);
+    }
+
+    /// The datagram an error should quote now, or `None` while the flow's
+    /// last error is too recent (or nothing has been sent).
+    pub(crate) fn due(&mut self) -> Option<&[u8]> {
+        let now = Instant::now();
+        if self.quote.is_empty()
+            || self
+                .last_error
+                .is_some_and(|t| now.duration_since(t) < ICMP_ERROR_GAP)
+        {
+            return None;
+        }
+        self.last_error = Some(now);
+        Some(&self.quote)
+    }
+}
 
 /// Whether a `recv` error on a connected UDP socket leaves it usable.
 ///
@@ -58,6 +106,8 @@ pub(crate) struct UdpConn {
     socket: Arc<UdpSocket>,
     closed: Arc<AtomicBool>,
     pub(crate) last_act: Mutex<Instant>,
+    refusals: Mutex<Refusals>,
+    send: SendFn,
 }
 
 impl UdpConn {
@@ -84,6 +134,8 @@ impl UdpConn {
             socket: socket.clone(),
             closed: closed.clone(),
             last_act: Mutex::new(Instant::now()),
+            refusals: Mutex::new(Refusals::default()),
+            send: send.clone(),
         });
 
         let weak = Arc::downgrade(&conn);
@@ -101,6 +153,12 @@ impl UdpConn {
                 let n = match socket.recv(&mut buf) {
                     // Zero-length datagrams are valid and relayed too.
                     Ok(n) => n,
+                    Err(e) if e.kind() == ErrorKind::ConnectionRefused => {
+                        if let Some(conn) = weak.upgrade() {
+                            conn.refused();
+                        }
+                        continue;
+                    }
                     // Timeout: loop back and re-check the stop flag.
                     Err(e) if is_transient(&e) => continue,
                     Err(_) => return,
@@ -147,10 +205,32 @@ impl UdpConn {
         if len < 8 || len > udp.len() {
             return;
         }
-        let _ = self.socket.send(&udp[8..len]);
+        self.refusals
+            .lock()
+            .expect("poisoned")
+            .record(&ip[..ihl + len], QUOTE_V4);
+        if matches!(self.socket.send(&udp[8..len]), Err(e) if e.kind() == ErrorKind::ConnectionRefused)
+        {
+            // The refusal of an earlier datagram, reported instead of
+            // sending this one: report it, and send this one after all.
+            self.refused();
+            let _ = self.socket.send(&udp[8..len]);
+        }
         if let Ok(mut t) = self.last_act.lock() {
             *t = Instant::now();
         }
+    }
+
+    /// The destination refused a datagram: tell the guest, as the host
+    /// refusing it would have, with an ICMP port unreachable. The flow stays
+    /// open, as a later datagram may find the port listening.
+    fn refused(&self) {
+        let icmp = {
+            let mut r = self.refusals.lock().expect("poisoned");
+            let Some(quote) = r.due() else { return };
+            build_icmpv4_port_unreachable(self.r_ip, self.c_src_ip, quote)
+        };
+        let _ = (self.send)(&icmp);
     }
 
     /// True once the flow has been closed or its reader has died.
@@ -170,5 +250,23 @@ impl UdpConn {
 impl Drop for UdpConn {
     fn drop(&mut self) {
         self.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A flow reports refusals no faster than one per ICMP_ERROR_GAP, and
+    /// quotes no more of a datagram than it may.
+    #[test]
+    fn refusals_are_rate_limited_and_quotes_bounded() {
+        let mut r = Refusals::default();
+        assert!(r.due().is_none(), "nothing sent, nothing to quote");
+        r.record(&[9u8; 2000], QUOTE_V4);
+        assert_eq!(r.due().map(<[u8]>::len), Some(QUOTE_V4));
+        assert!(r.due().is_none());
+        std::thread::sleep(ICMP_ERROR_GAP);
+        assert!(r.due().is_some());
     }
 }

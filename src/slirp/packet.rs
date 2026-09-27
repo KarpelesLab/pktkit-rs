@@ -17,7 +17,7 @@ pub(crate) const LINK_MTU: usize = 1500;
 /// datagram share it, so it must differ between datagrams in flight.
 static NEXT_IP_ID: AtomicU32 = AtomicU32::new(1);
 
-fn next_ip_id() -> u32 {
+pub(crate) fn next_ip_id() -> u32 {
     NEXT_IP_ID.fetch_add(1, Ordering::Relaxed)
 }
 

@@ -1,9 +1,11 @@
 //! IPv6 UDP NAT, mirroring [`udp`](super::udp) for IPv6.
 
 use crate::Result;
+use crate::slirp::icmpv6::build_icmpv6_port_unreachable;
 use crate::slirp::packet::{build_udp_packet6, fit_link};
-use crate::slirp::udp::{ClosedOnExit, is_transient};
+use crate::slirp::udp::{ClosedOnExit, Refusals, is_transient};
 use crate::time::Instant;
+use std::io::ErrorKind;
 use std::net::{Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -16,6 +18,11 @@ pub(crate) type SendFn = Arc<dyn Fn(&[u8]) -> Result<()> + Send + Sync>;
 /// reader cooperatively rather than by closing the fd out from under it.
 const READ_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// What an ICMPv6 error for a refused datagram quotes of it: as much as
+/// keeps the error within the minimum IPv6 MTU (RFC 4443 §2.4 (c)), past
+/// the 48 bytes of IPv6 and ICMPv6 headers.
+const QUOTE_V6: usize = 1280 - 48;
+
 pub(crate) struct UdpConn6 {
     c_src_ip: Ipv6Addr,
     c_src_port: u16,
@@ -24,6 +31,8 @@ pub(crate) struct UdpConn6 {
     socket: Arc<UdpSocket>,
     closed: Arc<AtomicBool>,
     pub(crate) last_act: Mutex<Instant>,
+    refusals: Mutex<Refusals>,
+    send: SendFn,
 }
 
 impl UdpConn6 {
@@ -56,6 +65,8 @@ impl UdpConn6 {
             socket: socket.clone(),
             closed: closed.clone(),
             last_act: Mutex::new(Instant::now()),
+            refusals: Mutex::new(Refusals::default()),
+            send: send.clone(),
         });
 
         let weak = Arc::downgrade(&conn);
@@ -73,6 +84,12 @@ impl UdpConn6 {
                 let n = match socket.recv(&mut buf) {
                     // Zero-length datagrams are valid and relayed too.
                     Ok(n) => n,
+                    Err(e) if e.kind() == ErrorKind::ConnectionRefused => {
+                        if let Some(conn) = weak.upgrade() {
+                            conn.refused();
+                        }
+                        continue;
+                    }
                     // Timeout: loop back and re-check the stop flag.
                     Err(e) if is_transient(&e) => continue,
                     Err(_) => return,
@@ -116,10 +133,29 @@ impl UdpConn6 {
         if len < 8 || len > udp.len() {
             return;
         }
-        let _ = self.socket.send(&udp[8..len]);
+        self.refusals
+            .lock()
+            .expect("poisoned")
+            .record(&packet[..transport_off + len], QUOTE_V6);
+        if matches!(self.socket.send(&udp[8..len]), Err(e) if e.kind() == ErrorKind::ConnectionRefused)
+        {
+            // See `UdpConn::handle_outbound`.
+            self.refused();
+            let _ = self.socket.send(&udp[8..len]);
+        }
         if let Ok(mut t) = self.last_act.lock() {
             *t = Instant::now();
         }
+    }
+
+    /// See `UdpConn::refused`.
+    fn refused(&self) {
+        let icmp = {
+            let mut r = self.refusals.lock().expect("poisoned");
+            let Some(quote) = r.due() else { return };
+            build_icmpv6_port_unreachable(self.r_ip, self.c_src_ip, quote)
+        };
+        let _ = (self.send)(&icmp);
     }
 
     /// True once the flow has been closed or its reader has died.

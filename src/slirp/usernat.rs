@@ -1725,7 +1725,7 @@ fn takes_new_syn(conn: &Mutex<crate::vtcp::Conn>, tcp: &[u8]) -> bool {
 mod tests {
     use super::*;
     use crate::Protocol;
-    use crate::slirp::checksum::{ipv4_header_checksum, udp_v4_checksum};
+    use crate::slirp::checksum::{ipv4_header_checksum, ipv6_pseudo_checksum, udp_v4_checksum};
     use crate::vtcp::State as VtcpState;
     use crate::vtcp::segment::flags as tcp_flags;
     use std::net::{IpAddr, UdpSocket};
@@ -2635,11 +2635,76 @@ mod tests {
             let mut buf = [0u8; 64];
             let (n, from) = server.recv_from(&mut buf).unwrap();
             server.send_to(&buf[..n], from).unwrap();
-            wait_for("the reply", || !captured.lock().unwrap().is_empty());
-            assert_eq!(&captured.lock().unwrap()[0][28..], b"early");
+            // Past the port unreachable reported for the first datagram.
+            let udp = || {
+                captured
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|p| p[9] == 17)
+                    .cloned()
+            };
+            wait_for("the reply", || udp().is_some());
+            assert_eq!(&udp().unwrap()[28..], b"early");
             return;
         }
         panic!("no free port to test with");
+    }
+
+    /// A datagram to a closed port draws the ICMP port unreachable the
+    /// guest would have had from the host itself, quoting its datagram, so
+    /// that it fails at once instead of waiting out its own timeout.
+    #[test]
+    fn udp_to_a_closed_port_draws_port_unreachable() {
+        use crate::slirp::checksum::internet_checksum;
+        let closed_port = |addr: &str| UdpSocket::bind(addr).unwrap().local_addr().unwrap().port();
+        let stack = Stack::new();
+        let captured = capture(&stack);
+        let icmp = |proto: u8| {
+            let got = captured.lock().unwrap();
+            got.iter()
+                .find(|p| p[if proto == 1 { 9 } else { 6 }] == proto)
+                .cloned()
+        };
+
+        let client = Ipv4Addr::new(10, 0, 0, 5);
+        let port = closed_port("127.0.0.1:0");
+        let dgram = build_udp_v4_packet(client, 41600, Ipv4Addr::LOCALHOST, port, b"anyone?");
+        L3Device::send(&*stack, Packet::from_slice(&dgram)).unwrap();
+        wait_for("a port unreachable", || icmp(1).is_some());
+        let p = icmp(1).unwrap();
+        assert_eq!(&p[12..16], &Ipv4Addr::LOCALHOST.octets());
+        assert_eq!(&p[16..20], &client.octets());
+        assert_eq!(ipv4_header_checksum(&p[..20]), 0);
+        assert_eq!((p[20], p[21]), (3, 3));
+        assert_eq!(internet_checksum(&p[20..]), 0);
+        assert_eq!(&p[28..], &dgram[..], "the datagram is not quoted");
+
+        let c6: Ipv6Addr = "fd00::5".parse().unwrap();
+        let Ok(probe) = UdpSocket::bind("[::1]:0") else {
+            return; // no IPv6 loopback here
+        };
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let dgram = crate::slirp::packet::build_udp_packet6(
+            c6,
+            41600,
+            Ipv6Addr::LOCALHOST,
+            port,
+            b"anyone?",
+        );
+        L3Device::send(&*stack, Packet::from_slice(&dgram)).unwrap();
+        wait_for("a port unreachable", || icmp(58).is_some());
+        let p = icmp(58).unwrap();
+        assert_eq!(&p[8..24], &Ipv6Addr::LOCALHOST.octets());
+        assert_eq!(&p[24..40], &c6.octets());
+        assert_eq!((p[40], p[41]), (1, 4));
+        let len = p.len() - 40;
+        assert_eq!(
+            ipv6_pseudo_checksum(Ipv6Addr::LOCALHOST, c6, 58, len as u32, &p[40..]),
+            0
+        );
+        assert_eq!(&p[48..], &dgram[..], "the datagram is not quoted");
     }
 
     #[test]

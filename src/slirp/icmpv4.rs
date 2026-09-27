@@ -1,4 +1,5 @@
-//! IPv4 ICMP handling: answers Echo Requests addressed to the stack.
+//! IPv4 ICMP handling: answers Echo Requests addressed to the stack, and
+//! builds the errors it reports to the guest.
 //!
 //! Mirrors `slirp/icmpv4.go`. Anything that isn't a ping for our own
 //! interface is dropped silently.
@@ -50,6 +51,29 @@ pub(crate) fn build_icmpv4_echo_reply(
     reply[10..12].copy_from_slice(&hcs.to_be_bytes());
 
     Some(reply)
+}
+
+/// Build a Destination Unreachable / Port Unreachable (type 3, code 3) from
+/// `from` to `to`, quoting `orig`: the start of the refused datagram, its IP
+/// header included (RFC 792).
+pub(crate) fn build_icmpv4_port_unreachable(from: Ipv4Addr, to: Ipv4Addr, orig: &[u8]) -> Vec<u8> {
+    let total = 28 + orig.len();
+    let mut p = vec![0u8; total];
+    p[0] = 0x45;
+    p[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+    p[4..6].copy_from_slice(&(crate::slirp::packet::next_ip_id() as u16).to_be_bytes());
+    p[8] = 64;
+    p[9] = 1; // ICMP
+    p[12..16].copy_from_slice(&from.octets());
+    p[16..20].copy_from_slice(&to.octets());
+    let hcs = ipv4_header_checksum(&p[..20]);
+    p[10..12].copy_from_slice(&hcs.to_be_bytes());
+    p[20] = 3;
+    p[21] = 3;
+    p[28..].copy_from_slice(orig);
+    let cs = internet_checksum(&p[20..]);
+    p[22..24].copy_from_slice(&cs.to_be_bytes());
+    p
 }
 
 #[cfg(test)]
