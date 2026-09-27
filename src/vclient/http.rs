@@ -404,6 +404,12 @@ impl ResponseReader {
                         let hex = std::str::from_utf8(hex)
                             .map_err(|_| invalid("bad chunk size"))?
                             .trim();
+                        // Hex digits only: from_str_radix would also take a
+                        // sign. One that overflows is an error, not a wrap
+                        // (RFC 9112 §7.1).
+                        if hex.is_empty() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                            return Err(invalid("bad chunk size"));
+                        }
                         let size = usize::from_str_radix(hex, 16)
                             .map_err(|_| invalid("bad chunk size"))?;
                         *state = if size == 0 {
@@ -414,7 +420,9 @@ impl ResponseReader {
                     }
                     Chunked::Data(left) => {
                         let have = self.buf.len() - self.pos;
-                        if have < *left + 2 {
+                        // A size near usize::MAX is legal to announce;
+                        // it just never arrives, so saturate.
+                        if have < left.saturating_add(2) {
                             // Take what is here so the buffer need not hold
                             // the whole chunk.
                             let take = have.min(*left);
@@ -647,6 +655,23 @@ mod tests {
         }
         let bad = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhiXX0\r\n\r\n";
         assert!(read_response(bad, bad.len()).is_err());
+    }
+
+    #[test]
+    fn huge_or_signed_chunk_sizes_do_not_overflow() {
+        let head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        for size in [&b"ffffffffffffffff"[..], b"fffffffffffffffe", b"+5"] {
+            let mut raw = head.to_vec();
+            raw.extend_from_slice(size);
+            raw.extend_from_slice(b"\r\nhello\r\n0\r\n\r\n");
+            for step in [1, raw.len()] {
+                assert!(read_response(&raw, step).is_err(), "{size:?}");
+            }
+        }
+        // More hex digits than any size can hold.
+        let mut raw = head.to_vec();
+        raw.extend_from_slice(b"10000000000000000\r\nx\r\n");
+        assert!(read_response(&raw, raw.len()).is_err());
     }
 
     #[test]
