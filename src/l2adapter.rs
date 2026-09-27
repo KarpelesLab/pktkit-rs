@@ -250,13 +250,18 @@ impl L2Adapter {
                 } else {
                     let dst = pkt.ipv4_dst_addr().unwrap();
                     let prefix = self.l3.addr();
-                    let target =
-                        if prefix.is_valid() && prefix.is_v4() && !prefix.contains(IpAddr::V4(dst))
-                        {
-                            self.gateway_v4.lock().unwrap().unwrap_or(dst)
-                        } else {
-                            dst
-                        };
+                    // 169.254/16 is on-link whatever our prefix, and a router
+                    // must not forward it: RFC 3927 §2.6.2 has the host ARP
+                    // for the destination directly.
+                    let target = if prefix.is_valid()
+                        && prefix.is_v4()
+                        && !prefix.contains(IpAddr::V4(dst))
+                        && !dst.is_link_local()
+                    {
+                        self.gateway_v4.lock().unwrap().unwrap_or(dst)
+                    } else {
+                        dst
+                    };
                     match self.arp.lookup(target) {
                         Some(m) => (m, EtherType::IPV4),
                         None => {
@@ -780,6 +785,22 @@ mod tests {
         let ns = Packet::from_slice(f.payload()).ipv6_payload();
         assert_eq!(ns[0], ndp::NS_TYPE);
         assert_eq!(ns[8..24], peer.octets(), "solicited the gateway instead");
+    }
+
+    #[test]
+    fn ipv4_link_local_destinations_are_resolved_on_link() {
+        let (pipe, adapter, out) = rig("10.0.0.5/24");
+        adapter.set_gateway_v4(Ipv4Addr::new(10, 0, 0, 1));
+        pipe.inject(Packet::from_slice(&v4_packet(
+            [10, 0, 0, 5],
+            [169, 254, 3, 4],
+        )))
+        .unwrap();
+        let sent = take(&out);
+        assert_eq!(sent.len(), 1);
+        let (op, _, _, _, target) = arp::parse(Frame::from_slice(&sent[0]).payload()).unwrap();
+        assert_eq!(op, arp::OP_REQUEST);
+        assert_eq!(target, Ipv4Addr::new(169, 254, 3, 4), "ARPed the gateway");
     }
 
     #[test]
