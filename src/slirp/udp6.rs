@@ -2,7 +2,7 @@
 
 use crate::Result;
 use crate::slirp::packet::{build_udp_packet6, fit_link};
-use crate::slirp::udp::is_transient;
+use crate::slirp::udp::{ClosedOnExit, is_transient};
 use crate::time::Instant;
 use std::net::{Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -60,10 +60,14 @@ impl UdpConn6 {
 
         let weak = Arc::downgrade(&conn);
         super::spawn_flow_thread(move || {
+            // However the reader ends, the flow is dead from then on, so the
+            // next datagram from the client opens a fresh one instead of
+            // feeding a flow that can no longer answer.
+            let closed = ClosedOnExit(closed);
             // Room for the largest datagram, so none is silently cut short.
             let mut buf = vec![0u8; 65535];
             loop {
-                if closed.load(Ordering::Relaxed) {
+                if closed.0.load(Ordering::Relaxed) {
                     return;
                 }
                 let n = match socket.recv(&mut buf) {
@@ -71,13 +75,7 @@ impl UdpConn6 {
                     Ok(n) => n,
                     // Timeout: loop back and re-check the stop flag.
                     Err(e) if is_transient(&e) => continue,
-                    Err(_) => {
-                        // Mark the flow dead so the next datagram from the
-                        // client opens a fresh one instead of feeding a flow
-                        // that can no longer answer.
-                        closed.store(true, Ordering::Relaxed);
-                        return;
-                    }
+                    Err(_) => return,
                 };
                 let conn = match weak.upgrade() {
                     Some(c) => c,

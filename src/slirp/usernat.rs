@@ -523,21 +523,16 @@ impl Stack {
     /// Route a packet originating from the namespace `ns` to the right handler.
     /// `ns == 0` means the legacy single-peer path.
     fn dispatch(inner: &Arc<Inner>, ns: u64, pkt: &[u8]) -> Result<()> {
-        if ns == 0 {
-            let h = inner.handler.lock().expect("poisoned").clone();
-            if let Some(h) = h {
-                return h(Packet::from_slice(pkt));
-            }
-            return Ok(());
+        let h = if ns == 0 {
+            inner.handler.lock().expect("poisoned").clone()
+        } else {
+            let side = inner.ns_sides.lock().expect("poisoned").get(&ns).cloned();
+            side.and_then(|s| s.handler.lock().expect("poisoned").clone())
+        };
+        match h {
+            Some(h) => call_handler(&h, pkt),
+            None => Ok(()),
         }
-        let side = inner.ns_sides.lock().expect("poisoned").get(&ns).cloned();
-        if let Some(side) = side {
-            let h = side.handler.lock().expect("poisoned").clone();
-            if let Some(h) = h {
-                return h(Packet::from_slice(pkt));
-            }
-        }
-        Ok(())
     }
 
     /// Dispatch a packet the stack built, fragmented to fit the link: an
@@ -1363,6 +1358,20 @@ impl L3Connector for Stack {
             Ok(())
         }))
     }
+}
+
+/// Hand `pkt` to a user handler, containing a panic in it.
+///
+/// Most packets reach the handler from the stack's own threads: the tick
+/// thread that drives the timers of every connection of every namespace, the
+/// UDP readers, the dials and the byte pumps. Nothing joins or watches them,
+/// so a panic unwinding out of one would end it for good, silently: one bad
+/// packet would stop every retransmission and keepalive of the stack, or
+/// leave a flow in the table that nobody reads. The panic costs that packet
+/// only, and reads as an error to a caller that looks.
+fn call_handler(h: &L3Handler, pkt: &[u8]) -> Result<()> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h(Packet::from_slice(pkt))))
+        .unwrap_or_else(|_| Err(io::Error::other("packet handler panicked")))
 }
 
 /// Whether a new outbound bridge may be opened in `table`. Bridges in
@@ -3207,5 +3216,77 @@ mod tests {
                 assert_eq!(rst.ack, 1002);
             }
         }
+    }
+
+    /// A handler that panics once, on one of the stack's own threads, must
+    /// cost that packet only: the tick thread serves every connection of
+    /// every namespace, and must keep retransmitting after it.
+    #[test]
+    fn handler_panic_does_not_kill_the_tick_thread() {
+        let stack = Stack::new();
+        let from_bg = Arc::new(AtomicUsize::new(0));
+        let panicked = Arc::new(AtomicBool::new(false));
+        let (fb, pk) = (from_bg.clone(), panicked.clone());
+        stack.set_handler(Arc::new(move |_p: &Packet| {
+            // The test's own thread is named; the stack's are not.
+            if thread::current().name().is_none() {
+                if !pk.swap(true, Ordering::SeqCst) {
+                    panic!("handler bug, once");
+                }
+                fb.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(())
+        }));
+        let _l = stack.listen("tcp", "10.0.0.1:8080").unwrap();
+        let client = Ipv4Addr::new(10, 0, 0, 5);
+        let server = Ipv4Addr::new(10, 0, 0, 1);
+        // Unanswered SYN-ACKs, which only the tick thread retransmits.
+        let syn = build_tcp_v4_packet(client, 40030, server, 8080, 500, 0, tcp_flags::SYN, &[]);
+        L3Device::send(&*stack, Packet::from_slice(&syn)).unwrap();
+        wait_for("the panic", || panicked.load(Ordering::SeqCst));
+        let syn = build_tcp_v4_packet(client, 40031, server, 8080, 900, 0, tcp_flags::SYN, &[]);
+        L3Device::send(&*stack, Packet::from_slice(&syn)).unwrap();
+        wait_for("a retransmission after the panic", || {
+            from_bg.load(Ordering::SeqCst) > 0
+        });
+    }
+
+    /// Likewise for a UDP flow's reader thread: a panic in the handler must
+    /// not leave the flow in the table with nobody reading its replies.
+    #[test]
+    fn handler_panic_does_not_blackhole_a_udp_flow() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let sport = server.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let mut b = [0u8; 1500];
+            while let Ok((n, a)) = server.recv_from(&mut b) {
+                let _ = server.send_to(&b[..n], a);
+            }
+        });
+        let stack = Stack::new();
+        let got = Arc::new(AtomicUsize::new(0));
+        let panicked = Arc::new(AtomicBool::new(false));
+        let (g, pk) = (got.clone(), panicked.clone());
+        stack.set_handler(Arc::new(move |_p: &Packet| {
+            if !pk.swap(true, Ordering::SeqCst) {
+                panic!("handler bug, once");
+            }
+            g.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }));
+        let pkt = build_udp_v4_packet(
+            Ipv4Addr::new(10, 0, 0, 5),
+            5555,
+            Ipv4Addr::new(127, 0, 0, 1),
+            sport,
+            b"a",
+        );
+        L3Device::send(&*stack, Packet::from_slice(&pkt)).unwrap();
+        wait_for("the panic", || panicked.load(Ordering::SeqCst));
+        wait_for("a reply after the panic", || {
+            L3Device::send(&*stack, Packet::from_slice(&pkt)).unwrap();
+            thread::sleep(Duration::from_millis(50));
+            got.load(Ordering::SeqCst) > 0
+        });
     }
 }

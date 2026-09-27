@@ -40,6 +40,16 @@ pub(crate) fn is_transient(e: &std::io::Error) -> bool {
     )
 }
 
+/// Marks a flow closed when its reader thread ends, by returning or by
+/// unwinding.
+pub(crate) struct ClosedOnExit(pub(crate) Arc<AtomicBool>);
+
+impl Drop for ClosedOnExit {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
 pub(crate) struct UdpConn {
     c_src_ip: Ipv4Addr,
     c_src_port: u16,
@@ -78,10 +88,14 @@ impl UdpConn {
 
         let weak = Arc::downgrade(&conn);
         super::spawn_flow_thread(move || {
+            // However the reader ends, the flow is dead from then on, so the
+            // next datagram from the client opens a fresh one instead of
+            // feeding a flow that can no longer answer.
+            let closed = ClosedOnExit(closed);
             // Room for the largest datagram, so none is silently cut short.
             let mut buf = vec![0u8; 65535];
             loop {
-                if closed.load(Ordering::Relaxed) {
+                if closed.0.load(Ordering::Relaxed) {
                     return;
                 }
                 let n = match socket.recv(&mut buf) {
@@ -89,13 +103,7 @@ impl UdpConn {
                     Ok(n) => n,
                     // Timeout: loop back and re-check the stop flag.
                     Err(e) if is_transient(&e) => continue,
-                    Err(_) => {
-                        // Mark the flow dead so the next datagram from the
-                        // client opens a fresh one instead of feeding a flow
-                        // that can no longer answer.
-                        closed.store(true, Ordering::Relaxed);
-                        return;
-                    }
+                    Err(_) => return,
                 };
                 let conn = match weak.upgrade() {
                     Some(c) => c,
