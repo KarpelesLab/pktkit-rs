@@ -18,11 +18,14 @@
 //! inside IP on the control port, [`UPnPHelper::handle_local`] mints a
 //! server-side `vtcp::Conn` (passive open via `accept_syn`), drives the
 //! handshake, accumulates the HTTP/1.1 request bytes off the established
-//! stream, parses the request line + headers + Content-Length body, calls
-//! [`UPnPHelper::handle_soap`], writes the HTTP/1.1 response (with the SOAP XML
-//! body) back over the connection, and then closes. This is a minimal embedded
-//! HTTP/1.1 server over a single vtcp connection: one request/response, then
-//! close. Outgoing segments are wrapped in IPv4 (with correct IP + TCP
+//! stream, and parses the request line + headers + Content-Length body. A GET
+//! of the SSDP `LOCATION` (`/rootDesc.xml`) returns the device description
+//! ([`UPnPHelper::root_desc`]), a GET of the service description it names
+//! returns that, and a POST to its control URL is a SOAP action handled as
+//! [`UPnPHelper::handle_soap`] does; anything else draws a 404 or 405. The
+//! HTTP/1.1 response is written back over the connection, which then closes.
+//! This is a minimal embedded HTTP/1.1 server over a single vtcp connection:
+//! one request/response, then close. Outgoing segments are wrapped in IPv4 (with correct IP + TCP
 //! checksums) and injected onto the inside via [`Nat::send_inside`].
 
 use crate::nat::helper::{Helper, LocalHelper, PROTO_TCP, PROTO_UDP, PortForward};
@@ -64,6 +67,13 @@ const DEFAULT_MAX_PER_CLIENT: usize = 128;
 /// Default [`UPnPConfig::lease_duration`]: 7 days, the longest lease
 /// WANIPConnection:2 allows.
 const DEFAULT_MAX_LEASE: Duration = Duration::from_secs(604_800);
+
+/// Where the control port serves the device description (the SSDP
+/// `LOCATION`), the WANIPConnection service description, and its control
+/// URL.
+const ROOT_DESC_PATH: &str = "/rootDesc.xml";
+const SCPD_PATH: &str = "/WANIPConnection.xml";
+const CONTROL_PATH: &str = "/ctl/WANIPConnection";
 
 /// Configuration knobs for the UPnP IGD helper.
 ///
@@ -321,8 +331,8 @@ impl UPnPHelper {
             None => return,
         };
         let location = format!(
-            "http://{}:{}/rootDesc.xml",
-            inside_ip, self.cfg.control_port
+            "http://{}:{}{}",
+            inside_ip, self.cfg.control_port, ROOT_DESC_PATH
         );
         let resp = format!(
             "HTTP/1.1 200 OK\r\n\
@@ -452,9 +462,7 @@ EXT:\r\n\r\n",
                 match parse_http_request(&cc.req) {
                     _ if remove => {}
                     Ok(Some(req)) => {
-                        let res =
-                            self.soap(nat, ns, &req.soap_action, &req.body, Some(cc.client_ip));
-                        let resp = build_http_response(&res);
+                        let resp = self.serve(nat, ns, &req, cc.client_ip, inside_ip);
                         let (_, segs) = cc.conn.write(&resp);
                         outgoing.extend(segs);
                         // Single request/response per connection: half-close.
@@ -493,13 +501,51 @@ EXT:\r\n\r\n",
         true
     }
 
+    /// Answer one HTTP request on the control port. A control point fetches
+    /// the device description at the SSDP `LOCATION`, then (some do) the
+    /// service description it names, and POSTs SOAP to the control URL;
+    /// each has its own path, and only the last is a SOAP action.
+    fn serve(
+        &self,
+        nat: &Nat,
+        ns: u64,
+        req: &HttpRequest,
+        client_ip: Ipv4Addr,
+        inside_ip: Ipv4Addr,
+    ) -> Vec<u8> {
+        let method = req.method.as_str();
+        let get = method == "GET" || method == "HEAD";
+        let doc = |body: String| build_http_response(200, "OK", "", &body, method == "HEAD");
+        match request_path(&req.target) {
+            ROOT_DESC_PATH if get => doc(self.root_desc(inside_ip)),
+            SCPD_PATH if get => doc(wanip_scpd()),
+            CONTROL_PATH if method == "POST" => {
+                let res = self.soap(nat, ns, &req.soap_action, &req.body, Some(client_ip));
+                // UPnP faults travel with HTTP 500 (UDA 1.0 §3.2.2).
+                let (code, reason) = if res.status == 200 {
+                    (200, "OK")
+                } else {
+                    (500, "Internal Server Error")
+                };
+                build_http_response(code, reason, "", &res.body, false)
+            }
+            ROOT_DESC_PATH | SCPD_PATH => {
+                build_http_response(405, "Method Not Allowed", "Allow: GET, HEAD\r\n", "", false)
+            }
+            CONTROL_PATH => {
+                build_http_response(405, "Method Not Allowed", "Allow: POST\r\n", "", false)
+            }
+            _ => build_http_response(404, "Not Found", "", "", false),
+        }
+    }
+
     // ---- SOAP ----------------------------------------------------------
 
     /// The device description document a client fetches from `LOCATION`.
     pub fn root_desc(&self, inside_ip: Ipv4Addr) -> String {
         let control_url = format!(
-            "http://{}:{}/ctl/WANIPConnection",
-            inside_ip, self.cfg.control_port
+            "http://{}:{}{}",
+            inside_ip, self.cfg.control_port, CONTROL_PATH
         );
         format!(
             "<?xml version=\"1.0\"?>\n\
@@ -521,12 +567,12 @@ EXT:\r\n\r\n",
 <serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType>\
 <serviceId>urn:upnp-org:serviceId:WANIPConnection</serviceId>\
 <controlURL>{}</controlURL>\
-<SCPDURL>/WANIPConnection.xml</SCPDURL>\
+<SCPDURL>{}</SCPDURL>\
 </service></serviceList>\
 </device></deviceList>\
 </device></deviceList>\
 </device></root>",
-            control_url
+            control_url, SCPD_PATH
         )
     }
 
@@ -862,6 +908,9 @@ fn wrap_tcp_v4(src: Ipv4Addr, dst: Ipv4Addr, seg: &[u8]) -> Vec<u8> {
 
 /// A parsed HTTP/1.1 request: enough of one for the UPnP SOAP control flow.
 struct HttpRequest {
+    method: String,
+    /// The request target as sent (origin or absolute form).
+    target: String,
     /// Value of the `SOAPAction` header (raw; `normalize_action` strips it).
     soap_action: String,
     /// The request body (Content-Length bytes).
@@ -888,9 +937,10 @@ fn parse_http_request(buf: &[u8]) -> Result<Option<HttpRequest>, ()> {
 
     let head_str = String::from_utf8_lossy(head);
     let mut lines = head_str.split("\r\n");
-    // Request line (METHOD SP path SP version) — we accept any method; UPnP
-    // control uses POST.
-    let _request_line = lines.next();
+    // Request line: METHOD SP target SP version.
+    let mut request_line = lines.next().unwrap_or("").split(' ');
+    let method = request_line.next().unwrap_or("").to_string();
+    let target = request_line.next().unwrap_or("").to_string();
 
     let mut content_length: Option<usize> = None;
     let mut soap_action = String::new();
@@ -921,32 +971,149 @@ fn parse_http_request(buf: &[u8]) -> Result<Option<HttpRequest>, ()> {
         return Ok(None); // body not fully buffered yet
     }
     let body = buf[body_start..body_end].to_vec();
-    Ok(Some(HttpRequest { soap_action, body }))
+    Ok(Some(HttpRequest {
+        method,
+        target,
+        soap_action,
+        body,
+    }))
 }
 
-/// Build an HTTP/1.1 response carrying a SOAP result. A 200 status yields
-/// `200 OK`; anything else (a SOAP fault) yields `500 Internal Server Error`,
-/// matching the UPnP convention that faults travel with HTTP 500.
-fn build_http_response(res: &SoapResult) -> Vec<u8> {
-    let (code, reason) = if res.status == 200 {
-        (200u16, "OK")
-    } else {
-        (500u16, "Internal Server Error")
+/// The path of a request target, in origin form (`/x?q`) or absolute form
+/// (`http://host:port/x?q`, RFC 9112 §3.2.2), without its query.
+fn request_path(target: &str) -> &str {
+    let path = match target.split_once("://") {
+        Some((_, rest)) => rest.find('/').map_or("/", |i| &rest[i..]),
+        None => target,
     };
-    let body = res.body.as_bytes();
-    let head = format!(
+    path.split('?').next().unwrap_or(path)
+}
+
+/// Build an HTTP/1.1 response. `extra` holds further header lines, each
+/// ending in CRLF. A response to HEAD announces the body but leaves it out.
+fn build_http_response(code: u16, reason: &str, extra: &str, body: &str, head: bool) -> Vec<u8> {
+    let content_type = if body.is_empty() {
+        ""
+    } else {
+        "Content-Type: text/xml; charset=\"utf-8\"\r\n"
+    };
+    let mut out = format!(
         "HTTP/1.1 {} {}\r\n\
-Content-Type: text/xml; charset=\"utf-8\"\r\n\
-Content-Length: {}\r\n\
+{}{}Content-Length: {}\r\n\
 Connection: close\r\n\
 Server: pktkit/1.0 UPnP/1.1\r\n\r\n",
         code,
         reason,
+        content_type,
+        extra,
         body.len(),
+    )
+    .into_bytes();
+    if !head {
+        out.extend_from_slice(body.as_bytes());
+    }
+    out
+}
+
+/// The service description (SCPD) of WANIPConnection:1, trimmed to the
+/// actions this helper implements.
+fn wanip_scpd() -> String {
+    const ACTIONS: &[(&str, &[(&str, bool, &str)])] = &[
+        (
+            "GetExternalIPAddress",
+            &[("NewExternalIPAddress", false, "ExternalIPAddress")],
+        ),
+        (
+            "AddPortMapping",
+            &[
+                ("NewRemoteHost", true, "RemoteHost"),
+                ("NewExternalPort", true, "ExternalPort"),
+                ("NewProtocol", true, "PortMappingProtocol"),
+                ("NewInternalPort", true, "InternalPort"),
+                ("NewInternalClient", true, "InternalClient"),
+                ("NewEnabled", true, "PortMappingEnabled"),
+                ("NewPortMappingDescription", true, "PortMappingDescription"),
+                ("NewLeaseDuration", true, "PortMappingLeaseDuration"),
+            ],
+        ),
+        (
+            "DeletePortMapping",
+            &[
+                ("NewRemoteHost", true, "RemoteHost"),
+                ("NewExternalPort", true, "ExternalPort"),
+                ("NewProtocol", true, "PortMappingProtocol"),
+            ],
+        ),
+        (
+            "GetGenericPortMappingEntry",
+            &[
+                ("NewPortMappingIndex", true, "PortMappingNumberOfEntries"),
+                ("NewRemoteHost", false, "RemoteHost"),
+                ("NewExternalPort", false, "ExternalPort"),
+                ("NewProtocol", false, "PortMappingProtocol"),
+                ("NewInternalPort", false, "InternalPort"),
+                ("NewInternalClient", false, "InternalClient"),
+                ("NewEnabled", false, "PortMappingEnabled"),
+                ("NewPortMappingDescription", false, "PortMappingDescription"),
+                ("NewLeaseDuration", false, "PortMappingLeaseDuration"),
+            ],
+        ),
+        (
+            "GetSpecificPortMappingEntry",
+            &[
+                ("NewRemoteHost", true, "RemoteHost"),
+                ("NewExternalPort", true, "ExternalPort"),
+                ("NewProtocol", true, "PortMappingProtocol"),
+                ("NewInternalPort", false, "InternalPort"),
+                ("NewInternalClient", false, "InternalClient"),
+                ("NewEnabled", false, "PortMappingEnabled"),
+                ("NewPortMappingDescription", false, "PortMappingDescription"),
+                ("NewLeaseDuration", false, "PortMappingLeaseDuration"),
+            ],
+        ),
+    ];
+    const VARIABLES: &[(&str, &str)] = &[
+        ("ExternalIPAddress", "string"),
+        ("RemoteHost", "string"),
+        ("ExternalPort", "ui2"),
+        ("InternalPort", "ui2"),
+        ("PortMappingProtocol", "string"),
+        ("InternalClient", "string"),
+        ("PortMappingEnabled", "boolean"),
+        ("PortMappingDescription", "string"),
+        ("PortMappingLeaseDuration", "ui4"),
+        ("PortMappingNumberOfEntries", "ui2"),
+    ];
+    let mut out = String::from(
+        "<?xml version=\"1.0\"?>\n\
+<scpd xmlns=\"urn:schemas-upnp-org:service-1-0\">\
+<specVersion><major>1</major><minor>0</minor></specVersion><actionList>",
     );
-    let mut out = Vec::with_capacity(head.len() + body.len());
-    out.extend_from_slice(head.as_bytes());
-    out.extend_from_slice(body);
+    for (name, args) in ACTIONS {
+        out.push_str(&format!("<action><name>{name}</name><argumentList>"));
+        for (arg, input, var) in *args {
+            let dir = if *input { "in" } else { "out" };
+            out.push_str(&format!(
+                "<argument><name>{arg}</name><direction>{dir}</direction>\
+<relatedStateVariable>{var}</relatedStateVariable></argument>"
+            ));
+        }
+        out.push_str("</argumentList></action>");
+    }
+    out.push_str("</actionList><serviceStateTable>");
+    for (name, ty) in VARIABLES {
+        out.push_str(&format!(
+            "<stateVariable sendEvents=\"no\"><name>{name}</name><dataType>{ty}</dataType>"
+        ));
+        if *name == "PortMappingProtocol" {
+            out.push_str(
+                "<allowedValueList><allowedValue>TCP</allowedValue>\
+<allowedValue>UDP</allowedValue></allowedValueList>",
+            );
+        }
+        out.push_str("</stateVariable>");
+    }
+    out.push_str("</serviceStateTable></scpd>");
     out
 }
 
@@ -1737,5 +1904,191 @@ MAN: \"ssdp:discover\"\r\nST: upnp:rootdevice\r\n\r\n";
         let polite = Ipv4Addr::new(10, 0, 0, 42);
         h.handle_local(&nat, crate::Packet::from_slice(&syn(polite, 50000)));
         assert!(h.ctrl.lock().unwrap().keys().any(|k| k.client_ip == polite));
+    }
+
+    /// One HTTP exchange over a fresh TCP connection from `client` to
+    /// `server:port` through the NAT's inside interface, as a UPnP control
+    /// point makes it. Returns the response bytes.
+    fn http_through_nat(
+        nat: &Nat,
+        inside: &StdMutex<Vec<Vec<u8>>>,
+        (client, cport): (Ipv4Addr, u16),
+        (server, port): (Ipv4Addr, u16),
+        request: &[u8],
+    ) -> Vec<u8> {
+        use crate::vtcp::{Conn, ConnConfig};
+        let mut conn = Conn::new(ConnConfig {
+            local_addr: Some(SocketAddr::new(IpAddr::V4(client), cport)),
+            remote_addr: Some(SocketAddr::new(IpAddr::V4(server), port)),
+            local_port: cport,
+            remote_port: port,
+            ..Default::default()
+        });
+        let mut pending = conn.connect();
+        let mut sent = false;
+        let mut got = Vec::new();
+        for _ in 0..64 {
+            for seg in pending.drain(..) {
+                let ip = wrap_tcp_v4(client, server, &seg);
+                nat.inside().send(crate::Packet::from_slice(&ip)).unwrap();
+            }
+            for pkt in std::mem::take(&mut *inside.lock().unwrap()) {
+                let ihl = (pkt[0] & 0x0F) as usize * 4;
+                let seg = Segment::parse(&pkt[ihl..]).unwrap();
+                pending.extend(conn.handle_segment(&seg));
+            }
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = conn.read(&mut buf);
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&buf[..n]);
+            }
+            if conn.is_established() && !sent {
+                let (n, segs) = conn.write(request);
+                assert_eq!(n, request.len());
+                pending.extend(segs);
+                sent = true;
+            }
+            if sent && pending.is_empty() && inside.lock().unwrap().is_empty() {
+                break;
+            }
+        }
+        got
+    }
+
+    fn header<'a>(msg: &'a str, name: &str) -> Option<&'a str> {
+        msg.split("\r\n").find_map(|l| {
+            let (n, v) = l.split_once(':')?;
+            n.trim().eq_ignore_ascii_case(name).then(|| v.trim())
+        })
+    }
+
+    fn body(resp: &[u8]) -> String {
+        let at = find_subslice(resp, b"\r\n\r\n").unwrap() + 4;
+        String::from_utf8_lossy(&resp[at..]).into_owned()
+    }
+
+    /// Split `http://host:port/path` into its parts.
+    fn split_url(url: &str) -> (Ipv4Addr, u16, String) {
+        let rest = url.strip_prefix("http://").unwrap();
+        let (auth, path) = rest.split_at(rest.find('/').unwrap());
+        let (host, port) = auth.split_once(':').unwrap();
+        (
+            host.parse().unwrap(),
+            port.parse().unwrap(),
+            path.to_string(),
+        )
+    }
+
+    /// What a client such as miniupnpc does: discover the gateway over SSDP,
+    /// fetch the description at its LOCATION, find the WANIPConnection
+    /// control URL there, and POST AddPortMapping to it.
+    #[test]
+    fn a_standard_client_walks_discovery_to_control() {
+        let (nat, inside, _outside) = wired();
+        let client = Ipv4Addr::new(10, 0, 0, 50);
+
+        nat.inside()
+            .send(crate::Packet::from_slice(&msearch(client)))
+            .unwrap();
+        let reply = inside.lock().unwrap().pop().expect("SSDP reply");
+        let reply = String::from_utf8_lossy(&reply[28..]).into_owned();
+        let (host, port, path) = split_url(header(&reply, "LOCATION").unwrap());
+
+        let get = format!("GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n");
+        let resp = http_through_nat(&nat, &inside, (client, 40001), (host, port), get.as_bytes());
+        assert!(
+            resp.starts_with(b"HTTP/1.1 200 "),
+            "{}",
+            String::from_utf8_lossy(&resp)
+        );
+        let desc = body(&resp);
+        let service = desc
+            .split("<service>")
+            .find(|s| s.contains("urn:schemas-upnp-org:service:WANIPConnection:1"))
+            .expect("WANIPConnection service");
+        let control = xml_field(service, "controlURL").unwrap();
+        let scpd = xml_field(service, "SCPDURL").unwrap();
+
+        let get = format!("GET {scpd} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n");
+        let resp = http_through_nat(&nat, &inside, (client, 40002), (host, port), get.as_bytes());
+        assert!(resp.starts_with(b"HTTP/1.1 200 "));
+        assert!(body(&resp).contains("<name>AddPortMapping</name>"));
+
+        let (chost, cport, cpath) = split_url(&control);
+        let soap = add_body(8080, 80, "10.0.0.50", "TCP", 3600);
+        let mut post = format!(
+            "POST {cpath} HTTP/1.1\r\nHost: {chost}:{cport}\r\n\
+Content-Type: text/xml; charset=\"utf-8\"\r\n\
+SOAPAction: \"urn:schemas-upnp-org:service:WANIPConnection:1#AddPortMapping\"\r\n\
+Content-Length: {}\r\n\r\n",
+            soap.len()
+        )
+        .into_bytes();
+        post.extend_from_slice(&soap);
+        let resp = http_through_nat(&nat, &inside, (client, 40003), (chost, cport), &post);
+        assert!(
+            resp.starts_with(b"HTTP/1.1 200 "),
+            "{}",
+            String::from_utf8_lossy(&resp)
+        );
+        assert!(body(&resp).contains("AddPortMappingResponse"));
+        let fwds = nat.list_port_forwards();
+        assert_eq!(fwds.len(), 1);
+        assert_eq!((fwds[0].outside_port, fwds[0].inside_ip), (8080, client));
+    }
+
+    #[test]
+    fn only_a_post_to_the_control_url_is_soap() {
+        let (nat, inside, _outside) = wired();
+        let client = Ipv4Addr::new(10, 0, 0, 50);
+        let server = (Ipv4Addr::new(10, 0, 0, 1), 5000);
+        let soap = add_body(8080, 80, "10.0.0.50", "TCP", 3600);
+        let request = |line: &str| {
+            let mut r = format!(
+                "{line} HTTP/1.1\r\nSOAPAction: \"urn:schemas-upnp-org:service:WANIPConnection:1#AddPortMapping\"\r\n\
+Content-Length: {}\r\n\r\n",
+                soap.len()
+            )
+            .into_bytes();
+            r.extend_from_slice(&soap);
+            r
+        };
+        for (i, (line, status)) in [
+            ("POST /rootDesc.xml", "405"),
+            ("GET /ctl/WANIPConnection", "405"),
+            ("POST /elsewhere", "404"),
+            ("GET /", "404"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let resp = http_through_nat(
+                &nat,
+                &inside,
+                (client, 41000 + i as u16),
+                server,
+                &request(line),
+            );
+            let resp = String::from_utf8_lossy(&resp);
+            assert!(
+                resp.starts_with(&format!("HTTP/1.1 {status} ")),
+                "{line}: {resp}"
+            );
+        }
+        assert!(nat.list_port_forwards().is_empty());
+
+        // The absolute form of the control URL is the control URL.
+        let resp = http_through_nat(
+            &nat,
+            &inside,
+            (client, 42000),
+            server,
+            &request("POST http://10.0.0.1:5000/ctl/WANIPConnection"),
+        );
+        assert!(resp.starts_with(b"HTTP/1.1 200 "));
+        assert_eq!(nat.list_port_forwards().len(), 1);
     }
 }
