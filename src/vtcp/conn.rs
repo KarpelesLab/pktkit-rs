@@ -2045,11 +2045,17 @@ impl Conn {
             // The receiver closed its window under data in flight, so our
             // retransmits are really zero-window probes and its duplicate
             // ACKs never count as progress. Keep going while it answers, as
-            // Linux does; give up only once it has gone quiet.
-            if self.last_recv.elapsed() > MAX_RTO {
+            // Linux does; give up only once as many probes in a row as
+            // retransmissions otherwise go unanswered. Not by the time since
+            // it last answered: with the backoff at MAX_RTO, a timer
+            // serviced a little late (a coarse tick) puts more than MAX_RTO
+            // between an answer and the next timeout of a peer that
+            // answered every probe at once.
+            if self.probes_out >= MAX_RETRIES {
                 self.tear_down(State::Closed);
                 return;
             }
+            self.probes_out += 1;
         } else {
             self.retries += 1;
             if self.retries > MAX_RETRIES {
@@ -2974,10 +2980,44 @@ mod tests {
             assert!(!client.is_closed());
         }
 
-        // A peer silent for longer than MAX_RTO is gone after all.
-        client.last_recv = Instant::now() - MAX_RTO - Duration::from_secs(1);
+        // A peer that stops answering is gone after all: the last probe
+        // above is the first of MAX_RETRIES unanswered ones.
+        for _ in 1..MAX_RETRIES {
+            fire_rto(&mut client);
+        }
+        assert!(!client.is_closed());
         fire_rto(&mut client);
         assert!(client.is_closed());
+    }
+
+    /// The same, with the backoff at MAX_RTO and the timer serviced late
+    /// (a coarse tick): the peer answers every probe within a millisecond,
+    /// yet the gap from its last answer to the next timeout exceeds
+    /// MAX_RTO. That is no sign of a dead peer.
+    #[test]
+    fn zero_window_probes_survive_a_late_timer() {
+        let (mut client, server) = established(40028);
+        client.write(b"data the peer cannot take");
+        let una = client.send_buf.as_ref().unwrap().una();
+        let zero_window_ack = Segment {
+            src_port: 80,
+            dst_port: 40028,
+            seq: server.send_buf.as_ref().unwrap().nxt(),
+            ack: una,
+            flags: flags::ACK,
+            window: 0,
+            ..Default::default()
+        };
+        for round in 0..MAX_RETRIES * 4 {
+            client.handle_segment(&zero_window_ack);
+            let rto = client.rto.rto();
+            client.last_recv = Instant::now() - (rto + Duration::from_millis(49));
+            fire_rto(&mut client);
+            assert!(
+                !client.is_closed(),
+                "torn down at round {round}, rto {rto:?}"
+            );
+        }
     }
 
     // The FIN needs a byte of window. Sent past the right edge, it would
