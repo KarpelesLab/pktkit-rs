@@ -171,9 +171,19 @@ impl Client {
             }
         };
 
-        let mut conn = self.dial_any(&addrs, req.port, deadline)?;
-        conn.set_write_timeout(Some(remaining()?));
-        conn.write_all(&wire).map_err(timed_out)?;
+        let conn = self.dial_any(&addrs, req.port, deadline)?;
+        // Not `write_all`: a write that hits its timeout returns what it
+        // got out so far, and the next would start a timeout of its own, so
+        // a peer that keeps its window just ajar could stretch the send
+        // forever. Each write gets only what is left of the deadline.
+        let mut sent = 0;
+        while sent < wire.len() {
+            conn.set_write_timeout(Some(remaining()?));
+            match conn.write(&wire[sent..]).map_err(timed_out)? {
+                0 => return Err(io::ErrorKind::WriteZero.into()),
+                n => sent += n,
+            }
+        }
 
         // Read until the response's own framing says it is complete, or to
         // EOF when it has none (we ask for `Connection: close`).
@@ -886,6 +896,8 @@ mod tests {
         use std::sync::{Arc, Mutex};
 
         let server: Arc<Mutex<Option<Conn>>> = Arc::new(Mutex::new(None));
+        // Packets waiting to be sent, and whether a call is sending them.
+        let outbox: Arc<Mutex<(std::collections::VecDeque<Vec<u8>>, bool)>> = Arc::default();
         let weak = Arc::downgrade(client);
         client.set_handler(Arc::new(move |pkt: &Packet| {
             let Ok(seg) = Segment::parse(pkt.payload()) else {
@@ -907,18 +919,31 @@ mod tests {
                     }
                 }
             };
-            if let Some(client) = weak.upgrade() {
-                for s in out {
-                    let ip = crate::build::build_ipv4(
-                        Ipv4Addr::new(10, 0, 0, 1),
-                        Ipv4Addr::new(10, 0, 0, 2),
-                        Protocol::TCP,
-                        64,
-                        &s,
-                    );
+            // Replies go out from the outermost call only: each ACK lets the
+            // client send more, synchronously, and answering from inside
+            // that would recurse once per segment of a large transfer.
+            let mut q = outbox.lock().unwrap();
+            q.0.extend(out.into_iter().map(|s| {
+                crate::build::build_ipv4(
+                    Ipv4Addr::new(10, 0, 0, 1),
+                    Ipv4Addr::new(10, 0, 0, 2),
+                    Protocol::TCP,
+                    64,
+                    &s,
+                )
+            }));
+            if q.1 {
+                return Ok(());
+            }
+            q.1 = true;
+            while let Some(ip) = q.0.pop_front() {
+                drop(q);
+                if let Some(client) = weak.upgrade() {
                     let _ = client.send(Packet::from_slice(&ip));
                 }
+                q = outbox.lock().unwrap();
             }
+            q.1 = false;
             Ok(())
         }));
     }
@@ -936,6 +961,28 @@ mod tests {
         let err = client.http(&req).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
         assert!(start.elapsed() < Duration::from_secs(3));
+    }
+
+    /// A server that never reads fills its window, then the client's send
+    /// buffer: sending stalls, and must give up when the request's timeout
+    /// runs out, not a timeout later for each partial write.
+    #[test]
+    fn stalled_send_times_out_on_the_request_deadline() {
+        let client = Client::new(super::super::ClientConfig::default().prefix(
+            crate::IpPrefix::new(IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 2)), 24),
+        ));
+        silent_server(&client);
+        let timeout = Duration::from_millis(1000);
+        // More than the peer's receive buffer and our send buffer together.
+        let body = vec![b'x'; 4 << 20];
+        let req = Request::post("http://10.0.0.1/", body)
+            .unwrap()
+            .timeout(timeout);
+        let start = std::time::Instant::now();
+        let err = client.http(&req).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        let took = start.elapsed();
+        assert!(took < timeout * 3 / 2, "took {took:?}");
     }
 
     /// Servers listening at `open` complete handshakes; a SYN to any other
