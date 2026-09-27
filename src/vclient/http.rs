@@ -650,31 +650,59 @@ fn parse_head(head: &[u8]) -> Result<Head, &'static str> {
         .fold(0u16, |n, d| n * 10 + u16::from(d - b'0'));
     let reason = String::from_utf8_lossy(sp.next().unwrap_or(b"")).into_owned();
 
-    let mut headers = BTreeMap::new();
-    let mut set_cookies = Vec::new();
+    // Each field line is `name ":" OWS value OWS` (RFC 9112 §5), read
+    // strictly: a line taken for a field it is not can carry a
+    // Content-Length or Transfer-Encoding the server never sent.
+    let mut fields: Vec<(String, Vec<u8>)> = Vec::new();
     for line in lines {
         if line.is_empty() {
             break;
         }
-        if let Some(colon) = line.iter().position(|&b| b == b':') {
-            let k = String::from_utf8_lossy(trim_ows(&line[..colon])).to_ascii_lowercase();
-            let v = String::from_utf8_lossy(trim_ows(&line[colon + 1..])).into_owned();
-            if k == "set-cookie" {
-                set_cookies.push(v.clone());
-                headers.insert(k, v);
-                continue;
-            }
-            // A repeated field is the list of its values (RFC 9110 §5.3),
-            // so a second Content-Length is checked against the first
-            // rather than silently replacing it.
-            headers
-                .entry(k)
-                .and_modify(|all: &mut String| {
-                    all.push_str(", ");
-                    all.push_str(&v);
-                })
-                .or_insert(v);
+        if let [b' ' | b'\t', ..] = line {
+            // obs-fold (RFC 9112 §5.2): a line that starts with whitespace
+            // continues the field before it, and a user agent replaces the
+            // fold with a space. Before the first field there is nothing to
+            // continue, and §2.2 lets such a line be rejected.
+            let (_, value) = fields
+                .last_mut()
+                .ok_or("whitespace before the first field")?;
+            value.push(b' ');
+            value.extend_from_slice(trim_ows(line));
+            continue;
         }
+        let colon = line
+            .iter()
+            .position(|&b| b == b':')
+            .ok_or("field line without a colon")?;
+        // Whitespace between the name and the colon is refused outright
+        // (RFC 9112 §5.1): proxies have read such names both ways.
+        let name = &line[..colon];
+        if name.is_empty() || !name.iter().all(|&b| is_tchar(b)) {
+            return Err("bad field name");
+        }
+        let name = String::from_utf8_lossy(name).to_ascii_lowercase();
+        fields.push((name, trim_ows(&line[colon + 1..]).to_vec()));
+    }
+
+    let mut headers = BTreeMap::new();
+    let mut set_cookies = Vec::new();
+    for (k, v) in fields {
+        let v = String::from_utf8_lossy(trim_ows(&v)).into_owned();
+        if k == "set-cookie" {
+            set_cookies.push(v.clone());
+            headers.insert(k, v);
+            continue;
+        }
+        // A repeated field is the list of its values (RFC 9110 §5.3), so a
+        // second Content-Length is checked against the first rather than
+        // silently replacing it.
+        headers
+            .entry(k)
+            .and_modify(|all: &mut String| {
+                all.push_str(", ");
+                all.push_str(&v);
+            })
+            .or_insert(v);
     }
     Ok((status, reason, headers, set_cookies))
 }
@@ -1269,6 +1297,36 @@ mod tests {
 
         // Nothing in the client's family at all.
         assert!(client.dial_any(&[v6], 80, deadline()).is_err());
+    }
+
+    /// A folded line continues the field before it (RFC 9112 §5.2): it is
+    /// never a field of its own.
+    #[test]
+    fn obs_fold_continues_the_previous_field() {
+        let raw = b"HTTP/1.1 200 OK\r\nX-A: a\r\n Content-Length: 3\r\n\tb \r\nContent-Length: 2\r\n\r\nokk";
+        let r = read_response(raw, raw.len()).unwrap();
+        assert_eq!(r.header("x-a"), Some("a Content-Length: 3 b"));
+        assert_eq!(r.header("content-length"), Some("2"));
+        assert_eq!(r.body, b"ok");
+        // Nothing to continue before the first field.
+        assert!(parse_head(b"HTTP/1.1 200 OK\r\n Content-Length: 3\r\n\r\n").is_err());
+    }
+
+    /// A field line must be a name, a colon, then the value (RFC 9112 §5.1).
+    #[test]
+    fn malformed_field_lines_reject_the_response() {
+        for bad in [
+            "Content-Length : 3",
+            "Content-Length\t: 3",
+            "Transfer-Encoding chunked",
+            ": x",
+            "Bad Name: x",
+            "X-\u{e9}: x",
+        ] {
+            let raw = format!("HTTP/1.1 200 OK\r\n{bad}\r\n\r\nabc");
+            let e = read_response(raw.as_bytes(), raw.len()).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{bad:?}");
+        }
     }
 
     /// Octets above 0x7F (obs-text) in a field value or the reason phrase
