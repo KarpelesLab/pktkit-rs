@@ -152,10 +152,20 @@ impl Drop for Keypair {
     }
 }
 
-/// A peer's session — current keypair plus the most recently rotated one.
+/// A peer's session: the keypairs of its last three handshakes, as in the
+/// reference implementation (whitepaper §5.4.6).
+///
+/// - `keypair_next`: derived by us as responder, not yet confirmed. The
+///   initiator may never have received our response, so we must not send
+///   with it; the first transport packet that authenticates under it
+///   promotes it to current.
+/// - `keypair_current`: the one we send with.
+/// - `keypair_prev`: the one before, still accepted on receive so packets in
+///   flight across a rekey are not lost.
 pub(crate) struct Session {
     pub keypair_current: Option<Arc<Keypair>>,
     pub keypair_prev: Option<Arc<Keypair>>,
+    pub keypair_next: Option<Arc<Keypair>>,
     pub last_received: Instant,
     pub last_sent: Instant,
     #[allow(dead_code)]
@@ -263,6 +273,9 @@ impl Handler {
                 kps.remove(&kp.local_index);
             }
             if let Some(kp) = sess.keypair_prev.as_ref() {
+                kps.remove(&kp.local_index);
+            }
+            if let Some(kp) = sess.keypair_next.as_ref() {
                 kps.remove(&kp.local_index);
             }
         }
@@ -428,24 +441,27 @@ impl Handler {
     fn cleanup_sessions(&self) {
         let n = Instant::now();
         let mut sess = self.sessions.write().expect("sessions lock");
-        let mut to_remove = Vec::new();
-        for (k, s) in sess.iter() {
-            let last_active = s.last_received.max(s.last_sent);
-            if n.duration_since(last_active) > REJECT_AFTER_TIME {
-                to_remove.push(*k);
-            }
-        }
         let mut kps = self.keypairs.write().expect("keypairs lock");
-        for k in &to_remove {
-            if let Some(s) = sess.remove(k) {
-                if let Some(kp) = s.keypair_current.as_ref() {
-                    kps.remove(&kp.local_index);
-                }
-                if let Some(kp) = s.keypair_prev.as_ref() {
-                    kps.remove(&kp.local_index);
+        // A keypair past REJECT_AFTER_TIME can neither send nor receive, so
+        // its index entry and slot only take up room.
+        sess.retain(|_, s| {
+            for slot in [
+                &mut s.keypair_current,
+                &mut s.keypair_prev,
+                &mut s.keypair_next,
+            ] {
+                if slot
+                    .as_ref()
+                    .is_some_and(|kp| n.duration_since(kp.created) > REJECT_AFTER_TIME)
+                {
+                    kps.remove(&slot.take().unwrap().local_index);
                 }
             }
-        }
+            let last_active = s.last_received.max(s.last_sent);
+            n.duration_since(last_active) <= REJECT_AFTER_TIME
+                || s.keypair_current.is_some()
+                || s.keypair_next.is_some()
+        });
     }
 
     /// Drop all per-connection state. Peer authorizations survive.
@@ -471,11 +487,26 @@ impl Handler {
         Ok(())
     }
 
-    pub(crate) fn take_handshake(&self, idx: u32) -> Option<crate::wg::handshake::Handshake> {
+    /// A copy of the pending handshake at `idx`. The entry stays in place
+    /// until [`complete_handshake`](Self::complete_handshake), so a forged
+    /// response that fails authentication cannot discard it.
+    pub(crate) fn peek_handshake(&self, idx: u32) -> Option<crate::wg::handshake::Handshake> {
+        self.handshakes
+            .lock()
+            .expect("handshakes lock")
+            .get(&idx)
+            .cloned()
+    }
+
+    /// Remove the pending handshake at `idx` once a response for it has
+    /// authenticated. False if it is already gone: another copy of the same
+    /// response completed it first.
+    pub(crate) fn complete_handshake(&self, idx: u32) -> bool {
         self.handshakes
             .lock()
             .expect("handshakes lock")
             .remove(&idx)
+            .is_some()
     }
 
     pub(crate) fn has_handshake_index(&self, idx: u32) -> bool {
@@ -483,13 +514,6 @@ impl Handler {
             .lock()
             .expect("handshakes lock")
             .contains_key(&idx)
-    }
-
-    pub(crate) fn install_keypair(&self, idx: u32, kp: Arc<Keypair>) {
-        self.keypairs
-            .write()
-            .expect("keypairs lock")
-            .insert(idx, kp);
     }
 
     pub(crate) fn lookup_keypair(&self, idx: u32) -> Option<Arc<Keypair>> {
@@ -507,42 +531,86 @@ impl Handler {
             .contains_key(&idx)
     }
 
-    pub(crate) fn check_keypair_capacity(&self, cap: usize) -> Result<()> {
-        if self.keypairs.read().expect("keypairs lock").len() >= cap {
-            return Err(io::Error::other("keypair table full"));
-        }
-        Ok(())
-    }
-
-    pub(crate) fn check_session_capacity(&self, cap: usize, k: &NoisePublicKey) -> Result<()> {
-        let g = self.sessions.read().expect("sessions lock");
-        if g.len() >= cap && !g.contains_key(k) {
+    /// Index `kp` and give it a slot in `peer_key`'s session, via `place`,
+    /// which returns the keypairs it displaced; their index entries go too.
+    /// Capacity is checked before anything is touched, so a refusal leaves
+    /// no orphan entry behind.
+    fn install(
+        &self,
+        peer_key: NoisePublicKey,
+        kp: Arc<Keypair>,
+        place: impl FnOnce(&mut Session, Arc<Keypair>) -> Vec<Arc<Keypair>>,
+    ) -> Result<()> {
+        use crate::wg::constants::{MAX_HANDSHAKES, MAX_SESSIONS};
+        let mut sess = self.sessions.write().expect("sessions lock");
+        let mut kps = self.keypairs.write().expect("keypairs lock");
+        if sess.len() >= MAX_SESSIONS && !sess.contains_key(&peer_key) {
             return Err(io::Error::other("session table full"));
         }
+        if kps.len() >= MAX_HANDSHAKES {
+            return Err(io::Error::other("keypair table full"));
+        }
+        kps.insert(kp.local_index, kp.clone());
+        let s = sess.entry(peer_key).or_insert_with(|| Session {
+            keypair_current: None,
+            keypair_prev: None,
+            keypair_next: None,
+            last_received: Instant::now(),
+            last_sent: Instant::now(),
+            peer_key,
+        });
+        for old in place(s, kp) {
+            kps.remove(&old.local_index);
+        }
         Ok(())
     }
 
-    pub(crate) fn upsert_session(&self, peer_key: NoisePublicKey, kp: Arc<Keypair>) {
+    /// Install the keypair from a handshake we initiated. The response
+    /// proved the peer holds it, so it becomes current at once.
+    pub(crate) fn install_initiator_keypair(
+        &self,
+        peer_key: NoisePublicKey,
+        kp: Arc<Keypair>,
+    ) -> Result<()> {
+        self.install(peer_key, kp, |s, kp| {
+            let mut gone: Vec<_> = s.keypair_next.take().into_iter().collect();
+            gone.extend(s.keypair_prev.take());
+            s.keypair_prev = s.keypair_current.replace(kp);
+            gone
+        })
+    }
+
+    /// Install the keypair from a handshake we answered. Held as next until
+    /// the initiator's first transport packet shows it got our response.
+    pub(crate) fn install_responder_keypair(
+        &self,
+        peer_key: NoisePublicKey,
+        kp: Arc<Keypair>,
+    ) -> Result<()> {
+        self.install(peer_key, kp, |s, kp| {
+            s.keypair_next.replace(kp).into_iter().collect()
+        })
+    }
+
+    /// A transport packet authenticated under `kp`. If that is the session's
+    /// unconfirmed next keypair, the initiator has it: make it current.
+    pub(crate) fn received_with_keypair(&self, kp: &Arc<Keypair>) {
         let mut sess = self.sessions.write().expect("sessions lock");
-        match sess.get_mut(&peer_key) {
-            Some(s) => {
-                if let Some(prev) = s.keypair_current.take() {
-                    s.keypair_prev = Some(prev);
-                }
-                s.keypair_current = Some(kp);
-            }
-            None => {
-                sess.insert(
-                    peer_key,
-                    Session {
-                        keypair_current: Some(kp),
-                        keypair_prev: None,
-                        last_received: Instant::now(),
-                        last_sent: Instant::now(),
-                        peer_key,
-                    },
-                );
-            }
+        let Some(s) = sess.get_mut(&kp.peer_key) else {
+            return;
+        };
+        if !s.keypair_next.as_ref().is_some_and(|n| Arc::ptr_eq(n, kp)) {
+            return;
+        }
+        let next = s.keypair_next.take();
+        let old_prev = std::mem::replace(&mut s.keypair_prev, s.keypair_current.take());
+        s.keypair_current = next;
+        drop(sess);
+        if let Some(old) = old_prev {
+            self.keypairs
+                .write()
+                .expect("keypairs lock")
+                .remove(&old.local_index);
         }
     }
 
@@ -782,6 +850,99 @@ mod tests {
             before,
             "each encrypt leaked a reference"
         );
+    }
+
+    /// Full handshake a→b, returning the keepalive a sent.
+    fn handshake(a: &Handler, b: &Handler) -> Vec<u8> {
+        let addr = loopback();
+        let init = a.initiate_handshake(&b.public_key()).unwrap();
+        let resp = b.process_packet(&init, &addr).unwrap();
+        let ka = a.process_packet(&resp.response, &addr).unwrap();
+        b.process_packet(&ka.response, &addr).unwrap();
+        ka.response
+    }
+
+    fn pair() -> (Arc<Handler>, Arc<Handler>) {
+        let a = Handler::new(Config::default()).unwrap();
+        let b = Handler::new(Config::default()).unwrap();
+        a.add_peer(b.public_key());
+        b.add_peer(a.public_key());
+        (a, b)
+    }
+
+    /// The responder must not send with a keypair the initiator may never
+    /// have derived (whitepaper §5.4.6): if the response is lost, traffic
+    /// from the responder has to keep working on the old keypair.
+    #[test]
+    fn responder_keeps_sending_on_the_old_keypair_until_confirmed() {
+        let (a, b) = pair();
+        let addr = loopback();
+        handshake(&a, &b);
+
+        // Rekey, but the response never reaches a.
+        let init = a.initiate_handshake(&b.public_key()).unwrap();
+        let _lost = b.process_packet(&init, &addr).unwrap();
+        let pkt = b.encrypt(b"still here", &a.public_key()).unwrap();
+        let got = a.process_packet(&pkt, &addr).unwrap();
+        assert_eq!(got.data, b"still here");
+
+        // First handshake: nothing to send with until a confirms.
+        let (c, d) = pair();
+        let init = c.initiate_handshake(&d.public_key()).unwrap();
+        let resp = d.process_packet(&init, &addr).unwrap();
+        assert!(!d.has_session(&c.public_key()));
+        let ka = c.process_packet(&resp.response, &addr).unwrap();
+        d.process_packet(&ka.response, &addr).unwrap();
+        assert!(d.has_session(&c.public_key()), "confirmed by c's keepalive");
+    }
+
+    /// Handshake after handshake, each side indexes at most its three
+    /// keypairs (previous, current, next) for the peer.
+    #[test]
+    fn rekeying_does_not_grow_the_keypair_table() {
+        let (a, b) = pair();
+        for i in 0..20 {
+            if i % 2 == 0 {
+                handshake(&a, &b);
+            } else {
+                handshake(&b, &a);
+            }
+        }
+        assert!(
+            a.keypairs.read().unwrap().len() <= 3,
+            "{}",
+            a.keypairs.read().unwrap().len()
+        );
+        assert!(
+            b.keypairs.read().unwrap().len() <= 3,
+            "{}",
+            b.keypairs.read().unwrap().len()
+        );
+        let pkt = a.encrypt(b"after", &b.public_key()).unwrap();
+        assert_eq!(b.process_packet(&pkt, &loopback()).unwrap().data, b"after");
+    }
+
+    /// A forged response with the right receiver index and a valid MAC1
+    /// (both computable from public information) must not cost the initiator
+    /// its pending handshake.
+    #[test]
+    fn forged_response_does_not_discard_the_pending_handshake() {
+        use crate::wg::constants::MESSAGE_RESPONSE_SIZE;
+        let (a, b) = pair();
+        let addr = loopback();
+        let init = a.initiate_handshake(&b.public_key()).unwrap();
+        let resp = b.process_packet(&init, &addr).unwrap();
+
+        let mut forged = resp.response.clone();
+        forged[12..MESSAGE_RESPONSE_SIZE - 32].fill(0x42);
+        let mac1_key = crate::wg::crypto::calculate_mac1_key(&a.public_key());
+        let mac1 =
+            crate::wg::crypto::blake2s_mac_128(&mac1_key, &forged[..MESSAGE_RESPONSE_SIZE - 32]);
+        forged[MESSAGE_RESPONSE_SIZE - 32..MESSAGE_RESPONSE_SIZE - 16].copy_from_slice(&mac1);
+        assert!(a.process_packet(&forged, &addr).is_err());
+
+        let ka = a.process_packet(&resp.response, &addr).unwrap();
+        assert_eq!(ka.ty, PacketType::HandshakeResponse);
     }
 
     #[test]

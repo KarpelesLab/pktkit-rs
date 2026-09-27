@@ -73,6 +73,9 @@ pub(crate) fn process_data_packet(h: &Handler, data: &[u8]) -> Result<PacketResu
     if kp.replay_filter.check_replay(counter) {
         return Err(replay());
     }
+    // The initiator sends with a keypair only once it has our response, so
+    // this is the confirmation a responder's next keypair waits for.
+    h.received_with_keypair(&kp);
 
     let peer_key = kp.peer_key;
 

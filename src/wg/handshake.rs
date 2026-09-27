@@ -15,9 +15,8 @@ use crate::zeroize::zeroize;
 use crate::Result;
 use crate::wg::constants::{
     BLAKE2S_128_SIZE, BLAKE2S_256_SIZE, CHACHAPOLY_KEY_SIZE, CHACHAPOLY_OVERHEAD, HandshakeState,
-    MAX_HANDSHAKES, MAX_SESSIONS, MESSAGE_INITIATION_SIZE, MESSAGE_INITIATION_TYPE,
-    MESSAGE_RESPONSE_SIZE, MESSAGE_RESPONSE_TYPE, NOISE_PUBLIC_KEY_SIZE, NoisePrivateKey,
-    NoisePublicKey, TAI64N_TIMESTAMP_SIZE,
+    MESSAGE_INITIATION_SIZE, MESSAGE_INITIATION_TYPE, MESSAGE_RESPONSE_SIZE, MESSAGE_RESPONSE_TYPE,
+    NOISE_PUBLIC_KEY_SIZE, NoisePrivateKey, NoisePublicKey, TAI64N_TIMESTAMP_SIZE,
 };
 use crate::wg::crypto::{
     aead_open_zero, aead_seal_zero, blake2s_mac_128, calculate_mac1_key, ct_eq, fill_random,
@@ -224,14 +223,15 @@ pub(crate) fn process_handshake_response(h: &Handler, data: &[u8]) -> Result<Pac
             .unwrap(),
     );
 
+    // Work on a copy: the receiver index is in cleartext in our initiation,
+    // so anyone on path can send a response for it. The pending handshake is
+    // only consumed once the response authenticates, below.
     let mut hs = h
-        .take_handshake(receiver_idx)
+        .peek_handshake(receiver_idx)
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no pending handshake"))?;
 
     // MAC1 is keyed on *our* public key.
     if !check_mac1(h.public_key().as_bytes(), data) {
-        // Put the handshake back so a later retransmit can complete.
-        h.insert_handshake(receiver_idx, hs)?;
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid MAC1 on response",
@@ -283,6 +283,15 @@ pub(crate) fn process_handshake_response(h: &Handler, data: &[u8]) -> Result<Pac
     let h_save = hs.hash;
     mix_hash(&mut hs.hash, &h_save, empty_ct);
 
+    // Authenticated. Consume the pending handshake; if it is already gone,
+    // a copy of this response got there first.
+    if !h.complete_handshake(receiver_idx) {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "no pending handshake",
+        ));
+    }
+
     // Bind remote index/eph for later use (also touches the local copy).
     hs.remote_index = sender_idx;
     hs.remote_ephemeral = server_eph_pub;
@@ -315,8 +324,7 @@ pub(crate) fn process_handshake_response(h: &Handler, data: &[u8]) -> Result<Pac
         replay_filter: SlidingWindow::new(),
     });
 
-    h.install_keypair(local_idx, kp.clone());
-    h.upsert_session(peer_key, kp);
+    h.install_initiator_keypair(peer_key, kp)?;
 
     // Touch peer last-handshake.
     h.touch_peer_handshake(&peer_key);
@@ -574,10 +582,7 @@ pub(crate) fn process_handshake_initiation(
         replay_filter: SlidingWindow::new(),
     });
 
-    h.check_keypair_capacity(MAX_HANDSHAKES)?;
-    h.install_keypair(sender_idx_local, kp.clone());
-    h.check_session_capacity(MAX_SESSIONS, &peer_key)?;
-    h.upsert_session(peer_key, kp);
+    h.install_responder_keypair(peer_key, kp)?;
 
     h.touch_peer_handshake(&peer_key);
 
