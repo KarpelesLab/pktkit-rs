@@ -654,9 +654,9 @@ impl Nat {
             pkt_in
         };
 
-        if pkt.len() < 20 || pkt[0] >> 4 != 4 {
+        let Some((pkt, ihl)) = ipv4_datagram(pkt) else {
             return;
-        }
+        };
 
         // Local helper interception: packets to the NAT's own inside IP, and
         // multicast and broadcast (SSDP discovery goes to 239.255.255.250).
@@ -673,10 +673,6 @@ impl Nat {
             return;
         }
 
-        let ihl = (pkt[0] & 0x0F) as usize * 4;
-        if ihl < 20 {
-            return;
-        }
         let proto = pkt[9];
         match proto {
             PROTO_TCP | PROTO_UDP => {
@@ -832,13 +828,9 @@ impl Nat {
             pkt_in
         };
 
-        if pkt.len() < 20 || pkt[0] >> 4 != 4 {
+        let Some((pkt, ihl)) = ipv4_datagram(pkt) else {
             return;
-        }
-        let ihl = (pkt[0] & 0x0F) as usize * 4;
-        if ihl < 20 {
-            return;
-        }
+        };
         let proto = pkt[9];
         match proto {
             PROTO_TCP | PROTO_UDP => {
@@ -992,67 +984,102 @@ impl Nat {
         }
     }
 
+    /// Translate an ICMP error about a packet this NAT sent out (RFC 5508
+    /// §7): the outer destination and the embedded packet's source go back to
+    /// the inside endpoint, with every checksum that covers them patched.
     fn inbound_icmp_error(&self, pkt: &[u8], outer_ihl: usize) {
         let emb_off = outer_ihl + 8;
         if pkt.len() < emb_off + 20 {
             return;
         }
-        let emb_ihl = (pkt[emb_off] & 0x0F) as usize * 4;
-        if emb_ihl < 20 || pkt.len() < emb_off + emb_ihl + 4 {
+        // The outer checksum is recomputed below; check it first, so a
+        // corrupted error is not passed on as a valid one.
+        if checksum(&pkt[outer_ihl..]) != 0 {
             return;
         }
-        let emb_proto = pkt[emb_off + 9];
-        let emb_port = match emb_proto {
-            PROTO_TCP | PROTO_UDP => {
-                u16::from_be_bytes([pkt[emb_off + emb_ihl], pkt[emb_off + emb_ihl + 1]])
-            }
-            PROTO_ICMP => {
-                if pkt.len() < emb_off + emb_ihl + 6 {
-                    return;
-                }
-                u16::from_be_bytes([pkt[emb_off + emb_ihl + 4], pkt[emb_off + emb_ihl + 5]])
-            }
+        let emb_ihl = (pkt[emb_off] & 0x0F) as usize * 4;
+        if emb_ihl < 20 || pkt.len() < emb_off + emb_ihl + 8 {
+            return;
+        }
+        let emb = &pkt[emb_off..];
+        let emb_proto = emb[9];
+        let l4 = &emb[emb_ihl..];
+        let (emb_port, remote) = match emb_proto {
+            PROTO_TCP | PROTO_UDP => (
+                u16::from_be_bytes([l4[0], l4[1]]),
+                SocketAddrV4::new(
+                    Ipv4Addr::new(emb[16], emb[17], emb[18], emb[19]),
+                    u16::from_be_bytes([l4[2], l4[3]]),
+                ),
+            ),
+            // Only an echo request can have left through this NAT.
+            PROTO_ICMP if l4[0] == 8 => (
+                u16::from_be_bytes([l4[4], l4[5]]),
+                SocketAddrV4::new(Ipv4Addr::new(emb[16], emb[17], emb[18], emb[19]), 0),
+            ),
             _ => return,
         };
+        if Some(Ipv4Addr::new(emb[12], emb[13], emb[14], emb[15])) != self.outside_addr() {
+            return;
+        }
         let rk = NatRevKey {
             proto: emb_proto,
             port: emb_port,
         };
         let mapping_key = {
-            let mut inner = self.inner.lock().unwrap();
+            let inner = self.inner.lock().unwrap();
             let k = match inner.reverse.get(&rk).copied() {
                 Some(k) => k,
                 None => return,
             };
-            if let Some(m) = inner.mappings.get_mut(&k) {
-                m.last_active = Instant::now();
+            // The error must be about traffic this mapping actually sent;
+            // anyone can otherwise forge errors that tear down or confuse
+            // an inside host's sessions.
+            match inner.mappings.get(&k) {
+                Some(m) if m.peers.contains(&remote) => {}
+                _ => return,
             }
             k
         };
 
         let mut out = pkt.to_vec();
         let old_outer_dst: [u8; 4] = out[16..20].try_into().unwrap();
-        let new_outer_dst = mapping_key.ip.octets();
-        out[16..20].copy_from_slice(&new_outer_dst);
-        update_ip_checksum(&mut out, old_outer_dst, new_outer_dst);
+        let inside_ip = mapping_key.ip.octets();
+        out[16..20].copy_from_slice(&inside_ip);
+        update_ip_checksum(&mut out, old_outer_dst, inside_ip);
 
-        // Rewrite embedded source IP → inside client.
-        out[emb_off + 12..emb_off + 16].copy_from_slice(&new_outer_dst);
-
-        // Rewrite embedded source port.
+        // Embedded packet: source back to the inside endpoint, fixing its IP
+        // header checksum and, where the quoted bytes include it, its
+        // transport checksum, so the inside stack can match the error to
+        // its own packet.
+        let old_src: [u8; 4] = out[emb_off + 12..emb_off + 16].try_into().unwrap();
+        {
+            let emb = &mut out[emb_off..];
+            emb[12..16].copy_from_slice(&inside_ip);
+            update_ip_checksum(emb, old_src, inside_ip);
+        }
+        let l4_off = emb_off + emb_ihl;
+        let new_port = mapping_key.port;
         match emb_proto {
             PROTO_TCP | PROTO_UDP => {
-                out[emb_off + emb_ihl..emb_off + emb_ihl + 2]
-                    .copy_from_slice(&mapping_key.port.to_be_bytes());
+                out[l4_off..l4_off + 2].copy_from_slice(&new_port.to_be_bytes());
+                let csum_off = l4_off + if emb_proto == PROTO_TCP { 16 } else { 6 };
+                let present = out.len() >= csum_off + 2;
+                let unused =
+                    emb_proto == PROTO_UDP && present && out[csum_off..csum_off + 2] == [0, 0];
+                if present && !unused {
+                    update_l4_checksum(&mut out, csum_off, old_src, inside_ip, emb_port, new_port);
+                    if emb_proto == PROTO_UDP {
+                        udp_nonzero_checksum(&mut out, csum_off);
+                    }
+                }
             }
-            PROTO_ICMP => {
-                out[emb_off + emb_ihl + 4..emb_off + emb_ihl + 6]
-                    .copy_from_slice(&mapping_key.port.to_be_bytes());
+            _ => {
+                out[l4_off + 4..l4_off + 6].copy_from_slice(&new_port.to_be_bytes());
+                update_icmp_checksum(&mut out, l4_off, emb_port, new_port);
             }
-            _ => unreachable!(),
         }
 
-        // Recompute outer ICMP checksum from scratch (it covers modified bytes).
         out[outer_ihl + 2..outer_ihl + 4].copy_from_slice(&[0, 0]);
         let csum = checksum(&out[outer_ihl..]);
         out[outer_ihl + 2..outer_ihl + 4].copy_from_slice(&csum.to_be_bytes());
@@ -1269,6 +1296,21 @@ pub(crate) fn update_l4_checksum(
     );
     csum = checksum_adjust(csum, old_port, new_port);
     pkt[csum_off..csum_off + 2].copy_from_slice(&csum.to_be_bytes());
+}
+
+/// Validate an IPv4 header and return the datagram, cut to its total length
+/// (anything after it is link-layer padding, which no checksum covers),
+/// along with its header length.
+fn ipv4_datagram(pkt: &[u8]) -> Option<(&[u8], usize)> {
+    if pkt.len() < 20 || pkt[0] >> 4 != 4 {
+        return None;
+    }
+    let ihl = (pkt[0] & 0x0F) as usize * 4;
+    let total = u16::from_be_bytes([pkt[2], pkt[3]]) as usize;
+    if ihl < 20 || total < ihl || pkt.len() < total {
+        return None;
+    }
+    Some((&pkt[..total], ihl))
 }
 
 /// The TCP flags byte of a TCP packet, `None` for anything else (or a
@@ -2024,5 +2066,77 @@ mod tests {
         open_tcp(&nat, &o);
         nat.sweep_at(Instant::now() + Duration::from_secs(3600));
         assert_eq!(mapped(&nat), 1);
+    }
+
+    /// An ICMP error from `from` quoting `quoted` in full.
+    fn icmp_error(from: Ipv4Addr, quoted: &[u8]) -> Vec<u8> {
+        let total = 20 + 8 + quoted.len();
+        let mut p = vec![0u8; total];
+        p[0] = 0x45;
+        p[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+        p[8] = 64;
+        p[9] = PROTO_ICMP;
+        p[12..16].copy_from_slice(&from.octets());
+        p[16..20].copy_from_slice(&PUBLIC.octets());
+        let ic = checksum(&p[..20]);
+        p[10..12].copy_from_slice(&ic.to_be_bytes());
+        p[20] = 3; // destination unreachable
+        p[21] = 3; // port unreachable
+        p[28..].copy_from_slice(quoted);
+        let cs = checksum(&p[20..]);
+        p[22..24].copy_from_slice(&cs.to_be_bytes());
+        p
+    }
+
+    #[test]
+    fn icmp_error_is_translated_with_valid_checksums() {
+        let (nat, i, o) = setup();
+        let mut p = build_udp(INSIDE, 5000, REMOTE, 53, b"query");
+        crate::nat::l4::fill_v4_l4_checksum(&mut p, 20);
+        nat.inside().send(Packet::from_slice(&p)).unwrap();
+        let sent = o.lock().unwrap()[0].clone();
+
+        nat.outside()
+            .send(Packet::from_slice(&icmp_error(REMOTE, &sent)))
+            .unwrap();
+        let got = i.lock().unwrap();
+        assert_eq!(got.len(), 1);
+        let e = &got[0];
+        assert_eq!(&e[16..20], &INSIDE.octets());
+        assert_eq!(checksum(&e[20..]), 0, "outer ICMP checksum");
+        let inner = &e[28..];
+        // The quoted datagram is exactly what the inside host sent.
+        assert_eq!(inner, &p[..]);
+        assert_eq!(checksum(&inner[..20]), 0, "inner IP checksum");
+        assert!(
+            crate::nat::l4::v4_l4_checksum_ok(inner, 20),
+            "inner UDP checksum"
+        );
+    }
+
+    #[test]
+    fn forged_icmp_error_is_dropped() {
+        let (nat, i, o) = setup();
+        let p = build_udp(INSIDE, 5000, REMOTE, 53, b"query");
+        nat.inside().send(Packet::from_slice(&p)).unwrap();
+        let sent = o.lock().unwrap()[0].clone();
+
+        // An error quoting a packet to a host the mapping never talked to.
+        let other = Ipv4Addr::new(192, 0, 2, 66);
+        let mut forged = sent.clone();
+        forged[16..20].copy_from_slice(&other.octets());
+        forged[10..12].copy_from_slice(&[0, 0]);
+        let ic = checksum(&forged[..20]);
+        forged[10..12].copy_from_slice(&ic.to_be_bytes());
+        nat.outside()
+            .send(Packet::from_slice(&icmp_error(other, &forged)))
+            .unwrap();
+        assert!(i.lock().unwrap().is_empty());
+
+        // A corrupted error is not laundered into a valid one either.
+        let mut bad = icmp_error(REMOTE, &sent);
+        bad[30] ^= 0xFF;
+        nat.outside().send(Packet::from_slice(&bad)).unwrap();
+        assert!(i.lock().unwrap().is_empty());
     }
 }

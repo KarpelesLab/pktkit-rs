@@ -119,6 +119,11 @@ impl Peers {
         }
     }
 
+    /// True if the mapping has exchanged traffic with `peer`.
+    pub(crate) fn contains(&self, peer: &SocketAddrV4) -> bool {
+        self.map.contains_key(peer)
+    }
+
     /// Forget remotes idle past their timeout, and report whether the whole
     /// mapping (last active at `last_active`) is now idle and may go.
     pub(crate) fn expire(&mut self, proto: u8, last_active: Instant, now: Instant) -> bool {
@@ -193,7 +198,7 @@ mod tests {
         p.note(peer(80), true, Some(TCP_SYN), now);
         p.note(peer(80), false, Some(TCP_SYN | TCP_ACK), now);
         p.note(peer(81), false, Some(TCP_RST), now);
-        assert!(!p.map.contains_key(&peer(81)));
+        assert!(!p.contains(&peer(81)));
         assert!(!p.expire(PROTO_TCP, now, now + Duration::from_secs(3600)));
     }
 
