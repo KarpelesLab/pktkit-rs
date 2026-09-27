@@ -43,6 +43,16 @@ pub struct Config {
     /// (1000); `Some(n)` sets it exactly, so `Some(0)` makes every
     /// initiation under-load (useful in tests to force the cookie path).
     pub load_threshold: Option<usize>,
+
+    /// Peers [`Handler::accept_unknown_peer`] (and
+    /// [`Adapter::accept_unknown_peer`](crate::wg::Adapter::accept_unknown_peer))
+    /// will take the handler to: past this many authorized peers, a new one
+    /// is refused. An `on_unknown_peer` that accepts every key would
+    /// otherwise let anyone grow the peer table without end, one fresh key
+    /// per initiation. Peers added with [`Handler::add_peer`] are not
+    /// limited, but count. `None` uses the default (10000, the most that
+    /// can hold a session at once).
+    pub unknown_peer_limit: Option<usize>,
 }
 
 setters! {
@@ -50,6 +60,7 @@ setters! {
         set private_key: NoisePrivateKey;
         some on_unknown_peer: UnknownPeerFn;
         some load_threshold: usize;
+        some unknown_peer_limit: usize;
     }
 }
 
@@ -59,6 +70,7 @@ impl std::fmt::Debug for Config {
             .field("private_key", &self.private_key)
             .field("on_unknown_peer", &self.on_unknown_peer.is_some())
             .field("load_threshold", &self.load_threshold)
+            .field("unknown_peer_limit", &self.unknown_peer_limit)
             .finish()
     }
 }
@@ -207,6 +219,7 @@ pub struct Handler {
     pub(crate) sessions: RwLock<HashMap<NoisePublicKey, Session>>,
 
     on_unknown_peer: Mutex<Option<UnknownPeerFn>>,
+    unknown_peer_limit: usize,
     load_threshold: usize,
     /// Initiations seen in the current one-second window, and when being
     /// under load lapses. Initiations are processed inline, so the
@@ -253,6 +266,9 @@ impl Handler {
             keypairs: RwLock::new(HashMap::new()),
             sessions: RwLock::new(HashMap::new()),
             on_unknown_peer: Mutex::new(cfg.on_unknown_peer),
+            unknown_peer_limit: cfg
+                .unknown_peer_limit
+                .unwrap_or(crate::wg::constants::DEFAULT_UNKNOWN_PEER_LIMIT),
             load_threshold: lt,
             load: Mutex::new(LoadMeter::default()),
             cookie_checker: Mutex::new(crate::wg::cookie::CookieChecker::new(&pub_key)),
@@ -281,7 +297,10 @@ impl Handler {
     /// calls this on every identity. Use [`remove_peer`](Self::remove_peer)
     /// first to take the key away.
     pub fn add_peer(&self, peer_key: NoisePublicKey) {
-        let mut peers = self.peers.write().expect("peers lock");
+        Self::add_peer_locked(&mut self.peers.write().expect("peers lock"), peer_key);
+    }
+
+    fn add_peer_locked(peers: &mut HashMap<NoisePublicKey, PeerEntry>, peer_key: NoisePublicKey) {
         match peers.get_mut(&peer_key) {
             // Update in place, as add_peer_with_psk does, to keep the replay
             // state.
@@ -1106,16 +1125,31 @@ impl Handler {
             .consume_reply(nonce, ct)
     }
 
+    /// [`add_peer`](Self::add_peer) for a peer accepted from
+    /// `on_unknown_peer`: refused if it is new and the table already holds
+    /// [`unknown_peer_limit`](Config::unknown_peer_limit) peers.
+    pub(crate) fn add_unknown_peer(&self, peer_key: NoisePublicKey) -> Result<()> {
+        let mut peers = self.peers.write().expect("peers lock");
+        if !peers.contains_key(&peer_key) && peers.len() >= self.unknown_peer_limit {
+            return Err(io::Error::other("peer table full"));
+        }
+        Self::add_peer_locked(&mut peers, peer_key);
+        Ok(())
+    }
+
     /// Authorize a previously unknown peer and complete its handshake by
     /// re-running the initiation through the responder path. Returns the
     /// raw response bytes the caller should send back to `remote_addr`.
+    ///
+    /// A new peer is refused once the handler has
+    /// [`unknown_peer_limit`](Config::unknown_peer_limit) peers.
     pub fn accept_unknown_peer(
         &self,
         peer_key: NoisePublicKey,
         initiation_packet: &[u8],
         remote_addr: &SocketAddr,
     ) -> Result<Vec<u8>> {
-        self.add_peer(peer_key);
+        self.add_unknown_peer(peer_key)?;
         // Re-running an initiation from a peer still unauthorized would only
         // be refused again, after invoking on_unknown_peer once more.
         if !self.is_authorized_peer(&peer_key) {
@@ -1885,6 +1919,33 @@ mod tests {
         let (a, b) = pair();
         assert!(a.encrypt(b"x", &b.public_key()).is_err());
         assert_eq!(timer_actions(&a), ["handshake"]);
+    }
+
+    /// Accepting unknown peers stops at the configured limit: an
+    /// on_unknown_peer that takes every key let anyone grow the peer table
+    /// without end, one fresh key per initiation.
+    #[test]
+    fn accepting_unknown_peers_stops_at_the_limit() {
+        let b = Handler::new(Config::default().unknown_peer_limit(3)).unwrap();
+        b.add_peer(NoisePublicKey([1; 32]));
+        let accept = |a: &Handler| {
+            a.add_peer(b.public_key());
+            let init = a.initiate_handshake(&b.public_key()).unwrap();
+            b.accept_unknown_peer(a.public_key(), &init, &loopback())
+        };
+        let (a1, a2, a3) = (pair().0, pair().0, pair().0);
+        assert!(accept(&a1).is_ok());
+        assert!(accept(&a2).is_ok());
+        assert!(accept(&a3).is_err(), "grew past the limit");
+        assert_eq!(b.peers().len(), 3);
+        // A peer already there is still refreshed: an expired one can be
+        // accepted again.
+        b.set_peer_expiry(&a1.public_key(), Instant::now() - Duration::from_secs(1));
+        pace();
+        assert!(accept(&a1).is_ok());
+        // Explicit authorization is the caller's call and is not limited.
+        b.add_peer(a3.public_key());
+        assert_eq!(b.peers().len(), 4);
     }
 
     #[test]

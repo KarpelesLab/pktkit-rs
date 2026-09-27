@@ -35,12 +35,18 @@ pub struct AdapterConfig {
     pub addr: IpPrefix,
     /// Optional callback for unauthorized peers.
     pub on_unknown_peer: Option<crate::wg::handler::UnknownPeerFn>,
+    /// Most peers [`Adapter::accept_unknown_peer`] takes the handler to; see
+    /// [`Config::unknown_peer_limit`](crate::wg::Config::unknown_peer_limit).
+    /// `None` uses the default (10000). Ignored if `multi_handler` is set:
+    /// its handlers carry their own.
+    pub unknown_peer_limit: Option<usize>,
 }
 
 setters! {
     AdapterConfig {
         some multi_handler: Arc<MultiHandler>;
         some on_unknown_peer: crate::wg::handler::UnknownPeerFn;
+        some unknown_peer_limit: usize;
     }
 }
 
@@ -58,6 +64,7 @@ impl AdapterConfig {
             connector,
             addr,
             on_unknown_peer: None,
+            unknown_peer_limit: None,
         }
     }
 }
@@ -220,6 +227,7 @@ impl Adapter {
                 private_key: cfg.private_key.clone(),
                 on_unknown_peer: cfg.on_unknown_peer.clone(),
                 load_threshold: None,
+                unknown_peer_limit: cfg.unknown_peer_limit,
             })?;
             ServerConfig {
                 handler: Some(h),
@@ -300,6 +308,9 @@ impl Adapter {
     /// Authorize an unknown peer's handshake (call from `on_unknown_peer`)
     /// and complete it: the response goes out, the peer's address is
     /// recorded and `on_peer_connected` fires, as for any other handshake.
+    ///
+    /// A new peer is refused once the handler has
+    /// [`unknown_peer_limit`](AdapterConfig::unknown_peer_limit) peers.
     pub fn accept_unknown_peer(
         &self,
         key: NoisePublicKey,
@@ -314,10 +325,10 @@ impl Adapter {
                 .ok_or_else(|| {
                     io::Error::new(io::ErrorKind::NotFound, "no handler matched MAC1")
                 })?;
-            h.add_peer(key);
+            h.add_unknown_peer(key)?;
             h
         } else if let Some(h) = self.handler.as_ref() {
-            h.add_peer(key);
+            h.add_unknown_peer(key)?;
             h.clone()
         } else {
             return Err(io::Error::other("no handler"));

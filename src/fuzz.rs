@@ -650,6 +650,7 @@ pub fn wg_process(data: &[u8]) {
             private_key: [7u8; 32].into(),
             on_unknown_peer: None,
             load_threshold: None,
+            unknown_peer_limit: None,
         })
         .expect("wg handler")
     });

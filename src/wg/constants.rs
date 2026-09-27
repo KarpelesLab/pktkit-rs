@@ -99,6 +99,10 @@ pub(crate) const MAX_HANDSHAKES: usize = 10000;
 /// Maximum number of established sessions per handler.
 pub(crate) const MAX_SESSIONS: usize = 10000;
 
+/// Default for [`Config::unknown_peer_limit`](crate::wg::Config): no more
+/// peers than can hold a session at once.
+pub(crate) const DEFAULT_UNKNOWN_PEER_LIMIT: usize = MAX_SESSIONS;
+
 // === Key sizes =============================================================
 
 pub const NOISE_PUBLIC_KEY_SIZE: usize = 32;
