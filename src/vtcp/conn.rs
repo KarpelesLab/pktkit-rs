@@ -200,6 +200,9 @@ pub struct Conn {
     sack_enabled: bool,
     sack_ok: bool,
 
+    // SND.WL1 / SND.WL2: SEQ and ACK of the segment that last set snd_wnd.
+    snd_wl: Option<(u32, u32)>,
+
     // Right edge of the receive window as last advertised (RCV.NXT +
     // RCV.WND), once an ACK has carried one.
     rcv_adv: Option<u32>,
@@ -286,6 +289,7 @@ impl Conn {
             ts_offset_ms,
             sack_enabled: cfg.enable_sack,
             sack_ok: false,
+            snd_wl: None,
             rcv_adv: None,
             fin_pending: false,
             pending_fin_seq: 0,
@@ -696,7 +700,10 @@ impl Conn {
             return seq_in_range_inclusive(seg.seq, rcv_nxt, rcv_nxt.wrapping_add(rcv_wnd));
         }
         if rcv_wnd == 0 {
-            return false;
+            // A bare FIN at RCV.NXT takes no buffer space; refusing it would
+            // leave a peer unable to close to a reader that has stopped
+            // reading (Linux accepts it too).
+            return seg.payload.is_empty() && seg.seq == rcv_nxt;
         }
         let seg_end = seg.seq.wrapping_add(seg_len.wrapping_sub(1));
         seq_in_range(seg.seq, rcv_nxt, rcv_nxt.wrapping_add(rcv_wnd))
@@ -776,6 +783,9 @@ impl Conn {
                     .unwrap_or(false);
             if !syn_rcvd_simopen {
                 if !seg.has_flag(flags::RST) {
+                    if self.state == State::TimeWait && seg.has_flag(flags::FIN) {
+                        self.restart_time_wait();
+                    }
                     self.queue_ack();
                 }
                 return self.take_outgoing();
@@ -816,8 +826,12 @@ impl Conn {
             State::Closing => self.handle_closing(seg),
             State::LastAck => self.handle_last_ack(seg),
             State::TimeWait => {
-                self.restart_time_wait();
-                self.queue_ack();
+                // Only a retransmitted FIN calls for an answer (RFC 9293
+                // §3.10.7.4); ACKing anything else can ping-pong forever.
+                if seg.has_flag(flags::FIN) {
+                    self.restart_time_wait();
+                    self.queue_ack();
+                }
                 self.take_outgoing()
             }
             _ => self.take_outgoing(),
@@ -964,8 +978,7 @@ impl Conn {
         }
 
         if seg.has_flag(flags::ACK) {
-            self.process_ack(seg.ack, &seg.options);
-            self.snd_wnd = (seg.window as u32) << self.snd_wnd_shift;
+            self.process_ack(seg);
         }
 
         if !seg.payload.is_empty() {
@@ -1023,8 +1036,7 @@ impl Conn {
 
     fn handle_close_wait(&mut self, seg: &Segment) -> Vec<Vec<u8>> {
         if seg.has_flag(flags::ACK) {
-            self.process_ack(seg.ack, &seg.options);
-            self.snd_wnd = (seg.window as u32) << self.snd_wnd_shift;
+            self.process_ack(seg);
         }
         self.take_outgoing()
     }
@@ -1033,22 +1045,22 @@ impl Conn {
         // Data and the FIN may still be in flight (or not yet sent), so ACKs
         // here need the full treatment, not just a check for the FIN's.
         if seg.has_flag(flags::ACK) {
-            self.process_ack(seg.ack, &seg.options);
-            self.snd_wnd = (seg.window as u32) << self.snd_wnd_shift;
+            self.process_ack(seg);
         }
         if self.fin_acked() {
             self.state = State::TimeWait;
             self.stop_rto();
             self.start_time_wait();
         }
-        self.queue_ack();
+        // No ACK of our own: the peer's FIN is already in, and a
+        // retransmission of it fails the sequence check, which ACKs it.
+        // Answering every ACK would ping-pong with a peer doing the same.
         self.take_outgoing()
     }
 
     fn handle_last_ack(&mut self, seg: &Segment) -> Vec<Vec<u8>> {
         if seg.has_flag(flags::ACK) {
-            self.process_ack(seg.ack, &seg.options);
-            self.snd_wnd = (seg.window as u32) << self.snd_wnd_shift;
+            self.process_ack(seg);
         }
         if self.fin_acked() {
             self.tear_down(State::Closed);
@@ -1077,13 +1089,45 @@ impl Conn {
         }
     }
 
-    fn process_ack(&mut self, ack: u32, opts: &[TcpOption]) {
+    /// Apply the segment's window, per RFC 9293 §3.10.7.4: only from a
+    /// segment no older than the one that last set it, so a reordered old
+    /// segment cannot roll the window back. Returns true if it changed.
+    fn update_send_window(&mut self, seg: &Segment) -> bool {
+        if let Some((wl1, wl2)) = self.snd_wl
+            && (seq_before(seg.seq, wl1) || (seg.seq == wl1 && seq_before(seg.ack, wl2)))
+        {
+            return false;
+        }
+        self.snd_wl = Some((seg.seq, seg.ack));
+        let wnd = (seg.window as u32) << self.snd_wnd_shift;
+        let changed = wnd != self.snd_wnd;
+        self.snd_wnd = wnd;
+        changed
+    }
+
+    fn process_ack(&mut self, seg: &Segment) {
+        let ack = seg.ack;
+        let opts = &seg.options;
         let una = self.send_buf.as_ref().unwrap().una();
+        let snd_nxt = self.send_buf.as_ref().unwrap().nxt();
+        if seq_after(ack, snd_nxt) {
+            self.queue_ack();
+            return;
+        }
+        // The window comes first: the flush below must see this segment's.
+        let wnd_changed = self.update_send_window(seg);
         if !seq_after(ack, una) {
-            // Duplicate ACK.
-            if self.cc.on_dup_ack() {
+            // RFC 5681 §2: only an ACK of SND.UNA with data outstanding, no
+            // payload or FIN, and the same window is a duplicate. A window
+            // update is not a loss signal, and its window must be used.
+            if ack == una
+                && una != snd_nxt
+                && !wnd_changed
+                && seg.payload.is_empty()
+                && !seg.has_flag(flags::FIN)
+                && self.cc.on_dup_ack()
+            {
                 let flight = self.send_buf.as_ref().unwrap().unacked() as u32;
-                let snd_nxt = self.send_buf.as_ref().unwrap().nxt();
                 self.cc.on_fast_retransmit(flight, snd_nxt);
                 let _ = self.retransmit();
             }
@@ -1093,11 +1137,12 @@ impl Conn {
                     self.send_buf.as_mut().unwrap().mark_sacked(&blocks);
                 }
             }
-            return;
-        }
-        let snd_nxt = self.send_buf.as_ref().unwrap().nxt();
-        if seq_after(ack, snd_nxt) {
-            self.queue_ack();
+            if wnd_changed {
+                if self.snd_wnd > 0 && self.persist_deadline.is_some() {
+                    self.stop_persist();
+                }
+                self.flush_send_queue();
+            }
             return;
         }
 
@@ -1224,7 +1269,15 @@ impl Conn {
                 State::FinWait1 | State::Closing | State::LastAck
             )
         {
-            self.queue_fin();
+            // The FIN takes a sequence number, so it needs a byte of window
+            // like data does. Past the right edge, every later segment from
+            // us would carry an out-of-window SEQ and have its ACK ignored.
+            let unacked = self.send_buf.as_ref().unwrap().unacked() as u32;
+            if self.snd_wnd > unacked {
+                self.queue_fin();
+            } else if unacked == 0 && self.persist_deadline.is_none() {
+                self.start_persist();
+            }
         }
 
         // Zero-window probing.
@@ -1401,8 +1454,13 @@ impl Conn {
         }
         if self.send_buf.as_ref().is_none_or(|s| s.pending() == 0) {
             // Nothing new to probe with; bytes already in flight are the
-            // RTO's to resend.
+            // RTO's to resend. A FIN waiting on the window is the probe
+            // instead: a receiver takes a bare FIN at RCV.NXT even into a
+            // zero window.
             self.stop_persist();
+            if self.fin_queued && self.send_buf.as_ref().is_some_and(|s| s.unacked() == 0) {
+                self.queue_fin();
+            }
             return;
         }
         // 1-byte window probe.
@@ -2039,11 +2097,20 @@ mod tests {
         }
         assert_eq!(last_window, Some(0));
 
+        let (n, blocked) = client.write(b"more");
+        assert_eq!(n, 4);
+        assert!(blocked.is_empty());
+
         let mut buf = [0u8; 4096];
         assert_eq!(server.read(&mut buf), 4096);
         let update = server.take_outgoing();
         assert_eq!(update.len(), 1);
         assert!(parse(&update[0]).window > 0);
+
+        // The update ACKs nothing new, but it is no duplicate ACK: the
+        // sender must use the window it brings.
+        let sent = deliver(&mut client, &update);
+        assert_eq!(parse(&sent[0]).payload, b"more");
     }
 
     // The peer filled our whole window and its first segment was lost: its
@@ -2171,6 +2238,75 @@ mod tests {
         assert!(client.is_closed());
     }
 
+    // The FIN needs a byte of window. Sent past the right edge, it would
+    // put every later segment's SEQ out of the peer's window.
+    #[test]
+    fn fin_waits_for_window_room() {
+        let (mut client, mut server) = established(40024);
+        client.snd_wnd = 100;
+        let (_, data) = client.write(&[8u8; 100]);
+        assert_eq!(data.len(), 1);
+        assert!(client.close().is_empty());
+
+        let acks = deliver(&mut server, &data);
+        let fin = deliver(&mut client, &acks);
+        assert!(parse(&fin[0]).has_flag(flags::FIN));
+    }
+
+    // A reader that has stopped reading still lets the peer close: the FIN
+    // goes out as the persist probe and is taken into a zero window.
+    #[test]
+    fn fin_into_zero_window() {
+        let (mut client, mut server) = established(40025);
+        let (_, mut pkts) = client.write(&[6u8; 4096]);
+        while !pkts.is_empty() {
+            let acks = deliver(&mut server, &pkts);
+            pkts = deliver(&mut client, &acks);
+        }
+        assert_eq!(client.snd_wnd, 0);
+        assert!(client.close().is_empty());
+
+        client.persist_deadline = Some(Instant::now());
+        let fin = client.tick();
+        assert!(parse(&fin[0]).has_flag(flags::FIN));
+        let ack = deliver(&mut server, &fin);
+        assert!(server.fin_received());
+        deliver(&mut client, &ack);
+        assert_eq!(client.state(), State::FinWait2);
+        assert_eq!(read_all(&mut server).len(), 4096);
+    }
+
+    // Pure ACKs get no reply in CLOSING or TIME-WAIT, or two ends answering
+    // each other's ACKs would never stop.
+    #[test]
+    fn closing_and_time_wait_do_not_answer_pure_acks() {
+        let (mut a, mut b) = established(40026);
+        let a_fin = a.close();
+        let b_fin = b.close();
+        let b_ack = deliver(&mut b, &a_fin);
+        assert_eq!(b.state(), State::Closing);
+        let a_ack = deliver(&mut a, &b_fin);
+        assert_eq!(a.state(), State::Closing);
+
+        let bare_ack = |c: &Conn| Segment {
+            src_port: c.cfg.remote_port,
+            dst_port: c.cfg.local_port,
+            seq: c.recv_buf.as_ref().unwrap().nxt(),
+            ack: c.send_buf.as_ref().unwrap().una(),
+            flags: flags::ACK,
+            window: 4096,
+            ..Default::default()
+        };
+        assert!(a.handle_segment(&bare_ack(&a)).is_empty());
+
+        deliver(&mut a, &b_ack);
+        deliver(&mut b, &a_ack);
+        assert_eq!(a.state(), State::TimeWait);
+        assert!(a.handle_segment(&bare_ack(&a)).is_empty());
+        // A retransmitted FIN is still answered.
+        assert_eq!(deliver(&mut a, &b_fin).len(), 1);
+    }
+
     #[test]
     fn syn_ack_window_is_not_scaled() {
         let mut client = Conn::new(ConnConfig {
@@ -2246,10 +2382,6 @@ mod tests {
         // links[i] carries segments sent by side i.
         // The handshake runs over the lossy link too.
         let mut links: [Vec<Vec<u8>>; 2] = [syn, Vec::new()];
-        // Loss comes in short bursts only: enough back-to-back losses make
-        // the engine give up after MAX_RETRIES, which is correct but would
-        // make the run's outcome luck rather than behaviour.
-        let mut drop_run = [0u32; 2];
 
         let done = |s: &[Side; 2]| {
             s.iter().all(|x| {
@@ -2301,11 +2433,14 @@ mod tests {
                     };
                     let pkt = links[i].remove(k);
                     let fate = rng.below(20);
-                    if fate < 2 && drop_run[i] < 3 {
-                        drop_run[i] += 1;
+                    // Enough losses in a row make an end give up after
+                    // MAX_RETRIES, which is correct but would make the run's
+                    // outcome luck. The link stops losing while either end
+                    // is halfway there, so giving up is the engine's fault.
+                    let struggling = sides.iter().any(|s| s.conn.retries >= MAX_RETRIES / 2);
+                    if fate < 2 && !struggling {
                         continue;
                     }
-                    drop_run[i] = 0;
                     if fate == 2 {
                         links[i].insert(0, pkt.clone());
                     }
