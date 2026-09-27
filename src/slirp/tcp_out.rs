@@ -74,6 +74,9 @@ pub(crate) struct TcpOutConn {
     /// When the stack's tick first saw the virtual side in TIME-WAIT; the
     /// oldest go first when there are too many.
     time_wait_since: OnceLock<Instant>,
+    /// Called if the bridge goes while its dial is still running; taken
+    /// once the dial finishes.
+    on_orphan: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl TcpOutConn {
@@ -135,12 +138,15 @@ impl TcpOutConn {
             closed: Arc::new(AtomicBool::new(false)),
             syn: Mutex::new(Some(syn.clone())),
             time_wait_since: OnceLock::new(),
+            on_orphan: Mutex::new(None),
         })
     }
 
     /// Dial `dest` on a thread of its own and, once it answers, complete the
     /// virtual handshake and start the byte pumps. `on_done` runs when the
-    /// dial has finished either way.
+    /// dial has finished either way; `on_orphan` runs before that if the
+    /// bridge is torn down (the guest reset it, say) while the dial is still
+    /// running, as nothing waits on the dial from then on.
     ///
     /// The dial must not run on the caller's thread: that is the packet path,
     /// and a destination that drops SYNs would stall every other flow of the
@@ -148,8 +154,14 @@ impl TcpOutConn {
     pub(crate) fn start_dial(
         self: &Arc<Self>,
         dest: SocketAddr,
+        on_orphan: impl FnOnce() + Send + 'static,
         on_done: impl FnOnce() + Send + 'static,
     ) {
+        *self.on_orphan.lock().expect("poisoned") = Some(Box::new(on_orphan));
+        // Torn down before the hook was in place: nothing else will call it.
+        if self.closed.load(Ordering::SeqCst) {
+            self.orphan_dial();
+        }
         let bridge = self.clone();
         // Runs `on_done` however the dial ends, even if its thread never
         // starts: a failed spawn drops the closure, and with it this guard.
@@ -167,6 +179,9 @@ impl TcpOutConn {
     }
 
     fn finish_dial(self: Arc<Self>, res: std::io::Result<(TcpStream, TcpStream)>) {
+        // The dial is over: its place is given back as it returns, orphaned
+        // or not.
+        drop(self.on_orphan.lock().expect("poisoned").take());
         // The SYN stays in place until the engine has taken it: while it is
         // there, handle_segment holds back the client's segments, and a
         // retransmitted SYN reaching the engine before accept_syn would draw
@@ -235,6 +250,7 @@ impl TcpOutConn {
             // RST means the client gave up, so the dial's result is moot.
             if seg.has_flag(crate::vtcp::segment::flags::RST) {
                 self.closed.store(true, Ordering::SeqCst);
+                self.orphan_dial();
             }
             return Ok(());
         }
@@ -278,12 +294,21 @@ impl TcpOutConn {
         self.closed.load(Ordering::Acquire) || self.state.conn.lock().expect("poisoned").is_closed()
     }
 
+    /// Tell the dial, if one is still running, that nothing waits on it.
+    fn orphan_dial(&self) {
+        let f = self.on_orphan.lock().expect("poisoned").take();
+        if let Some(f) = f {
+            f();
+        }
+    }
+
     /// Forcibly tear the bridge down: RST the virtual client and close the real
     /// socket. Called by `Stack::shutdown` and namespace cleanup.
     pub(crate) fn close(&self) {
         if self.closed.swap(true, Ordering::SeqCst) {
             return;
         }
+        self.orphan_dial();
         let segs = {
             let mut conn = self.state.conn.lock().expect("poisoned");
             // In TIME-WAIT both sides have already finished; a RST would

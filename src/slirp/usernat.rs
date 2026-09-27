@@ -85,6 +85,19 @@ const MAX_TIME_WAIT: usize = if cfg!(test) { 4 } else { 8192 };
 /// are dropped, and the client's retransmissions try again later.
 const MAX_PENDING_DIALS: usize = 256;
 
+/// Cap on the dials of [`MAX_PENDING_DIALS`] one namespace may hold, so that
+/// one guest cannot hold them all and leave every other guest unable to
+/// open a connection. Small under test so the cap itself can be exercised.
+const MAX_PENDING_DIALS_PER_NS: usize = if cfg!(test) { 4 } else { 64 };
+
+/// Cap on dials still running for a bridge that has already gone (the guest
+/// reset it while it was dialing). Nothing waits on such a dial any more, so
+/// it gives its place under [`MAX_PENDING_DIALS`] back; but its thread runs
+/// on until the connect ends, so these are capped too, stack-wide and per
+/// namespace (at [`MAX_PENDING_DIALS_PER_NS`]). A dial past these caps keeps
+/// counting as pending until it ends.
+const MAX_ORPHAN_DIALS: usize = 256;
+
 /// Cap on UDP flows per address family. Each one holds a real socket and a
 /// reader thread, and any new 4-tuple from the virtual network opens one.
 /// Small under test so the cap itself can be exercised.
@@ -129,7 +142,7 @@ struct Inner {
     ns_counter: AtomicU64,
     /// Outbound dials still waiting on the real destination; each holds a
     /// thread, so they are capped separately from established flows.
-    pending_dials: Arc<AtomicUsize>,
+    dials: Arc<Mutex<Dials>>,
     /// Fragments from the virtual network awaiting the rest of their datagram.
     defrag: Mutex<Reassembler>,
     /// Which host destinations the guests may reach; `None` allows all.
@@ -218,7 +231,7 @@ impl Stack {
             listeners6: Mutex::new(HashMap::new()),
             ns_sides: Mutex::new(HashMap::new()),
             ns_counter: AtomicU64::new(0),
-            pending_dials: Arc::new(AtomicUsize::new(0)),
+            dials: Arc::new(Mutex::new(Dials::default())),
             defrag: Mutex::new(Reassembler::default()),
             filter: RwLock::new(None),
             closed: AtomicBool::new(false),
@@ -718,14 +731,15 @@ impl Stack {
 
         // SYN → dial the real destination and bridge it to a server-side
         // vtcp::Conn terminating the virtual side.
-        if !outbound_slot_free(&inner.tcp, &inner.tcp_time_wait)
-            || inner.pending_dials.load(Ordering::Acquire) >= MAX_PENDING_DIALS
-        {
+        if !outbound_slot_free(&inner.tcp, &inner.tcp_time_wait) {
             return Ok(()); // silently drop; client will retransmit
         }
         let seg = match Segment::parse(tcp) {
             Ok(s) => s,
             Err(_) => return Ok(()),
+        };
+        let Some(slot) = DialSlot::reserve(&inner.dials, ns) else {
+            return Ok(()); // as above
         };
 
         let sink = Self::sink(inner, ns);
@@ -743,18 +757,17 @@ impl Stack {
             .lock()
             .expect("poisoned")
             .insert(key, conn.clone());
-        Self::start_dial(inner, &conn, dial);
+        Self::start_dial(&conn, dial, slot);
         Ok(())
     }
 
     /// Dial the real destination of an outbound bridge in the background,
-    /// counting it against [`MAX_PENDING_DIALS`] until it finishes.
-    fn start_dial(inner: &Arc<Inner>, conn: &Arc<TcpOutConn>, dest: SocketAddr) {
-        let pending = inner.pending_dials.clone();
-        pending.fetch_add(1, Ordering::AcqRel);
-        conn.start_dial(dest, move || {
-            pending.fetch_sub(1, Ordering::AcqRel);
-        });
+    /// holding `slot` until the dial finishes. Should the bridge go first,
+    /// the dial becomes an orphan and stops counting as pending.
+    fn start_dial(conn: &Arc<TcpOutConn>, dest: SocketAddr, slot: DialSlot) {
+        let slot = Arc::new(slot);
+        let orphan = slot.clone();
+        conn.start_dial(dest, move || orphan.orphan(), move || drop(slot));
     }
 
     /// Look up a registered IPv4 listener for `(dst, dst_port)`, falling back
@@ -1071,14 +1084,15 @@ impl Stack {
             return Self::dispatch(inner, ns, &pkt);
         };
 
-        if !outbound_slot_free(&inner.tcp6, &inner.tcp6_time_wait)
-            || inner.pending_dials.load(Ordering::Acquire) >= MAX_PENDING_DIALS
-        {
+        if !outbound_slot_free(&inner.tcp6, &inner.tcp6_time_wait) {
             return Ok(()); // silently drop; client will retransmit
         }
         let seg = match Segment::parse(tcp) {
             Ok(s) => s,
             Err(_) => return Ok(()),
+        };
+        let Some(slot) = DialSlot::reserve(&inner.dials, ns) else {
+            return Ok(()); // as above
         };
 
         let sink = Self::sink(inner, ns);
@@ -1095,7 +1109,7 @@ impl Stack {
             .lock()
             .expect("poisoned")
             .insert(key, conn.clone());
-        Self::start_dial(inner, &conn, dial);
+        Self::start_dial(&conn, dial, slot);
         Ok(())
     }
 
@@ -1353,6 +1367,81 @@ impl L3Connector for Stack {
             }
             Ok(())
         }))
+    }
+}
+
+/// Outbound dials in flight: `(pending, orphans)`, stack-wide and per
+/// namespace. See [`MAX_PENDING_DIALS`] and [`MAX_ORPHAN_DIALS`].
+#[derive(Default)]
+struct Dials {
+    all: (usize, usize),
+    per_ns: HashMap<u64, (usize, usize)>,
+}
+
+/// One dial's place under the dial caps, given back when dropped.
+struct DialSlot {
+    dials: Arc<Mutex<Dials>>,
+    ns: u64,
+    /// Whether it counts as an orphan rather than as pending; only ever
+    /// changed with `dials` locked.
+    orphan: AtomicBool,
+}
+
+impl DialSlot {
+    /// Take a place for a new dial from namespace `ns`, if the caps allow.
+    fn reserve(dials: &Arc<Mutex<Dials>>, ns: u64) -> Option<DialSlot> {
+        let mut d = dials.lock().expect("poisoned");
+        let mine = d.per_ns.get(&ns).map_or(0, |c| c.0);
+        if d.all.0 >= MAX_PENDING_DIALS || mine >= MAX_PENDING_DIALS_PER_NS {
+            return None;
+        }
+        d.all.0 += 1;
+        d.per_ns.entry(ns).or_default().0 += 1;
+        Some(DialSlot {
+            dials: dials.clone(),
+            ns,
+            orphan: AtomicBool::new(false),
+        })
+    }
+
+    /// The bridge this dial was for has gone: stop counting the dial as
+    /// pending, if the orphan caps have room for it.
+    fn orphan(&self) {
+        let mut d = self.dials.lock().expect("poisoned");
+        let d = &mut *d;
+        let mine = d.per_ns.entry(self.ns).or_default();
+        if self.orphan.load(Ordering::Relaxed)
+            || d.all.1 >= MAX_ORPHAN_DIALS
+            || mine.1 >= MAX_PENDING_DIALS_PER_NS
+        {
+            return;
+        }
+        d.all = (d.all.0 - 1, d.all.1 + 1);
+        *mine = (mine.0 - 1, mine.1 + 1);
+        self.orphan.store(true, Ordering::Relaxed);
+    }
+}
+
+impl Drop for DialSlot {
+    fn drop(&mut self) {
+        let Ok(mut d) = self.dials.lock() else {
+            return;
+        };
+        let orphan = self.orphan.load(Ordering::Relaxed);
+        let take = |c: &mut (usize, usize)| {
+            if orphan {
+                c.1 -= 1;
+            } else {
+                c.0 -= 1;
+            }
+        };
+        take(&mut d.all);
+        if let Some(c) = d.per_ns.get_mut(&self.ns) {
+            take(c);
+            if *c == (0, 0) {
+                d.per_ns.remove(&self.ns);
+            }
+        }
     }
 }
 
@@ -3443,5 +3532,76 @@ mod tests {
             Ok(0),
             "the server never saw the bridge's socket shut down"
         );
+    }
+
+    /// `(pending, orphan)` dials of namespace `ns`.
+    fn dials_of(stack: &Stack, ns: u64) -> (usize, usize) {
+        let d = stack.inner.dials.lock().unwrap();
+        d.per_ns.get(&ns).copied().unwrap_or_default()
+    }
+
+    /// Open a dial from namespace `ns` to a destination that never answers
+    /// (TEST-NET-1), from the client's port `port`; `false` if the host has
+    /// no route there, so the dial ended at once and cannot be held open.
+    fn blackholed_dial(stack: &Stack, ns: u64, port: u16) -> bool {
+        let syn = build_tcp_v4_packet(
+            Ipv4Addr::new(10, 0, 0, 5),
+            port,
+            Ipv4Addr::new(192, 0, 2, 1),
+            80,
+            1,
+            0,
+            tcp_flags::SYN,
+            &[],
+        );
+        let before = dials_of(stack, ns).0;
+        Stack::handle_packet(&stack.inner, ns, &syn).unwrap();
+        thread::sleep(Duration::from_millis(50));
+        dials_of(stack, ns).0 > before
+    }
+
+    /// A guest that resets its connection while it is still being dialed
+    /// gives the dial's place back at once, not when the connect times out
+    /// up to 30 s later: else a SYN then a RST, over and over, would hold
+    /// every place and leave every other connection unable to dial.
+    #[test]
+    fn a_reset_dial_gives_its_place_back() {
+        let stack = Stack::new();
+        let _captured = capture(&stack);
+        if !blackholed_dial(&stack, 0, 20000) {
+            eprintln!("no route to TEST-NET-1 here: the dial cannot be held open");
+            return;
+        }
+        assert_eq!(dials_of(&stack, 0), (1, 0));
+        let rst = build_tcp_v4_packet(
+            Ipv4Addr::new(10, 0, 0, 5),
+            20000,
+            Ipv4Addr::new(192, 0, 2, 1),
+            80,
+            2,
+            0,
+            tcp_flags::RST,
+            &[],
+        );
+        L3Device::send(&*stack, Packet::from_slice(&rst)).unwrap();
+        // Still running, but no longer counted as pending.
+        assert_eq!(dials_of(&stack, 0), (0, 1));
+        assert_eq!(stack.inner.dials.lock().unwrap().all, (0, 1));
+    }
+
+    /// One namespace cannot hold every dial place: past its own cap its
+    /// SYNs are dropped, while another namespace still dials.
+    #[test]
+    fn one_namespace_cannot_hold_every_dial() {
+        let stack = Stack::new();
+        for i in 0..MAX_PENDING_DIALS_PER_NS as u16 {
+            if !blackholed_dial(&stack, 1, 20000 + i) {
+                eprintln!("no route to TEST-NET-1 here: the dial cannot be held open");
+                return;
+            }
+        }
+        assert_eq!(dials_of(&stack, 1).0, MAX_PENDING_DIALS_PER_NS);
+        assert!(!blackholed_dial(&stack, 1, 21000), "past the cap");
+        assert!(blackholed_dial(&stack, 2, 21000), "another namespace");
     }
 }
