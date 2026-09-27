@@ -117,12 +117,14 @@ impl SendBuf {
         n
     }
 
-    /// Add the receiver's SACK blocks to the scoreboard.
+    /// Add the receiver's SACK blocks to the scoreboard. Returns true if
+    /// they covered anything not SACKed before.
     ///
     /// Blocks accumulate: an ACK carries at most three or four, newest first
     /// (RFC 2018 §4), so ranges reported earlier are not repeated once more
     /// recent ones fill the option.
-    pub fn mark_sacked(&mut self, blocks: &[SackBlock]) {
+    pub fn mark_sacked(&mut self, blocks: &[SackBlock]) -> bool {
+        let before = self.sacked_between(self.una, self.nxt);
         for b in blocks {
             // Clip to what is actually in flight. D-SACKs (RFC 2883) report
             // data below UNA and so clip to nothing.
@@ -140,6 +142,20 @@ impl SendBuf {
                 self.add_sacked(left, right);
             }
         }
+        // Only MAX_SACKED truncation can lower the total, and that drops
+        // the highest range, which a later report may bring back.
+        self.sacked_between(self.una, self.nxt) != before
+    }
+
+    /// IsLost (RFC 6675 §4): whether `seq` counts as lost, because
+    /// `dup_thresh` discontiguous SACKed ranges lie above it, or more than
+    /// `(dup_thresh - 1) * mss` SACKed bytes do.
+    pub fn is_lost(&self, seq: u32, dup_thresh: u32, mss: u32) -> bool {
+        let next = seq.wrapping_add(1);
+        let above = |b: &&SackBlock| seq_after(b.right, next);
+        let ranges = self.sacked.iter().filter(above).count() as u32;
+        let bytes = self.sacked_between(next, self.nxt);
+        ranges >= dup_thresh || bytes > (dup_thresh - 1).saturating_mul(mss)
     }
 
     fn add_sacked(&mut self, mut left: u32, mut right: u32) {
@@ -499,6 +515,26 @@ mod tests {
         assert_eq!(s.pending(), refilled);
         assert_eq!(s.peek_unsent(3), &[3, 3, 3][..]);
         assert_eq!(s.available(), CAP - refilled);
+    }
+
+    #[test]
+    fn is_lost_counts_ranges_or_bytes_above() {
+        let mut s = SendBuf::new(100, 0);
+        s.write(&[1; 100]);
+        s.advance_sent(100);
+        let b = |left, right| SackBlock { left, right };
+        assert!(s.mark_sacked(&[b(10, 30)]));
+        assert!(!s.mark_sacked(&[b(10, 30)]), "nothing new");
+        assert!(!s.is_lost(0, 3, 10), "20 bytes, not more than 20");
+        assert!(s.mark_sacked(&[b(10, 31)]));
+        assert!(s.is_lost(0, 3, 10), "21 bytes");
+        assert!(!s.is_lost(15, 3, 10));
+        let mut s = SendBuf::new(100, 0);
+        s.write(&[1; 100]);
+        s.advance_sent(100);
+        s.mark_sacked(&[b(10, 11), b(20, 21), b(30, 31)]);
+        assert!(s.is_lost(0, 3, 10), "three discontiguous ranges");
+        assert!(!s.is_lost(10, 3, 10));
     }
 
     #[test]

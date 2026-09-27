@@ -1414,21 +1414,26 @@ impl Conn {
         if !seq_after(ack, una) {
             // The scoreboard first: a retransmission below must see what
             // this ACK reports.
+            let mut new_sack = false;
             if self.sack_ok {
                 let blocks = get_sack_blocks(opts);
                 if !blocks.is_empty() {
-                    self.send_buf.as_mut().unwrap().mark_sacked(&blocks);
+                    new_sack = self.send_buf.as_mut().unwrap().mark_sacked(&blocks);
                 }
             }
             // RFC 5681 §2: only an ACK of SND.UNA with data outstanding, no
             // payload or FIN, and the same window is a duplicate. A window
-            // update is not a loss signal, and its window must be used.
+            // update is not a loss signal, and its window must be used. With
+            // SACK, RFC 6675 §2 counts one that reports data not SACKed
+            // before whatever its window: that is a segment arriving above a
+            // hole, even at a receiver whose window moves as its application
+            // reads.
             //
             // Nor is an ACK of a zero window: it is what a probe draws, and
             // the receiver taking nothing says nothing about loss.
             if ack == una
                 && una != snd_nxt
-                && !wnd_changed
+                && (!wnd_changed || new_sack)
                 && self.snd_wnd > 0
                 && seg.payload.is_empty()
                 && !seg.has_flag(flags::FIN)
@@ -1556,7 +1561,12 @@ impl Conn {
         let oseg = flight.div_ceil(mss);
         let can_send_new = sb.pending() > 0 && self.snd_wnd > flight;
         let early = oseg < 4 && !can_send_new && self.dup_acks >= oseg.saturating_sub(1).max(1);
-        if threshold_reached {
+        // RFC 6675 §5 step 2: loss recovery also starts once the scoreboard
+        // alone shows the first unacknowledged segment lost (IsLost), as
+        // when one ACK SACKs several segments at once: waiting for a third
+        // duplicate could then mean waiting for the RTO.
+        let lost = self.sack_ok && sb.is_lost(sb.una(), 3, mss);
+        if threshold_reached || lost {
             self.fast_retransmit(flight, snd_nxt);
         } else if early {
             // With so few duplicates, a segment merely reordered looks lost.
@@ -3603,6 +3613,60 @@ mod tests {
         assert_eq!(read_all(&mut server).len(), 10_000);
         assert!(deliver(&mut client, &acks).is_empty(), "hole resent twice");
         assert!(client.rto_recover.is_none());
+    }
+
+    /// With SACK, an ACK reporting newly SACKed data is a duplicate even
+    /// if its window moved (RFC 6675 §2): here the receiver's application
+    /// reads as the segments behind the hole arrive, so every one of the
+    /// ACKs they draw carries a different window.
+    #[test]
+    fn sack_duplicates_count_despite_window_changes() {
+        let mut client = Conn::new(big(40240, 80));
+        let mut server = Conn::new(big(80, 40240));
+        drive_handshake(&mut client, &mut server);
+        warm_up(&mut client, &mut server);
+        let (_, segs) = client.write(&[8; 10_000]);
+        assert_eq!(segs.len(), 10);
+        let mut dups = deliver(&mut server, &segs[1..]);
+        for (i, d) in dups.iter_mut().enumerate() {
+            let mut seg = parse(d);
+            assert!(!get_sack_blocks(&seg.options).is_empty());
+            seg.window = seg.window.wrapping_sub(i as u16 + 1);
+            *d = seg.marshal();
+        }
+        let out = deliver(&mut client, &dups);
+        assert!(client.cc.in_recovery(), "no fast retransmit");
+        assert!(seqs(&out).contains(&parse(&segs[0]).seq));
+    }
+
+    /// RFC 6675 §5: one ACK that SACKs more than two segments' worth above
+    /// the first unacknowledged byte shows it lost (IsLost), and starts
+    /// recovery without waiting for two more duplicates that may never
+    /// come.
+    #[test]
+    fn sack_recovery_starts_once_the_scoreboard_shows_loss() {
+        let mut client = Conn::new(big(40241, 80));
+        let mut server = Conn::new(big(80, 40241));
+        drive_handshake(&mut client, &mut server);
+        warm_up(&mut client, &mut server);
+        let (_, segs) = client.write(&[8; 10_000]);
+        assert_eq!(segs.len(), 10);
+        // Segments 1-3 arrive, but only the last ACK does: it SACKs all
+        // three.
+        let dups = deliver(&mut server, &segs[1..4]);
+        let out = deliver(&mut client, &dups[dups.len() - 1..]);
+        assert!(client.cc.in_recovery(), "no recovery on IsLost");
+        assert_eq!(seqs(&out)[0], parse(&segs[0]).seq);
+
+        // Two segments' worth SACKed is not yet enough.
+        let mut client = Conn::new(big(40242, 80));
+        let mut server = Conn::new(big(80, 40242));
+        drive_handshake(&mut client, &mut server);
+        warm_up(&mut client, &mut server);
+        let (_, segs) = client.write(&[8; 10_000]);
+        let dups = deliver(&mut server, &segs[1..3]);
+        deliver(&mut client, &dups[dups.len() - 1..]);
+        assert!(!client.cc.in_recovery());
     }
 
     /// The MSS counts payload only; options come out of it (RFC 6691 §2,
