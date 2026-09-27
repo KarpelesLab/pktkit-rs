@@ -474,9 +474,18 @@ impl Handler {
         let peers: Vec<NoisePublicKey> = self.peers().into_iter().collect();
         let mut out = Vec::new();
         for peer in peers {
-            let Some((due, keepalive)) =
-                self.with_timers(&peer, |t| (t.handshake_due(now), t.keepalive_due(now)))
-            else {
+            // Claim the initiation under the timers lock, where it is
+            // decided: initiate_handshake records it only after its DH
+            // work, and a concurrent poll (the maintenance thread and an
+            // inline one from a send) would otherwise send a second, which
+            // supersedes the first (whitepaper §6.1).
+            let Some((due, keepalive)) = self.with_timers(&peer, |t| {
+                let due = t.handshake_due(now);
+                if due == Some(true) {
+                    t.initiation_sent(now);
+                }
+                (due, t.keepalive_due(now))
+            }) else {
                 continue;
             };
             match due {
@@ -1168,6 +1177,38 @@ mod tests {
         assert!(timer_actions(&b).is_empty());
         rewind(&b, &a.public_key(), crate::wg::KEEPALIVE_TIMEOUT);
         assert_eq!(timer_actions(&b), ["keepalive"]);
+    }
+
+    /// Whitepaper §6.1: at most one initiation per REKEY_TIMEOUT. The
+    /// server polls the timers from its maintenance thread and inline from
+    /// send; two polls that both saw a handshake due each sent one, and
+    /// the second superseded the first.
+    #[test]
+    fn concurrent_timer_polls_send_one_initiation() {
+        let (a, b) = pair();
+        for _ in 0..5 {
+            a.with_timers(&b.public_key(), |t| {
+                *t = PeerTimers::default();
+                t.want_handshake = true;
+            });
+            let barrier = Arc::new(std::sync::Barrier::new(8));
+            let sent: usize = (0..8)
+                .map(|_| {
+                    let (a, barrier) = (a.clone(), barrier.clone());
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        a.poll_timers()
+                            .iter()
+                            .filter(|x| matches!(x, TimerAction::SendHandshake { .. }))
+                            .count()
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|t| t.join().unwrap())
+                .sum();
+            assert_eq!(sent, 1);
+        }
     }
 
     #[test]
