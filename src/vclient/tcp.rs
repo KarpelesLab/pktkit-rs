@@ -531,11 +531,15 @@ impl TcpStack {
             let ended = conn.fin_received();
             let segs = conn.tick();
             let closed = conn.is_closed();
-            drop(conn);
             if closed && !ended {
-                // Retransmissions or keepalives went unanswered.
+                // Retransmissions or keepalives went unanswered. Recorded
+                // under the conn lock, as `handle_inbound` records a reset:
+                // a reader that took the lock in between would find the
+                // connection closed with no error, and report a clean end
+                // of stream for one that timed out.
                 cs.fail(io::ErrorKind::TimedOut);
             }
+            drop(conn);
             if !segs.is_empty() {
                 cs.wrap_and_send(segs);
             }
