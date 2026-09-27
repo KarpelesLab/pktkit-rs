@@ -56,6 +56,9 @@ mod accept;
 pub mod build;
 mod checksum;
 mod connect;
+// Reassembly for the stacks that terminate flows themselves.
+#[cfg(any(feature = "slirp", feature = "vclient"))]
+mod defrag;
 mod ethertype;
 pub mod fragment;
 mod frame;

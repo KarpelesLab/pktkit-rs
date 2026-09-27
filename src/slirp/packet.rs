@@ -251,7 +251,7 @@ mod tests {
         let pkt = build_udp_packet6(src, 53, dst, 4000, &body);
         let frags = fit_link(pkt.clone());
         assert_eq!(frags.len(), 3);
-        let mut r = crate::slirp::defrag::Reassembler::default();
+        let mut r = crate::defrag::Reassembler::default();
         let mut whole = None;
         for f in &frags {
             assert!(f.len() <= LINK_MTU);

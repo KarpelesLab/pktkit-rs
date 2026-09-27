@@ -26,7 +26,6 @@
 //!   side.
 
 mod checksum;
-pub(crate) mod defrag;
 mod icmpv4;
 mod icmpv6;
 mod ipv6;

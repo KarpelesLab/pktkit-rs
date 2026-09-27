@@ -521,7 +521,7 @@ pub fn l2adapter_frames(data: &[u8]) {
 /// path would after validating each header.
 #[cfg(feature = "slirp")]
 pub fn slirp_reassembly(data: &[u8]) {
-    let mut r = crate::slirp::defrag::Reassembler::default();
+    let mut r = crate::defrag::Reassembler::default();
     let now = crate::time::Instant::now();
     for msg in messages(data) {
         let p = Packet::from_slice(msg);

@@ -18,9 +18,9 @@
 //! `vtcp::Conn` and surfaces a [`TcpStream`](super::TcpStream) on ESTABLISHED.
 
 use crate::accept::{Cleanup, L3Connector};
+use crate::defrag::{Reassembler, ipv6_fragment_header};
 use crate::iface::{L3Device, L3Handler};
 use crate::packet::Packet;
-use crate::slirp::defrag::{Reassembler, ipv6_fragment_header};
 use crate::slirp::icmpv4::build_icmpv4_echo_reply;
 use crate::slirp::icmpv6::build_icmpv6_echo_reply;
 use crate::slirp::ipv6::skip_extension_headers;
@@ -776,22 +776,20 @@ impl Stack {
         let pkt = &pkt[..40 + payload_len];
         // See the IPv4 path: fragments are reassembled before anything reads
         // a transport header.
-        if let Some(frag_off) = ipv6_fragment_header(pkt) {
-            let whole =
-                inner
-                    .defrag
-                    .lock()
-                    .expect("poisoned")
-                    .push_v6(Instant::now(), ns, pkt, frag_off);
-            // Reassembly happens once (RFC 8200 §4.5). A rebuilt packet
-            // that still carries a Fragment header is not a datagram but a
-            // nesting trick: unwrapping it again would recurse, and copy
-            // up to 64 KiB, once per 8-byte header.
+        if ipv6_fragment_header(pkt).is_some() {
+            let whole = inner
+                .defrag
+                .lock()
+                .expect("poisoned")
+                .reassemble(Instant::now(), ns, pkt);
+            // Straight to the datagram path, never back through this one:
+            // reassembly happens once, and a rebuilt packet that still
+            // carries a Fragment header has already been dropped. Unwrapping
+            // it again would recurse, and copy up to 64 KiB, once per
+            // 8-byte header.
             return match whole {
-                Some(p) if ipv6_fragment_header(&p).is_none() => {
-                    Self::handle_ipv6_datagram(inner, ns, &p)
-                }
-                _ => Ok(()),
+                Some(p) => Self::handle_ipv6_datagram(inner, ns, &p),
+                None => Ok(()),
             };
         }
         Self::handle_ipv6_datagram(inner, ns, pkt)
@@ -2094,7 +2092,7 @@ mod tests {
         let reply: Vec<u8> = (0..5000u32).map(|i| (i % 253) as u8).collect();
         server.send_to(&reply, from).unwrap();
 
-        let mut r = crate::slirp::defrag::Reassembler::default();
+        let mut r = crate::defrag::Reassembler::default();
         let mut whole = None;
         wait_for("the whole reply", || {
             for p in captured.lock().unwrap().drain(..) {

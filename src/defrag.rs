@@ -1,9 +1,10 @@
-//! Fragment reassembly for datagrams arriving from the virtual network.
+//! Fragment reassembly for the stacks that terminate flows themselves
+//! (`slirp` and `vclient`).
 //!
-//! The stack terminates flows itself, so it needs whole datagrams: a
-//! fragment carries no transport header past the first one, and the first
-//! one alone would be forwarded truncated. This is a small reassembler
-//! (RFC 791 for IPv4, RFC 8200 §4.5 for IPv6) with bounded memory:
+//! They need whole datagrams: a fragment carries no transport header past
+//! the first one, and the first one alone is truncated. This is a small
+//! reassembler (RFC 791 for IPv4, RFC 8200 §4.5 for IPv6) with bounded
+//! memory:
 //!
 //! - at most [`MAX_DATAGRAMS`] datagrams in progress, the oldest evicted
 //!   first, each at most 64 KiB;
@@ -12,10 +13,11 @@
 //!   repeat, discard the whole datagram (RFC 5722; for IPv4 it is the same
 //!   defence against overlap-based filter evasion, RFC 1858).
 //!
-//! The `nat` feature has a reassembler of its own, but slirp does not
-//! depend on that feature.
+//! The `nat` feature has a reassembler of its own, but neither of them
+//! depends on that feature.
 
 use crate::time::Instant;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -115,7 +117,7 @@ impl Reassembler {
         out[2..4].copy_from_slice(&(total as u16).to_be_bytes());
         out[6..8].copy_from_slice(&[0, 0]);
         out[10..12].copy_from_slice(&[0, 0]);
-        let cs = crate::slirp::checksum::ipv4_header_checksum(&out);
+        let cs = crate::checksum::checksum(&out);
         out[10..12].copy_from_slice(&cs.to_be_bytes());
         out.extend_from_slice(&payload);
         Some(out)
@@ -263,6 +265,52 @@ impl Partial {
         self.pieces.insert(i, (p.offset, end));
         self.received += p.data.len();
         true
+    }
+}
+
+impl Reassembler {
+    /// Pass an IP packet through reassembly: a packet that is not a
+    /// fragment comes back as it is (trimmed to its IP length), the fragment
+    /// completing a datagram brings back the whole datagram, and anything
+    /// else (a fragment held for later, a malformed packet) gives `None`.
+    pub(crate) fn reassemble<'a>(
+        &mut self,
+        now: Instant,
+        ns: u64,
+        pkt: &'a [u8],
+    ) -> Option<Cow<'a, [u8]>> {
+        match pkt.first()? >> 4 {
+            4 => {
+                let ihl = (pkt[0] & 0x0F) as usize * 4;
+                let total = u16::from_be_bytes([*pkt.get(2)?, *pkt.get(3)?]) as usize;
+                if ihl < 20 || total < ihl || total > pkt.len() {
+                    return None;
+                }
+                let pkt = &pkt[..total];
+                if u16::from_be_bytes([pkt[6], pkt[7]]) & 0x3FFF == 0 {
+                    return Some(Cow::Borrowed(pkt));
+                }
+                self.push_v4(now, ns, pkt, ihl).map(Cow::Owned)
+            }
+            6 => {
+                let len = 40 + u16::from_be_bytes([*pkt.get(4)?, *pkt.get(5)?]) as usize;
+                if pkt.len() < len {
+                    return None;
+                }
+                let pkt = &pkt[..len];
+                let Some(frag_off) = ipv6_fragment_header(pkt) else {
+                    return Some(Cow::Borrowed(pkt));
+                };
+                let whole = self.push_v6(now, ns, pkt, frag_off)?;
+                // Reassembly happens once (RFC 8200 §4.5): a Fragment header
+                // left in the rebuilt packet is a nesting trick, not a
+                // datagram.
+                ipv6_fragment_header(&whole)
+                    .is_none()
+                    .then_some(Cow::Owned(whole))
+            }
+            _ => Some(Cow::Borrowed(pkt)),
+        }
     }
 }
 

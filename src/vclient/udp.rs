@@ -431,6 +431,50 @@ mod tests {
     }
 
     #[test]
+    fn fragmented_reply_is_reassembled() {
+        use crate::L3Device;
+        use crate::fragment::{Fragmentation, fragment_ipv4};
+
+        let client = super::super::Client::new(super::super::ClientConfig::default().prefix(
+            crate::IpPrefix::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 24),
+        ));
+        let conn = client
+            .dial_udp(SocketAddr::from(([10, 0, 0, 1], 53)))
+            .unwrap();
+        conn.set_nonblocking(true);
+        let port = conn.local_addr().port();
+        // Where the second fragment's data starts, the payload looks like a
+        // UDP header for this socket: read as one, it would be delivered.
+        let mut payload: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+        let at = 1480 - 8;
+        payload[at..at + 2].copy_from_slice(&53u16.to_be_bytes());
+        payload[at + 2..at + 4].copy_from_slice(&port.to_be_bytes());
+        payload[at + 4..at + 6].copy_from_slice(&16u16.to_be_bytes());
+        payload[at + 6..at + 8].copy_from_slice(&[0, 0]);
+        let mut reply = wrap_udp_v4(
+            Ipv4Addr::new(10, 0, 0, 1),
+            53,
+            Ipv4Addr::new(10, 0, 0, 2),
+            port,
+            &payload,
+        );
+        reply[4..6].copy_from_slice(&0x77u16.to_be_bytes());
+        let Fragmentation::Fragments(frags) = fragment_ipv4(Packet::from_slice(&reply), 1500)
+        else {
+            panic!("expected fragments");
+        };
+
+        let mut buf = vec![0u8; 8192];
+        client.send(Packet::from_slice(&frags[1])).unwrap();
+        assert!(conn.recv(&mut buf).is_err(), "a fragment read as UDP");
+        for f in frags.iter().rev() {
+            client.send(Packet::from_slice(f)).unwrap();
+        }
+        let n = conn.recv(&mut buf).unwrap();
+        assert_eq!(&buf[..n], &payload[..]);
+    }
+
+    #[test]
     fn receive_queue_is_bounded() {
         let sink: Arc<dyn Fn(&[u8]) + Send + Sync> = Arc::new(|_b: &[u8]| {});
         let stack = UdpStack::new(sink);

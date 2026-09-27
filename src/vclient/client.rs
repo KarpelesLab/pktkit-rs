@@ -12,6 +12,8 @@
 
 use super::tcp::{self, TcpConn, TcpStack};
 use super::udp::{UdpConn, UdpStack};
+use crate::defrag::Reassembler;
+use crate::time::Instant;
 use crate::{IpPrefix, L3Device, L3Handler, Packet, Result};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -43,6 +45,8 @@ pub struct Client {
     addr: Mutex<IpPrefix>,
     tcp: Arc<TcpStack>,
     udp: Arc<UdpStack>,
+    /// Inbound fragments awaiting the rest of their datagram.
+    defrag: Mutex<Reassembler>,
 }
 
 impl core::fmt::Debug for Client {
@@ -77,6 +81,7 @@ impl Client {
             addr: Mutex::new(addr),
             tcp,
             udp,
+            defrag: Mutex::new(Reassembler::default()),
         })
     }
 
@@ -164,6 +169,17 @@ impl L3Device for Client {
         *self.handler.lock().unwrap() = Some(h);
     }
     fn send(&self, pkt: &Packet) -> Result<()> {
+        // Fragments are put back together before anything reads a transport
+        // header: past the first fragment there is none, only data.
+        let whole = self
+            .defrag
+            .lock()
+            .unwrap()
+            .reassemble(Instant::now(), 0, pkt.as_bytes());
+        let Some(whole) = whole else {
+            return Ok(());
+        };
+        let pkt = Packet::from_slice(&whole);
         // Inbound from the L3 network: demux to a TCP connection, then a UDP
         // socket. Unmatched packets (e.g. ICMP) are dropped.
         if self.tcp.handle_inbound(pkt) {
