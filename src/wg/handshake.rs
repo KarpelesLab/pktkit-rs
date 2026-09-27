@@ -479,7 +479,8 @@ pub(crate) fn process_handshake_initiation(
     zeroize(&mut temp_ss);
     zeroize(&mut t1);
 
-    // Decrypt timestamp; we don't enforce monotonicity yet (TODO).
+    // Decrypt the timestamp; accept_peer_timestamp below refuses one that is
+    // not newer than the last, so a replayed initiation is dropped.
     let enc_timestamp = &data[INIT_OFF_TIMESTAMP..INIT_OFF_TIMESTAMP_END];
     let timestamp = aead_open_zero(&k, enc_timestamp, &hs.hash)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "decrypt timestamp"))?;
@@ -556,7 +557,11 @@ pub(crate) fn process_handshake_initiation(
     let mac1_key = calculate_mac1_key(&hs.remote_static);
     let mac1 = blake2s_mac_128(&mac1_key, &pkt[..RESP_OFF_MAC1]);
     pkt[RESP_OFF_MAC1..RESP_OFF_MAC2].copy_from_slice(&mac1);
-    // MAC2 stays zero (we don't generate cookies yet — TODO).
+    // MAC2 stays zero. A responder has a cookie to echo only if the initiator,
+    // under load, answered one of its responses with a cookie reply
+    // (whitepaper §5.4.7); this implementation neither sends such replies nor
+    // tracks them. A response is only accepted for a pending initiation of
+    // ours, which already limits what a flood of them can cost.
 
     // === Derive transport keys: responder = recv | send order ===
     let mut t0 = [0u8; BLAKE2S_256_SIZE];
