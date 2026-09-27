@@ -111,23 +111,24 @@ pub fn icmpv6_checksum(src: Ipv6Addr, dst: Ipv6Addr, icmp_data: &[u8]) -> u16 {
     let d = dst.octets();
     let length = icmp_data.len();
 
-    let mut sum: u32 = 0;
+    // 64 bits, as in crate::checksum, so a large message cannot overflow it.
+    let mut sum: u64 = 0;
     for i in (0..16).step_by(2) {
-        sum += ((s[i] as u32) << 8) | (s[i + 1] as u32);
+        sum += ((s[i] as u64) << 8) | (s[i + 1] as u64);
     }
     for i in (0..16).step_by(2) {
-        sum += ((d[i] as u32) << 8) | (d[i + 1] as u32);
+        sum += ((d[i] as u64) << 8) | (d[i + 1] as u64);
     }
-    sum += length as u32;
+    sum += length as u64;
     sum += 58; // ICMPv6 next header
 
     let mut i = 0;
     while i + 1 < length {
-        sum += ((icmp_data[i] as u32) << 8) | (icmp_data[i + 1] as u32);
+        sum += ((icmp_data[i] as u64) << 8) | (icmp_data[i + 1] as u64);
         i += 2;
     }
     if length & 1 != 0 {
-        sum += (icmp_data[length - 1] as u32) << 8;
+        sum += (icmp_data[length - 1] as u64) << 8;
     }
 
     while sum >> 16 != 0 {
@@ -258,5 +259,19 @@ mod tests {
         assert_eq!(ns[0], NS_TYPE);
         let mac = parse_option(&ns[24..], OPT_SOURCE_LINK_ADDR).unwrap();
         assert_eq!(mac, m);
+    }
+
+    #[test]
+    fn icmpv6_checksum_of_a_large_buffer_does_not_overflow() {
+        let big = vec![0xFFu8; 256 * 1024];
+        let a: Ipv6Addr = "fe80::1".parse().unwrap();
+        let sum = icmpv6_checksum(a, a, &big);
+        let mut pseudo = Vec::new();
+        pseudo.extend_from_slice(&a.octets());
+        pseudo.extend_from_slice(&a.octets());
+        pseudo.extend_from_slice(&(big.len() as u32).to_be_bytes());
+        pseudo.extend_from_slice(&[0, 0, 0, 58]);
+        pseudo.extend_from_slice(&big);
+        assert_eq!(sum, crate::checksum(&pseudo));
     }
 }

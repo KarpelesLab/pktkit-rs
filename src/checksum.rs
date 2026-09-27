@@ -9,16 +9,18 @@ use std::net::IpAddr;
 /// assert_eq!(checksum(&[]), 0xFFFF);
 /// ```
 pub fn checksum(data: &[u8]) -> u16 {
-    let mut sum: u32 = 0;
+    // 64 bits so no buffer can overflow it: a u32 fills after 64 Ki words
+    // of 0xFFFF, a mere 128 KiB (a GSO super-packet, say).
+    let mut sum: u64 = 0;
     let n = data.len();
     let mut i = 0;
     // Word-aligned tight loop.
     while i + 1 < n {
-        sum += ((data[i] as u32) << 8) | (data[i + 1] as u32);
+        sum += ((data[i] as u64) << 8) | (data[i + 1] as u64);
         i += 2;
     }
     if n & 1 != 0 {
-        sum += (data[n - 1] as u32) << 8;
+        sum += (data[n - 1] as u64) << 8;
     }
     while sum >> 16 != 0 {
         sum = (sum & 0xFFFF) + (sum >> 16);
@@ -123,46 +125,48 @@ pub fn incremental_update(old_checksum: u16, old: &[u8], new: &[u8]) -> u16 {
         "incremental_update needs equal-length before/after images"
     );
     // HC' = ~(~HC + ~m + m')
-    let mut sum = (!old_checksum) as u32;
+    let mut sum = (!old_checksum) as u64;
     sum += ones_complement_words(old);
     sum += word_sum(new);
     !fold(sum)
 }
 
+// The sums below are u64 for the reason given in `checksum`.
+
 /// Sum the 16-bit words of `data`, padding an odd tail byte on the right.
-fn word_sum(data: &[u8]) -> u32 {
-    let mut sum = 0u32;
+fn word_sum(data: &[u8]) -> u64 {
+    let mut sum = 0u64;
     let n = data.len();
     let mut i = 0;
     while i + 1 < n {
-        sum += ((data[i] as u32) << 8) | (data[i + 1] as u32);
+        sum += ((data[i] as u64) << 8) | (data[i + 1] as u64);
         i += 2;
     }
     if n & 1 != 0 {
-        sum += (data[n - 1] as u32) << 8;
+        sum += (data[n - 1] as u64) << 8;
     }
     sum
 }
 
 /// Sum the *complements* of the 16-bit words of `data` — the `~m` term.
-fn ones_complement_words(data: &[u8]) -> u32 {
-    let mut sum = 0u32;
+fn ones_complement_words(data: &[u8]) -> u64 {
+    let mut sum = 0u64;
     let n = data.len();
     let mut i = 0;
     while i + 1 < n {
         let w = ((data[i] as u16) << 8) | (data[i + 1] as u16);
-        sum += (!w) as u32;
+        sum += (!w) as u64;
         i += 2;
     }
     if n & 1 != 0 {
         let w = (data[n - 1] as u16) << 8;
-        sum += (!w) as u32;
+        sum += (!w) as u64;
     }
     sum
 }
 
 #[inline]
-fn fold(mut sum: u32) -> u16 {
+fn fold(mut sum: u64) -> u16 {
     while sum >> 16 != 0 {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
@@ -291,5 +295,20 @@ mod tests {
         let patched = incremental_update(sum, &data[4..5], &[0x99]);
         data[4] = 0x99;
         assert_eq!(patched, checksum(&data));
+    }
+
+    #[test]
+    fn checksum_of_a_large_buffer_does_not_overflow() {
+        // 0xFFFF words: each one pushes the running sum as high as it goes.
+        // One's-complement sums of these are all ones, so the checksum is 0.
+        let big = vec![0xFFu8; 256 * 1024];
+        assert_eq!(checksum(&big), 0);
+        let mut odd = vec![0xFFu8; 256 * 1024 + 1];
+        odd[256 * 1024] = 0;
+        assert_eq!(checksum(&odd), 0);
+
+        // Rewriting all of it, incrementally.
+        let new: Vec<u8> = (0..big.len()).map(|i| i as u8).collect();
+        assert_eq!(incremental_update(0, &big, &new), checksum(&new));
     }
 }
