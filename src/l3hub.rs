@@ -26,9 +26,11 @@ fn next_port_id() -> u64 {
 ///
 /// `L3Hub` looks at each packet's destination address: the connected device
 /// owning the longest prefix containing the destination gets the packet, and
-/// no other device does. Broadcast and multicast are flooded to every port except the
-/// source. A default route may be configured to absorb packets that don't
-/// match any connected prefix.
+/// no other device does; when that is the sending device itself, the
+/// destination is on its own network and the packet is dropped. Broadcast
+/// and multicast are flooded to every port except the source. A default
+/// route may be configured to absorb packets that don't match any connected
+/// prefix.
 ///
 /// A packet that matches no prefix and has no default route is dropped, and
 /// [`stats`](Self::stats) is where that shows up.
@@ -192,6 +194,41 @@ impl L3Hub {
             return;
         }
 
+        // Longest prefix wins, so a narrower network inside a wider one is
+        // reachable whatever order the ports were attached in. A device with
+        // no address owns nothing: its unspecified 0.0.0.0/0 would otherwise
+        // match every destination. Catch-alls go through the default route.
+        //
+        // The source port takes part: if its own network is the best match,
+        // the destination is on the sender's side, and handing the packet to
+        // a wider network elsewhere (or the default route) would leak it
+        // there. It is dropped instead of sent back where it came from. On a
+        // tie another port wins, as when several hosts share one subnet.
+        let best = ports
+            .iter()
+            .filter_map(|p| {
+                let prefix = p.dev.addr();
+                (prefix.is_valid() && prefix.contains(dst))
+                    .then_some(((prefix.bits(), p.id != source_id), p))
+            })
+            .max_by_key(|(key, _)| *key);
+        let out = match best {
+            Some((_, p)) if p.id == source_id => None,
+            Some((_, p)) => Some(p),
+            None => {
+                // Copied out rather than matched on the guard: the send below
+                // may re-enter this hub, which would then deadlock on the lock.
+                let default_route = *self.default_route.lock().unwrap();
+                default_route.and_then(|d| ports.iter().find(|p| p.id == d && p.id != source_id))
+            }
+        };
+        let Some(out) = out else {
+            // Nowhere to send it: the sender's own network, or no matching
+            // prefix and no usable default route.
+            self.stats.record_dropped();
+            return;
+        };
+
         // RFC 1812 §5.3.1 / RFC 8200 §3: a router decrements the TTL / hop
         // limit of what it forwards, and discards what reaches zero -- that
         // is what finally ends a routing loop.
@@ -202,41 +239,8 @@ impl L3Hub {
             self.time_exceeded(pkt, &ports, source_id);
             return;
         }
-        let pkt: &Packet = fwd;
-
-        // Longest prefix wins, so a narrower network inside a wider one is
-        // reachable whatever order the ports were attached in. A device with
-        // no address owns nothing: its unspecified 0.0.0.0/0 would otherwise
-        // match every destination. Catch-alls go through the default route.
-        let best = ports
-            .iter()
-            .filter(|p| p.id != source_id)
-            .filter_map(|p| {
-                let prefix = p.dev.addr();
-                (prefix.is_valid() && prefix.contains(dst)).then_some((prefix.bits(), p))
-            })
-            .max_by_key(|(bits, _)| *bits);
-        if let Some((_, p)) = best {
-            let _ = p.dev.send(pkt);
-            self.stats.record_forwarded(1);
-            return;
-        }
-
-        // Copied out rather than matched on the guard: the send below may
-        // re-enter this hub, which would then deadlock on the lock.
-        let default_route = *self.default_route.lock().unwrap();
-        if let Some(default_id) = default_route {
-            for p in &ports {
-                if p.id == default_id && p.id != source_id {
-                    let _ = p.dev.send(pkt);
-                    self.stats.record_forwarded(1);
-                    return;
-                }
-            }
-        }
-
-        // Nowhere to send it: no matching prefix and no usable default route.
-        self.stats.record_dropped();
+        let _ = out.dev.send(fwd);
+        self.stats.record_forwarded(1);
     }
 
     /// Tell the sender of an expired packet, if the hub has an address to
@@ -423,6 +427,38 @@ mod tests {
         let buf = v4([192, 168, 0, 1], [10, 2, 0, 9]);
         hub.route(Packet::from_slice(&buf), ha.id);
         assert_eq!((count(&wide), count(&narrow)), (1, 1));
+    }
+
+    #[test]
+    fn the_senders_own_network_is_not_routed_elsewhere() {
+        let hub = Arc::new(L3Hub::new());
+        let narrow = sink("10.1.0.1/16");
+        let wide = sink("10.0.0.1/8");
+        let gw = sink("172.16.0.1/16");
+        let hn = hub.connect(narrow.clone());
+        let _hw = hub.connect(wide.clone());
+        let gw_arc: Arc<dyn L3Device> = Arc::new(gw.clone());
+        let _hg = hub.connect_arc(gw_arc.clone());
+        hub.set_default_route(&gw_arc);
+
+        // 10.1.0.9 is on the sender's own /16: not the /8's, nor the
+        // default route's, and not echoed back either.
+        let buf = v4([10, 1, 0, 1], [10, 1, 0, 9]);
+        hub.route(Packet::from_slice(&buf), hn.id);
+        assert_eq!((count(&narrow), count(&wide), count(&gw)), (0, 0, 0));
+        assert_eq!(hub.stats().dropped, 1);
+
+        // Elsewhere in the /8 still goes to the /8.
+        let buf = v4([10, 1, 0, 1], [10, 2, 0, 9]);
+        hub.route(Packet::from_slice(&buf), hn.id);
+        assert_eq!(count(&wide), 1);
+
+        // Hosts sharing one subnet still reach each other.
+        let peer = sink("10.1.0.2/16");
+        let _hp = hub.connect(peer.clone());
+        let buf = v4([10, 1, 0, 1], [10, 1, 0, 2]);
+        hub.route(Packet::from_slice(&buf), hn.id);
+        assert_eq!(count(&peer), 1);
     }
 
     #[test]
