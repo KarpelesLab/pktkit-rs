@@ -373,6 +373,11 @@ impl TcpOutConn {
                 let mut conn = self.state.conn.lock().expect("poisoned");
                 let n = conn.read(&mut buf);
                 if n > 0 {
+                    // See `TcpStream::read`: a reopened window goes out now,
+                    // not on the next tick.
+                    let segs = conn.take_outgoing();
+                    drop(conn);
+                    self.state.wrap_and_send(segs);
                     (n, false)
                 } else if conn.is_closed() {
                     // Reset, or our timers gave up: nothing will ever reach

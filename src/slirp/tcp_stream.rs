@@ -335,6 +335,12 @@ impl TcpStream {
         loop {
             let n = conn.read(buf);
             if n > 0 {
+                // Reading can reopen a window the peer is waiting on: tell it
+                // now, not on the next tick up to 100 ms later, which would
+                // stall a sender at every buffer-full.
+                let segs = conn.take_outgoing();
+                drop(conn);
+                self.state.wrap_and_send(segs);
                 return Ok(n);
             }
             if conn.fin_received() || conn.is_closed() {
@@ -450,6 +456,14 @@ mod tests {
     /// A slirp-side connection accepted from `peer`, with everything it
     /// sends collected (as TCP segments, the 20-byte IPv4 header stripped).
     fn accepted(peer: &mut Conn) -> (Arc<ConnState>, Arc<Mutex<Vec<Vec<u8>>>>) {
+        accepted_with(peer, ConnConfig::default())
+    }
+
+    /// As [`accepted`], the slirp side's engine configured by `cfg`.
+    fn accepted_with(
+        peer: &mut Conn,
+        cfg: ConnConfig,
+    ) -> (Arc<ConnState>, Arc<Mutex<Vec<Vec<u8>>>>) {
         let out: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
         let o = out.clone();
         let state = ConnState::new(
@@ -459,7 +473,7 @@ mod tests {
                 remote_ip: Ipv4Addr::new(10, 0, 0, 5),
                 remote_port: 5000,
             },
-            Conn::new(ConnConfig::default().local_port(80).remote_port(5000)),
+            Conn::new(cfg.local_port(80).remote_port(5000)),
             Arc::new(move |p: &[u8]| o.lock().unwrap().push(p[20..].to_vec())),
         );
         let syn = Segment::parse(&peer.connect()[0]).unwrap();
@@ -543,6 +557,26 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("read(&mut []) blocked");
         assert_eq!(got, Ok(0));
+    }
+
+    /// A read that reopens a closed receive window advertises it at once,
+    /// rather than leaving the sender stalled until the next tick.
+    #[test]
+    fn a_read_after_a_zero_window_updates_it_at_once() {
+        let mut peer = peer();
+        let (state, out) = accepted_with(&mut peer, ConnConfig::default().recv_buf_size(4096));
+        let stream = TcpStream::new(state.clone());
+        let (_, segs) = peer.write(&[7u8; 16384]);
+        for seg in segs {
+            state.deliver(&Segment::parse(&seg).unwrap());
+        }
+        pump(&state, &out, &mut peer);
+        assert!(out.lock().unwrap().is_empty());
+        let mut buf = vec![0u8; 8192];
+        assert_eq!(stream.read(&mut buf).unwrap(), 4096);
+        let sent = out.lock().unwrap().clone();
+        let update = sent.last().expect("no window update after the read");
+        assert!(Segment::parse(update).unwrap().window > 0);
     }
 
     /// A timeout too long for an `Instant` means no deadline, not a panic.
