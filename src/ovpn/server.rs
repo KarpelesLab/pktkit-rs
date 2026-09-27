@@ -611,8 +611,14 @@ fn tcp_conn(server: &Weak<Server>, stream: TcpStream, addr: SocketAddr) {
     };
     s.dispatch(&entry, &first);
     drop(s);
-    let idle = (timers.keepalive_timeout * 2).max(timers.handshake_window);
-    let _ = reader.get_ref().set_read_timeout(Some(idle));
+    // From here the peer's own timers decide when the client is gone -- the
+    // handshake window before it authenticates, ping-restart after -- and
+    // dropping the peer closes the connection. The read timeout is only a
+    // backstop, and there is none without keepalive: a quiet client may
+    // then stay as long as it likes, as with OpenVPN.
+    let idle = (!timers.keepalive_timeout.is_zero())
+        .then(|| (timers.keepalive_timeout * 2).max(timers.handshake_window));
+    let _ = reader.get_ref().set_read_timeout(idle);
 
     while let Some(data) = read_frame(&mut reader) {
         let Some(s) = live(server) else {
@@ -1138,6 +1144,64 @@ mod tests {
 
         server.close();
         assert_eq!(disconnects.load(Ordering::SeqCst), 1);
+    }
+
+    fn auth_ok() -> OnAuth {
+        Arc::new(|_| {
+            Ok(PeerConfig::new(
+                "10.8.0.2".parse().unwrap(),
+                "10.8.0.1".parse().unwrap(),
+                "255.255.255.0".parse().unwrap(),
+                24,
+            ))
+        })
+    }
+
+    /// Connect a test client to `server` over TCP.
+    fn connect_tcp(server: &Server, client: &mut TestClient) -> TcpStream {
+        let sock = tcp_client(server);
+        sock.set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let (mut w, mut r) = (sock.try_clone().unwrap(), sock.try_clone().unwrap());
+        connect_via(client, &mut |d| tcp_send(&mut w, d), &mut || {
+            tcp_recv(&mut r).ok()
+        });
+        sock
+    }
+
+    /// With keepalive disabled (a zero timeout, which is documented to
+    /// disable it), nothing says when a quiet client is gone: an
+    /// authenticated TCP client that just has nothing to send stays
+    /// connected, however long the handshake window is.
+    #[test]
+    fn idle_tcp_client_stays_when_keepalive_is_off() {
+        let on_data: OnData = Arc::new(|_, _, _| {});
+        let timers = PeerTimers::default()
+            .keepalive_interval(Duration::ZERO)
+            .keepalive_timeout(Duration::ZERO)
+            .handshake_window(Duration::from_secs(1));
+        let cfg = ServerConfig::new(
+            crate::ovpn::tests::server_config(),
+            "127.0.0.1:0".parse().unwrap(),
+            auth_ok(),
+            on_data,
+        )
+        .timers(timers);
+        let server = Server::new(cfg).unwrap();
+        let mut client = TestClient::new(*b"CLIENTID");
+        let mut sock = connect_tcp(&server, &mut client);
+        let key = PeerKey::new(sock.local_addr().unwrap(), Transport::Tcp);
+
+        std::thread::sleep(Duration::from_millis(2500));
+        server.send_to_peer(&key, b"still here").unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        loop {
+            let d = tcp_recv(&mut sock).expect("connection still open");
+            if Opcode::from_byte(d[0]).0 == Opcode::DATA_V1 {
+                break;
+            }
+        }
+        server.close();
     }
 
     #[test]
