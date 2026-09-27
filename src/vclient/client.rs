@@ -40,6 +40,11 @@ setters! {
 }
 
 /// A virtual network client. Implements [`L3Device`].
+///
+/// Dropping the last `Arc` tears the client down as
+/// [`close`](L3Device::close) does: its connections are reset, its listeners
+/// and UDP sockets closed, and a thread blocked on any of their handles,
+/// which outlive the client, wakes with an error.
 pub struct Client {
     cfg: Mutex<ClientConfig>,
     handler: Arc<Mutex<Option<L3Handler>>>,
@@ -135,7 +140,8 @@ impl Client {
     }
 
     /// Open a TCP connection to `addr`, blocking until the handshake
-    /// completes (or `timeout` elapses).
+    /// completes or 10 seconds pass; [`dial_tcp_timeout`](Self::dial_tcp_timeout)
+    /// takes another limit.
     #[cfg(not(target_family = "wasm"))]
     pub fn dial_tcp(&self, addr: SocketAddr) -> Result<TcpConn> {
         self.dial_tcp_timeout(addr, Duration::from_secs(10))
