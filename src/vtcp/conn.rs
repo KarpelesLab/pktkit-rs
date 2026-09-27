@@ -1645,10 +1645,16 @@ impl Conn {
             let room = self.payload_room(&opts);
             let n = avail.min(room).min(pending);
 
-            // Sender SWS avoidance: avoid tiny segments. Once closing, nothing
-            // more will be written to coalesce with, so send what there is.
-            // A full segment is what fits beside this segment's options.
-            if n < room && self.send_buf.as_ref().unwrap().unacked() > 0 && !self.fin_queued {
+            // Sender SWS avoidance (RFC 9293 §3.8.6.2.1): avoid tiny
+            // segments. Once closing, nothing more will be written to
+            // coalesce with, so send what there is. A full segment is what
+            // fits beside this segment's options; against a peer whose
+            // window never reaches one, half the largest window it has
+            // offered is as good, or every send would wait for all data in
+            // flight to be ACKed.
+            let half_wnd = self.max_snd_wnd / 2;
+            let big_enough = n >= room || (half_wnd > 0 && n >= half_wnd as usize);
+            if !big_enough && self.send_buf.as_ref().unwrap().unacked() > 0 && !self.fin_queued {
                 break;
             }
 
@@ -2824,6 +2830,26 @@ mod tests {
         deliver(&mut client, &ack);
         assert_eq!(client.state(), State::FinWait2);
         assert_eq!(read_all(&mut server).len(), 4096);
+    }
+
+    // RFC 9293 §3.8.6.2.1: with data in flight, a segment is still worth
+    // sending once it is at least half the largest window the peer has
+    // offered, even if short of the MSS; a peer that never offers a full
+    // segment's worth would otherwise get one segment per round trip.
+    #[test]
+    fn sender_sws_sends_half_the_max_window() {
+        let (mut client, _server) = established(40027);
+        client.set_snd_wnd(1000);
+        client.max_snd_wnd = 1000;
+        let (_, first) = client.write(&[1; 400]);
+        assert_eq!(seqs(&first).len(), 1);
+        let (_, second) = client.write(&[2; 1000]);
+        assert_eq!(second.len(), 1, "600 bytes fit, over half the max window");
+        assert_eq!(parse(&second[0]).payload.len(), 600);
+        // Less than half is still held back.
+        client.snd_wnd = 1400;
+        let (_, third) = client.write(&[3; 10]);
+        assert!(third.is_empty());
     }
 
     // A segment at RCV.NXT carrying data into our zero window still has
