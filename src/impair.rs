@@ -24,7 +24,9 @@
 //! ```
 //!
 //! Impairment applies in **both** directions: what the device sends and what it
-//! receives. Set [`Impairment::seed`] to make a run reproducible — the same
+//! receives. The wrapper takes over the wrapped device's handler when its own
+//! is first set; until then, what the wrapped device receives stays with it,
+//! as if no handler were set at all. Set [`Impairment::seed`] to make a run reproducible — the same
 //! seed drops and delays the same packets, which is what turns a flaky failure
 //! into a test case.
 //!
@@ -507,6 +509,10 @@ macro_rules! impaired_device {
             handler: Mutex<Option<$handler>>,
             engine: Arc<Engine>,
             worker: Mutex<Option<JoinHandle<()>>>,
+            /// Ourselves, for the handler installed on `inner`.
+            this: Weak<$name>,
+            /// Whether that handler has been installed yet.
+            hooked: std::sync::Once,
         }
 
         impl core::fmt::Debug for $name {
@@ -521,11 +527,13 @@ macro_rules! impaired_device {
             /// Wrap `inner`, impairing traffic in both directions.
             pub fn new(inner: Arc<dyn $device>, cfg: Impairment) -> Arc<$name> {
                 let engine = Engine::new(cfg);
-                let me = Arc::new($name {
+                let me = Arc::new_cyclic(|this| $name {
                     inner,
                     handler: Mutex::new(None),
                     engine: engine.clone(),
                     worker: Mutex::new(None),
+                    this: this.clone(),
+                    hooked: std::sync::Once::new(),
                 });
 
                 // The release thread and the wrapped device's handler both
@@ -542,17 +550,29 @@ macro_rules! impaired_device {
                     *me.worker.lock().unwrap() = Some(worker);
                 }
 
-                let weak: Weak<$name> = Arc::downgrade(&me);
-                me.inner.set_handler(Arc::new(move |m: &$msg| {
-                    if let Some(me) = weak.upgrade() {
-                        if let Some(now) = me.engine.submit(Direction::Rx, m.as_bytes()) {
-                            me.deliver(Direction::Rx, &now);
-                        }
-                    }
-                    Ok(())
-                }));
-
                 me
+            }
+
+            /// Install the handler, and on the first call take over the
+            /// wrapped device's.
+            ///
+            /// Taking it over only now, rather than in `new`, leaves whatever
+            /// the wrapped device receives before then with that device, to
+            /// hold or drop as it does when it has no handler, instead of
+            /// being impaired only to be discarded here for want of one.
+            fn install_handler(&self, h: $handler) {
+                *self.handler.lock().unwrap() = Some(h);
+                self.hooked.call_once(|| {
+                    let weak = self.this.clone();
+                    self.inner.set_handler(Arc::new(move |m: &$msg| {
+                        if let Some(me) = weak.upgrade() {
+                            if let Some(now) = me.engine.submit(Direction::Rx, m.as_bytes()) {
+                                me.deliver(Direction::Rx, &now);
+                            }
+                        }
+                        Ok(())
+                    }));
+                });
             }
 
             /// Replace the impairment. Messages already queued keep the
@@ -606,9 +626,13 @@ macro_rules! impaired_device {
                         let _ = self.inner.send($msg::from_slice(data));
                     }
                     Direction::Rx => {
+                        // Always set by now: nothing is received before it is.
                         let h = self.handler.lock().unwrap().clone();
-                        if let Some(h) = h {
-                            let _ = h($msg::from_slice(data));
+                        match h {
+                            Some(h) => {
+                                let _ = h($msg::from_slice(data));
+                            }
+                            None => self.engine.stats.record_rx_drop(),
                         }
                     }
                 }
@@ -646,7 +670,7 @@ impaired_device!(
 
 impl L2Device for ImpairL2 {
     fn set_handler(&self, h: L2Handler) {
-        *self.handler.lock().unwrap() = Some(h);
+        self.install_handler(h);
     }
 
     fn send(&self, frame: &Frame) -> Result<()> {
@@ -672,7 +696,7 @@ impl L2Device for ImpairL2 {
 
 impl L3Device for ImpairL3 {
     fn set_handler(&self, h: L3Handler) {
-        *self.handler.lock().unwrap() = Some(h);
+        self.install_handler(h);
     }
 
     fn send(&self, packet: &Packet) -> Result<()> {
@@ -869,6 +893,33 @@ mod tests {
         wire.deliver(Frame::from_slice(&f));
         assert_eq!(*seen.lock().unwrap(), 0, "inbound loss applies as well");
         assert_eq!(link.stats().unwrap().snapshot().rx_dropped, 1);
+    }
+
+    #[test]
+    fn the_wrapped_device_keeps_its_traffic_until_a_handler_is_set() {
+        let (wire, link) = wrap(Impairment::default());
+        // Nothing to hand received frames to yet, so the wrapper has not
+        // claimed them: the wrapped device still has no handler.
+        assert!(wire.handler.lock().unwrap().is_none());
+
+        let seen = Arc::new(Mutex::new(0usize));
+        let seen2 = seen.clone();
+        link.set_handler(Arc::new(move |_f: &Frame| {
+            *seen2.lock().unwrap() += 1;
+            Ok(())
+        }));
+        assert!(wire.handler.lock().unwrap().is_some());
+        wire.deliver(Frame::from_slice(&frame(1)));
+        assert_eq!(*seen.lock().unwrap(), 1);
+
+        // A replacement handler takes over without re-hooking.
+        let seen3 = seen.clone();
+        link.set_handler(Arc::new(move |_f: &Frame| {
+            *seen3.lock().unwrap() += 10;
+            Ok(())
+        }));
+        wire.deliver(Frame::from_slice(&frame(2)));
+        assert_eq!(*seen.lock().unwrap(), 11);
     }
 
     #[test]
