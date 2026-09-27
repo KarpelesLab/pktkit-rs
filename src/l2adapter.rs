@@ -18,6 +18,7 @@ use crate::{
 #[cfg(feature = "dhcp")]
 use crate::IpPrefix;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 /// Configure an [`L2Adapter`].
@@ -71,6 +72,10 @@ pub struct L2Adapter {
     #[cfg(feature = "dhcp")]
     probe: Mutex<Option<(Ipv4Addr, bool)>>,
 
+    /// ARP and NDP messages from other stations claiming one of our
+    /// addresses (RFC 5227 §2.4).
+    conflicts: AtomicU64,
+
     // Self-Arc, for use by closures that need to refer back to us.
     weak_self: Mutex<Weak<L2Adapter>>,
 }
@@ -111,6 +116,7 @@ impl L2Adapter {
             dhcp: Mutex::new(None),
             #[cfg(feature = "dhcp")]
             probe: Mutex::new(None),
+            conflicts: AtomicU64::new(0),
             weak_self: Mutex::new(Weak::new()),
         });
         *a.weak_self.lock().unwrap() = Arc::downgrade(&a);
@@ -130,6 +136,15 @@ impl L2Adapter {
     /// Adapter MAC.
     pub fn hw_addr(&self) -> MacAddr {
         self.mac
+    }
+
+    /// How many ARP or NDP messages have come from another station claiming
+    /// one of our addresses (RFC 5227 §2.4): the sign that someone else is
+    /// configured with it. They are not learnt from, so traffic keeps going
+    /// out on the wire rather than being handed to the claimant as a
+    /// neighbour; resolving the conflict is left to whoever reads this.
+    pub fn address_conflicts(&self) -> u64 {
+        self.conflicts.load(Ordering::Relaxed)
     }
 
     /// Set the IPv4 default gateway used for off-subnet ARP. With DHCP
@@ -377,6 +392,17 @@ impl L2Adapter {
             IpAddr::V4(a) if !a.is_unspecified() => Some(a),
             _ => None,
         };
+        // Someone else sending from our address (RFC 5227 §2.4) is a
+        // conflict to report, not a neighbour: caching it would point our
+        // own address at another station, and answering a gratuitous ARP
+        // would only argue with it. Our own ARP looped back by a hub is
+        // neither.
+        if our_addr.is_some() && our_addr == Some(sender_ip) {
+            if sender_mac != self.mac {
+                self.conflicts.fetch_add(1, Ordering::Relaxed);
+            }
+            return;
+        }
         let for_us = our_addr == Some(target_ip);
 
         // RFC 826's merge rule: refresh a station already known from any
@@ -482,11 +508,13 @@ impl L2Adapter {
             // link hears a multicast NS, and caching its source for every
             // one overheard would let any station rewrite, say, the
             // gateway's entry by soliciting some other address.
-            let dev_addr = match self.l3.addr().addr() {
-                IpAddr::V6(a) => Some(a),
-                _ => None,
-            };
-            if target != ndp::link_local_from_mac(self.mac) && dev_addr != Some(target) {
+            if !self.is_our_v6(target) {
+                return true;
+            }
+            // Another station soliciting from one of our addresses is
+            // using it too: a conflict, and nobody to learn or answer.
+            if self.is_our_v6(src) {
+                self.note_conflict(frame_src);
                 return true;
             }
             // As for ARP, a neighbour we would never resolve ourselves is
@@ -516,6 +544,12 @@ impl L2Adapter {
         if solicited && dst.is_multicast() {
             return true;
         }
+        // Somebody else advertising one of our addresses: a conflict, and
+        // never a cache entry for ourselves.
+        if self.is_our_v6(target) {
+            self.note_conflict(frame_src);
+            return true;
+        }
         let Some(mac) = ndp::parse_option(opts, ndp::OPT_TARGET_LINK_ADDR) else {
             return true;
         };
@@ -529,6 +563,19 @@ impl L2Adapter {
             None => {}
         }
         true
+    }
+
+    /// One of our IPv6 addresses: the configured one or the link-local.
+    fn is_our_v6(&self, ip: Ipv6Addr) -> bool {
+        ip == ndp::link_local_from_mac(self.mac) || self.l3.addr().addr() == IpAddr::V6(ip)
+    }
+
+    /// Count a message claiming one of our addresses, unless it is our own,
+    /// looped back.
+    fn note_conflict(&self, frame_src: Option<MacAddr>) {
+        if frame_src != Some(self.mac) {
+            self.conflicts.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Drop the ARP cache and whatever was queued for resolution, when the
@@ -1113,6 +1160,52 @@ mod tests {
             [10, 0, 0, 9],
         );
         assert_eq!(adapter.arp.lookup(Ipv4Addr::new(10, 0, 0, 7)), Some(moved));
+    }
+
+    #[test]
+    fn a_neighbour_claiming_our_address_is_not_cached() {
+        let (_pipe, adapter, out) = rig("10.0.0.5/24");
+        let evil = MacAddr([2, 0, 0, 0, 0, 0xee]);
+        let us = Ipv4Addr::new(10, 0, 0, 5);
+        // A gratuitous ARP for our address, then a reply claiming it.
+        arp_in(
+            &adapter,
+            arp::OP_REQUEST,
+            evil,
+            [10, 0, 0, 5],
+            [10, 0, 0, 5],
+        );
+        arp_in(&adapter, arp::OP_REPLY, evil, [10, 0, 0, 5], [10, 0, 0, 5]);
+        assert_eq!(adapter.arp.lookup(us), None, "cached ourselves");
+        assert!(take(&out).is_empty(), "answered the conflicting host");
+        assert_eq!(adapter.address_conflicts(), 2);
+
+        // Our own announcement, looped back by a hub, is no conflict.
+        let mine = adapter.mac;
+        arp_in(
+            &adapter,
+            arp::OP_REQUEST,
+            mine,
+            [10, 0, 0, 5],
+            [10, 0, 0, 5],
+        );
+        assert_eq!(adapter.address_conflicts(), 2);
+
+        let (_pipe, adapter, _out) = rig("2001:db8::5/64");
+        // An NS for our address from our own address, and an NA for it.
+        let mut ns = ndp::build_ns(evil, our_ip());
+        let f = ndp_frame(&adapter, evil, our_ip(), our_ip(), &mut ns);
+        adapter.send(Frame::from_slice(&f)).unwrap();
+        let ll = ndp::link_local_from_mac(adapter.mac);
+        let mut ns = ndp::build_ns(evil, our_ip());
+        let f = ndp_frame(&adapter, evil, ll, our_ip(), &mut ns);
+        adapter.send(Frame::from_slice(&f)).unwrap();
+        let mut na = ndp::build_na(evil, our_ip(), false);
+        let f = ndp_frame(&adapter, evil, our_ip(), our_ip(), &mut na);
+        adapter.send(Frame::from_slice(&f)).unwrap();
+        assert_eq!(adapter.ndp.lookup(our_ip()), None, "cached ourselves");
+        assert_eq!(adapter.ndp.lookup(ll), None, "cached our link-local");
+        assert_eq!(adapter.address_conflicts(), 3);
     }
 
     /// `frame` with an 802.1Q tag carrying `vid` inserted after the MACs.
