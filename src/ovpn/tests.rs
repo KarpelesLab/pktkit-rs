@@ -1436,6 +1436,30 @@ fn client_may_renegotiate_after_a_failed_attempt() {
     );
 }
 
+/// `authenticated` says what state the peer is in after the output, in
+/// every output: not only in those that advanced the handshake.
+#[test]
+fn every_output_says_whether_the_peer_is_authenticated() {
+    let mut server = Peer::new(server_config(), *b"SERVERID", auth_hook())
+        .unwrap()
+        .with_timers(quiet_timers());
+    let mut client = TestClient::new(*b"CLIENTID");
+    let out = server.tick(Instant::now()).unwrap();
+    assert!(!out.authenticated);
+    let keys = connect(&mut server, &mut client);
+
+    let opts = gcm_opts();
+    let pkt = data::encrypt(&opts, &keys, 0, 1, b"x", super::peer::fill_random).unwrap();
+    let out = server.handle_packet(&pkt).unwrap();
+    assert!(out.deliver.is_some());
+    assert!(out.authenticated, "data packet");
+    let out = server.tick(Instant::now()).unwrap();
+    assert!(out.authenticated, "tick");
+    // A renegotiation under way leaves the working key in use.
+    let out = server.handle_packet(&client.renegotiate(1)).unwrap();
+    assert!(out.authenticated, "renegotiation");
+}
+
 /// A soft reset is checked before it starts a new key: one that is not
 /// packet 0, or that ACKs for another session, is dropped (ssl.c
 /// tls_pre_decrypt validates before key_state_soft_reset), not left to

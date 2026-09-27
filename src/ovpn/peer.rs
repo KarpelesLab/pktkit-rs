@@ -164,7 +164,11 @@ pub struct PeerOutput {
     pub send: Vec<Vec<u8>>,
     /// Decrypted payload to deliver to the adapter, if a data packet arrived.
     pub deliver: Option<Vec<u8>>,
-    /// True once the peer has authenticated and the data channel is active.
+    /// Whether, once this output is acted on, the peer has an authenticated
+    /// session with a usable data channel key. Set in every output --
+    /// from [`Peer::handle_packet`], [`Peer::tick`] and
+    /// [`Peer::complete_auth`] alike -- and false in one that closes the
+    /// connection.
     pub authenticated: bool,
     /// Set exactly once per session, by the datagram that completed its
     /// authentication: the config pushed to the client.
@@ -510,7 +514,7 @@ impl Peer {
                     io::ErrorKind::TimedOut,
                     "nothing received within the ping-restart timeout",
                 ));
-                return Ok(out);
+                return Ok(self.report(out));
             }
             let interval = self.timers.keepalive_interval;
             if !interval.is_zero()
@@ -523,7 +527,7 @@ impl Peer {
         if !out.send.is_empty() {
             self.last_sent = now;
         }
-        Ok(out)
+        Ok(self.report(out))
     }
 
     /// Process one inbound datagram from the peer.
@@ -565,7 +569,7 @@ impl Peer {
         if !out.send.is_empty() {
             self.last_sent = now;
         }
-        Ok(out)
+        Ok(self.report(out))
     }
 
     /// Handle a control packet. Returns the output, and whether the packet
@@ -680,6 +684,17 @@ impl Peer {
         Ok((out, slot == Slot::Active))
     }
 
+    /// Record in `out` whether the peer is authenticated once it is acted
+    /// on (see [`PeerOutput::authenticated`]).
+    fn report(&self, mut out: PeerOutput) -> PeerOutput {
+        // Mid-renegotiation the new key is not ready but the old one is.
+        out.authenticated = !out.close
+            && self.active.as_ref().is_some_and(|s| {
+                s.primary.data.is_some() || s.lame.as_ref().is_some_and(|k| k.data.is_some())
+            });
+        out
+    }
+
     /// After a session made progress: a session that has authenticated
     /// takes over the data channel.
     fn settle(&mut self, slot: Slot, out: &mut PeerOutput) {
@@ -699,10 +714,6 @@ impl Peer {
             out.replaced = self.active.is_some();
             self.active = session;
         }
-        // Mid-renegotiation the new key is not ready but the old one is.
-        out.authenticated = self.active.as_ref().is_some_and(|s| {
-            s.primary.data.is_some() || s.lame.as_ref().is_some_and(|k| k.data.is_some())
-        });
     }
 
     /// Finish an authentication handed out as [`PeerOutput::auth`], with
@@ -718,7 +729,7 @@ impl Peer {
     ) -> PeerOutput {
         let mut out = PeerOutput::default();
         let Some(slot) = self.awaiting(req) else {
-            return out;
+            return self.report(out);
         };
         let session = self.session_mut(slot).expect("slot just resolved");
         let (_, kx) = session.primary.auth_pending.take().expect("checked above");
@@ -729,13 +740,13 @@ impl Peer {
         let pumped = session.pump_tls(&mut out);
         if let Err(e) = res.and(pumped) {
             self.fail_key(slot, &mut out, e);
-            return out;
+            return self.report(out);
         }
         self.settle(slot, &mut out);
         if !out.send.is_empty() {
             self.last_sent = Instant::now();
         }
-        out
+        self.report(out)
     }
 
     /// Whether a verdict on `req` would still be acted on: its key exchange
