@@ -1156,14 +1156,23 @@ impl Conn {
         self.handle_data_state(seg)
     }
 
+    /// PAWS (RFC 7323 §5), and TS.Recent for the echo. False if `seg`
+    /// must be dropped.
+    fn check_paws(&mut self, seg: &Segment) -> bool {
+        if self.update_timestamp(seg) {
+            return true;
+        }
+        // RFC 7323 §5.3 answers with an ACK, but through the invalid-
+        // segment throttle as Linux does: replayed old segments must not
+        // each draw one.
+        self.queue_oow_ack(seg);
+        false
+    }
+
     fn handle_data_state(&mut self, seg: &Segment) -> Vec<Vec<u8>> {
         let mut need_ack = false;
 
-        if !self.update_timestamp(seg) {
-            // RFC 7323 §5.3 answers with an ACK, but through the invalid-
-            // segment throttle as Linux does: replayed old segments must
-            // not each draw one.
-            self.queue_oow_ack(seg);
+        if !self.check_paws(seg) {
             return self.take_outgoing();
         }
 
@@ -1232,7 +1241,13 @@ impl Conn {
         }
     }
 
+    // Here, in CLOSING and in LAST-ACK the peer's FIN is in, but its ACKs
+    // still carry timestamps: without PAWS and TS.Recent, every echo we
+    // send would be stale and the peer's RTT samples would keep growing.
     fn handle_close_wait(&mut self, seg: &Segment) -> Vec<Vec<u8>> {
+        if !self.check_paws(seg) {
+            return self.take_outgoing();
+        }
         if seg.has_flag(flags::ACK) {
             self.process_ack(seg);
         }
@@ -1240,6 +1255,9 @@ impl Conn {
     }
 
     fn handle_closing(&mut self, seg: &Segment) -> Vec<Vec<u8>> {
+        if !self.check_paws(seg) {
+            return self.take_outgoing();
+        }
         // Data and the FIN may still be in flight (or not yet sent), so ACKs
         // here need the full treatment, not just a check for the FIN's.
         if seg.has_flag(flags::ACK) {
@@ -1257,6 +1275,9 @@ impl Conn {
     }
 
     fn handle_last_ack(&mut self, seg: &Segment) -> Vec<Vec<u8>> {
+        if !self.check_paws(seg) {
+            return self.take_outgoing();
+        }
         if seg.has_flag(flags::ACK) {
             self.process_ack(seg);
         }
@@ -3948,6 +3969,31 @@ mod tests {
         seg.seq = seg.seq.wrapping_sub(100);
         client.handle_segment(&seg);
         assert_eq!(client.ts_recent, before.wrapping_add(1000));
+    }
+
+    // Timestamps keep working after the peer's FIN: a server answering a
+    // half-closed client from CLOSE-WAIT must echo the TSvals of the ACKs
+    // it gets, or the client's RTT samples (RFC 7323 §4) grow with every
+    // one, and old segments must still meet PAWS.
+    #[test]
+    fn close_wait_tracks_timestamps() {
+        let (mut client, mut server) = ts_pair(40316);
+        let fin = client.close();
+        let acks = deliver(&mut server, &fin);
+        deliver(&mut client, &acks);
+        assert_eq!(server.state(), State::CloseWait);
+
+        let una = server.send_buf.as_ref().unwrap().una();
+        let recent = server.ts_recent;
+        let mut ack = bare_ack(&server, &client, una, 4096);
+        ack.options = vec![timestamp_option(recent.wrapping_add(1000), 0)];
+        server.handle_segment(&ack);
+        assert_eq!(server.ts_recent, recent.wrapping_add(1000));
+
+        // An old one is dropped, and draws only the throttled ACK.
+        ack.options = vec![timestamp_option(recent, 0)];
+        assert_eq!(server.handle_segment(&ack).len(), 1);
+        assert_eq!(server.ts_recent, recent.wrapping_add(1000));
     }
 
     // The duplicate ACK a PAWS rejection draws goes through the same
