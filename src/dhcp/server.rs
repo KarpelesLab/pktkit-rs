@@ -343,6 +343,7 @@ impl Server {
     fn request(&self, p: &wire::Parsed, key: &ClientKey) -> Answer {
         let now = Instant::now();
         let mut leases = self.live_leases(now);
+        let mut renewing = false;
         let ip = match (p.server_id, p.requested_ip) {
             // SELECTING, but the client took another server's offer: ours is
             // free again.
@@ -363,19 +364,24 @@ impl Server {
             // INIT-REBOOT: the client asks to keep an address it remembers.
             (None, Some(ip)) => ip,
             // RENEWING or REBINDING: the address is in ciaddr.
-            (None, None) if !p.ciaddr.is_unspecified() => p.ciaddr,
+            (None, None) if !p.ciaddr.is_unspecified() => {
+                renewing = true;
+                p.ciaddr
+            }
             _ => return Answer::Silent,
         };
-        self.commit(&mut leases, (key, self.reservation(p)), ip, now)
+        self.commit(&mut leases, (key, self.reservation(p)), ip, renewing, now)
     }
 
     /// Bind `ip` to client `key` (with reservation `res`) if the server
-    /// agrees that is the client's address.
+    /// agrees that is the client's address. `renewing` is set for a client
+    /// RENEWING or REBINDING, which is already using `ip`.
     fn commit(
         &self,
         leases: &mut HashMap<ClientKey, Lease>,
         (key, res): (&ClientKey, Reservation),
         ip: Ipv4Addr,
+        renewing: bool,
         now: Instant,
     ) -> Answer {
         let lease = Lease {
@@ -417,8 +423,23 @@ impl Server {
         if !self.in_pool(ip) {
             return Answer::Silent;
         }
-        if held.contains(&ip) || self.declined.lock().unwrap().contains_key(&ip) {
+        if held.contains(&ip) {
             return Answer::Nak;
+        }
+        {
+            let mut declined = self.declined.lock().unwrap();
+            if declined.contains_key(&ip) {
+                // Having forgotten the lease, we may well have offered the
+                // address to someone else, whose ARP check found this very
+                // client on it and declined it. A client renewing is using
+                // the address, so the decline was about it: refusing it now
+                // would take the address from its rightful holder. Anyone
+                // else is kept off an address found in use.
+                if !renewing {
+                    return Answer::Nak;
+                }
+                declined.remove(&ip);
+            }
         }
         if leases.len() >= MAX_LEASES {
             return Answer::Silent;
@@ -959,6 +980,46 @@ mod tests {
         // Renewing an address the server never gave this client.
         let mut m = wire::Builder::new(1, 8, MacAddr([2, 0, 0, 0, 0, 2]));
         m.message_type(wire::MSG_REQUEST).ciaddr(ip);
+        s.handle_dhcp(&m.finish());
+        assert_eq!(replies(&r)[0].msg_type, wire::MSG_NAK);
+    }
+
+    #[test]
+    fn a_renewal_after_a_restart_keeps_an_address_declined_for_it() {
+        // The server restarted and forgot A's lease. It offered A's address
+        // to B, whose ARP probe found A there, so B declined it.
+        let (s, r) = recording(one_address_pool());
+        let a = MacAddr([2, 0, 0, 0, 0, 0xa]);
+        let b = MacAddr([2, 0, 0, 0, 0, 0xb]);
+        let ip = bound_lease(&s, &r, b);
+        s.handle_dhcp(&decline(b, Some(ip), Some(Ipv4Addr::new(10, 0, 0, 1))));
+        assert!(s.declined.lock().unwrap().contains_key(&ip));
+
+        let renew = |mac: MacAddr| {
+            let mut m = wire::Builder::new(1, 7, mac);
+            m.message_type(wire::MSG_REQUEST).ciaddr(ip);
+            m.finish()
+        };
+        // A, which rightly holds it, renews.
+        s.handle_dhcp(&renew(a));
+        let got = replies(&r);
+        assert_eq!(got[0].msg_type, wire::MSG_ACK, "NAKed the address's holder");
+        assert_eq!(got[0].yiaddr, ip);
+        assert!(!s.declined.lock().unwrap().contains_key(&ip));
+        assert_eq!(s.leases.lock().unwrap()[&hw(a)].ip, ip);
+
+        // A renewal never takes an address someone else holds, though.
+        s.handle_dhcp(&renew(b));
+        assert_eq!(replies(&r)[0].msg_type, wire::MSG_NAK);
+
+        // Nor does an INIT-REBOOT get a declined address: the client asking
+        // is not known to be on it.
+        let (s, r) = recording(one_address_pool());
+        let ip = bound_lease(&s, &r, b);
+        s.handle_dhcp(&decline(b, Some(ip), Some(Ipv4Addr::new(10, 0, 0, 1))));
+        let mut m = wire::Builder::new(1, 9, a);
+        m.message_type(wire::MSG_REQUEST)
+            .ipv4_option(wire::OPT_REQUESTED_IP, ip);
         s.handle_dhcp(&m.finish());
         assert_eq!(replies(&r)[0].msg_type, wire::MSG_NAK);
     }
