@@ -216,9 +216,15 @@ impl L2Adapter {
                 if !pkt.is_valid() {
                     return;
                 }
-                // Intercept DHCP (IPv4 UDP port 68).
+                // Intercept DHCP (IPv4 UDP port 68). Only a whole datagram
+                // has a UDP header where one is looked for: in a later
+                // fragment those bytes are payload, and a first fragment
+                // holds only part of the message. Fragments go to the host.
                 #[cfg(feature = "dhcp")]
-                if pkt.version() == 4 && pkt.ipv4_protocol() == Protocol::UDP {
+                if pkt.version() == 4
+                    && pkt.ipv4_protocol() == Protocol::UDP
+                    && !pkt.ipv4_is_fragment()
+                {
                     let udp = pkt.ipv4_payload();
                     if udp.len() >= 8 {
                         let dport = u16::from_be_bytes([udp[2], udp[3]]);
@@ -1204,6 +1210,43 @@ mod tests {
         t.begin_probe(ip2);
         t.send_probe(ip2);
         assert!(!t.probe_conflict(ip2));
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn fragments_are_not_taken_for_dhcp() {
+        let (pipe, adapter, _out) = rig("10.0.0.5/24");
+        adapter.start_dhcp();
+        let got = Arc::new(Mutex::new(0usize));
+        let g = got.clone();
+        pipe.set_handler(Arc::new(move |_p: &Packet| {
+            *g.lock().unwrap() += 1;
+            Ok(())
+        }));
+        let (s, d) = (Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 5));
+        let udp = crate::build::build_udp(s.into(), d.into(), 67, 68, &[0; 64]);
+        let whole = crate::build::build_ipv4(s, d, Protocol::UDP, 64, &udp);
+        let peer = MacAddr([2, 0, 0, 0, 0, 1]);
+
+        // A later fragment whose payload happens to read 68 at bytes 2..4.
+        let mut later = whole.clone();
+        Packet::from_mut(&mut later).set_ipv4_fragment_offset(1480);
+        // A first fragment: MF set.
+        let mut first = whole.clone();
+        Packet::from_mut(&mut first).set_ipv4_more_fragments(true);
+        for pkt in [&later, &first] {
+            let mut pkt = pkt.clone();
+            Packet::from_mut(&mut pkt).recompute_ipv4_checksum();
+            let f = build_frame(adapter.mac, peer, EtherType::IPV4, &pkt);
+            adapter.send(Frame::from_slice(&f)).unwrap();
+        }
+        assert_eq!(*got.lock().unwrap(), 2, "fragment swallowed as DHCP");
+
+        // The whole datagram is still the DHCP client's.
+        let f = build_frame(adapter.mac, peer, EtherType::IPV4, &whole);
+        adapter.send(Frame::from_slice(&f)).unwrap();
+        assert_eq!(*got.lock().unwrap(), 2);
+        adapter.stop_dhcp();
     }
 
     #[cfg(feature = "dhcp")]
