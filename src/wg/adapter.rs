@@ -9,7 +9,7 @@
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock, Weak};
 use std::thread;
 
 use crate::accept::{Cleanup, L3Connector};
@@ -390,9 +390,15 @@ impl Adapter {
             let mut g = self.peers.write().expect("peers lock");
             g.drain().map(|(_, p)| p).collect()
         };
+        // Cleanups are caller code, and this may run from Drop, on the
+        // server's read loop: one that panics must not skip the rest.
         for p in peers {
-            if let Some(cleanup) = p.cleanup.lock().expect("cleanup lock").take() {
-                let _ = cleanup();
+            let cleanup = p
+                .cleanup
+                .into_inner()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(cleanup) = cleanup {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(cleanup));
             }
         }
         if let Some(mh) = self.multi_handler.as_ref() {
@@ -820,5 +826,36 @@ mod tests {
         }
         assert!(adapter.upgrade().is_none());
         t.join().unwrap().unwrap();
+    }
+
+    /// A cleanup that panics does not keep the others from running when
+    /// the adapter closes (which dropping it now does, possibly on the
+    /// server's read loop).
+    #[test]
+    fn a_panicking_cleanup_does_not_skip_the_others() {
+        struct PanickyCleanup(Arc<AtomicUsize>);
+        impl L3Connector for PanickyCleanup {
+            fn connect_l3(&self, _dev: Arc<dyn L3Device>) -> Result<Cleanup> {
+                let n = self.0.clone();
+                Ok(Box::new(move || {
+                    n.fetch_add(1, Ordering::SeqCst);
+                    panic!("caller bug");
+                }))
+            }
+        }
+        let n = Arc::new(AtomicUsize::new(0));
+        let a = Adapter::new(AdapterConfig::new(
+            crate::wg::generate_private_key().unwrap(),
+            Arc::new(PanickyCleanup(n.clone())),
+            "10.0.0.1/24".parse().unwrap(),
+        ))
+        .unwrap();
+        for i in 1..=2 {
+            let key = NoisePublicKey([i; 32]);
+            a.add_peer(key);
+            a.on_peer_connected(key);
+        }
+        drop(a);
+        assert_eq!(n.load(Ordering::SeqCst), 2);
     }
 }
