@@ -444,6 +444,23 @@ impl Tx {
             self.free.extend_from_slice(&batch[..n]);
         }
     }
+
+    /// Reap completions, then take a free UMEM frame for a TX ring slot, or
+    /// say which of the two is missing.
+    ///
+    /// Reaped on every call, not only once the pool runs dry: a pool larger
+    /// than the two rings together never runs dry, and the COMPLETION ring,
+    /// never drained, fills. The kernel stops transmitting until there is
+    /// room in it for what it sends, the TX ring fills behind it, and every
+    /// send from then on would find a free frame and no slot to put it in.
+    /// With nothing to reap, this is two cursor loads.
+    fn reserve(&mut self) -> std::result::Result<u64, &'static str> {
+        self.reclaim();
+        if self.ring.free() == 0 {
+            return Err("afxdp: TX ring full");
+        }
+        self.free.pop().ok_or("afxdp: no free TX buffers")
+    }
 }
 
 /// A socket's receive rings, owned by its poll loop: the rings take one
@@ -902,22 +919,17 @@ impl Socket {
         }
 
         let mut tx = self.tx.lock().unwrap();
-
-        // Reaping completions is a ring read, not a syscall, but it still costs
-        // two cache-line touches; only pay for it once the pool runs dry.
-        let addr = match tx.free.pop() {
-            Some(a) => a,
-            None => {
-                tx.reclaim();
-                match tx.free.pop() {
-                    Some(a) => a,
-                    None => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::WouldBlock,
-                            "afxdp: no free TX buffers",
-                        ));
-                    }
-                }
+        let addr = match tx.reserve() {
+            Ok(a) => a,
+            Err(_) => {
+                // Every frame is queued or in flight. The kernel may be
+                // waiting for a wakeup to move them, so give it one (which
+                // reaps as it goes) before calling this backpressure.
+                drop(tx);
+                self.kick_tx();
+                tx = self.tx.lock().unwrap();
+                tx.reserve()
+                    .map_err(|m| io::Error::new(io::ErrorKind::WouldBlock, m))?
             }
         };
 
@@ -933,13 +945,10 @@ impl Socket {
             len: len as u32,
             options: 0,
         }];
-        if tx.ring.produce(&desc) == 0 {
-            tx.free.push(addr);
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "afxdp: TX ring full",
-            ));
-        }
+        // We are the ring's only producer, hold the lock, and `reserve` saw a
+        // free slot, so this cannot fail.
+        let produced = tx.ring.produce(&desc);
+        debug_assert_eq!(produced, 1, "TX ring shrank under its only producer");
         // With XDP_USE_NEED_WAKEUP this is only true when the kernel has gone
         // idle on this ring, so the common case costs no syscall at all.
         let wake = tx.ring.need_wakeup();
@@ -968,8 +977,11 @@ impl Socket {
         }
 
         let mut tx = self.tx.lock().unwrap();
+        // See `Tx::reserve` for why this is not left until the pool is dry.
+        tx.reclaim();
         let mut taken = 0;
         let mut queued = false;
+        let mut kicked = false;
         let mut descs = [XdpDesc {
             addr: 0,
             len: 0,
@@ -1015,8 +1027,20 @@ impl Socket {
                 queued = true;
             }
             if upto == taken {
-                // Neither a buffer nor a ring slot to be had.
-                break;
+                // Neither a buffer nor a ring slot to be had. The kernel may
+                // be waiting for a wakeup to free some, so once per call, give
+                // it one (which reaps as it goes) and look again.
+                if kicked {
+                    break;
+                }
+                kicked = true;
+                drop(tx);
+                self.kick_tx();
+                tx = self.tx.lock().unwrap();
+                tx.reclaim();
+                // Whatever was queued before has just been kicked.
+                queued = false;
+                continue;
             }
             taken = upto;
         }
@@ -1752,6 +1776,67 @@ mod tests {
             },
         );
         assert_eq!((n, left.get()), (2, 0));
+    }
+
+    /// Flat memory standing in for one ring's mapping: cursors a cache line
+    /// apart, then the descriptors. u64s, for their alignment.
+    fn ring_mem(size: u32, elem: usize) -> (Vec<u64>, RingOffset) {
+        let off = RingOffset {
+            producer: 0,
+            consumer: 64,
+            flags: 128,
+            desc: 192,
+        };
+        (vec![0u64; (192 + size as usize * elem) / 8], off)
+    }
+
+    #[test]
+    fn completions_are_reaped_before_the_pool_runs_dry() {
+        const SIZE: u32 = 4;
+        let desc = |addr| XdpDesc {
+            addr,
+            len: 60,
+            options: 0,
+        };
+        let (mut tx_mem, tx_off) = ring_mem(SIZE, size_of::<XdpDesc>());
+        let (mut cq_mem, cq_off) = ring_mem(SIZE, 8);
+        let tx_p = tx_mem.as_mut_ptr() as *mut u8;
+        let cq_p = cq_mem.as_mut_ptr() as *mut u8;
+        // SAFETY: each mapping is sized for its ring. Userspace gets one
+        // object per ring; the second over each plays the kernel, the other
+        // end of the same single-producer/single-consumer protocol.
+        let (mut tx, mut k_tx, mut k_cq) = unsafe {
+            (
+                Tx {
+                    ring: DescRing::new(tx_p, tx_off, SIZE),
+                    comp: AddrRing::new(cq_p, cq_off, SIZE),
+                    // A pool of three rings' worth: more than the TX and
+                    // COMPLETION rings can hold between them.
+                    free: (0..3 * SIZE as u64).map(|i| i * 2048).collect(),
+                },
+                DescRing::new(tx_p, tx_off, SIZE),
+                AddrRing::new(cq_p, cq_off, SIZE),
+            )
+        };
+
+        // Fill the TX ring; the kernel sends it all and fills the COMPLETION
+        // ring with it.
+        for _ in 0..SIZE {
+            let a = tx.reserve().unwrap();
+            assert_eq!(tx.ring.produce(&[desc(a)]), 1);
+        }
+        assert_eq!(tx.reserve(), Err("afxdp: TX ring full"));
+        let mut sent = [XdpDesc::default(); SIZE as usize];
+        assert_eq!(k_tx.consume(&mut sent), SIZE as usize);
+        assert_eq!(k_cq.produce(&sent.map(|d| d.addr)), SIZE as usize);
+
+        // The pool still has frames, so nothing forced a reap before; the
+        // kernel, with a full COMPLETION ring, would never send again.
+        assert_eq!(tx.free.len(), 2 * SIZE as usize);
+        tx.reserve().unwrap();
+        assert_eq!(tx.free.len(), 3 * SIZE as usize - 1);
+        let mut out = [0u64; 1];
+        assert_eq!(tx.comp.consume(&mut out), 0, "COMPLETION ring drained");
     }
 
     #[test]
