@@ -157,7 +157,8 @@ use pktkit::{PipeL3, IpPrefix, connect_l3};
 
 let a = Arc::new(PipeL3::new(IpPrefix::new(Ipv4Addr::new(10, 0, 0, 1).into(), 24)));
 let b = Arc::new(PipeL3::new(IpPrefix::new(Ipv4Addr::new(10, 0, 0, 2).into(), 24)));
-connect_l3(a, b);
+// `a` holds the wiring (and `b`): keep it for as long as the link should last.
+connect_l3(a.clone(), b);
 ```
 
 ### Virtual LAN with DHCP and NAT

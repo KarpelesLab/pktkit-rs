@@ -1,42 +1,80 @@
+use crate::l2hub::{DEFAULT_MAX_FORWARD_DEPTH, DepthGuard};
 use crate::{Frame, L2Device, L3Device, Packet};
 use std::sync::Arc;
 
 /// Wire two [`L2Device`]s point-to-point: frames produced by one are delivered
 /// to the other.
 ///
-/// Both devices must outlive the wiring; pass `Arc`s if their lifetimes are
-/// distinct from the surrounding scope.
+/// `a` owns the wiring. Its handler holds `b`, while `b`'s handler holds only
+/// a weak reference back to `a`, so the pair is not a reference cycle: once
+/// the last `Arc` to `a` is dropped, `a` goes, and `b` with it unless it is
+/// shared elsewhere. Keep `a` for as long as the two should stay connected.
+///
+/// Delivery is a synchronous call from one device into the other, so a loop
+/// in the topology is recursion. It is cut off, and the frame dropped, at
+/// the same depth as in [`L2Hub`](crate::L2Hub). Two devices that hand what
+/// they are sent straight back to their handler, such as two
+/// [`PipeL2`](crate::PipeL2)s, are such a loop.
 ///
 /// ```
-/// # use std::sync::Arc;
-/// # use pktkit::{PipeL2, MacAddr, connect_l2, L2Device, build_frame, EtherType, Frame};
-/// let a = Arc::new(PipeL2::new(MacAddr::zero()));
-/// let b = Arc::new(PipeL2::new(MacAddr::zero()));
-/// connect_l2(a.clone(), b.clone());
+/// # #[cfg(feature = "l2adapter")] {
+/// use pktkit::{L2Adapter, L2AdapterConfig, PipeL3, connect_l2};
 ///
-/// // Frames sent into `a` reach `b` and vice-versa.
+/// // Two hosts on one cable: what either adapter sends reaches the other.
+/// let host = |ip: &str| PipeL3::new(ip.parse().unwrap());
+/// let a = L2Adapter::new(host("10.0.0.1/24"), L2AdapterConfig::default());
+/// let b = L2Adapter::new(host("10.0.0.2/24"), L2AdapterConfig::default());
+/// connect_l2(a.clone(), b);
+/// # }
 /// ```
-pub fn connect_l2<A, B>(a: A, b: B)
+pub fn connect_l2<A, B>(a: Arc<A>, b: B)
 where
-    A: L2Device + Clone + 'static,
-    B: L2Device + Clone + 'static,
+    A: L2Device + ?Sized + 'static,
+    B: L2Device + 'static,
 {
-    let b_for_a = b.clone();
-    a.set_handler(Arc::new(move |f: &Frame| b_for_a.send(f)));
-    let a_for_b = a;
-    b.set_handler(Arc::new(move |f: &Frame| a_for_b.send(f)));
+    let weak_a = Arc::downgrade(&a);
+    b.set_handler(Arc::new(move |f: &Frame| {
+        let Some(_depth) = DepthGuard::enter(DEFAULT_MAX_FORWARD_DEPTH) else {
+            return Ok(());
+        };
+        match weak_a.upgrade() {
+            Some(a) => a.send(f),
+            None => Ok(()),
+        }
+    }));
+    a.set_handler(Arc::new(move |f: &Frame| {
+        let Some(_depth) = DepthGuard::enter(DEFAULT_MAX_FORWARD_DEPTH) else {
+            return Ok(());
+        };
+        b.send(f)
+    }));
 }
 
 /// Wire two [`L3Device`]s point-to-point.
-pub fn connect_l3<A, B>(a: A, b: B)
+///
+/// As with [`connect_l2`], `a` owns the wiring and keeps `b` alive, `b`
+/// refers back to `a` only weakly, and a loop between them is cut off.
+pub fn connect_l3<A, B>(a: Arc<A>, b: B)
 where
-    A: L3Device + Clone + 'static,
-    B: L3Device + Clone + 'static,
+    A: L3Device + ?Sized + 'static,
+    B: L3Device + 'static,
 {
-    let b_for_a = b.clone();
-    a.set_handler(Arc::new(move |p: &Packet| b_for_a.send(p)));
-    let a_for_b = a;
-    b.set_handler(Arc::new(move |p: &Packet| a_for_b.send(p)));
+    let weak_a = Arc::downgrade(&a);
+    b.set_handler(Arc::new(move |p: &Packet| {
+        let Some(_depth) = DepthGuard::enter(DEFAULT_MAX_FORWARD_DEPTH) else {
+            return Ok(());
+        };
+        match weak_a.upgrade() {
+            Some(a) => a.send(p),
+            None => Ok(()),
+        }
+    }));
+    a.set_handler(Arc::new(move |p: &Packet| {
+        let Some(_depth) = DepthGuard::enter(DEFAULT_MAX_FORWARD_DEPTH) else {
+            return Ok(());
+        };
+        b.send(p)
+    }));
 }
 
 #[cfg(test)]
@@ -124,5 +162,56 @@ mod tests {
         p[2..4].copy_from_slice(&20u16.to_be_bytes());
         pipe.inject(Packet::from_slice(&p)).unwrap();
         assert_eq!(rec.inner.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn two_pipes_wired_together_do_not_overflow_the_stack() {
+        let a = Arc::new(PipeL2::new(MacAddr::zero()));
+        let b = Arc::new(PipeL2::new(MacAddr::zero()));
+        connect_l2(a.clone(), b.clone());
+        let buf = build_frame(MacAddr::broadcast(), MacAddr::zero(), EtherType::IPV4, &[1]);
+        // Run on a small stack: unbounded, the bouncing frame recurses until
+        // it overflows.
+        let a2 = a.clone();
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || a2.inject(Frame::from_slice(&buf)).unwrap())
+            .unwrap()
+            .join()
+            .expect("recursed without bound");
+        let tx = a.stats().unwrap().snapshot().tx_packets;
+        assert!(tx < 64, "bounced {tx} times");
+
+        let p = Arc::new(PipeL3::new("10.0.0.1/24".parse().unwrap()));
+        let q = Arc::new(PipeL3::new("10.0.0.2/24".parse().unwrap()));
+        connect_l3(p.clone(), q.clone());
+        let mut pkt = vec![0u8; 20];
+        pkt[0] = 0x45;
+        pkt[2..4].copy_from_slice(&20u16.to_be_bytes());
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || p.inject(Packet::from_slice(&pkt)).unwrap())
+            .unwrap()
+            .join()
+            .expect("recursed without bound");
+    }
+
+    #[test]
+    fn wiring_is_not_a_reference_cycle() {
+        let a = Arc::new(PipeL2::new(MacAddr::zero()));
+        let b = Arc::new(PipeL2::new(MacAddr::zero()));
+        let (wa, wb) = (Arc::downgrade(&a), Arc::downgrade(&b));
+        connect_l2(a, b);
+        assert!(wa.upgrade().is_none(), "a leaked");
+        assert!(wb.upgrade().is_none(), "b leaked");
+
+        // While `a` is kept, it keeps `b`.
+        let a = Arc::new(PipeL3::new("10.0.0.1/24".parse().unwrap()));
+        let b = Arc::new(PipeL3::new("10.0.0.2/24".parse().unwrap()));
+        let wb = Arc::downgrade(&b);
+        connect_l3(a.clone(), b);
+        assert!(wb.upgrade().is_some());
+        drop(a);
+        assert!(wb.upgrade().is_none(), "b leaked");
     }
 }
