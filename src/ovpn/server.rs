@@ -76,6 +76,11 @@ pub struct ServerConfig {
     pub timers: PeerTimers,
 }
 
+/// Default [`ServerConfig::max_peers`].
+pub(super) const DEFAULT_MAX_PEERS: usize = 1024;
+/// Default [`ServerConfig::max_tcp_connections`].
+pub(super) const DEFAULT_MAX_TCP_CONNECTIONS: usize = 256;
+
 setters! {
     ServerConfig {
         some on_connect: OnConnect;
@@ -101,8 +106,8 @@ impl ServerConfig {
             on_data,
             on_connect: None,
             on_disconnect: None,
-            max_peers: 1024,
-            max_tcp_connections: 256,
+            max_peers: DEFAULT_MAX_PEERS,
+            max_tcp_connections: DEFAULT_MAX_TCP_CONNECTIONS,
             timers: PeerTimers::default(),
         }
     }

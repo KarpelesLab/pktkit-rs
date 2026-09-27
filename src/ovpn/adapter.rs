@@ -18,7 +18,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, Weak};
 
 use super::addr::PeerKey;
-use super::peer::{OnAuth, PeerConfig};
+use super::peer::{OnAuth, PeerConfig, PeerTimers};
 use super::server::{Server, ServerConfig};
 use crate::accept::{Cleanup, L2Connector, L3Connector};
 use crate::iface::{L2Device, L2Handler, L3Device, L3Handler};
@@ -52,10 +52,26 @@ pub struct AdapterConfig {
     pub connector: Connector,
     /// Auth hook returning the per-peer IP config.
     pub on_auth: OnAuth,
+    /// Most peers held at once; see [`ServerConfig::max_peers`].
+    pub max_peers: usize,
+    /// Most TCP connections served at once; see
+    /// [`ServerConfig::max_tcp_connections`].
+    pub max_tcp_connections: usize,
+    /// Each peer's timers; see [`ServerConfig::timers`].
+    pub timers: PeerTimers,
+}
+
+setters! {
+    AdapterConfig {
+        set max_peers: usize;
+        set max_tcp_connections: usize;
+        set timers: PeerTimers;
+    }
 }
 
 impl AdapterConfig {
-    /// Every field is required; see each for what it does.
+    /// The required fields; the limits and timers take the server's
+    /// defaults.
     pub fn new(
         tls_config: Arc<purecrypto::tls::Config>,
         listen_addr: SocketAddr,
@@ -67,6 +83,9 @@ impl AdapterConfig {
             listen_addr,
             connector,
             on_auth,
+            max_peers: super::server::DEFAULT_MAX_PEERS,
+            max_tcp_connections: super::server::DEFAULT_MAX_TCP_CONNECTIONS,
+            timers: PeerTimers::default(),
         }
     }
 }
@@ -76,6 +95,9 @@ impl std::fmt::Debug for AdapterConfig {
         f.debug_struct("AdapterConfig")
             .field("listen_addr", &self.listen_addr)
             .field("connector", &self.connector)
+            .field("max_peers", &self.max_peers)
+            .field("max_tcp_connections", &self.max_tcp_connections)
+            .field("timers", &self.timers)
             .finish()
     }
 }
@@ -119,6 +141,9 @@ impl Adapter {
             })
         };
         let server_cfg = ServerConfig::new(cfg.tls_config, cfg.listen_addr, cfg.on_auth, on_data)
+            .max_peers(cfg.max_peers)
+            .max_tcp_connections(cfg.max_tcp_connections)
+            .timers(cfg.timers)
             .on_connect({
                 let a = adapter.me.clone();
                 Arc::new(move |key, cfg| {
@@ -365,5 +390,71 @@ impl L2Device for PeerL2Device {
 
     fn close(&self) -> Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ovpn::Opcode;
+    use crate::ovpn::packet_ctrl::ControlPacket;
+    use std::net::UdpSocket;
+    use std::time::Duration;
+
+    /// Counts attached devices; detaching is a no-op.
+    #[derive(Default)]
+    struct CountingConnector {
+        connects: std::sync::atomic::AtomicUsize,
+    }
+
+    impl L3Connector for CountingConnector {
+        fn connect_l3(&self, _dev: Arc<dyn L3Device>) -> Result<Cleanup> {
+            self.connects
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Box::new(|| Ok(())))
+        }
+    }
+
+    fn config(connector: Arc<CountingConnector>) -> AdapterConfig {
+        let on_auth: OnAuth = Arc::new(|_| Err(io::Error::other("no auth in this test")));
+        AdapterConfig::new(
+            crate::ovpn::tests::server_config(),
+            "127.0.0.1:0".parse().unwrap(),
+            Connector::L3(connector),
+            on_auth,
+        )
+    }
+
+    fn client_reset(sid: [u8; 8]) -> Vec<u8> {
+        let mut p = ControlPacket::new(Opcode::CONTROL_HARD_RESET_CLIENT_V2, 0, sid, [0; 8]);
+        p.set_pid(0);
+        p.to_bytes(&[])
+    }
+
+    /// Whether the server answers a hard reset from a fresh address.
+    fn answers(adapter: &Adapter, sid: [u8; 8]) -> bool {
+        let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+        s.connect(adapter.local_addr().unwrap()).unwrap();
+        s.set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        s.send(&client_reset(sid)).unwrap();
+        let mut buf = [0u8; 2048];
+        s.recv(&mut buf).is_ok()
+    }
+
+    /// The server's limits are the adapter's to set: here, a one-peer cap
+    /// turns the second client away.
+    #[test]
+    fn server_limits_are_configurable() {
+        let adapter = Adapter::new(
+            config(Arc::default())
+                .max_peers(1)
+                .max_tcp_connections(1)
+                .timers(crate::ovpn::PeerTimers::default().keepalive_interval(Duration::ZERO)),
+        )
+        .unwrap();
+        assert!(answers(&adapter, *b"CLIENT01"));
+        assert!(!answers(&adapter, *b"CLIENT02"), "peer cap not applied");
+        adapter.close();
     }
 }
