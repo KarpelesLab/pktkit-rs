@@ -289,15 +289,25 @@ EXT:\r\n\r\n",
                     cc.req.extend_from_slice(&buf[..n]);
                 }
 
-                if !remove && let Some(req) = parse_http_request(&cc.req) {
-                    let res =
-                        self.handle_soap(nat, &req.soap_action, &req.body, Some(cc.client_ip));
-                    let resp = build_http_response(&res);
-                    let (_, segs) = cc.conn.write(&resp);
-                    outgoing.extend(segs);
-                    // Single request/response per connection: half-close.
-                    outgoing.extend(cc.conn.close());
-                    cc.responded = true;
+                match parse_http_request(&cc.req) {
+                    _ if remove => {}
+                    Ok(Some(req)) => {
+                        let res =
+                            self.handle_soap(nat, &req.soap_action, &req.body, Some(cc.client_ip));
+                        let resp = build_http_response(&res);
+                        let (_, segs) = cc.conn.write(&resp);
+                        outgoing.extend(segs);
+                        // Single request/response per connection: half-close.
+                        outgoing.extend(cc.conn.close());
+                        cc.responded = true;
+                    }
+                    Ok(None) => {}
+                    Err(()) => {
+                        // A framing we cannot trust: there is no telling where
+                        // the body ends, so answering would be a guess.
+                        outgoing.extend(cc.conn.abort());
+                        remove = true;
+                    }
                 }
                 // TODO(nat): pipelined / multi-request HTTP over a single
                 // control connection is not handled — we serve exactly one
@@ -648,17 +658,21 @@ struct HttpRequest {
     body: Vec<u8>,
 }
 
-/// Parse a buffered HTTP/1.1 request. Returns `None` if the request is not yet
-/// complete (headers not terminated, or body shorter than `Content-Length`).
+/// Parse a buffered HTTP/1.1 request. Returns `Ok(None)` if the request is not
+/// yet complete (headers not terminated, or body shorter than
+/// `Content-Length`), and `Err` if its framing is invalid (RFC 9112 §6.3) or
+/// announces a body larger than we are willing to buffer.
 ///
 /// This is a deliberately small, std-only parser for the single
 /// request/response UPnP control exchange: it reads the request line + headers,
 /// honours `Content-Length`, and pulls out the `SOAPAction` header. Anything
 /// beyond that (chunked transfer-encoding, pipelining, trailers) is left as
 /// `// TODO(nat)`.
-fn parse_http_request(buf: &[u8]) -> Option<HttpRequest> {
+fn parse_http_request(buf: &[u8]) -> Result<Option<HttpRequest>, ()> {
     // Find the end of the header block (CRLFCRLF).
-    let hdr_end = find_subslice(buf, b"\r\n\r\n")?;
+    let Some(hdr_end) = find_subslice(buf, b"\r\n\r\n") else {
+        return Ok(None);
+    };
     let head = &buf[..hdr_end];
     let body_start = hdr_end + 4;
 
@@ -666,16 +680,25 @@ fn parse_http_request(buf: &[u8]) -> Option<HttpRequest> {
     let mut lines = head_str.split("\r\n");
     // Request line (METHOD SP path SP version) — we accept any method; UPnP
     // control uses POST.
-    let _request_line = lines.next()?;
+    let _request_line = lines.next();
 
-    let mut content_length: usize = 0;
+    let mut content_length: Option<usize> = None;
     let mut soap_action = String::new();
     for line in lines {
         if let Some((name, value)) = line.split_once(':') {
             let name = name.trim();
             let value = value.trim();
             if name.eq_ignore_ascii_case("content-length") {
-                content_length = value.parse().unwrap_or(0);
+                // Bounded before any arithmetic: the value is attacker-chosen.
+                let len = value
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|&n| n <= MAX_REQUEST_BYTES)
+                    .ok_or(())?;
+                if content_length.is_some_and(|prev| prev != len) {
+                    return Err(());
+                }
+                content_length = Some(len);
             } else if name.eq_ignore_ascii_case("soapaction") {
                 soap_action = value.to_string();
             }
@@ -683,11 +706,12 @@ fn parse_http_request(buf: &[u8]) -> Option<HttpRequest> {
         }
     }
 
-    if buf.len() < body_start + content_length {
-        return None; // body not fully buffered yet
+    let body_end = body_start + content_length.unwrap_or(0);
+    if buf.len() < body_end {
+        return Ok(None); // body not fully buffered yet
     }
-    let body = buf[body_start..body_start + content_length].to_vec();
-    Some(HttpRequest { soap_action, body })
+    let body = buf[body_start..body_end].to_vec();
+    Ok(Some(HttpRequest { soap_action, body }))
 }
 
 /// Build an HTTP/1.1 response carrying a SOAP result. A 200 status yields
@@ -961,6 +985,28 @@ mod tests {
         let res = h.handle_soap(&nat, "DeletePortMapping", del.as_bytes(), Some(client));
         assert_eq!(res.status, 200, "body: {}", res.body);
         assert_eq!(nat.list_port_forwards().len(), 0);
+    }
+
+    #[test]
+    fn huge_content_length_is_rejected() {
+        let req = b"POST /ctl HTTP/1.1\r\nContent-Length: 18446744073709551615\r\n\r\nabc";
+        assert!(parse_http_request(req).is_err());
+        let req = b"POST /ctl HTTP/1.1\r\nContent-Length: 100000\r\n\r\nabc";
+        assert!(parse_http_request(req).is_err());
+        let req = b"POST /ctl HTTP/1.1\r\nContent-Length: nope\r\n\r\nabc";
+        assert!(parse_http_request(req).is_err());
+        let req = b"POST /ctl HTTP/1.1\r\nContent-Length: 3\r\nContent-Length: 4\r\n\r\nabcd";
+        assert!(parse_http_request(req).is_err());
+    }
+
+    #[test]
+    fn content_length_bounds_the_body() {
+        let req = b"POST /ctl HTTP/1.1\r\nSOAPAction: \"x#Y\"\r\nContent-Length: 3\r\n\r\nab";
+        assert!(matches!(parse_http_request(req), Ok(None)));
+        let req = b"POST /ctl HTTP/1.1\r\nSOAPAction: \"x#Y\"\r\nContent-Length: 3\r\n\r\nabcd";
+        let r = parse_http_request(req).unwrap().unwrap();
+        assert_eq!(r.body, b"abc");
+        assert_eq!(r.soap_action, "\"x#Y\"");
     }
 
     #[test]
