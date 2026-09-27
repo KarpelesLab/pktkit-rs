@@ -42,8 +42,9 @@ pub enum TimerAction {
         peer: NoisePublicKey,
         packet: Vec<u8>,
     },
-    /// No handshake response came within `REKEY_ATTEMPT_TIME`. Anything
-    /// queued for this peer should be dropped.
+    /// No handshake response came within `REKEY_ATTEMPT_TIME`, or an
+    /// initiation could not be built at all (the peer's authorization
+    /// expired, say). Anything queued for this peer should be dropped.
     HandshakeFailed { peer: NoisePublicKey },
 }
 

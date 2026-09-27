@@ -91,12 +91,70 @@ pub struct Server {
     peer_handlers: RwLock<std::collections::HashMap<NoisePublicKey, Arc<Handler>>>,
     /// Plaintext waiting for a session with its peer: sent while there was
     /// none (or it had expired), and flushed once a handshake completes.
-    staged: Mutex<std::collections::HashMap<NoisePublicKey, std::collections::VecDeque<Vec<u8>>>>,
+    staged: Mutex<Staged>,
+}
+
+/// Plaintext held per peer until a handshake gives it a keypair, with the
+/// total size tracked so no number of peers can make it grow unbounded.
+#[derive(Default)]
+struct Staged {
+    queues: std::collections::HashMap<NoisePublicKey, std::collections::VecDeque<Vec<u8>>>,
+    bytes: usize,
+}
+
+impl Staged {
+    /// Queue `data` for `peer`, dropping the peer's oldest past
+    /// [`MAX_STAGED_PACKETS`], or `data` itself if every peer's together
+    /// would pass [`MAX_STAGED_BYTES`].
+    fn push(&mut self, peer: &NoisePublicKey, data: &[u8]) {
+        let q = self.queues.entry(*peer).or_default();
+        if q.len() >= MAX_STAGED_PACKETS
+            && let Some(old) = q.pop_front()
+        {
+            self.bytes -= old.len();
+        }
+        if self.bytes + data.len() <= MAX_STAGED_BYTES {
+            self.bytes += data.len();
+            q.push_back(data.to_vec());
+        }
+        if q.is_empty() {
+            self.queues.remove(peer);
+        }
+    }
+
+    fn take(&mut self, peer: &NoisePublicKey) -> Option<std::collections::VecDeque<Vec<u8>>> {
+        let q = self.queues.remove(peer)?;
+        self.bytes -= q.iter().map(Vec::len).sum::<usize>();
+        Some(q)
+    }
+
+    /// Return what [`take`](Self::take) took and could not send, ahead of
+    /// anything queued since, within the same limits as [`push`](Self::push).
+    fn put_back(&mut self, peer: &NoisePublicKey, older: std::collections::VecDeque<Vec<u8>>) {
+        let q = self.queues.entry(*peer).or_default();
+        for data in older.into_iter().rev() {
+            if q.len() >= MAX_STAGED_PACKETS || self.bytes + data.len() > MAX_STAGED_BYTES {
+                break;
+            }
+            self.bytes += data.len();
+            q.push_front(data);
+        }
+        if q.is_empty() {
+            self.queues.remove(peer);
+        }
+    }
+
+    fn peers(&self) -> Vec<NoisePublicKey> {
+        self.queues.keys().copied().collect()
+    }
 }
 
 /// Packets held per peer while a handshake is under way, as in the
 /// reference implementation. Past this, the oldest are dropped.
 const MAX_STAGED_PACKETS: usize = 128;
+/// Bytes held across all peers: a bound on memory whatever the number of
+/// peers with a handshake pending.
+const MAX_STAGED_BYTES: usize = 4 << 20;
 /// How often the maintenance thread runs the protocol timers.
 const TIMER_TICK: Duration = Duration::from_millis(100);
 
@@ -147,7 +205,7 @@ impl Server {
             threads: Mutex::new(Vec::new()),
             peer_addrs: RwLock::new(std::collections::HashMap::new()),
             peer_handlers: RwLock::new(std::collections::HashMap::new()),
-            staged: Mutex::new(std::collections::HashMap::new()),
+            staged: Mutex::new(Staged::default()),
         }))
     }
 
@@ -274,6 +332,7 @@ impl Server {
     /// keepalives. Without this nothing ever rekeyed, so a tunnel died when
     /// its keypair reached REJECT_AFTER_TIME.
     fn run_timers(&self) {
+        self.prune_staged();
         let actions: Vec<(Arc<Handler>, TimerAction)> =
             if let Some(mh) = self.multi_handler.as_ref() {
                 mh.poll_timers()
@@ -300,10 +359,43 @@ impl Server {
                     }
                 }
                 TimerAction::HandshakeFailed { peer } => {
-                    self.staged.lock().expect("staged lock").remove(&peer);
+                    self.staged.lock().expect("staged lock").take(&peer);
                 }
             }
         }
+    }
+
+    /// Drop what is staged for peers no handler would start a handshake
+    /// with any more (removed, or past their expiry): the timers only poll
+    /// authorized peers, so nothing would ever report them failed.
+    fn prune_staged(&self) {
+        let peers = self.staged.lock().expect("staged lock").peers();
+        for peer in peers {
+            if !self.authorized_anywhere(&peer) {
+                self.staged.lock().expect("staged lock").take(&peer);
+            }
+        }
+    }
+
+    fn authorized_anywhere(&self, peer: &NoisePublicKey) -> bool {
+        match self.multi_handler.as_ref() {
+            Some(mh) => mh.handlers().iter().any(|h| h.is_authorized_peer(peer)),
+            None => self
+                .handler
+                .as_ref()
+                .is_some_and(|h| h.is_authorized_peer(peer)),
+        }
+    }
+
+    /// Forget everything held for `peer`: its staged packets and endpoint.
+    /// For a peer that has just been removed.
+    pub(crate) fn forget_peer(&self, peer: &NoisePublicKey) {
+        self.staged.lock().expect("staged lock").take(peer);
+        self.peer_addrs.write().expect("addr lock").remove(peer);
+        self.peer_handlers
+            .write()
+            .expect("handler lock")
+            .remove(peer);
     }
 
     /// Send what was staged for `peer` once it has a session.
@@ -317,7 +409,7 @@ impl Server {
         if !handler.has_session(peer) {
             return;
         }
-        let Some(mut queue) = self.staged.lock().expect("staged lock").remove(peer) else {
+        let Some(mut queue) = self.staged.lock().expect("staged lock").take(peer) else {
             return;
         };
         while let Some(data) = queue.pop_front() {
@@ -331,12 +423,10 @@ impl Server {
                     // handshake. Keep the rest for that one, ahead of
                     // anything staged meanwhile.
                     queue.push_front(data);
-                    let mut staged = self.staged.lock().expect("staged lock");
-                    let q = staged.entry(*peer).or_default();
-                    queue.extend(q.drain(..));
-                    let excess = queue.len().saturating_sub(MAX_STAGED_PACKETS);
-                    queue.drain(..excess);
-                    *q = queue;
+                    self.staged
+                        .lock()
+                        .expect("staged lock")
+                        .put_back(peer, queue);
                     return;
                 }
             }
@@ -344,12 +434,7 @@ impl Server {
     }
 
     fn stage(&self, peer: &NoisePublicKey, data: &[u8]) {
-        let mut staged = self.staged.lock().expect("staged lock");
-        let q = staged.entry(*peer).or_default();
-        if q.len() >= MAX_STAGED_PACKETS {
-            q.pop_front();
-        }
-        q.push_back(data.to_vec());
+        self.staged.lock().expect("staged lock").push(peer, data);
     }
 
     fn dispatch(
@@ -431,6 +516,15 @@ impl Server {
             // the packet for when it completes instead of losing it, and
             // start the handshake now rather than on the next timer tick.
             Err(e) if matches!(e.kind(), io::ErrorKind::NotConnected | io::ErrorKind::Other) => {
+                // Unless no handshake can be started: then nothing would
+                // ever send the packet, or report that it failed.
+                if !handler.is_authorized_peer(peer_key) {
+                    self.staged.lock().expect("staged lock").take(peer_key);
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "peer not authorized",
+                    ));
+                }
                 self.stage(peer_key, data);
                 self.run_timers();
                 Ok(())
@@ -634,6 +728,74 @@ mod tests {
         s.process_incoming(&ka.response, peer_addr, &sock);
         let pkt = recv_type(&peer_sock, 4);
         assert_eq!(b.process_packet(&pkt, &a_addr).unwrap().data, b"staged");
+    }
+
+    fn staged_for(s: &Server, peer: &NoisePublicKey) -> usize {
+        s.staged
+            .lock()
+            .unwrap()
+            .queues
+            .get(peer)
+            .map_or(0, |q| q.len())
+    }
+
+    /// Packets are staged only for a peer a handshake can be started with,
+    /// and go once it no longer can be: otherwise nothing ever reports the
+    /// handshake failed, and they stay forever.
+    #[test]
+    fn staged_packets_do_not_outlive_the_peer() {
+        let a = Handler::new(Config::default()).unwrap();
+        let (s, _sock) = idle_server(&a);
+        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let known = |k: NoisePublicKey| {
+            s.peer_addrs.write().unwrap().insert(k, addr);
+        };
+
+        // Removed while its packets wait.
+        let b = crate::wg::generate_private_key().unwrap();
+        let b = crate::wg::crypto::x25519_public(&b);
+        a.add_peer(b);
+        known(b);
+        s.send(b"x", &b).unwrap();
+        assert_eq!(staged_for(&s, &b), 1);
+        a.remove_peer(&b);
+        s.run_timers();
+        assert_eq!(staged_for(&s, &b), 0, "removed peer");
+
+        // Never authorized, or expired: nothing to stage for.
+        let c = NoisePublicKey([7; 32]);
+        known(c);
+        assert!(s.send(b"x", &c).is_err());
+        assert_eq!(staged_for(&s, &c), 0, "unauthorized peer");
+        let d = crate::wg::crypto::x25519_public(&crate::wg::generate_private_key().unwrap());
+        a.add_peer(d);
+        a.set_peer_expiry(&d, Instant::now() - Duration::from_secs(1));
+        known(d);
+        assert!(s.send(b"x", &d).is_err());
+        assert_eq!(staged_for(&s, &d), 0, "expired peer");
+    }
+
+    /// However many peers have packets waiting, the total held is bounded.
+    #[test]
+    fn staged_memory_is_bounded() {
+        let a = Handler::new(Config::default()).unwrap();
+        let (s, _sock) = idle_server(&a);
+        let big = vec![0u8; 60_000];
+        for i in 0..1000u32 {
+            let mut k = [0u8; 32];
+            k[..4].copy_from_slice(&i.to_le_bytes());
+            s.stage(&NoisePublicKey(k), &big);
+        }
+        let total: usize = s
+            .staged
+            .lock()
+            .unwrap()
+            .queues
+            .values()
+            .flat_map(|q| q.iter())
+            .map(|p| p.len())
+            .sum();
+        assert!(total <= MAX_STAGED_BYTES, "{total} bytes staged");
     }
 
     /// Data sent before the handshake completes is held and delivered once

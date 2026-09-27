@@ -490,11 +490,12 @@ impl Handler {
             };
             match due {
                 None => out.push(TimerAction::HandshakeFailed { peer }),
-                Some(true) => {
-                    if let Ok(packet) = self.initiate_handshake(&peer) {
-                        out.push(TimerAction::SendHandshake { peer, packet });
-                    }
-                }
+                Some(true) => match self.initiate_handshake(&peer) {
+                    Ok(packet) => out.push(TimerAction::SendHandshake { peer, packet }),
+                    // Nothing can answer an initiation that never went out,
+                    // so what waits on this handshake would wait in vain.
+                    Err(_) => out.push(TimerAction::HandshakeFailed { peer }),
+                },
                 Some(false) => {}
             }
             if keepalive {

@@ -322,6 +322,7 @@ impl Adapter {
         } else if let Some(h) = self.handler.as_ref() {
             h.remove_peer(key);
         }
+        self.server.forget_peer(key);
         self.teardown_peer(key);
     }
 
