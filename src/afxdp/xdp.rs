@@ -396,14 +396,10 @@ struct Socket {
     _rx_map: Mapping,
     _tx_map: Mapping,
 
-    fill_ring: AddrRing,
-    comp_ring: AddrRing,
-    rx_ring: DescRing,
-    tx_ring: DescRing,
-
-    /// Free UMEM addresses available for TX, guarded together with the TX
-    /// rings since `send` and the completion reaper both touch them.
-    tx_free: Mutex<Vec<u64>>,
+    /// The TX side. `send` and the completion reaper in the poll loop both
+    /// produce into and consume from it, so it sits behind a lock. The RX
+    /// side, [`RxRings`], belongs to the poll loop alone.
+    tx: Mutex<Tx>,
 
     handler: Arc<Mutex<Option<L2Handler>>>,
     closed: Arc<AtomicBool>,
@@ -426,6 +422,35 @@ impl Socket {
     fn raw(&self) -> RawFd {
         self.fd.as_raw_fd()
     }
+}
+
+/// A socket's transmit state: its TX ring, its COMPLETION ring, and the UMEM
+/// addresses free for TX.
+struct Tx {
+    ring: DescRing,
+    comp: AddrRing,
+    free: Vec<u64>,
+}
+
+impl Tx {
+    /// Drain the completion ring, returning finished TX addresses to the pool.
+    fn reclaim(&mut self) {
+        let mut batch = [0u64; BATCH];
+        loop {
+            let n = self.comp.consume(&mut batch);
+            if n == 0 {
+                return;
+            }
+            self.free.extend_from_slice(&batch[..n]);
+        }
+    }
+}
+
+/// A socket's receive rings, owned by its poll loop: the rings take one
+/// producer or consumer at a time, and the loop is the only one there is.
+struct RxRings {
+    rx: DescRing,
+    fill: AddrRing,
 }
 
 /// Shared device state.
@@ -532,8 +557,9 @@ impl Device {
         let handler: Arc<Mutex<Option<L2Handler>>> = Arc::new(Mutex::new(None));
 
         let mut sockets = Vec::with_capacity(queue_ids.len());
+        let mut rx_rings = Vec::with_capacity(queue_ids.len());
         for &queue_id in &queue_ids {
-            let sock = Socket::open(
+            let (sock, rx) = Socket::open(
                 ifindex,
                 queue_id,
                 &cfg,
@@ -549,6 +575,7 @@ impl Device {
             }
             xdp::set_socket_raw(xskmap_fd, queue_id, sock.raw())?;
             sockets.push(Arc::new(sock));
+            rx_rings.push(rx);
         }
 
         let inner = Arc::new(Inner {
@@ -561,10 +588,10 @@ impl Device {
             tx_cursor: AtomicUsize::new(0),
         });
 
-        for (i, sock) in inner.sockets.iter().enumerate() {
+        for (i, (sock, rings)) in inner.sockets.iter().zip(rx_rings).enumerate() {
             let s = sock.clone();
             let Some(&cpu) = cfg.rx_cpus.get(i) else {
-                std::thread::spawn(move || poll_loop(s));
+                std::thread::spawn(move || poll_loop(s, rings));
                 continue;
             };
             // The thread pins itself before it touches a ring, and reports
@@ -577,7 +604,7 @@ impl Device {
                 let ok = pinned.is_ok();
                 let _ = tx.send(pinned);
                 if ok {
-                    poll_loop(s);
+                    poll_loop(s, rings);
                 }
             });
             rx.recv().map_err(|_| {
@@ -730,7 +757,7 @@ impl Socket {
         want_zerocopy: bool,
         handler: Arc<Mutex<Option<L2Handler>>>,
         closed: Arc<AtomicBool>,
-    ) -> Result<Socket> {
+    ) -> Result<(Socket, RxRings)> {
         let ring_size = cfg.ring_size;
         let frame_size = cfg.frame_size;
         let num_frames = cfg.num_frames;
@@ -788,7 +815,8 @@ impl Socket {
 
         // SAFETY: each mapping is sized for its ring (see `mmap_ring`), the
         // offsets came from the kernel, and ring_size is a power of two.
-        let fill_ring = unsafe { AddrRing::new(fill_map.ptr(), offs.fr, ring_size) };
+        // Each ring gets exactly one object, as the ring types require.
+        let mut fill_ring = unsafe { AddrRing::new(fill_map.ptr(), offs.fr, ring_size) };
         let comp_ring = unsafe { AddrRing::new(comp_map.ptr(), offs.cr, ring_size) };
         let rx_ring = unsafe { DescRing::new(rx_map.ptr(), offs.rx, ring_size) };
         let tx_ring = unsafe { DescRing::new(tx_map.ptr(), offs.tx, ring_size) };
@@ -811,7 +839,7 @@ impl Socket {
             set_busy_poll(raw, bp).map_err(|e| step("SO_BUSY_POLL", e))?;
         }
 
-        Ok(Socket {
+        let sock = Socket {
             fd,
             queue_id,
             frame_size: frame_size as usize,
@@ -822,14 +850,19 @@ impl Socket {
             _comp_map: comp_map,
             _rx_map: rx_map,
             _tx_map: tx_map,
-            fill_ring,
-            comp_ring,
-            rx_ring,
-            tx_ring,
-            tx_free: Mutex::new(tx_free),
+            tx: Mutex::new(Tx {
+                ring: tx_ring,
+                comp: comp_ring,
+                free: tx_free,
+            }),
             handler,
             closed,
-        })
+        };
+        let rx = RxRings {
+            rx: rx_ring,
+            fill: fill_ring,
+        };
+        Ok((sock, rx))
     }
 
     /// Copy `frame` into a free UMEM slot and enqueue it on the TX ring.
@@ -852,15 +885,15 @@ impl Socket {
             return Err(io::Error::new(io::ErrorKind::NotConnected, "afxdp: closed"));
         }
 
-        let mut free = self.tx_free.lock().unwrap();
+        let mut tx = self.tx.lock().unwrap();
 
         // Reaping completions is a ring read, not a syscall, but it still costs
         // two cache-line touches; only pay for it once the pool runs dry.
-        let addr = match free.pop() {
+        let addr = match tx.free.pop() {
             Some(a) => a,
             None => {
-                self.reclaim_tx(&mut free);
-                match free.pop() {
+                tx.reclaim();
+                match tx.free.pop() {
                     Some(a) => a,
                     None => {
                         return Err(io::Error::new(
@@ -884,18 +917,19 @@ impl Socket {
             len: len as u32,
             options: 0,
         }];
-        if self.tx_ring.produce(&desc) == 0 {
-            free.push(addr);
+        if tx.ring.produce(&desc) == 0 {
+            tx.free.push(addr);
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "afxdp: TX ring full",
             ));
         }
-        drop(free);
-
         // With XDP_USE_NEED_WAKEUP this is only true when the kernel has gone
         // idle on this ring, so the common case costs no syscall at all.
-        if self.tx_ring.need_wakeup() {
+        let wake = tx.ring.need_wakeup();
+        drop(tx);
+
+        if wake {
             self.kick_tx();
         }
         Ok(())
@@ -917,7 +951,7 @@ impl Socket {
             return Err(io::Error::new(io::ErrorKind::NotConnected, "afxdp: closed"));
         }
 
-        let mut free = self.tx_free.lock().unwrap();
+        let mut tx = self.tx.lock().unwrap();
         let mut taken = 0;
         let mut queued = false;
         let mut descs = [XdpDesc {
@@ -929,7 +963,7 @@ impl Socket {
         while taken < frames.len() {
             // We are the ring's only producer and hold the lock, so the room
             // seen here cannot shrink before the produce below.
-            let room = self.tx_ring.free().min(BATCH);
+            let room = tx.ring.free().min(BATCH);
             let mut n = 0;
             let mut upto = taken;
             while n < room && upto < frames.len() {
@@ -938,10 +972,10 @@ impl Socket {
                     upto += 1;
                     continue;
                 }
-                if free.is_empty() {
-                    self.reclaim_tx(&mut free);
+                if tx.free.is_empty() {
+                    tx.reclaim();
                 }
-                let Some(addr) = free.pop() else { break };
+                let Some(addr) = tx.free.pop() else { break };
                 // SAFETY: addr is a frame-aligned offset from the TX pool and
                 // the length was checked against frame_size above.
                 unsafe {
@@ -960,7 +994,7 @@ impl Socket {
                 upto += 1;
             }
             if n > 0 {
-                let produced = self.tx_ring.produce(&descs[..n]);
+                let produced = tx.ring.produce(&descs[..n]);
                 debug_assert_eq!(produced, n, "TX ring shrank under its only producer");
                 queued = true;
             }
@@ -970,25 +1004,13 @@ impl Socket {
             }
             taken = upto;
         }
-        drop(free);
+        let wake = queued && tx.ring.need_wakeup();
+        drop(tx);
 
-        if queued && self.tx_ring.need_wakeup() {
+        if wake {
             self.kick_tx();
         }
         Ok(taken)
-    }
-
-    /// Drain the completion ring, returning finished TX addresses to the pool.
-    /// Caller holds the `tx_free` lock.
-    fn reclaim_tx(&self, free: &mut Vec<u64>) {
-        let mut batch = [0u64; BATCH];
-        loop {
-            let n = self.comp_ring.consume(&mut batch);
-            if n == 0 {
-                return;
-            }
-            free.extend_from_slice(&batch[..n]);
-        }
     }
 
     /// Ask the kernel to pick up queued TX descriptors.
@@ -1019,7 +1041,7 @@ fn umem_split(num_frames: u32) -> (u32, u32) {
 /// recycle their UMEM addresses into the FILL ring.
 //
 // TODO(afxdp): needs hardware to verify — no packets arrive in a sandbox.
-fn poll_loop(sock: Arc<Socket>) {
+fn poll_loop(sock: Arc<Socket>, mut rings: RxRings) {
     let mut rx_batch = [XdpDesc {
         addr: 0,
         len: 0,
@@ -1030,7 +1052,7 @@ fn poll_loop(sock: Arc<Socket>) {
     let mut idle = 0u32;
 
     while !sock.closed.load(Ordering::Acquire) {
-        let got = sock.rx_ring.consume(&mut rx_batch);
+        let got = rings.rx.consume(&mut rx_batch);
         if got == 0 && idle < sock.rx_spin {
             // Traffic was here a moment ago; look again before paying for a
             // trip through poll().
@@ -1041,10 +1063,7 @@ fn poll_loop(sock: Arc<Socket>) {
         if got == 0 {
             // Idle: give TX completions back to the pool for whichever thread
             // sends next, then sleep until the kernel has something for us.
-            {
-                let mut free = sock.tx_free.lock().unwrap();
-                sock.reclaim_tx(&mut free);
-            }
+            sock.tx.lock().unwrap().reclaim();
             sock.wait(POLL_TIMEOUT_MS);
             continue;
         }
@@ -1078,10 +1097,10 @@ fn poll_loop(sock: Arc<Socket>) {
         }
 
         if fill_count > 0 {
-            sock.fill_ring.produce(&fill_batch[..fill_count]);
+            rings.fill.produce(&fill_batch[..fill_count]);
             // The driver stops consuming the FILL ring when it finds it empty;
             // this is the flag that says it is waiting on us.
-            if sock.fill_ring.need_wakeup() {
+            if rings.fill.need_wakeup() {
                 sock.wait(0);
             }
         }

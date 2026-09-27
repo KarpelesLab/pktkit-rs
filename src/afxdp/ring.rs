@@ -17,8 +17,23 @@
 //! The pointers stored here alias kernel-shared `mmap` memory and must stay
 //! valid for the life of the ring. The owning `Device` keeps the mappings
 //! alive and never moves them, and the cursors are only ever touched through
-//! atomics, so concurrent kernel access is sound. The rings are therefore
-//! `Send`/`Sync` (see the explicit impls below).
+//! atomics, so concurrent kernel access is sound.
+//!
+//! Userspace is only ever *one* side of a ring, and the protocol has room for
+//! exactly one userspace producer (or consumer): two threads producing at once
+//! would both claim the same slots. So `produce` and `consume` take
+//! `&mut self`, and the borrow checker enforces the single-producer /
+//! single-consumer discipline. Share a ring between threads by putting it
+//! behind a `Mutex`. The read-only queries (`free`, `need_wakeup`) take
+//! `&self`.
+//!
+//! ```compile_fail
+//! // Two threads producing into one ring through a shared reference is
+//! // exactly the race the rings rule out.
+//! fn race(ring: &pktkit::afxdp::ring::AddrRing) {
+//!     ring.produce(&[0]);
+//! }
+//! ```
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -132,17 +147,19 @@ pub struct AddrRing {
     addrs: *mut u64,
 }
 
-// SAFETY: all shared state is accessed through atomics on the cursors; the
-// address slots are only written by the producing side and read by the
-// consuming side after observing the producer cursor, so there is no data
-// race. The mapping outlives the ring.
+// SAFETY: the mapping outlives the ring (a `new` precondition). Slots are
+// only touched by `produce`/`consume`, which take `&mut self`, so a shared
+// `&AddrRing` can do nothing but load the cursors and flags, which are
+// atomics.
 unsafe impl Send for AddrRing {}
 unsafe impl Sync for AddrRing {}
 
 impl AddrRing {
     /// # Safety
     /// See `Cursors::new`; additionally the element size at `off.desc` must
-    /// be `u64`.
+    /// be `u64`, and this must be the only `AddrRing` over that ring for as
+    /// long as it lives: `&mut self` guarantees one userspace producer or
+    /// consumer only if there is one ring object to borrow.
     pub unsafe fn new(mem: *mut u8, off: RingOffset, size: u32) -> AddrRing {
         // SAFETY: the caller upholds `Cursors::new`'s contract, and `off.desc`
         // is within the same mapping.
@@ -163,7 +180,7 @@ impl AddrRing {
     /// Enqueue `addrs` into a producer ring (the FILL ring: app hands free
     /// UMEM frames to the kernel). Returns how many were enqueued, which may
     /// be fewer than requested if the ring filled up.
-    pub fn produce(&self, addrs: &[u64]) -> usize {
+    pub fn produce(&mut self, addrs: &[u64]) -> usize {
         let prod = self.cur.producer().load(Ordering::Relaxed);
         let cons = self.cur.consumer().load(Ordering::Acquire);
 
@@ -189,7 +206,7 @@ impl AddrRing {
     /// Dequeue from a consumer ring (the COMPLETION ring: kernel hands back
     /// addresses of frames it finished transmitting) into `out`. Returns how
     /// many were dequeued.
-    pub fn consume(&self, out: &mut [u64]) -> usize {
+    pub fn consume(&mut self, out: &mut [u64]) -> usize {
         let cons = self.cur.consumer().load(Ordering::Relaxed);
         let prod = self.cur.producer().load(Ordering::Acquire);
 
@@ -230,7 +247,8 @@ unsafe impl Sync for DescRing {}
 impl DescRing {
     /// # Safety
     /// See `Cursors::new`; additionally the element size at `off.desc` must
-    /// be `xdp_desc`.
+    /// be `xdp_desc`, and this must be the only `DescRing` over that ring
+    /// (see [`AddrRing::new`]).
     pub unsafe fn new(mem: *mut u8, off: RingOffset, size: u32) -> DescRing {
         // SAFETY: as `AddrRing::new`, with `xdp_desc`-sized elements.
         unsafe {
@@ -248,7 +266,8 @@ impl DescRing {
     }
 
     /// Slots a producer could fill right now. The consumer only ever frees
-    /// more, so for the single producer this is a floor, not a guess.
+    /// more, so for the holder of `&mut self` — the only producer — this is a
+    /// floor, not a guess.
     #[inline]
     pub fn free(&self) -> usize {
         let prod = self.cur.producer().load(Ordering::Relaxed);
@@ -258,7 +277,7 @@ impl DescRing {
 
     /// Enqueue TX descriptors (app asks the kernel to transmit). Returns how
     /// many were enqueued.
-    pub fn produce(&self, descs: &[XdpDesc]) -> usize {
+    pub fn produce(&mut self, descs: &[XdpDesc]) -> usize {
         let prod = self.cur.producer().load(Ordering::Relaxed);
         let cons = self.cur.consumer().load(Ordering::Acquire);
 
@@ -286,7 +305,7 @@ impl DescRing {
 
     /// Dequeue RX descriptors (kernel delivered received packets) into `out`.
     /// Returns how many were dequeued.
-    pub fn consume(&self, out: &mut [XdpDesc]) -> usize {
+    pub fn consume(&mut self, out: &mut [XdpDesc]) -> usize {
         let cons = self.cur.consumer().load(Ordering::Relaxed);
         let prod = self.cur.producer().load(Ordering::Acquire);
 
@@ -351,7 +370,7 @@ mod tests {
     fn addr_ring_produce_consume_roundtrip() {
         let size = 8u32;
         let mut mem = backing(size, 8);
-        let ring = unsafe { AddrRing::new(mem.as_mut_ptr(), offsets(), size) };
+        let mut ring = unsafe { AddrRing::new(mem.as_mut_ptr(), offsets(), size) };
 
         let in_addrs = [4096u64, 8192, 12288];
         assert_eq!(ring.produce(&in_addrs), 3);
@@ -368,7 +387,7 @@ mod tests {
     fn addr_ring_respects_capacity() {
         let size = 4u32;
         let mut mem = backing(size, 8);
-        let ring = unsafe { AddrRing::new(mem.as_mut_ptr(), offsets(), size) };
+        let mut ring = unsafe { AddrRing::new(mem.as_mut_ptr(), offsets(), size) };
 
         // Ring of 4 can hold at most 4 entries at once.
         let many: Vec<u64> = (0..10).map(|i| i as u64 * 64).collect();
@@ -388,7 +407,7 @@ mod tests {
     fn addr_ring_wraps_around_mask() {
         let size = 4u32;
         let mut mem = backing(size, 8);
-        let ring = unsafe { AddrRing::new(mem.as_mut_ptr(), offsets(), size) };
+        let mut ring = unsafe { AddrRing::new(mem.as_mut_ptr(), offsets(), size) };
 
         // Cycle through more than `size` total entries to force the index
         // wrap (cursor keeps climbing, slot index masks back to 0..size).
@@ -407,7 +426,7 @@ mod tests {
     fn desc_ring_produce_consume_roundtrip() {
         let size = 8u32;
         let mut mem = backing(size, std::mem::size_of::<XdpDesc>());
-        let ring = unsafe { DescRing::new(mem.as_mut_ptr(), offsets(), size) };
+        let mut ring = unsafe { DescRing::new(mem.as_mut_ptr(), offsets(), size) };
 
         let descs = [
             XdpDesc {
@@ -442,7 +461,7 @@ mod tests {
     fn empty_consume_is_zero() {
         let size = 8u32;
         let mut mem = backing(size, 8);
-        let ring = unsafe { AddrRing::new(mem.as_mut_ptr(), offsets(), size) };
+        let mut ring = unsafe { AddrRing::new(mem.as_mut_ptr(), offsets(), size) };
         let mut out = [0u64; 4];
         assert_eq!(ring.consume(&mut out), 0);
     }
