@@ -102,9 +102,9 @@ pub(super) const DEFAULT_MAX_PEERS: usize = 1024;
 /// Default [`ServerConfig::max_tcp_connections`].
 pub(super) const DEFAULT_MAX_TCP_CONNECTIONS: usize = 256;
 /// Default [`ServerConfig::connect_freq_initial`].
-const DEFAULT_CONNECT_FREQ_INITIAL: (u32, Duration) = (100, Duration::from_secs(10));
+pub(super) const DEFAULT_CONNECT_FREQ_INITIAL: (u32, Duration) = (100, Duration::from_secs(10));
 /// Default [`ServerConfig::max_auth_threads`].
-const DEFAULT_MAX_AUTH_THREADS: usize = 16;
+pub(super) const DEFAULT_MAX_AUTH_THREADS: usize = 16;
 
 setters! {
     ServerConfig {

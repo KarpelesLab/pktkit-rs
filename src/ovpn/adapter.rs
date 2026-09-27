@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::time::Duration;
 
 use super::addr::PeerKey;
 use super::peer::{OnAuth, PeerConfig, PeerTimers};
@@ -65,6 +66,12 @@ pub struct AdapterConfig {
     pub max_tcp_connections: usize,
     /// Each peer's timers; see [`ServerConfig::timers`].
     pub timers: PeerTimers,
+    /// Answers to UDP clients' first packets per period; see
+    /// [`ServerConfig::connect_freq_initial`].
+    pub connect_freq_initial: (u32, Duration),
+    /// Most `on_auth` calls running at once; see
+    /// [`ServerConfig::max_auth_threads`].
+    pub max_auth_threads: usize,
 }
 
 setters! {
@@ -72,12 +79,14 @@ setters! {
         set max_peers: usize;
         set max_tcp_connections: usize;
         set timers: PeerTimers;
+        set connect_freq_initial: (u32, Duration);
+        set max_auth_threads: usize;
     }
 }
 
 impl AdapterConfig {
     /// The required fields; the limits and timers take the server's
-    /// defaults.
+    /// defaults (see [`ServerConfig`]).
     pub fn new(
         tls_config: Arc<purecrypto::tls::Config>,
         listen_addr: SocketAddr,
@@ -92,6 +101,8 @@ impl AdapterConfig {
             max_peers: super::server::DEFAULT_MAX_PEERS,
             max_tcp_connections: super::server::DEFAULT_MAX_TCP_CONNECTIONS,
             timers: PeerTimers::default(),
+            connect_freq_initial: super::server::DEFAULT_CONNECT_FREQ_INITIAL,
+            max_auth_threads: super::server::DEFAULT_MAX_AUTH_THREADS,
         }
     }
 }
@@ -104,6 +115,8 @@ impl std::fmt::Debug for AdapterConfig {
             .field("max_peers", &self.max_peers)
             .field("max_tcp_connections", &self.max_tcp_connections)
             .field("timers", &self.timers)
+            .field("connect_freq_initial", &self.connect_freq_initial)
+            .field("max_auth_threads", &self.max_auth_threads)
             .finish()
     }
 }
@@ -159,6 +172,8 @@ impl Adapter {
             .max_peers(cfg.max_peers)
             .max_tcp_connections(cfg.max_tcp_connections)
             .timers(cfg.timers)
+            .connect_freq_initial(cfg.connect_freq_initial)
+            .max_auth_threads(cfg.max_auth_threads)
             .on_connect({
                 let a = adapter.me.clone();
                 Arc::new(move |key, cfg| {
@@ -479,7 +494,6 @@ mod tests {
     use crate::ovpn::Opcode;
     use crate::ovpn::packet_ctrl::ControlPacket;
     use std::net::UdpSocket;
-    use std::time::Duration;
 
     /// Counts attached devices; detaching is a no-op.
     #[derive(Default)]
@@ -591,6 +605,25 @@ mod tests {
         .unwrap();
         assert!(answers(&adapter, *b"CLIENT01"));
         assert!(!answers(&adapter, *b"CLIENT02"), "peer cap not applied");
+        adapter.close();
+    }
+
+    /// So is the limit on answers to strangers: here, one per minute.
+    #[test]
+    fn connect_freq_initial_is_configurable() {
+        let adapter =
+            Adapter::new(config(Arc::default()).connect_freq_initial((1, Duration::from_secs(60))))
+                .unwrap();
+        let answered = |sid: [u8; 8]| {
+            let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+            s.connect(adapter.local_addr().unwrap()).unwrap();
+            s.set_read_timeout(Some(Duration::from_millis(300)))
+                .unwrap();
+            s.send(&client_reset(sid)).unwrap();
+            s.recv(&mut [0u8; 2048]).is_ok()
+        };
+        assert!(answered(*b"CLIENT01"));
+        assert!(!answered(*b"CLIENT02"), "rate limit not applied");
         adapter.close();
     }
 
