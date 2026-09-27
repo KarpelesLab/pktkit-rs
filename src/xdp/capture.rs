@@ -1777,9 +1777,7 @@ mod tests {
                     _ => panic!("unknown helper {func}"),
                 }
                 // r1-r5 are clobbered by a call.
-                for r in 1..=5 {
-                    self.regs[r] = 0xdead_beef_dead_beef;
-                }
+                self.regs[1..=5].fill(0xdead_beef_dead_beef);
             }
 
             fn load_bytes(&mut self, addr: u64, len: usize) -> Vec<u8> {
