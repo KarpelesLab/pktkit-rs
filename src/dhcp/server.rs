@@ -158,14 +158,29 @@ impl Server {
                 Answer::Nak => self.send_nak(&p, from),
                 Answer::Silent => {}
             },
-            wire::MSG_RELEASE => {
-                self.leases.lock().unwrap().remove(&p.chaddr);
-            }
+            wire::MSG_RELEASE => self.release(&p),
             wire::MSG_DECLINE => self.decline(&p),
             wire::MSG_INFORM => {
                 self.send_reply(&p, from, wire::MSG_ACK, None);
             }
             _ => {}
+        }
+    }
+
+    /// A client gives its lease back (RFC 2131 §4.4.6).
+    ///
+    /// Like a DECLINE this is unauthenticated, and chaddr is whatever the
+    /// sender wrote, so it is believed only as a real client would send it:
+    /// naming us as the server and carrying in ciaddr the address it holds
+    /// (Table 5). Otherwise anyone could free a client's address for
+    /// someone else to be given while the client still uses it.
+    fn release(&self, p: &wire::Parsed) {
+        if p.server_id != Some(self.cfg.server_ip) {
+            return;
+        }
+        let mut leases = self.leases.lock().unwrap();
+        if leases.get(&p.chaddr).is_some_and(|l| l.ip == p.ciaddr) {
+            leases.remove(&p.chaddr);
         }
     }
 
@@ -652,15 +667,44 @@ mod tests {
         }));
 
         s.handle_dhcp(&build_discover(1, mac));
-        assert_eq!(r.lock().unwrap().len(), 1);
+        let ip = Ipv4Addr::new(10, 0, 0, 10);
+        s.handle_dhcp(&request(1, mac, ip, Ipv4Addr::new(10, 0, 0, 1)));
+        assert_eq!(r.lock().unwrap().len(), 2);
 
-        // Release.
-        let mut b = wire::Builder::new(1, 2, mac);
-        b.message_type(wire::MSG_RELEASE);
-        s.handle_dhcp(&b.finish());
-
-        // Lease table should be empty.
+        s.handle_dhcp(&release(mac, ip, Some(Ipv4Addr::new(10, 0, 0, 1))));
         assert_eq!(s.leases.lock().unwrap().len(), 0);
+    }
+
+    fn release(mac: MacAddr, ciaddr: Ipv4Addr, server: Option<Ipv4Addr>) -> Vec<u8> {
+        let mut b = wire::Builder::new(1, 2, mac);
+        b.message_type(wire::MSG_RELEASE).ciaddr(ciaddr);
+        if let Some(s) = server {
+            b.ipv4_option(wire::OPT_SERVER_ID, s);
+        }
+        b.finish()
+    }
+
+    #[test]
+    fn a_release_must_name_us_and_the_leased_address() {
+        let (s, r) = recording(one_address_pool());
+        let a = MacAddr([2, 0, 0, 0, 0, 0xa]);
+        let ip = bound_lease(&s, &r, a);
+        let us = Some(Ipv4Addr::new(10, 0, 0, 1));
+
+        // Forged by MAC alone, for another server, or for another address.
+        s.handle_dhcp(&release(a, Ipv4Addr::UNSPECIFIED, None));
+        s.handle_dhcp(&release(a, Ipv4Addr::UNSPECIFIED, us));
+        s.handle_dhcp(&release(a, ip, None));
+        s.handle_dhcp(&release(a, ip, Some(Ipv4Addr::new(10, 0, 0, 2))));
+        s.handle_dhcp(&release(a, Ipv4Addr::new(10, 0, 0, 11), us));
+        assert_eq!(
+            s.leases.lock().unwrap().get(&a).map(|l| l.ip),
+            Some(ip),
+            "a forged RELEASE freed the lease"
+        );
+
+        s.handle_dhcp(&release(a, ip, us));
+        assert!(!s.leases.lock().unwrap().contains_key(&a));
     }
 
     type Sent = Arc<Mutex<Vec<Vec<u8>>>>;
