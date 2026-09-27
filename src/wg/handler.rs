@@ -282,27 +282,28 @@ impl Handler {
         }
     }
 
-    /// Remove a peer and tear down all session state belonging to it.
+    /// Remove a peer and tear down all session state belonging to it,
+    /// including initiations still waiting for an answer: a response to one
+    /// would otherwise install a session for the revoked key, even after the
+    /// peer is authorized again under new terms.
     pub fn remove_peer(&self, peer_key: &NoisePublicKey) {
+        // Deauthorize first: install() checks authorization under the
+        // sessions lock, so a handshake finishing concurrently either sees
+        // the peer gone or installs before the sweep below removes it.
         self.peers.write().expect("peers lock").remove(peer_key);
 
-        let removed = self
-            .sessions
+        self.handshakes
+            .lock()
+            .expect("handshakes lock")
+            .retain(|_, hs| hs.remote_static != *peer_key);
+        let mut sess = self.sessions.write().expect("sessions lock");
+        sess.remove(peer_key);
+        // Sweep the index rather than only the session's slots, so nothing
+        // indexed for the peer outlives it whichever way it got there.
+        self.keypairs
             .write()
-            .expect("sessions lock")
-            .remove(peer_key);
-        if let Some(sess) = removed {
-            let mut kps = self.keypairs.write().expect("keypairs lock");
-            if let Some(kp) = sess.keypair_current.as_ref() {
-                kps.remove(&kp.local_index);
-            }
-            if let Some(kp) = sess.keypair_prev.as_ref() {
-                kps.remove(&kp.local_index);
-            }
-            if let Some(kp) = sess.keypair_next.as_ref() {
-                kps.remove(&kp.local_index);
-            }
-        }
+            .expect("keypairs lock")
+            .retain(|_, kp| kp.peer_key != *peer_key);
     }
 
     /// True if the peer is in the authorized table and (if `expires_at` is
@@ -448,18 +449,21 @@ impl Handler {
     /// True if `peer_key` has a current keypair that can still send: one
     /// past `REJECT_AFTER_TIME` or `REJECT_AFTER_MESSAGES` stays installed
     /// until the next [`maintenance`](Self::maintenance), but
-    /// [`encrypt`](Self::encrypt) refuses it.
+    /// [`encrypt`](Self::encrypt) refuses it. The same goes for every
+    /// keypair of a peer past its [expiry](Self::set_peer_expiry).
     pub fn has_session(&self, peer_key: &NoisePublicKey) -> bool {
-        self.sessions
-            .read()
-            .expect("sessions lock")
-            .get(peer_key)
-            .and_then(|s| s.keypair_current.as_ref())
-            .is_some_and(|kp| {
-                kp.created.elapsed() <= REJECT_AFTER_TIME
-                    && kp.send_counter.load(std::sync::atomic::Ordering::Relaxed)
-                        < crate::wg::constants::REJECT_AFTER_MESSAGES
-            })
+        self.is_authorized_peer(peer_key)
+            && self
+                .sessions
+                .read()
+                .expect("sessions lock")
+                .get(peer_key)
+                .and_then(|s| s.keypair_current.as_ref())
+                .is_some_and(|kp| {
+                    kp.created.elapsed() <= REJECT_AFTER_TIME
+                        && kp.send_counter.load(std::sync::atomic::Ordering::Relaxed)
+                            < crate::wg::constants::REJECT_AFTER_MESSAGES
+                })
     }
 
     /// Keep sending keepalives to `peer_key` whenever nothing else has gone
@@ -650,6 +654,16 @@ impl Handler {
         use crate::wg::constants::{MAX_HANDSHAKES, MAX_SESSIONS};
         let mut sess = self.sessions.write().expect("sessions lock");
         let mut kps = self.keypairs.write().expect("keypairs lock");
+        // Checked here, under the sessions lock, and not only by the caller:
+        // remove_peer deauthorizes and then sweeps under this lock, so a
+        // handshake that finishes while the peer is being removed cannot
+        // slip a session in after the sweep.
+        if !self.is_authorized_peer(&peer_key) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "peer not authorized",
+            ));
+        }
         if sess.len() >= MAX_SESSIONS && !sess.contains_key(&peer_key) {
             return Err(io::Error::other("session table full"));
         }
@@ -1238,6 +1252,46 @@ mod tests {
         assert!(a.has_session(&b.public_key()));
         rewind(&a, &b.public_key(), Duration::from_secs(6));
         assert!(timer_actions(&a).is_empty(), "still retrying");
+    }
+
+    /// A response to an initiation made before the peer was removed must not
+    /// bring it back: it would install a session for a revoked key, and a
+    /// server would report the peer connected again.
+    #[test]
+    fn a_removed_peer_cannot_return_through_a_late_response() {
+        let (a, b) = pair();
+        let addr = loopback();
+        let init = a.initiate_handshake(&b.public_key()).unwrap();
+        a.remove_peer(&b.public_key());
+        let resp = b.process_packet(&init, &addr).unwrap();
+        assert!(a.process_packet(&resp.response, &addr).is_err());
+        assert!(!a.has_session(&b.public_key()));
+        assert!(a.sessions.read().unwrap().is_empty());
+        assert!(a.keypairs.read().unwrap().is_empty());
+
+        // Nor once it is authorized again: that handshake belonged to the
+        // authorization that was revoked.
+        let (a, b) = pair();
+        let init = a.initiate_handshake(&b.public_key()).unwrap();
+        a.remove_peer(&b.public_key());
+        a.add_peer(b.public_key());
+        let resp = b.process_packet(&init, &addr).unwrap();
+        assert!(a.process_packet(&resp.response, &addr).is_err());
+        assert!(!a.has_session(&b.public_key()));
+    }
+
+    /// Past its expiry a peer's session is unusable at once, both ways, not
+    /// only once maintenance gets round to it.
+    #[test]
+    fn an_expired_peer_can_neither_send_nor_receive() {
+        let (a, b) = pair();
+        let addr = loopback();
+        handshake(&a, &b);
+        let from_b = b.encrypt(b"late", &a.public_key()).unwrap();
+        a.set_peer_expiry(&b.public_key(), Instant::now() - Duration::from_secs(1));
+        assert!(!a.has_session(&b.public_key()));
+        assert!(a.encrypt(b"x", &b.public_key()).is_err());
+        assert!(a.process_packet(&from_b, &addr).is_err());
     }
 
     /// The unknown-peer callback may replace itself: it must not run under

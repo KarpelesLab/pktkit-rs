@@ -233,6 +233,14 @@ pub(crate) fn process_handshake_response(h: &Handler, data: &[u8]) -> Result<Pac
     let mut hs = h
         .peek_handshake(receiver_idx)
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no pending handshake"))?;
+    // The peer may have been removed, or have expired, since we initiated;
+    // its answer must not bring it back.
+    if !h.is_authorized_peer(&hs.remote_static) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "peer not authorized",
+        ));
+    }
 
     // MAC1 is keyed on *our* public key.
     if !check_mac1(h.public_key().as_bytes(), data) {

@@ -56,6 +56,14 @@ pub(crate) fn process_data_packet(h: &Handler, data: &[u8]) -> Result<PacketResu
     if Instant::now().duration_since(kp.created) > REJECT_AFTER_TIME {
         return Err(io::Error::other("keypair expired"));
     }
+    // A peer past its expiry keeps its keypairs until maintenance; they
+    // must stop working at once, not then.
+    if !h.is_authorized_peer(&kp.peer_key) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "peer not authorized",
+        ));
+    }
 
     // Drop obvious replays before paying to decrypt them; nothing is
     // recorded yet.
@@ -153,7 +161,12 @@ pub(crate) fn encrypt_into(
         });
     }
 
-    // Anything that stops us sending calls for a handshake.
+    // An expired peer's session lingers until maintenance, and must not be
+    // sent on meanwhile. No handshake is asked for: none could be started.
+    if !h.is_authorized_peer(peer_key) {
+        return Err(EncryptError::NoSession);
+    }
+    // Anything else that stops us sending calls for a handshake.
     let want_handshake = |h: &Handler| {
         h.with_timers(peer_key, |t| t.want_handshake = true);
     };
