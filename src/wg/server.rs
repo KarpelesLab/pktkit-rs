@@ -220,15 +220,19 @@ impl Server {
 
         *self.conn.lock().expect("conn lock") = Some(conn.clone());
 
-        // Spawn the maintenance thread.
+        // Spawn the maintenance thread. It lives as long as this call:
+        // however the read loop ends, `_stop` tells it to go, rather than
+        // leaving it to send keepalives for a server that no longer reads.
         let me = self.clone();
         let interval = self.maintenance_interval;
         let done = self.done.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let _stop = StopOnDrop(stop.clone());
         let maint = thread::Builder::new()
             .name("wg-maint".into())
             .spawn(move || {
                 let mut last = Instant::now();
-                while !done.load(Ordering::SeqCst) {
+                while !done.load(Ordering::SeqCst) && !stop.load(Ordering::SeqCst) {
                     thread::sleep(TIMER_TICK);
                     me.run_timers();
                     if last.elapsed() >= interval {
@@ -289,17 +293,19 @@ impl Server {
     }
 
     fn process_incoming(&self, data: &[u8], addr: SocketAddr, conn: &UdpSocket) {
-        let (result, handler) = if let Some(mh) = self.multi_handler.as_ref() {
-            match mh.process_packet(data, &addr) {
-                Ok(mr) => (mr.result, mr.handler),
-                Err(_) => return,
+        // Processing may call on_unknown_peer, caller code, which must not
+        // take the read loop down with it; no lock is held while it runs.
+        let processed = catch_callback(|| {
+            if let Some(mh) = self.multi_handler.as_ref() {
+                mh.process_packet(data, &addr)
+                    .map(|mr| (mr.result, mr.handler))
+            } else {
+                let h = self.handler.as_ref().unwrap().clone();
+                h.process_packet(data, &addr).map(|r| (r, h))
             }
-        } else {
-            let h = self.handler.as_ref().unwrap().clone();
-            match h.process_packet(data, &addr) {
-                Ok(r) => (r, h),
-                Err(_) => return,
-            }
+        });
+        let Some(Ok((result, handler))) = processed else {
+            return;
         };
 
         // Roaming (whitepaper §6): only a packet that authenticated as the
@@ -453,11 +459,11 @@ impl Server {
                 if result.ty == PacketType::HandshakeResponse
                     && let Some(cb) = self.on_peer_connected.as_ref()
                 {
-                    cb(result.peer_key, handler);
+                    catch_callback(|| cb(result.peer_key, handler));
                 }
             }
             PacketType::TransportData => {
-                (self.on_packet)(&result.data, result.peer_key, handler);
+                catch_callback(|| (self.on_packet)(&result.data, result.peer_key, handler));
             }
             PacketType::Keepalive | PacketType::CookieReceived => {
                 // Nothing else to do; address already noted above.
@@ -606,6 +612,21 @@ impl Server {
             let _ = h.join();
         }
         Ok(())
+    }
+}
+
+/// Run caller code for the read loop: a panic in it costs the packet
+/// being handled, not the loop (and with it every peer).
+fn catch_callback<T>(f: impl FnOnce() -> T) -> Option<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).ok()
+}
+
+/// Sets its flag when dropped, however the scope holding it is left.
+struct StopOnDrop(Arc<AtomicBool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
     }
 }
 
@@ -827,5 +848,111 @@ mod tests {
         assert_eq!(got, vec![b"first".to_vec(), b"second".to_vec()]);
         a.close().unwrap();
         b.close().unwrap();
+    }
+
+    /// Complete a handshake between `client` and the server at `saddr`
+    /// over `sock`.
+    fn handshake(client: &Handler, sock: &UdpSocket, saddr: SocketAddr, spub: NoisePublicKey) {
+        sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        sock.send_to(&client.initiate_handshake(&spub).unwrap(), saddr)
+            .unwrap();
+        let resp = recv_type(sock, 2);
+        client.process_packet(&resp, &saddr).unwrap();
+    }
+
+    /// A panicking on_packet costs the packet it was handed, not the read
+    /// loop: before, the loop died with it, and every peer went unheard.
+    #[test]
+    fn a_panicking_callback_does_not_stop_the_read_loop() {
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let tx = Mutex::new(tx);
+        let (s, h, saddr) = server(Arc::new(move |d: &[u8], _, _| {
+            if d == b"boom" {
+                panic!("caller bug");
+            }
+            let _ = tx.lock().unwrap().send(d.to_vec());
+        }));
+        let c = Handler::new(Config::default()).unwrap();
+        c.add_peer(h.public_key());
+        h.add_peer(c.public_key());
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        handshake(&c, &sock, saddr, h.public_key());
+        for d in [&b"boom"[..], b"after"] {
+            sock.send_to(&c.encrypt(d, &h.public_key()).unwrap(), saddr)
+                .unwrap();
+        }
+        let got = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("read loop died");
+        assert_eq!(got, b"after");
+        s.close().unwrap();
+    }
+
+    /// Likewise a panicking on_unknown_peer, which runs inside processing.
+    #[test]
+    fn a_panicking_unknown_peer_callback_does_not_stop_the_read_loop() {
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let tx = Mutex::new(tx);
+        let (s, h, saddr) = server(Arc::new(move |d: &[u8], _, _| {
+            let _ = tx.lock().unwrap().send(d.to_vec());
+        }));
+        h.set_on_unknown_peer(Arc::new(|_, _, _| panic!("caller bug")));
+        let stranger = Handler::new(Config::default()).unwrap();
+        stranger.add_peer(h.public_key());
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock.send_to(
+            &stranger.initiate_handshake(&h.public_key()).unwrap(),
+            saddr,
+        )
+        .unwrap();
+
+        let c = Handler::new(Config::default()).unwrap();
+        c.add_peer(h.public_key());
+        h.add_peer(c.public_key());
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        handshake(&c, &sock, saddr, h.public_key());
+        sock.send_to(&c.encrypt(b"hi", &h.public_key()).unwrap(), saddr)
+            .unwrap();
+        let got = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("read loop died");
+        assert_eq!(got, b"hi");
+        s.close().unwrap();
+    }
+
+    /// However serve ends, its maintenance thread ends with it, rather than
+    /// sending keepalives and handshakes for a server nobody reads for.
+    #[test]
+    fn the_maintenance_thread_stops_when_serve_does() {
+        let h = Handler::new(Config::default()).unwrap();
+        let s = Server::new(ServerConfig::default().handler(h.clone())).unwrap();
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+        let saddr = sock.local_addr().unwrap();
+        // Something in the read loop panics: here a poisoned lock.
+        let s2 = s.clone();
+        let _ = thread::spawn(move || {
+            let _g = s2.peer_addrs.write().unwrap();
+            panic!("poison");
+        })
+        .join();
+        let s2 = s.clone();
+        let serve = thread::spawn(move || s2.serve(sock));
+
+        let c = Handler::new(Config::default()).unwrap();
+        c.add_peer(h.public_key());
+        h.add_peer(c.public_key());
+        let csock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        csock
+            .send_to(&c.initiate_handshake(&h.public_key()).unwrap(), saddr)
+            .unwrap();
+        assert!(serve.join().is_err(), "serve should have panicked");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !s.threads.lock().unwrap()[0].is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "maintenance thread still running"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 }
