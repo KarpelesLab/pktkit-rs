@@ -44,6 +44,10 @@ impl Mode {
     /// `XDP_FLAGS_DRV_MODE`.
     pub const DRIVER: Mode = Mode(1 << 2);
     /// `XDP_FLAGS_HW_MODE` (SmartNIC offload).
+    ///
+    /// [`Program::attach`] refuses it: the kernel only attaches a program in
+    /// this mode if it was loaded for that one device (`prog_ifindex`), which
+    /// [`Program::load`] does not do.
     pub const HARDWARE: Mode = Mode(1 << 3);
 
     /// True if a socket bound behind a program in this mode can negotiate
@@ -162,6 +166,7 @@ impl Program {
     /// Attaching never replaces a program somebody else installed; that is an
     /// `EBUSY`, and [`detach`] is the deliberate way out.
     pub fn attach(&self, ifindex: u32, mode: Mode) -> Result<Link> {
+        check_attach_mode(mode)?;
         let mut last: Option<io::Error> = None;
         for &m in mode.candidates() {
             match self.attach_exact(ifindex, m) {
@@ -212,6 +217,23 @@ impl Program {
             mode,
         })
     }
+}
+
+/// Refuse a mode no program from [`Program::load`] can attach in.
+///
+/// An offloaded attachment needs a program the kernel translated for the
+/// NIC at load time, and `dev_xdp_attach` refuses anything else with a bare
+/// `EINVAL`. Offload could not run the capture program anyway: it has no
+/// `bpf_redirect_map` into an XSKMAP and no LPM tries.
+fn check_attach_mode(mode: Mode) -> Result<()> {
+    if mode == Mode::HARDWARE {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "xdp: hardware (offload) mode needs a program loaded for that device; \
+             use Mode::DRIVER or Mode::GENERIC",
+        ));
+    }
+    Ok(())
 }
 
 /// What [`Program::test_run`] observed.
@@ -322,6 +344,15 @@ mod tests {
     #[test]
     fn auto_tries_driver_before_generic() {
         assert_eq!(Mode::AUTO.candidates(), &[Mode::DRIVER, Mode::GENERIC]);
+    }
+
+    #[test]
+    fn hardware_mode_is_refused_up_front() {
+        let e = check_attach_mode(Mode::HARDWARE).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::Unsupported);
+        for m in [Mode::AUTO, Mode::DRIVER, Mode::GENERIC] {
+            assert!(check_attach_mode(m).is_ok());
+        }
     }
 
     #[test]
