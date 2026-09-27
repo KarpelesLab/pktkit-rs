@@ -440,14 +440,21 @@ impl Handler {
         crate::wg::handshake::initiate_handshake(self, peer_key)
     }
 
-    /// True if there is a current session with an installed keypair for `peer_key`.
+    /// True if `peer_key` has a current keypair that can still send: one
+    /// past `REJECT_AFTER_TIME` or `REJECT_AFTER_MESSAGES` stays installed
+    /// until the next [`maintenance`](Self::maintenance), but
+    /// [`encrypt`](Self::encrypt) refuses it.
     pub fn has_session(&self, peer_key: &NoisePublicKey) -> bool {
         self.sessions
             .read()
             .expect("sessions lock")
             .get(peer_key)
             .and_then(|s| s.keypair_current.as_ref())
-            .is_some()
+            .is_some_and(|kp| {
+                kp.created.elapsed() <= REJECT_AFTER_TIME
+                    && kp.send_counter.load(std::sync::atomic::Ordering::Relaxed)
+                        < crate::wg::constants::REJECT_AFTER_MESSAGES
+            })
     }
 
     /// Keep sending keepalives to `peer_key` whenever nothing else has gone

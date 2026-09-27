@@ -317,12 +317,28 @@ impl Server {
         if !handler.has_session(peer) {
             return;
         }
-        let Some(queue) = self.staged.lock().expect("staged lock").remove(peer) else {
+        let Some(mut queue) = self.staged.lock().expect("staged lock").remove(peer) else {
             return;
         };
-        for data in queue {
-            if let Ok(ct) = handler.encrypt(&data, peer) {
-                let _ = conn.send_to(&ct, addr);
+        while let Some(data) = queue.pop_front() {
+            match handler.encrypt(&data, peer) {
+                Ok(ct) => {
+                    let _ = conn.send_to(&ct, addr);
+                }
+                Err(_) => {
+                    // The keypair became unusable under us (it expired or
+                    // ran out of messages); encrypt has asked for a
+                    // handshake. Keep the rest for that one, ahead of
+                    // anything staged meanwhile.
+                    queue.push_front(data);
+                    let mut staged = self.staged.lock().expect("staged lock");
+                    let q = staged.entry(*peer).or_default();
+                    queue.extend(q.drain(..));
+                    let excess = queue.len().saturating_sub(MAX_STAGED_PACKETS);
+                    queue.drain(..excess);
+                    *q = queue;
+                    return;
+                }
             }
         }
     }
@@ -554,6 +570,70 @@ mod tests {
         let attacker: SocketAddr = "127.0.0.1:9".parse().unwrap();
         s.process_incoming(&forged, attacker, &sock);
         assert_eq!(s.peer_addr(&b.public_key()), Some(peer_addr));
+    }
+
+    /// Receive from `sock` until a packet of WireGuard type `ty` arrives.
+    fn recv_type(sock: &UdpSocket, ty: u8) -> Vec<u8> {
+        let mut buf = [0u8; 2048];
+        loop {
+            let (n, _) = sock.recv_from(&mut buf).expect("nothing arrived");
+            if buf[0] == ty {
+                return buf[..n].to_vec();
+            }
+        }
+    }
+
+    /// Packets staged while the current keypair had expired (it lingers
+    /// until the next cleanup) wait for a usable one, rather than being
+    /// flushed into it and dropped when encryption fails.
+    #[test]
+    fn staged_packets_wait_out_an_expired_keypair() {
+        use crate::wg::handler::Keypair;
+        let a = Handler::new(Config::default()).unwrap();
+        let b = Handler::new(Config::default()).unwrap();
+        a.add_peer(b.public_key());
+        b.add_peer(a.public_key());
+        let (s, sock) = idle_server(&a);
+        let peer_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        peer_sock
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let peer_addr = peer_sock.local_addr().unwrap();
+        let a_addr = sock.local_addr().unwrap();
+
+        // A session, whose current keypair then ages past REJECT_AFTER_TIME.
+        s.connect(&b.public_key(), peer_addr).unwrap();
+        let init = recv_type(&peer_sock, 1);
+        let resp = b.process_packet(&init, &a_addr).unwrap();
+        s.process_incoming(&resp.response, peer_addr, &sock);
+        {
+            let mut sess = a.sessions.write().unwrap();
+            let slot = &mut sess.get_mut(&b.public_key()).unwrap().keypair_current;
+            let kp = slot.take().unwrap();
+            *slot = Some(Arc::new(Keypair {
+                send_key: kp.send_key,
+                receive_key: kp.receive_key,
+                send_counter: Default::default(),
+                created: Instant::now() - crate::wg::constants::REJECT_AFTER_TIME * 2,
+                local_index: kp.local_index,
+                remote_index: kp.remote_index,
+                peer_key: kp.peer_key,
+                is_initiator: kp.is_initiator,
+                replay_filter: crate::wg::SlidingWindow::new(),
+            }));
+        }
+        s.send(b"staged", &b.public_key()).unwrap();
+
+        // The peer initiates. Our response leaves the new keypair
+        // unconfirmed, and the expired one is still current.
+        let init = b.initiate_handshake(&a.public_key()).unwrap();
+        s.process_incoming(&init, peer_addr, &sock);
+        let resp = recv_type(&peer_sock, 2);
+        let ka = b.process_packet(&resp, &a_addr).unwrap();
+        // Its keepalive confirms the new keypair; now the packet goes out.
+        s.process_incoming(&ka.response, peer_addr, &sock);
+        let pkt = recv_type(&peer_sock, 4);
+        assert_eq!(b.process_packet(&pkt, &a_addr).unwrap().data, b"staged");
     }
 
     /// Data sent before the handshake completes is held and delivered once
