@@ -22,6 +22,9 @@ use std::time::Duration;
 const PPTP_PORT: u16 = 1723;
 const PPTP_MAGIC_COOKIE: u32 = 0x1A2B_3C4D;
 const PPTP_GRE_TIMEOUT: Duration = Duration::from_secs(120);
+/// How often the call table is swept of stale calls. A sweep walks the
+/// whole table (up to 65536 calls, one per ID), so not on every message.
+const PPTP_CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
 
 // PPTP control message types.
 const PPTP_OUTGOING_CALL_REQ: u16 = 7;
@@ -42,8 +45,29 @@ struct PptpCallInfo {
 
 #[derive(Debug)]
 pub struct PptpHelper {
-    /// Indexed by call ID.
-    calls: Mutex<HashMap<u16, PptpCallInfo>>,
+    calls: Mutex<Calls>,
+}
+
+/// The calls, indexed by call ID, and when they are next swept.
+#[derive(Debug)]
+struct Calls {
+    by_id: HashMap<u16, PptpCallInfo>,
+    next_cleanup: Instant,
+}
+
+impl Calls {
+    /// Record `info` under `call_id`, first sweeping stale calls if
+    /// [`PPTP_CLEANUP_INTERVAL`] has passed: a stale call lingers a while
+    /// longer, but no message pays for a walk of the table.
+    fn insert(&mut self, call_id: u16, info: PptpCallInfo) {
+        let now = info.created;
+        if now >= self.next_cleanup {
+            self.next_cleanup = now + PPTP_CLEANUP_INTERVAL;
+            self.by_id
+                .retain(|_, c| now.saturating_duration_since(c.created) <= PPTP_GRE_TIMEOUT);
+        }
+        self.by_id.insert(call_id, info);
+    }
 }
 
 impl Default for PptpHelper {
@@ -55,14 +79,11 @@ impl Default for PptpHelper {
 impl PptpHelper {
     pub fn new() -> PptpHelper {
         PptpHelper {
-            calls: Mutex::new(HashMap::new()),
+            calls: Mutex::new(Calls {
+                by_id: HashMap::new(),
+                next_cleanup: Instant::now() + PPTP_CLEANUP_INTERVAL,
+            }),
         }
-    }
-
-    /// Remove stale call entries. Caller holds the lock.
-    fn cleanup_calls(calls: &mut HashMap<u16, PptpCallInfo>) {
-        let now = Instant::now();
-        calls.retain(|_, info| now.duration_since(info.created) <= PPTP_GRE_TIMEOUT);
     }
 }
 
@@ -106,7 +127,6 @@ impl PacketHelper for PptpHelper {
                 }
                 {
                     let mut calls = self.calls.lock().unwrap();
-                    Self::cleanup_calls(&mut calls);
                     calls.insert(
                         call_id,
                         PptpCallInfo {
@@ -173,7 +193,7 @@ impl PacketHelper for PptpHelper {
                 let peer_call_id = u16::from_be_bytes([payload[14], payload[15]]);
                 {
                     let mut calls = self.calls.lock().unwrap();
-                    if let Some(info) = calls.get_mut(&peer_call_id) {
+                    if let Some(info) = calls.by_id.get_mut(&peer_call_id) {
                         info.peer_call_id = server_call_id;
                     }
                 }
@@ -314,7 +334,7 @@ mod tests {
         assert_eq!(out, pkt);
 
         // Call-ID 0x2222 is now tracked.
-        assert!(h.calls.lock().unwrap().contains_key(&0x2222));
+        assert!(h.calls.lock().unwrap().by_id.contains_key(&0x2222));
 
         // No expectation the NAT core could never match is left behind.
         assert!(
@@ -350,7 +370,50 @@ mod tests {
         h.process_inbound(&nat, reply, &mapping(inside));
 
         let calls = h.calls.lock().unwrap();
-        let info = calls.get(&0x3333).expect("call should still be tracked");
+        let info = calls
+            .by_id
+            .get(&0x3333)
+            .expect("call should still be tracked");
         assert_eq!(info.peer_call_id, 0x9999);
+    }
+
+    #[test]
+    fn requests_do_not_each_walk_the_call_table() {
+        let nat = Nat::new(pfx("10.0.0.1/24"), pfx("203.0.113.1/24"));
+        let h = PptpHelper::new();
+        let inside = Ipv4Addr::new(10, 0, 0, 5);
+        let server = Ipv4Addr::new(198, 51, 100, 9);
+        let send = |call_id: u16, outbound: bool| {
+            let payload = pptp_payload(PPTP_OUTGOING_CALL_REQ, call_id, 0);
+            if outbound {
+                let pkt = build_pptp(inside, 60000, server, PPTP_PORT, &payload);
+                h.process_outbound(&nat, pkt, &mapping(inside));
+            } else {
+                let pkt = build_pptp(server, PPTP_PORT, inside, 60000, &payload);
+                h.process_inbound(&nat, pkt, &mapping(inside));
+            }
+        };
+        // A table nearly full of calls, then a stream of requests: each
+        // used to sweep the whole table. The bound is loose enough for a
+        // slow debug build.
+        for id in 1..=60000 {
+            send(id, false);
+        }
+        let start = std::time::Instant::now();
+        for id in 60001..=62000 {
+            send(id, true);
+        }
+        let took = start.elapsed();
+        assert!(took < Duration::from_millis(300), "{took:?}");
+
+        // Stale calls still go, once the interval has passed.
+        let old = Instant::now() - PPTP_GRE_TIMEOUT - Duration::from_secs(1);
+        {
+            let mut calls = h.calls.lock().unwrap();
+            calls.by_id.values_mut().for_each(|c| c.created = old);
+            calls.next_cleanup = Instant::now();
+        }
+        send(1, true);
+        assert_eq!(h.calls.lock().unwrap().by_id.len(), 1);
     }
 }
