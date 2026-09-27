@@ -6,10 +6,10 @@
 //! window scaling, SACK, or timestamps (the 32-bit ISS isn't wide enough).
 //! This matches the Linux behavior.
 //!
-//! The cookie's MAC is the keyed SipHash of [`super::secret`], as in Linux,
-//! over the full 4-tuple (RFC 4987 §3.6: without the addresses, a cookie
-//! earned from one source validates an ACK spoofed from any other), the
-//! peer's ISN, the MSS index and a time counter. The counter is what expires
+//! The cookie's MAC is the keyed SipHash vtcp also derives its ISNs from,
+//! as in Linux, over the full 4-tuple (RFC 4987 §3.6: without the addresses,
+//! a cookie earned from one source validates an ACK spoofed from any other),
+//! the peer's ISN, the MSS index and a time counter. The counter is what expires
 //! a cookie, so the key itself never has to rotate.
 
 use std::net::IpAddr;
