@@ -22,8 +22,15 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 const MAX_FRAME_SIZE: usize = 65535;
+
+/// How long [`close`](L2Device::close) lets the writer thread flush frames
+/// already queued before it hangs up regardless. Bounded, because a peer
+/// that has stopped reading would otherwise hold the writer, and the
+/// socket, open for as long as it pleases.
+const CLOSE_GRACE: Duration = Duration::from_secs(1);
 
 /// Most frames queued for one peer's socket; past it, frames are dropped.
 ///
@@ -65,6 +72,34 @@ impl HandlerSlot {
     }
 }
 
+/// Set once, by the writer thread as it exits; waited on with a timeout.
+struct Latch {
+    set: Mutex<bool>,
+    cvar: Condvar,
+}
+
+impl Latch {
+    fn new() -> Arc<Self> {
+        Arc::new(Latch {
+            set: Mutex::new(false),
+            cvar: Condvar::new(),
+        })
+    }
+    fn set(&self) {
+        *self.set.lock().unwrap() = true;
+        self.cvar.notify_all();
+    }
+    /// Whether the latch was set within `timeout`.
+    fn wait_timeout(&self, timeout: Duration) -> bool {
+        let g = self.set.lock().unwrap();
+        let (g, _) = self
+            .cvar
+            .wait_timeout_while(g, timeout, |set| !*set)
+            .unwrap();
+        *g
+    }
+}
+
 impl DoneSignal {
     fn new() -> Arc<Self> {
         Arc::new(DoneSignal {
@@ -103,6 +138,8 @@ pub struct Conn {
     out: Mutex<Option<SyncSender<Vec<u8>>>>,
     handler: Arc<HandlerSlot>,
     done: Arc<DoneSignal>,
+    /// Set when the writer thread has finished, and hung up the socket.
+    writer_done: Arc<Latch>,
     /// Shuts the socket down in both directions: the peer sees EOF and the
     /// reader thread's blocked read returns, as does a blocked write.
     shutdown: Arc<dyn Fn() + Send + Sync>,
@@ -150,28 +187,35 @@ impl Conn {
                 if read.read_exact(&mut buf[..len]).is_err() {
                     break;
                 }
-                let Some(h) = handler_t.get(&done_t) else {
-                    break;
-                };
-                let _ = h(Frame::from_slice(&buf[..len]));
+                // Once closed, frames are read and discarded until the writer
+                // hangs up: a socket closed with unread data answers with a
+                // RST, which could cost the peer the frames still being
+                // flushed to it.
+                if let Some(h) = handler_t.get(&done_t) {
+                    let _ = h(Frame::from_slice(&buf[..len]));
+                }
             }
             done_t.signal();
         });
 
         let (out, rx) = mpsc::sync_channel::<Vec<u8>>(OUT_QUEUE_LIMIT);
         let shutdown_t = shutdown.clone();
+        let writer_done = Latch::new();
+        let writer_done_t = writer_done.clone();
         // Ends once the queue's sender is dropped (on close) and drained, or
-        // when a write fails. A failed write may have left half a frame on the
-        // stream, after which nothing sent could be framed right, so the
-        // connection is hung up.
+        // when a write fails, and hangs up either way: on close, only now
+        // that every queued frame has gone out whole; after a failed write,
+        // because it may have left half a frame on the stream, after which
+        // nothing sent could be framed right.
         std::thread::spawn(move || {
             let mut write = write;
             while let Ok(frame) = rx.recv() {
                 if write.write_all(&frame).is_err() {
-                    shutdown_t();
-                    return;
+                    break;
                 }
             }
+            shutdown_t();
+            writer_done_t.set();
         });
 
         Arc::new(Conn {
@@ -179,6 +223,7 @@ impl Conn {
             out: Mutex::new(Some(out)),
             handler,
             done,
+            writer_done,
             shutdown,
         })
     }
@@ -189,8 +234,23 @@ impl Conn {
         let _guard = self.handler.handler.lock().unwrap();
         self.handler.ready.notify_all();
         drop(_guard);
-        drop(self.out.lock().unwrap().take());
-        (self.shutdown)();
+        // Closing the queue lets the writer flush what is on it and then hang
+        // up, so no frame is lost or cut in half. Only the first close does.
+        if self.out.lock().unwrap().take().is_none() {
+            return;
+        }
+        // A peer that has stopped reading would hold the writer forever:
+        // past the grace period, hang up under it. That can cut a frame, but
+        // the peer was not taking them anyway.
+        let (writer_done, shutdown) = (self.writer_done.clone(), self.shutdown.clone());
+        let watchdog = std::thread::Builder::new().spawn(move || {
+            if !writer_done.wait_timeout(CLOSE_GRACE) {
+                shutdown();
+            }
+        });
+        if watchdog.is_err() {
+            (self.shutdown)();
+        }
     }
 
     /// Wait until the connection is closed (peer disconnects or
@@ -553,6 +613,63 @@ mod tests {
         assert_eq!(
             client.send(Frame::from_slice(&frame)).unwrap_err().kind(),
             std::io::ErrorKind::NotConnected
+        );
+    }
+
+    /// Frames queued when `close` is called still reach the peer, each one
+    /// whole, before it sees the hang-up.
+    #[test]
+    fn close_flushes_the_queue_before_hanging_up() {
+        let ln = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = dial_tcp(ln.local_addr().unwrap()).unwrap();
+        let (mut peer, _) = ln.accept().unwrap();
+
+        let m = MacAddr([2, 0, 0, 0, 0, 1]);
+        // More than the socket buffers hold, so most are still queued when
+        // `close` is called.
+        let mut sent = Vec::new();
+        for i in 0..OUT_QUEUE_LIMIT as u8 {
+            let frame = build_frame(m, m, EtherType::IPV4, &[i; 60_000]);
+            if client.send(Frame::from_slice(&frame)).is_ok() {
+                sent.push(i);
+            }
+        }
+        client.close().unwrap();
+
+        peer.set_read_timeout(Some(ECHO_TIMEOUT)).unwrap();
+        let mut got = Vec::new();
+        peer.read_to_end(&mut got)
+            .expect("peer never saw the hang-up");
+        let mut frames = Vec::new();
+        let mut rest = &got[..];
+        while !rest.is_empty() {
+            assert!(rest.len() >= 4, "length prefix cut short");
+            let len = u32::from_be_bytes(rest[..4].try_into().unwrap()) as usize;
+            assert!(rest.len() >= 4 + len, "frame {} cut short", frames.len());
+            frames.push(rest[4 + 14]);
+            rest = &rest[4 + len..];
+        }
+        assert_eq!(frames, sent);
+    }
+
+    /// A peer that never reads cannot hold a closed connection open: the
+    /// writer is cut loose once the grace period runs out.
+    #[test]
+    fn close_gives_up_on_a_peer_that_never_reads() {
+        let ln = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = dial_tcp(ln.local_addr().unwrap()).unwrap();
+        let (_peer, _) = ln.accept().unwrap();
+
+        let m = MacAddr([2, 0, 0, 0, 0, 1]);
+        let frame = build_frame(m, m, EtherType::IPV4, &[0u8; 60_000]);
+        for _ in 0..OUT_QUEUE_LIMIT * 2 {
+            let _ = client.send(Frame::from_slice(&frame));
+        }
+        assert!(!client.writer_done.wait_timeout(Duration::from_millis(100)));
+        client.close().unwrap();
+        assert!(
+            client.writer_done.wait_timeout(CLOSE_GRACE + ECHO_TIMEOUT),
+            "writer still stuck on the peer"
         );
     }
 
