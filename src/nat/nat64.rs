@@ -3,8 +3,8 @@
 //! e.g. `64:ff9b::192.0.2.33` for the Well-Known Prefix.
 //!
 //! Inside faces IPv6; outside faces IPv4. TCP, UDP and ICMP echo sessions
-//! are translated; ICMPv4 errors about them are translated to ICMPv6 per
-//! RFC 7915 §4.2 (ICMPv6 errors from the inside are not translated).
+//! are translated, and so are ICMP errors about them in both directions:
+//! ICMPv4 to ICMPv6 per RFC 7915 §4.2, ICMPv6 to ICMPv4 per §5.2.
 
 use crate::nat::frag::FragTable;
 use crate::nat::helper::{PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP};
@@ -347,8 +347,8 @@ impl Nat64 {
         if icmp.len() < 8 {
             return;
         }
-        if icmp[0] != 128 {
-            // Only Echo Request → Echo Request is translated outbound.
+        // Echo Request, and the errors RFC 7915 §5.2 has ICMPv4 types for.
+        if !matches!(icmp[0], 1..=4 | 128) {
             return;
         }
         // The ICMPv4 checksum is computed afresh; check the original first,
@@ -361,6 +361,9 @@ impl Nat64 {
         );
         if sum != 0xFFFF {
             return;
+        }
+        if icmp[0] != 128 {
+            return self.outbound_icmpv6_error(icmp, dst_v6, (outside_ip, dst_v4), hop);
         }
         let id = u16::from_be_bytes([icmp[4], icmp[5]]);
         let k = Nat64Key {
@@ -384,6 +387,141 @@ impl Nat64 {
 
         let (ip_id, flags) = self.unfragmented_v4_id(IPV4_MIN_HEADER + msg.len());
         let mut out = v4_header(outside_ip, dst_v4, PROTO_ICMP, hop, msg.len(), ip_id, flags);
+        out.extend_from_slice(&msg);
+        self.outside.deliver(Packet::from_slice(&out));
+    }
+
+    /// Translate an ICMPv6 error the inside sends about a packet that came
+    /// in through this NAT64 into ICMPv4 (RFC 7915 §5.2 and §5.3): type and
+    /// code from the RFC's tables, and the quoted IPv6 packet turned back
+    /// into the IPv4 one it was translated from.
+    fn outbound_icmpv6_error(
+        &self,
+        icmp: &[u8],
+        dst_v6: Ipv6Addr,
+        (outside_ip, dst_v4): (Ipv4Addr, Ipv4Addr),
+        ttl: u8,
+    ) {
+        let rest = [icmp[4], icmp[5], icmp[6], icmp[7]];
+        // Packet Too Big's MTU is filled in once the quote is parsed.
+        let (v4_type, v4_code, mut word) = match (icmp[0], icmp[1]) {
+            (1, 0 | 2 | 3) => (3, 1, [0; 4]),
+            (1, 1) => (3, 10, [0; 4]),
+            (1, 4) => (3, 3, [0; 4]),
+            (2, _) => (3, 4, [0; 4]),
+            (3, c @ (0 | 1)) => (11, c, [0; 4]),
+            (4, 0) => match v6_pointer_to_v4(u32::from_be_bytes(rest)) {
+                Some(p) => (12, 0, [p, 0, 0, 0]),
+                None => return,
+            },
+            // Unrecognized Next Header: the IPv4 host named a protocol the
+            // IPv6 one does not speak.
+            (4, 1) => (3, 2, [0; 4]),
+            _ => return,
+        };
+
+        // The quote: an IPv6 header, a Fragment Header if the packet was
+        // translated from the first fragment of an IPv4 datagram, then the
+        // transport header whose ports identify the session.
+        let emb = &icmp[8..];
+        if emb.len() < IPV6_HEADER_LEN || emb[0] >> 4 != 6 {
+            return;
+        }
+        let mut nh = emb[6];
+        let mut off = IPV6_HEADER_LEN;
+        let mut frag = None;
+        if nh == 44 {
+            if emb.len() < off + 8 {
+                return;
+            }
+            let fo = u16::from_be_bytes([emb[off + 2], emb[off + 3]]);
+            // A later fragment carries no ports to find the session by.
+            if fo & 0xFFF8 != 0 {
+                return;
+            }
+            frag = Some((
+                u16::from_be_bytes([emb[off + 6], emb[off + 7]]),
+                fo & 1 != 0,
+            ));
+            nh = emb[off];
+            off += 8;
+        }
+        if (nh != PROTO_TCP && nh != PROTO_UDP) || emb.len() < off + 8 {
+            return;
+        }
+        let l4 = &emb[off..];
+        let (emb_src_v6, emb_dst_v6) = (read_v6(&emb[8..24]), read_v6(&emb[24..40]));
+        // An error goes back to whoever sent the packet it quotes.
+        if emb_src_v6 != dst_v6 {
+            return;
+        }
+        let remote = SocketAddrV4::new(dst_v4, u16::from_be_bytes([l4[0], l4[1]]));
+        let inside_port = u16::from_be_bytes([l4[2], l4[3]]);
+        let k = Nat64Key {
+            proto: nh,
+            ip: emb_dst_v6,
+            port: inside_port,
+        };
+        // Only for a live mapping, about traffic it carried from that
+        // remote: an inside host must not be able to forge errors against
+        // sessions it is not part of.
+        let outside_port = {
+            let inner = self.inner.lock().unwrap();
+            match inner.mappings.get(&k) {
+                Some(m) if m.peers.contains(&remote) => m.outside_port,
+                _ => return,
+            }
+        };
+        if v4_type == 3 && v4_code == 4 {
+            // The IPv4 packet was 20 bytes smaller than the IPv6 one, or 28
+            // when the translation added a Fragment Header (RFC 7915 §5.2).
+            let shrink = if frag.is_some() { 28 } else { 20 };
+            let mtu = u32::from_be_bytes(rest).saturating_sub(shrink).min(0xFFFF) as u16;
+            word[2..4].copy_from_slice(&mtu.to_be_bytes());
+        }
+
+        let payload_len = usize::from(u16::from_be_bytes([emb[4], emb[5]]));
+        let v4_payload = payload_len.saturating_sub(off - IPV6_HEADER_LEN);
+        let (id, flags) = frag.map_or((0, 0), |(id, more)| (id, if more { 0x2000 } else { 0 }));
+        let mut quote = v4_header(dst_v4, outside_ip, nh, emb[7], v4_payload, id, flags);
+        // Type of Service from the Traffic Class.
+        quote[1] = (emb[0] << 4) | (emb[1] >> 4);
+        quote[10..12].copy_from_slice(&[0, 0]);
+        let cs = checksum(&quote);
+        quote[10..12].copy_from_slice(&cs.to_be_bytes());
+
+        // An ICMPv4 error stays within 576 bytes (RFC 1812 §4.3.2.3).
+        let room = 576 - 2 * IPV4_MIN_HEADER - 8;
+        let l4_off = quote.len();
+        quote.extend_from_slice(&l4[..l4.len().min(room)]);
+        let q = &mut quote[l4_off..];
+        let new_port = outside_port.to_be_bytes();
+        q[2..4].copy_from_slice(&new_port);
+        let field = if nh == PROTO_TCP { 16 } else { 6 };
+        if q.len() >= field + 2 && !(nh == PROTO_UDP && q[6..8] == [0, 0]) {
+            let cs = u16::from_be_bytes([q[field], q[field + 1]]);
+            let mut cs = csum_replace(
+                cs,
+                &[
+                    &emb_src_v6.octets(),
+                    &emb_dst_v6.octets(),
+                    &inside_port.to_be_bytes(),
+                ],
+                &[&dst_v4.octets(), &outside_ip.octets(), &new_port],
+            );
+            if nh == PROTO_UDP && cs == 0 {
+                cs = 0xFFFF;
+            }
+            q[field..field + 2].copy_from_slice(&cs.to_be_bytes());
+        }
+
+        let mut msg = vec![v4_type, v4_code, 0, 0];
+        msg.extend_from_slice(&word);
+        msg.extend_from_slice(&quote);
+        let cs = checksum(&msg);
+        msg[2..4].copy_from_slice(&cs.to_be_bytes());
+        let (ip_id, flags) = self.unfragmented_v4_id(IPV4_MIN_HEADER + msg.len());
+        let mut out = v4_header(outside_ip, dst_v4, PROTO_ICMP, ttl, msg.len(), ip_id, flags);
         out.extend_from_slice(&msg);
         self.outside.deliver(Packet::from_slice(&out));
     }
@@ -1082,6 +1220,22 @@ fn v4_pointer_to_v6(p: u8) -> Option<u8> {
     }
 }
 
+/// RFC 7915 figure 6: where an ICMPv6 Parameter Problem pointer into the
+/// IPv6 header lands in the IPv4 header. The Flow Label, and anything past
+/// the header, has no counterpart.
+fn v6_pointer_to_v4(p: u32) -> Option<u8> {
+    match p {
+        0 => Some(0),
+        1 => Some(1),
+        4 | 5 => Some(2),
+        6 => Some(9),
+        7 => Some(8),
+        8..=23 => Some(12),
+        24..=39 => Some(16),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1537,6 +1691,148 @@ mod tests {
         reply[24..26].copy_from_slice(&8u16.to_be_bytes());
         nat.outside().send(Packet::from_slice(&reply)).unwrap();
         assert_eq!(inside.lock().unwrap()[0][7], 63);
+    }
+
+    /// A UDP reply from `server`:53 to the NAT64's public `port`, with its
+    /// checksum.
+    fn v4_reply(server: Ipv4Addr, port: u16) -> Vec<u8> {
+        let mut r = vec![0u8; 32];
+        r[0] = 0x45;
+        r[2..4].copy_from_slice(&32u16.to_be_bytes());
+        r[8] = 64;
+        r[9] = PROTO_UDP;
+        r[12..16].copy_from_slice(&server.octets());
+        r[16..20].copy_from_slice(&[198, 51, 100, 1]);
+        let ic = checksum(&r[..20]);
+        r[10..12].copy_from_slice(&ic.to_be_bytes());
+        r[20..22].copy_from_slice(&53u16.to_be_bytes());
+        r[22..24].copy_from_slice(&port.to_be_bytes());
+        r[24..26].copy_from_slice(&12u16.to_be_bytes());
+        r[28..32].copy_from_slice(b"resp");
+        crate::nat::l4::fill_v4_l4_checksum(&mut r, 20);
+        r
+    }
+
+    /// An ICMPv6 error from the client to `to` quoting `quoted`.
+    fn icmp6_error(to: Ipv6Addr, t: u8, code: u8, word: [u8; 4], quoted: &[u8]) -> Vec<u8> {
+        let client: Ipv6Addr = CLIENT.parse().unwrap();
+        let mut msg = vec![t, code, 0, 0];
+        msg.extend_from_slice(&word);
+        msg.extend_from_slice(quoted);
+        let cs = compute_icmpv6_checksum(client, to, &msg);
+        msg[2..4].copy_from_slice(&cs.to_be_bytes());
+        let mut p = v6_header(client, to, PROTO_ICMPV6, 64, msg.len());
+        p.extend_from_slice(&msg);
+        p
+    }
+
+    /// Have the client answer a server's reply with an ICMPv6 error;
+    /// returns what left the outside, if anything, and the reply.
+    fn client_error(t: u8, code: u8, word: [u8; 4]) -> (Option<Vec<u8>>, Vec<u8>) {
+        let (nat, inside, outside) = wired();
+        let sent = send_udp(&nat, &outside);
+        outside.lock().unwrap().clear();
+        let reply = v4_reply(SERVER, u16::from_be_bytes([sent[20], sent[21]]));
+        nat.outside().send(Packet::from_slice(&reply)).unwrap();
+        let delivered = inside.lock().unwrap().pop().unwrap();
+        let err = icmp6_error(wkp(SERVER), t, code, word, &delivered);
+        nat.inside().send(Packet::from_slice(&err)).unwrap();
+        let got = outside.lock().unwrap().pop();
+        (got, reply)
+    }
+
+    #[test]
+    fn icmpv6_error_from_the_inside_becomes_icmpv4() {
+        let (got, reply) = client_error(1, 4, [0; 4]);
+        let e = got.expect("port unreachable must reach the server");
+        assert_eq!(&e[12..16], &[198, 51, 100, 1]);
+        assert_eq!(&e[16..20], &SERVER.octets());
+        assert_eq!(checksum(&e[..20]), 0, "outer IP checksum");
+        assert_eq!((e[20], e[21]), (3, 3));
+        assert_eq!(checksum(&e[20..]), 0, "ICMPv4 checksum");
+        // The quote is the server's own datagram again.
+        let q = &e[28..];
+        assert_eq!(q[0], 0x45);
+        assert_eq!(checksum(&q[..20]), 0, "quoted IP checksum");
+        assert_eq!(&q[2..4], &reply[2..4], "quoted total length");
+        assert_eq!(q[9], PROTO_UDP);
+        assert_eq!(&q[12..20], &reply[12..20]);
+        assert_eq!(&q[20..], &reply[20..], "quoted UDP, ports and checksum");
+    }
+
+    #[test]
+    fn icmpv6_error_types_follow_rfc7915() {
+        for ((t, code, word), want) in [
+            ((1, 0, [0; 4]), Some((3, 1, [0; 4]))),
+            ((1, 1, [0; 4]), Some((3, 10, [0; 4]))),
+            ((1, 2, [0; 4]), Some((3, 1, [0; 4]))),
+            ((1, 3, [0; 4]), Some((3, 1, [0; 4]))),
+            ((1, 5, [0; 4]), None),
+            // Packet Too Big: 20 bytes less for the smaller header.
+            ((2, 0, [0, 0, 0x05, 0x78]), Some((3, 4, [0, 0, 0x05, 0x64]))),
+            ((3, 1, [0; 4]), Some((11, 1, [0; 4]))),
+            // Pointer at Next Header (6) is at Protocol (9) in IPv4.
+            ((4, 0, [0, 0, 0, 6]), Some((12, 0, [9, 0, 0, 0]))),
+            // A Flow Label has nowhere to point in IPv4.
+            ((4, 0, [0, 0, 0, 2]), None),
+            ((4, 1, [0; 4]), Some((3, 2, [0; 4]))),
+            ((4, 2, [0; 4]), None),
+        ] {
+            let (got, _) = client_error(t, code, word);
+            let got = got.map(|e| (e[20], e[21], [e[24], e[25], e[26], e[27]]));
+            assert_eq!(got, want, "ICMPv6 {t}/{code}");
+        }
+    }
+
+    #[test]
+    fn packet_too_big_about_a_fragment_allows_for_the_fragment_header() {
+        let (nat, inside, outside) = wired();
+        let sent = send_udp(&nat, &outside);
+        outside.lock().unwrap().clear();
+        // The first fragment of the reply: just the UDP header.
+        let mut f = v4_reply(SERVER, u16::from_be_bytes([sent[20], sent[21]]));
+        f.truncate(28);
+        f[2..4].copy_from_slice(&28u16.to_be_bytes());
+        f[4..6].copy_from_slice(&0x1234u16.to_be_bytes());
+        f[6] = 0x20;
+        f[10..12].copy_from_slice(&[0, 0]);
+        let ic = checksum(&f[..20]);
+        f[10..12].copy_from_slice(&ic.to_be_bytes());
+        nat.outside().send(Packet::from_slice(&f)).unwrap();
+        let delivered = inside.lock().unwrap().pop().unwrap();
+        assert_eq!(delivered[6], 44, "translated with a Fragment Header");
+
+        let err = icmp6_error(wkp(SERVER), 2, 0, [0, 0, 0x05, 0x00], &delivered);
+        nat.inside().send(Packet::from_slice(&err)).unwrap();
+        let e = outside.lock().unwrap().pop().expect("frag needed");
+        assert_eq!((e[20], e[21]), (3, 4));
+        assert_eq!(u16::from_be_bytes([e[26], e[27]]), 1280 - 28);
+        assert_eq!(checksum(&e[20..]), 0);
+        // The quoted header is the fragment's again.
+        let q = &e[28..];
+        assert_eq!(&q[4..8], &f[4..8], "ID, MF and offset");
+        assert_eq!(&q[2..4], &f[2..4], "total length");
+        assert_eq!(checksum(&q[..20]), 0);
+        assert_eq!(&q[20..28], &f[20..28]);
+    }
+
+    #[test]
+    fn inside_cannot_forge_icmpv6_errors() {
+        let (nat, _inside, outside) = wired();
+        send_udp(&nat, &outside);
+        outside.lock().unwrap().clear();
+        // A reply from a server the mapping never exchanged traffic with.
+        let other = Ipv4Addr::new(9, 9, 9, 9);
+        let src = wkp(other);
+        let client: Ipv6Addr = CLIENT.parse().unwrap();
+        let mut q = v6_header(src, client, PROTO_UDP, 60, 12);
+        let mut udp = [53u16, 5555, 12, 0].map(u16::to_be_bytes).concat();
+        udp.extend_from_slice(b"resp");
+        fill_v6_checksum(&mut udp, 6, PROTO_UDP, src, client);
+        q.extend_from_slice(&udp);
+        let err = icmp6_error(src, 1, 4, [0; 4], &q);
+        nat.inside().send(Packet::from_slice(&err)).unwrap();
+        assert!(outside.lock().unwrap().is_empty());
     }
 
     #[test]
