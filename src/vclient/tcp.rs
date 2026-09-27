@@ -485,7 +485,7 @@ impl TcpStack {
             conns: Mutex::new(HashMap::new()),
             listeners: Mutex::new(HashMap::new()),
             sink,
-            next_port: Mutex::new(EPHEMERAL_FIRST),
+            next_port: Mutex::new(0),
             stop: Arc::new(Mutex::new(false)),
         });
         // Tick thread: drive timers for all connections every 100ms. Without
@@ -546,7 +546,7 @@ impl TcpStack {
         // lock, so two dials cannot pick the same 4-tuple.
         let mut conns = self.conns.lock().unwrap();
         let listeners = self.listeners.lock().unwrap();
-        let local_port = pick_port(&mut self.next_port.lock().unwrap(), |p| {
+        let local_port = pick_port(&mut self.next_port.lock().unwrap(), local_ip, remote, |p| {
             listeners.contains_key(&p)
                 || conns.contains_key(&ConnKey {
                     local_port: p,
@@ -899,20 +899,29 @@ fn wrap_v6(src: Ipv6Addr, dst: Ipv6Addr, seg: &[u8]) -> Vec<u8> {
 }
 
 /// First and last port of the ephemeral range (RFC 6335 dynamic ports).
-pub(crate) const EPHEMERAL_FIRST: u16 = 49152;
+const EPHEMERAL_FIRST: u16 = 49152;
 const EPHEMERAL_LAST: u16 = 65535;
 
-/// Pick the next ephemeral port, starting at `*next`, that `in_use` does not
-/// claim. Once the counter wraps, ports still held by live sockets come round
-/// again, and reusing one would hijack its connection.
-pub(crate) fn pick_port(next: &mut u16, in_use: impl Fn(u16) -> bool) -> io::Result<u16> {
-    for _ in EPHEMERAL_FIRST..=EPHEMERAL_LAST {
-        let port = *next;
-        *next = if port == EPHEMERAL_LAST {
-            EPHEMERAL_FIRST
-        } else {
-            port + 1
-        };
+/// Pick an ephemeral port for a socket from `local` to `remote` that
+/// `in_use` does not claim, by RFC 6056 §3.3.3 (Algorithm 3): a secret
+/// per-destination offset plus the shared counter `next`. Handed out in
+/// plain sequence, ports tell an off-path attacker which one the next
+/// connection uses, halving the guesswork of blind injection (RFC 5961) or
+/// a spoofed DNS answer; the keyed offset hides that, while each
+/// destination still sees ports go round the whole range before any
+/// repeats. Ports still held by live sockets are skipped: reusing one would
+/// hijack its connection.
+pub(crate) fn pick_port(
+    next: &mut u16,
+    local: IpAddr,
+    remote: SocketAddr,
+    in_use: impl Fn(u16) -> bool,
+) -> io::Result<u16> {
+    const RANGE: u32 = (EPHEMERAL_LAST - EPHEMERAL_FIRST) as u32 + 1;
+    let offset = crate::vtcp::secret::keyed_hash(("port", local, remote)) as u32;
+    for _ in 0..RANGE {
+        let port = EPHEMERAL_FIRST + (offset.wrapping_add(u32::from(*next)) % RANGE) as u16;
+        *next = next.wrapping_add(1);
         if !in_use(port) {
             return Ok(port);
         }
@@ -978,8 +987,10 @@ mod tests {
         let stack = TcpStack::new(sink);
         let local = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
         let remote = SocketAddr::from(([10, 0, 0, 1], 80));
+        let before = *stack.next_port.lock().unwrap();
         let first = stack.start_dial(local, remote).unwrap();
-        *stack.next_port.lock().unwrap() = first.key.local_port;
+        // Wind the counter back: the same port comes round again.
+        *stack.next_port.lock().unwrap() = before;
         let second = stack.start_dial(local, remote).unwrap();
         assert_ne!(second.key.local_port, first.key.local_port);
         let conns = stack.conns.lock().unwrap();
@@ -1154,13 +1165,42 @@ mod tests {
     }
 
     #[test]
-    fn pick_port_wraps_and_reports_exhaustion() {
-        let mut next = EPHEMERAL_LAST;
-        assert_eq!(pick_port(&mut next, |_| false).unwrap(), EPHEMERAL_LAST);
-        assert_eq!(next, EPHEMERAL_FIRST);
+    fn pick_port_covers_the_range_and_reports_exhaustion() {
+        let local = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+        let remote = SocketAddr::from(([10, 0, 0, 1], 80));
+        // From any counter value, one destination sees every port once
+        // before a repeat -- the counter wrapping included.
+        let mut next = u16::MAX - 100;
+        let mut seen = std::collections::HashSet::new();
+        for _ in EPHEMERAL_FIRST..=EPHEMERAL_LAST {
+            let p = pick_port(&mut next, local, remote, |_| false).unwrap();
+            assert!(p >= EPHEMERAL_FIRST);
+            assert!(seen.insert(p), "port {p} repeated");
+        }
         assert_eq!(
-            pick_port(&mut next, |_| true).unwrap_err().kind(),
+            pick_port(&mut next, local, remote, |_| true)
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::AddrNotAvailable
         );
+    }
+
+    #[test]
+    fn ports_are_not_handed_out_in_sequence() {
+        // Consecutive dials to different destinations: an observer of one
+        // learns nothing of the port the next one uses (RFC 6056).
+        let local = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+        let mut next = 0;
+        let ports: Vec<u16> = (1..=8u8)
+            .map(|i| {
+                let remote = SocketAddr::from(([10, 0, 0, i], 80));
+                pick_port(&mut next, local, remote, |_| false).unwrap()
+            })
+            .collect();
+        let sequential = ports
+            .windows(2)
+            .filter(|w| w[1] == w[0].wrapping_add(1))
+            .count();
+        assert!(sequential < 2, "{ports:?}");
     }
 }

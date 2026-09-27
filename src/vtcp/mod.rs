@@ -40,7 +40,7 @@ pub mod conn;
 pub mod options;
 pub mod recvbuf;
 pub mod rto;
-mod secret;
+pub(crate) mod secret;
 pub mod segment;
 pub mod sendbuf;
 pub mod seqspace;

@@ -208,7 +208,7 @@ impl UdpStack {
         Arc::new(UdpStack {
             conns: Mutex::new(HashMap::new()),
             sink,
-            next_port: Mutex::new(super::tcp::EPHEMERAL_FIRST),
+            next_port: Mutex::new(0),
             closed: AtomicBool::new(false),
         })
     }
@@ -220,7 +220,7 @@ impl UdpStack {
         if self.closed.load(Ordering::Acquire) {
             return Err(client_closed());
         }
-        let local_port = pick_port(&mut self.next_port.lock().unwrap(), |p| {
+        let local_port = pick_port(&mut self.next_port.lock().unwrap(), local_ip, remote, |p| {
             conns.contains_key(&UdpKey {
                 local_port: p,
                 remote: remote.ip(),
@@ -505,9 +505,10 @@ mod tests {
         let stack = UdpStack::new(sink);
         let local = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
         let remote = SocketAddr::from(([10, 0, 0, 1], 53));
+        let before = *stack.next_port.lock().unwrap();
         let first = stack.dial(local, remote).unwrap();
-        // Wrap the allocator round to the port `first` still holds.
-        *stack.next_port.lock().unwrap() = first.local_addr().port();
+        // Wind the counter back: the port `first` still holds comes round.
+        *stack.next_port.lock().unwrap() = before;
         let second = stack.dial(local, remote).unwrap();
         assert_ne!(second.local_addr().port(), first.local_addr().port());
 
