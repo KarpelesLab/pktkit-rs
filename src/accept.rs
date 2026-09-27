@@ -63,10 +63,22 @@ pub trait DoneSignal {
 /// remote end disconnects; any other device stays attached for as long as
 /// the connector keeps it.
 ///
-/// Blocks until the acceptor returns an error.
+/// Blocks until the acceptor returns an error that retrying cannot cure.
+/// One that can -- out of file descriptors or memory, a peer that gave up
+/// while queued -- is waited out, backing off from 5 ms to 1 s, rather than
+/// end the loop, and with it every future connection, over a condition
+/// that passes when a peer leaves.
 pub fn serve(acceptor: &dyn L2Acceptor, connector: &dyn L2Connector) -> Result<()> {
+    let mut backoff = Backoff::default();
     loop {
-        let dev = acceptor.accept_l2()?;
+        let dev = match acceptor.accept_l2() {
+            Ok(dev) => dev,
+            Err(e) => {
+                backoff.wait_out(e)?;
+                continue;
+            }
+        };
+        backoff.reset();
         let cleanup = match connector.connect_l2(dev.clone()) {
             Ok(c) => c,
             Err(_) => {
@@ -79,10 +91,7 @@ pub fn serve(acceptor: &dyn L2Acceptor, connector: &dyn L2Connector) -> Result<(
         // (wasm) there is no waiting, and the device stays attached.
         #[cfg(not(target_family = "wasm"))]
         if let Some(done) = dev.done_signal() {
-            std::thread::spawn(move || {
-                done.wait_done();
-                let _ = cleanup();
-            });
+            detach_when(&*dev, cleanup, move || done.wait_done());
             continue;
         }
 
@@ -103,8 +112,16 @@ pub fn serve_with_done<A>(acceptor: &A, connector: &dyn L2Connector) -> Result<(
 where
     A: L2AcceptorWithDone + ?Sized,
 {
+    let mut backoff = Backoff::default();
     loop {
-        let (dev, done) = acceptor.accept_l2_with_done()?;
+        let (dev, done) = match acceptor.accept_l2_with_done() {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                backoff.wait_out(e)?;
+                continue;
+            }
+        };
+        backoff.reset();
         let cleanup = match connector.connect_l2(dev.clone()) {
             Ok(c) => c,
             Err(_) => {
@@ -114,14 +131,93 @@ where
         };
 
         if let Some(done) = done {
-            std::thread::spawn(move || {
-                done.wait();
-                let _ = cleanup();
-            });
+            detach_when(&*dev, cleanup, move || done.wait());
         } else {
             std::mem::forget(cleanup);
         }
     }
+}
+
+/// Run `cleanup` once `wait` returns, from a thread of its own. Out of
+/// threads, as with descriptors, `thread::spawn` would panic and take the
+/// accept loop down: instead the device is detached and closed at once,
+/// since nothing would be left to notice it go.
+#[cfg(not(target_family = "wasm"))]
+fn detach_when(dev: &dyn L2Device, cleanup: Cleanup, wait: impl FnOnce() + Send + 'static) {
+    let cell = Arc::new(std::sync::Mutex::new(Some(cleanup)));
+    let c = cell.clone();
+    let spawned = std::thread::Builder::new().spawn(move || {
+        wait();
+        if let Some(cleanup) = c.lock().unwrap().take() {
+            let _ = cleanup();
+        }
+    });
+    if spawned.is_err() {
+        if let Some(cleanup) = cell.lock().unwrap().take() {
+            let _ = cleanup();
+        }
+        let _ = dev.close();
+    }
+}
+
+/// The accept loops' answer to a failed accept: wait and retry if the error
+/// is one that passes, give up with it otherwise.
+#[derive(Default)]
+struct Backoff {
+    /// The next wait; zero until an error has been seen.
+    delay: std::time::Duration,
+}
+
+impl Backoff {
+    const FIRST: std::time::Duration = std::time::Duration::from_millis(5);
+    const MAX: std::time::Duration = std::time::Duration::from_secs(1);
+
+    fn reset(&mut self) {
+        self.delay = std::time::Duration::ZERO;
+    }
+
+    /// Sleep before the next attempt if `e` is transient, or hand it back.
+    /// Without threads (wasm) nothing can change while we sleep, and sleep
+    /// is not allowed, so every error ends the loop there.
+    fn wait_out(&mut self, e: std::io::Error) -> Result<()> {
+        if cfg!(target_family = "wasm") || !transient(&e) {
+            return Err(e);
+        }
+        self.delay = (self.delay * 2).clamp(Self::FIRST, Self::MAX);
+        #[cfg(not(target_family = "wasm"))]
+        std::thread::sleep(self.delay);
+        Ok(())
+    }
+}
+
+/// Whether an accept that failed with `e` may succeed if tried again: the
+/// process or system is out of descriptors, buffers or memory (which a
+/// departing peer gives back), the connection was dropped while it waited
+/// in the backlog, or the call was interrupted. Linux's accept(2) also
+/// asks for its pending network errors to be treated as a retry. Anything
+/// else, such as a listener that was closed, ends the loop.
+fn transient(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::*;
+    if matches!(
+        e.kind(),
+        ConnectionAborted | ConnectionReset | Interrupted | WouldBlock | OutOfMemory
+    ) {
+        return true;
+    }
+    // EMFILE, ENFILE and ENOBUFS have no ErrorKind of their own. There is
+    // no libc to name them here, so by number, which is fixed per ABI.
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "fullrust"))]
+    const CODES: &[i32] = &[24, 23, 105];
+    #[cfg(windows)]
+    const CODES: &[i32] = &[10024, 10055]; // WSAEMFILE, WSAENOBUFS
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "fullrust",
+        windows
+    )))]
+    const CODES: &[i32] = &[24, 23, 55]; // the BSDs and Apple
+    e.raw_os_error().is_some_and(|c| CODES.contains(&c))
 }
 
 /// Variant of [`L2Acceptor`] that yields an optional connection-closed signal
@@ -212,6 +308,48 @@ mod tests {
                 Ok(())
             }))
         }
+    }
+
+    /// Fails as the acceptor is told to, then hands out its devices.
+    struct Flaky(Mutex<Vec<std::io::Error>>, Queue);
+
+    impl L2Acceptor for Flaky {
+        fn accept_l2(&self) -> Result<Arc<dyn L2Device>> {
+            match self.0.lock().unwrap().pop() {
+                Some(e) => Err(e),
+                None => self.1.accept_l2(),
+            }
+        }
+    }
+
+    /// Running out of file descriptors, or a peer giving up in the backlog,
+    /// passes: the loop must wait it out, not stop accepting for good.
+    #[test]
+    fn serve_retries_transient_accept_errors() {
+        #[cfg(unix)]
+        let emfile = std::io::Error::from_raw_os_error(24);
+        #[cfg(windows)]
+        let emfile = std::io::Error::from_raw_os_error(10024);
+        let hangup = Arc::new(Hangup::default());
+        let acceptor = Flaky(
+            Mutex::new(vec![
+                emfile,
+                std::io::ErrorKind::ConnectionAborted.into(),
+                std::io::ErrorKind::Interrupted.into(),
+            ]),
+            Queue(Mutex::new(vec![Arc::new(Transient(hangup.clone()))])),
+        );
+        let attached = Arc::new(AtomicUsize::new(0));
+        let (tx, _rx) = mpsc::channel();
+        let connector = Attached(attached.clone(), tx);
+        let err = serve(&acceptor, &connector).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+        assert_eq!(
+            attached.load(Ordering::SeqCst),
+            1,
+            "gave up before the device"
+        );
+        hangup.raise();
     }
 
     #[test]

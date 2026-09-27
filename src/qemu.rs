@@ -19,7 +19,7 @@ use std::net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs};
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -40,6 +40,11 @@ const CLOSE_GRACE: Duration = Duration::from_secs(1);
 /// the frame -- a hub forwarding inline to every port, or another peer's
 /// reader, which with two peers doing it to each other is a deadlock.
 const OUT_QUEUE_LIMIT: usize = 128;
+
+/// Default for [`ListenerConfig::max_peers`]. Each peer holds a socket (three
+/// descriptors, with its clones) and two threads, three with
+/// [`serve`](crate::serve)'s wait for its hang-up.
+pub const DEFAULT_MAX_PEERS: usize = 1024;
 
 struct DoneSignal {
     closed: AtomicBool,
@@ -168,11 +173,15 @@ impl Conn {
     /// socket down. Spawns a reader thread that invokes the installed handler
     /// for each received frame, and a writer thread that drains the outbound
     /// queue into the socket.
+    ///
+    /// Fails if a thread cannot be started, which, like running out of
+    /// descriptors, is a condition that passes: the caller may retry.
     fn from_split(
         read: Box<dyn Read + Send + 'static>,
         write: Box<dyn Write + Send + 'static>,
         shutdown: Arc<dyn Fn() + Send + Sync>,
-    ) -> Arc<Conn> {
+        slot: Option<PeerSlot>,
+    ) -> Result<Arc<Conn>> {
         let mac = MacAddr::random_local_unicast();
         let handler = Arc::new(HandlerSlot {
             handler: Mutex::new(None),
@@ -182,22 +191,42 @@ impl Conn {
 
         let handler_t = handler.clone();
         let done_t = done.clone();
-        std::thread::spawn(move || {
+        let shutdown_r = shutdown.clone();
+        // Spawned with the Builder: `thread::spawn` panics when no thread
+        // can be had, which would take the accept loop down with it.
+        std::thread::Builder::new().spawn(move || {
             // Signals done however the thread ends: whatever else fails,
             // `wait_done` and `serve`'s cleanup must still learn of it.
             let _done = SignalOnDrop(done_t.clone());
+            // The listener's count of peers drops once the peer has gone.
+            let _slot = slot;
             let mut read = read;
             let mut hdr = [0u8; 4];
             let mut buf = vec![0u8; MAX_FRAME_SIZE];
+            // A read that timed out is a peer idle past the listener's
+            // limit: hang up on it, so it learns it has been dropped. Not
+            // once closed, though: then the writer is flushing, and hangs up
+            // itself when done.
+            let hang_up_if_idle = |e: std::io::Error| {
+                let idle = matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                );
+                if idle && !done_t.closed.load(Ordering::Acquire) {
+                    shutdown_r();
+                }
+            };
             loop {
-                if read.read_exact(&mut hdr).is_err() {
+                if let Err(e) = read.read_exact(&mut hdr) {
+                    hang_up_if_idle(e);
                     break;
                 }
                 let len = u32::from_be_bytes(hdr) as usize;
                 if !(14..=MAX_FRAME_SIZE).contains(&len) {
                     break;
                 }
-                if read.read_exact(&mut buf[..len]).is_err() {
+                if let Err(e) = read.read_exact(&mut buf[..len]) {
+                    hang_up_if_idle(e);
                     break;
                 }
                 // Once closed, frames are read and discarded until the writer
@@ -213,7 +242,7 @@ impl Conn {
                     }));
                 }
             }
-        });
+        })?;
 
         let (out, rx) = mpsc::sync_channel::<Vec<u8>>(OUT_QUEUE_LIMIT);
         let shutdown_t = shutdown.clone();
@@ -224,7 +253,7 @@ impl Conn {
         // that every queued frame has gone out whole; after a failed write,
         // because it may have left half a frame on the stream, after which
         // nothing sent could be framed right.
-        std::thread::spawn(move || {
+        let writer = std::thread::Builder::new().spawn(move || {
             let mut write = write;
             while let Ok(frame) = rx.recv() {
                 if write.write_all(&frame).is_err() {
@@ -234,15 +263,20 @@ impl Conn {
             shutdown_t();
             writer_done_t.set();
         });
+        if let Err(e) = writer {
+            // The reader is running: hanging up is what ends it.
+            shutdown();
+            return Err(e);
+        }
 
-        Arc::new(Conn {
+        Ok(Arc::new(Conn {
             mac,
             out: Mutex::new(Some(out)),
             handler,
             done,
             writer_done,
             shutdown,
-        })
+        }))
     }
 
     fn shut(&self) {
@@ -350,15 +384,19 @@ impl crate::DoneSignal for Arc<Conn> {
 
 /// Dial a QEMU socket netdev over TCP.
 pub fn dial_tcp(addr: impl ToSocketAddrs) -> Result<Arc<Conn>> {
-    tcp_conn(TcpStream::connect(addr)?)
+    tcp_conn(TcpStream::connect(addr)?, None, None)
 }
 
-fn tcp_conn(s: TcpStream) -> Result<Arc<Conn>> {
+/// `idle`: how long the peer may go without sending before it is hung up
+/// on. The receive timeout is the socket's, which the clones share, but only
+/// the reader reads.
+fn tcp_conn(s: TcpStream, idle: Option<Duration>, slot: Option<PeerSlot>) -> Result<Arc<Conn>> {
+    s.set_read_timeout(idle)?;
     let (w, c) = (s.try_clone()?, s.try_clone()?);
     let shutdown = Arc::new(move || {
         let _ = c.shutdown(Shutdown::Both);
     });
-    Ok(Conn::from_split(Box::new(s), Box::new(w), shutdown))
+    Conn::from_split(Box::new(s), Box::new(w), shutdown, slot)
 }
 
 /// Dial a QEMU socket netdev over a Unix domain socket.
@@ -367,16 +405,18 @@ fn tcp_conn(s: TcpStream) -> Result<Arc<Conn>> {
 /// use [`dial_tcp`] there.
 #[cfg(unix)]
 pub fn dial_unix(path: impl AsRef<Path>) -> Result<Arc<Conn>> {
-    unix_conn(UnixStream::connect(path)?)
+    unix_conn(UnixStream::connect(path)?, None, None)
 }
 
+/// As [`tcp_conn`].
 #[cfg(unix)]
-fn unix_conn(s: UnixStream) -> Result<Arc<Conn>> {
+fn unix_conn(s: UnixStream, idle: Option<Duration>, slot: Option<PeerSlot>) -> Result<Arc<Conn>> {
+    s.set_read_timeout(idle)?;
     let (w, c) = (s.try_clone()?, s.try_clone()?);
     let shutdown = Arc::new(move || {
         let _ = c.shutdown(Shutdown::Both);
     });
-    Ok(Conn::from_split(Box::new(s), Box::new(w), shutdown))
+    Conn::from_split(Box::new(s), Box::new(w), shutdown, slot)
 }
 
 /// Dial a QEMU socket netdev over a Unix domain socket.
@@ -397,28 +437,138 @@ fn no_unix_sockets() -> std::io::Error {
     )
 }
 
-/// Listens for QEMU peers over TCP or Unix sockets.
-pub enum Listener {
-    Tcp(TcpListener),
-    /// Only present on platforms with Unix-domain sockets.
-    #[cfg(unix)]
-    Unix(UnixListener),
+/// Limits a [`Listener`] puts on its peers.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ListenerConfig {
+    /// Most peers connected at once ([`DEFAULT_MAX_PEERS`] unless set).
+    /// Each costs a socket and threads, so without a bound anyone who can
+    /// reach the listener could open peers until the process runs out of
+    /// either. A peer arriving past it is hung up on at once; it counts
+    /// until its socket's reader has seen it go.
+    pub max_peers: usize,
+    /// Hang up on a peer that sends nothing for this long. `None` (the
+    /// default) never does: a guest with nothing to say sends nothing, so
+    /// only set it where peers are known to keep talking, or to be
+    /// expendable when they stop.
+    pub idle_timeout: Option<Duration>,
 }
 
-impl core::fmt::Debug for Listener {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Listener::Tcp(_) => f.write_str("qemu::Listener::Tcp"),
-            #[cfg(unix)]
-            Listener::Unix(_) => f.write_str("qemu::Listener::Unix"),
+impl Default for ListenerConfig {
+    fn default() -> Self {
+        Self {
+            max_peers: DEFAULT_MAX_PEERS,
+            idle_timeout: None,
         }
     }
 }
 
+setters! {
+    ListenerConfig {
+        set max_peers: usize;
+        some idle_timeout: Duration;
+    }
+}
+
+/// One of a listener's peer slots, given back when dropped.
+struct PeerSlot(Arc<AtomicUsize>);
+
+impl Drop for PeerSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+enum Socket {
+    Tcp(TcpListener),
+    #[cfg(unix)]
+    Unix(UnixListener),
+}
+
+/// Listens for QEMU peers over TCP or Unix sockets, within the limits of
+/// its [`ListenerConfig`].
+pub struct Listener {
+    socket: Socket,
+    cfg: ListenerConfig,
+    /// Peers connected now, bounded by `cfg.max_peers`.
+    peers: Arc<AtomicUsize>,
+}
+
+impl core::fmt::Debug for Listener {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let kind = match self.socket {
+            Socket::Tcp(_) => "tcp",
+            #[cfg(unix)]
+            Socket::Unix(_) => "unix",
+        };
+        f.debug_struct("qemu::Listener")
+            .field("kind", &kind)
+            .field("cfg", &self.cfg)
+            .field("peers", &self.peers.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
+impl From<TcpListener> for Listener {
+    fn from(l: TcpListener) -> Listener {
+        Listener::new(Socket::Tcp(l))
+    }
+}
+
+#[cfg(unix)]
+impl From<UnixListener> for Listener {
+    fn from(l: UnixListener) -> Listener {
+        Listener::new(Socket::Unix(l))
+    }
+}
+
 impl Listener {
+    fn new(socket: Socket) -> Listener {
+        Listener {
+            socket,
+            cfg: ListenerConfig::default(),
+            peers: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
     /// Bind a TCP listener.
     pub fn bind_tcp(addr: impl ToSocketAddrs) -> Result<Listener> {
-        Ok(Listener::Tcp(TcpListener::bind(addr)?))
+        Ok(TcpListener::bind(addr)?.into())
+    }
+
+    /// Apply `cfg` to peers accepted from now on.
+    #[must_use]
+    pub fn with_config(mut self, cfg: ListenerConfig) -> Listener {
+        self.cfg = cfg;
+        self
+    }
+
+    /// The limits in force.
+    pub fn config(&self) -> &ListenerConfig {
+        &self.cfg
+    }
+
+    /// The address a TCP listener is bound to. A Unix-domain one reports
+    /// `ErrorKind::InvalidInput`: its address is the path it was bound to.
+    pub fn local_addr(&self) -> Result<std::net::SocketAddr> {
+        match &self.socket {
+            Socket::Tcp(l) => l.local_addr(),
+            #[cfg(unix)]
+            Socket::Unix(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "qemu: a Unix-domain listener has no socket address",
+            )),
+        }
+    }
+
+    /// Take a peer slot, if one is free.
+    fn reserve(&self) -> Option<PeerSlot> {
+        self.peers
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < self.cfg.max_peers).then_some(n + 1)
+            })
+            .ok()?;
+        Some(PeerSlot(self.peers.clone()))
     }
 
     /// Bind a Unix-domain listener. Any stale socket file at `path` is
@@ -429,7 +579,7 @@ impl Listener {
     #[cfg(unix)]
     pub fn bind_unix(path: impl AsRef<Path>) -> Result<Listener> {
         let _ = std::fs::remove_file(path.as_ref());
-        Ok(Listener::Unix(UnixListener::bind(path)?))
+        Ok(UnixListener::bind(path)?.into())
     }
 
     /// Bind a Unix-domain listener.
@@ -442,12 +592,29 @@ impl Listener {
         Err(no_unix_sockets())
     }
 
-    /// Block until a peer arrives, then wrap it as a [`Conn`].
+    /// Block until a peer arrives, then wrap it as a [`Conn`]. Peers past
+    /// [`max_peers`](ListenerConfig::max_peers) are hung up on as they
+    /// arrive, and the wait goes on.
     pub fn accept(&self) -> Result<Arc<Conn>> {
-        match self {
-            Listener::Tcp(l) => tcp_conn(l.accept()?.0),
-            #[cfg(unix)]
-            Listener::Unix(l) => unix_conn(l.accept()?.0),
+        let idle = self.cfg.idle_timeout;
+        loop {
+            // Accepted before the check, and dropped if over: left in the
+            // backlog, a refused peer would sit connected to nothing.
+            match &self.socket {
+                Socket::Tcp(l) => {
+                    let s = l.accept()?.0;
+                    if let Some(slot) = self.reserve() {
+                        return tcp_conn(s, idle, Some(slot));
+                    }
+                }
+                #[cfg(unix)]
+                Socket::Unix(l) => {
+                    let s = l.accept()?.0;
+                    if let Some(slot) = self.reserve() {
+                        return unix_conn(s, idle, Some(slot));
+                    }
+                }
+            }
         }
     }
 }
@@ -469,15 +636,63 @@ mod tests {
     /// a passing run returns as soon as the frame is back.
     const ECHO_TIMEOUT: Duration = Duration::from_secs(10);
 
-    /// The address a TCP listener is bound to. A `match` rather than
-    /// `let ... else`: where there are no Unix sockets `Tcp` is the only
-    /// variant, and a refutable pattern there is a warning.
     fn tcp_addr(ln: &Listener) -> std::net::SocketAddr {
-        match ln {
-            Listener::Tcp(l) => l.local_addr().unwrap(),
-            #[cfg(unix)]
-            _ => unreachable!(),
-        }
+        ln.local_addr().unwrap()
+    }
+
+    /// Whether `conn`'s peer hangs up within the echo timeout.
+    fn hangs_up(conn: &Arc<Conn>) -> bool {
+        let (tx, rx) = mpsc::channel();
+        let c = conn.clone();
+        std::thread::spawn(move || {
+            c.wait_done();
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(ECHO_TIMEOUT).is_ok()
+    }
+
+    /// Past `max_peers`, a peer is hung up on as it arrives, and the listener
+    /// goes on: a slot freed by a peer leaving is there for the next one.
+    #[test]
+    fn peers_past_the_limit_are_refused() {
+        let ln = Listener::bind_tcp("127.0.0.1:0")
+            .unwrap()
+            .with_config(ListenerConfig::default().max_peers(1));
+        let addr = tcp_addr(&ln);
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            while let Ok(c) = ln.accept() {
+                c.set_handler(Arc::new(|_: &Frame| Ok(())));
+                if tx.send(c).is_err() {
+                    return;
+                }
+            }
+        });
+        let first = dial_tcp(addr).unwrap();
+        let served = rx.recv_timeout(ECHO_TIMEOUT).expect("first never accepted");
+        let second = dial_tcp(addr).unwrap();
+        assert!(hangs_up(&second), "a peer past the limit was kept");
+
+        first.close().unwrap();
+        assert!(hangs_up(&served));
+        // The slot is free once the reader has seen the peer go.
+        let third = dial_tcp(addr).unwrap();
+        rx.recv_timeout(ECHO_TIMEOUT)
+            .expect("the freed slot was not reused");
+        drop(third);
+    }
+
+    /// With an idle timeout, a peer that sends nothing is hung up on.
+    #[test]
+    fn idle_peers_are_hung_up_on_when_asked() {
+        let ln = Listener::bind_tcp("127.0.0.1:0")
+            .unwrap()
+            .with_config(ListenerConfig::default().idle_timeout(Duration::from_millis(100)));
+        let client = dial_tcp(tcp_addr(&ln)).unwrap();
+        let server = ln.accept().unwrap();
+        server.set_handler(Arc::new(|_: &Frame| Ok(())));
+        assert!(hangs_up(&server), "the idle peer was kept");
+        assert!(hangs_up(&client));
     }
 
     /// Accept one peer on `ln` and echo every frame back to it, holding the
@@ -729,11 +944,7 @@ mod tests {
     #[test]
     fn tcp_roundtrip() {
         let ln = Listener::bind_tcp("127.0.0.1:0").unwrap();
-        let addr = match &ln {
-            Listener::Tcp(l) => l.local_addr().unwrap(),
-            #[cfg(unix)]
-            _ => unreachable!(),
-        };
+        let addr = tcp_addr(&ln);
         let (server, done) = echo_server(ln);
 
         let client = dial_tcp(addr).unwrap();
