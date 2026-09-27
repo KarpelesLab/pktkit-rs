@@ -212,7 +212,49 @@ struct Engine {
     rng: Mutex<Rng>,
     queue: Mutex<Queue>,
     wake: Condvar,
+    /// Held while taking due messages off the queue *and* delivering them,
+    /// by the release thread and by `poll` alike, so that deliveries from the
+    /// two never interleave out of order.
+    delivering: DeliveryLock,
     stats: DeviceStats,
+}
+
+/// A lock a thread cannot take twice: the second, nested attempt is told so
+/// instead of deadlocking. A handler that calls `poll` from inside a delivery
+/// is the nested case.
+#[derive(Default)]
+struct DeliveryLock {
+    owner: Mutex<Option<std::thread::ThreadId>>,
+    free: Condvar,
+}
+
+struct DeliveryGuard<'a>(&'a DeliveryLock);
+
+impl DeliveryLock {
+    /// Wait for the lock; `None` if this thread already holds it.
+    fn acquire(&self) -> Option<DeliveryGuard<'_>> {
+        let me = std::thread::current().id();
+        let mut owner = self.owner.lock().unwrap();
+        loop {
+            match *owner {
+                None => {
+                    *owner = Some(me);
+                    return Some(DeliveryGuard(self));
+                }
+                Some(t) if t == me => return None,
+                // Only reachable with threads: without them nobody else can
+                // be holding it.
+                Some(_) => owner = self.free.wait(owner).unwrap(),
+            }
+        }
+    }
+}
+
+impl Drop for DeliveryGuard<'_> {
+    fn drop(&mut self) {
+        *self.0.owner.lock().unwrap() = None;
+        self.0.free.notify_one();
+    }
 }
 
 impl core::fmt::Debug for Engine {
@@ -234,6 +276,7 @@ impl Engine {
                 ..Default::default()
             }),
             wake: Condvar::new(),
+            delivering: DeliveryLock::default(),
             stats: DeviceStats::new(),
         })
     }
@@ -254,7 +297,6 @@ impl Engine {
     where
         F: Fn(Direction, &[u8]),
     {
-        let mut due: Vec<Queued> = Vec::new();
         loop {
             {
                 let mut q = self.queue.lock().unwrap();
@@ -272,16 +314,18 @@ impl Engine {
                         None => q = self.wake.wait(q).unwrap(),
                     }
                 }
-                // Take everything that has come due in one pass so a burst
-                // does not pay for a lock round-trip per message.
-                let now = Instant::now();
-                while matches!(q.heap.peek(), Some(Reverse(h)) if h.at <= now) {
-                    due.push(q.heap.pop().unwrap().0);
-                }
             }
-            // Deliver outside the lock: a handler may well send again, which
-            // would deadlock if we still held the queue.
-            for item in due.drain(..) {
+            // Take everything that has come due in one pass so a burst does
+            // not pay for a lock round-trip per message, and deliver it
+            // outside the queue lock -- a handler may well send again, which
+            // would deadlock if we still held it -- but under the delivery
+            // lock, so a concurrent `poll` cannot slip later messages in
+            // ahead of this batch. The worker is never inside a delivery
+            // here, so this always gets the lock.
+            let Some(_delivering) = self.delivering.acquire() else {
+                continue;
+            };
+            for item in self.take_due() {
                 deliver(item.dir, &item.data);
             }
         }
@@ -534,9 +578,16 @@ macro_rules! impaired_device {
             /// Where threads exist the release thread does this on its own.
             /// On `wasm32` it is the only way messages leave the queue:
             /// call it again after the returned delay.
+            ///
+            /// Messages leave in release order even while the release thread
+            /// is delivering too. Called from a handler in the middle of a
+            /// delivery, it delivers nothing: the delivery in progress would
+            /// otherwise be overtaken.
             pub fn poll(&self) -> Option<Duration> {
-                for item in self.engine.take_due() {
-                    self.deliver(item.dir, &item.data);
+                if let Some(_delivering) = self.engine.delivering.acquire() {
+                    for item in self.engine.take_due() {
+                        self.deliver(item.dir, &item.data);
+                    }
                 }
                 self.engine.until_next()
             }
@@ -935,6 +986,43 @@ mod tests {
         assert_eq!(wire.count() + wire2.count(), 0);
         // Waiting forever is spelled Duration::MAX, and must not panic either.
         assert!(link.wait_idle(Duration::MAX));
+    }
+
+    #[test]
+    fn polling_alongside_the_release_thread_keeps_order() {
+        // A slow far side keeps the release thread inside a batch while the
+        // caller polls; whoever delivers, the wire must see send order.
+        struct SlowWire(Mutex<Vec<u8>>);
+        impl L2Device for SlowWire {
+            fn set_handler(&self, _h: L2Handler) {}
+            fn send(&self, f: &Frame) -> Result<()> {
+                std::thread::sleep(Duration::from_micros(300));
+                self.0.lock().unwrap().push(f.as_bytes()[14]);
+                Ok(())
+            }
+            fn hw_addr(&self) -> MacAddr {
+                MacAddr::zero()
+            }
+            fn close(&self) -> Result<()> {
+                Ok(())
+            }
+        }
+        let wire = Arc::new(SlowWire(Mutex::new(Vec::new())));
+        let link = ImpairL2::new(
+            wire.clone(),
+            Impairment::default().delay(Duration::from_millis(2)),
+        );
+        const N: u8 = 60;
+        for i in 0..N {
+            link.send(Frame::from_slice(&frame(i))).unwrap();
+            std::thread::sleep(Duration::from_micros(50));
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while wire.0.lock().unwrap().len() < N as usize && Instant::now() < deadline {
+            link.poll();
+        }
+        let got = wire.0.lock().unwrap().clone();
+        assert_eq!(got, (0..N).collect::<Vec<_>>());
     }
 
     #[test]
