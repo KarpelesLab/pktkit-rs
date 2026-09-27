@@ -308,9 +308,10 @@ mod tests {
         let p = payload_of(&out[0]);
         // IP at offset 2 rewritten to outside.
         assert_eq!(&p[2..6], &[203, 0, 113, 1]);
-        // Port at offset 6 rewritten to a NAT-range mapped port.
+        // Port at offset 6: the one mapped, the inside port itself, as it
+        // was free (port preservation).
         let mapped = u16::from_be_bytes([p[6], p[7]]);
-        assert!(mapped >= 10000, "expected mapped port, got {}", mapped);
+        assert_eq!(mapped, 0x1234);
         assert!(
             crate::nat::l4::v4_l4_checksum_ok(&out[0], 20),
             "rewritten H.225 segment must carry a valid TCP checksum"
@@ -394,6 +395,12 @@ mod tests {
     /// how many of them came out mapped to another port.
     fn announce(nat: &Nat, h: &H323Helper, ports: std::ops::Range<u16>) -> usize {
         let inside = Ipv4Addr::new(10, 0, 0, 5);
+        // Another host holds the same outside ports, so that a mapped port
+        // cannot keep its number and shows as rewritten.
+        for p in ports.clone() {
+            nat.create_mapping(PROTO_TCP, Ipv4Addr::new(10, 0, 0, 99), p)
+                .unwrap();
+        }
         let mut body = Vec::new();
         for p in ports.clone() {
             body.push(0x00);

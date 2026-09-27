@@ -759,7 +759,7 @@ impl Nat {
                 Some(p) => p,
                 None => match Self::forward_port_for_locked(inner, k, now) {
                     Some(p) => p,
-                    None => Self::alloc_port_locked(inner)?,
+                    None => Self::alloc_port_locked(inner, proto, inside_port)?,
                 },
             },
         };
@@ -996,7 +996,7 @@ impl Nat {
         // The host's quota first: a host at its cap must not cost the
         // others a reclaim sweep.
         let mut m = Self::new_mapping_locked(inner, k, 0, now, false)?;
-        let port = Self::alloc_port_locked(inner)?;
+        let port = Self::alloc_port_locked(inner, k.proto, k.port)?;
         m.outside_port = port;
         inner.reverse.insert(
             NatRevKey {
@@ -1017,30 +1017,31 @@ impl Nat {
         (f.expires.is_none_or(|e| e >= now) && !inner.reverse.contains_key(&rk)).then_some(rk.port)
     }
 
-    /// A free outside port. When none is left, idle mappings are reclaimed
-    /// first, so a caller that never sweeps does not lose the pool to them.
+    /// A free outside port for a new mapping of inside source port (or
+    /// ICMP identifier) `want`, chosen as [`PortUse::choose`] says. When
+    /// none is left, idle mappings are reclaimed first, so a caller that
+    /// never sweeps does not lose the pool to them.
     ///
     /// A port is free when nothing holds it for any protocol: ports a
     /// forward or a pending expectation will receive traffic on count too,
     /// or that traffic would reach a new session.
-    fn alloc_port_locked(inner: &mut NatInner) -> Option<u16> {
-        Self::scan_port_locked(inner)
-            .or_else(|| Self::reclaim_locked(inner).then(|| Self::scan_port_locked(inner))?)
+    fn alloc_port_locked(inner: &mut NatInner, proto: u8, want: u16) -> Option<u16> {
+        Self::scan_port_locked(inner, proto, want).or_else(|| {
+            Self::reclaim_locked(inner).then(|| Self::scan_port_locked(inner, proto, want))?
+        })
     }
 
-    fn scan_port_locked(inner: &mut NatInner) -> Option<u16> {
-        // The count answers for a full pool without a search.
-        if inner.ports.pool_free(None) == 0 {
-            return None;
-        }
+    fn scan_port_locked(inner: &mut NatInner, proto: u8, want: u16) -> Option<u16> {
         let p = inner
             .ports
-            .find((NAT_PORT_MIN, NAT_PORT_MAX), inner.next_port, None)?;
-        inner.next_port = if p == NAT_PORT_MAX {
-            NAT_PORT_MIN
-        } else {
-            p + 1
-        };
+            .choose(proto != PROTO_ICMP, want, inner.next_port)?;
+        if p != want && (NAT_PORT_MIN..=NAT_PORT_MAX).contains(&p) {
+            inner.next_port = if p == NAT_PORT_MAX {
+                NAT_PORT_MIN
+            } else {
+                p + 1
+            };
+        }
         Some(p)
     }
 
@@ -2844,11 +2845,18 @@ mod tests {
     #[test]
     fn alloc_port_in_range() {
         let nat = Nat::new(pfx("10.0.0.1/24"), pfx("203.0.113.1/24"));
-        for _ in 0..16 {
+        for i in 0..16 {
             let port = nat
-                .create_mapping(PROTO_TCP, Ipv4Addr::new(10, 0, 0, 2), 1234)
+                .create_mapping(PROTO_TCP, Ipv4Addr::new(10, 0, 0, 2 + i), 1234)
                 .unwrap();
-            assert!((NAT_PORT_MIN..=NAT_PORT_MAX).contains(&port));
+            // The first keeps its port; the others get one from the pool,
+            // as even.
+            if i == 0 {
+                assert_eq!(port, 1234);
+            } else {
+                assert!((NAT_PORT_MIN..=NAT_PORT_MAX).contains(&port));
+                assert_eq!(port % 2, 0);
+            }
         }
     }
 
@@ -2969,10 +2977,10 @@ mod tests {
             Ipv4Addr::new(8, 8, 8, 8),
             Ipv4Addr::new(203, 0, 113, 1),
         );
-        // A fresh NAT hands out its first port.
+        // A fresh NAT keeps the host's port, which is free.
         let p = udp_zero_after_xlat(
             inside,
-            5000,
+            NAT_PORT_MIN,
             remote,
             53,
             (outside, NAT_PORT_MIN, remote, 53),
@@ -2992,14 +3000,14 @@ mod tests {
             Ipv4Addr::new(8, 8, 8, 8),
             Ipv4Addr::new(203, 0, 113, 1),
         );
-        let p = build_udp(inside, 5000, remote, 53, &[1]);
+        let p = build_udp(inside, NAT_PORT_MIN, remote, 53, &[1]);
         nat.inside().send(Packet::from_slice(&p)).unwrap();
         let reply = udp_zero_after_xlat(
             remote,
             53,
             outside,
             NAT_PORT_MIN,
-            (remote, 53, inside, 5000),
+            (remote, 53, inside, NAT_PORT_MIN),
         );
         nat.outside().send(Packet::from_slice(&reply)).unwrap();
         let got = i.lock().unwrap();
@@ -3348,20 +3356,18 @@ mod tests {
     fn exhausted_pool_reclaims_idle_mappings_without_sweep() {
         let nat = Nat::new(pfx("10.0.0.1/24"), pfx("203.0.113.1/24"));
         nat.set_limits(NatLimits::default().max_mappings_per_host(0));
-        let pool = usize::from(NAT_PORT_MAX - NAT_PORT_MIN) + 1;
-        for i in 0..pool {
-            let ip = Ipv4Addr::from(u32::from(INSIDE) + (i / 60000) as u32);
-            assert!(
-                nat.create_mapping(PROTO_UDP, ip, 1 + (i % 60000) as u16)
-                    .is_some()
-            );
-        }
-        assert!(nat.create_mapping(PROTO_UDP, REMOTE, 1).is_none(), "full");
+        fill_pool(&nat);
+        // A port of the pool's is taken, so the pool it is, and that is full.
+        let want = NAT_PORT_MIN;
+        assert!(
+            nat.create_mapping(PROTO_UDP, REMOTE, want).is_none(),
+            "full"
+        );
         // Every mapping has been idle past its timeout; nobody swept.
         age_mappings(&nat, UDP_TIMEOUT + Duration::from_secs(1));
         // And the last reclaim, which found nothing, was long enough ago.
         nat.inner.lock().unwrap().next_reclaim = Instant::now();
-        assert!(nat.create_mapping(PROTO_UDP, REMOTE, 1).is_some());
+        assert!(nat.create_mapping(PROTO_UDP, REMOTE, want).is_some());
         assert!(
             nat.create_mapping_pair_in(0, PROTO_UDP, REMOTE, (2, 3))
                 .is_some()
@@ -3369,25 +3375,52 @@ mod tests {
         assert_eq!(mapped(&nat), 3);
     }
 
+    /// Map one inside host's UDP ports to every port of the pool, each
+    /// keeping its number.
+    fn fill_pool(nat: &Nat) {
+        for port in NAT_PORT_MIN..=NAT_PORT_MAX {
+            assert_eq!(nat.create_mapping(PROTO_UDP, INSIDE, port), Some(port));
+        }
+    }
+
+    #[test]
+    fn ports_keep_what_they_can_of_the_hosts_choice() {
+        let (nat, _i, o) = setup();
+        let other = Ipv4Addr::new(10, 0, 0, 6);
+        let out_port = |src: Ipv4Addr, sport: u16| {
+            let p = build_udp(src, sport, REMOTE, 53, b"q");
+            nat.inside().send(Packet::from_slice(&p)).unwrap();
+            src_port(o.lock().unwrap().last().unwrap())
+        };
+        // Preserved when free, in the pool or not.
+        assert_eq!(out_port(INSIDE, 40001), 40001);
+        assert_eq!(out_port(INSIDE, 5060), 5060);
+        assert_eq!(out_port(INSIDE, 123), 123);
+        // Taken: same range and parity (RFC 4787 REQ-3, REQ-4).
+        let p = out_port(other, 40001);
+        assert!(p >= NAT_PORT_MIN && p % 2 == 1, "{p}");
+        let p = out_port(other, 5060);
+        assert!(p >= NAT_PORT_MIN && p % 2 == 0, "{p}");
+        let p = out_port(other, 123);
+        assert!((1..512).contains(&p) && p % 2 == 1, "{p}");
+        let p = out_port(other, 1022);
+        assert_eq!(p, 1022);
+        let q = out_port(Ipv4Addr::new(10, 0, 0, 7), 1022);
+        assert!((600..1024).contains(&q) && q % 2 == 0, "{q}");
+    }
+
     #[test]
     fn a_full_pool_refuses_new_flows_cheaply() {
         let (nat, _i, o) = setup();
         nat.set_limits(NatLimits::default().max_mappings_per_host(0));
-        let pool = usize::from(NAT_PORT_MAX - NAT_PORT_MIN) + 1;
-        for i in 0..pool {
-            let ip = Ipv4Addr::from(u32::from(INSIDE) + (i / 60000) as u32);
-            assert!(
-                nat.create_mapping(PROTO_UDP, ip, 1 + (i % 60000) as u16)
-                    .is_some()
-            );
-        }
+        fill_pool(&nat);
         // Every mapping is live: nothing can be reclaimed. Each new flow
         // used to rescan the pool and walk the whole table under the lock,
         // some 5 ms apiece; now the free count refuses it, and a reclaim
         // runs at most once a second. The bound is loose enough for a slow
         // debug build.
         let start = std::time::Instant::now();
-        for sport in 1..=2000 {
+        for sport in NAT_PORT_MIN..NAT_PORT_MIN + 2000 {
             let p = build_udp(Ipv4Addr::new(10, 0, 0, 200), sport, REMOTE, 53, b"q");
             nat.inside().send(Packet::from_slice(&p)).unwrap();
         }
@@ -3402,7 +3435,7 @@ mod tests {
                 ns: 0,
                 proto: PROTO_UDP,
                 ip: INSIDE,
-                port: 1,
+                port: NAT_PORT_MIN,
             };
             let port = inner.mappings[&k].outside_port;
             Nat::remove_mapping_at_locked(
@@ -3413,9 +3446,10 @@ mod tests {
                 },
             );
         }
-        let p = build_udp(Ipv4Addr::new(10, 0, 0, 200), 1, REMOTE, 53, b"q");
+        let sport = NAT_PORT_MIN + 1;
+        let p = build_udp(Ipv4Addr::new(10, 0, 0, 200), sport, REMOTE, 53, b"q");
         nat.inside().send(Packet::from_slice(&p)).unwrap();
-        assert_eq!(o.lock().unwrap().len(), 1);
+        assert_eq!(src_port(&o.lock().unwrap()[0]), NAT_PORT_MIN);
     }
 
     #[test]

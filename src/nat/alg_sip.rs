@@ -761,11 +761,14 @@ a=rtcp:9001 IN IP4 10.0.0.5\r\na=sendrecv\r\n";
 
     #[test]
     fn rtcp_off_the_next_port_is_announced() {
-        // The RTP endpoint already holds a port of its own, so the pair
-        // cannot be laid out as RTP + 1; the peer must be told.
+        // The RTP endpoint already holds a port of its own, and another
+        // host the one after it, so the pair cannot be laid out as RTP + 1;
+        // the peer must be told.
         let sdp = "v=0\r\nc=IN IP4 10.0.0.5\r\nm=audio 8000 RTP/AVP 0\r\n";
         let (nat, out, inbound) = invite_with_sdp(sdp, |nat| {
             nat.create_mapping(PROTO_UDP, Ipv4Addr::new(10, 0, 0, 5), 8000)
+                .unwrap();
+            nat.create_mapping(PROTO_UDP, Ipv4Addr::new(10, 0, 0, 6), 8001)
                 .unwrap();
         });
         let rtp = port_after(&out, "m=audio ");

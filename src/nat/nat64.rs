@@ -1187,7 +1187,7 @@ impl Nat64 {
             .or_insert_with(|| Arc::new(HostQuota::new(limits)))
             .clone();
         let hold = MappingHold::take(&host, false)?;
-        let port = Self::alloc_port_locked(inner)?;
+        let port = Self::alloc_port_locked(inner, k.proto, k.port)?;
         let m = Mapping {
             key: k,
             outside_port: port,
@@ -1216,35 +1216,35 @@ impl Nat64 {
         }
     }
 
-    /// A free outside port, for any protocol. When none is left, idle
-    /// mappings are reclaimed first, so a caller that never sweeps does not
-    /// lose the pool to them; but at most once a [`RECLAIM_INTERVAL`], as
-    /// each walks the whole table.
-    fn alloc_port_locked(inner: &mut Nat64Inner) -> Option<u16> {
-        Self::scan_port_locked(inner).or_else(|| {
+    /// A free outside port, for any protocol, for a new mapping of inside
+    /// source port (or ICMP identifier) `want`, chosen as
+    /// [`PortUse::choose`] says. When none is left, idle mappings are
+    /// reclaimed first, so a caller that never sweeps does not lose the
+    /// pool to them; but at most once a [`RECLAIM_INTERVAL`], as each walks
+    /// the whole table.
+    fn alloc_port_locked(inner: &mut Nat64Inner, proto: u8, want: u16) -> Option<u16> {
+        Self::scan_port_locked(inner, proto, want).or_else(|| {
             let now = Instant::now();
             if now < inner.next_reclaim {
                 return None;
             }
             inner.next_reclaim = now + RECLAIM_INTERVAL;
             Self::expire_locked(inner, now);
-            Self::scan_port_locked(inner)
+            Self::scan_port_locked(inner, proto, want)
         })
     }
 
-    fn scan_port_locked(inner: &mut Nat64Inner) -> Option<u16> {
-        // The count answers for a full pool without a search.
-        if inner.ports.pool_free(None) == 0 {
-            return None;
-        }
+    fn scan_port_locked(inner: &mut Nat64Inner, proto: u8, want: u16) -> Option<u16> {
         let p = inner
             .ports
-            .find((NAT_PORT_MIN, NAT_PORT_MAX), inner.next_port, None)?;
-        inner.next_port = if p == NAT_PORT_MAX {
-            NAT_PORT_MIN
-        } else {
-            p + 1
-        };
+            .choose(proto != PROTO_ICMP, want, inner.next_port)?;
+        if p != want && (NAT_PORT_MIN..=NAT_PORT_MAX).contains(&p) {
+            inner.next_port = if p == NAT_PORT_MAX {
+                NAT_PORT_MIN
+            } else {
+                p + 1
+            };
+        }
         Some(p)
     }
 }
@@ -1718,8 +1718,9 @@ mod tests {
         assert_eq!(p[0] >> 4, 4);
         assert_eq!(&p[12..16], &[198, 51, 100, 1]);
         assert_eq!(&p[16..20], &[8, 8, 8, 8]);
+        // Free, so the client's own port is kept.
         let mapped_port = u16::from_be_bytes([p[20], p[21]]);
-        assert!(mapped_port >= NAT_PORT_MIN);
+        assert_eq!(mapped_port, 5555);
         let dport = u16::from_be_bytes([p[22], p[23]]);
         assert_eq!(dport, 53);
         assert!(
@@ -2117,18 +2118,7 @@ mod tests {
     #[test]
     fn idle_mappings_go_without_sweep() {
         let (nat, _inside, outside) = wired();
-        nat.set_limits(NatLimits::default().max_mappings_per_host(0));
-        let pool = usize::from(NAT_PORT_MAX - NAT_PORT_MIN) + 1;
-        let client: Ipv6Addr = CLIENT.parse().unwrap();
-        for i in 0..pool {
-            let ip = Ipv6Addr::from(u128::from(client) + 1 + (i / 60000) as u128);
-            let k = Nat64Key {
-                proto: PROTO_UDP,
-                ip,
-                port: 1 + (i % 60000) as u16,
-            };
-            assert!(nat.get_or_create_mapping(k).is_some());
-        }
+        fill_pool(&nat);
         let age = |nat: &Nat64| {
             let then = Instant::now() - UDP_TIMEOUT - std::time::Duration::from_secs(1);
             for m in nat.inner.lock().unwrap().mappings.values_mut() {
@@ -2137,9 +2127,12 @@ mod tests {
                     .backdate(UDP_TIMEOUT + std::time::Duration::from_secs(1));
             }
         };
-        // Full: nothing gets out, until the idle mappings are reclaimed.
+        // Full: nothing gets out, until the idle mappings are reclaimed. (A
+        // source port in the pool's range, which is taken, has only the
+        // pool to go to.)
         age(&nat);
-        send_udp(&nat, &outside);
+        let pkt = build_v6_udp(CLIENT.parse().unwrap(), NAT_PORT_MIN, wkp(SERVER), 53, b"q");
+        nat.inside().send(Packet::from_slice(&pkt)).unwrap();
         assert_eq!(outside.lock().unwrap().len(), 1);
         assert_eq!(nat.inner.lock().unwrap().mappings.len(), 1);
 
@@ -2155,28 +2148,34 @@ mod tests {
     #[test]
     fn a_full_pool_refuses_new_flows_cheaply() {
         let (nat, _inside, outside) = wired();
-        nat.set_limits(NatLimits::default().max_mappings_per_host(0));
-        let pool = usize::from(NAT_PORT_MAX - NAT_PORT_MIN) + 1;
+        fill_pool(&nat);
         let client: Ipv6Addr = CLIENT.parse().unwrap();
-        for i in 0..pool {
-            let k = Nat64Key {
-                proto: PROTO_UDP,
-                ip: Ipv6Addr::from(u128::from(client) + 1 + (i / 60000) as u128),
-                port: 1 + (i % 60000) as u16,
-            };
-            assert!(nat.get_or_create_mapping(k).is_some());
-        }
         // All live: each new flow is refused by the free count, with a
         // reclaim at most once a second, not a rescan and a table walk
         // apiece. The bound is loose enough for a slow debug build.
         let start = std::time::Instant::now();
-        for sport in 1..=2000 {
+        for sport in NAT_PORT_MIN..NAT_PORT_MIN + 2000 {
             let pkt = build_v6_udp(client, sport, wkp(SERVER), 53, b"q");
             nat.inside().send(Packet::from_slice(&pkt)).unwrap();
         }
         let took = start.elapsed();
         assert!(outside.lock().unwrap().is_empty());
         assert!(took < std::time::Duration::from_millis(500), "{took:?}");
+    }
+
+    /// Map one host's UDP ports to every port of the pool, each keeping
+    /// its number.
+    fn fill_pool(nat: &Nat64) {
+        nat.set_limits(NatLimits::default().max_mappings_per_host(0));
+        let ip = Ipv6Addr::from(u128::from(CLIENT.parse::<Ipv6Addr>().unwrap()) + 1);
+        for port in NAT_PORT_MIN..=NAT_PORT_MAX {
+            let k = Nat64Key {
+                proto: PROTO_UDP,
+                ip,
+                port,
+            };
+            assert_eq!(nat.get_or_create_mapping(k), Some((port, true)));
+        }
     }
 
     #[test]
