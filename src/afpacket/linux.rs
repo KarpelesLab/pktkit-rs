@@ -18,7 +18,11 @@ const PACKET_OUTGOING: u8 = 4;
 
 /// An `AF_PACKET` socket bound to one interface, presented as an [`L2Device`].
 pub struct Socket {
-    fd: OwnedFd,
+    /// Shared with the reader thread, which may still be inside `recvfrom`
+    /// when the socket is dropped: the fd is closed only once both are done
+    /// with it, so the reader can never read from a number the process has
+    /// since reused for something else.
+    fd: Arc<OwnedFd>,
     interface: String,
     ifindex: u32,
     mac: MacAddr,
@@ -83,7 +87,7 @@ impl Socket {
         let mtu = crate::sys::if_mtu(&cfg.interface).unwrap_or(crate::DEFAULT_MTU);
 
         let sock = Arc::new(Socket {
-            fd,
+            fd: Arc::new(fd),
             interface: cfg.interface.clone(),
             ifindex,
             mac,
@@ -112,7 +116,7 @@ impl Socket {
 /// Start the receive thread. It holds only the pieces it needs, so the socket
 /// itself can be dropped while the thread is still winding down.
 fn spawn_reader(sock: &Arc<Socket>, inbound_only: bool) {
-    let fd = sock.fd.as_raw_fd();
+    let fd = sock.fd.clone();
     let handler = sock.handler.clone();
     let closed = sock.closed.clone();
     let stats = sock.stats.clone();
@@ -125,7 +129,7 @@ fn spawn_reader(sock: &Arc<Socket>, inbound_only: bool) {
             let mut from_len = std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t;
             let n = unsafe {
                 libc::recvfrom(
-                    fd,
+                    fd.as_raw_fd(),
                     buf.as_mut_ptr() as *mut libc::c_void,
                     buf.len(),
                     0,
