@@ -439,6 +439,11 @@ impl Drop for TcpOutConn {
 /// state. Returns the marshaled TCP segment bytes (the caller wraps it in IP).
 pub(crate) fn build_rst_for_stray(tcp: &[u8], dst_port: u16, src_port: u16) -> Option<Vec<u8>> {
     let seg = Segment::parse(tcp).ok()?;
+    // A RST is never answered: two stacks that each reset the other's
+    // resets would bounce them forever.
+    if seg.has_flag(crate::vtcp::segment::flags::RST) {
+        return None;
+    }
     let rst = if seg.has_flag(crate::vtcp::segment::flags::ACK) {
         // Send RST with SEQ=SEG.ACK, no ACK.
         Segment {
@@ -530,6 +535,21 @@ mod tests {
         assert_eq!(parsed.flags, flags::RST | flags::ACK);
         // SEG.LEN counts the SYN and the FIN.
         assert_eq!(parsed.ack, 102);
+    }
+
+    #[test]
+    fn stray_rst_is_not_answered() {
+        for f in [flags::RST, flags::RST | flags::ACK, flags::RST | flags::SYN] {
+            let seg = Segment {
+                src_port: 5000,
+                dst_port: 80,
+                seq: 100,
+                ack: 7,
+                flags: f,
+                ..Default::default()
+            };
+            assert!(build_rst_for_stray(&seg.marshal(), 80, 5000).is_none());
+        }
     }
 
     #[test]
