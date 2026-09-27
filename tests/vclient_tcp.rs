@@ -17,8 +17,14 @@ const CLIENT_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
 const SERVER_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
 const SERVER_PORT: u16 = 80;
 
-/// Wrap a marshaled TCP segment from `src` to `dst` in a minimal IPv4 packet.
+/// Wrap a marshaled TCP segment from `src` to `dst` in a minimal IPv4 packet,
+/// with the TCP checksum the client verifies.
 fn wrap(src: Ipv4Addr, dst: Ipv4Addr, seg: &[u8]) -> Vec<u8> {
+    let mut seg = seg.to_vec();
+    seg[16..18].fill(0);
+    let tcp_cs = pktkit::transport_checksum(Protocol::TCP, src.into(), dst.into(), &seg);
+    seg[16..18].copy_from_slice(&tcp_cs.to_be_bytes());
+    let seg = &seg[..];
     let total = 20 + seg.len();
     let mut ip = vec![0u8; total];
     ip[0] = 0x45;

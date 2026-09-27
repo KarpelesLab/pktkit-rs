@@ -669,6 +669,11 @@ impl TcpStack {
             (Some(s), Some(d)) => (s, d),
             _ => return false,
         };
+        // A segment damaged on the way is dropped unread (RFC 9293 §3.1):
+        // what its bits say now may be anything, a RST included.
+        if pkt.verify_transport_checksum() != Some(true) {
+            return true;
+        }
         let payload = pkt.payload();
         let seg = match Segment::parse(payload) {
             Ok(s) => s,
@@ -1111,6 +1116,27 @@ mod tests {
         stack.handle_inbound(Packet::from_slice(&elsewhere), IpAddr::V4(US));
         assert!(stack.conns.lock().unwrap().is_empty());
         stack.handle_inbound(Packet::from_slice(&inbound(syn)), IpAddr::V4(US));
+        assert_eq!(stack.conns.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn segments_with_a_bad_checksum_are_dropped() {
+        let (stack, out) = capturing_stack();
+        let _listener = stack.listen(IpAddr::V4(US), 80).unwrap();
+        let syn = Segment {
+            src_port: 4000,
+            dst_port: 80,
+            seq: 1,
+            flags: flags::SYN,
+            ..Default::default()
+        };
+        let mut pkt = inbound(syn);
+        pkt[20 + 16] ^= 0x40;
+        stack.handle_inbound(Packet::from_slice(&pkt), IpAddr::V4(US));
+        assert!(stack.conns.lock().unwrap().is_empty());
+        assert!(out.lock().unwrap().is_empty());
+        pkt[20 + 16] ^= 0x40;
+        stack.handle_inbound(Packet::from_slice(&pkt), IpAddr::V4(US));
         assert_eq!(stack.conns.lock().unwrap().len(), 1);
     }
 

@@ -268,9 +268,9 @@ impl UdpStack {
         if pkt.ip_protocol() != Protocol::UDP {
             return false;
         }
-        let src = match pkt.src_addr() {
-            Some(s) => s,
-            None => return false,
+        let (src, dst) = match (pkt.src_addr(), pkt.dst_addr()) {
+            (Some(s), Some(d)) => (s, d),
+            _ => return false,
         };
         let udp = pkt.payload();
         if udp.len() < 8 {
@@ -280,6 +280,18 @@ impl UdpStack {
         let dst_port = u16::from_be_bytes([udp[2], udp[3]]);
         let len = u16::from_be_bytes([udp[4], udp[5]]) as usize;
         if len < 8 || udp.len() < len {
+            return false;
+        }
+        // A damaged datagram is dropped (RFC 768). Over IPv4 a zero
+        // checksum means the sender computed none; over IPv6 the checksum
+        // is mandatory and a zero one is invalid (RFC 8200 §8.1).
+        let sum = u16::from_be_bytes([udp[6], udp[7]]);
+        let valid = if sum == 0 {
+            src.is_ipv4()
+        } else {
+            checksum::raw_transport_sum(Protocol::UDP, src, dst, &udp[..len]) == 0xFFFF
+        };
+        if !valid {
             return false;
         }
         let payload = &udp[8..len];
@@ -419,6 +431,36 @@ mod tests {
         let mut buf = [0u8; 16];
         let n = conn.recv(&mut buf).unwrap();
         assert_eq!(&buf[..n], b"answer");
+    }
+
+    #[test]
+    fn datagrams_with_a_bad_checksum_are_dropped() {
+        let sink: Arc<dyn Fn(&[u8]) + Send + Sync> = Arc::new(|_b: &[u8]| {});
+        let stack = UdpStack::new(sink);
+        let (us4, peer4) = (Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(10, 0, 0, 1));
+        let (us6, peer6): (Ipv6Addr, Ipv6Addr) =
+            ("fd00::2".parse().unwrap(), "fd00::1".parse().unwrap());
+        let v4 = stack
+            .dial(IpAddr::V4(us4), SocketAddr::from((peer4, 53)))
+            .unwrap();
+        let v6 = stack
+            .dial(IpAddr::V6(us6), SocketAddr::from((peer6, 53)))
+            .unwrap();
+        let reply4 = wrap_udp_v4(peer4, 53, us4, v4.local_addr().port(), b"answer");
+        let reply6 = wrap_udp_v6(peer6, 53, us6, v6.local_addr().port(), b"answer");
+
+        for (reply, at) in [(&reply4, 20), (&reply6, 40)] {
+            let mut bad = reply.clone();
+            *bad.last_mut().unwrap() ^= 1;
+            assert!(!stack.handle_inbound(Packet::from_slice(&bad)));
+            // No checksum at all: none needed over IPv4, invalid over IPv6.
+            let mut none = reply.clone();
+            none[at + 6..at + 8].copy_from_slice(&[0, 0]);
+            assert_eq!(stack.handle_inbound(Packet::from_slice(&none)), at == 20);
+            assert!(stack.handle_inbound(Packet::from_slice(reply)));
+        }
+        assert_eq!(v4.state.rx.lock().unwrap().q.len(), 2);
+        assert_eq!(v6.state.rx.lock().unwrap().q.len(), 1);
     }
 
     #[test]

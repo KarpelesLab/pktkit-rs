@@ -1176,13 +1176,15 @@ mod tests {
             // that would recurse once per segment of a large transfer.
             let mut q = outbox.lock().unwrap();
             q.0.extend(out.into_iter().map(|s| {
-                crate::build::build_ipv4(
+                let mut ip = crate::build::build_ipv4(
                     Ipv4Addr::new(10, 0, 0, 1),
                     Ipv4Addr::new(10, 0, 0, 2),
                     Protocol::TCP,
                     64,
                     &s,
-                )
+                );
+                Packet::from_mut(&mut ip).recompute_transport_checksum();
+                ip
             }));
             if q.1 {
                 return Ok(());
@@ -1283,7 +1285,8 @@ mod tests {
             };
             if let Some(client) = weak.upgrade() {
                 for s in out {
-                    let ip = crate::build::build_ip(dst, src, Protocol::TCP, 64, &s).unwrap();
+                    let mut ip = crate::build::build_ip(dst, src, Protocol::TCP, 64, &s).unwrap();
+                    Packet::from_mut(&mut ip).recompute_transport_checksum();
                     let _ = client.send(Packet::from_slice(&ip));
                 }
             }
