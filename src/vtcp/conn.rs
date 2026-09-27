@@ -137,8 +137,8 @@ pub struct ConnConfig {
     /// its FIN would otherwise hold an abandoned connection forever. Like
     /// Linux's `tcp_fin_timeout`, it spares a mere half-close
     /// ([`Conn::close`]): the application is still reading, and the peer
-    /// may send for as long as it likes. Measured from the last segment
-    /// received. `None` waits forever.
+    /// may send for as long as it likes. Measured from the release or the
+    /// last segment received, whichever is later. `None` waits forever.
     pub fin_wait2_timeout: Option<Duration>,
     /// How long TIME-WAIT lasts ([`TIME_WAIT_DURATION`] by default).
     pub time_wait: Duration,
@@ -278,8 +278,8 @@ pub struct Conn {
     // number right after the last data byte.
     fin_queued: bool,
     fin_sent: bool,
-    /// The owner has let go of the connection (see [`Conn::release`]).
-    released: bool,
+    /// When the owner let go of the connection (see [`Conn::release`]).
+    released: Option<Instant>,
 
     // Persist (zero-window probing).
     persist_deadline: std::option::Option<Instant>,
@@ -376,7 +376,7 @@ impl Conn {
             pending_fin_seq: 0,
             fin_queued: false,
             fin_sent: false,
-            released: false,
+            released: None,
             persist_deadline: None,
             persist_backoff: Duration::ZERO,
             time_wait_deadline: None,
@@ -1177,7 +1177,7 @@ impl Conn {
             // (TCPABORTONDATA); it also stops a peer that keeps talking from
             // holding the connection open past the FIN-WAIT-2 timeout.
             let end = seg.seq.wrapping_add(seg.payload.len() as u32);
-            if self.released && seq_after(end, self.recv_buf.as_ref().unwrap().nxt()) {
+            if self.released.is_some() && seq_after(end, self.recv_buf.as_ref().unwrap().nxt()) {
                 return self.abort();
             }
             self.process_data(seg);
@@ -1760,11 +1760,13 @@ impl Conn {
             self.closed = true;
         }
         // FIN-WAIT-2: the peer has gone quiet without closing, and nothing
-        // on our side is waiting for what it might still send.
+        // on our side is waiting for what it might still send. Quiet since
+        // the release, that is: before it, a half-closed application was
+        // still reading, and the peer was free to take its time.
         if self.state == State::FinWait2
-            && self.released
+            && let Some(released) = self.released
             && let Some(t) = self.cfg.fin_wait2_timeout
-            && self.last_recv.elapsed() >= t
+            && now.duration_since(released.max(self.last_recv)) >= t
         {
             let rst = self.abort();
             self.outgoing.extend(rst);
@@ -2074,7 +2076,7 @@ impl Conn {
     /// nothing left to abort and would only cut TIME-WAIT short (Linux's
     /// socket is in CLOSE by then, where `tcp_close` sends nothing).
     pub fn release(&mut self) -> Vec<Vec<u8>> {
-        self.released = true;
+        self.released.get_or_insert_with(Instant::now);
         if !matches!(self.state, State::TimeWait | State::Closed)
             && self.recv_buf.as_ref().is_some_and(|rb| rb.readable() > 0)
         {
@@ -3822,9 +3824,11 @@ mod tests {
         // once: see released_connections_reset_on_data.)
         let half = client.cfg.fin_wait2_timeout.unwrap() / 2;
         client.last_recv = Instant::now() - half;
+        client.released = Some(client.last_recv);
         assert!(client.tick().is_empty());
 
         client.last_recv = Instant::now() - client.cfg.fin_wait2_timeout.unwrap();
+        client.released = Some(client.last_recv);
         let rst = client.tick();
         assert!(client.is_closed());
         assert!(parse(&rst[0]).has_flag(flags::RST));
@@ -3844,10 +3848,34 @@ mod tests {
         assert!(client.tick().is_empty());
         assert_eq!(client.state(), State::FinWait2);
 
-        // Once the application lets go, the timeout applies.
+        // Once the application lets go, the timeout applies, but it counts
+        // from the release, as Linux's tcp_fin_timeout counts from close():
+        // the peer's quiet spell before then was allowed.
         assert!(client.release().is_empty(), "the FIN is already out");
+        assert!(client.tick().is_empty(), "reset at release");
+        assert_eq!(client.state(), State::FinWait2);
+        client.released = client
+            .released
+            .map(|_| Instant::now() - client.cfg.fin_wait2_timeout.unwrap());
         assert!(parse(&client.tick()[0]).has_flag(flags::RST));
         assert!(client.is_closed());
+    }
+
+    // A peer still sending ACKs is not gone: the timeout counts from the
+    // later of the release and the last segment received.
+    #[test]
+    fn fin_wait_2_timeout_counts_from_the_last_segment() {
+        let (mut client, mut server) = established(40323);
+        let fin = client.release();
+        let ack = deliver(&mut server, &fin);
+        deliver(&mut client, &ack);
+        assert_eq!(client.state(), State::FinWait2);
+        let timeout = client.cfg.fin_wait2_timeout.unwrap();
+        client.released = Some(Instant::now() - timeout);
+        client.last_recv = Instant::now() - timeout / 2;
+        assert!(client.tick().is_empty());
+        client.last_recv = Instant::now() - timeout;
+        assert!(parse(&client.tick()[0]).has_flag(flags::RST));
     }
 
     #[test]
