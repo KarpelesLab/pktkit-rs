@@ -594,10 +594,11 @@ impl Conn {
         }
     }
 
-    fn add_options(&self, seg: &mut Segment) {
+    /// The options a segment sent now carries: timestamps and SACK blocks.
+    fn segment_options(&self) -> Vec<TcpOption> {
+        let mut opts = Vec::new();
         if self.ts_ok {
-            seg.options
-                .push(timestamp_option(self.ts_now(), self.ts_recent));
+            opts.push(timestamp_option(self.ts_now(), self.ts_recent));
         }
         if self.sack_ok
             && let Some(rb) = self.recv_buf.as_ref()
@@ -607,9 +608,33 @@ impl Conn {
             // timestamp (RFC 2018 §3).
             let blocks = rb.sack_blocks_up_to(if self.ts_ok { 3 } else { 4 });
             if !blocks.is_empty() {
-                seg.options.push(sack_option(&blocks));
+                opts.push(sack_option(&blocks));
             }
         }
+        opts
+    }
+
+    fn add_options(&self, seg: &mut Segment) {
+        seg.options.extend(self.segment_options());
+    }
+
+    /// Payload that fits a segment beside `opts`. The MSS counts data only
+    /// and the sender must make room for its own options within it (RFC
+    /// 6691 §2, RFC 9293 §3.7.1), like Linux's `tcp_current_mss`: a full
+    /// segment with timestamps and SACK blocks would otherwise exceed the
+    /// MTU the peer derived its MSS from.
+    fn payload_room(&self, opts: &[TcpOption]) -> usize {
+        let opt_len = if opts.is_empty() {
+            0
+        } else {
+            options::build_options(opts).len()
+        };
+        (self.mss as usize).saturating_sub(opt_len).max(1)
+    }
+
+    /// [`payload_room`](Self::payload_room) for a segment sent now.
+    fn send_mss(&self) -> usize {
+        self.payload_room(&self.segment_options())
     }
 
     fn ts_now(&self) -> u32 {
@@ -1451,11 +1476,12 @@ impl Conn {
     /// Resend the oldest unacknowledged data. Returns false when there is
     /// none (at most the FIN is outstanding).
     fn retransmit(&mut self) -> bool {
+        let room = self.send_mss();
         let Some((seq, data)) = self
             .send_buf
             .as_ref()
             .unwrap()
-            .retransmit_data(self.mss as usize)
+            .retransmit_data(room)
             .map(|(seq, d)| (seq, d.to_vec()))
         else {
             return false;
@@ -1471,11 +1497,12 @@ impl Conn {
             return false;
         }
         let mss = self.mss as u32;
+        let room = self.send_mss();
         let Some((seq, data)) = self
             .send_buf
             .as_ref()
             .unwrap()
-            .lost_hole_from(self.high_rxt, mss as usize, 2 * mss)
+            .lost_hole_from(self.high_rxt, room, 2 * mss)
             .map(|(seq, d)| (seq, d.to_vec()))
         else {
             return false;
@@ -1522,14 +1549,14 @@ impl Conn {
                 break;
             }
             let avail = (eff_wnd - unacked) as usize;
-            let n = avail.min(self.mss as usize).min(pending);
+            let opts = self.segment_options();
+            let room = self.payload_room(&opts);
+            let n = avail.min(room).min(pending);
 
             // Sender SWS avoidance: avoid tiny segments. Once closing, nothing
             // more will be written to coalesce with, so send what there is.
-            if n < self.mss as usize
-                && self.send_buf.as_ref().unwrap().unacked() > 0
-                && !self.fin_queued
-            {
+            // A full segment is what fits beside this segment's options.
+            if n < room && self.send_buf.as_ref().unwrap().unacked() > 0 && !self.fin_queued {
                 break;
             }
 
@@ -1544,7 +1571,7 @@ impl Conn {
 
             let snd_nxt = self.send_buf.as_ref().unwrap().nxt();
             let rcv_nxt = self.recv_buf.as_ref().unwrap().nxt();
-            let mut seg = Segment {
+            let seg = Segment {
                 src_port: self.cfg.local_port,
                 dst_port: self.cfg.remote_port,
                 seq: snd_nxt,
@@ -1552,9 +1579,9 @@ impl Conn {
                 flags: flags::ACK | flags::PSH,
                 window: self.rcv_window(),
                 payload: data.clone(),
+                options: opts,
                 ..Default::default()
             };
-            self.add_options(&mut seg);
             self.queue_seg(seg);
             self.send_buf.as_mut().unwrap().advance_sent(data.len());
             self.rto.start_timing(snd_nxt);
@@ -3044,6 +3071,45 @@ mod tests {
             "resent again, sent {:?}",
             seqs(&out)
         );
+    }
+
+    /// The MSS counts payload only; options come out of it (RFC 6691 §2,
+    /// RFC 9293 §3.7.1). A full-sized segment that also carries timestamps
+    /// and SACK blocks would otherwise exceed the path MTU.
+    #[test]
+    fn segments_with_options_fit_the_mss() {
+        let conf = |l, r| big(l, r).enable_timestamps(true);
+        let mut client = Conn::new(conf(40226, 80));
+        let mut server = Conn::new(conf(80, 40226));
+        drive_handshake(&mut client, &mut server);
+        assert!(server.ts_ok && server.sack_ok);
+        let mss = server.mss as usize;
+        let fits = |pkts: &[Vec<u8>]| {
+            for p in pkts {
+                assert!(
+                    p.len() <= 20 + mss,
+                    "{} bytes of TCP for MSS {mss}",
+                    p.len()
+                );
+            }
+        };
+
+        // Timestamps only: a full segment carries MSS - 12 bytes of data.
+        let (_, out) = server.write(&[1; 3000]);
+        fits(&out);
+        assert_eq!(parse(&out[0]).payload.len(), mss - 12);
+        let acks = deliver(&mut client, &out);
+        deliver(&mut server, &acks);
+
+        // With a hole in what the server has received, its data segments
+        // carry SACK blocks too, and a retransmission must fit as well.
+        let (_, segs) = client.write(&[2; 4000]);
+        deliver(&mut server, &segs[1..2]);
+        deliver(&mut server, &segs[3..]);
+        let (_, out) = server.write(&[3; 3000]);
+        assert!(!get_sack_blocks(&parse(&out[0]).options).is_empty());
+        fits(&out);
+        fits(&fire_rto(&mut server));
     }
 
     fn fire_er(c: &mut Conn) -> Vec<Vec<u8>> {
