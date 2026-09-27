@@ -33,6 +33,8 @@ pub struct Listener {
     queue: Mutex<VecDeque<Arc<ConnState>>>,
     /// Signalled when a connection is enqueued or the listener is closed.
     signal: Condvar,
+    /// Removes this listener from the stack's table; taken by the first close.
+    unregister: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl core::fmt::Debug for Listener {
@@ -51,7 +53,14 @@ impl Listener {
             closed: Arc::new(AtomicBool::new(false)),
             queue: Mutex::new(VecDeque::new()),
             signal: Condvar::new(),
+            unregister: Mutex::new(None),
         }
+    }
+
+    /// Install the hook that frees the address in the stack once this
+    /// listener is closed or dropped.
+    pub(crate) fn set_unregister(&self, f: Box<dyn FnOnce() + Send>) {
+        *self.unregister.lock().expect("poisoned") = Some(f);
     }
 
     /// The address this listener is bound to.
@@ -96,9 +105,15 @@ impl Listener {
         }
     }
 
-    /// Close the listener and abort any queued-but-unaccepted connections.
+    /// Close the listener, free its address in the stack, and abort any
+    /// queued-but-unaccepted connections. Dropping the last handle does the
+    /// same.
     pub fn close(&self) -> Result<()> {
         self.closed.store(true, Ordering::Release);
+        let unregister = self.unregister.lock().expect("poisoned").take();
+        if let Some(f) = unregister {
+            f();
+        }
         // Abort connections still sitting in the queue.
         let drained: Vec<Arc<ConnState>> = {
             let mut q = self.queue.lock().expect("poisoned");
@@ -110,6 +125,12 @@ impl Listener {
         }
         self.signal.notify_all();
         Ok(())
+    }
+}
+
+impl Drop for Listener {
+    fn drop(&mut self) {
+        let _ = self.close();
     }
 }
 

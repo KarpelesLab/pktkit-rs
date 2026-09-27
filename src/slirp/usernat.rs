@@ -38,7 +38,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::thread;
 use std::time::Duration;
 
@@ -90,8 +90,10 @@ struct Inner {
     // Inbound virtual TCP connections accepted by a Listener (vtcp-backed).
     virt_tcp: Mutex<HashMap<Key, Arc<ConnState>>>,
     virt_tcp6: Mutex<HashMap<Key6, Arc<ConnState>>>,
-    listeners: Mutex<HashMap<ListenerKey, Arc<Listener>>>,
-    listeners6: Mutex<HashMap<ListenerKey6, Arc<Listener6>>>,
+    // Held weakly: the application owns its listeners, and dropping the last
+    // handle closes one and frees its address.
+    listeners: Mutex<HashMap<ListenerKey, Weak<Listener>>>,
+    listeners6: Mutex<HashMap<ListenerKey6, Weak<Listener6>>>,
     // Per-namespace sides (each device attached via ConnectL3).
     ns_sides: Mutex<HashMap<u64, Arc<NsSide>>>,
     ns_counter: AtomicU64,
@@ -338,13 +340,25 @@ impl Stack {
                     port: addr.port(),
                 };
                 let mut m = self.inner.listeners.lock().expect("poisoned");
-                if m.contains_key(&key) {
+                if m.get(&key).is_some_and(|l| l.strong_count() > 0) {
                     return Err(io::Error::new(
                         io::ErrorKind::AddrInUse,
                         "address already in use",
                     ));
                 }
-                m.insert(key, listener.clone());
+                let me = Arc::downgrade(&listener);
+                m.insert(key, me.clone());
+                let stack = Arc::downgrade(&self.inner);
+                listener.set_unregister(Box::new(move || {
+                    if let Some(inner) = stack.upgrade() {
+                        let mut m = inner.listeners.lock().expect("poisoned");
+                        // Only this listener's entry: a newer one may own the
+                        // address by now.
+                        if m.get(&key).is_some_and(|l| l.ptr_eq(&me)) {
+                            m.remove(&key);
+                        }
+                    }
+                }));
                 Ok(listener)
             }
             _ => Err(io::Error::new(
@@ -363,13 +377,24 @@ impl Stack {
             port: addr.port(),
         };
         let mut m = self.inner.listeners6.lock().expect("poisoned");
-        if m.contains_key(&key) {
+        if m.get(&key).is_some_and(|l| l.strong_count() > 0) {
             return Err(io::Error::new(
                 io::ErrorKind::AddrInUse,
                 "address already in use",
             ));
         }
-        m.insert(key, listener.clone());
+        let me = Arc::downgrade(&listener);
+        m.insert(key, me.clone());
+        let stack = Arc::downgrade(&self.inner);
+        listener.set_unregister(Box::new(move || {
+            if let Some(inner) = stack.upgrade() {
+                let mut m = inner.listeners6.lock().expect("poisoned");
+                // Only this listener's entry (see `listen`).
+                if m.get(&key).is_some_and(|l| l.ptr_eq(&me)) {
+                    m.remove(&key);
+                }
+            }
+        }));
         Ok(listener)
     }
 
@@ -588,17 +613,18 @@ impl Stack {
     /// to a wildcard (0.0.0.0) listener on the same port.
     fn find_listener(inner: &Arc<Inner>, dst: Ipv4Addr, dst_port: u16) -> Option<Arc<Listener>> {
         let m = inner.listeners.lock().expect("poisoned");
-        if let Some(l) = m.get(&ListenerKey {
+        let exact = ListenerKey {
             ip: dst.octets(),
             port: dst_port,
-        }) {
-            return Some(l.clone());
-        }
-        m.get(&ListenerKey {
+        };
+        let wildcard = ListenerKey {
             ip: [0, 0, 0, 0],
             port: dst_port,
-        })
-        .cloned()
+        };
+        [exact, wildcard]
+            .iter()
+            .filter_map(|k| m.get(k)?.upgrade())
+            .find(|l| !l.closed.load(Ordering::Acquire))
     }
 
     /// Passive-open a server-side `vtcp::Conn` for an inbound SYN to a virtual
@@ -661,7 +687,10 @@ impl Stack {
             conn,
             sink,
         );
-        state.set_pending_accept(Box::new(move |s| listener.enqueue(s)));
+        let listener = Arc::downgrade(&listener);
+        state.set_pending_accept(Box::new(move |s| {
+            listener.upgrade().is_some_and(|l| l.enqueue(s))
+        }));
         inner
             .virt_tcp
             .lock()
@@ -862,17 +891,18 @@ impl Stack {
     /// to a wildcard (`::`) listener on the same port.
     fn find_listener6(inner: &Arc<Inner>, dst: Ipv6Addr, dst_port: u16) -> Option<Arc<Listener6>> {
         let m = inner.listeners6.lock().expect("poisoned");
-        if let Some(l) = m.get(&ListenerKey6 {
+        let exact = ListenerKey6 {
             ip: dst.octets(),
             port: dst_port,
-        }) {
-            return Some(l.clone());
-        }
-        m.get(&ListenerKey6 {
+        };
+        let wildcard = ListenerKey6 {
             ip: Ipv6Addr::UNSPECIFIED.octets(),
             port: dst_port,
-        })
-        .cloned()
+        };
+        [exact, wildcard]
+            .iter()
+            .filter_map(|k| m.get(k)?.upgrade())
+            .find(|l| !l.closed.load(Ordering::Acquire))
     }
 
     /// IPv6 analogue of [`accept_syn_v4`](Self::accept_syn_v4): passive-open a
@@ -935,7 +965,10 @@ impl Stack {
             conn,
             sink,
         );
-        state.set_pending_accept(Box::new(move |s| listener.enqueue(s)));
+        let listener = Arc::downgrade(&listener);
+        state.set_pending_accept(Box::new(move |s| {
+            listener.upgrade().is_some_and(|l| l.enqueue(s))
+        }));
         inner
             .virt_tcp6
             .lock()
@@ -1306,6 +1339,28 @@ mod tests {
         // duplicate listen → AddrInUse
         assert!(s.listen("tcp", "127.0.0.1:8088").is_err());
         l.close().unwrap();
+    }
+
+    #[test]
+    fn closing_or_dropping_a_listener_frees_its_address() {
+        let s = Stack::new();
+        let l = s.listen("tcp", "10.0.0.1:8089").unwrap();
+        l.close().unwrap();
+        let l2 = s
+            .listen("tcp", "10.0.0.1:8089")
+            .expect("closed listener freed the port");
+        // The first listener's handle going away must not unregister the
+        // second one.
+        drop(l);
+        assert!(s.listen("tcp", "10.0.0.1:8089").is_err());
+        drop(l2);
+        s.listen("tcp", "10.0.0.1:8089")
+            .expect("dropped listener freed the port");
+
+        let l6 = s.listen6("[fd00::1]:8089").unwrap();
+        l6.close().unwrap();
+        s.listen6("[fd00::1]:8089")
+            .expect("closed listener6 freed the port");
     }
 
     #[test]
