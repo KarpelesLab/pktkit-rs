@@ -1200,6 +1200,7 @@ impl Conn {
             return true;
         }
 
+        let flight = self.send_buf.as_ref().unwrap().unacked() as u32;
         let acked = self.send_buf.as_mut().unwrap().acknowledge(ack);
         self.retries = 0;
         self.dup_acks = 0;
@@ -1220,7 +1221,7 @@ impl Conn {
         } else {
             // After a timeout this is slow start, which a partial ACK
             // should keep growing.
-            self.cc.on_ack(acked);
+            self.cc.on_new_ack(acked, flight);
         }
 
         if self.sack_ok {
@@ -1523,7 +1524,9 @@ impl Conn {
     }
 
     fn on_rto_timeout(&mut self) {
-        if self.snd_wnd == 0 && !matches!(self.state, State::SynSent | State::SynReceived) {
+        let zero_window =
+            self.snd_wnd == 0 && !matches!(self.state, State::SynSent | State::SynReceived);
+        if zero_window {
             // The receiver closed its window under data in flight, so our
             // retransmits are really zero-window probes and its duplicate
             // ACKs never count as progress. Keep going while it answers, as
@@ -1541,7 +1544,13 @@ impl Conn {
         }
         self.rto.backoff();
         self.rto.invalidate_timing();
-        self.cc.on_timeout();
+        // Only the first timeout of a segment sets ssthresh (RFC 5681 §3.1);
+        // `retries` counts timeouts without an ACK in between. A zero
+        // window does not count them, but its timeouts after the first are
+        // probes, not new losses.
+        let repeated = self.retries > 1 || (zero_window && self.rto_recover.is_some());
+        let flight = self.send_buf.as_ref().map_or(0, |s| s.unacked() as u32);
+        self.cc.on_retransmit_timeout(flight, repeated);
         self.dup_acks = 0;
         self.limited_transmit = 0;
         if let Some(sb) = self.send_buf.as_mut() {
@@ -2957,6 +2966,21 @@ mod tests {
             assert!(out.is_empty(), "retransmitted on a zero-window ACK");
         }
         assert!(!client.cc.in_recovery());
+        assert_eq!(client.cc.send_window(), cwnd);
+    }
+
+    // A sender that never fills its window has not shown the network can
+    // take more, so its cwnd must not grow (RFC 7661).
+    #[test]
+    fn application_limited_sender_keeps_cwnd() {
+        let (mut client, mut server) = established(40280);
+        let cwnd = client.cc.send_window();
+        for _ in 0..200 {
+            let (_, data) = client.write(&[1; 100]);
+            let acks = deliver(&mut server, &data);
+            read_all(&mut server);
+            deliver(&mut client, &acks);
+        }
         assert_eq!(client.cc.send_window(), cwnd);
     }
 
