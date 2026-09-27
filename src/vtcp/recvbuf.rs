@@ -1,12 +1,15 @@
 //! Receiver-side reassembly buffer with SACK reporting.
 
 use super::options::SackBlock;
-use super::seqspace::{seq_after, seq_before, seq_before_eq};
+use super::seqspace::{seq_after, seq_after_eq, seq_before, seq_before_eq};
 
 /// Cap on the number of out-of-order ranges. Adjacent and overlapping
 /// segments merge into one range, so this counts holes in the stream, not
 /// segments; the bytes they hold are bounded by the window.
 const MAX_OOO_ENTRIES: usize = 128;
+
+/// SACK blocks reported per ACK: all that fit beside a timestamp option.
+const MAX_SACK_BLOCKS: usize = 3;
 
 #[derive(Debug, Clone)]
 struct OooEntry {
@@ -21,6 +24,9 @@ pub struct RecvBuf {
     buf: Vec<u8>,
     nxt: u32,
     ooo: Vec<OooEntry>,
+    /// A sequence number inside each of the most recently extended
+    /// out-of-order ranges, newest first. RFC 2018 orders SACK blocks by it.
+    recent: Vec<u32>,
     window_size: usize,
 }
 
@@ -31,6 +37,7 @@ impl RecvBuf {
             buf: Vec::new(),
             nxt: initial_nxt,
             ooo: Vec::new(),
+            recent: Vec::new(),
             window_size,
         }
     }
@@ -104,7 +111,28 @@ impl RecvBuf {
             // cumulatively acknowledged.
             self.ooo.pop();
         }
+        self.note_recent(seq);
         0
+    }
+
+    /// The out-of-order range holding `seq`, if any.
+    fn range_of(&self, seq: u32) -> Option<&OooEntry> {
+        self.ooo.iter().find(|e| {
+            seq_before_eq(e.seq, seq) && seq_before(seq, e.seq.wrapping_add(e.data.len() as u32))
+        })
+    }
+
+    /// Record that the range holding `seq` was just extended, displacing any
+    /// older mark for the same range (ranges merge, so two marks can meet).
+    fn note_recent(&mut self, seq: u32) {
+        let Some(range) = self.range_of(seq) else {
+            return; // pruned as soon as it arrived
+        };
+        let (left, right) = (range.seq, range.seq.wrapping_add(range.data.len() as u32));
+        self.recent
+            .retain(|&s| !(seq_before_eq(left, s) && seq_before(s, right)));
+        self.recent.insert(0, seq);
+        self.recent.truncate(MAX_SACK_BLOCKS);
     }
 
     fn insert_ooo(&mut self, mut seq: u32, data: &[u8]) {
@@ -169,6 +197,8 @@ impl RecvBuf {
                 // else: entirely before nxt, discard
             }
             self.ooo = remaining;
+            let nxt = self.nxt;
+            self.recent.retain(|&s| seq_after_eq(s, nxt));
             if !found {
                 break;
             }
@@ -199,16 +229,27 @@ impl RecvBuf {
         self.nxt = self.nxt.wrapping_add(n);
     }
 
-    /// Up to 3 SACK blocks describing out-of-order data.
+    /// Up to 3 SACK blocks describing out-of-order data, ordered as RFC 2018
+    /// §4 requires: the range holding the most recently received segment
+    /// first, then the other recently extended ranges, newest first. Any room
+    /// left goes to the ranges nearest RCV.NXT, the holes to fill first.
     pub fn sack_blocks(&self) -> Vec<SackBlock> {
-        let n = self.ooo.len().min(3);
-        self.ooo[..n]
-            .iter()
-            .map(|e| SackBlock {
-                left: e.seq,
-                right: e.seq.wrapping_add(e.data.len() as u32),
-            })
-            .collect()
+        let block = |e: &OooEntry| SackBlock {
+            left: e.seq,
+            right: e.seq.wrapping_add(e.data.len() as u32),
+        };
+        let mut out: Vec<SackBlock> = Vec::with_capacity(MAX_SACK_BLOCKS);
+        let recent = self.recent.iter().filter_map(|&s| self.range_of(s));
+        for e in recent.chain(self.ooo.iter()) {
+            if out.len() == MAX_SACK_BLOCKS {
+                break;
+            }
+            let b = block(e);
+            if !out.contains(&b) {
+                out.push(b);
+            }
+        }
+        out
     }
 
     #[inline]
@@ -338,15 +379,35 @@ mod tests {
     }
 
     #[test]
+    fn sack_blocks_lead_with_the_newest_range() {
+        let mut r = RecvBuf::new(0, 0);
+        for seq in [10, 30, 50, 70] {
+            r.insert(seq, b"xxxxx");
+        }
+        let lefts = |r: &RecvBuf| r.sack_blocks().iter().map(|b| b.left).collect::<Vec<_>>();
+        assert_eq!(lefts(&r), vec![70, 50, 30]);
+        // Extending an older range makes it the newest; the one it pushed out
+        // of the recent list is reported only if room remains.
+        r.insert(15, b"yyyyy");
+        assert_eq!(lefts(&r), vec![10, 70, 50]);
+        assert_eq!(r.sack_blocks()[0].right, 20);
+        // Once a range joins the stream it is no longer reported.
+        r.insert(0, &[0; 10]);
+        assert_eq!(r.nxt(), 20);
+        assert_eq!(lefts(&r), vec![70, 50, 30]);
+    }
+
+    #[test]
     fn sack_blocks_reflect_ooo() {
         let mut r = RecvBuf::new(1000, 0);
         r.insert(1010, b"abcde");
         r.insert(1020, b"fghij");
+        // Newest first (RFC 2018 §4), not in sequence order.
         let blocks = r.sack_blocks();
         assert_eq!(blocks.len(), 2);
-        assert_eq!(blocks[0].left, 1010);
-        assert_eq!(blocks[0].right, 1015);
-        assert_eq!(blocks[1].left, 1020);
-        assert_eq!(blocks[1].right, 1025);
+        assert_eq!(blocks[0].left, 1020);
+        assert_eq!(blocks[0].right, 1025);
+        assert_eq!(blocks[1].left, 1010);
+        assert_eq!(blocks[1].right, 1015);
     }
 }
