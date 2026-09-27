@@ -736,11 +736,19 @@ impl TcpStack {
                 }
                 segs
             };
-            state.wrap_and_send(segs);
+            // The client's sink contains a panicking handler, but a sink
+            // that does not must still not cost this connection its accept
+            // or its readers their wakeup: settle first, then let it go on.
+            let sent = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                state.wrap_and_send(segs)
+            }));
             if !state.after_segment() {
                 self.forget(&state);
             }
             state.signal.notify_all();
+            if let Err(panic) = sent {
+                std::panic::resume_unwind(panic);
+            }
             return true;
         }
 
@@ -1148,6 +1156,54 @@ mod tests {
         stack.handle_inbound(Packet::from_slice(&inbound(syn)), ours);
         assert!(stack.conns.lock().unwrap().is_empty());
         assert!(out.lock().unwrap().is_empty());
+    }
+
+    /// A sink that panics on the reply to the segment completing a
+    /// handshake must not cost the connection its place in the accept queue.
+    #[test]
+    fn a_panicking_sink_still_settles_the_segment() {
+        let out: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
+        let panicking = Arc::new(AtomicBool::new(false));
+        let (o, p) = (out.clone(), panicking.clone());
+        let sink: Arc<dyn Fn(&[u8]) + Send + Sync> = Arc::new(move |b: &[u8]| {
+            assert!(!p.load(Ordering::Relaxed), "sink panics");
+            o.lock().unwrap().push(b.to_vec());
+        });
+        let stack = TcpStack::new(sink);
+        let listener = stack.listen(own(US), 80).unwrap();
+        listener.set_nonblocking(true);
+        let syn = Segment {
+            src_port: 4000,
+            dst_port: 80,
+            seq: 1,
+            flags: flags::SYN,
+            window: 65535,
+            ..Default::default()
+        };
+        stack.handle_inbound(Packet::from_slice(&inbound(syn)), IpAddr::V4(US));
+        let synack = Segment::parse(Packet::from_slice(&out.lock().unwrap()[0]).payload()).unwrap();
+        assert_eq!(synack.flags, flags::SYN | flags::ACK);
+
+        // The handshake's ACK carries data and a FIN, which we acknowledge
+        // at once: that reply is what the sink panics on.
+        panicking.store(true, Ordering::Relaxed);
+        let ack = Segment {
+            src_port: 4000,
+            dst_port: 80,
+            seq: 2,
+            ack: synack.seq.wrapping_add(1),
+            flags: flags::ACK | flags::PSH | flags::FIN,
+            window: 65535,
+            payload: b"hi".to_vec(),
+            ..Default::default()
+        };
+        let pkt = inbound(ack);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            stack.handle_inbound(Packet::from_slice(&pkt), IpAddr::V4(US))
+        }));
+        panicking.store(false, Ordering::Relaxed);
+        assert!(r.is_err(), "nothing was sent for the sink to panic on");
+        assert!(listener.accept().is_ok(), "the connection was never queued");
     }
 
     /// The cell a client keeps its address in, holding `ip`.

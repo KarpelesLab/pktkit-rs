@@ -73,11 +73,20 @@ impl Client {
 
         // The TCP stack pushes fully-framed IP packets back out the client's
         // installed L3 handler.
+        //
+        // Every packet the client sends goes through here, from the caller's
+        // thread and from the tick thread alike, so a panic in the handler
+        // is contained here: unwinding into the tick thread would end it, and
+        // with it every connection's timers, and unwinding out of
+        // `handle_inbound` would skip the wakeups its readers wait on. One
+        // packet the handler could not take is lost, as on a lossy link.
         let h = handler.clone();
         let sink: Arc<dyn Fn(&[u8]) + Send + Sync> = Arc::new(move |bytes: &[u8]| {
             let handler = h.lock().unwrap().clone();
             if let Some(handler) = handler {
-                let _ = handler(Packet::from_slice(bytes));
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    handler(Packet::from_slice(bytes))
+                }));
             }
         });
         let tcp = TcpStack::new(sink.clone());
@@ -262,6 +271,40 @@ mod tests {
                 .recv_timeout(Duration::from_secs(2))
                 .expect("a handle stayed blocked");
             assert!(failed, "{what} returned success");
+        }
+    }
+
+    /// A handler that panics costs the packet it was handed, not the tick
+    /// thread: the SYN's retransmissions keep coming after one of them
+    /// panicked there.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn a_panicking_handler_does_not_kill_the_tick_thread() {
+        let client = Client::new(
+            ClientConfig::default()
+                .prefix(IpPrefix::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 24)),
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        let tx = Mutex::new(tx);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        client.set_handler(Arc::new(move |_: &Packet| {
+            // The first call is the SYN, sent from `dial`; the second, the
+            // first retransmission, comes from the tick thread.
+            let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = tx.lock().unwrap().send(n);
+            if n == 1 {
+                panic!("handler panics on the tick thread");
+            }
+            Ok(())
+        }));
+        let _conn = client
+            .dial_tcp_nonblocking(SocketAddr::from(([10, 0, 0, 1], 80)))
+            .unwrap();
+        for want in 0..3 {
+            let n = rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the tick thread stopped sending");
+            assert_eq!(n, want);
         }
     }
 
