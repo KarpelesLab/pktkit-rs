@@ -13,6 +13,11 @@ use std::time::Duration;
 const MAX_LEASES: usize = 1024;
 const OFFER_HOLD: Duration = Duration::from_secs(60);
 const DEFAULT_LEASE: Duration = Duration::from_secs(3600);
+/// The lease granted to a client asking for an address we have no record
+/// of giving it. As short as an offer's hold, since such a request is as
+/// cheap to forge as a DISCOVER; a real client renews at half of it and
+/// then gets the full lease, a forger has to keep asking.
+const PROVISIONAL_LEASE: Duration = OFFER_HOLD;
 
 /// Configure a [`Server`].
 #[derive(Clone)]
@@ -87,7 +92,8 @@ struct Reservation {
 }
 
 enum Answer {
-    Ack(Ipv4Addr),
+    /// The address, and the lease time to grant, in seconds.
+    Ack(Ipv4Addr, u32),
     Nak,
     Silent,
 }
@@ -127,6 +133,9 @@ pub struct Server {
     handler: Mutex<Option<L2Handler>>,
     leases: Mutex<HashMap<ClientKey, Lease>>,
     declined: Mutex<HashMap<Ipv4Addr, Instant>>,
+    /// How many clients the server can hold leases for: the pool's size,
+    /// up to [`MAX_LEASES`].
+    capacity: usize,
 }
 
 impl core::fmt::Debug for Server {
@@ -142,6 +151,7 @@ impl Server {
     /// Build a new server.
     pub fn new(cfg: ServerConfig) -> Server {
         Server {
+            capacity: pool_size(&cfg).min(MAX_LEASES),
             cfg,
             handler: Mutex::new(None),
             leases: Mutex::new(HashMap::new()),
@@ -183,11 +193,12 @@ impl Server {
         match p.msg_type {
             wire::MSG_DISCOVER => {
                 if let Some(ip) = self.allocate(&key, self.reservation(&p)) {
-                    self.send_reply(&p, from, wire::MSG_OFFER, Some(ip));
+                    let lease = (ip, self.lease_secs());
+                    self.send_reply(&p, from, wire::MSG_OFFER, Some(lease));
                 }
             }
             wire::MSG_REQUEST => match self.request(&p, &key) {
-                Answer::Ack(ip) => self.send_reply(&p, from, wire::MSG_ACK, Some(ip)),
+                Answer::Ack(ip, secs) => self.send_reply(&p, from, wire::MSG_ACK, Some((ip, secs))),
                 Answer::Nak => self.send_nak(&p, from),
                 Answer::Silent => {}
             },
@@ -397,14 +408,14 @@ impl Server {
                 return Answer::Nak;
             }
             leases.insert(key.clone(), lease);
-            return Answer::Ack(ip);
+            return Answer::Ack(ip, self.lease_secs());
         }
 
         let held = self.held_by_others(leases, key, res);
         match leases.get(key) {
             Some(l) if l.ip == ip && !held.contains(&ip) => {
                 leases.insert(key.clone(), lease);
-                return Answer::Ack(ip);
+                return Answer::Ack(ip, self.lease_secs());
             }
             Some(l) if l.bound => return Answer::Nak,
             // An outstanding offer the client chose not to take: forget it,
@@ -416,10 +427,11 @@ impl Server {
             None => {}
         }
 
-        // No record, as after a server restart. RFC 2131 wants silence here
-        // so servers sharing a segment do not fight; an address from our
-        // own pool is ours to judge, though, and granting it when it is free
-        // lets clients keep their address across a restart.
+        // No record, as after a server restart. RFC 2131 §4.3.2 wants
+        // silence here so servers sharing a segment do not fight; an
+        // address from our own pool is ours to judge, though, and granting
+        // it when it is free lets clients keep their address across a
+        // restart -- provisionally, as below.
         if !self.in_pool(ip) {
             return Answer::Silent;
         }
@@ -441,11 +453,24 @@ impl Server {
                 declined.remove(&ip);
             }
         }
-        if leases.len() >= MAX_LEASES {
+        // Nothing but its word says the client ever had the address, and
+        // a stream of such requests from made-up clients would take the
+        // pool a lease at a time, skipping the offer's short hold. So the
+        // lease is only as long as that hold, and past three quarters full
+        // we keep to the RFC's silence: the client falls back to DISCOVER,
+        // and the offer path.
+        if leases.len() * 4 >= self.capacity * 3 {
             return Answer::Silent;
         }
-        leases.insert(key.clone(), lease);
-        Answer::Ack(ip)
+        let provisional = self.cfg.lease_time.min(PROVISIONAL_LEASE);
+        leases.insert(
+            key.clone(),
+            Lease {
+                expiry: now + provisional,
+                ..lease
+            },
+        );
+        Answer::Ack(ip, provisional.as_secs() as u32)
     }
 
     /// The lease time as option 51 carries it. Anything from 0xffffffff
@@ -522,8 +547,9 @@ impl Server {
         p: &wire::Parsed,
         from: Option<MacAddr>,
         msg_type: u8,
-        yiaddr: Option<Ipv4Addr>,
+        lease: Option<(Ipv4Addr, u32)>,
     ) {
+        let yiaddr = lease.map(|(ip, _)| ip);
         let mut b = wire::Builder::new(2, p.xid, p.chaddr);
         // Table 3: htype, hlen, chaddr, flags and giaddr are the client's,
         // echoed back.
@@ -544,8 +570,8 @@ impl Server {
         // RFC 2131 Table 3: every OFFER and ACK names its server, an ACK to
         // an INFORM (which grants no address, so carries no lease time)
         // included; clients use it to tell servers' answers apart.
-        if yiaddr.is_some() {
-            b.u32_option(wire::OPT_LEASE_TIME, self.lease_secs());
+        if let Some((_, secs)) = lease {
+            b.u32_option(wire::OPT_LEASE_TIME, secs);
         }
         b.ipv4_option(wire::OPT_SERVER_ID, self.cfg.server_ip);
         let (mac, ip, port) = self.destination(p, from, yiaddr, false);
@@ -617,6 +643,29 @@ impl Server {
             let _ = h(Frame::from_slice(&frame));
         }
     }
+}
+
+/// How many addresses [`Server::in_pool`] accepts: the configured range
+/// within the server's subnet, less the addresses the subnet uses for
+/// something else.
+fn pool_size(cfg: &ServerConfig) -> usize {
+    let mask = u32::from(cfg.subnet_mask);
+    let net = u32::from(cfg.server_ip) & mask;
+    let last = net | !mask;
+    let lo = u32::from(cfg.range_start).max(net);
+    let hi = u32::from(cfg.range_end).min(last);
+    if lo > hi {
+        return 0;
+    }
+    let mut taken = vec![u32::from(cfg.server_ip)];
+    taken.extend(cfg.router.map(u32::from));
+    if mask.leading_ones() < 31 {
+        taken.extend([net, last]);
+    }
+    taken.sort_unstable();
+    taken.dedup();
+    let taken = taken.iter().filter(|&&a| (lo..=hi).contains(&a)).count() as u64;
+    usize::try_from(u64::from(hi - lo) + 1 - taken).unwrap_or(usize::MAX)
 }
 
 impl L2Device for Server {
@@ -982,6 +1031,74 @@ mod tests {
         m.message_type(wire::MSG_REQUEST).ciaddr(ip);
         s.handle_dhcp(&m.finish());
         assert_eq!(replies(&r)[0].msg_type, wire::MSG_NAK);
+    }
+
+    #[test]
+    fn requests_from_unknown_clients_cannot_drain_the_pool() {
+        let cfg = ServerConfig::new(
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(10, 0, 0, 10),
+            Ipv4Addr::new(10, 0, 0, 209),
+        );
+        let (s, r) = recording(cfg);
+        assert_eq!(s.capacity, 200);
+        // INIT-REBOOT from made-up clients, each for an address of its own.
+        let mut acked = 0;
+        for i in 0..200u32 {
+            let mac = MacAddr([2, 0xee, 0, 0, (i >> 8) as u8, i as u8]);
+            let mut m = wire::Builder::new(1, i, mac);
+            m.message_type(wire::MSG_REQUEST)
+                .ipv4_option(wire::OPT_REQUESTED_IP, Ipv4Addr::from(0x0a00_000a + i));
+            s.handle_dhcp(&m.finish());
+            for p in replies(&r) {
+                assert_eq!(p.msg_type, wire::MSG_ACK);
+                assert!(p.lease_time.unwrap() <= 60, "{:?}", p.lease_time);
+                acked += 1;
+            }
+        }
+        assert_eq!(acked, 150, "past three quarters full, silence");
+        // A real client still gets an address.
+        s.handle_dhcp(&build_discover(1, MacAddr([2, 0, 0, 0, 0, 1])));
+        assert_eq!(replies(&r)[0].msg_type, wire::MSG_OFFER, "pool drained");
+    }
+
+    #[test]
+    fn a_provisional_lease_is_made_whole_on_renewal() {
+        let (s, r) = recording(one_address_pool());
+        let mac = MacAddr([2, 0, 0, 0, 0, 1]);
+        let ip = Ipv4Addr::new(10, 0, 0, 10);
+        let mut m = wire::Builder::new(1, 1, mac);
+        m.message_type(wire::MSG_REQUEST)
+            .ipv4_option(wire::OPT_REQUESTED_IP, ip);
+        s.handle_dhcp(&m.finish());
+        let got = replies(&r);
+        assert_eq!(got[0].msg_type, wire::MSG_ACK);
+        assert_eq!(got[0].lease_time, Some(PROVISIONAL_LEASE.as_secs() as u32));
+
+        let mut m = wire::Builder::new(1, 2, mac);
+        m.message_type(wire::MSG_REQUEST).ciaddr(ip);
+        s.handle_dhcp(&m.finish());
+        let got = replies(&r);
+        assert_eq!(got[0].msg_type, wire::MSG_ACK);
+        assert_eq!(got[0].lease_time, Some(DEFAULT_LEASE.as_secs() as u32));
+    }
+
+    #[test]
+    fn pool_size_counts_what_in_pool_accepts() {
+        for (start, end, router) in [
+            ([10, 0, 0, 0], [10, 0, 0, 255], Some([10, 0, 0, 254])),
+            ([10, 0, 0, 10], [10, 0, 0, 20], None),
+            ([9, 0, 0, 0], [11, 0, 0, 0], Some([10, 0, 0, 1])),
+            ([10, 0, 1, 0], [10, 0, 2, 0], None),
+        ] {
+            let mut cfg = ServerConfig::new(Ipv4Addr::new(10, 0, 0, 1), start.into(), end.into());
+            cfg.router = router.map(Ipv4Addr::from);
+            let s = Server::new(cfg);
+            let n = (0x0a00_0000..=0x0a00_00ffu32)
+                .filter(|&a| s.in_pool(a.into()))
+                .count();
+            assert_eq!(pool_size(&s.cfg), n, "{start:?}-{end:?}");
+        }
     }
 
     #[test]
