@@ -9,8 +9,8 @@
 //! - TLS control channel over the reliable layer, with sessions routed by
 //!   session id as in OpenVPN's `ssl.c`.
 //! - Key-method 2 key exchange and TLS-1.0 PRF key derivation.
-//! - Renegotiation (soft reset) from either side, with the previous key kept
-//!   for the transition window.
+//! - Renegotiation (soft reset) from either side, with the previous key's
+//!   data channel kept for the transition window.
 //! - Data channel: AES-256/128-GCM (AEAD) and AES-CBC + HMAC.
 //! - Replay window, PKCS#7 padding, control-packet framing.
 //! - UDP and TCP [`Server`]; per-peer [`Adapter`] over an `L3Connector` (tun)
@@ -21,9 +21,13 @@
 //! [`Server`]'s maintenance loop), and peer-info / repeated `PUSH_REQUEST`
 //! control messages are handled after authentication.
 //!
-//! TODO (tracked under `// TODO(ovpn): …` markers):
-//! - tls-crypt / tls-auth HMAC wrapping of control packets.
-//! - Full PUSH_REPLY option negotiation beyond ifconfig/ping/comp-lzo.
+//! Not implemented:
+//! - tls-crypt / tls-auth HMAC wrapping of control packets. Without it
+//!   anyone can send a hard reset from a client's address; see
+//!   [`Peer`] for how such resets are kept from disturbing a session.
+//! - PUSH_REPLY options beyond ifconfig, ping / ping-restart, cipher and
+//!   comp-lzo (no routes, DNS, or `topology subnet`).
+//! - P_DATA_V2 / peer-id, and the CHACHA20-POLY1305 data cipher.
 
 #[cfg(not(target_family = "wasm"))]
 mod adapter;
