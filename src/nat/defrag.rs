@@ -12,6 +12,10 @@ use std::time::Duration;
 
 pub(crate) const DEFRAG_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const DEFRAG_MAX_ENTRIES: usize = 256;
+/// Cap on fragments buffered for one datagram. A 64 KiB datagram over a
+/// 576-byte path is about 120 fragments; more than this is an attack on the
+/// buffer, not a datagram.
+pub(crate) const DEFRAG_MAX_FRAGS: usize = 256;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct FragKey {
@@ -132,6 +136,18 @@ impl Defragger {
         if let Some(total) = entry.total
             && (end > total || entry.frags.iter().any(|f| f.offset + f.data.len() > total))
         {
+            inner.entries.remove(&k);
+            return None;
+        }
+
+        // Overlaps are rejected on arrival rather than at reassembly, so a
+        // fragment sent over and over cannot pile up copies of itself (RFC
+        // 5722 has IPv6 drop the whole datagram too).
+        let overlaps = entry
+            .frags
+            .iter()
+            .any(|f| frag_offset < f.offset + f.data.len() && f.offset < end);
+        if overlaps || entry.frags.len() >= DEFRAG_MAX_FRAGS {
             inner.entries.remove(&k);
             return None;
         }
@@ -333,5 +349,35 @@ mod tests {
         let out = d.process(&f2).unwrap();
         assert_eq!(out.len(), 32);
         assert_eq!(&out[28..32], &[2u8; 4]);
+    }
+
+    fn buffered(d: &Defragger) -> usize {
+        d.inner
+            .lock()
+            .unwrap()
+            .entries
+            .values()
+            .map(|e| e.frags.len())
+            .sum()
+    }
+
+    #[test]
+    fn repeated_fragment_is_not_buffered_again() {
+        let d = Defragger::new();
+        let f = build_ipv4(20, true, 0, &[1u8; 8]);
+        for _ in 0..1000 {
+            assert!(d.process(&f).is_none());
+        }
+        assert!(buffered(&d) <= 1);
+    }
+
+    #[test]
+    fn fragments_per_datagram_are_bounded() {
+        let d = Defragger::new();
+        for i in 0..2000 {
+            let f = build_ipv4(21, true, i * 8, &[1u8; 8]);
+            assert!(d.process(&f).is_none());
+        }
+        assert!(buffered(&d) <= DEFRAG_MAX_FRAGS);
     }
 }

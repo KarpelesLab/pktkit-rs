@@ -43,6 +43,14 @@ const SSDP_MCAST: Ipv4Addr = Ipv4Addr::new(239, 255, 255, 250);
 /// hostile client. A UPnP SOAP control request is a few hundred bytes.
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 
+/// Cap on concurrent control connections. Each holds a TCP engine and a
+/// request buffer, and a SYN is all it takes to create one.
+const MAX_CTRL_CONNS: usize = 64;
+
+/// A control connection with no traffic for this long is dropped: a SOAP
+/// exchange takes milliseconds, and nothing else drives the engine's timers.
+const CTRL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Configuration knobs for the UPnP IGD helper.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -110,6 +118,8 @@ struct CtrlConn {
     /// further inbound bytes on this connection are ignored (single
     /// request/response per connection — the common UPnP control flow).
     responded: bool,
+    /// When the client last sent anything.
+    last: Instant,
 }
 
 /// UPnP IGD helper. Register via
@@ -230,11 +240,14 @@ EXT:\r\n\r\n",
         let mut remove = false;
         {
             let mut table = self.ctrl.lock().unwrap();
+            let now = Instant::now();
+            table.retain(|_, c| now.duration_since(c.last) < CTRL_IDLE_TIMEOUT);
             // Mint a fresh server-side Conn on the opening SYN.
             let mut fresh = false;
             if seg.has_flag(crate::vtcp::flags::SYN)
                 && !seg.has_flag(crate::vtcp::flags::ACK)
                 && !table.contains_key(&key)
+                && table.len() < MAX_CTRL_CONNS
             {
                 let cfg = ConnConfig {
                     local_addr: Some(SocketAddr::new(
@@ -253,6 +266,7 @@ EXT:\r\n\r\n",
                         client_ip,
                         req: Vec::new(),
                         responded: false,
+                        last: now,
                     },
                 );
                 fresh = true;
@@ -264,6 +278,7 @@ EXT:\r\n\r\n",
                 // NAT mapping path for our own control endpoint.
                 return true;
             };
+            cc.last = now;
 
             // Drive the state machine: the opening SYN goes through the passive
             // open (`accept_syn`); every later segment goes through the normal
@@ -1229,5 +1244,37 @@ Content-Length: {len}\r\n\r\n",
             resp
         );
         assert!(resp.contains("s:Envelope"), "response: {}", resp);
+    }
+
+    #[test]
+    fn control_connection_table_is_bounded_and_reaped() {
+        let nat = Nat::new(pfx("10.0.0.1/24"), pfx("203.0.113.1/24"));
+        let h = UPnPHelper::new(UPnPConfig::default());
+        let client_ip = Ipv4Addr::new(10, 0, 0, 42);
+        let inside_ip = Ipv4Addr::new(10, 0, 0, 1);
+        let syn = |port: u16| {
+            let mut c = crate::vtcp::Conn::new(crate::vtcp::ConnConfig {
+                local_addr: Some(SocketAddr::new(IpAddr::V4(client_ip), port)),
+                remote_addr: Some(SocketAddr::new(IpAddr::V4(inside_ip), 5000)),
+                local_port: port,
+                remote_port: 5000,
+                ..Default::default()
+            });
+            wrap_tcp_v4(client_ip, inside_ip, &c.connect()[0])
+        };
+        // Half-open handshakes that never complete.
+        for port in 0..(MAX_CTRL_CONNS as u16 + 50) {
+            h.handle_local(&nat, crate::Packet::from_slice(&syn(40000 + port)));
+        }
+        assert!(h.ctrl.lock().unwrap().len() <= MAX_CTRL_CONNS);
+
+        let long_ago = Instant::now() - CTRL_IDLE_TIMEOUT - Duration::from_secs(1);
+        h.ctrl
+            .lock()
+            .unwrap()
+            .values_mut()
+            .for_each(|c| c.last = long_ago);
+        h.handle_local(&nat, crate::Packet::from_slice(&syn(60000)));
+        assert_eq!(h.ctrl.lock().unwrap().len(), 1);
     }
 }

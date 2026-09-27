@@ -26,6 +26,9 @@ pub(crate) const NAT_TCP_TIMEOUT: Duration = Duration::from_secs(300);
 pub(crate) const NAT_UDP_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) const NAT_ICMP_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const NAT_TCP_FIN_GRACE: Duration = Duration::from_secs(30);
+/// Cap on pending expectations. ALGs add them on packets remote peers
+/// control (TFTP requests, SDP offers), so the table must not grow unbounded.
+const MAX_EXPECTATIONS: usize = 1024;
 
 /// Key into the forward connection table.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -248,6 +251,18 @@ impl Nat {
         }) {
             old.expires = old.expires.max(e.expires);
             return;
+        }
+        if inner.expectations.len() >= MAX_EXPECTATIONS {
+            let now = Instant::now();
+            inner.expectations.retain(|e| now <= e.expires);
+            // Still full: the one closest to lapsing is the least likely to
+            // be used, so it makes room.
+            if inner.expectations.len() >= MAX_EXPECTATIONS
+                && let Some(pos) =
+                    (0..inner.expectations.len()).min_by_key(|&i| inner.expectations[i].expires)
+            {
+                inner.expectations.swap_remove(pos);
+            }
         }
         inner.expectations.push(e);
     }
@@ -501,6 +516,7 @@ impl Nat {
             .is_some_and(|e| e < now);
         if expired {
             inner.forwards.remove(&rk);
+            Self::remove_mapping_at_locked(inner, rk);
             return None;
         }
         inner.forwards.get(&rk)
@@ -589,6 +605,17 @@ impl Nat {
                 true
             }
         });
+        inner.expectations.retain(|e| now <= e.expires);
+        let lapsed: Vec<NatRevKey> = inner
+            .forwards
+            .iter()
+            .filter(|(_, pf)| pf.expires.is_some_and(|e| e < now))
+            .map(|(rk, _)| *rk)
+            .collect();
+        for rk in lapsed {
+            inner.forwards.remove(&rk);
+            Self::remove_mapping_at_locked(inner, rk);
+        }
         // Also sweep the defragger if enabled.
         if let Some(d) = self.defragger.lock().unwrap().clone() {
             d.sweep();
@@ -598,6 +625,10 @@ impl Nat {
     fn cleanup_namespace(&self, ns: u64) {
         let mut inner = self.inner.lock().unwrap();
         let inner = &mut *inner;
+        // Namespace IDs are never reused, so anything aimed at this one is
+        // dead weight from now on.
+        inner.expectations.retain(|e| e.namespace != ns);
+        inner.forwards.retain(|_, pf| pf.namespace != ns);
         inner.mappings.retain(|k, m| {
             if k.ns == ns {
                 inner.reverse.remove(&NatRevKey {
@@ -1894,5 +1925,39 @@ mod tests {
         let got = tap.got.lock().unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(dst_port(&got[0]), 1234);
+    }
+
+    #[test]
+    fn expectation_table_is_bounded() {
+        let nat = Nat::new(pfx("10.0.0.1/24"), pfx("203.0.113.1/24"));
+        for i in 0..(MAX_EXPECTATIONS as u16 + 500) {
+            nat.add_expectation(Expectation::new(PROTO_UDP, INSIDE, i, 20000 + i, soon()));
+        }
+        assert!(nat.inner.lock().unwrap().expectations.len() <= MAX_EXPECTATIONS);
+    }
+
+    #[test]
+    fn sweep_purges_expired_expectations_and_forwards() {
+        let (nat, i, _o) = setup();
+        let past = Instant::now() - Duration::from_secs(1);
+        nat.add_expectation(Expectation::new(PROTO_UDP, INSIDE, 5004, 30000, past));
+        nat.add_port_forward(PortForward::new(PROTO_TCP, 8080, INSIDE, 80).expires(soon()))
+            .unwrap();
+        let syn = build_tcp(REMOTE, 4444, PUBLIC, 8080, 0x02);
+        nat.outside().send(Packet::from_slice(&syn)).unwrap();
+        assert_eq!(i.lock().unwrap().len(), 1);
+        nat.inner
+            .lock()
+            .unwrap()
+            .forwards
+            .values_mut()
+            .for_each(|pf| pf.expires = Some(past));
+
+        nat.sweep();
+        let inner = nat.inner.lock().unwrap();
+        assert!(inner.expectations.is_empty());
+        assert!(inner.forwards.is_empty());
+        // The session the lapsed forward carried is gone as well.
+        assert!(inner.reverse.is_empty());
     }
 }
