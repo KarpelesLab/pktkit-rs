@@ -826,7 +826,7 @@ impl Nat {
                 if pkt.len() < ihl + 8 {
                     return;
                 }
-                self.outbound_icmp(ns, pkt, ihl, fmax);
+                self.outbound_icmp(ns, pkt, ihl, whole, fmax);
             }
             _ => {}
         }
@@ -963,10 +963,12 @@ impl Nat {
         emit(&out, fmax, |p| self.outside.deliver(p));
     }
 
-    fn outbound_icmp(&self, ns: u64, pkt: &[u8], ihl: usize, fmax: Option<FragMax>) {
-        let icmp_type = pkt[ihl];
-        if icmp_type != 8 {
-            return; // outbound: only Echo Request
+    fn outbound_icmp(&self, ns: u64, pkt: &[u8], ihl: usize, whole: bool, fmax: Option<FragMax>) {
+        match pkt[ihl] {
+            8 => {}
+            // Errors are small; a fragmented one is not worth reassembling.
+            3 | 11 | 12 if whole => return self.outbound_icmp_error(ns, pkt, ihl),
+            _ => return,
         }
         let src_ip = Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]);
         let id = u16::from_be_bytes([pkt[ihl + 4], pkt[ihl + 5]]);
@@ -1006,6 +1008,94 @@ impl Nat {
         update_icmp_checksum(&mut out, ihl, old_id, outside_port);
 
         emit(&out, fmax, |p| self.outside.deliver(p));
+    }
+
+    /// Translate an ICMP error an inside host, or a router on the inside,
+    /// sends about a packet that came in through this NAT (RFC 5508 §4.2):
+    /// the outer source and the embedded packet's destination go back to
+    /// the public endpoint, with every checksum that covers them patched.
+    fn outbound_icmp_error(&self, ns: u64, pkt: &[u8], outer_ihl: usize) {
+        let emb_off = outer_ihl + 8;
+        if pkt.len() < emb_off + 20 {
+            return;
+        }
+        // The outer checksum is recomputed below; check it first, so a
+        // corrupted error is not passed on as a valid one.
+        if checksum(&pkt[outer_ihl..]) != 0 {
+            return;
+        }
+        let emb_ihl = (pkt[emb_off] & 0x0F) as usize * 4;
+        if emb_ihl < 20 || pkt.len() < emb_off + emb_ihl + 8 {
+            return;
+        }
+        let emb = &pkt[emb_off..];
+        let emb_proto = emb[9];
+        // Only TCP and UDP reach inside hosts from outside; echo requests
+        // are answered by no one behind the NAT.
+        if emb_proto != PROTO_TCP && emb_proto != PROTO_UDP {
+            return;
+        }
+        let l4 = &emb[emb_ihl..];
+        let remote_ip = Ipv4Addr::new(emb[12], emb[13], emb[14], emb[15]);
+        let remote = SocketAddrV4::new(remote_ip, u16::from_be_bytes([l4[0], l4[1]]));
+        // An error goes back to whoever sent the packet it quotes.
+        if pkt[16..20] != remote_ip.octets() {
+            return;
+        }
+        let k = NatKey {
+            ns,
+            proto: emb_proto,
+            ip: Ipv4Addr::new(emb[16], emb[17], emb[18], emb[19]),
+            port: u16::from_be_bytes([l4[2], l4[3]]),
+        };
+        // RFC 5508 REQ-4: only for a live mapping, and only about traffic
+        // it actually carried from that remote; otherwise an inside host
+        // could tear down any session through the NAT, its own or not.
+        let outside_port = {
+            let inner = self.inner.lock().unwrap();
+            match inner.mappings.get(&k) {
+                Some(m) if m.peers.contains(&remote) => m.outside_port,
+                _ => return,
+            }
+        };
+        let Some(outside_ip) = self.outside_addr() else {
+            return;
+        };
+        let public = outside_ip.octets();
+
+        let mut out = pkt.to_vec();
+        let old_outer_src: [u8; 4] = out[12..16].try_into().unwrap();
+        out[12..16].copy_from_slice(&public);
+        update_ip_checksum(&mut out, old_outer_src, public);
+
+        let old_dst = k.ip.octets();
+        {
+            let emb = &mut out[emb_off..];
+            emb[16..20].copy_from_slice(&public);
+            update_ip_checksum(emb, old_dst, public);
+        }
+        let l4_off = emb_off + emb_ihl;
+        out[l4_off + 2..l4_off + 4].copy_from_slice(&outside_port.to_be_bytes());
+        let csum_off = l4_off + if emb_proto == PROTO_TCP { 16 } else { 6 };
+        let present = out.len() >= csum_off + 2;
+        let unused = emb_proto == PROTO_UDP && present && out[csum_off..csum_off + 2] == [0, 0];
+        if present && !unused {
+            update_l4_checksum(&mut out, csum_off, old_dst, public, k.port, outside_port);
+            if emb_proto == PROTO_UDP {
+                udp_nonzero_checksum(&mut out, csum_off);
+            }
+        }
+
+        out[outer_ihl + 2..outer_ihl + 4].copy_from_slice(&[0, 0]);
+        let csum = checksum(&out[outer_ihl..]);
+        out[outer_ihl + 2..outer_ihl + 4].copy_from_slice(&csum.to_be_bytes());
+
+        // About hairpinned traffic: the remote is another inside host.
+        if out[16..20] == public {
+            self.inbound(&out, None);
+            return;
+        }
+        self.outside.deliver(Packet::from_slice(&out));
     }
 
     // ---------- Inbound (outside -> inside) ----------
@@ -2412,6 +2502,11 @@ mod tests {
 
     /// An ICMP error from `from` quoting `quoted` in full.
     fn icmp_error(from: Ipv4Addr, quoted: &[u8]) -> Vec<u8> {
+        icmp_error_to(from, PUBLIC, quoted)
+    }
+
+    /// An ICMP port unreachable from `from` to `to` quoting `quoted`.
+    fn icmp_error_to(from: Ipv4Addr, to: Ipv4Addr, quoted: &[u8]) -> Vec<u8> {
         let total = 20 + 8 + quoted.len();
         let mut p = vec![0u8; total];
         p[0] = 0x45;
@@ -2419,7 +2514,7 @@ mod tests {
         p[8] = 64;
         p[9] = PROTO_ICMP;
         p[12..16].copy_from_slice(&from.octets());
-        p[16..20].copy_from_slice(&PUBLIC.octets());
+        p[16..20].copy_from_slice(&to.octets());
         let ic = checksum(&p[..20]);
         p[10..12].copy_from_slice(&ic.to_be_bytes());
         p[20] = 3; // destination unreachable
@@ -2480,6 +2575,59 @@ mod tests {
         bad[30] ^= 0xFF;
         nat.outside().send(Packet::from_slice(&bad)).unwrap();
         assert!(i.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn icmp_error_from_the_inside_is_translated_out() {
+        let (nat, i, o) = setup();
+        let mut p = build_udp(INSIDE, 5000, REMOTE, 53, b"query");
+        crate::nat::l4::fill_v4_l4_checksum(&mut p, 20);
+        nat.inside().send(Packet::from_slice(&p)).unwrap();
+        let port = src_port(&o.lock().unwrap()[0]);
+        o.lock().unwrap().clear();
+
+        // The remote's answer reaches the inside host, which has closed
+        // the socket and says so. So does a router on the inside.
+        let mut r = build_udp(REMOTE, 53, PUBLIC, port, b"answer");
+        crate::nat::l4::fill_v4_l4_checksum(&mut r, 20);
+        nat.outside().send(Packet::from_slice(&r)).unwrap();
+        let delivered = i.lock().unwrap()[0].clone();
+        let router = Ipv4Addr::new(10, 0, 0, 254);
+        for from in [INSIDE, router] {
+            let err = icmp_error_to(from, REMOTE, &delivered);
+            nat.inside().send(Packet::from_slice(&err)).unwrap();
+        }
+
+        let out = o.lock().unwrap();
+        assert_eq!(out.len(), 2);
+        for e in out.iter() {
+            assert_eq!(&e[12..16], &PUBLIC.octets(), "outer source");
+            assert_eq!(&e[16..20], &REMOTE.octets());
+            assert_eq!(checksum(&e[..20]), 0, "outer IP checksum");
+            assert_eq!(checksum(&e[20..]), 0, "outer ICMP checksum");
+            // The quoted datagram is what the remote sent.
+            assert_eq!(&e[28..], &r[..]);
+        }
+    }
+
+    #[test]
+    fn inside_cannot_forge_errors_about_other_sessions() {
+        let (nat, _i, o) = setup();
+        let p = build_udp(INSIDE, 5000, REMOTE, 53, b"query");
+        nat.inside().send(Packet::from_slice(&p)).unwrap();
+        o.lock().unwrap().clear();
+
+        // No packet from this remote ever reached the mapping.
+        let other = Ipv4Addr::new(192, 0, 2, 66);
+        let mut q = build_udp(other, 53, INSIDE, 5000, b"never sent");
+        crate::nat::l4::fill_v4_l4_checksum(&mut q, 20);
+        let err = icmp_error_to(INSIDE, other, &q);
+        nat.inside().send(Packet::from_slice(&err)).unwrap();
+        // Nor did anything reach an endpoint without a mapping.
+        let q = build_udp(REMOTE, 53, INSIDE, 5001, b"x");
+        let err = icmp_error_to(INSIDE, REMOTE, &q);
+        nat.inside().send(Packet::from_slice(&err)).unwrap();
+        assert!(o.lock().unwrap().is_empty());
     }
 
     /// A TCP segment with explicit sequence numbers, options and payload.
