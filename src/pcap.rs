@@ -261,6 +261,11 @@ impl L2Device for TapL2 {
     fn stats(&self) -> Option<&DeviceStats> {
         Some(&self.shared.stats)
     }
+
+    // A wrapper lives exactly as long as the connection it wraps.
+    fn done_signal(&self) -> Option<Arc<dyn crate::DoneSignal + Send + Sync>> {
+        self.inner.done_signal()
+    }
 }
 
 /// An [`L3Device`] that mirrors every packet crossing it into a pcap file,

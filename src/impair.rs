@@ -692,6 +692,11 @@ impl L2Device for ImpairL2 {
     fn stats(&self) -> Option<&DeviceStats> {
         Some(&self.engine.stats)
     }
+
+    // A wrapper lives exactly as long as the connection it wraps.
+    fn done_signal(&self) -> Option<Arc<dyn crate::DoneSignal + Send + Sync>> {
+        self.inner.done_signal()
+    }
 }
 
 impl L3Device for ImpairL3 {

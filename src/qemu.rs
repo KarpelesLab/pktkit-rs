@@ -189,6 +189,9 @@ impl L2Device for Conn {
         self.shut();
         Ok(())
     }
+    fn done_signal(&self) -> Option<Arc<dyn crate::DoneSignal + Send + Sync>> {
+        Some(self.done.clone())
+    }
 }
 
 impl Drop for Conn {
@@ -197,6 +200,12 @@ impl Drop for Conn {
         // the socket would stay open, and the thread blocked on it, until the
         // peer happened to hang up.
         self.shut();
+    }
+}
+
+impl crate::DoneSignal for DoneSignal {
+    fn wait_done(&self) {
+        self.wait();
     }
 }
 
@@ -411,6 +420,44 @@ mod tests {
         // Closing is idempotent, and dropping after it is fine.
         client.close().unwrap();
         drop(client);
+    }
+
+    /// `serve` detaches a peer once it hangs up, rather than keeping its
+    /// port for good.
+    #[test]
+    fn serve_detaches_a_peer_that_hangs_up() {
+        struct Count(Arc<Mutex<usize>>, mpsc::Sender<()>);
+        impl crate::L2Connector for Count {
+            fn connect_l2(&self, dev: Arc<dyn L2Device>) -> Result<crate::Cleanup> {
+                *self.0.lock().unwrap() += 1;
+                let _ = self.1.send(());
+                let (n, tx) = (self.0.clone(), self.1.clone());
+                // Holds the device while attached, as a hub port would.
+                Ok(Box::new(move || {
+                    drop(dev);
+                    *n.lock().unwrap() -= 1;
+                    let _ = tx.send(());
+                    Ok(())
+                }))
+            }
+        }
+
+        let ln = Listener::bind_tcp("127.0.0.1:0").unwrap();
+        let Listener::Tcp(l) = &ln else {
+            unreachable!()
+        };
+        let addr = l.local_addr().unwrap();
+        let attached = Arc::new(Mutex::new(0));
+        let (tx, rx) = mpsc::channel();
+        let connector = Count(attached.clone(), tx);
+        std::thread::spawn(move || crate::serve(&ln, &connector));
+
+        let client = dial_tcp(addr).unwrap();
+        rx.recv_timeout(ECHO_TIMEOUT).expect("never attached");
+        assert_eq!(*attached.lock().unwrap(), 1);
+        client.close().unwrap();
+        rx.recv_timeout(ECHO_TIMEOUT).expect("never detached");
+        assert_eq!(*attached.lock().unwrap(), 0);
     }
 
     #[test]

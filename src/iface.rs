@@ -1,4 +1,4 @@
-use crate::{DeviceStats, Frame, IpPrefix, MacAddr, Packet, Result};
+use crate::{DeviceStats, DoneSignal, Frame, IpPrefix, MacAddr, Packet, Result};
 use std::sync::Arc;
 
 /// A frame handler: invoked synchronously by an [`L2Device`] when a frame is
@@ -45,6 +45,14 @@ pub trait L2Device: Send + Sync {
     fn stats(&self) -> Option<&DeviceStats> {
         None
     }
+
+    /// A way to wait for the device's connection to end, for a device that
+    /// has one, such as a socket to a VM. [`serve`](crate::serve) waits on
+    /// it to detach the device once the peer is gone. Defaults to `None`:
+    /// the device has no connection of its own to lose.
+    fn done_signal(&self) -> Option<Arc<dyn DoneSignal + Send + Sync>> {
+        None
+    }
 }
 
 /// A Layer 3 (IP) network device.
@@ -89,6 +97,10 @@ impl<T: L2Device + ?Sized> L2Device for Arc<T> {
     #[inline]
     fn stats(&self) -> Option<&DeviceStats> {
         (**self).stats()
+    }
+    #[inline]
+    fn done_signal(&self) -> Option<Arc<dyn DoneSignal + Send + Sync>> {
+        (**self).done_signal()
     }
 }
 
