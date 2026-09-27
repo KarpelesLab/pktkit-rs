@@ -30,13 +30,20 @@ pub(crate) struct HalfOpenSlot(Arc<AtomicUsize>);
 
 impl HalfOpenSlot {
     /// Take a slot from `count`, unless all are in use.
+    ///
+    /// A compare-exchange loop rather than `fetch_update`, which newer
+    /// toolchains deprecate for a `try_update` missing at this crate's MSRV.
     pub(crate) fn take(count: &Arc<AtomicUsize>) -> Option<HalfOpenSlot> {
-        count
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < HALF_OPEN_CAP).then_some(n + 1)
-            })
-            .ok()
-            .map(|_| HalfOpenSlot(count.clone()))
+        let mut n = count.load(Ordering::Acquire);
+        loop {
+            if n >= HALF_OPEN_CAP {
+                return None;
+            }
+            match count.compare_exchange_weak(n, n + 1, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Some(HalfOpenSlot(count.clone())),
+                Err(actual) => n = actual,
+            }
+        }
     }
 }
 
