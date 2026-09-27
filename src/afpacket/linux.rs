@@ -70,6 +70,8 @@ impl Socket {
         // SAFETY: `raw` is a fresh, valid fd that nothing else owns.
         let fd = unsafe { OwnedFd::from_raw_fd(raw) };
 
+        // Before `bind`, so no frame arrives without it and loses its tag.
+        set_int_opt(&fd, libc::SOL_PACKET, PACKET_AUXDATA, 1)?;
         bind_to_interface(&fd, ifindex, proto)?;
 
         if cfg.recv_buffer > 0 {
@@ -113,6 +115,27 @@ impl Socket {
     }
 }
 
+/// `PACKET_AUXDATA`: per-frame metadata as a control message, the only place
+/// the kernel reports an 802.1Q tag it has stripped.
+const PACKET_AUXDATA: libc::c_int = 8;
+
+/// `struct tpacket_auxdata`, our own so an old `libc` need not have it.
+/// Declared whole for its layout; only the VLAN fields are read.
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+struct TpacketAuxdata {
+    tp_status: u32,
+    tp_len: u32,
+    tp_snaplen: u32,
+    tp_mac: u16,
+    tp_net: u16,
+    tp_vlan_tci: u16,
+    tp_vlan_tpid: u16,
+}
+
+const _: () = assert!(std::mem::size_of::<TpacketAuxdata>() == 20);
+
 /// Start the receive thread. It holds only the pieces it needs, so the socket
 /// itself can be dropped while the thread is still winding down.
 fn spawn_reader(sock: &Arc<Socket>, inbound_only: bool) {
@@ -120,23 +143,29 @@ fn spawn_reader(sock: &Arc<Socket>, inbound_only: bool) {
     let handler = sock.handler.clone();
     let closed = sock.closed.clone();
     let stats = sock.stats.clone();
-    // Room for a jumbo frame plus its header.
-    let mut buf = vec![0u8; 65_536];
+    // Room for a jumbo frame plus its header, behind headroom for a VLAN tag.
+    let mut buf = vec![0u8; super::VLAN_TAG_LEN + 65_536];
 
     std::thread::spawn(move || {
+        // u64s for the alignment `cmsghdr` needs; room for one auxdata.
+        let mut control = [0u64; 8];
         while !closed.load(Ordering::Acquire) {
             let mut from: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
-            let mut from_len = std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t;
-            let n = unsafe {
-                libc::recvfrom(
-                    fd.as_raw_fd(),
-                    buf.as_mut_ptr() as *mut libc::c_void,
-                    buf.len(),
-                    0,
-                    &mut from as *mut libc::sockaddr_ll as *mut libc::sockaddr,
-                    &mut from_len,
-                )
+            let data = &mut buf[super::VLAN_TAG_LEN..];
+            let mut iov = libc::iovec {
+                iov_base: data.as_mut_ptr() as *mut libc::c_void,
+                iov_len: data.len(),
             };
+            // SAFETY: all-zero is a valid msghdr; the pointers are set below.
+            let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+            msg.msg_name = &mut from as *mut libc::sockaddr_ll as *mut libc::c_void;
+            msg.msg_namelen = std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t;
+            msg.msg_iov = &mut iov;
+            msg.msg_iovlen = 1;
+            msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+            msg.msg_controllen = std::mem::size_of_val(&control) as _;
+            // SAFETY: every pointer in `msg` is to a live local sized as stated.
+            let n = unsafe { libc::recvmsg(fd.as_raw_fd(), &mut msg, 0) };
             if n < 0 {
                 let e = io::Error::last_os_error();
                 match e.kind() {
@@ -157,15 +186,46 @@ fn spawn_reader(sock: &Arc<Socket>, inbound_only: bool) {
             if inbound_only && from.sll_pkttype == PACKET_OUTGOING {
                 continue;
             }
-            stats.record_rx(n);
+            // SAFETY: `msg` is as `recvmsg` left it, its control buffer live.
+            let tag = unsafe { vlan_tag(&msg) };
+            let range = super::reinsert_vlan(&mut buf, n, tag);
+            let frame = &buf[range];
+            stats.record_rx(frame.len());
             let h = handler.lock().unwrap().clone();
             if let Some(h) = h {
-                let _ = h(Frame::from_slice(&buf[..n]));
+                let _ = h(Frame::from_slice(frame));
             } else {
                 stats.record_rx_drop();
             }
         }
     });
+}
+
+/// The stripped VLAN tag reported in `msg`'s `PACKET_AUXDATA`, if any.
+///
+/// # Safety
+/// `msg` must be a header `recvmsg` has just filled in, with its control
+/// buffer still live.
+unsafe fn vlan_tag(msg: &libc::msghdr) -> Option<(u16, u16)> {
+    // SAFETY: the caller guarantees `msg` and its control buffer; the CMSG_*
+    // walk stays within `msg_controllen`, and each auxdata is read unaligned
+    // only after checking the message is long enough to hold it.
+    unsafe {
+        let mut c = libc::CMSG_FIRSTHDR(msg);
+        while !c.is_null() {
+            let h = &*c;
+            if h.cmsg_level == libc::SOL_PACKET
+                && h.cmsg_type == PACKET_AUXDATA
+                && h.cmsg_len as usize
+                    >= libc::CMSG_LEN(std::mem::size_of::<TpacketAuxdata>() as u32) as usize
+            {
+                let aux = (libc::CMSG_DATA(c) as *const TpacketAuxdata).read_unaligned();
+                return super::aux_vlan_tag(aux.tp_status, aux.tp_vlan_tci, aux.tp_vlan_tpid);
+            }
+            c = libc::CMSG_NXTHDR(msg, c);
+        }
+    }
+    None
 }
 
 impl L2Device for Socket {
@@ -254,12 +314,16 @@ fn bind_to_interface(fd: &OwnedFd, ifindex: u32, proto: libc::c_int) -> Result<(
 
 fn set_recv_buffer(fd: &OwnedFd, bytes: usize) -> Result<()> {
     let size = bytes.min(i32::MAX as usize) as libc::c_int;
+    set_int_opt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, size)
+}
+
+fn set_int_opt(fd: &OwnedFd, level: libc::c_int, opt: libc::c_int, val: libc::c_int) -> Result<()> {
     let r = unsafe {
         libc::setsockopt(
             fd.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_RCVBUF,
-            &size as *const libc::c_int as *const libc::c_void,
+            level,
+            opt,
+            &val as *const libc::c_int as *const libc::c_void,
             std::mem::size_of::<libc::c_int>() as libc::socklen_t,
         )
     };
