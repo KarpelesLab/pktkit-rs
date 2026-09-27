@@ -1336,7 +1336,18 @@ impl Conn {
                 self.send_buf.as_mut().unwrap().mark_sacked(&blocks);
             }
         }
-        if fast_partial || rto_partial {
+        if fast_partial && self.sack_ok {
+            // With SACK, the hole at SND.UNA may already have gone out this
+            // episode through retransmit_lost_hole; resending it would be
+            // spurious and spoil RTT timing. RFC 6675 §5 NextSeg: only what
+            // lies at or past HighRxt is due.
+            let una = self.send_buf.as_ref().unwrap().una();
+            if seq_after_eq(una, self.high_rxt) {
+                let _ = self.retransmit();
+            } else {
+                let _ = self.retransmit_lost_hole();
+            }
+        } else if fast_partial || rto_partial {
             let _ = self.retransmit();
         }
 
@@ -2881,6 +2892,19 @@ mod tests {
             let acks = deliver(&mut server, &resent);
             assert_eq!(parse(acks.last().unwrap()).ack, lost[0] + 9000);
             assert_eq!(read_all(&mut server), data);
+            // The first of those ACKs is partial, stopping at the second
+            // hole. That hole is below HighRxt, already resent this episode:
+            // sending it again would be a spurious retransmission.
+            assert!(
+                acks.iter().any(|a| parse(a).ack == lost[1]),
+                "a partial ACK up to the second hole"
+            );
+            let out = deliver(&mut client, &acks);
+            assert!(
+                !seqs(&out).contains(&lost[1]),
+                "second hole retransmitted twice, sent {:?}",
+                seqs(&out)
+            );
             return;
         }
 
