@@ -318,10 +318,9 @@ impl Peer {
             };
             let tick = s.primary.reliable.tick(now);
             out.send.extend(tick.resend);
-            if let Some(at) = s.auth_failed {
-                if now >= at {
-                    let e =
-                        io::Error::new(io::ErrorKind::PermissionDenied, "authentication failed");
+            if let Some((at, why)) = &s.auth_failed {
+                if now >= *at {
+                    let e = io::Error::new(io::ErrorKind::PermissionDenied, why.clone());
                     self.fail_session(slot, &mut out, Some(e));
                 }
                 continue;
@@ -621,9 +620,9 @@ struct Session {
     /// exchange, retained for post-auth queries / diagnostics.
     peer_info: HashMap<String, String>,
     timers: PeerTimers,
-    /// Set when the client's credentials were rejected: when to drop the
-    /// session, which lingers only to deliver AUTH_FAILED.
-    auth_failed: Option<Instant>,
+    /// Set when the client was refused (credentials, data cipher): when to
+    /// drop the session, which lingers only to deliver AUTH_FAILED, and why.
+    auth_failed: Option<(Instant, String)>,
     /// Data cipher chosen by negotiation, pushed to the client.
     pushed_cipher: Option<&'static str>,
 }
@@ -892,9 +891,13 @@ impl Session {
         // A renegotiation re-runs the check (OpenVPN re-verifies the
         // credentials), but the session keeps the options and config it
         // pushed: the client does not ask for them again.
-        let cfg = match on_auth(&auth) {
+        let cfg = match &parsed.cipher_refused {
+            Some(why) => Err(why.clone()),
+            None => on_auth(&auth).map_err(|e| format!("authentication failed: {e}")),
+        };
+        let cfg = match cfg {
             Ok(cfg) => cfg,
-            Err(_) => {
+            Err(why) => {
                 // As OpenVPN's server does (send_auth_failed): tell the
                 // client, generate no keys, and end the session a few
                 // seconds later, once the message has had time to arrive.
@@ -902,7 +905,7 @@ impl Session {
                     .tls
                     .send(b"AUTH_FAILED\0")
                     .map_err(|e| invalid(format!("tls write AUTH_FAILED: {e:?}")))?;
-                self.auth_failed = Some(Instant::now() + AUTH_FAILED_EXIT);
+                self.auth_failed = Some((Instant::now() + AUTH_FAILED_EXIT, why));
                 return Ok(());
             }
         };
@@ -1063,7 +1066,11 @@ fn try_parse_key_exchange(buf: &[u8]) -> io::Result<Option<(KeyExchange, usize)>
     // OpenVPN only warns when the peer's options string differs from its
     // own (key_method_2_read -> options_warning), so take what we need from
     // it and ignore the rest rather than insisting it round-trips.
-    let mut opts = Options::parse(&options_string).map_err(invalid)?;
+    // The cipher is taken out before parsing: whether the one named is
+    // usable is part of choosing the data cipher, below, not a malformed
+    // options string. A negotiating client may well name one we lack.
+    let (options_rest, remote_cipher) = split_cipher(&options_string);
+    let mut opts = Options::parse(&options_rest).map_err(invalid)?;
     opts.is_server = false;
     // The PUSH_REPLY carries `comp-lzo no`, which puts the client on
     // stub framing (every packet starts with the no-compression byte)
@@ -1071,11 +1078,10 @@ fn try_parse_key_exchange(buf: &[u8]) -> io::Result<Option<(KeyExchange, usize)>
     opts.compression = "lzo".into();
 
     let peer_info = parse_peer_info(&peer_info_raw)?;
-    let ncp_cipher = negotiate_cipher(&peer_info)?;
-    if let Some(c) = ncp_cipher {
-        opts.set_cipher(c).map_err(invalid)?;
-    }
-    data::check_supported(&opts)?;
+    let (ncp_cipher, cipher_refused) = match select_cipher(&peer_info, remote_cipher, &mut opts) {
+        Ok(c) => (c, None),
+        Err(why) => (None, Some(why)),
+    };
 
     let options_server = {
         let mut o = opts.clone();
@@ -1085,6 +1091,7 @@ fn try_parse_key_exchange(buf: &[u8]) -> io::Result<Option<(KeyExchange, usize)>
 
     let kx = KeyExchange {
         ncp_cipher,
+        cipher_refused,
         pre_master,
         random1,
         random2,
@@ -1127,6 +1134,51 @@ fn negotiate_cipher(peer_info: &HashMap<String, String>) -> io::Result<Option<&'
         .ok_or_else(|| invalid("client supports none of our data ciphers"))
 }
 
+/// Choose the data cipher and install it in `opts` (multi.c
+/// multi_client_setup_ncp): the negotiated one if the client negotiates,
+/// else the one its options string names (ssl_ncp.c tls_poor_mans_ncp).
+/// Returns the cipher to push -- `None` when the client keeps its own -- or
+/// why no usable cipher could be agreed on.
+fn select_cipher(
+    peer_info: &HashMap<String, String>,
+    remote: Option<&str>,
+    opts: &mut Options,
+) -> Result<Option<&'static str>, String> {
+    let ncp = negotiate_cipher(peer_info).map_err(|e| e.to_string())?;
+    match (ncp, remote) {
+        (Some(c), _) => opts.set_cipher(c)?,
+        (None, Some(c)) => opts
+            .set_cipher(c)
+            .map_err(|e| format!("client's data cipher {c:?} is not supported: {e}"))?,
+        // Such a client runs OpenVPN's old default, BF-CBC (options.c);
+        // guessing anything else would leave neither side able to decrypt.
+        (None, None) => {
+            return Err("client neither negotiates a data cipher nor names one, \
+                        so it uses BF-CBC, which is not supported"
+                .into());
+        }
+    }
+    data::check_supported(opts).map_err(|e| e.to_string())?;
+    Ok(ncp)
+}
+
+/// Take the `cipher` option out of an options string (options_string.c
+/// options_string_extract_option), returning the rest and its value.
+fn split_cipher(options: &str) -> (String, Option<&str>) {
+    let mut cipher = None;
+    let rest: Vec<&str> = options
+        .split(',')
+        .filter(|part| {
+            let (k, v) = part.split_once(' ').unwrap_or((part, ""));
+            if k == "cipher" {
+                cipher = Some(v);
+            }
+            k != "cipher"
+        })
+        .collect();
+    (rest.join(","), cipher)
+}
+
 fn build_kx_reply(server_random: &[u8; 64], kx: &KeyExchange) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.extend_from_slice(&0u32.to_be_bytes());
@@ -1147,6 +1199,10 @@ struct KeyExchange {
     /// The cipher chosen by negotiation, to be pushed; `None` for a client
     /// without NCP, which uses the cipher of its options string.
     ncp_cipher: Option<&'static str>,
+    /// Why no data cipher could be agreed on, if none could: the client is
+    /// then refused with AUTH_FAILED, as OpenVPN refuses a client whose
+    /// cipher negotiation fails (multi.c, CAS_FAILED).
+    cipher_refused: Option<String>,
     pre_master: [u8; 48],
     random1: [u8; 32],
     random2: [u8; 32],

@@ -839,6 +839,7 @@ fn real_client_options_string_is_accepted() {
 
 /// A client asking for a data channel without encryption, or CBC without
 /// an HMAC, is refused: the server will not run an unauthenticated tunnel.
+/// Like any client left without a data cipher, it is told AUTH_FAILED.
 #[test]
 fn insecure_data_channel_is_refused() {
     for opts in [
@@ -850,8 +851,74 @@ fn insecure_data_channel_is_refused() {
         client.kx.options = opts.into();
         assert!(drive_handshake(&mut server, &mut client));
         send_client_key_material(&mut client);
-        assert!(pump(&mut server, &mut client), "{opts}: must be refused");
-        assert!(server.peer_config().is_none());
+        pump(&mut server, &mut client);
+        assert!(server.peer_config().is_none(), "{opts}: must be refused");
+        assert!(
+            client
+                .control_text()
+                .windows(12)
+                .any(|w| w == b"AUTH_FAILED\0"),
+            "{opts}: client was not told"
+        );
+    }
+}
+
+/// A negotiating client's options string may name a cipher we lack --
+/// a 2.4 client's default `cipher BF-CBC`, say. Negotiation overrides it,
+/// so it is no reason to refuse the client.
+#[test]
+fn negotiating_client_may_name_an_unsupported_cipher() {
+    let mut server = Peer::new(server_config(), *b"SERVERID", auth_hook()).unwrap();
+    let mut client = TestClient::new(*b"CLIENTID");
+    client.kx.options = "V4,dev-type tun,link-mtu 1542,tun-mtu 1500,proto UDPv4,\
+                         cipher BF-CBC,auth SHA1,keysize 128,key-method 2,tls-client"
+        .into();
+    client.kx.peer_info = Some("IV_VER=2.4.12\nIV_NCP=2\n".into());
+    let keys = connect(&mut server, &mut client);
+    assert_eq!(
+        deliver(&mut server, &keys, 1, b"hello"),
+        Some(b"hello".to_vec())
+    );
+}
+
+/// A client that does not negotiate (no IV_NCP=2, no IV_CIPHERS) uses the
+/// cipher its options string names. One that names none runs OpenVPN's
+/// historical default, BF-CBC, which is not implemented here; so is a named
+/// BF-CBC. Guessing another cipher would leave both ends unable to decrypt
+/// each other, so the client is refused the way OpenVPN refuses a failed
+/// cipher negotiation: AUTH_FAILED, and the session ends shortly after.
+#[test]
+fn client_without_a_usable_cipher_is_refused() {
+    use crate::time::Instant;
+    use std::time::Duration;
+
+    for opts in [
+        "V4,dev-type tun,link-mtu 1542,tun-mtu 1500,proto UDPv4,auth SHA1,keysize 128,\
+         key-method 2,tls-client",
+        "V4,dev-type tun,link-mtu 1542,tun-mtu 1500,proto UDPv4,cipher BF-CBC,auth SHA1,\
+         keysize 128,key-method 2,tls-client",
+    ] {
+        let mut server = Peer::new(server_config(), *b"SERVERID", auth_hook()).unwrap();
+        let mut client = TestClient::new(*b"CLIENTID");
+        client.kx.options = opts.into();
+        client.kx.peer_info = Some("IV_VER=2.3.18\nIV_PLAT=linux\n".into());
+        assert!(drive_handshake(&mut server, &mut client));
+        send_client_key_material(&mut client);
+        pump(&mut server, &mut client);
+        assert!(server.peer_config().is_none(), "{opts}: must be refused");
+        assert!(
+            client
+                .control_text()
+                .windows(12)
+                .any(|w| w == b"AUTH_FAILED\0"),
+            "{opts}: client was not told"
+        );
+        let out = server
+            .tick(Instant::now() + Duration::from_secs(6))
+            .unwrap();
+        assert!(out.close, "{opts}: session should end after AUTH_FAILED");
+        let why = out.error.expect("reason").to_string();
+        assert!(why.contains("cipher"), "{opts}: unclear reason {why:?}");
     }
 }
 
