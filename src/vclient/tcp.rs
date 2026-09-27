@@ -557,10 +557,13 @@ impl TcpStack {
 
     /// Open a connection and send the SYN, without waiting for the answer.
     pub fn start_dial(&self, local_ip: IpAddr, remote: SocketAddr) -> io::Result<Arc<ConnState>> {
-        self.check_open()?;
         // The port is picked and the connection registered under the one
-        // lock, so two dials cannot pick the same 4-tuple.
+        // lock, so two dials cannot pick the same 4-tuple. `stop` is checked
+        // under it too, as `shutdown` drains the table after setting it: a
+        // dial checked before the lock could register after the drain and
+        // be left open on a stack that will never serve it.
         let mut conns = self.conns.lock().unwrap();
+        self.check_open()?;
         let listeners = self.listeners.lock().unwrap();
         let local_port = pick_port(&mut self.next_port.lock().unwrap(), local_ip, remote, |p| {
             listeners.contains_key(&p)
@@ -655,8 +658,10 @@ impl TcpStack {
     /// kept in `own`. Returns a [`Listener`] whose `accept` yields completed
     /// inbound connections.
     pub fn listen(self: &Arc<Self>, own: Arc<Mutex<IpPrefix>>, port: u16) -> io::Result<Listener> {
-        self.check_open()?;
+        // Under the table lock, which `shutdown` drains after setting
+        // `stop`: see `start_dial`.
         let mut listeners = self.listeners.lock().unwrap();
+        self.check_open()?;
         if listeners.contains_key(&port) {
             return Err(io::Error::new(
                 io::ErrorKind::AddrInUse,
@@ -846,7 +851,15 @@ impl TcpStack {
         let mut conn = Conn::new(cfg);
         let synack = conn.accept_syn(syn);
         let state = ConnState::new(key, local_ip, conn, self.sink.clone(), Some(listener));
-        self.conns.lock().unwrap().insert(key, state.clone());
+        {
+            // A SYN racing `shutdown` past `handle_inbound`'s own check must
+            // not leave a connection behind once the table has been drained.
+            let mut conns = self.conns.lock().unwrap();
+            if self.check_open().is_err() {
+                return;
+            }
+            conns.insert(key, state.clone());
+        }
         state.wrap_and_send(synack);
     }
 
@@ -1230,6 +1243,37 @@ mod tests {
         pkt[20 + 16] ^= 0x40;
         stack.handle_inbound(Packet::from_slice(&pkt), IpAddr::V4(US));
         assert_eq!(stack.conns.lock().unwrap().len(), 1);
+    }
+
+    /// A listener or dial racing `shutdown` either fails or is closed by it:
+    /// none is left registered on a stack that will never serve it.
+    #[test]
+    fn nothing_opened_during_shutdown_outlives_it() {
+        // The interleaving is forced: the opener is held at the table lock,
+        // past any check it makes before it, while `shutdown` sets `stop`
+        // and drains that table, as it does when it gets there first.
+        let (stack, _out) = capturing_stack();
+        let listeners = stack.listeners.lock().unwrap();
+        let s = stack.clone();
+        let t = std::thread::spawn(move || s.listen(own(US), 80).map(drop));
+        std::thread::sleep(Duration::from_millis(50));
+        *stack.stop.lock().unwrap() = true;
+        drop(listeners);
+        assert!(t.join().unwrap().is_err(), "listened on a closed stack");
+        assert!(stack.listeners.lock().unwrap().is_empty());
+
+        let (stack, _out) = capturing_stack();
+        let conns = stack.conns.lock().unwrap();
+        let s = stack.clone();
+        let t = std::thread::spawn(move || {
+            s.start_dial(IpAddr::V4(US), SocketAddr::from((PEER, 80)))
+                .map(drop)
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        *stack.stop.lock().unwrap() = true;
+        drop(conns);
+        assert!(t.join().unwrap().is_err(), "dialled on a closed stack");
+        assert!(stack.conns.lock().unwrap().is_empty());
     }
 
     #[test]
