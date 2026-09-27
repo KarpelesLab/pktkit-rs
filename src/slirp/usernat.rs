@@ -383,10 +383,36 @@ impl Stack {
         Ok(listener)
     }
 
-    /// Shut the stack down: close every in-flight connection and stop
-    /// the maintenance thread.
+    /// Shut the stack down: close every listener and in-flight connection,
+    /// and stop the maintenance thread.
     pub fn shutdown(&self) -> Result<()> {
         self.inner.closed.store(true, Ordering::Release);
+        // A listener outlives the stack in the application's hands, and
+        // nothing will ever feed its queue again: close it, or a thread
+        // parked in `accept` waits forever. Collected first, as closing
+        // unregisters through these same table locks.
+        let listeners: Vec<Arc<Listener>> = self
+            .inner
+            .listeners
+            .lock()
+            .expect("poisoned")
+            .values()
+            .filter_map(Weak::upgrade)
+            .collect();
+        let listeners6: Vec<Arc<Listener6>> = self
+            .inner
+            .listeners6
+            .lock()
+            .expect("poisoned")
+            .values()
+            .filter_map(Weak::upgrade)
+            .collect();
+        for l in listeners {
+            let _ = l.close();
+        }
+        for l in listeners6 {
+            let _ = l.close();
+        }
         Self::close_flows(&self.inner, |_| true);
         // Namespace sides point back at the stack; dropping them here breaks
         // that cycle for peers whose cleanup never runs.
@@ -2643,5 +2669,30 @@ mod tests {
             L3Device::send(&*s, Packet::from_slice(&f)).unwrap();
         }
         assert!(!captured.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn shutdown_wakes_threads_blocked_in_accept() {
+        use std::sync::mpsc;
+        let s = Stack::new();
+        let l = s.listen("tcp", "10.0.0.1:80").unwrap();
+        let l6 = s.listen6("[fd00::1]:80").unwrap();
+        let (tx, rx) = mpsc::channel();
+        let tx6 = tx.clone();
+        thread::spawn(move || {
+            let _ = tx.send(l.accept().is_err());
+        });
+        thread::spawn(move || {
+            let _ = tx6.send(l6.accept().is_err());
+        });
+        // Let both threads park in accept before the stack goes away.
+        thread::sleep(Duration::from_millis(50));
+        drop(s);
+        for _ in 0..2 {
+            let failed = rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("accept still blocked after the stack shut down");
+            assert!(failed);
+        }
     }
 }
