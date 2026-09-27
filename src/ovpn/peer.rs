@@ -95,13 +95,16 @@ impl PeerConfig {
 /// Authentication callback: given the credentials, return the IP config to push
 /// or an error to reject the connection.
 ///
-/// Threading: the [`Server`](super::Server) calls it on a thread of its
-/// own, one per authentication, with no lock held -- the way OpenVPN defers
-/// authentication to a plugin or script (`KS_AUTH_DEFERRED`). It may take
-/// its time (asking an auth backend, say) without holding up other
-/// clients, and may call back into the server, `send_to_peer` included. The
-/// client's handshake window bounds how long it has: a verdict that comes
-/// later is discarded, along with the session. It can still be running when
+/// Threading: the [`Server`](super::Server) calls it on auth threads of
+/// its own, with no lock held -- the way OpenVPN defers authentication to a
+/// plugin or script (`KS_AUTH_DEFERRED`). It may take its time (asking an
+/// auth backend, say) without holding up other clients, and may call back
+/// into the server, `send_to_peer` included. At most
+/// [`max_auth_threads`](super::ServerConfig::max_auth_threads) calls run at
+/// once, and one client's run one at a time; the others wait their turn.
+/// The client's handshake window bounds how long it has, waiting included:
+/// a verdict that comes later is discarded, along with the session. A
+/// panic counts as a refusal. It can still be running when
 /// [`Server::close`](super::Server::close) returns.
 ///
 /// A [`Peer`] used on its own calls it inline, from
@@ -605,19 +608,7 @@ impl Peer {
         result: io::Result<PeerConfig>,
     ) -> PeerOutput {
         let mut out = PeerOutput::default();
-        let pending = |s: &Option<Session>| {
-            s.as_ref().is_some_and(|s| {
-                s.primary
-                    .auth_pending
-                    .as_ref()
-                    .is_some_and(|(t, _)| *t == req.token)
-            })
-        };
-        let slot = if pending(&self.active) {
-            Slot::Active
-        } else if pending(&self.initial) {
-            Slot::Initial
-        } else {
+        let Some(slot) = self.awaiting(req) else {
             return out;
         };
         let session = self.session_mut(slot).expect("slot just resolved");
@@ -636,6 +627,32 @@ impl Peer {
             self.last_sent = Instant::now();
         }
         out
+    }
+
+    /// Whether a verdict on `req` would still be acted on: its key exchange
+    /// is still waiting for one. Checking credentials no longer awaited is
+    /// wasted work.
+    pub fn awaits(&self, req: &AuthRequest) -> bool {
+        self.awaiting(req).is_some()
+    }
+
+    /// The session whose key exchange awaits the verdict on `req`.
+    fn awaiting(&self, req: &AuthRequest) -> Option<Slot> {
+        let pending = |s: &Option<Session>| {
+            s.as_ref().is_some_and(|s| {
+                s.primary
+                    .auth_pending
+                    .as_ref()
+                    .is_some_and(|(t, _)| *t == req.token)
+            })
+        };
+        if pending(&self.active) {
+            Some(Slot::Active)
+        } else if pending(&self.initial) {
+            Some(Slot::Initial)
+        } else {
+            None
+        }
     }
 
     /// The session's newest key failed to negotiate (TLS error, timeout). A

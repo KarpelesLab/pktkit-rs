@@ -177,7 +177,7 @@ impl TestClient {
     }
 
     // Build the client hard reset datagram (pid 0, advancing out_counter).
-    fn hard_reset(&mut self) -> Vec<u8> {
+    pub(super) fn hard_reset(&mut self) -> Vec<u8> {
         let pkt = self.reliable.build_client_hard_reset();
         pkt.to_bytes(&[])
     }
@@ -204,7 +204,7 @@ impl TestClient {
         send
     }
 
-    fn pump_tls(&mut self, send: &mut Vec<Vec<u8>>) {
+    pub(super) fn pump_tls(&mut self, send: &mut Vec<Vec<u8>>) {
         // As an OpenVPN client, start TLS only once the server has answered
         // the hard reset: until then there is no session to send it on.
         let tls_out = if self.reliable.peer_id == [0; 8] {
@@ -230,7 +230,7 @@ impl TestClient {
         }
     }
 
-    fn handshake_done(&self) -> bool {
+    pub(super) fn handshake_done(&self) -> bool {
         self.tls.is_handshake_complete()
     }
 
@@ -264,6 +264,19 @@ impl TestClient {
         self.reliable = r;
         self.ctrl_buf.clear();
         self.reliable.build_soft_reset().to_bytes(&[])
+    }
+
+    /// Whether a control datagram from the server belongs to this client's
+    /// session, for tests running several clients over one socket.
+    pub(super) fn owns(&self, data: &[u8]) -> bool {
+        let Ok(p) = ControlPacket::parse(data) else {
+            return false;
+        };
+        if self.reliable.peer_id == [0; 8] {
+            p.remote_id == self.reliable.local_id
+        } else {
+            p.session_id == self.reliable.peer_id
+        }
     }
 
     /// Control-channel plaintext received so far.
@@ -1404,7 +1417,7 @@ fn auth_hook() -> OnAuth {
 }
 
 /// Write the client's key-method-2 blob and return its secret material.
-fn send_client_key_material(client: &mut TestClient) -> ([u8; 48], [u8; 32], [u8; 32]) {
+pub(super) fn send_client_key_material(client: &mut TestClient) -> ([u8; 48], [u8; 32], [u8; 32]) {
     let mut pre_master = [0u8; 48];
     let mut random1 = [0u8; 32];
     let mut random2 = [0u8; 32];
