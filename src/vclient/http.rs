@@ -108,6 +108,13 @@ impl Request {
     }
 
     /// Add a request header. A `Host` header replaces the one the URL gives.
+    ///
+    /// The body's framing is the library's: it always sends the body whole,
+    /// after a `Content-Length` of its own. A `Content-Length` added here
+    /// must therefore be the body's length, and `Transfer-Encoding` cannot
+    /// be added at all; the request then fails with
+    /// [`InvalidInput`](io::ErrorKind::InvalidInput) when sent, since a
+    /// server would read the body some other way than it goes out.
     pub fn header(mut self, name: &str, value: &str) -> Request {
         self.headers.push((name.to_string(), value.to_string()));
         self
@@ -139,10 +146,26 @@ impl Request {
         {
             let _ = write!(out, "Host: {}\r\n", host_header(&self.host, self.port));
         }
+        let framing = |what: &str| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{what}: the body is sent whole, after its Content-Length"),
+            )
+        };
         let mut have_len = false;
         let mut have_conn = false;
         for (k, v) in &self.headers {
+            // The body goes out as is, so a Transfer-Encoding would have the
+            // server decode what was never encoded, and a Content-Length
+            // other than the body's would have it take part of the body, or
+            // the next request, for this one's (RFC 9112 §6.1, §6.2).
+            if k.eq_ignore_ascii_case("transfer-encoding") {
+                return Err(framing("Transfer-Encoding cannot be set"));
+            }
             if k.eq_ignore_ascii_case("content-length") {
+                if content_length(v) != Some(self.body.len()) {
+                    return Err(framing("Content-Length is not the body's length"));
+                }
                 have_len = true;
             }
             if k.eq_ignore_ascii_case("connection") {
@@ -150,7 +173,14 @@ impl Request {
             }
             let _ = write!(out, "{k}: {v}\r\n");
         }
-        if !self.body.is_empty() && !have_len {
+        // A method that gives content a meaning gets a Content-Length even
+        // for an empty body (RFC 9110 §8.6), so the server knows there is
+        // none rather than waiting for it; one that does not, only when
+        // there is a body.
+        let expects_content = ["POST", "PUT", "PATCH"]
+            .iter()
+            .any(|m| self.method.eq_ignore_ascii_case(m));
+        if !have_len && (!self.body.is_empty() || expects_content) {
             let _ = write!(out, "Content-Length: {}\r\n", self.body.len());
         }
         if !have_conn {
@@ -894,6 +924,36 @@ mod tests {
         assert!(s.contains("Host: h\r\n"));
         assert!(s.contains("Content-Length: 3\r\n"));
         assert!(s.ends_with("\r\n\r\nabc"));
+    }
+
+    #[test]
+    fn body_framing_is_consistent() {
+        let wire = |req: Request| req.serialize().map(|w| String::from_utf8(w).unwrap());
+        let lengths = |s: &str| {
+            s.lines()
+                .filter(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+                .count()
+        };
+        // An empty POST still says so; a GET without a body says nothing.
+        let s = wire(Request::post("http://h/", Vec::new()).unwrap()).unwrap();
+        assert!(s.contains("Content-Length: 0\r\n"), "{s:?}");
+        let s = wire(Request::get("http://h/").unwrap()).unwrap();
+        assert_eq!(lengths(&s), 0);
+
+        // The caller's own Content-Length, if right, is the only one.
+        let post = || Request::post("http://h/", b"abc".to_vec()).unwrap();
+        let s = wire(post().header("content-length", "3")).unwrap();
+        assert_eq!(lengths(&s), 1);
+        // Anything that frames the body otherwise than it is sent is refused.
+        for (k, v) in [
+            ("Content-Length", "2"),
+            ("Content-Length", "x"),
+            ("Transfer-Encoding", "chunked"),
+            ("transfer-encoding", "gzip"),
+        ] {
+            let err = wire(post().header(k, v)).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{k}: {v}");
+        }
     }
 
     /// Feed `raw` in pieces of `step` bytes, then close.
