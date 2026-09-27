@@ -43,6 +43,9 @@ pub(crate) struct ConnState {
     signal: Condvar,
     /// Sink for fully-framed IP packets the engine wants to transmit.
     sink: Arc<dyn Fn(&[u8]) + Send + Sync>,
+    /// Packets on their way to `sink`, in the order the engine made them.
+    /// See [`ConnState::queue`].
+    outbox: Mutex<Outbox>,
     /// Set once the handshake has completed, so a connection that later
     /// closes is not mistaken for one that was refused.
     connected: AtomicBool,
@@ -63,6 +66,14 @@ pub(crate) struct ConnState {
     time_wait_since: Mutex<Option<Instant>>,
 }
 
+/// A connection's packets waiting for the sink.
+#[derive(Default)]
+struct Outbox {
+    queue: VecDeque<Vec<u8>>,
+    /// Someone is sending from `queue`, and will send whatever joins it.
+    emitting: bool,
+}
+
 impl ConnState {
     fn new(
         key: ConnKey,
@@ -77,6 +88,7 @@ impl ConnState {
             conn: Mutex::new(conn),
             signal: Condvar::new(),
             sink,
+            outbox: Mutex::default(),
             connected: AtomicBool::new(false),
             error: Mutex::new(None),
             opened: Instant::now(),
@@ -118,11 +130,66 @@ impl ConnState {
         self.error.lock().unwrap().get_or_insert(kind);
     }
 
-    fn wrap_and_send(&self, segments: Vec<Vec<u8>>) {
-        for seg in segments {
-            let pkt = wrap_segment(self.local_ip, self.key.remote, &seg);
-            (self.sink)(&pkt);
+    /// Put what the engine just produced in line to go out. Call it under
+    /// the conn lock, before letting go of it, and [`flush`](Self::flush)
+    /// once that is released: the order segments reach the queue is then
+    /// the order the engine made them in, whichever threads made them.
+    fn queue(&self, segments: Vec<Vec<u8>>) {
+        if segments.is_empty() {
+            return;
         }
+        let mut out = self.outbox.lock().unwrap();
+        for seg in segments {
+            out.queue
+                .push_back(wrap_segment(self.local_ip, self.key.remote, &seg));
+        }
+    }
+
+    /// Send what is queued, unless someone is already at it; they will
+    /// send it too, after what was queued before it.
+    ///
+    /// Over a synchronous link a send runs the peer, whose ACK comes back
+    /// on this very stack, into this connection, and opens the window for
+    /// more data before the rest of the burst has gone out. Sent there and
+    /// then, the new segments would overtake the old ones, and the peer,
+    /// seeing holes everywhere, would ACK its way into a retransmission
+    /// storm. Here the nested call only queues them, behind the burst, and
+    /// the outermost sender goes on to send them in order. It also keeps
+    /// such a ping-pong from recursing once per segment.
+    fn flush(&self) {
+        let mut out = self.outbox.lock().unwrap();
+        if out.emitting {
+            return;
+        }
+        out.emitting = true;
+        // Unset if the sink panics: the connection must not be left with
+        // nobody ever sending again. What it had not sent yet goes out
+        // with whatever is sent next.
+        struct Unwinding<'a>(&'a Mutex<Outbox>);
+        impl Drop for Unwinding<'_> {
+            fn drop(&mut self) {
+                if let Ok(mut out) = self.0.lock() {
+                    out.emitting = false;
+                }
+            }
+        }
+        while let Some(pkt) = out.queue.pop_front() {
+            drop(out);
+            let unwinding = Unwinding(&self.outbox);
+            (self.sink)(&pkt);
+            std::mem::forget(unwinding);
+            out = self.outbox.lock().unwrap();
+        }
+        // Still under the lock, so nothing can be queued between finding
+        // the queue empty and a sender that would then leave it there.
+        out.emitting = false;
+    }
+
+    /// [`queue`](Self::queue) and [`flush`](Self::flush), for segments
+    /// made where no other could be made at the same time.
+    fn wrap_and_send(&self, segments: Vec<Vec<u8>>) {
+        self.queue(segments);
+        self.flush();
     }
 
     /// For an inbound connection whose handshake has completed, hand it to
@@ -155,8 +222,10 @@ impl ConnState {
 
     /// Send a RST, close, and wake anyone waiting on the connection.
     fn abort(&self) {
-        let segs = self.conn.lock().unwrap().abort();
-        self.wrap_and_send(segs);
+        let mut conn = self.conn.lock().unwrap();
+        self.queue(conn.abort());
+        drop(conn);
+        self.flush();
         self.signal.notify_all();
     }
 }
@@ -290,9 +359,10 @@ impl TcpConn {
                 ));
             }
             let (n, segs) = conn.write(&buf[written..]);
+            self.state.queue(segs);
             drop(conn);
             if n > 0 {
-                self.state.wrap_and_send(segs);
+                self.state.flush();
                 written += n;
             } else if !may_block(&self.nonblocking) || deadline.is_some_and(|d| Instant::now() >= d)
             {
@@ -335,9 +405,9 @@ impl TcpConn {
                 // Reading can open the receive window; tell the peer now
                 // rather than on the next tick, which on wasm is whenever
                 // the caller gets round to it.
-                let segs = conn.take_outgoing();
+                self.state.queue(conn.take_outgoing());
                 drop(conn);
-                self.state.wrap_and_send(segs);
+                self.state.flush();
                 return Ok(n);
             }
             if conn.fin_received() || conn.is_closed() {
@@ -369,9 +439,9 @@ impl TcpConn {
     /// Initiate a graceful close (sends FIN).
     pub fn close(&self) -> io::Result<()> {
         let mut conn = self.state.conn.lock().unwrap();
-        let segs = conn.close();
+        self.state.queue(conn.close());
         drop(conn);
-        self.state.wrap_and_send(segs);
+        self.state.flush();
         Ok(())
     }
 }
@@ -398,8 +468,10 @@ impl Drop for TcpConn {
         // engine time out a peer that never finishes, and reset one that
         // keeps sending or whose data was left unread, as Linux does for an
         // orphaned socket.
-        let segs = self.state.conn.lock().unwrap().release();
-        self.state.wrap_and_send(segs);
+        let mut conn = self.state.conn.lock().unwrap();
+        self.state.queue(conn.release());
+        drop(conn);
+        self.state.flush();
     }
 }
 
@@ -701,7 +773,7 @@ impl TcpStack {
                 continue;
             }
             let ended = conn.fin_received();
-            let segs = conn.tick();
+            cs.queue(conn.tick());
             let closed = conn.is_closed();
             let state = conn.state();
             if closed && !ended {
@@ -713,9 +785,7 @@ impl TcpStack {
                 cs.fail(io::ErrorKind::TimedOut);
             }
             drop(conn);
-            if !segs.is_empty() {
-                cs.wrap_and_send(segs);
-            }
+            cs.flush();
             cs.signal.notify_all();
             if closed {
                 self.forget(&cs);
@@ -788,11 +858,10 @@ impl TcpStack {
         drop(conns);
 
         // Send SYN.
-        let segs = {
-            let mut conn = state.conn.lock().unwrap();
-            conn.connect()
-        };
-        state.wrap_and_send(segs);
+        let mut conn = state.conn.lock().unwrap();
+        state.queue(conn.connect());
+        drop(conn);
+        state.flush();
         Ok(state)
     }
 
@@ -921,7 +990,7 @@ impl TcpStack {
             existing = None;
         }
         if let Some(state) = existing {
-            let segs = {
+            {
                 let mut conn = state.conn.lock().unwrap();
                 // Closing marks the FIN as received too, so this tells a
                 // stream that had ended from one cut short.
@@ -947,14 +1016,12 @@ impl TcpStack {
                 if seg.has_flag(flags::RST) && conn.is_closed() && !ended {
                     state.fail(io::ErrorKind::ConnectionReset);
                 }
-                segs
-            };
+                state.queue(segs);
+            }
             // The client's sink contains a panicking handler, but a sink
             // that does not must still not cost this connection its accept
             // or its readers their wakeup: settle first, then let it go on.
-            let sent = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                state.wrap_and_send(segs)
-            }));
+            let sent = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| state.flush()));
             if !state.after_segment() {
                 self.forget(&state);
             }

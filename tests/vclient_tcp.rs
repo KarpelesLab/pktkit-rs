@@ -578,3 +578,94 @@ fn dropping_a_connection_with_unread_data_resets_it() {
         Ok(n) => panic!("read {n} bytes, expected a reset"),
     }
 }
+
+/// Records the TCP data segments (SEQ, length) a client sends.
+struct Sniff {
+    dev: Arc<pktkit::vclient::Client>,
+    log: Arc<Mutex<Vec<(u32, usize)>>>,
+}
+
+impl std::fmt::Debug for Sniff {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Sniff")
+    }
+}
+
+impl L3Device for Sniff {
+    fn set_handler(&self, h: pktkit::L3Handler) {
+        let log = self.log.clone();
+        self.dev.set_handler(Arc::new(move |p: &Packet| {
+            if let Ok(seg) = Segment::parse(p.payload())
+                && !seg.payload.is_empty()
+            {
+                log.lock().unwrap().push((seg.seq, seg.payload.len()));
+            }
+            h(p)
+        }));
+    }
+    fn send(&self, p: &Packet) -> pktkit::Result<()> {
+        self.dev.send(p)
+    }
+    fn addr(&self) -> IpPrefix {
+        self.dev.addr()
+    }
+    fn set_addr(&self, p: IpPrefix) -> pktkit::Result<()> {
+        self.dev.set_addr(p)
+    }
+    fn close(&self) -> pktkit::Result<()> {
+        self.dev.close()
+    }
+}
+
+/// Over a synchronous link every send runs the peer, and the peer's ACK
+/// comes back on the same stack, into the sender, before the rest of the
+/// sender's burst has gone out. The segments that ACK releases must still
+/// go out after that burst, not ahead of it: out of order, every burst
+/// looks like loss, and throughput collapses to a few Mbit/s of RTOs.
+#[test]
+fn bulk_transfer_over_a_synchronous_hub_stays_in_order() {
+    use std::io::Read;
+
+    const SIZE: usize = 8 << 20;
+    let (a, b) = (client(2), client(3));
+    let hub = Arc::new(pktkit::L3Hub::new());
+    let log: Arc<Mutex<Vec<(u32, usize)>>> = Arc::default();
+    let _ha = hub.connect(Sniff {
+        dev: a.clone(),
+        log: Arc::default(),
+    });
+    let _hb = hub.connect(Sniff {
+        dev: b.clone(),
+        log: log.clone(),
+    });
+    let listener = b.listen_tcp(LISTEN_PORT).unwrap();
+    let data: Vec<u8> = (0..SIZE).map(|i| (i * 7 + i / 4096) as u8).collect();
+    let sent = data.clone();
+    let server = std::thread::spawn(move || {
+        let mut s = listener.accept().unwrap();
+        s.write_all(&sent).unwrap();
+        s
+    });
+    let start = std::time::Instant::now();
+    let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3)), LISTEN_PORT);
+    let mut conn = a.dial_tcp(dst).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(60)));
+    let mut got = vec![0u8; SIZE];
+    conn.read_exact(&mut got).unwrap();
+    let took = start.elapsed();
+    let _server = server.join().unwrap();
+    assert!(got == data, "the stream arrived corrupted");
+
+    // Nothing was lost, so every data segment starts where the last ended.
+    let log = log.lock().unwrap();
+    let out_of_order = log
+        .windows(2)
+        .filter(|w| w[1].0 != w[0].0.wrapping_add(w[0].1 as u32))
+        .count();
+    assert_eq!(out_of_order, 0, "segments left out of order");
+    let limit = if cfg!(debug_assertions) { 20 } else { 2 };
+    assert!(
+        took < Duration::from_secs(limit),
+        "8 MiB took {took:?} over a lossless link"
+    );
+}
