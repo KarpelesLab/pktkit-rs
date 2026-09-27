@@ -94,7 +94,7 @@ sockets there, so the crate works as a sans-I/O stack that the embedder drives:
   method you call on a timer: `vclient::Client::tick` (TCP retransmits and
   keepalives, about every 100 ms), `ImpairL2::poll` / `ImpairL3::poll`
   (each returns when the next message is due), `dhcp::Client::tick` or
-  `L2Adapter::tick` (lease renewal), `wg::Handler::maintenance` and
+  `L2Adapter::tick` (lease renewal), `wg::Handler::poll_timers` (handshake retries, rekeys, keepalives) and `wg::Handler::maintenance`, and
   `nat::Nat::sweep`.
 
 On `wasm32-unknown-unknown` the clock and the entropy come from the page.

@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use crate::Result;
 use crate::wg::NoisePublicKey;
+use crate::wg::TimerAction;
 use crate::wg::handler::{Handler, PacketResult, PacketType};
 use crate::wg::multihandler::MultiHandler;
 
@@ -88,7 +89,16 @@ pub struct Server {
 
     peer_addrs: RwLock<std::collections::HashMap<NoisePublicKey, SocketAddr>>,
     peer_handlers: RwLock<std::collections::HashMap<NoisePublicKey, Arc<Handler>>>,
+    /// Plaintext waiting for a session with its peer: sent while there was
+    /// none (or it had expired), and flushed once a handshake completes.
+    staged: Mutex<std::collections::HashMap<NoisePublicKey, std::collections::VecDeque<Vec<u8>>>>,
 }
+
+/// Packets held per peer while a handshake is under way, as in the
+/// reference implementation. Past this, the oldest are dropped.
+const MAX_STAGED_PACKETS: usize = 128;
+/// How often the maintenance thread runs the protocol timers.
+const TIMER_TICK: Duration = Duration::from_millis(100);
 
 impl std::fmt::Debug for Server {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -137,6 +147,7 @@ impl Server {
             threads: Mutex::new(Vec::new()),
             peer_addrs: RwLock::new(std::collections::HashMap::new()),
             peer_handlers: RwLock::new(std::collections::HashMap::new()),
+            staged: Mutex::new(std::collections::HashMap::new()),
         }))
     }
 
@@ -157,7 +168,8 @@ impl Server {
             .spawn(move || {
                 let mut last = Instant::now();
                 while !done.load(Ordering::SeqCst) {
-                    thread::sleep(Duration::from_millis(200));
+                    thread::sleep(TIMER_TICK);
+                    me.run_timers();
                     if last.elapsed() >= interval {
                         if let Some(mh) = me.multi_handler.as_ref() {
                             mh.maintenance();
@@ -243,7 +255,77 @@ impl Server {
             }
         }
 
+        let peer = result.peer_key;
         self.dispatch(result, &handler, addr, conn);
+        if !peer.is_zero() {
+            self.flush_staged(&peer, &handler, addr, conn);
+        }
+    }
+
+    /// Send what the protocol timers ask for: handshake retries and rekeys,
+    /// keepalives. Without this nothing ever rekeyed, so a tunnel died when
+    /// its keypair reached REJECT_AFTER_TIME.
+    fn run_timers(&self) {
+        let actions: Vec<(Arc<Handler>, TimerAction)> =
+            if let Some(mh) = self.multi_handler.as_ref() {
+                mh.poll_timers()
+            } else if let Some(h) = self.handler.as_ref() {
+                h.poll_timers()
+                    .into_iter()
+                    .map(|a| (h.clone(), a))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+        if actions.is_empty() {
+            return;
+        }
+        let Some(conn) = self.conn.lock().expect("conn lock").clone() else {
+            return;
+        };
+        for (_, action) in actions {
+            match action {
+                TimerAction::SendHandshake { peer, packet }
+                | TimerAction::SendKeepalive { peer, packet } => {
+                    if let Some(addr) = self.peer_addr(&peer) {
+                        let _ = conn.send_to(&packet, addr);
+                    }
+                }
+                TimerAction::HandshakeFailed { peer } => {
+                    self.staged.lock().expect("staged lock").remove(&peer);
+                }
+            }
+        }
+    }
+
+    /// Send what was staged for `peer` once it has a session.
+    fn flush_staged(
+        &self,
+        peer: &NoisePublicKey,
+        handler: &Arc<Handler>,
+        addr: SocketAddr,
+        conn: &UdpSocket,
+    ) {
+        if !handler.has_session(peer) {
+            return;
+        }
+        let Some(queue) = self.staged.lock().expect("staged lock").remove(peer) else {
+            return;
+        };
+        for data in queue {
+            if let Ok(ct) = handler.encrypt(&data, peer) {
+                let _ = conn.send_to(&ct, addr);
+            }
+        }
+    }
+
+    fn stage(&self, peer: &NoisePublicKey, data: &[u8]) {
+        let mut staged = self.staged.lock().expect("staged lock");
+        let q = staged.entry(*peer).or_default();
+        if q.len() >= MAX_STAGED_PACKETS {
+            q.pop_front();
+        }
+        q.push_back(data.to_vec());
     }
 
     fn dispatch(
@@ -316,9 +398,21 @@ impl Server {
             .expect("conn lock")
             .clone()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "server not serving"))?;
-        let ct = handler.encrypt(data, peer_key)?;
-        conn.send_to(&ct, addr)?;
-        Ok(())
+        match handler.encrypt(data, peer_key) {
+            Ok(ct) => {
+                conn.send_to(&ct, addr)?;
+                Ok(())
+            }
+            // No usable keypair: the handler has asked for a handshake. Hold
+            // the packet for when it completes instead of losing it, and
+            // start the handshake now rather than on the next timer tick.
+            Err(e) if matches!(e.kind(), io::ErrorKind::NotConnected | io::ErrorKind::Other) => {
+                self.stage(peer_key, data);
+                self.run_timers();
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     pub fn peer_addr(&self, peer_key: &NoisePublicKey) -> Option<SocketAddr> {
@@ -387,5 +481,54 @@ impl Server {
             let _ = h.join();
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wg::handler::Config;
+
+    fn server(on_packet: OnPacketFn) -> (Arc<Server>, Arc<Handler>, SocketAddr) {
+        let h = Handler::new(Config::default()).unwrap();
+        let s = Server::new(
+            ServerConfig::default()
+                .handler(h.clone())
+                .on_packet(on_packet),
+        )
+        .unwrap();
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+        let addr = sock.local_addr().unwrap();
+        let s2 = s.clone();
+        thread::spawn(move || s2.serve(sock));
+        // Let serve() install the socket.
+        while s.conn.lock().unwrap().is_none() {
+            thread::sleep(Duration::from_millis(1));
+        }
+        (s, h, addr)
+    }
+
+    /// Data sent before the handshake completes is held and delivered once
+    /// it does, not lost.
+    #[test]
+    fn data_sent_during_the_handshake_arrives() {
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let tx = Mutex::new(tx);
+        let (b, hb, b_addr) = server(Arc::new(move |d: &[u8], _, _| {
+            let _ = tx.lock().unwrap().send(d.to_vec());
+        }));
+        let (a, ha, _) = server(Arc::new(|_, _, _| {}));
+        ha.add_peer(hb.public_key());
+        hb.add_peer(ha.public_key());
+
+        a.connect(&hb.public_key(), b_addr).unwrap();
+        a.send(b"first", &hb.public_key()).unwrap();
+        a.send(b"second", &hb.public_key()).unwrap();
+        let got: Vec<Vec<u8>> = (0..2)
+            .map(|_| rx.recv_timeout(Duration::from_secs(5)).expect("lost"))
+            .collect();
+        assert_eq!(got, vec![b"first".to_vec(), b"second".to_vec()]);
+        a.close().unwrap();
+        b.close().unwrap();
     }
 }

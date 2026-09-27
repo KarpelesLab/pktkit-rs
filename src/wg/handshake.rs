@@ -192,6 +192,7 @@ pub(crate) fn initiate_handshake(h: &Handler, peer_key: &NoisePublicKey) -> Resu
     h.cookie_add_macs(peer_key, &mut pkt);
 
     zeroize(&mut key);
+    h.with_timers(peer_key, |t| t.initiation_sent(Instant::now()));
     Ok(pkt)
 }
 
@@ -294,6 +295,10 @@ pub(crate) fn process_handshake_response(h: &Handler, data: &[u8]) -> Result<Pac
             "no pending handshake",
         ));
     }
+    h.with_timers(&hs.remote_static, |t| {
+        t.handshake_complete();
+        t.packet_received(Instant::now(), false);
+    });
 
     // Bind remote index/eph for later use (also touches the local copy).
     hs.remote_index = sender_idx;

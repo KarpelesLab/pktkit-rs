@@ -15,6 +15,7 @@ use crate::wg::constants::{
 };
 use crate::wg::crypto::{aead_open, aead_seal_in_place};
 use crate::wg::handler::{Handler, PacketResult, PacketType};
+use crate::wg::timers::{KEEPALIVE_TIMEOUT, REKEY_TIMEOUT};
 
 /// Total wire size of an encrypted WireGuard packet for the given plaintext
 /// length: 16-byte header + plaintext + 16-byte tag.
@@ -78,6 +79,19 @@ pub(crate) fn process_data_packet(h: &Handler, data: &[u8]) -> Result<PacketResu
     h.received_with_keypair(&kp);
 
     let peer_key = kp.peer_key;
+    let age = Instant::now().duration_since(kp.created);
+    let is_current = h.is_current_keypair(&kp);
+    h.with_timers(&peer_key, |t| {
+        t.packet_received(Instant::now(), !plaintext.is_empty());
+        // Whitepaper §6.2: the initiator rekeys ahead of expiry even if it
+        // only receives, or a one-way flow would die at REJECT_AFTER_TIME.
+        if is_current
+            && kp.is_initiator
+            && age >= REJECT_AFTER_TIME - KEEPALIVE_TIMEOUT - REKEY_TIMEOUT
+        {
+            t.want_handshake = true;
+        }
+    });
 
     // Update session last-received timestamp.
     h.touch_session_received(&peer_key);
@@ -139,16 +153,23 @@ pub(crate) fn encrypt_into(
         });
     }
 
-    let (kp, kp_age) = h
-        .with_current_keypair(peer_key)
-        .ok_or(EncryptError::NoSession)?;
+    // Anything that stops us sending calls for a handshake.
+    let want_handshake = |h: &Handler| {
+        h.with_timers(peer_key, |t| t.want_handshake = true);
+    };
+    let Some((kp, kp_age)) = h.with_current_keypair(peer_key) else {
+        want_handshake(h);
+        return Err(EncryptError::NoSession);
+    };
     if kp_age > REJECT_AFTER_TIME {
+        want_handshake(h);
         return Err(EncryptError::KeypairExpired);
     }
 
     // Increment per-keypair counter (starts at 0).
     let counter = kp.send_counter.fetch_add(1, Ordering::SeqCst);
     if counter >= REJECT_AFTER_MESSAGES {
+        want_handshake(h);
         return Err(EncryptError::MessageLimitExceeded);
     }
 
@@ -166,6 +187,14 @@ pub(crate) fn encrypt_into(
     );
 
     let rekey = counter >= REKEY_AFTER_MESSAGES || kp_age >= REKEY_AFTER_TIME;
+    h.with_timers(peer_key, |t| {
+        t.packet_sent(Instant::now(), !data.is_empty());
+        // Whitepaper §6.2: only the initiator rekeys on age, so both ends do
+        // not start one at once; either rekeys on the message count.
+        if counter >= REKEY_AFTER_MESSAGES || (kp.is_initiator && kp_age >= REKEY_AFTER_TIME) {
+            t.want_handshake = true;
+        }
+    });
     Ok((needed, rekey))
 }
 

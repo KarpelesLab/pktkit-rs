@@ -196,6 +196,15 @@ impl MultiHandler {
         ))
     }
 
+    /// Run [`Handler::poll_timers`] on every member, pairing each action
+    /// with the identity it belongs to.
+    pub fn poll_timers(&self) -> Vec<(Arc<Handler>, crate::wg::TimerAction)> {
+        let g = self.handlers.read().expect("multihandler lock");
+        g.iter()
+            .flat_map(|h| h.poll_timers().into_iter().map(|a| (h.clone(), a)))
+            .collect()
+    }
+
     /// Run [`Handler::maintenance`] on every member.
     pub fn maintenance(&self) {
         let g = self.handlers.read().expect("multihandler lock");

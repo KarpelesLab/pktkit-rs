@@ -20,6 +20,7 @@ use crate::wg::constants::{
 };
 use crate::wg::crypto::x25519_public;
 use crate::wg::replay::SlidingWindow;
+use crate::wg::timers::{PeerTimers, TimerAction};
 use crate::wg::transport::EncryptError;
 
 /// Callback invoked when a handshake arrives from a peer not in the authorized
@@ -112,6 +113,7 @@ struct PeerEntry {
     has_timestamp: bool,
     /// Initiator-side cookie state: writes MAC1/MAC2 on outgoing handshakes.
     cookie_gen: Mutex<crate::wg::cookie::CookieGenerator>,
+    timers: Mutex<PeerTimers>,
 }
 
 impl PeerEntry {
@@ -126,6 +128,7 @@ impl PeerEntry {
             last_timestamp: [0u8; TAI64N_TIMESTAMP_SIZE],
             has_timestamp: false,
             cookie_gen: Mutex::new(crate::wg::cookie::CookieGenerator::new(&key)),
+            timers: Mutex::new(PeerTimers::default()),
         }
     }
 }
@@ -146,7 +149,6 @@ pub(crate) struct Keypair {
     pub local_index: u32,
     pub remote_index: u32,
     pub peer_key: NoisePublicKey,
-    #[allow(dead_code)]
     pub is_initiator: bool,
     pub replay_filter: SlidingWindow,
 }
@@ -448,6 +450,62 @@ impl Handler {
             .is_some()
     }
 
+    /// Keep sending keepalives to `peer_key` whenever nothing else has gone
+    /// to it for `interval`, so a NAT or stateful firewall between the two
+    /// keeps its mapping (whitepaper §6.5). `None` turns it off.
+    pub fn set_persistent_keepalive(&self, peer_key: &NoisePublicKey, interval: Option<Duration>) {
+        self.with_timers(peer_key, |t| t.persistent_keepalive = interval);
+    }
+
+    /// Run the protocol timers (whitepaper §6) and return what they want
+    /// sent: handshake retries and rekeys, keepalives, and notice of
+    /// handshakes abandoned after `REKEY_ATTEMPT_TIME`. Call this every
+    /// 100 ms or so. [`Server`](crate::wg::Server) does it for you; without
+    /// one, the caller sends each packet to the peer's endpoint.
+    pub fn poll_timers(&self) -> Vec<TimerAction> {
+        let now = Instant::now();
+        let peers: Vec<NoisePublicKey> = self.peers().into_iter().collect();
+        let mut out = Vec::new();
+        for peer in peers {
+            let Some((due, keepalive)) =
+                self.with_timers(&peer, |t| (t.handshake_due(now), t.keepalive_due(now)))
+            else {
+                continue;
+            };
+            match due {
+                None => out.push(TimerAction::HandshakeFailed { peer }),
+                Some(true) => {
+                    if let Ok(packet) = self.initiate_handshake(&peer) {
+                        out.push(TimerAction::SendHandshake { peer, packet });
+                    }
+                }
+                Some(false) => {}
+            }
+            if keepalive {
+                if self.has_session(&peer) {
+                    if let Ok(packet) = self.encrypt(&[], &peer) {
+                        out.push(TimerAction::SendKeepalive { peer, packet });
+                    }
+                } else {
+                    // A keepalive needs a keypair; get one.
+                    self.with_timers(&peer, |t| t.want_handshake = true);
+                }
+            }
+        }
+        out
+    }
+
+    pub(crate) fn with_timers<R>(
+        &self,
+        peer_key: &NoisePublicKey,
+        f: impl FnOnce(&mut PeerTimers) -> R,
+    ) -> Option<R> {
+        let peers = self.peers.read().expect("peers lock");
+        let p = peers.get(peer_key)?;
+        let mut t = p.timers.lock().expect("timers lock");
+        Some(f(&mut t))
+    }
+
     /// Run periodic cleanup: drop stale handshakes and inactive sessions.
     pub fn maintenance(&self) {
         self.cleanup_handshakes();
@@ -502,6 +560,10 @@ impl Handler {
         hs: crate::wg::handshake::Handshake,
     ) -> Result<()> {
         let mut g = self.handshakes.lock().expect("handshakes lock");
+        // One pending initiation per peer, as in the reference: a retry
+        // supersedes the last, and a response to the old one is refused.
+        // Keeping them would stack up an entry per retry.
+        g.retain(|_, old| old.remote_static != hs.remote_static);
         if g.len() >= crate::wg::constants::MAX_HANDSHAKES && !g.contains_key(&idx) {
             return Err(io::Error::other("handshake table full"));
         }
@@ -612,6 +674,15 @@ impl Handler {
         self.install(peer_key, kp, |s, kp| {
             s.keypair_next.replace(kp).into_iter().collect()
         })
+    }
+
+    pub(crate) fn is_current_keypair(&self, kp: &Arc<Keypair>) -> bool {
+        self.sessions
+            .read()
+            .expect("sessions lock")
+            .get(&kp.peer_key)
+            .and_then(|s| s.keypair_current.as_ref())
+            .is_some_and(|c| Arc::ptr_eq(c, kp))
     }
 
     /// A transport packet authenticated under `kp`. If that is the session's
@@ -1019,6 +1090,84 @@ mod tests {
             .collect();
         assert_eq!(tys[..3], [PacketType::HandshakeResponse; 3]);
         assert_eq!(tys[3..], [PacketType::CookieReply; 2]);
+    }
+
+    fn timer_actions(h: &Handler) -> Vec<&'static str> {
+        h.poll_timers()
+            .iter()
+            .map(|a| match a {
+                TimerAction::SendHandshake { .. } => "handshake",
+                TimerAction::SendKeepalive { .. } => "keepalive",
+                TimerAction::HandshakeFailed { .. } => "failed",
+            })
+            .collect()
+    }
+
+    fn rewind(h: &Handler, peer: &NoisePublicKey, by: Duration) {
+        h.with_timers(peer, |t| {
+            let back = |x: &mut Option<Instant>| {
+                if let Some(v) = x {
+                    *v = v.checked_sub(by).unwrap();
+                }
+            };
+            back(&mut t.attempt_started);
+            back(&mut t.last_initiation);
+            back(&mut t.keepalive_due_since);
+            back(&mut t.reply_due_since);
+            back(&mut t.last_sent);
+        });
+    }
+
+    #[test]
+    fn an_unanswered_initiation_is_sent_again() {
+        let (a, b) = pair();
+        a.initiate_handshake(&b.public_key()).unwrap();
+        assert!(timer_actions(&a).is_empty());
+        rewind(&a, &b.public_key(), Duration::from_secs(6));
+        assert_eq!(timer_actions(&a), ["handshake"]);
+        rewind(&a, &b.public_key(), crate::wg::REKEY_ATTEMPT_TIME);
+        assert_eq!(timer_actions(&a), ["failed"]);
+    }
+
+    /// Past REKEY_AFTER_MESSAGES the next send starts a new handshake:
+    /// before, the rekey signal was dropped and the tunnel ran into the
+    /// hard limits.
+    #[test]
+    fn sending_past_the_rekey_limit_starts_a_handshake() {
+        let (a, b) = pair();
+        handshake(&a, &b);
+        rewind(&a, &b.public_key(), Duration::from_secs(6));
+        assert!(timer_actions(&a).is_empty());
+        let kp = a.sessions.read().unwrap()[&b.public_key()]
+            .keypair_current
+            .clone()
+            .unwrap();
+        kp.send_counter.store(
+            crate::wg::constants::REKEY_AFTER_MESSAGES,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        a.encrypt(b"x", &b.public_key()).unwrap();
+        assert_eq!(timer_actions(&a), ["handshake"]);
+    }
+
+    /// Data received and nothing sent back for KEEPALIVE_TIMEOUT: send a
+    /// keepalive, so the sender knows the session is alive.
+    #[test]
+    fn received_data_is_answered_with_a_keepalive() {
+        let (a, b) = pair();
+        handshake(&a, &b);
+        let pkt = a.encrypt(b"ping", &b.public_key()).unwrap();
+        b.process_packet(&pkt, &loopback()).unwrap();
+        assert!(timer_actions(&b).is_empty());
+        rewind(&b, &a.public_key(), crate::wg::KEEPALIVE_TIMEOUT);
+        assert_eq!(timer_actions(&b), ["keepalive"]);
+    }
+
+    #[test]
+    fn sending_with_no_session_asks_for_a_handshake() {
+        let (a, b) = pair();
+        assert!(a.encrypt(b"x", &b.public_key()).is_err());
+        assert_eq!(timer_actions(&a), ["handshake"]);
     }
 
     #[test]
