@@ -131,10 +131,10 @@ pub struct Nat {
     ns_counter: AtomicU64,
     ns_sides: Mutex<HashMap<u64, Arc<NatNsSide>>>,
 
-    /// Self-reference held in the `Arc` returned by `new`. The two side
+    /// Self-reference held in the `Arc` returned by `new`. The side
     /// devices need to find their parent without taking an `Arc<Nat>`
     /// directly (avoids a reference cycle through `Arc<Self>`).
-    self_ref: Mutex<Weak<Nat>>,
+    self_ref: Weak<Nat>,
 
     /// Set once an ALG has resized a TCP payload; until then no segment
     /// needs its sequence numbers looked at.
@@ -251,11 +251,13 @@ impl Nat {
     /// Construct a new NAT with the given inside (private) and outside (public)
     /// prefixes.
     pub fn new(inside_addr: IpPrefix, outside_addr: IpPrefix) -> Arc<Nat> {
-        let inside = Arc::new(NatSide::new(true, inside_addr));
-        let outside = Arc::new(NatSide::new(false, outside_addr));
-        let nat = Arc::new(Nat {
-            inside: inside.clone(),
-            outside: outside.clone(),
+        // Built cyclic so each side holds its parent from the start, with
+        // no lock to take on the packet path: a lock held there would be
+        // held through delivery, deadlocking a handler that replies from
+        // inside it and poisoned by one that panics.
+        Arc::new_cyclic(|me: &Weak<Nat>| Nat {
+            inside: Arc::new(NatSide::new(true, inside_addr, me.clone())),
+            outside: Arc::new(NatSide::new(false, outside_addr, me.clone())),
             inner: Mutex::new(NatInner {
                 mappings: HashMap::new(),
                 reverse: HashMap::new(),
@@ -268,17 +270,12 @@ impl Nat {
             defragger: Mutex::new(None),
             ns_counter: AtomicU64::new(0),
             ns_sides: Mutex::new(HashMap::new()),
-            self_ref: Mutex::new(Weak::new()),
+            self_ref: me.clone(),
             seqadj_used: AtomicBool::new(false),
             frags: Mutex::new(FragTable::default()),
             out_frags: Mutex::new(FragTable::default()),
             next_sweep: Mutex::new(Instant::now() + SWEEP_INTERVAL),
-        });
-        *nat.self_ref.lock().unwrap() = Arc::downgrade(&nat);
-        // Wire each side back to the NAT.
-        inside.set_parent(Arc::downgrade(&nat));
-        outside.set_parent(Arc::downgrade(&nat));
-        nat
+        })
     }
 
     /// Returns the inside L3 device (faces the private network).
@@ -1898,15 +1895,18 @@ impl Nat {
 impl L3Connector for Nat {
     fn connect_l3(&self, dev: Arc<dyn L3Device>) -> Result<crate::Cleanup> {
         let ns = self.ns_counter.fetch_add(1, Ordering::SeqCst) + 1;
-        let side = Arc::new(NatNsSide::new(ns, self.inside.addr()));
-        side.set_parent(self.self_ref.lock().unwrap().clone());
+        let side = Arc::new(NatNsSide::new(
+            ns,
+            self.inside.addr(),
+            self.self_ref.clone(),
+        ));
 
         // Bidirectional wire-up.
         connect_l3(side.clone() as Arc<dyn L3Device>, dev);
 
         self.ns_sides.lock().unwrap().insert(ns, side);
 
-        let self_ref = self.self_ref.lock().unwrap().clone();
+        let self_ref = self.self_ref.clone();
         Ok(Box::new(move || -> Result<()> {
             if let Some(nat) = self_ref.upgrade() {
                 nat.ns_sides.lock().unwrap().remove(&ns);
@@ -1943,21 +1943,17 @@ pub(crate) struct NatSide {
     is_inside: bool,
     handler: Mutex<Option<L3Handler>>,
     addr: Mutex<IpPrefix>,
-    parent: Mutex<Weak<Nat>>,
+    parent: Weak<Nat>,
 }
 
 impl NatSide {
-    fn new(is_inside: bool, addr: IpPrefix) -> NatSide {
+    fn new(is_inside: bool, addr: IpPrefix, parent: Weak<Nat>) -> NatSide {
         NatSide {
             is_inside,
             handler: Mutex::new(None),
             addr: Mutex::new(addr),
-            parent: Mutex::new(Weak::new()),
+            parent,
         }
-    }
-
-    fn set_parent(&self, w: Weak<Nat>) {
-        *self.parent.lock().unwrap() = w;
     }
 
     /// Deliver a packet to whoever is listening on this side.
@@ -1979,7 +1975,7 @@ impl L3Device for NatSide {
         if bytes.len() < 20 || bytes[0] >> 4 != 4 {
             return Ok(());
         }
-        if let Some(nat) = self.parent.lock().unwrap().upgrade() {
+        if let Some(nat) = self.parent.upgrade() {
             if self.is_inside {
                 nat.handle_outbound(0, bytes);
             } else {
@@ -2007,20 +2003,17 @@ struct NatNsSide {
     ns: u64,
     handler: Mutex<Option<L3Handler>>,
     addr: Mutex<IpPrefix>,
-    parent: Mutex<Weak<Nat>>,
+    parent: Weak<Nat>,
 }
 
 impl NatNsSide {
-    fn new(ns: u64, addr: IpPrefix) -> NatNsSide {
+    fn new(ns: u64, addr: IpPrefix, parent: Weak<Nat>) -> NatNsSide {
         NatNsSide {
             ns,
             handler: Mutex::new(None),
             addr: Mutex::new(addr),
-            parent: Mutex::new(Weak::new()),
+            parent,
         }
-    }
-    fn set_parent(&self, w: Weak<Nat>) {
-        *self.parent.lock().unwrap() = w;
     }
     fn deliver(&self, pkt: &Packet) {
         let h = self.handler.lock().unwrap().clone();
@@ -2039,7 +2032,7 @@ impl L3Device for NatNsSide {
         if bytes.len() < 20 || bytes[0] >> 4 != 4 {
             return Ok(());
         }
-        if let Some(nat) = self.parent.lock().unwrap().upgrade() {
+        if let Some(nat) = self.parent.upgrade() {
             nat.handle_outbound(self.ns, bytes);
         }
         Ok(())
@@ -3954,5 +3947,74 @@ mod tests {
             inner.forwards.by_endpoint.len(),
             inner.forwards.by_port.len()
         );
+    }
+
+    /// Run `f` on its own thread and fail if it does not return: a
+    /// deadlock would otherwise hang the test run.
+    fn within_3s(f: impl FnOnce() + Send + 'static) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            f();
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_secs(3)).is_ok(),
+            "deadlocked"
+        );
+    }
+
+    #[test]
+    fn hairpin_to_a_synchronously_answering_host_does_not_deadlock() {
+        within_3s(|| {
+            let nat = Nat::new(pfx("10.0.0.1/24"), pfx("203.0.113.1/24"));
+            let server = Ipv4Addr::new(10, 0, 0, 50);
+            nat.add_port_forward(PortForward::new(PROTO_TCP, 8080, server, 80))
+                .unwrap();
+            // The inside network answers the forwarded server's SYN from
+            // within the delivery, as a virtual host on the same thread would.
+            let got = Arc::new(StdMutex::new(Vec::<Vec<u8>>::new()));
+            let (w, g) = (Arc::downgrade(&nat), got.clone());
+            nat.inside().set_handler(Arc::new(move |p| {
+                let p = p.as_bytes().to_vec();
+                g.lock().unwrap().push(p.clone());
+                if p[16..20] == server.octets() {
+                    let synack = build_tcp(server, 80, PUBLIC, src_port(&p), 0x12);
+                    w.upgrade()
+                        .unwrap()
+                        .inside()
+                        .send(Packet::from_slice(&synack))?;
+                }
+                Ok(())
+            }));
+            let syn = build_tcp(INSIDE, 40000, PUBLIC, 8080, 0x02);
+            nat.inside().send(Packet::from_slice(&syn)).unwrap();
+            let got = got.lock().unwrap();
+            assert_eq!(got.len(), 2);
+            assert_eq!(&got[1][16..20], &INSIDE.octets());
+            assert_eq!(dst_port(&got[1]), 40000);
+        });
+    }
+
+    #[test]
+    fn a_panicking_handler_does_not_break_later_sends() {
+        let nat = Nat::new(pfx("10.0.0.1/24"), pfx("203.0.113.1/24"));
+        let n = Arc::new(AtomicU64::new(0));
+        let n2 = n.clone();
+        nat.outside().set_handler(Arc::new(move |_| {
+            if n2.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("handler bug");
+            }
+            Ok(())
+        }));
+        let p = build_udp(INSIDE, 1000, Ipv4Addr::new(8, 8, 8, 8), 53, b"x");
+        let send = || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                nat.inside().send(Packet::from_slice(&p))
+            }))
+        };
+        // The panic is the caller's to see; it just must not poison anything.
+        assert!(send().is_err());
+        assert!(send().is_ok());
+        assert_eq!(n.load(Ordering::SeqCst), 2);
     }
 }

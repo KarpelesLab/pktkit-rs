@@ -68,7 +68,6 @@ pub struct Nat64 {
     outside: Arc<Nat64Side>,
 
     inner: Mutex<Nat64Inner>,
-    self_ref: Mutex<Weak<Nat64>>,
     /// IPv4 Identification for packets translated from unfragmented IPv6.
     next_id: AtomicU16,
     /// Inbound fragmented datagrams: the inside host each one's first
@@ -104,26 +103,23 @@ impl Nat64 {
     /// prefix nothing is translated. `outside_addr` is the IPv4 address the
     /// translated traffic uses.
     pub fn new(inside_addr: IpPrefix, outside_addr: IpPrefix) -> Arc<Nat64> {
-        let inside = Arc::new(Nat64Side::new(true, inside_addr));
-        let outside = Arc::new(Nat64Side::new(false, outside_addr));
-        let nat = Arc::new(Nat64 {
-            inside: inside.clone(),
-            outside: outside.clone(),
+        // Built cyclic so each side holds its parent from the start, with
+        // no lock to take on the packet path: a lock held there would be
+        // held through delivery, deadlocking a handler that replies from
+        // inside it and poisoned by one that panics.
+        Arc::new_cyclic(|me: &Weak<Nat64>| Nat64 {
+            inside: Arc::new(Nat64Side::new(true, inside_addr, me.clone())),
+            outside: Arc::new(Nat64Side::new(false, outside_addr, me.clone())),
             inner: Mutex::new(Nat64Inner {
                 mappings: HashMap::new(),
                 reverse: HashMap::new(),
                 next_port: NAT_PORT_MIN,
             }),
-            self_ref: Mutex::new(Weak::new()),
             next_id: AtomicU16::new(crate::rand::u32() as u16),
             frags: Mutex::new(FragTable::default()),
             out_frags: Mutex::new(FragTable::default()),
             next_sweep: Mutex::new(Instant::now() + SWEEP_INTERVAL),
-        });
-        *nat.self_ref.lock().unwrap() = Arc::downgrade(&nat);
-        inside.set_parent(Arc::downgrade(&nat));
-        outside.set_parent(Arc::downgrade(&nat));
-        nat
+        })
     }
 
     pub fn inside(&self) -> Arc<dyn L3Device> {
@@ -1115,20 +1111,17 @@ pub(crate) struct Nat64Side {
     is_inside: bool,
     handler: Mutex<Option<L3Handler>>,
     addr: Mutex<IpPrefix>,
-    parent: Mutex<Weak<Nat64>>,
+    parent: Weak<Nat64>,
 }
 
 impl Nat64Side {
-    fn new(is_inside: bool, addr: IpPrefix) -> Nat64Side {
+    fn new(is_inside: bool, addr: IpPrefix, parent: Weak<Nat64>) -> Nat64Side {
         Nat64Side {
             is_inside,
             handler: Mutex::new(None),
             addr: Mutex::new(addr),
-            parent: Mutex::new(Weak::new()),
+            parent,
         }
-    }
-    fn set_parent(&self, w: Weak<Nat64>) {
-        *self.parent.lock().unwrap() = w;
     }
     fn deliver(&self, p: &Packet) {
         let h = self.handler.lock().unwrap().clone();
@@ -1144,7 +1137,7 @@ impl L3Device for Nat64Side {
     }
     fn send(&self, packet: &Packet) -> Result<()> {
         let bytes = packet.as_bytes();
-        if let Some(nat) = self.parent.lock().unwrap().upgrade() {
+        if let Some(nat) = self.parent.upgrade() {
             if self.is_inside {
                 if bytes.len() >= IPV6_HEADER_LEN && bytes[0] >> 4 == 6 {
                     nat.handle_outbound(bytes);
@@ -2485,5 +2478,48 @@ mod tests {
         assert_eq!(read_v6(&got[0][24..40]), b);
         assert_eq!(u16::from_be_bytes([got[0][42], got[0][43]]), 7000);
         assert!(v6_sum_ok(&got[0]));
+    }
+
+    #[test]
+    fn handlers_answering_synchronously_do_not_deadlock() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let nat = Nat64::new(pfx("64:ff9b::/96"), pfx("198.51.100.1/24"));
+            // The IPv4 side answers every datagram from within its delivery.
+            let w = Arc::downgrade(&nat);
+            nat.outside().set_handler(Arc::new(move |p| {
+                let b = p.as_bytes();
+                let src = Ipv4Addr::new(b[16], b[17], b[18], b[19]);
+                let dst = Ipv4Addr::new(b[12], b[13], b[14], b[15]);
+                let sport = u16::from_be_bytes([b[20], b[21]]);
+                let l4 = crate::build::build_udp(src.into(), dst.into(), 53, sport, b"a");
+                let r = crate::build::build_ipv4(src, dst, crate::Protocol::UDP, 64, &l4);
+                w.upgrade().unwrap().outside().send(Packet::from_slice(&r))
+            }));
+            let client: Ipv6Addr = "2001:db8:1::100".parse().unwrap();
+            let dst: Ipv6Addr = "64:ff9b::808:808".parse().unwrap();
+            let query = move || {
+                let l4 = crate::build::build_udp(client.into(), dst.into(), 5555, 53, b"q");
+                crate::build::build_ipv6(client, dst, crate::Protocol::UDP, 64, &l4)
+            };
+            // And the IPv6 side asks again on hearing the first answer.
+            let got = Arc::new(AtomicU16::new(0));
+            let (w, g) = (Arc::downgrade(&nat), got.clone());
+            nat.inside().set_handler(Arc::new(move |_| {
+                if g.fetch_add(1, Ordering::SeqCst) == 0 {
+                    w.upgrade()
+                        .unwrap()
+                        .inside()
+                        .send(Packet::from_slice(&query()))?;
+                }
+                Ok(())
+            }));
+            nat.inside().send(Packet::from_slice(&query())).unwrap();
+            let _ = tx.send(got.load(Ordering::SeqCst));
+        });
+        let got = rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .expect("deadlocked");
+        assert_eq!(got, 2);
     }
 }
