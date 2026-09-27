@@ -1894,6 +1894,37 @@ mod tests {
     }
 
     #[test]
+    fn zero_length_udp_datagrams_are_relayed_both_ways() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let sport = server.local_addr().unwrap().port();
+        let stack = Stack::new();
+        let captured = capture(&stack);
+        let mut dgram = build_udp_v4_packet(
+            Ipv4Addr::new(10, 0, 0, 5),
+            41800,
+            Ipv4Addr::new(127, 0, 0, 1),
+            sport,
+            &[],
+        );
+        // Link padding past the UDP length is not part of the datagram.
+        dgram.extend_from_slice(&[0xEE; 6]);
+        let total = dgram.len() as u16;
+        dgram[2..4].copy_from_slice(&total.to_be_bytes());
+        L3Device::send(&*stack, Packet::from_slice(&dgram)).unwrap();
+        let mut buf = [0u8; 16];
+        let (n, from) = server.recv_from(&mut buf).unwrap();
+        assert_eq!(n, 0);
+        server.send_to(&[], from).unwrap();
+        wait_for("the empty reply", || !captured.lock().unwrap().is_empty());
+        let got = captured.lock().unwrap();
+        assert_eq!(got[0].len(), 28);
+        assert_eq!(u16::from_be_bytes([got[0][24], got[0][25]]), 8);
+    }
+
+    #[test]
     fn udp_flows_are_capped() {
         let server = UdpSocket::bind("127.0.0.1:0").unwrap();
         let sport = server.local_addr().unwrap().port();

@@ -85,8 +85,8 @@ impl UdpConn {
                     return;
                 }
                 let n = match socket.recv(&mut buf) {
-                    Ok(n) if n > 0 => n,
-                    Ok(_) => continue,
+                    // Zero-length datagrams are valid and relayed too.
+                    Ok(n) => n,
                     // Timeout: loop back and re-check the stop flag.
                     Err(e) if is_transient(&e) => continue,
                     Err(_) => {
@@ -133,10 +133,13 @@ impl UdpConn {
         if udp.len() < 8 {
             return;
         }
-        let payload = &udp[8..];
-        if !payload.is_empty() {
-            let _ = self.socket.send(payload);
+        // The UDP length, not the IP payload, bounds the datagram: anything
+        // past it is link padding. An empty payload is a valid datagram.
+        let len = u16::from_be_bytes([udp[4], udp[5]]) as usize;
+        if len < 8 || len > udp.len() {
+            return;
         }
+        let _ = self.socket.send(&udp[8..len]);
         if let Ok(mut t) = self.last_act.lock() {
             *t = Instant::now();
         }
