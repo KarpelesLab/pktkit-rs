@@ -21,6 +21,7 @@ pub const BPF_MAP_UPDATE_ELEM: i32 = 2;
 pub const BPF_MAP_DELETE_ELEM: i32 = 3;
 pub const BPF_PROG_LOAD: i32 = 5;
 pub const BPF_PROG_TEST_RUN: i32 = 10;
+pub const BPF_OBJ_GET_INFO_BY_FD: i32 = 15;
 pub const BPF_LINK_CREATE: i32 = 28;
 
 // --- program / attach types ------------------------------------------------
@@ -51,6 +52,29 @@ pub struct MapElemAttr {
     /// `value` for update, `next_key` for iteration; unused by delete.
     pub value: u64,
     pub flags: u64,
+}
+
+/// `bpf_attr` for `BPF_OBJ_GET_INFO_BY_FD`.
+#[repr(C)]
+#[derive(Default)]
+pub struct ObjInfoAttr {
+    pub bpf_fd: u32,
+    /// Bytes of `info` the kernel may write; it copies out no more.
+    pub info_len: u32,
+    pub info: u64,
+}
+
+/// The leading fields of `struct bpf_map_info`. The kernel accepts a shorter
+/// buffer than its own struct and fills in only that much.
+#[repr(C)]
+#[derive(Default)]
+pub struct MapInfo {
+    pub map_type: u32,
+    pub id: u32,
+    pub key_size: u32,
+    pub value_size: u32,
+    pub max_entries: u32,
+    pub map_flags: u32,
 }
 
 /// `bpf_attr` for `BPF_PROG_LOAD`.
@@ -105,6 +129,8 @@ const _: () = {
     assert!(std::mem::size_of::<ProgLoadAttr>() == 8 * 4 + 3 * 8 + 16);
     assert!(std::mem::size_of::<ProgTestRunAttr>() == 12 * 4 + 4 * 8);
     assert!(std::mem::size_of::<LinkCreateAttr>() == 4 * 4);
+    assert!(std::mem::size_of::<ObjInfoAttr>() == 2 * 4 + 8);
+    assert!(std::mem::size_of::<MapInfo>() == 6 * 4);
 };
 
 /// `bpf_attr` for `BPF_LINK_CREATE` against an XDP target.

@@ -9,7 +9,7 @@ use std::io;
 use std::net::IpAddr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
-use super::sys::{self, MapCreateAttr, MapElemAttr, bpf_cmd, ctx_err};
+use super::sys::{self, MapCreateAttr, MapElemAttr, MapInfo, ObjInfoAttr, bpf_cmd, ctx_err};
 use crate::{IpPrefix, Result};
 
 /// `bpf_map_type`. Open newtype: the kernel adds types faster than we care to
@@ -21,8 +21,27 @@ pub struct MapType(pub u32);
 impl MapType {
     pub const HASH: MapType = MapType(1);
     pub const ARRAY: MapType = MapType(2);
+    pub const PERCPU_HASH: MapType = MapType(5);
+    pub const PERCPU_ARRAY: MapType = MapType(6);
+    pub const LRU_PERCPU_HASH: MapType = MapType(10);
     pub const LPM_TRIE: MapType = MapType(11);
     pub const XSKMAP: MapType = MapType(17);
+    pub const PERCPU_CGROUP_STORAGE: MapType = MapType(21);
+
+    /// True for the types whose elements hold one value per possible CPU.
+    ///
+    /// Userspace reads and writes such an element as
+    /// `round_up(value_size, 8) * num_possible_cpus()` bytes, not
+    /// `value_size`, which [`Map::lookup`] and [`Map::update`] do not support.
+    pub fn is_per_cpu(self) -> bool {
+        matches!(
+            self,
+            MapType::PERCPU_HASH
+                | MapType::PERCPU_ARRAY
+                | MapType::LRU_PERCPU_HASH
+                | MapType::PERCPU_CGROUP_STORAGE
+        )
+    }
 }
 
 /// `BPF_F_NO_PREALLOC`. Mandatory for `LPM_TRIE`, which allocates nodes as
@@ -122,6 +141,22 @@ impl Map {
         self.max_entries
     }
 
+    /// Refuse element access whose size the kernel would not take from
+    /// `value_size`: a per-CPU map copies a value per possible CPU, which
+    /// would overrun a `value_size` buffer in both directions.
+    fn check_value_access(&self) -> Result<()> {
+        if self.kind.is_per_cpu() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "xdp: map type {} holds a value per CPU; element access is not supported",
+                    self.kind.0
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     fn check_key(&self, key: &[u8]) -> Result<()> {
         if key.len() != self.key_size as usize {
             return Err(io::Error::new(
@@ -137,7 +172,11 @@ impl Map {
     }
 
     /// Insert or replace `key -> value`.
+    ///
+    /// Fails with [`io::ErrorKind::Unsupported`] on a per-CPU map; see
+    /// [`MapType::is_per_cpu`].
     pub fn update(&self, key: &[u8], value: &[u8], flags: UpdateFlags) -> Result<()> {
+        self.check_value_access()?;
         self.check_key(key)?;
         if value.len() != self.value_size as usize {
             return Err(io::Error::new(
@@ -164,7 +203,11 @@ impl Map {
     }
 
     /// Read `key` into `out`. Returns `false` if the key is absent.
+    ///
+    /// Fails with [`io::ErrorKind::Unsupported`] on a per-CPU map; see
+    /// [`MapType::is_per_cpu`].
     pub fn lookup(&self, key: &[u8], out: &mut [u8]) -> Result<bool> {
+        self.check_value_access()?;
         self.check_key(key)?;
         if out.len() != self.value_size as usize {
             return Err(io::Error::new(
@@ -237,8 +280,19 @@ impl AsRawFd for Map {
 /// file descriptor.
 ///
 /// For the case where the program and its map belong to somebody else and all
-/// we were handed is the fd.
+/// we were handed is the fd. The map is checked to be an XSKMAP first: any
+/// other geometry would have the kernel read past the 4-byte key or value.
 pub fn set_socket_raw(map_fd: RawFd, queue_id: u32, socket_fd: RawFd) -> Result<()> {
+    let info = map_info(map_fd)?;
+    if info.map_type != MapType::XSKMAP.0 || info.key_size != 4 || info.value_size != 4 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "xdp: fd {map_fd} is not an XSKMAP (type {}, key {} bytes, value {} bytes)",
+                info.map_type, info.key_size, info.value_size
+            ),
+        ));
+    }
     let key = queue_id.to_ne_bytes();
     let value = (socket_fd as u32).to_ne_bytes();
     let mut attr = MapElemAttr {
@@ -253,6 +307,21 @@ pub fn set_socket_raw(map_fd: RawFd, queue_id: u32, socket_fd: RawFd) -> Result<
     unsafe { bpf_cmd(sys::BPF_MAP_UPDATE_ELEM, &mut attr) }
         .map_err(|e| ctx_err("xskmap update", e))?;
     Ok(())
+}
+
+/// What the kernel says about the map behind `fd`.
+fn map_info(fd: RawFd) -> Result<MapInfo> {
+    let mut info = MapInfo::default();
+    let mut attr = ObjInfoAttr {
+        bpf_fd: fd as u32,
+        info_len: std::mem::size_of::<MapInfo>() as u32,
+        info: &mut info as *mut MapInfo as u64,
+    };
+    // SAFETY: `info` is writable for `info_len` bytes, which caps what the
+    // kernel copies out, and outlives the call.
+    unsafe { bpf_cmd(sys::BPF_OBJ_GET_INFO_BY_FD, &mut attr) }
+        .map_err(|e| ctx_err("map info", e))?;
+    Ok(info)
 }
 
 /// The largest `bpf_lpm_trie_key` we build: 4-byte prefix length plus a
@@ -326,6 +395,43 @@ mod tests {
         assert_eq!(&k.as_bytes()[..4], &128u32.to_ne_bytes());
         assert_eq!(&k.as_bytes()[4..], &addr.octets());
         assert_eq!(k.addr_len(), 16);
+    }
+
+    #[test]
+    fn per_cpu_maps_refuse_element_access_before_the_kernel_sees_it() {
+        // A per-CPU lookup has the kernel write a value per possible CPU,
+        // far past a `value_size` buffer. Any fd will do: the call must be
+        // refused before one is issued.
+        let fd =
+            crate::syscall::socket(crate::syscall::AF_INET, crate::syscall::SOCK_DGRAM, 0).unwrap();
+        for kind in [
+            MapType::PERCPU_HASH,
+            MapType::PERCPU_ARRAY,
+            MapType::LRU_PERCPU_HASH,
+            MapType::PERCPU_CGROUP_STORAGE,
+        ] {
+            let map = Map {
+                fd: fd.try_clone().unwrap(),
+                kind,
+                key_size: 4,
+                value_size: 4,
+                max_entries: 1,
+            };
+            let mut out = [0u8; 4];
+            let e = map.lookup(&[0; 4], &mut out).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::Unsupported, "{e}");
+            let e = map.update(&[0; 4], &[0; 4], UpdateFlags::ANY).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::Unsupported, "{e}");
+        }
+        assert!(!MapType::XSKMAP.is_per_cpu());
+        assert!(!MapType::LPM_TRIE.is_per_cpu());
+    }
+
+    #[test]
+    fn a_non_map_fd_is_not_taken_for_an_xskmap() {
+        let s =
+            crate::syscall::socket(crate::syscall::AF_INET, crate::syscall::SOCK_DGRAM, 0).unwrap();
+        assert!(set_socket_raw(s.as_raw_fd(), 0, 0).is_err());
     }
 
     #[test]
