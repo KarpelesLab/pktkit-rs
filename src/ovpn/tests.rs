@@ -440,6 +440,25 @@ fn retransmit_fires_when_ack_withheld() {
     );
 }
 
+/// Garbage on the session's in-order TLS stream is fatal to the session and
+/// says so through `close`, not through an `Err` (which means "dropped").
+#[test]
+fn tls_garbage_closes_the_session() {
+    use super::Opcode;
+    use super::packet_ctrl::ControlPacket;
+
+    let mut server = Peer::new(server_config(), *b"SERVERID", auth_hook()).unwrap();
+    let mut client = TestClient::new(*b"CLIENTID");
+    server.handle_packet(&client.hard_reset()).unwrap();
+
+    let mut p = ControlPacket::new(Opcode::CONTROL_V1, 0, *b"CLIENTID", [0; 8]);
+    p.set_pid(1);
+    p.payload = vec![0x99, 0x03, 0x03, 0x00, 0x01, 0x00];
+    let out = server.handle_packet(&p.to_bytes(&[])).unwrap();
+    assert!(out.close, "TLS failure must end the session");
+    assert!(out.error.is_some());
+}
+
 // --- helpers ----------------------------------------------------------------
 
 fn auth_hook() -> OnAuth {

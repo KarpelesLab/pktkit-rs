@@ -346,11 +346,8 @@ impl Server {
             let mut peer = entry.peer.lock().unwrap();
             match peer.handle_packet(data) {
                 Ok(o) => o,
-                Err(_) => {
-                    drop(peer);
-                    self.remove_peer(key);
-                    return;
-                }
+                // A dropped datagram; only `out.close` ends the session.
+                Err(_) => return,
             }
         };
 
@@ -415,5 +412,83 @@ impl Server {
 impl Drop for Server {
     fn drop(&mut self) {
         self.closed.store(true, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ovpn::Opcode;
+    use crate::ovpn::packet_ctrl::ControlPacket;
+    use std::time::Duration;
+
+    fn test_server() -> Arc<Server> {
+        let on_auth: OnAuth = Arc::new(|_| Err(io::Error::other("no auth in this test")));
+        let on_data: OnData = Arc::new(|_, _, _| {});
+        let cfg = ServerConfig::new(
+            crate::ovpn::tests::server_config(),
+            "127.0.0.1:0".parse().unwrap(),
+            on_auth,
+            on_data,
+        );
+        Server::new(cfg).unwrap()
+    }
+
+    fn udp_client(server: &Server) -> UdpSocket {
+        let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+        s.connect(server.local_addr().unwrap()).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        s
+    }
+
+    fn client_reset(sid: [u8; 8]) -> Vec<u8> {
+        let mut p = ControlPacket::new(Opcode::CONTROL_HARD_RESET_CLIENT_V2, 0, sid, [0; 8]);
+        p.set_pid(0);
+        p.to_bytes(&[])
+    }
+
+    fn recv_ctrl(s: &UdpSocket) -> ControlPacket {
+        let mut buf = [0u8; 2048];
+        let n = s.recv(&mut buf).expect("server reply");
+        ControlPacket::parse(&buf[..n]).unwrap()
+    }
+
+    /// Junk from a peer's address -- a truncated control packet, a data
+    /// packet before any key exists, a control packet far outside the
+    /// receive window, an unknown opcode -- is dropped. It must not tear
+    /// down the peer's session, or anyone able to send one datagram could
+    /// disconnect any client.
+    #[test]
+    fn junk_datagrams_do_not_tear_down_a_peer() {
+        let server = test_server();
+        let c = udp_client(&server);
+        let sid = *b"CLIENT01";
+        c.send(&client_reset(sid)).unwrap();
+        let first = recv_ctrl(&c);
+        assert_eq!(first.opcode, Opcode::CONTROL_HARD_RESET_SERVER_V2);
+        let server_sid = first.session_id;
+
+        let mut far = ControlPacket::new(Opcode::CONTROL_V1, 0, sid, [0; 8]);
+        far.set_pid(1000);
+        let junk: Vec<Vec<u8>> = vec![
+            vec![Opcode::CONTROL_V1.to_byte(0), 1, 2],
+            vec![Opcode::DATA_V1.to_byte(0), 0, 0, 0, 1, 2, 3],
+            far.to_bytes(&[]),
+            vec![0xff; 13],
+        ];
+        for j in &junk {
+            c.send(j).unwrap();
+        }
+        // A repeated hard reset is answered by the session that owns it; a
+        // fresh peer would answer with a different server session id.
+        c.send(&client_reset(sid)).unwrap();
+        loop {
+            let p = recv_ctrl(&c);
+            assert_eq!(p.session_id, server_sid, "peer was torn down by junk");
+            if p.acked_pids.contains(&0) {
+                break;
+            }
+        }
+        server.close();
     }
 }

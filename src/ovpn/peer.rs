@@ -96,6 +96,9 @@ pub struct PeerOutput {
     pub authenticated: bool,
     /// True if the connection should be torn down.
     pub close: bool,
+    /// Why the connection is being torn down, when `close` is set by an
+    /// error rather than a timeout.
+    pub error: Option<io::Error>,
 }
 
 /// Phase of the control flow.
@@ -205,6 +208,12 @@ impl Peer {
     }
 
     /// Process one inbound datagram from the peer.
+    ///
+    /// An `Err` means this one datagram was dropped (malformed, replayed,
+    /// out of window, undecryptable, ...) and the session is unaffected:
+    /// anyone can put a datagram on the peer's address, so none of those may
+    /// cost the peer its connection. A condition that is fatal to the session
+    /// is reported as `Ok` with [`PeerOutput::close`] set instead.
     pub fn handle_packet(&mut self, data: &[u8]) -> io::Result<PeerOutput> {
         if data.is_empty() {
             return Ok(PeerOutput::default());
@@ -237,19 +246,31 @@ impl Peer {
             return Ok(out);
         }
 
-        // Feed any newly-ordered TLS bytes into the TLS engine.
-        if !recv.tls_bytes.is_empty() {
-            let mut fed = 0usize;
-            while fed < recv.tls_bytes.len() {
-                let n = self
-                    .tls
-                    .feed(&recv.tls_bytes[fed..])
-                    .map_err(|e| invalid(format!("tls feed: {e:?}")))?;
-                if n == 0 {
-                    break;
-                }
-                fed += n;
-            }
+        // Past the reliable layer the bytes are part of this session's TLS
+        // stream, so a failure from here on is fatal to the session (as a TLS
+        // error is for an OpenVPN key state) rather than a packet to drop.
+        if let Err(e) = self.process_tls(&recv.tls_bytes, &mut out) {
+            // Still flush what the TLS engine queued (an alert, typically).
+            let _ = self.pump_tls(&mut out);
+            out.close = true;
+            out.error = Some(e);
+            return Ok(out);
+        }
+
+        if self.kx_done {
+            out.authenticated = true;
+        }
+        Ok(out)
+    }
+
+    /// Feed in-order TLS bytes to the engine, run the control exchange on the
+    /// plaintext, and queue the TLS output.
+    fn process_tls(&mut self, tls_bytes: &[u8], out: &mut PeerOutput) -> io::Result<()> {
+        if !tls_bytes.is_empty() {
+            // `feed` consumes the whole slice.
+            self.tls
+                .feed(tls_bytes)
+                .map_err(|e| invalid(format!("tls feed: {e:?}")))?;
 
             // Drain decrypted plaintext into the control buffer. `recv`
             // hands back everything buffered in one call.
@@ -265,12 +286,7 @@ impl Peer {
 
         // Pump any TLS output (handshake records or our control replies) back
         // onto the reliable layer, then attach pending ACKs.
-        self.pump_tls(&mut out)?;
-
-        if self.kx_done {
-            out.authenticated = true;
-        }
-        Ok(out)
+        self.pump_tls(out)
     }
 
     /// Emit any pending TLS output as P_CONTROL_V1 packets, plus a standalone
