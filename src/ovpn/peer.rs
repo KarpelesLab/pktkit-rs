@@ -556,7 +556,13 @@ impl Peer {
         let (Some(opts), Some(keys)) = (self.opts.as_ref(), self.keys.as_ref()) else {
             return Err(invalid("stream not ready for data transmission"));
         };
-        self.out_pid = self.out_pid.wrapping_add(1);
+        // The packet id is the GCM nonce prefix: wrapping it would reuse a
+        // nonce under the same key. OpenVPN (packet_id_send_update) refuses
+        // to send once the id space is spent; only a new key resets it.
+        self.out_pid = self
+            .out_pid
+            .checked_add(1)
+            .ok_or_else(|| invalid("data channel packet id exhausted; renegotiation required"))?;
         data::encrypt(opts, keys, self.out_pid, payload, fill_random)
     }
 }
@@ -635,7 +641,36 @@ pub(crate) fn fill_random(buf: &mut [u8]) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_peer_info;
+    use super::*;
+
+    /// A peer with data-channel keys installed directly, skipping the TLS
+    /// handshake that normally derives them.
+    fn keyed_peer() -> Peer {
+        let tls = crate::ovpn::tests::server_config();
+        let on_auth: OnAuth = Arc::new(|_: &AuthInfo| Err(invalid("unused")));
+        let mut p = Peer::new(tls, *b"SERVERID", on_auth).unwrap();
+        p.opts = Some(Options {
+            cipher_block: super::super::GCM,
+            cipher_size: 256,
+            auth: super::super::options::AuthHash::None,
+            ..Options::default()
+        });
+        p.keys = Some(PeerKeys::from_expansion(&[7u8; 256]));
+        p
+    }
+
+    #[test]
+    fn send_data_refuses_to_wrap_the_packet_id() {
+        let mut p = keyed_peer();
+        p.out_pid = u32::MAX - 1;
+        // The last id OpenVPN allows is u32::MAX.
+        let pkt = p.send_data(b"x").unwrap();
+        assert_eq!(&pkt[1..5], &u32::MAX.to_be_bytes());
+        // Going further would reuse GCM nonce `0 || implicit IV` under the
+        // same key; the peer must refuse instead.
+        assert!(p.send_data(b"y").is_err());
+        assert!(p.send_data(b"z").is_err());
+    }
 
     #[test]
     fn peer_info_parses_iv_keys() {

@@ -96,7 +96,7 @@ fn server_config_versions(versions: (ProtocolVersion, ProtocolVersion)) -> Arc<T
     )
 }
 
-fn server_config() -> Arc<TlsConfig> {
+pub(super) fn server_config() -> Arc<TlsConfig> {
     server_config_versions(TLS12_ONLY)
 }
 
