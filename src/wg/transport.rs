@@ -56,17 +56,23 @@ pub(crate) fn process_data_packet(h: &Handler, data: &[u8]) -> Result<PacketResu
         return Err(io::Error::other("keypair expired"));
     }
 
-    // Replay window check.
-    if kp.replay_filter.check_replay(counter) {
-        return Err(io::Error::other(format!(
-            "replay detected: counter={}",
-            counter
-        )));
+    // Drop obvious replays before paying to decrypt them; nothing is
+    // recorded yet.
+    let replay = || io::Error::other(format!("replay detected: counter={counter}"));
+    if kp.replay_filter.is_replay(counter) {
+        return Err(replay());
     }
 
     let ciphertext = &data[MESSAGE_TRANSPORT_HEADER_SIZE..];
     let plaintext = aead_open(&kp.receive_key, counter, ciphertext, &[])
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "decrypt failed"))?;
+
+    // Only an authenticated counter may move the window (whitepaper §5.4.6),
+    // or one forged packet with a huge counter would make every genuine one
+    // after it look old. This also settles two copies decrypted at once.
+    if kp.replay_filter.check_replay(counter) {
+        return Err(replay());
+    }
 
     let peer_key = kp.peer_key;
 
