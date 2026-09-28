@@ -15,7 +15,11 @@
 //!   (200 ms floor under the variance term, 1 s initial RTO).
 //! - RFC 5681: congestion control (slow start, congestion avoidance, fast
 //!   retransmit/recovery), with RFC 6582's NewReno partial-ACK handling,
-//!   RFC 3042 Limited Transmit and RFC 6928's initial window.
+//!   RFC 3042 Limited Transmit and RFC 6928's initial window; cwnd grows
+//!   by bytes acknowledged (RFC 3465, L = 2).
+//! - RFC 1122 §4.2.3.2, RFC 5681 §4.2: delayed ACKs (40 ms, at least every
+//!   second full-sized segment, at once for anything out of order), with
+//!   Linux's quick-ACK and ping-pong modes.
 //! - RFC 3649: HighSpeed TCP (default controller); NewReno is the other.
 //! - RFC 7661 §4.3: no cwnd growth while the sender is application-limited.
 //! - RFC 7323: window scaling, timestamps (PAWS, and an RTT sample from
