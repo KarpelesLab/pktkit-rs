@@ -650,17 +650,17 @@ impl Scoreboard {
         let mut r = 0;
         while r < self.tq.len() {
             let rec = self.tq[r];
-            if rec.xmit > rack_xmit {
+            // What follows went out no earlier. Segments sent in one burst
+            // share a timestamp, so the tie goes by sequence: the queue is
+            // in that order within a burst too, retransmissions first, and
+            // the scan stops at the first not sent before RACK.segment, as
+            // Linux's does.
+            if !sent_after(rack_xmit, rack_end, rec.xmit, rec.end) {
                 break;
             }
             r += 1;
             let live = self.live_range(&rec);
             if live.is_empty() {
-                continue;
-            }
-            if !sent_after(rack_xmit, rack_end, rec.xmit, rec.end) {
-                self.tq.swap(w, r - 1);
-                w += 1;
                 continue;
             }
             let due = rec.xmit.saturating_add(rack_rtt).saturating_add(reo);

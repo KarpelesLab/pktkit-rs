@@ -2839,11 +2839,12 @@ impl Conn {
             && self.snd_wnd > 0
             && self.state.is_synchronized()
         {
-            let room = self.send_mss();
+            let opts = self.segment_options();
+            let room = self.payload_room(&opts);
             let rcv_room = self.snd_wnd.saturating_sub(unacked) as usize;
             let n = room.min(pending).min(rcv_room);
             if n > 0 {
-                self.send_new(n);
+                self.send_new(n, opts);
                 self.tlp_retrans = false;
             } else if let Some((seq, len, fin)) = self.score.last(room as u32) {
                 self.resend(seq, len, fin);
@@ -2973,9 +2974,8 @@ impl Conn {
         }
     }
 
-    /// Send `n` bytes of new data as one segment.
-    fn send_new(&mut self, n: usize) {
-        let opts = self.segment_options();
+    /// Send `n` bytes of new data as one segment carrying `opts`.
+    fn send_new(&mut self, n: usize, opts: Vec<TcpOption>) {
         let data = self.send_buf.as_ref().unwrap().peek_unsent(n).to_vec();
         if data.is_empty() {
             return;
@@ -3031,7 +3031,8 @@ impl Conn {
                 break;
             }
             let avail = cc_room.min(rcv_room) as usize;
-            let room = self.send_mss();
+            let opts = self.segment_options();
+            let room = self.payload_room(&opts);
             let n = avail.min(room).min(pending);
 
             // Sender SWS avoidance (RFC 9293 §3.8.6.2.1): avoid tiny
@@ -3054,7 +3055,7 @@ impl Conn {
             if !big_enough && self.send_buf.as_ref().unwrap().unacked() > 0 && !self.fin_queued {
                 break;
             }
-            self.send_new(n);
+            self.send_new(n, opts);
             sent_new = true;
         }
 
@@ -3779,6 +3780,8 @@ impl Conn {
         self.release_growth();
         if let Some(sb) = self.send_buf.as_mut() {
             sb.release_memory();
+            // Nothing will be resent: the scoreboard goes too.
+            self.score = Scoreboard::new(sb.una(), self.now);
         }
         let keep_unread = self.released.is_none();
         if let Some(rb) = self.recv_buf.as_mut() {
