@@ -3,17 +3,16 @@
 
 use crate::MacAddr;
 use std::net::Ipv6Addr;
-use std::time::Duration;
 
 pub const NS_TYPE: u8 = 135;
 pub const NA_TYPE: u8 = 136;
-pub const RS_TYPE: u8 = 133;
-pub const RA_TYPE: u8 = 134;
 
 pub const OPT_SOURCE_LINK_ADDR: u8 = 1;
 pub const OPT_TARGET_LINK_ADDR: u8 = 2;
 
-pub const DEFAULT_TTL: Duration = crate::arp::DEFAULT_TTL;
+#[cfg(test)]
+pub const DEFAULT_TTL: std::time::Duration = crate::arp::DEFAULT_TTL;
+#[cfg(test)]
 pub const MAX_ENTRIES: usize = crate::arp::MAX_ENTRIES;
 
 /// IPv6 neighbor cache: the same cache, and the same Neighbour
@@ -182,6 +181,7 @@ pub fn parse_option(mut opts: &[u8], opt_type: u8) -> Option<MacAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn full_table_evicts_the_entry_closest_to_expiry() {

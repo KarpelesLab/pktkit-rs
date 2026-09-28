@@ -33,6 +33,7 @@ pub const RETRANS_TIMER: Duration = Duration::from_secs(1);
 pub const MAX_MULTICAST_SOLICIT: u32 = 3;
 /// How long resolution is tried before it fails: [`MAX_MULTICAST_SOLICIT`]
 /// solicitations, [`RETRANS_TIMER`] apart, and as long again after the last.
+#[cfg(test)]
 pub const PENDING_TIMEOUT: Duration = Duration::from_secs(3);
 pub const PENDING_MAX_PKTS: usize = 16;
 /// Most destinations that may be awaiting resolution at once.
@@ -186,12 +187,8 @@ impl<K: Eq + Hash + Copy> Table<K> {
         }
     }
 
-    /// The MAC to send a packet for `ip` to, as of now, and whether to
+    /// The MAC to send a packet for `ip` to, as of `now`, and whether to
     /// probe it (RFC 4861 §7.3.3).
-    pub fn resolve(&self, ip: K) -> Resolved {
-        self.resolve_at(ip, Instant::now())
-    }
-
     pub(crate) fn resolve_at(&self, ip: K, now: Instant) -> Resolved {
         let t = &mut self.inner.lock().unwrap().map;
         let Some(e) = t.get_mut(&ip) else {
@@ -259,12 +256,14 @@ impl<K: Eq + Hash + Copy> Table<K> {
     }
 
     /// Forget every entry, as when the network they were learnt on is left.
+    #[cfg(feature = "dhcp")]
     pub fn clear(&self) {
         self.inner.lock().unwrap().map.clear();
     }
 
     /// Install or refresh an entry, confirmed reachable (for `ttl` or
     /// [`REACHABLE_TIME`], whichever is shorter) and kept for `ttl`.
+    #[cfg(test)]
     pub fn set(&self, ip: K, mac: MacAddr, ttl: Duration) {
         let now = Instant::now();
         let mut t = self.inner.lock().unwrap();
@@ -502,6 +501,7 @@ impl<K: Eq + Hash + Copy> Pending<K> {
     /// with its queue emptied is refused outright, and nothing is dropped
     /// for it. The [pinned](Self::pin) router is
     /// the exception to both, and takes its room from the others.
+    #[cfg(test)]
     pub fn enqueue(&self, ip: K, pkt: &[u8]) -> bool {
         self.enqueue_at(ip, pkt, Instant::now())
     }
@@ -641,6 +641,7 @@ impl<K: Eq + Hash + Copy> Pending<K> {
     }
 
     /// Drop every queue, and the packets in them.
+    #[cfg(feature = "dhcp")]
     pub fn clear(&self) {
         let mut q = self.inner.lock().unwrap();
         q.map.clear();
@@ -649,6 +650,7 @@ impl<K: Eq + Hash + Copy> Pending<K> {
 
     /// Keep only the queued packets `keep` accepts; a queue left empty is
     /// dropped, and its resolution with it.
+    #[cfg(feature = "dhcp")]
     pub fn retain_packets(&self, mut keep: impl FnMut(&[u8]) -> bool) {
         let q = &mut *self.inner.lock().unwrap();
         q.map.retain(|_, e| {

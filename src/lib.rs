@@ -127,13 +127,11 @@ pub mod fuzz;
 
 // --- Feature modules --------------------------------------------------------
 
+// ARP and NDP: the neighbour caches and codecs behind `L2Adapter`.
 #[cfg(feature = "l2adapter")]
-#[cfg_attr(docsrs, doc(cfg(feature = "l2adapter")))]
-pub mod arp;
-
+mod arp;
 #[cfg(feature = "l2adapter")]
-#[cfg_attr(docsrs, doc(cfg(feature = "l2adapter")))]
-pub mod ndp;
+mod ndp;
 
 #[cfg(feature = "l2adapter")]
 #[cfg_attr(docsrs, doc(cfg(feature = "l2adapter")))]
