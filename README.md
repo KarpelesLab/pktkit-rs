@@ -237,6 +237,14 @@ let adapter = Adapter::new(AdapterConfig::new(
     IpPrefix::new(Ipv4Addr::new(10, 0, 0, 1).into(), 24),
 ))?;
 adapter.add_peer(client_public_key);
+// Like the kernel's AllowedIPs: only packets from these sources are taken
+// from the peer. Without it any source is accepted, which is fine with one
+// isolated stack per peer but not when peers share a routing hub
+// (`AdapterConfig::require_allowed_ips` makes it mandatory).
+adapter.set_allowed_ips(
+    &client_public_key,
+    vec![IpPrefix::new(Ipv4Addr::new(10, 0, 0, 2).into(), 32)],
+);
 
 let udp = UdpSocket::bind("0.0.0.0:51820")?;
 adapter.serve(udp)?;
