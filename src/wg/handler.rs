@@ -2061,8 +2061,16 @@ mod tests {
                 .all(|w| w[1] - w[0] >= crate::wg::REKEY_TIMEOUT),
             "{at:?}"
         );
+        // Each give-up is followed by one wait of at least the interval --
+        // except one so close to the end of the run that the next attempt
+        // falls outside it.
         let gaps = at.windows(2).filter(|w| w[1] - w[0] >= every).count();
-        assert_eq!(gaps, failed, "{at:?}");
+        let tail = Duration::from_secs(600) - *at.last().unwrap();
+        let last_gap_in_run = tail >= every + crate::wg::REKEY_TIMEOUT * 2;
+        assert!(
+            gaps == failed || (gaps + 1 == failed && !last_gap_in_run),
+            "{gaps} long gaps for {failed} give-ups: {at:?}"
+        );
     }
 
     #[test]
