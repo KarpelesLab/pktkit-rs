@@ -1115,14 +1115,20 @@ impl TcpStack {
                 .filter(|l| l.accepts(dst, ours))
                 .cloned();
             if let Some(listener) = listener {
-                if let Some(pending) = listener.reserve_half_open() {
+                if listener.queue_full() {
+                    // A full accept queue drops the SYN, as Linux does
+                    // (`tcp_conn_request`): a handshake started now could
+                    // only wait in SYN-RECEIVED for room, holding a
+                    // half-open slot and retransmitting SYN-ACKs, and a
+                    // cookie would lead to a reset. The peer retransmits
+                    // its SYN, and by then the application may have made
+                    // room.
+                } else if let Some(pending) = listener.reserve_half_open() {
                     self.accept_syn(pending, dst, src, &seg);
-                } else if !listener.queue_full() {
+                } else {
                     // The backlog is full, which is what a SYN flood looks
                     // like: answer with a cookie and keep no state, so the
-                    // flood cannot lock out peers that really connect. A
-                    // full accept queue drops the SYN instead, as Linux
-                    // does: a cookie would only lead to a reset.
+                    // flood cannot lock out peers that really connect.
                     let synack =
                         listener
                             .cookies
@@ -1875,6 +1881,43 @@ mod tests {
         let tail = &got[got.len() - 2..];
         assert_eq!(tail[0], (20001, b"x".to_vec()));
         assert_eq!(tail[1], (30000, b"abcd".to_vec()));
+    }
+
+    /// A SYN arriving while the accept queue is full is dropped, as Linux
+    /// drops it, rather than answered with a SYN-ACK for a handshake that
+    /// could only wait for room; retransmitted once there is room, it is
+    /// answered.
+    #[test]
+    fn a_full_accept_queue_drops_new_syns() {
+        let (stack, out) = capturing_stack();
+        let listener = stack.listen(own(US), 80).unwrap();
+        listener.set_nonblocking(true);
+        let feed = |seg: Segment| {
+            out.lock().unwrap().clear();
+            stack.handle_inbound(Packet::from_slice(&inbound(seg)), IpAddr::V4(US));
+            out.lock().unwrap().len()
+        };
+        for port in 0..ACCEPT_QUEUE_CAP as u16 {
+            feed(syn_from(10000 + port));
+            let synack = last_sent(&out);
+            feed(Segment {
+                src_port: 10000 + port,
+                dst_port: 80,
+                seq: 2,
+                ack: synack.seq.wrapping_add(1),
+                flags: flags::ACK,
+                window: 65535,
+                ..Default::default()
+            });
+        }
+        assert!(listener.state.queue_full());
+        assert_eq!(feed(syn_from(30000)), 0, "answered a SYN");
+        assert_eq!(listener.state.half_open.load(Ordering::Acquire), 0);
+        assert_eq!(stack.conns.lock().unwrap().len(), ACCEPT_QUEUE_CAP);
+
+        drop(listener.accept().unwrap());
+        assert_eq!(feed(syn_from(30000)), 1);
+        assert_eq!(last_sent(&out).flags, flags::SYN | flags::ACK);
     }
 
     /// A Fragmentation Needed lowers the MSS of the connection it quotes,
