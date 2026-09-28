@@ -79,7 +79,7 @@ pub struct AdapterConfig {
     pub max_tcp_connections_per_source: usize,
     /// Each peer's timers; see [`ServerConfig::timers`].
     pub timers: PeerTimers,
-    /// Answers to UDP clients' first packets per period; see
+    /// Answers to UDP clients' first packets per period and source; see
     /// [`ServerConfig::connect_freq_initial`].
     pub connect_freq_initial: (u32, Duration),
     /// Most `on_auth` calls running at once; see

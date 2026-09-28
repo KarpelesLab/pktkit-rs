@@ -110,10 +110,9 @@ impl Cookies {
     }
 }
 
-/// OpenVPN's `connect-freq-initial`: at most `max` stateless replies per
-/// `period` (reflect_filter.c). A reply is a packet sent to an address
-/// nobody vouched for, so without a bound the server would reflect a
-/// spoofed flood at its victim.
+/// At most `max` events per `period`: OpenVPN's `connect-freq-initial`
+/// (reflect_filter.c) and `connect-freq`, kept per source by
+/// [`SourceRateLimit`].
 pub(super) struct RateLimit {
     max: u32,
     period: Duration,
@@ -122,17 +121,17 @@ pub(super) struct RateLimit {
 }
 
 impl RateLimit {
-    pub(super) fn new(max: u32, period: Duration) -> RateLimit {
+    fn new(max: u32, period: Duration, start: Instant) -> RateLimit {
         RateLimit {
             max,
             period,
-            start: Instant::now(),
+            start,
             count: 0,
         }
     }
 
-    /// Count one reply; whether it may be sent.
-    pub(super) fn allow(&mut self, now: Instant) -> bool {
+    /// Count one event; whether it may happen.
+    fn allow(&mut self, now: Instant) -> bool {
         if now.saturating_duration_since(self.start) > self.period {
             self.start = now;
             self.count = 0;
@@ -141,19 +140,24 @@ impl RateLimit {
         self.count <= self.max
     }
 
-    /// A reply that led to a session does not count against the limit
-    /// (reflect_filter_rate_limit_decrease).
-    pub(super) fn refund(&mut self) {
+    /// Take back one count.
+    fn refund(&mut self) {
         self.count = self.count.saturating_sub(1);
     }
 }
 
-/// A [`RateLimit`] for each source (the server's `connect_freq`), keeping
-/// at most `sources` of them. A source's count is kept for a period after it
-/// last started one; to make room for a new source, those whose period has
-/// run out are forgotten, or failing that the one whose period started
-/// first. Forgetting a count lets that source start over: under a flood of
-/// sources the limit weakens, but nobody is ever refused for want of room.
+/// A [`RateLimit`] for each source (the server's `connect_freq` and
+/// `connect_freq_initial`), keeping at most `sources` of them. A source's
+/// count is kept for a period after it last started one; to make room for a
+/// new source, those whose period has run out are forgotten, or failing that
+/// those whose period started first. Forgetting a count lets that source
+/// start over: under a flood of sources the limit weakens, but nobody is ever
+/// refused for want of room.
+///
+/// Room is made an eighth of the table at a time, so that a flood of new
+/// sources -- which `connect_freq_initial` sees for the price of one spoofed
+/// datagram each -- costs a walk of the table every `sources / 8` of them,
+/// not every one.
 pub(super) struct SourceRateLimit {
     max: u32,
     period: Duration,
@@ -177,25 +181,30 @@ impl SourceRateLimit {
             let period = self.period;
             self.limits
                 .retain(|_, l| now.saturating_duration_since(l.start) <= period);
-            if self.limits.len() >= self.sources
-                && let Some(stalest) = self
-                    .limits
-                    .iter()
-                    .min_by_key(|(_, l)| l.start)
-                    .map(|(ip, _)| *ip)
-            {
-                self.limits.remove(&stalest);
+            let keep = self.sources - (self.sources / 8).max(1);
+            if self.limits.len() > keep {
+                let mut starts: Vec<(Instant, IpAddr)> =
+                    self.limits.iter().map(|(ip, l)| (l.start, *ip)).collect();
+                let drop = starts.len() - keep;
+                starts.select_nth_unstable_by_key(drop - 1, |(start, _)| *start);
+                for (_, ip) in &starts[..drop] {
+                    self.limits.remove(ip);
+                }
             }
         }
         self.limits
             .entry(source)
-            .or_insert_with(|| RateLimit {
-                max: self.max,
-                period: self.period,
-                start: now,
-                count: 0,
-            })
+            .or_insert_with(|| RateLimit::new(self.max, self.period, now))
             .allow(now)
+    }
+
+    /// Give back one count of `source`'s, if it still has one: a stateless
+    /// reply that led to a session does not count against the limit
+    /// (reflect_filter_rate_limit_decrease).
+    pub(super) fn refund(&mut self, source: IpAddr) {
+        if let Some(l) = self.limits.get_mut(&source) {
+            l.refund();
+        }
     }
 }
 
@@ -282,12 +291,41 @@ mod tests {
         let t2 = t1 + Duration::from_secs(11);
         assert!(r.allow(ip("192.0.2.4"), t2));
         assert_eq!(r.limits.len(), 1);
+        r.refund(ip("192.0.2.4"));
+        assert!(r.allow(ip("192.0.2.4"), t2));
+        assert!(!r.allow(ip("192.0.2.4"), t2));
+    }
+
+    /// Room is made in batches, stalest first, and the table never grows
+    /// past its bound.
+    #[test]
+    fn source_rate_limit_makes_room_in_batches() {
+        let t0 = Instant::now();
+        let mut r = SourceRateLimit::new(1, Duration::from_secs(10), 16);
+        for i in 0..16u32 {
+            assert!(r.allow(
+                IpAddr::from((0xC000_0200 + i).to_be_bytes()),
+                t0 + Duration::from_millis(i.into())
+            ));
+        }
+        assert_eq!(r.limits.len(), 16);
+        // Full: the two stalest go, and the newcomer comes in.
+        let late = t0 + Duration::from_secs(1);
+        assert!(r.allow(IpAddr::from([198, 51, 100, 1]), late));
+        assert_eq!(r.limits.len(), 15);
+        assert!(!r.limits.contains_key(&IpAddr::from([192, 0, 2, 0])));
+        assert!(!r.limits.contains_key(&IpAddr::from([192, 0, 2, 1])));
+        assert!(!r.allow(IpAddr::from([192, 0, 2, 2]), late));
+        for i in 0..1000u32 {
+            r.allow(IpAddr::from((0x0A00_0000 + i).to_be_bytes()), late);
+            assert!(r.limits.len() <= 16);
+        }
     }
 
     #[test]
     fn rate_limit_refills_each_period_and_refunds() {
         let t0 = Instant::now();
-        let mut r = RateLimit::new(2, Duration::from_secs(10));
+        let mut r = RateLimit::new(2, Duration::from_secs(10), t0);
         assert!(r.allow(t0));
         assert!(r.allow(t0));
         assert!(!r.allow(t0));

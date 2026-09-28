@@ -27,7 +27,7 @@ use std::thread::{self, ThreadId};
 use std::time::Duration;
 
 use super::addr::{PeerKey, Transport};
-use super::cookie::{Cookies, RateLimit, SourceRateLimit};
+use super::cookie::{Cookies, SourceRateLimit};
 use super::packet_ctrl::ControlPacket;
 use super::peer::{AuthRequest, OnAuth, Peer, PeerConfig, PeerOutput, PeerTimers};
 
@@ -140,10 +140,22 @@ pub struct ServerConfig {
     /// Defaults to OpenVPN's (see [`PeerTimers`]).
     pub timers: PeerTimers,
     /// At most this many answers to UDP clients' first packets per period
-    /// (OpenVPN's `connect-freq-initial`, default 100 per 10 s). The first
-    /// answer goes to an address nobody has vouched for yet, so this bounds
-    /// how much the server can be made to reflect at a spoofed victim.
-    /// Clients that complete the handshake are not counted.
+    /// and per source (an IPv4 address or an IPv6 /64); default 100 per
+    /// 10 s. The first answer goes to an address nobody has vouched for
+    /// yet, so this bounds how much the server can be made to reflect at a
+    /// spoofed victim. Clients that complete the handshake are not counted.
+    ///
+    /// OpenVPN's `connect-freq-initial` is one budget for everyone, and
+    /// that is what a spoofer aims at: a hard reset every tenth of a
+    /// second (about 140 B/s) from made-up addresses would use it up, and
+    /// no new UDP client would be answered at all. Here a flood uses up
+    /// only the budgets of the sources it claims to come from. The answer
+    /// is barely twice the size of the reset it answers, one for one, so
+    /// no global bound is kept: bouncing a flood off the server gets a
+    /// spoofer no more than twice what it sends, spread over the addresses
+    /// it made up. Claiming a victim's own address still uses up that
+    /// victim's budget, as with any limit on what the server sends an
+    /// address it cannot verify.
     pub connect_freq_initial: (u32, Duration),
     /// Most `on_auth` calls running at once, each on a thread of its own.
     /// Clients beyond it wait their turn, within their handshake window;
@@ -440,8 +452,8 @@ pub struct Server {
     me: Weak<Server>,
     /// Session ids for stateless answers to UDP clients' first packets.
     cookies: Cookies,
-    /// Bounds those answers (`connect_freq_initial`).
-    initial_limit: Mutex<RateLimit>,
+    /// Bounds those answers (`connect_freq_initial`), per source.
+    initial_limit: Mutex<SourceRateLimit>,
     /// Bounds new peers per source (`connect_freq`), if configured.
     connect_limit: Option<Mutex<SourceRateLimit>>,
     /// Peers with authentications to run, and the workers running them.
@@ -466,10 +478,11 @@ struct AuthPool {
     workers: usize,
 }
 
-/// Most sources `connect_freq` keeps a count for. Past it, the stalest
-/// count is forgotten -- that source's limit starts over -- rather than
-/// anyone refused: many sources each proving its address is what the caps
-/// on peers are for.
+/// Most sources `connect_freq` and `connect_freq_initial` each keep a
+/// count for. Past it, the stalest counts are forgotten -- those sources'
+/// limits start over -- rather than anyone refused: many sources each
+/// proving its address is what the caps on peers are for, and many made-up
+/// sources get no more than one answer, twice their reset's size, each.
 const CONNECT_FREQ_SOURCES: usize = 4096;
 
 /// A thread serving a listening socket.
@@ -549,7 +562,7 @@ impl Server {
 
         let cookies = Cookies::new(cfg.timers.handshake_window);
         let (max, period) = cfg.connect_freq_initial;
-        let initial_limit = Mutex::new(RateLimit::new(max, period));
+        let initial_limit = Mutex::new(SourceRateLimit::new(max, period, CONNECT_FREQ_SOURCES));
         let connect_limit = cfg.connect_freq.map(|(max, period)| {
             Mutex::new(SourceRateLimit::new(max, period, CONNECT_FREQ_SOURCES))
         });
@@ -682,11 +695,10 @@ impl Server {
         let now = crate::time::Instant::now();
         if Peer::is_session_start(data) {
             let reset = ControlPacket::parse(data).ok()?;
-            if self.initial_limit.lock().unwrap().allow(now) {
-                let reply = self.cookies.reply(&reset, src, now);
-                if let Some(udp) = self.udp.read().unwrap().as_ref() {
-                    let _ = udp.send_to(&reply, src);
-                }
+            if let Some(reply) = self.answer_reset(&reset, src, now)
+                && let Some(udp) = self.udp.read().unwrap().as_ref()
+            {
+                let _ = udp.send_to(&reply, src);
             }
             return None;
         }
@@ -700,8 +712,26 @@ impl Server {
         // A completed three-way handshake does not count against the
         // limit on replies to strangers -- only one that got a peer: an
         // echo refused one (a full table) can be replayed at will.
-        self.initial_limit.lock().unwrap().refund();
+        self.initial_limit
+            .lock()
+            .unwrap()
+            .refund(source_of(src.ip()));
         Some(entry)
+    }
+
+    /// The stateless answer to a client's hard reset from `src`, unless
+    /// `connect_freq_initial` says not to answer it.
+    fn answer_reset(
+        &self,
+        reset: &ControlPacket,
+        src: SocketAddr,
+        now: crate::time::Instant,
+    ) -> Option<Vec<u8>> {
+        let source = source_of(src.ip());
+        if !self.initial_limit.lock().unwrap().allow(source, now) {
+            return None;
+        }
+        Some(self.cookies.reply(reset, src, now))
     }
 
     fn accept_tcp(&self, weak: &Weak<Server>, stream: TcpStream, addr: SocketAddr) {
@@ -1688,6 +1718,44 @@ mod tests {
         assert!(answered(&spoofs[0], *b"SPOOF-01"));
         assert!(answered(&spoofs[1], *b"SPOOF-02"));
         assert!(!answered(&spoofs[2], *b"SPOOF-03"), "over the limit");
+        server.close();
+    }
+
+    /// A flood of spoofed resets uses up the answer budget of the sources
+    /// it claims, not everyone's: a client from elsewhere is still
+    /// answered. With one budget for all, ~140 B/s of spoofed resets kept
+    /// every new UDP client out.
+    #[test]
+    fn spoofed_resets_do_not_starve_other_sources() {
+        let server = test_server();
+        let now = crate::time::Instant::now();
+        let (max, _) = DEFAULT_CONNECT_FREQ_INITIAL;
+        // Well past the budget, from one IPv4 address (many ports) and
+        // from many addresses of one IPv6 /64.
+        for i in 0..(2 * max) {
+            let mut sid = [b'X'; 8];
+            sid[4..].copy_from_slice(&i.to_be_bytes());
+            let reset = ControlPacket::parse(&client_reset(sid)).unwrap();
+            let v4: SocketAddr = format!("203.0.113.9:{}", 1000 + i).parse().unwrap();
+            let v6: SocketAddr = format!("[2001:db8:0:1::{:x}]:1194", i + 1).parse().unwrap();
+            server.answer_reset(&reset, v4, now);
+            server.answer_reset(&reset, v6, now);
+        }
+        let reset = ControlPacket::parse(&client_reset(*b"LEGIT!!!")).unwrap();
+        let spoofed: SocketAddr = "203.0.113.9:5000".parse().unwrap();
+        assert!(server.answer_reset(&reset, spoofed, now).is_none());
+        let spoofed6: SocketAddr = "[2001:db8:0:1::ffff]:5000".parse().unwrap();
+        assert!(server.answer_reset(&reset, spoofed6, now).is_none());
+        let legit: SocketAddr = "198.51.100.7:5000".parse().unwrap();
+        assert!(
+            server.answer_reset(&reset, legit, now).is_some(),
+            "v4 client starved"
+        );
+        let legit6: SocketAddr = "[2001:db8:0:2::1]:5000".parse().unwrap();
+        assert!(
+            server.answer_reset(&reset, legit6, now).is_some(),
+            "v6 client starved"
+        );
         server.close();
     }
 
