@@ -695,6 +695,13 @@ impl Server {
             // Each connection costs two threads: refuse (close) past the
             // caps.
             let mut streams = self.tcp_streams.lock().unwrap();
+            // close() sets `closed`, then shuts down every stream in this
+            // table under its lock: checked under the same lock, a
+            // connection accepted as it runs is either shut down there or
+            // refused here, never left open.
+            if self.closed.load(Ordering::SeqCst) {
+                return;
+            }
             let source = source_of(addr.ip());
             let here = streams.values().filter(|(s, _)| *s == source).count();
             if streams.len() >= self.cfg.max_tcp_connections
@@ -1796,6 +1803,20 @@ mod tests {
         if let Ok(mut late) = TcpStream::connect(server.tcp_local_addr()) {
             expect_eof(&mut late);
         }
+    }
+
+    /// A connection the acceptor takes as close() runs is refused, not
+    /// kept: close() shuts down only the streams it finds.
+    #[test]
+    fn a_connection_accepted_during_close_is_not_kept() {
+        let server = test_server();
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (accepted, addr) = l.accept().unwrap();
+        server.close();
+        server.accept_tcp(&Arc::downgrade(&server), accepted, addr);
+        assert!(server.tcp_streams.lock().unwrap().is_empty());
+        expect_eof(&mut client);
     }
 
     /// close() gives the UDP port back, so a new server can bind it right
