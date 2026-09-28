@@ -104,6 +104,9 @@ pub struct L2Adapter {
     /// call to its handler, which may hold the device's locks: handing it
     /// a packet from there could deadlock it.
     deferred_icmp: Mutex<Vec<Vec<u8>>>,
+    /// Set by `close`: the timers send nothing more, whoever drives them
+    /// (the timer thread, or `tick` where there are no threads).
+    closed: std::sync::atomic::AtomicBool,
 
     // Self-Arc, for use by closures that need to refer back to us.
     weak_self: Mutex<Weak<L2Adapter>>,
@@ -167,6 +170,7 @@ impl L2Adapter {
             // reported in full.
             icmp_limit: RateLimiter::new(10, arp::PENDING_MAX_PKTS as u32),
             deferred_icmp: Mutex::new(Vec::new()),
+            closed: std::sync::atomic::AtomicBool::new(false),
             weak_self: Mutex::new(Weak::new()),
             #[cfg(not(target_family = "wasm"))]
             timer_stop: Arc::default(),
@@ -287,6 +291,9 @@ impl L2Adapter {
 
     /// The neighbour timers, as of `now`.
     fn run_timers(&self, now: Instant) {
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
         let deferred = std::mem::take(&mut *self.deferred_icmp.lock().unwrap());
         for reply in deferred {
             let _ = self.l3.send(Packet::from_slice(&reply));
@@ -885,6 +892,8 @@ impl L2Device for L2Adapter {
         self.stop_dhcp();
         // The timers only ever send: solicitations, probes and ICMP errors,
         // none of which a closed adapter has any business sending.
+        self.closed.store(true, Ordering::Release);
+        self.deferred_icmp.lock().unwrap().clear();
         #[cfg(not(target_family = "wasm"))]
         {
             let (stopped, wake) = &*self.timer_stop;
@@ -1159,6 +1168,23 @@ mod tests {
         // Two retransmissions' worth, and then some: a timer still running
         // would have solicited again by now.
         std::thread::sleep(arp::RETRANS_TIMER * 2 + Duration::from_millis(500));
+        assert!(take(&out).is_empty(), "the timers ran on after close");
+    }
+
+    /// Nor does anyone driving the timers by hand (`tick`, where there are
+    /// no threads): a closed adapter's timers do nothing.
+    #[test]
+    fn close_stops_hand_driven_timers() {
+        let (pipe, adapter, out) = rig("10.0.0.5/24");
+        let src: IpAddr = "10.0.0.5".parse().unwrap();
+        let dst: IpAddr = "10.0.0.6".parse().unwrap();
+        let udp = crate::build::build_udp(src, dst, 1000, 2000, b"hi");
+        let pkt = crate::build::build_ip(src, dst, Protocol::UDP, 64, &udp).unwrap();
+        pipe.inject(Packet::from_slice(&pkt)).unwrap();
+        assert_eq!(solicited(&take(&out)), [dst]);
+
+        adapter.close().unwrap();
+        adapter.run_timers(Instant::now() + Duration::from_secs(30));
         assert!(take(&out).is_empty(), "the timers ran on after close");
     }
 
