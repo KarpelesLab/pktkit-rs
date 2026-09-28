@@ -102,8 +102,10 @@ pub mod wire {
     /// Parse the response `data` to `query` (the whole message sent),
     /// returning the addresses it gives for the name asked about.
     ///
-    /// The response must carry the query's ID, be a response with RCODE 0,
-    /// and repeat its question. Of the answers, only CLASS IN records of the
+    /// The response must carry the query's ID, be a response, and repeat
+    /// its question -- all checked before its RCODE is believed, so an
+    /// error answer is held to the same test as a positive one -- and have
+    /// RCODE 0. Of the answers, only CLASS IN records of the
     /// type asked for count, and only those owned by the name asked about
     /// or one it leads to through CNAMEs in the same answer (RFC 1034
     /// §3.6.2, §5.3.3): anything else in the answer section is not an
@@ -120,11 +122,11 @@ pub mod wire {
         if flags & 0x8000 == 0 {
             return Err("not a response");
         }
-        if flags & 0x000F != 0 {
-            return Err("DNS error rcode");
-        }
         if !question_matches(data, query) {
             return Err("answer to another question");
+        }
+        if flags & 0x000F != 0 {
+            return Err("DNS error rcode");
         }
         let (qname, qend) = read_name(query, 12).ok_or("malformed query")?;
         let qtype = query.get(qend..qend + 2).ok_or("malformed query")?;
@@ -275,6 +277,16 @@ pub struct ResolverConfig {
     pub servers: Vec<SocketAddr>,
     /// How long to wait for each server's answer.
     pub timeout: Duration,
+    /// Send the name in a random mix of upper and lower case, and take
+    /// over UDP only an answer whose question repeats it letter for letter
+    /// (DNS 0x20, draft-vixie-dnsext-dns0x20). Default on.
+    ///
+    /// Names compare without regard to case, so the server answers the
+    /// same question; a forger racing it has to guess the case of every
+    /// letter as well as the ID and port. Servers copy the question into
+    /// the answer as sent (RFC 1035 §4.1.1), and nearly all keep its case;
+    /// one that does not is never answered in time, and needs this off.
+    pub randomize_case: bool,
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -282,6 +294,7 @@ setters! {
     ResolverConfig {
         set servers: Vec<SocketAddr>;
         set timeout: Duration;
+        set randomize_case: bool;
     }
 }
 
@@ -291,21 +304,49 @@ impl Default for ResolverConfig {
         ResolverConfig {
             servers: Vec::new(),
             timeout: Duration::from_secs(5),
+            randomize_case: true,
         }
     }
 }
 
-/// A transaction ID an off-path host cannot predict.
-///
-/// `crate::rand` is seeded from the clock, which is guessable. std's
-/// `RandomState` is keyed from the OS's random source, so SipHash under it
-/// gives unpredictable output with no extra dependency.
+/// A transaction ID an off-path host cannot predict. `crate::rand::u32`
+/// is seeded from the clock, which is guessable.
 #[cfg(not(target_family = "wasm"))]
 fn query_id() -> u16 {
-    use std::hash::{BuildHasher, Hasher};
-    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-    h.write_u32(crate::rand::u32());
-    h.finish() as u16
+    crate::rand::unpredictable_u64() as u16
+}
+
+/// Flip the letters of the question name in `query` (a whole message)
+/// to random case, for DNS 0x20 (see [`ResolverConfig::randomize_case`]).
+/// The bits come from the same keyed source as the ID, since a forger
+/// able to predict them gains nothing from the exercise.
+#[cfg(not(target_family = "wasm"))]
+fn randomize_case(query: &mut [u8]) {
+    let mut bits = 0u64;
+    let mut left = 0;
+    let mut off = 12;
+    while let Some(&len) = query.get(off) {
+        // Built by build_query: plain labels, ending in the root.
+        if len == 0 || len & 0xC0 != 0 {
+            break;
+        }
+        let end = (off + 1 + len as usize).min(query.len());
+        for b in &mut query[off + 1..end] {
+            if !b.is_ascii_alphabetic() {
+                continue;
+            }
+            if left == 0 {
+                bits = crate::rand::unpredictable_u64();
+                left = 64;
+            }
+            if bits & 1 == 1 {
+                *b ^= 0x20;
+            }
+            bits >>= 1;
+            left -= 1;
+        }
+        off = end;
+    }
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -331,13 +372,12 @@ impl Resolver {
     /// Convenience constructor from a list of server IPs (UDP/53).
     pub fn from_servers(servers: impl IntoIterator<Item = IpAddr>) -> Resolver {
         Resolver {
-            cfg: ResolverConfig {
-                servers: servers
+            cfg: ResolverConfig::default().servers(
+                servers
                     .into_iter()
                     .map(|ip| SocketAddr::new(ip, 53))
                     .collect(),
-                timeout: Duration::from_secs(5),
-            },
+            ),
         }
     }
 
@@ -386,8 +426,11 @@ impl Resolver {
         rtype: RecordType,
     ) -> io::Result<Vec<IpAddr>> {
         let id = query_id();
-        let query = wire::build_query(id, name, rtype)
+        let mut query = wire::build_query(id, name, rtype)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid domain name"))?;
+        if self.cfg.randomize_case {
+            randomize_case(&mut query);
+        }
 
         let bind = if server.is_ipv6() {
             "[::]:0"
@@ -425,11 +468,17 @@ impl Resolver {
             };
             let resp = &buf[..n];
             // Anything that is not a response to exactly this query is
-            // ignored: wrong ID, not a response, another question.
+            // ignored: wrong ID, not a response, another question, or --
+            // with 0x20 -- the question in other letter case than sent,
+            // which is what an off-path forger's would be. An error answer
+            // (SERVFAIL, NXDOMAIN) has to pass the same checks before it
+            // ends the query, so a forged one is no easier than a forged
+            // address.
             if resp.len() < 12
                 || resp[..2] != id.to_be_bytes()
                 || resp[2] & 0x80 == 0
                 || !wire::question_matches(resp, &query)
+                || (self.cfg.randomize_case && resp.get(12..query.len()) != query.get(12..))
             {
                 continue;
             }
@@ -774,10 +823,11 @@ mod tests {
         });
 
         // A timeout too long for an Instant to reach is no deadline.
-        let r = Resolver::new(ResolverConfig {
-            servers: vec![server_addr],
-            timeout: Duration::MAX,
-        });
+        let r = Resolver::new(
+            ResolverConfig::default()
+                .servers(vec![server_addr])
+                .timeout(Duration::MAX),
+        );
         let ips = r.query("anything.test", RecordType::A).unwrap();
         assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))]);
     }
@@ -860,9 +910,7 @@ mod tests {
             let mut forged = answer(&other, [6, 6, 6, 6]);
             forged[..2].copy_from_slice(&buf[..2]);
             server.send_to(&forged, from).unwrap();
-            // The name echoed in another letter case is still ours.
-            let mut real = answer(&buf[..n], [1, 2, 3, 4]);
-            real[13] = real[13].to_ascii_uppercase();
+            let real = answer(&buf[..n], [1, 2, 3, 4]);
             server.send_to(&real, from).unwrap();
         });
         let r = Resolver::new(
@@ -986,5 +1034,76 @@ mod tests {
             "took {:?}",
             start.elapsed()
         );
+    }
+
+    /// The query's name, lowercased: what a forger who cannot see the
+    /// query would echo.
+    fn lowercased(query: &[u8]) -> Vec<u8> {
+        let mut q = query.to_vec();
+        q[12..].make_ascii_lowercase();
+        q
+    }
+
+    #[test]
+    fn a_forged_error_in_the_wrong_case_does_not_end_the_query() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let server_addr = server.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1500];
+            let (n, from) = server.recv_from(&mut buf).unwrap();
+            // A SERVFAIL with the right ID and port, from a forger who
+            // could not see the query's letter case.
+            let mut forged = lowercased(&buf[..n]);
+            forged[2..4].copy_from_slice(&0x8182u16.to_be_bytes());
+            server.send_to(&forged, from).unwrap();
+            server
+                .send_to(&answer(&buf[..n], [1, 2, 3, 4]), from)
+                .unwrap();
+        });
+        let r = Resolver::new(
+            ResolverConfig::default()
+                .servers(vec![server_addr])
+                .timeout(Duration::from_secs(2)),
+        );
+        let name = "abcdefghijklmnopqrstuvwxyz.example.test";
+        let ips = r.query(name, RecordType::A).unwrap();
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))]);
+    }
+
+    #[test]
+    fn query_names_go_out_in_random_case() {
+        let name = "abcdefghijklmnopqrstuvwxyz.example.test";
+        let plain = wire::build_query(1, name, RecordType::A).unwrap();
+        let mut q = plain.clone();
+        randomize_case(&mut q);
+        assert!(wire::question_matches(&q, &plain), "not the same name");
+        assert_ne!(q, plain, "35 letters, and not one flipped");
+        let mut again = plain.clone();
+        randomize_case(&mut again);
+        assert_ne!(q, again, "the same case twice");
+        // Only letters change; lengths and the rest stay.
+        assert_eq!(lowercased(&q), plain);
+    }
+
+    #[test]
+    fn case_randomization_can_be_turned_off_for_servers_that_fold_case() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let server_addr = server.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1500];
+            let (n, from) = server.recv_from(&mut buf).unwrap();
+            let mut resp = answer(&buf[..n], [1, 2, 3, 4]);
+            let end = n;
+            resp[12..end].make_ascii_uppercase();
+            server.send_to(&resp, from).unwrap();
+        });
+        let r = Resolver::new(
+            ResolverConfig::default()
+                .servers(vec![server_addr])
+                .timeout(Duration::from_secs(2))
+                .randomize_case(false),
+        );
+        let ips = r.query("example.test", RecordType::A).unwrap();
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))]);
     }
 }
