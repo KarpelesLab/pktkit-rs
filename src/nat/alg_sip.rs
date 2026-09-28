@@ -20,6 +20,9 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 
 const SIP_PORT: u16 = 5060;
+/// The default port of SIP over TLS (RFC 3261 §19.1.2), which a `sips:`
+/// URI or a Via sent-by over TLS without a port means.
+const SIPS_PORT: u16 = 5061;
 const SIP_RTP_TIMEOUT: Duration = Duration::from_secs(120);
 /// Cap on the inside ports one SIP message may open. Each `m=` line opens
 /// its RTP and RTCP ports to any remote, and a message is the inside
@@ -130,8 +133,13 @@ impl SipHelper {
                 b"Contact:".as_slice(),
                 b"m:".as_slice(),
             ] {
-                new_payload =
-                    sip_rewrite_header(&new_payload, prefix, hp_from.as_bytes(), hp_to.as_bytes());
+                new_payload = sip_rewrite_header(
+                    &new_payload,
+                    prefix,
+                    hp_from.as_bytes(),
+                    hp_to.as_bytes(),
+                    None,
+                );
             }
             for prefix in [
                 b"Via:".as_slice(),
@@ -139,11 +147,18 @@ impl SipHelper {
                 b"Contact:".as_slice(),
                 b"m:".as_slice(),
             ] {
+                // A portless address means the transport's default port
+                // (RFC 3261 §18.2.1, §19.1.2); going out, if that is the
+                // mapping's inside port but not its outside one, the peer
+                // must be told which it is, or it sends to the default port
+                // on the public address, where no mapping leads here.
+                let portless = outbound.then_some((m.inside_port, m.outside_port));
                 new_payload = sip_rewrite_header(
                     &new_payload,
                     prefix,
                     addr_from.as_bytes(),
                     addr_to.as_bytes(),
+                    portless,
                 );
             }
 
@@ -405,7 +420,19 @@ fn sip_parse_media_line(
 
 /// Replace `old_val` with `new_val` only within lines whose start matches
 /// `prefix` (case-insensitive on the prefix).
-fn sip_rewrite_header(payload: &[u8], prefix: &[u8], old_val: &[u8], new_val: &[u8]) -> Vec<u8> {
+///
+/// With `portless` set to a mapping's `(inside, outside)` ports, `old_val`
+/// is a bare address, and where it names a host with no port (a Via
+/// sent-by or a URI host), the line's transport default, that stands for
+/// the inside port: if the outside port differs, `:outside` follows the
+/// new address.
+fn sip_rewrite_header(
+    payload: &[u8],
+    prefix: &[u8],
+    old_val: &[u8],
+    new_val: &[u8],
+    portless: Option<(u16, u16)>,
+) -> Vec<u8> {
     if old_val == new_val {
         return payload.to_vec();
     }
@@ -418,7 +445,12 @@ fn sip_rewrite_header(payload: &[u8], prefix: &[u8], old_val: &[u8], new_val: &[
         if !line[..prefix.len()].eq_ignore_ascii_case(prefix) {
             continue;
         }
-        let new_line = replace_addr(line, old_val, new_val);
+        let suffix = portless.and_then(|(inside, outside)| {
+            let default = default_port(line);
+            (inside == default && outside != default).then(|| format!(":{outside}"))
+        });
+        let new_line =
+            replace_addr_as(line, old_val, new_val, suffix.as_deref().map(str::as_bytes));
         if new_line != *line {
             *line = new_line;
             changed = true;
@@ -447,6 +479,17 @@ fn sip_update_content_length(headers: &mut Vec<u8>, sdp_body: &[u8]) -> Vec<u8> 
 const CONTENT_LENGTH: [&[u8]; 2] = [b"content-length", b"l"];
 /// `Content-Type` and its compact form (RFC 3261 §7.3.3, §20.15).
 const CONTENT_TYPE: [&[u8]; 2] = [b"content-type", b"c"];
+
+/// The port a portless address in Via or Contact header line `line` means:
+/// 5061 for TLS (a Via sent over TLS, a `sips:` URI or `transport=tls`),
+/// otherwise 5060 (RFC 3261 §18.2.1, §19.1.2).
+fn default_port(line: &[u8]) -> u16 {
+    let upper = line.to_ascii_uppercase();
+    let tls = [b"/TLS".as_slice(), b"SIPS:", b"TRANSPORT=TLS"]
+        .iter()
+        .any(|n| find_subslice(&upper, n).is_some());
+    if tls { SIPS_PORT } else { SIP_PORT }
+}
 
 /// Where the value of the first header called one of `names` (lower case)
 /// lies in `head`, a message head: its start line, then header lines, each
@@ -569,6 +612,14 @@ fn join_subslice(parts: &[Vec<u8>], sep: &[u8]) -> Vec<u8> {
 /// corrupting another host's address, so the bytes either side of a match must
 /// not continue the number.
 fn replace_addr(data: &[u8], old: &[u8], new: &[u8]) -> Vec<u8> {
+    replace_addr_as(data, old, new, None)
+}
+
+/// [`replace_addr`], writing `portless` after each replacement of an
+/// address that stands as a host with no port: after a space, `@` or the
+/// `:` of a URI scheme, and not followed by a `:port` of its own. An
+/// address as a parameter value (`received=`, `maddr=`) takes no port.
+fn replace_addr_as(data: &[u8], old: &[u8], new: &[u8], portless: Option<&[u8]>) -> Vec<u8> {
     if old.is_empty() {
         return data.to_vec();
     }
@@ -582,6 +633,13 @@ fn replace_addr(data: &[u8], old: &[u8], new: &[u8]) -> Vec<u8> {
             && data.get(end).is_none_or(|b| !b.is_ascii_digit())
         {
             out.extend_from_slice(new);
+            if let Some(suffix) = portless
+                && i > 0
+                && matches!(data[i - 1], b' ' | b'\t' | b'@' | b':')
+                && data.get(end) != Some(&b':')
+            {
+                out.extend_from_slice(suffix);
+            }
             i += old.len();
         } else {
             out.push(data[i]);
@@ -1169,5 +1227,78 @@ Content-Length: 21\r\n\r\nc=IN IP4 10.0.0.5\r\nxy";
         assert!(!is_sdp(
             b"INVITE x SIP/2.0\r\nContent-Type: text/plain\r\nX-Rc: application/sdp"
         ));
+    }
+
+    #[test]
+    fn portless_addresses_get_the_mapped_port() {
+        let nat = Nat::new(pfx("10.0.0.1/24"), pfx("203.0.113.1/24"));
+        nat.add_packet_helper(Arc::new(SipHelper::new()));
+        let captured = Arc::new(StdMutex::new(Vec::<Vec<u8>>::new()));
+        let c = captured.clone();
+        nat.outside().set_handler(Arc::new(move |p| {
+            c.lock().unwrap().push(p.as_bytes().to_vec());
+            Ok(())
+        }));
+        let server = Ipv4Addr::new(198, 51, 100, 9);
+        let body = |ip: &str| {
+            format!(
+                "REGISTER sip:example.com SIP/2.0\r\n\
+Via: SIP/2.0/UDP {ip};branch=z9hG4bK;received={ip}\r\n\
+Contact: <sip:alice@{ip}>\r\n\
+Content-Length: 0\r\n\r\n"
+            )
+        };
+        let send = |ip: Ipv4Addr| {
+            let pkt = build_sip_udp(ip, 5060, server, 5060, body(&ip.to_string()).as_bytes());
+            nat.inside().send(Packet::from_slice(&pkt)).unwrap();
+            let out = captured.lock().unwrap();
+            let p = out.last().unwrap();
+            let sport = u16::from_be_bytes([p[20], p[21]]);
+            (sport, String::from_utf8_lossy(payload_of(p)).to_string())
+        };
+        // The first phone keeps 5060, which portless addresses mean.
+        let (port, s) = send(Ipv4Addr::new(10, 0, 0, 6));
+        assert_eq!(port, 5060);
+        assert_eq!(s, body("203.0.113.1"));
+        // The second cannot; its peers must be told where it is.
+        let (port, s) = send(Ipv4Addr::new(10, 0, 0, 5));
+        assert_ne!(port, 5060);
+        assert!(
+            s.contains(&format!(
+                "UDP 203.0.113.1:{port};branch=z9hG4bK;received=203.0.113.1\r\n"
+            )),
+            "{s}"
+        );
+        assert!(
+            s.contains(&format!("<sip:alice@203.0.113.1:{port}>")),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn portless_addresses_over_tls_mean_5061() {
+        let rw = |line: &[u8], ports| {
+            let out = sip_rewrite_header(line, b"Via:", b"10.0.0.5", b"203.0.113.1", Some(ports));
+            String::from_utf8(out).unwrap()
+        };
+        let via = b"Via: SIP/2.0/TLS 10.0.0.5;branch=x";
+        assert_eq!(
+            rw(via, (5061, 20001)),
+            "Via: SIP/2.0/TLS 203.0.113.1:20001;branch=x"
+        );
+        assert_eq!(
+            rw(via, (5061, 5061)),
+            "Via: SIP/2.0/TLS 203.0.113.1;branch=x"
+        );
+        // Sent from 5060, the host is not the one 5061 names.
+        assert_eq!(
+            rw(via, (5060, 20000)),
+            "Via: SIP/2.0/TLS 203.0.113.1;branch=x"
+        );
+        let contact = b"Via: <sips:alice@10.0.0.5>";
+        assert_eq!(
+            rw(contact, (5061, 20001)),
+            "Via: <sips:alice@203.0.113.1:20001>"
+        );
     }
 }
