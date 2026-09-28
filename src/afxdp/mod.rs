@@ -52,14 +52,8 @@
 //! pieces — ring index math, eBPF byte encoding, netlink message layout,
 //! UMEM offset arithmetic — are unit-tested. Paths that require hardware are
 //! marked `// TODO(afxdp): needs hardware to verify`.
-//!
-//! # Module layout
-//!
-//! - [`ring`]: lock-free SPSC rings over the `mmap`'d shared memory.
-//! - `xdp` (private): socket setup and datapath; defines [`Config`]/[`Device`].
 
+mod ring;
 mod xdp;
-
-pub mod ring;
 
 pub use xdp::{BusyPoll, Config, Device, ProgramSource, Statistics, Zerocopy};
