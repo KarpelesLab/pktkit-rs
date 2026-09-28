@@ -2008,6 +2008,47 @@ fn renegotiation_cannot_change_the_client_certificate() {
     );
 }
 
+/// A client may start only so many renegotiations a minute: each costs
+/// the server a TLS handshake and an on_auth call. One past the limit is
+/// dropped, as if lost, and served once the period is over.
+#[test]
+fn client_renegotiations_are_rate_limited() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let calls = Arc::new(AtomicUsize::new(0));
+    let c = calls.clone();
+    let hook: OnAuth = Arc::new(move |info: &AuthInfo| {
+        c.fetch_add(1, Ordering::Relaxed);
+        auth_hook()(info)
+    });
+    let mut server = Peer::new(server_config(), *b"SERVERID", hook)
+        .unwrap()
+        .with_timers(quiet_timers());
+    let mut client = TestClient::new(*b"CLIENTID");
+    connect(&mut server, &mut client);
+    for kid in 1..=4 {
+        let first = vec![client.renegotiate(kid)];
+        let k = connect_from(&mut server, &mut client, first);
+        assert_eq!(
+            deliver_on(&mut server, &k, kid, 1, b"x"),
+            Some(b"x".to_vec())
+        );
+    }
+    assert_eq!(calls.load(Ordering::Relaxed), 5);
+    let reset = client.renegotiate(5);
+    assert!(server.handle_packet(&reset).is_err(), "fifth accepted");
+    assert!(
+        server.handle_packet(&reset).is_err(),
+        "retransmission accepted"
+    );
+    // A minute on, the retransmission is served.
+    let later = Instant::now() + Duration::from_secs(61);
+    let out = server.handle_packet_at(&reset, later).unwrap();
+    let first: Vec<Vec<u8>> = out.send.iter().flat_map(|d| client.handle(d)).collect();
+    let k = connect_from(&mut server, &mut client, first);
+    assert_eq!(deliver_on(&mut server, &k, 5, 1, b"y"), Some(b"y".to_vec()));
+    assert_eq!(calls.load(Ordering::Relaxed), 6);
+}
+
 // --- helpers ----------------------------------------------------------------
 
 /// Exchange what `client` has queued with `server` until both go quiet;

@@ -322,6 +322,17 @@ const MAX_UNPROVEN_TLS: usize = 16 * 1024;
 /// use up the budget of the genuine client.
 const NEW_SESSIONS: (u32, Duration) = (4, Duration::from_secs(60));
 
+/// A session's client starts at most this many renegotiations per period.
+/// Each costs a TLS handshake -- a signature -- and an authentication, an
+/// on_auth call; an authenticated client could otherwise have the server
+/// run them back to back. OpenVPN sets no such limit, but a client
+/// renegotiates when its reneg-sec (an hour, by default), reneg-bytes or
+/// reneg-pkts come due, or its packet ids run low: far less often than
+/// this. A soft reset past the limit is dropped, as if lost; the client
+/// retransmits it, and it is served once the period is over -- well
+/// within the handshake window the client gives it.
+const CLIENT_RENEGOTIATIONS: (u32, Duration) = (4, Duration::from_secs(60));
+
 /// One OpenVPN peer (one client address).
 pub struct Peer {
     config: Arc<purecrypto::tls::Config>,
@@ -771,6 +782,9 @@ impl Peer {
             }
             let (mut ks, server_reset) = session.next_key(&timers, now);
             opened = Some(ks.recv(key_id, pkt.clone())?);
+            if !session.allow_client_renegotiation(now) {
+                return Err(invalid("client renegotiating too often"));
+            }
             session.install_key(ks, &timers, now);
             reset = Some(server_reset);
         }
@@ -1064,6 +1078,9 @@ struct Session {
     /// Who the session first authenticated as; every renegotiation must
     /// present the same.
     identity: Option<Identity>,
+    /// Renegotiations the client started this period, and when it began
+    /// (see [`CLIENT_RENEGOTIATIONS`]).
+    client_renegotiations: (Instant, u32),
 }
 
 /// What a session's client authenticated as: pinned by its first
@@ -1292,6 +1309,7 @@ impl Session {
             pushed_cipher: None,
             push_reply_until: None,
             identity: None,
+            client_renegotiations: (Instant::now(), 0),
         }
     }
 
@@ -1316,6 +1334,19 @@ impl Session {
         let by_age = !timers.renegotiate_interval.is_zero()
             && now.saturating_duration_since(established) >= timers.renegotiate_interval;
         by_age || used_up
+    }
+
+    /// Count a renegotiation the client starts; whether the budget allows
+    /// it (see [`CLIENT_RENEGOTIATIONS`]).
+    fn allow_client_renegotiation(&mut self, now: Instant) -> bool {
+        let (max, period) = CLIENT_RENEGOTIATIONS;
+        let (start, count) = &mut self.client_renegotiations;
+        if now.saturating_duration_since(*start) >= period {
+            *start = now;
+            *count = 0;
+        }
+        *count += 1;
+        *count <= max
     }
 
     /// Whether the data channel runs AES-GCM, which has a usage limit.
