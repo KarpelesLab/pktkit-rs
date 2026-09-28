@@ -28,13 +28,22 @@ const PROVISIONAL_MIN_AGE: Duration = Duration::from_secs(PROVISIONAL_LEASE.as_s
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct ServerConfig {
+    /// The server's own address: the source of its replies and the server
+    /// identifier (option 54) clients answer to.
     pub server_ip: Ipv4Addr,
+    /// Subnet mask handed to clients (option 1). Default `/24`.
     pub subnet_mask: Ipv4Addr,
+    /// First address of the dynamic pool, inclusive.
     pub range_start: Ipv4Addr,
+    /// Last address of the dynamic pool, inclusive.
     pub range_end: Ipv4Addr,
+    /// Default gateway handed to clients (option 3), if any.
     pub router: Option<Ipv4Addr>,
+    /// DNS servers handed to clients (option 6).
     pub dns: Vec<Ipv4Addr>,
+    /// Lease length granted. Default one hour.
     pub lease_time: Duration,
+    /// The server's MAC, the source of the frames it sends.
     pub mac: MacAddr,
     /// Reserved IPs handed out to specific clients, never recycled to anyone
     /// else.
