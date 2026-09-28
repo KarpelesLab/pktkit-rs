@@ -14,7 +14,6 @@ use crate::Result;
 
 pub const BPF_LD: u8 = 0x00;
 pub const BPF_LDX: u8 = 0x01;
-pub const BPF_ST: u8 = 0x02;
 pub const BPF_STX: u8 = 0x03;
 pub const BPF_JMP: u8 = 0x05;
 pub const BPF_ALU64: u8 = 0x07;
@@ -57,7 +56,6 @@ impl Jmp {
     pub const JA: Jmp = Jmp(0x00);
     pub const JEQ: Jmp = Jmp(0x10);
     pub const JGT: Jmp = Jmp(0x20);
-    pub const JGE: Jmp = Jmp(0x30);
     /// `if dst & imm`
     pub const JSET: Jmp = Jmp(0x40);
     pub const JNE: Jmp = Jmp(0x50);
@@ -78,7 +76,6 @@ pub const R5: u8 = 5;
 pub const R6: u8 = 6;
 pub const R7: u8 = 7;
 pub const R8: u8 = 8;
-pub const R9: u8 = 9;
 /// Frame pointer. Read-only; stack slots are addressed as `R10 + negative`.
 pub const R10: u8 = 10;
 
@@ -183,16 +180,6 @@ impl Insn {
             regs: reg(dst, src),
             off,
             imm: 0,
-        }
-    }
-
-    /// `*(size *)(dst + off) = imm`
-    pub fn st_imm(size: Size, dst: u8, off: i16, imm: i32) -> Insn {
-        Insn {
-            code: BPF_ST | size.0 | BPF_MEM,
-            regs: reg(dst, 0),
-            off,
-            imm,
         }
     }
 
@@ -371,15 +358,6 @@ impl Asm {
             self.insns[*at].off = off;
         }
         Ok(self.insns)
-    }
-
-    /// Number of instructions emitted so far.
-    pub fn len(&self) -> usize {
-        self.insns.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.insns.is_empty()
     }
 }
 

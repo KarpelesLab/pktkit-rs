@@ -572,7 +572,7 @@ impl Device {
             ProgramSource::External { .. } => None,
         };
         let xskmap_fd = match (&capture, &cfg.program) {
-            (Some(c), _) => c.xskmap().as_raw_fd(),
+            (Some(c), _) => c.xsk_map().as_raw_fd(),
             (None, ProgramSource::External { xskmap_fd }) => *xskmap_fd,
             (None, _) => unreachable!("capture is Some for ProgramSource::Capture"),
         };
@@ -794,7 +794,7 @@ impl crate::L2Device for Device {
         // the kernel clears our sockets from its XSKMAP when they close.
         if let Some(c) = &self.inner.capture {
             for s in &self.inner.sockets {
-                let _ = c.xskmap().delete(&s.queue_id.to_ne_bytes());
+                let _ = c.xsk_map().delete(&s.queue_id.to_ne_bytes());
             }
             c.detach();
         }

@@ -48,9 +48,9 @@ impl Mode {
     pub const DRIVER: Mode = Mode(1 << 2);
     /// `XDP_FLAGS_HW_MODE` (SmartNIC offload).
     ///
-    /// [`Program::attach`] refuses it: the kernel only attaches a program in
-    /// this mode if it was loaded for that one device (`prog_ifindex`), which
-    /// [`Program::load`] does not do.
+    /// Attaching refuses it: the kernel only attaches a program in this mode
+    /// if it was loaded for that one device (`prog_ifindex`), which this
+    /// crate does not do.
     pub const HARDWARE: Mode = Mode(1 << 3);
 
     /// True if a socket bound behind a program in this mode can negotiate
@@ -242,7 +242,7 @@ fn check_attach_mode(mode: Mode) -> Result<()> {
     Ok(())
 }
 
-/// What [`Program::test_run`] observed.
+/// What [`Capture::test_run`](super::Capture::test_run) observed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TestRun {
     /// The verdict the program returned for the frame.
@@ -275,15 +275,6 @@ impl Program {
             action: Action(attr.retval),
             duration_ns: attr.duration,
         })
-    }
-
-    /// Give up ownership of the program's file descriptor.
-    ///
-    /// The program stays loaded for as long as the fd is open (or something
-    /// else, such as an attachment, references it).
-    #[inline]
-    pub fn into_fd(self) -> OwnedFd {
-        self.fd
     }
 }
 
@@ -318,11 +309,6 @@ impl Link {
     #[inline]
     pub fn mode(&self) -> Mode {
         self.mode
-    }
-
-    #[inline]
-    pub fn ifindex(&self) -> u32 {
-        self.ifindex
     }
 }
 
@@ -393,7 +379,7 @@ fn prog_fd_by_id(id: u32) -> Result<OwnedFd> {
 /// Force-detach whatever XDP program is on `ifindex`.
 ///
 /// The escape hatch for a program left behind by a process that died before
-/// its [`Link`] dropped. Clears every mode that has a program: an interface
+/// it could detach it (dropping a [`Capture`](super::Capture) does). Clears every mode that has a program: an interface
 /// can hold a generic, a driver and an offloaded one at once. Has no effect
 /// on a `bpf_link` attachment, which the kernel already cleaned up when its
 /// owner died; one whose owner is still alive fails with `EBUSY`.

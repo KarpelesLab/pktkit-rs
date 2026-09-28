@@ -429,8 +429,9 @@ complete and tested; a few have documented `// TODO(<feature>)` gaps:
   implemented. (Control-packet retransmission, keepalive and renegotiation
   timers run from `Peer::tick`, which `ovpn::Server` drives.)
 - **xdp / afxdp**: program codegen, map key layout and ring math are
-  unit-tested, and `tests/xdp_kernel.rs` covers verifier acceptance and the
-  veth datapath — but those are `#[ignore]`d because they need root, so the
+  unit-tested, and `src/xdp/kernel_tests.rs` (verifier acceptance) and
+  `tests/xdp_kernel.rs` (the veth datapath) cover the kernel side — but
+  those are `#[ignore]`d because they need root, so the
   kernel-facing paths stay marked `// TODO(afxdp)` until CI runs them.
   Zero-copy additionally needs a driver that supports it; `Device::zerocopy()`
   reports what was actually negotiated.

@@ -1,98 +1,11 @@
-//! An XDP program that redirects only the traffic belonging to a set of IP
-//! prefixes, and passes everything else to the kernel.
-//!
-//! The set lives in two `LPM_TRIE` maps (one per address family) rather than
-//! being baked into the instruction stream, so [`Capture::add`] and
-//! [`Capture::remove`] take effect immediately without reloading or
-//! reattaching anything. Lookup cost is independent of how many prefixes are
-//! in the set.
-//!
-//! # What gets captured
-//!
-//! For each frame the program checks, in order:
-//!
-//! - **IPv4** (`0x0800`): the destination address, the source address, or
-//!   both, per [`MatchField`].
-//! - **IPv6** (`0x86DD`): likewise, against the v6 trie.
-//! - **ARP** (`0x0806`), when [`CaptureConfig::arp`] is set: the target
-//!   protocol address, so an `ARP who-has <captured ip>` reaches userspace.
-//!   Without this a captured address is unreachable — nobody can resolve it.
-//!
-//! An address hit is not yet a capture: each prefix carries a short list of
-//! [`Rule`]s, and the packet has to satisfy one of them. [`Rule::Any`] takes
-//! the whole address; [`Rule::Proto`] one IP protocol on it; [`Rule::Port`]
-//! one TCP or UDP port. The port compared is the one at the captured endpoint
-//! — the destination port when the destination address matched, the source
-//! port when the source address did — so `Port(UDP, 53)` on a captured address
-//! means "the DNS service *at* that address", whichever way the packet is
-//! travelling.
-//!
-//! Prefixes nest. A packet is judged on the rules of every prefix in the set
-//! that contains its address, so a narrower prefix adds to a broader one
-//! rather than overriding it: `Port(UDP, 53)` on `10.0.0.1/32` takes nothing
-//! away from an [`Rule::Any`] on `10.0.0.0/24`. The trie only ever returns
-//! the longest match, so each entry is written with the rules it inherits
-//! from the broader prefixes around it, and together they count against
-//! [`CaptureConfig::max_rules_per_prefix`].
-//!
-//! ARP and neighbor discovery follow the rules too. Only a prefix with an
-//! [`Rule::Any`] entry has its ARP and neighbor solicitations captured: a
-//! narrower rule means the address is shared with the host stack, which then
-//! has to keep answering for it.
-//!
-//! A neighbor solicitation is addressed to a *solicited-node multicast* group
-//! rather than to the address it asks about, so destination matching cannot
-//! find it. With [`CaptureConfig::neighbor_discovery`] set, the program looks
-//! up the solicitation's *target address* instead, the way the ARP branch
-//! looks up `tpa`. The group itself is never captured: it is derived from only
-//! the low 24 bits of an address, so the host's own addresses can share it,
-//! and diverting the group would divert the host's neighbor discovery with it.
-//!
-//! Anything that matches nothing returns [`CaptureConfig::default_action`],
-//! normally [`Action::PASS`]. A capture device therefore coexists with the
-//! host stack on the same NIC instead of black-holing it.
-//!
-//! # Where the transport header is not
-//!
-//! A port rule can only be judged on a packet that carries a transport header
-//! at a place the program can find:
-//!
-//! - An IPv4 packet with a fragment offset other than zero has no transport
-//!   header. It does not match a port rule, and goes wherever the address's
-//!   other rules (or the default action) send it. The first fragment carries
-//!   the ports and matches normally.
-//! - IPv6 extension headers are not walked. A [`Rule::Proto`] is compared
-//!   against the Next Header field of the fixed header, and a [`Rule::Port`]
-//!   requires TCP or UDP to follow the fixed header directly. A packet with,
-//!   say, a Fragment header in between matches neither.
-//!
-//! # Never the whole interface
-//!
-//! Sharing the NIC only holds if the capture set stays a strict subset of the
-//! traffic on it, so [`Capture::add`] enforces that on two levels:
-//!
-//! - **Per prefix.** A `/0` matches every packet and is refused unconditionally.
-//!   [`CaptureConfig::min_prefix_v4`] and [`CaptureConfig::min_prefix_v6`] raise
-//!   the floor further for callers who want to allow no more than, say, a
-//!   subnet at a time.
-//! - **Per set.** A floor alone is not enough — two `/1`s clear it individually
-//!   and cover all of IPv4 between them. Any addition that would leave the set
-//!   spanning an entire address family is refused as well.
-//!
-//! The rules on a prefix do not relax either check: a port rule on every
-//! address is still a program that inspects every packet on the interface.
-//!
-//! Both checks run before anything reaches the kernel, so a refused call leaves
-//! the capture set exactly as it was.
-//!
-//! The guarantee is a property of [`Capture`]. Assembling [`CaptureMaps`] and
-//! [`build_program`] by hand, or supplying your own program through
-//! `afxdp::ProgramSource::External`, opts out of it — those are the deliberate
-//! low-level paths, and policing them is the caller's job.
+//! The IP-prefix capture program: its code generation, its maps, and
+//! [`Capture`], which owns them. What the program captures, and the checks
+//! that keep it from taking the whole interface, are documented on
+//! [`Capture`].
 
 use std::io;
-use std::net::{IpAddr, Ipv6Addr};
-use std::os::fd::AsRawFd;
+use std::net::IpAddr;
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::sync::Mutex;
 
 use super::insn::{
@@ -229,7 +142,7 @@ pub const MAX_RULES_PER_PREFIX: u8 = 64;
 
 impl Rule {
     /// Reject a rule the program could not evaluate.
-    pub fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         match self {
             Rule::Port(proto, _) if *proto != Protocol::TCP && *proto != Protocol::UDP => {
                 Err(io::Error::new(
@@ -400,7 +313,7 @@ impl Default for CaptureConfig {
 
 impl CaptureConfig {
     /// Reject a configuration that could not uphold the sharing invariant.
-    pub fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if self.min_prefix_v4 == 0 || self.min_prefix_v6 == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -448,7 +361,7 @@ impl CaptureConfig {
     }
 
     /// Reject a prefix broader than this configuration allows.
-    pub fn check_prefix(&self, prefix: IpPrefix) -> Result<()> {
+    pub(crate) fn check_prefix(&self, prefix: IpPrefix) -> Result<()> {
         let (min, family) = if prefix.is_v4() {
             (self.min_prefix_v4.max(1), "IPv4")
         } else {
@@ -518,18 +431,18 @@ fn check_coverage(held: &[IpPrefix], new: IpPrefix) -> Result<()> {
 
 /// The maps a capture program reads.
 #[derive(Debug)]
-pub struct CaptureMaps {
+pub(crate) struct CaptureMaps {
     /// Queue index -> AF_XDP socket.
-    pub xskmap: Map,
+    pub(crate) xskmap: Map,
     /// IPv4 prefixes to capture. The value is the prefix's packed rule list.
-    pub v4: Map,
+    pub(crate) v4: Map,
     /// IPv6 prefixes to capture, likewise.
-    pub v6: Map,
+    pub(crate) v6: Map,
 }
 
 impl CaptureMaps {
     /// Create the three maps a capture program needs.
-    pub fn create(cfg: &CaptureConfig) -> Result<CaptureMaps> {
+    pub(crate) fn create(cfg: &CaptureConfig) -> Result<CaptureMaps> {
         let value = value_size(cfg.max_rules_per_prefix);
         Ok(CaptureMaps {
             xskmap: Map::xskmap(cfg.max_queues)?,
@@ -690,7 +603,9 @@ fn need_bytes(asm: &mut Asm, n: i32, miss: Label) {
 /// The map file descriptors are embedded in the instruction stream, so `maps`
 /// must stay open until the program is loaded (and the program keeps the maps
 /// alive from then on).
-pub fn build_program(cfg: &CaptureConfig, maps: &CaptureMaps) -> Result<Vec<Insn>> {
+// For the kernel tests, which only run on Linux.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn build_program(cfg: &CaptureConfig, maps: &CaptureMaps) -> Result<Vec<Insn>> {
     build_program_with_fds(
         cfg,
         maps.xskmap.as_raw_fd(),
@@ -701,6 +616,7 @@ pub fn build_program(cfg: &CaptureConfig, maps: &CaptureMaps) -> Result<Vec<Insn
 
 /// Codegen proper, parameterised on the map file descriptors so it can be
 /// exercised without `CAP_BPF`.
+#[cfg(test)]
 fn build_program_with_fds(
     cfg: &CaptureConfig,
     xskmap_fd: i32,
@@ -906,9 +822,99 @@ struct Entry {
     rules: Vec<Rule>,
 }
 
-/// A loaded, attached capture program together with the maps that drive it.
+/// A loaded, attached XDP program that redirects only the traffic belonging
+/// to a set of IP prefixes and passes everything else to the kernel, together
+/// with the maps that drive it.
 ///
 /// Dropping this detaches the program and frees the maps.
+///
+/// The set lives in two `LPM_TRIE` maps (one per address family) rather than
+/// being baked into the instruction stream, so [`add`](Self::add) and
+/// [`remove`](Self::remove) take effect immediately without reloading or
+/// reattaching anything. Lookup cost is independent of how many prefixes are
+/// in the set.
+///
+/// # What gets captured
+///
+/// For each frame the program checks, in order:
+///
+/// - **IPv4** (`0x0800`): the destination address, the source address, or
+///   both, per [`MatchField`].
+/// - **IPv6** (`0x86DD`): likewise, against the v6 trie.
+/// - **ARP** (`0x0806`), when [`CaptureConfig::arp`] is set: the target
+///   protocol address, so an `ARP who-has <captured ip>` reaches userspace.
+///   Without this a captured address is unreachable — nobody can resolve it.
+///
+/// An address hit is not yet a capture: each prefix carries a short list of
+/// [`Rule`]s, and the packet has to satisfy one of them. [`Rule::Any`] takes
+/// the whole address; [`Rule::Proto`] one IP protocol on it; [`Rule::Port`]
+/// one TCP or UDP port. The port compared is the one at the captured endpoint
+/// — the destination port when the destination address matched, the source
+/// port when the source address did — so `Port(UDP, 53)` on a captured address
+/// means "the DNS service *at* that address", whichever way the packet is
+/// travelling.
+///
+/// Prefixes nest. A packet is judged on the rules of every prefix in the set
+/// that contains its address, so a narrower prefix adds to a broader one
+/// rather than overriding it: `Port(UDP, 53)` on `10.0.0.1/32` takes nothing
+/// away from an [`Rule::Any`] on `10.0.0.0/24`. The trie only ever returns
+/// the longest match, so each entry is written with the rules it inherits
+/// from the broader prefixes around it, and together they count against
+/// [`CaptureConfig::max_rules_per_prefix`].
+///
+/// ARP and neighbor discovery follow the rules too. Only a prefix with an
+/// [`Rule::Any`] entry has its ARP and neighbor solicitations captured: a
+/// narrower rule means the address is shared with the host stack, which then
+/// has to keep answering for it.
+///
+/// A neighbor solicitation is addressed to a *solicited-node multicast* group
+/// rather than to the address it asks about, so destination matching cannot
+/// find it. With [`CaptureConfig::neighbor_discovery`] set, the program looks
+/// up the solicitation's *target address* instead, the way the ARP branch
+/// looks up `tpa`. The group itself is never captured: it is derived from only
+/// the low 24 bits of an address, so the host's own addresses can share it,
+/// and diverting the group would divert the host's neighbor discovery with it.
+///
+/// Anything that matches nothing returns [`CaptureConfig::default_action`],
+/// normally [`Action::PASS`]. A capture device therefore coexists with the
+/// host stack on the same NIC instead of black-holing it.
+///
+/// # Where the transport header is not
+///
+/// A port rule can only be judged on a packet that carries a transport header
+/// at a place the program can find:
+///
+/// - An IPv4 packet with a fragment offset other than zero has no transport
+///   header. It does not match a port rule, and goes wherever the address's
+///   other rules (or the default action) send it. The first fragment carries
+///   the ports and matches normally.
+/// - IPv6 extension headers are not walked. A [`Rule::Proto`] is compared
+///   against the Next Header field of the fixed header, and a [`Rule::Port`]
+///   requires TCP or UDP to follow the fixed header directly. A packet with,
+///   say, a Fragment header in between matches neither.
+///
+/// # Never the whole interface
+///
+/// Sharing the NIC only holds if the capture set stays a strict subset of the
+/// traffic on it, so [`add`](Self::add) enforces that on two levels:
+///
+/// - **Per prefix.** A `/0` matches every packet and is refused unconditionally.
+///   [`CaptureConfig::min_prefix_v4`] and [`CaptureConfig::min_prefix_v6`] raise
+///   the floor further for callers who want to allow no more than, say, a
+///   subnet at a time.
+/// - **Per set.** A floor alone is not enough — two `/1`s clear it individually
+///   and cover all of IPv4 between them. Any addition that would leave the set
+///   spanning an entire address family is refused as well.
+///
+/// The rules on a prefix do not relax either check: a port rule on every
+/// address is still a program that inspects every packet on the interface.
+///
+/// Both checks run before anything reaches the kernel, so a refused call leaves
+/// the capture set exactly as it was.
+///
+/// The guarantee is a property of `Capture`. Supplying your own program through
+/// `afxdp::ProgramSource::External` opts out of it: that is the deliberate
+/// low-level path, and policing it is the caller's job.
 #[derive(Debug)]
 pub struct Capture {
     maps: CaptureMaps,
@@ -964,15 +970,27 @@ impl Capture {
         drop(self.link.lock().unwrap().take());
     }
 
-    /// The XSKMAP an AF_XDP socket registers itself in.
+    /// The XSKMAP an AF_XDP socket registers itself in: the program
+    /// redirects a captured packet to the socket at its RX queue's index.
+    /// For AF_XDP sockets of your own; an `afxdp::Device` registers its own.
     #[inline]
-    pub fn xskmap(&self) -> &Map {
+    pub fn xskmap(&self) -> BorrowedFd<'_> {
+        self.maps.xskmap.fd()
+    }
+
+    /// The XSKMAP, for the `afxdp` sockets to register in.
+    #[cfg(feature = "afxdp")]
+    #[inline]
+    pub(crate) fn xsk_map(&self) -> &Map {
         &self.maps.xskmap
     }
 
-    /// Run the attached program against `frame` in the kernel, `repeat` times:
-    /// the verdict it gives with the capture set as it stands, and its mean
-    /// cost per packet. See [`Program::test_run`].
+    /// Run the attached program against `frame` in the kernel, `repeat` times
+    /// (`BPF_PROG_TEST_RUN`), without any traffic having to arrive: the
+    /// verdict it gives with the capture set as it stands, and its mean cost
+    /// per packet. This is the JITed program and the real maps; the frame is
+    /// seen as arriving on RX queue 0, and a redirect is only reported, never
+    /// carried out.
     pub fn test_run(&self, frame: &[u8], repeat: u32) -> Result<TestRun> {
         self.prog.test_run(frame, repeat)
     }
@@ -1222,7 +1240,8 @@ fn effective_rules(entries: &[Entry], prefix: IpPrefix) -> Option<Vec<Rule>> {
 }
 
 /// `ff02::1:ffXX:XXXX` for `addr`, per RFC 4291 §2.7.1.
-pub fn solicited_node_multicast(addr: Ipv6Addr) -> Ipv6Addr {
+#[cfg(test)]
+fn solicited_node_multicast(addr: std::net::Ipv6Addr) -> std::net::Ipv6Addr {
     let o = addr.octets();
     let mut sn = [0u8; 16];
     sn[0] = 0xff;
@@ -1230,14 +1249,14 @@ pub fn solicited_node_multicast(addr: Ipv6Addr) -> Ipv6Addr {
     sn[11] = 0x01;
     sn[12] = 0xff;
     sn[13..16].copy_from_slice(&o[13..16]);
-    Ipv6Addr::from(sn)
+    std::net::Ipv6Addr::from(sn)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::xdp::insn::{BPF_ADD, BPF_ALU64, BPF_JMP, BPF_K, BPF_STX};
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     const UDP: Protocol = Protocol::UDP;
     const TCP: Protocol = Protocol::TCP;

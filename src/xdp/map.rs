@@ -7,9 +7,9 @@
 
 use std::io;
 use std::net::IpAddr;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 
-use super::sys::{self, MapCreateAttr, MapElemAttr, MapInfo, ObjInfoAttr, bpf_cmd, ctx_err};
+use super::sys::{self, MapCreateAttr, MapElemAttr, bpf_cmd, ctx_err};
 use crate::{IpPrefix, Result};
 
 /// `bpf_map_type`. Open newtype: the kernel adds types faster than we care to
@@ -19,8 +19,6 @@ use crate::{IpPrefix, Result};
 pub struct MapType(pub u32);
 
 impl MapType {
-    pub const HASH: MapType = MapType(1);
-    pub const ARRAY: MapType = MapType(2);
     pub const PERCPU_HASH: MapType = MapType(5);
     pub const PERCPU_ARRAY: MapType = MapType(6);
     pub const LRU_PERCPU_HASH: MapType = MapType(10);
@@ -56,10 +54,6 @@ pub struct UpdateFlags(pub u64);
 impl UpdateFlags {
     /// Create or replace.
     pub const ANY: UpdateFlags = UpdateFlags(0);
-    /// Create only; fails with `EEXIST` if present.
-    pub const NOEXIST: UpdateFlags = UpdateFlags(1);
-    /// Replace only; fails with `ENOENT` if absent.
-    pub const EXIST: UpdateFlags = UpdateFlags(2);
 }
 
 /// An eBPF map. Closes its file descriptor on drop; the kernel frees the map
@@ -70,7 +64,6 @@ pub struct Map {
     kind: MapType,
     key_size: u32,
     value_size: u32,
-    max_entries: u32,
 }
 
 impl Map {
@@ -98,7 +91,6 @@ impl Map {
             kind,
             key_size,
             value_size,
-            max_entries,
         })
     }
 
@@ -119,26 +111,6 @@ impl Map {
             max_entries,
             BPF_F_NO_PREALLOC,
         )
-    }
-
-    #[inline]
-    pub fn kind(&self) -> MapType {
-        self.kind
-    }
-
-    #[inline]
-    pub fn key_size(&self) -> u32 {
-        self.key_size
-    }
-
-    #[inline]
-    pub fn value_size(&self) -> u32 {
-        self.value_size
-    }
-
-    #[inline]
-    pub fn max_entries(&self) -> u32 {
-        self.max_entries
     }
 
     /// Refuse element access whose size the kernel would not take from
@@ -252,20 +224,10 @@ impl Map {
         }
     }
 
-    /// Bind an AF_XDP socket to a queue index in an XSKMAP.
-    pub fn set_socket(&self, queue_id: u32, socket_fd: RawFd) -> Result<()> {
-        self.update(
-            &queue_id.to_ne_bytes(),
-            &(socket_fd as u32).to_ne_bytes(),
-            UpdateFlags::ANY,
-        )
-    }
-
-    /// Give up ownership of the map's file descriptor. The map lives as long
-    /// as the fd, or any program referencing it, does.
+    /// The map's file descriptor, borrowed.
     #[inline]
-    pub fn into_fd(self) -> OwnedFd {
-        self.fd
+    pub(crate) fn fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
     }
 }
 
@@ -282,6 +244,7 @@ impl AsRawFd for Map {
 /// For the case where the program and its map belong to somebody else and all
 /// we were handed is the fd. The map is checked to be an XSKMAP first: any
 /// other geometry would have the kernel read past the 4-byte key or value.
+#[cfg(any(test, feature = "afxdp"))]
 pub fn set_socket_raw(map_fd: RawFd, queue_id: u32, socket_fd: RawFd) -> Result<()> {
     let info = map_info(map_fd)?;
     if info.map_type != MapType::XSKMAP.0 || info.key_size != 4 || info.value_size != 4 {
@@ -319,7 +282,9 @@ pub fn set_socket_raw(map_fd: RawFd, queue_id: u32, socket_fd: RawFd) -> Result<
 }
 
 /// What the kernel says about the map behind `fd`.
-fn map_info(fd: RawFd) -> Result<MapInfo> {
+#[cfg(any(test, feature = "afxdp"))]
+fn map_info(fd: RawFd) -> Result<sys::MapInfo> {
+    use sys::{MapInfo, ObjInfoAttr};
     let mut info = MapInfo::default();
     let mut attr = ObjInfoAttr {
         bpf_fd: fd as u32,
@@ -354,7 +319,7 @@ impl LpmKey {
     }
 
     /// Length in bytes of the address portion (4 for v4, 16 for v6).
-    #[inline]
+    #[cfg(test)]
     pub fn addr_len(&self) -> usize {
         self.len - 4
     }
@@ -424,7 +389,6 @@ mod tests {
                 kind,
                 key_size: 4,
                 value_size: 4,
-                max_entries: 1,
             };
             let mut out = [0u8; 4];
             let e = map.lookup(&[0; 4], &mut out).unwrap_err();

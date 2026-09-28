@@ -1,4 +1,4 @@
-//! Tests that need a kernel: the eBPF verifier, real maps, a real interface.
+//! Tests that need a kernel: a live capture on a real interface.
 //!
 //! All of these are `#[ignore]`d because they need `CAP_BPF` + `CAP_NET_ADMIN`
 //! (in practice, root). Run them with:
@@ -7,9 +7,16 @@
 //! sudo -E cargo test --features afxdp --test xdp_kernel -- --ignored --test-threads=1
 //! ```
 //!
-//! The unit tests cover encoding and layout; these cover the two things only a
-//! kernel can answer — whether the generated program passes the verifier, and
-//! whether the trie keys we build actually match the way we expect.
+//! The unit tests cover encoding and layout; these cover what only a kernel
+//! can answer about the public API — what a live capture diverts, refuses and
+//! costs, and what reaches an AF_XDP device. Whether the verifier accepts
+//! every generated program, and whether the trie keys match the way we
+//! expect, is checked on the crate-private builders by the `#[ignore]`d unit
+//! tests in `src/xdp/kernel_tests.rs`:
+//!
+//! ```sh
+//! sudo -E cargo test --features afxdp --lib xdp::kernel_tests -- --ignored --test-threads=1
+//! ```
 #![cfg(all(feature = "afxdp", target_os = "linux", target_pointer_width = "64"))]
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -19,10 +26,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use pktkit::afxdp::{Config, Device, ProgramSource, Zerocopy};
-use pktkit::xdp::{
-    Action, Capture, CaptureConfig, CaptureMaps, MAX_RULES_PER_PREFIX, Map, MatchField, Mode,
-    Program, Rule, build_program,
-};
+use pktkit::xdp::{Action, Capture, CaptureConfig, MatchField, Mode, Rule};
 use pktkit::{EtherType, Frame, IpPrefix, L2Device, Protocol};
 
 /// True when this process can actually exercise the kernel paths.
@@ -174,126 +178,6 @@ fn ip(args: &[&str]) -> bool {
 
 fn v4(a: [u8; 4], bits: u8) -> IpPrefix {
     IpPrefix::new(Ipv4Addr::from(a).into(), bits)
-}
-
-// --- verifier ---------------------------------------------------------------
-
-/// The one thing no unit test can answer: does the kernel accept what we
-/// generate? Every configuration produces a different instruction stream, so
-/// every configuration has to be loaded.
-#[test]
-#[ignore = "needs CAP_BPF"]
-fn every_capture_configuration_passes_the_verifier() {
-    if !root() {
-        return;
-    }
-    for match_field in [MatchField::Dst, MatchField::Src, MatchField::Either] {
-        for arp in [true, false] {
-            for default_action in [Action::PASS, Action::DROP] {
-                // The rule walk is unrolled per slot, so the widest list is
-                // the one most likely to trip an instruction or complexity
-                // limit; the narrowest exercises the degenerate loop.
-                for max_rules_per_prefix in [1, 8, MAX_RULES_PER_PREFIX] {
-                    let cfg = CaptureConfig::default()
-                        .match_field(match_field)
-                        .arp(arp)
-                        .default_action(default_action)
-                        .max_rules_per_prefix(max_rules_per_prefix);
-                    let maps = CaptureMaps::create(&cfg).expect("create maps");
-                    let insns = build_program(&cfg, &maps).expect("codegen");
-                    Program::load(&insns, "pktkit_test").unwrap_or_else(|e| {
-                        panic!(
-                            "verifier rejected {match_field:?} arp={arp} \
-                             rules={max_rules_per_prefix}: {e}"
-                        )
-                    });
-                }
-            }
-        }
-    }
-}
-
-// --- maps -------------------------------------------------------------------
-
-/// Proves the `bpf_lpm_trie_key` layout against the kernel's own matcher: a
-/// prefix entry has to match every address inside it and nothing outside.
-#[test]
-#[ignore = "needs CAP_BPF"]
-fn lpm_trie_matches_by_longest_prefix() {
-    if !root() {
-        return;
-    }
-    let map = Map::lpm_trie(4, 4, 64).expect("create trie");
-    let one = 1u32.to_ne_bytes();
-    let two = 2u32.to_ne_bytes();
-
-    map.update(
-        pktkit::xdp::lpm_key(v4([10, 0, 0, 0], 8)).as_bytes(),
-        &one,
-        pktkit::xdp::UpdateFlags::ANY,
-    )
-    .unwrap();
-    map.update(
-        pktkit::xdp::lpm_key(v4([10, 1, 2, 0], 24)).as_bytes(),
-        &two,
-        pktkit::xdp::UpdateFlags::ANY,
-    )
-    .unwrap();
-
-    let lookup = |a: [u8; 4]| -> Option<u32> {
-        let mut out = [0u8; 4];
-        map.lookup(pktkit::xdp::lpm_key(v4(a, 32)).as_bytes(), &mut out)
-            .unwrap()
-            .then(|| u32::from_ne_bytes(out))
-    };
-
-    // Inside the /8 only.
-    assert_eq!(lookup([10, 5, 5, 5]), Some(1));
-    // Inside both: the longer prefix wins.
-    assert_eq!(lookup([10, 1, 2, 9]), Some(2));
-    // Outside everything.
-    assert_eq!(lookup([192, 0, 2, 1]), None);
-
-    // Removing the /24 falls back to the /8 rather than to nothing.
-    assert!(
-        map.delete(pktkit::xdp::lpm_key(v4([10, 1, 2, 0], 24)).as_bytes())
-            .unwrap()
-    );
-    assert_eq!(lookup([10, 1, 2, 9]), Some(1));
-}
-
-#[test]
-#[ignore = "needs CAP_BPF"]
-fn ipv6_prefixes_round_trip_through_the_trie() {
-    if !root() {
-        return;
-    }
-    let map = Map::lpm_trie(16, 4, 64).expect("create trie");
-    let net: Ipv6Addr = "2001:db8:1::".parse().unwrap();
-    map.update(
-        pktkit::xdp::lpm_key(IpPrefix::new(net.into(), 48)).as_bytes(),
-        &1u32.to_ne_bytes(),
-        pktkit::xdp::UpdateFlags::ANY,
-    )
-    .unwrap();
-
-    let hit: Ipv6Addr = "2001:db8:1::dead".parse().unwrap();
-    let miss: Ipv6Addr = "2001:db8:2::dead".parse().unwrap();
-    let mut out = [0u8; 4];
-    assert!(
-        map.lookup(
-            pktkit::xdp::lpm_key(IpPrefix::new(hit.into(), 128)).as_bytes(),
-            &mut out
-        )
-        .unwrap()
-    );
-    assert!(
-        !map.lookup(
-            pktkit::xdp::lpm_key(IpPrefix::new(miss.into(), 128)).as_bytes(),
-            &mut out
-        )
-        .unwrap()
-    );
 }
 
 // --- attach -----------------------------------------------------------------
@@ -469,8 +353,8 @@ fn neighbor_solicitations_are_captured_by_target() {
     let mine: Ipv6Addr = "2001:db8::dead:beef".parse().unwrap();
     let hosts: Ipv6Addr = "2001:db8::1:ad:beef".parse().unwrap();
     let p = IpPrefix::new(mine.into(), 128);
-    let sn = pktkit::xdp::solicited_node_multicast(mine);
-    assert_eq!(sn, pktkit::xdp::solicited_node_multicast(hosts));
+    let sn = solicited_node_multicast(mine);
+    assert_eq!(sn, solicited_node_multicast(hosts));
 
     let run = |target: Ipv6Addr| cap.test_run(&ns_frame(target), 1).unwrap().action;
 
@@ -484,10 +368,18 @@ fn neighbor_solicitations_are_captured_by_target() {
     assert_eq!(run(mine), MISS);
 }
 
+/// `ff02::1:ffXX:XXXX` for `addr`, per RFC 4291 §2.7.1.
+fn solicited_node_multicast(addr: Ipv6Addr) -> Ipv6Addr {
+    let o = addr.octets();
+    Ipv6Addr::from([
+        0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0xff, o[13], o[14], o[15],
+    ])
+}
+
 /// An ICMPv6 neighbor solicitation for `target`, sent to its solicited-node
 /// group.
 fn ns_frame(target: Ipv6Addr) -> Vec<u8> {
-    let group = pktkit::xdp::solicited_node_multicast(target);
+    let group = solicited_node_multicast(target);
     let mut icmp = vec![135, 0, 0, 0, 0, 0, 0, 0];
     icmp.extend_from_slice(&target.octets());
     icmp.extend_from_slice(&[1, 1, 0x02, 0, 0, 0, 0, 2]);

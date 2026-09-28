@@ -50,7 +50,7 @@
 //! A capture can never widen into the whole interface: `add` refuses a `/0`
 //! outright, refuses anything under [`CaptureConfig::min_prefix_v4`] /
 //! [`CaptureConfig::min_prefix_v6`], and refuses any addition that would leave
-//! the set covering an entire address family. See the [`capture`] module docs.
+//! the set covering an entire address family. See [`Capture`].
 //!
 //! # Attach modes
 //!
@@ -58,7 +58,7 @@
 //! `sk_buff` exists; it is both the fast path and a precondition for AF_XDP
 //! zero-copy. [`Mode::GENERIC`] works anywhere but always copies.
 //! [`Mode::AUTO`] tries the former and falls back to the latter, and
-//! [`Link::mode`] reports which one took effect.
+//! [`Capture::mode`] reports which one took effect.
 //!
 //! # Requirements
 //!
@@ -67,18 +67,16 @@
 //! codegen, map key layout, netlink message layout — are unit-tested; paths
 //! that require the kernel are marked `TODO(xdp)`.
 
-pub mod capture;
+mod capture;
+mod insn;
+#[cfg(all(test, target_os = "linux"))]
+mod kernel_tests;
+mod map;
 mod netlink;
 mod prog;
 mod sys;
 
-pub mod insn;
-pub mod map;
-
-pub use capture::{
-    Capture, CaptureConfig, CaptureMaps, MAX_RULES_PER_PREFIX, MatchField, Rule, build_program,
-    solicited_node_multicast,
-};
-pub use insn::{Asm, Insn, Label};
-pub use map::{LpmKey, Map, MapType, UpdateFlags, lpm_key, set_socket_raw};
-pub use prog::{Action, Link, Mode, Program, TestRun, detach};
+pub use capture::{Capture, CaptureConfig, MAX_RULES_PER_PREFIX, MatchField, Rule};
+#[cfg(feature = "afxdp")]
+pub(crate) use map::set_socket_raw;
+pub use prog::{Action, Mode, TestRun, detach};
