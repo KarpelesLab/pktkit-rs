@@ -66,6 +66,13 @@ pub const ORPHAN_RETRIES: u32 = 8;
 pub const TIME_WAIT_DURATION: Duration = Duration::from_secs(60);
 /// Floor for the Early Retransmit delay, as in Linux's delayed ER.
 const ER_MIN_DELAY: Duration = Duration::from_millis(2);
+/// How long an ACK may be delayed: Linux's `TCP_DELACK_MIN`, which is also
+/// where its adaptive delay sits for anything but a slow trickle. RFC 9293
+/// §3.8.6.3 allows up to 500 ms, and RFC 5681 §4.2 asks for less.
+pub const DELAYED_ACK: Duration = Duration::from_millis(40);
+/// Most segments ACKed at once in quick-ACK mode (Linux's
+/// `TCP_MAX_QUICKACKS`).
+const MAX_QUICKACKS: u32 = 16;
 /// Minimum spacing of challenge ACKs and out-of-window duplicate ACKs on one
 /// connection (RFC 5961 §7); Linux's `tcp_invalid_ratelimit` default.
 const OOW_ACK_INTERVAL: Duration = Duration::from_millis(500);
@@ -406,6 +413,28 @@ pub struct Conn {
     /// first (RFC 5827 §6's delay against reordering).
     er_deadline: std::option::Option<Instant>,
 
+    // Delayed ACK (RFC 9293 §3.8.6.3, RFC 5681 §4.2).
+    /// When the ACK held back for data received goes out on its own,
+    /// unless something we send first carries it.
+    delack_deadline: std::option::Option<Instant>,
+    /// Segments still to be ACKed at once, not delayed (Linux's quick-ACK
+    /// mode): at the start of the connection, after an idle spell, and
+    /// after a duplicate, when the sender's window is small and waiting on
+    /// every ACK.
+    quick_acks: u32,
+    /// Our data answers the peer's within a delayed ACK's time (Linux's
+    /// ping-pong mode): the ACK rides on the answer, so quick ACKs would
+    /// only add segments. Ends when a delayed ACK has to go out alone.
+    pingpong: bool,
+    /// The largest segment the peer has sent, up to our MSS (Linux's
+    /// `rcv_mss`): how "full-sized" is measured.
+    rcv_mss: u32,
+    /// When data last came in.
+    last_data_recv: std::option::Option<Instant>,
+    /// A segment shorter than `rcv_mss` is among those not yet ACKed: a
+    /// sender with Nagle on holds its next one back until this ACK.
+    ack_pushed: bool,
+
     // Buffer auto-tuning.
     /// Where buffer growth is drawn from, process-wide.
     budget: &'static Budget,
@@ -542,6 +571,14 @@ impl Conn {
             high_rxt: 0,
             limited_transmit: 0,
             er_deadline: None,
+            delack_deadline: None,
+            quick_acks: 0,
+            pingpong: false,
+            // Until the peer shows larger, RFC 9293's default send MSS,
+            // as Linux's tcp_initialize_rcv_mss assumes.
+            rcv_mss: u32::from(mss.min(536)),
+            last_data_recv: None,
+            ack_pushed: false,
             budget: &autotune::GLOBAL,
             grown: 0,
             snd_nospace: false,
@@ -1098,6 +1135,9 @@ impl Conn {
 
     fn queue_seg(&mut self, seg: Segment) {
         if seg.has_flag(flags::ACK) && self.recv_buf.is_some() {
+            // Whatever we send acknowledges everything received so far.
+            self.delack_deadline = None;
+            self.ack_pushed = false;
             self.last_ack_sent = Some(seg.ack);
             let shift = if seg.has_flag(flags::SYN) || !self.wscale_ok {
                 0
@@ -1654,7 +1694,9 @@ impl Conn {
     }
 
     fn handle_data_state(&mut self, seg: &Segment) -> Vec<Vec<u8>> {
+        // Some ACK is owed; `ack_now` if it must not be delayed.
         let mut need_ack = false;
+        let mut ack_now = false;
 
         if !self.check_paws(seg) {
             return self.take_outgoing();
@@ -1674,7 +1716,30 @@ impl Conn {
             if self.released.is_some() && seq_after(end, self.recv_buf.as_ref().unwrap().nxt()) {
                 return self.abort();
             }
+            let rb = self.recv_buf.as_ref().unwrap();
+            let (nxt, had_holes) = (rb.nxt(), rb.has_ooo());
             self.process_data(seg);
+            let rb = self.recv_buf.as_ref().unwrap();
+            // RFC 5681 §4.2: at once for a segment out of order, or one
+            // that fills all or part of a hole, so the sender learns of
+            // the loss, or of its repair, without delay. At once too for
+            // one the window did not take all of, or that left less than a
+            // segment of it: the sender, stopped by the window, must see
+            // how far it has closed (and would only learn of the delay
+            // what it cannot use). A duplicate means our ACK was lost, or
+            // the sender timed out: Linux goes into quick-ACK mode.
+            let duplicate = seq_before_eq(end, nxt);
+            ack_now = duplicate
+                || seg.seq != nxt
+                || had_holes
+                || rb.has_ooo()
+                || seq_before(rb.nxt(), end)
+                || self.rcv_wnd_bytes() < self.rcv_mss.max(seg.payload.len() as u32);
+            if duplicate {
+                self.enter_quickack();
+            } else {
+                self.note_data(seg.payload.len());
+            }
             need_ack = true;
         }
 
@@ -1683,21 +1748,83 @@ impl Conn {
             let rcv_nxt = self.recv_buf.as_ref().unwrap().nxt();
             if fin_seq == rcv_nxt {
                 self.recv_buf.as_mut().unwrap().bump_nxt(1);
-                need_ack = true;
                 self.process_fin_transition();
             } else {
                 self.fin_pending = true;
                 self.pending_fin_seq = fin_seq;
-                need_ack = true;
             }
+            // Nothing will follow to share an ACK with.
+            need_ack = true;
+            ack_now = true;
         } else if self.state == State::FinWait1 && self.fin_acked() {
             self.state = State::FinWait2;
         }
 
         if need_ack {
-            self.queue_ack();
+            self.ack_data(ack_now);
         }
         self.take_outgoing()
+    }
+
+    /// New data of `len` bytes came in (Linux's `tcp_event_data_recv`
+    /// and `tcp_measure_rcv_mss`).
+    fn note_data(&mut self, len: usize) {
+        let now = Instant::now();
+        // The first data, or data after longer than an RTO without any:
+        // the sender is (again) in slow start from a small window, and each
+        // delayed ACK would hold it up.
+        if self
+            .last_data_recv
+            .is_none_or(|t| now.saturating_duration_since(t) > self.rto.rto())
+        {
+            self.incr_quickack();
+        }
+        self.last_data_recv = Some(now);
+        let len = u32::try_from(len).unwrap_or(u32::MAX);
+        if len > self.rcv_mss {
+            self.rcv_mss = len.min(u32::from(self.cfg.mss.max(1)));
+        }
+        if len < self.rcv_mss {
+            self.ack_pushed = true;
+        }
+    }
+
+    /// Quick-ACK the next segments: as many as half the window holds, as
+    /// Linux's `tcp_incr_quickack` does, at least two and at most
+    /// [`MAX_QUICKACKS`].
+    fn incr_quickack(&mut self) {
+        let n = (self.rcv_wnd_bytes() / (2 * self.rcv_mss.max(1))).clamp(2, MAX_QUICKACKS);
+        self.quick_acks = self.quick_acks.max(n);
+    }
+
+    /// Linux's `tcp_enter_quickack_mode`: quick-ACK the next segments even
+    /// in ping-pong mode, which this leaves.
+    fn enter_quickack(&mut self) {
+        self.incr_quickack();
+        self.pingpong = false;
+    }
+
+    /// ACK the data just received, now or delayed (RFC 9293 §3.8.6.3,
+    /// RFC 1122 §4.2.3.2, RFC 5681 §4.2): at once when `now`, in quick-ACK
+    /// mode, or once more than a full-sized segment is unacknowledged, so
+    /// at least every second full-sized segment is ACKed; otherwise after
+    /// at most [`DELAYED_ACK`], unless data we send carries it first.
+    /// Halving the ACKs halves what the sender spends on them, and lets a
+    /// request's ACK ride on its answer.
+    fn ack_data(&mut self, now: bool) {
+        let rb = self.recv_buf.as_ref().unwrap();
+        let unacked = self
+            .last_ack_sent
+            .map_or(u32::MAX, |last| rb.nxt().wrapping_sub(last));
+        let quick = self.quick_acks > 0 && !self.pingpong;
+        if now || quick || unacked > self.rcv_mss {
+            if quick {
+                self.quick_acks -= 1;
+            }
+            self.queue_ack();
+        } else if self.delack_deadline.is_none() {
+            self.delack_deadline = Some(Instant::now() + DELAYED_ACK);
+        }
     }
 
     fn process_fin_transition(&mut self) {
@@ -2404,6 +2531,14 @@ impl Conn {
             };
             self.queue_seg(seg);
             self.send_buf.as_mut().unwrap().advance_sent(data.len());
+            // Answering the peer's data within a delayed ACK's time
+            // (Linux's tcp_event_data_sent).
+            if self
+                .last_data_recv
+                .is_some_and(|t| t.elapsed() < DELAYED_ACK)
+            {
+                self.pingpong = true;
+            }
             self.rto.start_timing(snd_nxt);
             if self.send_buf.as_ref().unwrap().unacked() > 0 && self.rto_deadline.is_none() {
                 self.start_rto();
@@ -2546,6 +2681,7 @@ impl Conn {
             consider(self.rto_deadline);
             consider(self.persist_deadline);
             consider(self.keepalive_deadline);
+            consider(self.delack_deadline);
         }
         consider(self.fin_wait2_deadline());
         next
@@ -2620,6 +2756,19 @@ impl Conn {
             && self.state != State::Closed
         {
             self.on_keepalive();
+        }
+        // Delayed ACK, last: anything the timers above sent carried it.
+        if let Some(d) = self.delack_deadline
+            && now >= d
+            && !self.closed
+            && self.state != State::Closed
+        {
+            self.delack_deadline = None;
+            // The answer the ACK was waiting to ride on did not come in
+            // time: not a request/response exchange after all (Linux's
+            // tcp_delack_timer_handler).
+            self.pingpong = false;
+            self.queue_ack();
         }
 
         self.take_outgoing()
@@ -2889,12 +3038,19 @@ impl Conn {
             .rcv_adv
             .filter(|&adv| seq_after(adv, nxt))
             .map_or(0, |adv| adv.wrapping_sub(nxt));
-        // The same test as Linux's tcp_cleanup_rbuf: worth a segment once
-        // the window at least doubles.
+        // The same tests as Linux's tcp_cleanup_rbuf: worth a segment
+        // once the window at least doubles; and a delayed ACK for a short
+        // segment is not worth holding once the application has read
+        // everything, outside a request/response exchange: that short
+        // segment may have been the sender's last before Nagle holds the
+        // next one back for this very ACK.
         let open = self.rcv_wnd_bytes();
+        let drained = self.delack_deadline.is_some()
+            && self.ack_pushed
+            && !self.pingpong
+            && rb.readable() == 0;
         if n > 0
-            && open > remaining
-            && open >= remaining.saturating_mul(2)
+            && (drained || (open > remaining && open >= remaining.saturating_mul(2)))
             && matches!(
                 self.state,
                 State::Established | State::FinWait1 | State::FinWait2
@@ -3045,6 +3201,7 @@ impl Conn {
         self.closed = new_state == State::Closed;
         self.stop_rto();
         self.er_deadline = None;
+        self.delack_deadline = None;
         self.stop_keepalive();
         self.stop_persist();
         self.time_wait_deadline = None;
@@ -3260,6 +3417,16 @@ mod tests {
         pkts.iter()
             .flat_map(|p| to.handle_segment(&parse(p)))
             .collect()
+    }
+
+    /// Let a pending delayed ACK go out, as its timer would within the
+    /// round trip on a path of 40 ms or more.
+    fn delack_expired(c: &mut Conn) -> Vec<Vec<u8>> {
+        if c.delack_deadline.is_none() {
+            return Vec::new();
+        }
+        c.delack_deadline = Some(Instant::now());
+        c.tick()
     }
 
     fn fire_rto(c: &mut Conn) -> Vec<Vec<u8>> {
@@ -4021,6 +4188,9 @@ mod tests {
                     if c.er_deadline.is_some() {
                         c.er_deadline = Some(now);
                     }
+                    if c.delack_deadline.is_some() {
+                        c.delack_deadline = Some(now);
+                    }
                     links[i].extend(c.tick());
                 }
             }
@@ -4285,7 +4455,8 @@ mod tests {
                 rtts <= 20,
                 "sack={sack}: {lost} lost segments, {rtts} round trips"
             );
-            let acks = deliver(&mut server, &out);
+            let mut acks = deliver(&mut server, &out);
+            acks.extend(delack_expired(&mut server));
             received.extend(read_all(&mut server));
             out = deliver(&mut client, &acks);
         }
@@ -5981,6 +6152,17 @@ mod tests {
         if let Some(r) = c.timeout_recover {
             assert!(seq_before_eq(r, nxt), "{}: recover past SND.NXT", ctx());
         }
+        if let Some(rb) = c.recv_buf.as_ref()
+            && !c.closed
+        {
+            // Whatever came in is ACKed, or its delayed ACK is on the way:
+            // nothing waits on an ACK that will never be sent.
+            assert!(
+                c.last_ack_sent == Some(rb.nxt()) || c.delack_deadline.is_some(),
+                "{}: data received and no ACK owed",
+                ctx()
+            );
+        }
         if let Some(rb) = c.recv_buf.as_ref() {
             let grown = (sb.capacity() - c.cfg.send_buf_size) + (rb.limit() - c.cfg.recv_buf_size);
             assert_eq!(grown, c.grown, "{}: growth not accounted", ctx());
@@ -6159,6 +6341,7 @@ mod tests {
                         &mut c.rto_deadline,
                         &mut c.persist_deadline,
                         &mut c.er_deadline,
+                        &mut c.delack_deadline,
                     ] {
                         if d.is_some() {
                             *d = Some(now);
@@ -6442,5 +6625,139 @@ mod tests {
         assert_eq!(client.ts_echo_rtt(&seg(0)), None);
         // From the future, or older than the connection could be.
         assert_eq!(client.ts_echo_rtt(&seg(now.wrapping_add(5))), None);
+    }
+
+    // --- Delayed ACK --------------------------------------------------------
+
+    /// A pair past the quick-ACK start of the connection, with `n`
+    /// full-sized segments from the client ready to deliver.
+    fn delack_pair(port: u16, n: usize) -> (Conn, Conn, Vec<Vec<u8>>) {
+        let mut client = Conn::new(big(port, 80));
+        let mut server = Conn::new(big(80, port));
+        drive_handshake(&mut client, &mut server);
+        // Warm up: the first data is quick-ACKed, and sets rcv_mss.
+        let (_, first) = client.write(&[0; 1000]);
+        deliver(&mut client, &deliver(&mut server, &first));
+        read_all(&mut server);
+        server.quick_acks = 0;
+        let (_, segs) = client.write(&vec![1; 1000 * n]);
+        assert_eq!(segs.len(), n);
+        (client, server, segs)
+    }
+
+    fn acks_in(pkts: &[Vec<u8>]) -> Vec<u32> {
+        pkts.iter().map(|p| parse(p).ack).collect()
+    }
+
+    /// At least every second full-sized segment is ACKed; the odd one out
+    /// waits for the delayed-ACK timer, no longer than DELAYED_ACK.
+    #[test]
+    fn delayed_ack_every_second_full_segment() {
+        let (_client, mut server, segs) = delack_pair(40620, 5);
+        let mut acks = Vec::new();
+        for (i, s) in segs.iter().enumerate() {
+            let out = deliver(&mut server, std::slice::from_ref(s));
+            assert_eq!(out.len(), i % 2, "segment {i}");
+            acks.extend(out);
+        }
+        let end = |s: &Vec<u8>| {
+            let s = parse(s);
+            s.seq.wrapping_add(s.payload.len() as u32)
+        };
+        assert_eq!(acks_in(&acks), [end(&segs[1]), end(&segs[3])]);
+        // The fifth is owed an ACK, on a timer.
+        let due = server.delack_deadline.expect("delayed ACK pending");
+        assert!(due <= Instant::now() + DELAYED_ACK);
+        assert_eq!(server.next_deadline(), Some(due));
+        assert!(server.tick().is_empty(), "not yet due");
+        let late = delack_expired(&mut server);
+        assert_eq!(acks_in(&late), [end(&segs[4])]);
+        assert_eq!(server.delack_deadline, None);
+    }
+
+    /// Out of order: ACKed at once, and so is the segment filling the hole
+    /// (RFC 5681 §4.2).
+    #[test]
+    fn out_of_order_and_hole_filling_segments_are_acked_at_once() {
+        let (_client, mut server, segs) = delack_pair(40621, 3);
+        let dup = deliver(&mut server, &segs[1..2]);
+        assert_eq!(dup.len(), 1, "out of order");
+        assert_eq!(acks_in(&dup), [parse(&segs[0]).seq]);
+        let filled = deliver(&mut server, &segs[0..1]);
+        assert_eq!(filled.len(), 1, "hole filled");
+        assert_eq!(acks_in(&filled), [parse(&segs[2]).seq]);
+        // A duplicate is answered at once too.
+        assert_eq!(deliver(&mut server, &segs[0..1]).len(), 1, "duplicate");
+    }
+
+    /// The first segments of a connection are each ACKed at once, so
+    /// slow start from the initial window is not held up by the timer.
+    #[test]
+    fn quick_acks_at_the_start() {
+        let mut client = Conn::new(big(40622, 80));
+        let mut server = Conn::new(big(80, 40622));
+        drive_handshake(&mut client, &mut server);
+        let (_, segs) = client.write(&[1; 10_000]);
+        assert_eq!(segs.len(), 10);
+        let acks = deliver(&mut server, &segs);
+        assert_eq!(acks.len(), 10);
+        deliver(&mut client, &acks);
+        // An idle spell longer than the RTO brings them back.
+        server.quick_acks = 0;
+        server.last_data_recv = Some(Instant::now() - Duration::from_secs(2));
+        let (_, segs) = client.write(&[2; 1000]);
+        assert_eq!(deliver(&mut server, &segs).len(), 1);
+    }
+
+    /// Our own data carries the ACK: nothing is left pending, and no bare
+    /// ACK follows.
+    #[test]
+    fn data_sent_carries_the_delayed_ack() {
+        let (_client, mut server, segs) = delack_pair(40623, 1);
+        assert!(deliver(&mut server, &segs).is_empty());
+        assert!(server.delack_deadline.is_some());
+        let (_, reply) = server.write(b"answer");
+        assert_eq!(reply.len(), 1);
+        assert_eq!(parse(&reply[0]).ack, parse(&segs[0]).seq.wrapping_add(1000));
+        assert_eq!(server.delack_deadline, None);
+        assert!(delack_expired(&mut server).is_empty());
+        // Answered within the delay: a request/response exchange, whose
+        // ACKs ride on the answers.
+        assert!(server.pingpong);
+    }
+
+    /// A short segment's delayed ACK goes out once the application has
+    /// read everything: the sender's Nagle may be holding its next write
+    /// back for it.
+    #[test]
+    fn reading_everything_acks_a_short_segment() {
+        let (mut client, mut server, _) = delack_pair(40624, 0);
+        let (_, segs) = client.write(&[3; 100]);
+        assert!(deliver(&mut server, &segs).is_empty());
+        let (_, held) = client.write(&[4; 100]);
+        assert!(held.is_empty(), "Nagle holds the second write");
+        let mut buf = [0; 50];
+        assert_eq!(server.read(&mut buf), 50);
+        assert!(server.take_outgoing().is_empty(), "not all read yet");
+        assert_eq!(server.read(&mut buf), 50);
+        let ack = server.take_outgoing();
+        assert_eq!(ack.len(), 1);
+        assert_eq!(deliver(&mut client, &ack).len(), 1, "Nagle let go");
+    }
+
+    /// The last segment the window has room for is ACKed at once: the
+    /// sender can send nothing more until it hears how the window stands.
+    #[test]
+    fn filling_the_window_is_acked_at_once() {
+        let small = |l, r| big(l, r).recv_buf_size(3000);
+        let mut client = Conn::new(small(40625, 80));
+        let mut server = Conn::new(small(80, 40625));
+        drive_handshake(&mut client, &mut server);
+        server.quick_acks = 0;
+        server.last_data_recv = Some(Instant::now());
+        let (_, segs) = client.write(&[5; 3000]);
+        let acks = deliver(&mut server, &segs);
+        assert_eq!(parse(acks.last().unwrap()).window, 0);
+        assert_eq!(server.delack_deadline, None);
     }
 }
