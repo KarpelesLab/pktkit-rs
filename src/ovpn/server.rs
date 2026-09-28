@@ -2233,6 +2233,9 @@ mod tests {
         data.extend(pump_udp(&sock, &mut client, |c| {
             c.control_text().windows(10).any(|w| w == b"PUSH_REPLY")
         }));
+        // on_connect runs on the auth worker, which may still be making it
+        // when the client already has its answers.
+        assert!(wait_for(|| connects.load(Ordering::SeqCst) >= 1));
         assert_eq!(connects.load(Ordering::SeqCst), 1);
 
         // The callback's packet arrives.
@@ -2474,6 +2477,9 @@ mod tests {
         let half = udp_client(&server);
         assert!(open_udp(&half, *b"HALFOPEN").1);
         assert_eq!(server.peers.read().unwrap().len(), 2);
+        // on_connect runs on the auth worker, which may still be making it
+        // when the client already has its keys.
+        assert!(wait_for(|| connects.load(Ordering::SeqCst) >= 1));
         assert_eq!(connects.load(Ordering::SeqCst), 1);
 
         server.close();

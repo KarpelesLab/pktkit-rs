@@ -186,7 +186,9 @@ fn udp_to_a_closed_host_port_is_refused() {
 #[test]
 fn the_bridge_adds_no_nagle_delay_to_small_writes() {
     use pktkit::impair::{ImpairL3, Impairment};
-    const ONE_WAY: Duration = Duration::from_millis(25);
+    // Long enough that scheduling noise on a loaded runner stays well
+    // inside the gap between two one-way trips and four.
+    const ONE_WAY: Duration = Duration::from_millis(150);
     let stack = pktkit::slirp::Stack::new();
     stack
         .set_addr(IpPrefix::new(IpAddr::V4(STACK_IP), 24))
@@ -205,7 +207,7 @@ fn the_bridge_adds_no_nagle_delay_to_small_writes() {
         let (mut s, _) = server.accept().unwrap();
         s.set_nodelay(true).unwrap();
         let mut times = Vec::new();
-        for _ in 0..3 {
+        for _ in 0..5 {
             let start = std::time::Instant::now();
             s.write_all(&[1; 10]).unwrap();
             std::thread::sleep(Duration::from_millis(5));
@@ -218,13 +220,13 @@ fn the_bridge_adds_no_nagle_delay_to_small_writes() {
     });
     let mut c = client.dial_tcp(dest).unwrap();
     c.set_read_timeout(Some(Duration::from_secs(10)));
-    for _ in 0..3 {
+    for _ in 0..5 {
         let mut msg = [0u8; 20];
         c.read_exact(&mut msg).unwrap();
         c.write_all(b"k").unwrap();
     }
     let best = rounds.join().unwrap().into_iter().min().unwrap();
-    // Two one-way trips (≈ 50 ms) without Nagle, four with it.
+    // Two one-way trips (≈ 300 ms) without Nagle, four (≈ 600 ms) with it.
     assert!(
         best < ONE_WAY * 3,
         "answer took {best:?}: the second piece waited on an ACK"
