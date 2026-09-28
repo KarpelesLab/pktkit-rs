@@ -16,6 +16,9 @@ const PORTS: usize = 1 << 16;
 const WORDS: usize = PORTS / 64;
 /// Every other bit, from bit 0: the even ports of a word.
 const EVEN: u64 = 0x5555_5555_5555_5555;
+/// The lowest inside source port a new mapping keeps when it is free (see
+/// [`PortUse::choose`]): the first unprivileged one.
+const PRESERVE_MIN: u16 = 1024;
 
 /// How many holders each outside port has, with a bitmap of the free ones
 /// and a count of those free in the dynamic pool by parity.
@@ -136,20 +139,23 @@ impl PortUse {
     /// identifier) `want`, searching the dynamic pool from `from`; `None`
     /// if nothing fits.
     ///
-    /// `want` itself if it is free and in the pool: the host chose it, and
-    /// applications that predict their public port from their local one
-    /// keep working. Anything else maps into the pool, with the same parity
-    /// if one is free (RFC 4787 REQ-4), since peers take RTP on an even
-    /// port and RTCP on the odd one above it.
+    /// `want` itself if it is free and not a privileged port (below
+    /// [`PRESERVE_MIN`]): the host chose it, and applications that
+    /// predict their public port from their local one keep working -- a
+    /// peer-to-peer client on 6881 or a SIP phone on 5060 that announces
+    /// its listening port, or asks UPnP to forward it to itself. Anything
+    /// else maps into the pool, with the same parity if one is free (RFC
+    /// 4787 REQ-4), since peers take RTP on an even port and RTCP on the
+    /// odd one above it.
     ///
-    /// Ports below the pool are never preserved, nor mapped into the
+    /// Privileged ports are never preserved, nor mapped into the
     /// privileged range as RFC 4787 REQ-3 recommends: a host sending from
-    /// 53, 123 or 5060 would take that port on the public address, and the
+    /// 53 or 123 would take that port on the public address, and the
     /// forward an administrator then adds for it would fail; one host
     /// sending from each of 1-1023 would take them all. Those ports are
     /// left to port forwards.
     pub(crate) fn choose(&self, want: u16, from: u16) -> Option<u16> {
-        if self.in_pool(want) && self.is_free(want) {
+        if want >= PRESERVE_MIN && self.is_free(want) {
             return Some(want);
         }
         let odd = Some(want & 1 == 1);
@@ -303,8 +309,12 @@ mod tests {
         assert_eq!(u.choose(40001, 10000), Some(40001));
         u.acquire(40001);
         assert_eq!(u.choose(40001, 10000), Some(10001), "odd, from the pool");
-        // Below the pool: into it, parity kept, even when free.
+        // Unprivileged ports below the pool are kept when free...
+        assert_eq!(u.choose(5060, 10000), Some(5060));
+        u.acquire(5060);
         assert_eq!(u.choose(5060, 10000), Some(10000), "even, from the pool");
+        // ...privileged ones never: into the pool, parity kept.
+        assert_eq!(u.choose(1022, 10000), Some(10000), "even, from the pool");
         assert_eq!(u.choose(123, 10000), Some(10001), "odd, from the pool");
         assert_eq!(u.choose(0, 10000), Some(10000));
         // No port of its parity left: any will do.

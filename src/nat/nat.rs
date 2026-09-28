@@ -90,6 +90,10 @@ struct Mapping {
     /// Until when an ALG opened a plain outbound mapping as `open` would
     /// (see [`ALG_OPEN_WINDOW`]).
     open_until: Option<Instant>,
+    /// The dynamic mapping of the same endpoint that a port forward
+    /// displaced, still on its own port: its sessions go on there, both
+    /// ways, until they idle out, rather than be stranded by the move.
+    alias: Option<Box<Mapping>>,
     /// Counts the mapping against its inside host's quota while it lives.
     _hold: MappingHold,
 }
@@ -109,8 +113,52 @@ impl Mapping {
             peers,
             open: false,
             open_until: None,
+            alias: None,
             _hold: hold,
         }
+    }
+
+    /// The side of the mapping that carries traffic with `peer`: the
+    /// displaced one (see `alias`) for a session begun there.
+    fn for_peer(&mut self, peer: &SocketAddrV4) -> &mut Mapping {
+        if self.alias.as_ref().is_some_and(|a| a.peers.contains(peer)) {
+            return self.alias.as_deref_mut().expect("checked above");
+        }
+        self
+    }
+
+    /// The side of the mapping on outside port `port`.
+    fn for_port(&mut self, port: u16) -> &mut Mapping {
+        if self.alias.as_ref().is_some_and(|a| a.outside_port == port) {
+            return self.alias.as_deref_mut().expect("checked above");
+        }
+        self
+    }
+
+    /// Forget remotes idle past their timeout, and the displaced side once
+    /// none of its are left, returning its port. The mapping may go once
+    /// `idle` says so.
+    fn expire(&mut self, proto: u8, now: Instant) -> Option<u16> {
+        let mut freed = None;
+        if let Some(a) = &mut self.alias
+            && a.peers.expire(proto, a.last_active, now)
+        {
+            freed = Some(a.outside_port);
+            self.alias = None;
+        }
+        freed
+    }
+
+    /// Whether the mapping, and any displaced side, have been idle past
+    /// their timeouts (with [`expire`](Self::expire) run first).
+    fn idle(&mut self, proto: u8, now: Instant) -> bool {
+        self.alias.is_none() && self.peers.expire(proto, self.last_active, now)
+    }
+
+    /// The outside ports the mapping holds.
+    fn ports(&self) -> impl Iterator<Item = u16> + use<> {
+        let alias = self.alias.as_ref().map(|a| a.outside_port);
+        std::iter::once(self.outside_port).chain(alias)
     }
 
     /// Whether any remote's traffic keeps the mapping alive (see `open`).
@@ -723,9 +771,21 @@ impl Nat {
     /// holds it: taking the port over would hand that session's traffic to
     /// the forward's host. A dynamic mapping of the forward's own inside
     /// endpoint is no conflict, and becomes the forward's, sessions and
-    /// all. Dynamic mappings only take ports in the pool (10000-65535), so
-    /// a forward of a port below it never meets one; one in the pool can,
-    /// and is refused rather than break the other host's session.
+    /// all: a host sending from its listening port keeps that port number
+    /// on the public address when it is free, so forwarding it (as a UPnP
+    /// client asks for its own port) changes nothing for its sessions.
+    ///
+    /// Dynamic mappings keep the inside host's source port when it is free
+    /// and not privileged (1024 and up), and otherwise take one from the
+    /// pool (10000-65535). A forward of a privileged port never meets one;
+    /// any other port may be held by some host's session, and is refused
+    /// while it is rather than break that session.
+    ///
+    /// If the forward's endpoint already has a dynamic mapping on another
+    /// port, the forward's port takes over as its public identity once
+    /// traffic arrives on it: new sessions leave from there. The sessions
+    /// the old mapping carried go on from their own port until they idle
+    /// out, or for as long as they like if the forward is removed first.
     ///
     /// Also fails with `AddrInUse` if another port is already forwarded to
     /// the same inside endpoint: the NAT gives each inside endpoint a
@@ -1087,34 +1147,59 @@ impl Nat {
         Some(quota)
     }
 
-    /// Drop whatever mapping owns outside port `rk`, in both tables.
+    /// Drop whatever mapping owns outside port `rk`, in both tables. A
+    /// mapping that displaced a dynamic one (see `Mapping::alias`) gives
+    /// way to it again: its sessions go on.
     fn remove_mapping_at_locked(inner: &mut NatInner, rk: NatRevKey) {
-        if let Some(k) = inner.reverse.remove(&rk)
-            && inner
-                .mappings
-                .get(&k)
-                .is_some_and(|m| m.outside_port == rk.port)
-        {
-            inner.mappings.remove(&k);
+        let Some(k) = inner.reverse.remove(&rk) else {
+            return;
+        };
+        let Some(m) = inner.mappings.get_mut(&k) else {
+            return;
+        };
+        if m.outside_port == rk.port {
+            match m.alias.take() {
+                Some(alias) => *m = *alias,
+                None => {
+                    inner.mappings.remove(&k);
+                }
+            }
+        } else if m.alias.as_ref().is_some_and(|a| a.outside_port == rk.port) {
+            m.alias = None;
         }
     }
 
-    /// Drop mapping `k` if it has been idle past its timeout. Sweeps are
-    /// lazy, so one can linger; where it would decide something, it must not
-    /// count as live.
+    /// Unbind the outside ports of mapping `k`, just taken out of the
+    /// table as `m`.
+    fn unbind_locked(reverse: &mut PortMap<NatRevKey, NatKey>, k: NatKey, m: &Mapping) {
+        for port in m.ports() {
+            let rk = NatRevKey {
+                proto: k.proto,
+                port,
+            };
+            if reverse.get(&rk) == Some(&k) {
+                reverse.remove(&rk);
+            }
+        }
+    }
+
+    /// Forget what of mapping `k` has been idle past its timeout, dropping
+    /// the mapping if all of it has. Sweeps are lazy, so one can linger;
+    /// where it would decide something, it must not count as live.
     fn expire_mapping_locked(inner: &mut NatInner, k: NatKey, now: Instant) {
         let Some(m) = inner.mappings.get_mut(&k) else {
             return;
         };
-        if m.peers.expire(k.proto, m.last_active, now) {
-            let rk = NatRevKey {
+        if let Some(port) = m.expire(k.proto, now) {
+            inner.reverse.remove(&NatRevKey {
                 proto: k.proto,
-                port: m.outside_port,
-            };
-            inner.mappings.remove(&k);
-            if inner.reverse.get(&rk) == Some(&k) {
-                inner.reverse.remove(&rk);
-            }
+                port,
+            });
+        }
+        if m.idle(k.proto, now)
+            && let Some(m) = inner.mappings.remove(&k)
+        {
+            Self::unbind_locked(&mut inner.reverse, k, &m);
         }
     }
 
@@ -1138,30 +1223,37 @@ impl Nat {
     ///
     /// The tables hold one mapping per inside endpoint. If `k` already has one
     /// on another port, `displace` decides: a port forward is the endpoint's
-    /// configured public identity and replaces it (old reverse entry
-    /// included); an expectation must not break a live session and is
-    /// refused. (Mappings made while a forward exists already use its port,
-    /// so only one from before the forward was added gets displaced.)
+    /// configured public identity and takes over, while the old mapping
+    /// carries on as its alias for the sessions it has, until they idle out
+    /// (a newer alias replaces an older one); an expectation must not break
+    /// a live session and is refused. (Mappings made while a forward exists
+    /// already use its port, so only one from before the forward was added
+    /// gets displaced.)
     fn install_mapping_locked(
         inner: &mut NatInner,
         k: NatKey,
         rk: NatRevKey,
         displace: bool,
     ) -> bool {
-        if let Some(old) = inner.mappings.get(&k) {
-            if !displace {
-                return false;
-            }
-            let old_rk = NatRevKey {
-                proto: k.proto,
-                port: old.outside_port,
-            };
-            inner.reverse.remove(&old_rk);
+        let now = Instant::now();
+        if inner.mappings.contains_key(&k) && !displace {
+            return false;
         }
-        let Some(mut m) = Self::new_mapping_locked(inner, k, rk.port, Instant::now(), true) else {
+        let Some(mut m) = Self::new_mapping_locked(inner, k, rk.port, now, true) else {
             return false;
         };
         m.open = true;
+        if let Some(mut old) = inner.mappings.remove(&k) {
+            if let Some(older) = old.alias.take() {
+                Self::unbind_locked(&mut inner.reverse, k, &older);
+            }
+            old.peers.expire(k.proto, old.last_active, now);
+            if old.peers.is_empty() {
+                Self::unbind_locked(&mut inner.reverse, k, &old);
+            } else {
+                m.alias = Some(Box::new(old));
+            }
+        }
         inner.mappings.insert(k, m);
         inner.reverse.insert(rk, k);
         true
@@ -1426,6 +1518,7 @@ impl Nat {
             let Some(m) = inner.mappings.get_mut(&k) else {
                 return;
             };
+            let m = m.for_peer(&peer);
             if delta != 0 {
                 m.peers.record_resize(&peer, outbound, seq, delta as i32);
                 self.seqadj_used.store(true, Ordering::Relaxed);
@@ -1475,12 +1568,16 @@ impl Nat {
     /// Drop idle mappings, and lapsed expectations and forwards, which all
     /// hold outside ports.
     fn expire_locked(inner: &mut NatInner, now: Instant) {
+        let reverse = &mut inner.reverse;
         inner.mappings.retain(|k, m| {
-            if m.peers.expire(k.proto, m.last_active, now) {
-                inner.reverse.remove(&NatRevKey {
+            if let Some(port) = m.expire(k.proto, now) {
+                reverse.remove(&NatRevKey {
                     proto: k.proto,
-                    port: m.outside_port,
+                    port,
                 });
+            }
+            if m.idle(k.proto, now) {
+                Self::unbind_locked(reverse, *k, m);
                 false
             } else {
                 true
@@ -1510,12 +1607,10 @@ impl Nat {
         // dead weight from now on.
         inner.expectations.retain(|e| e.namespace != ns);
         inner.forwards.retain(|pf| pf.namespace != ns);
+        let reverse = &mut inner.reverse;
         inner.mappings.retain(|k, m| {
             if k.ns == ns {
-                inner.reverse.remove(&NatRevKey {
-                    proto: k.proto,
-                    port: m.outside_port,
-                });
+                Self::unbind_locked(reverse, *k, m);
                 false
             } else {
                 true
@@ -1708,6 +1803,11 @@ impl Nat {
                 Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]),
                 u16::from_be_bytes([pkt[ihl + 2], pkt[ihl + 3]]),
             );
+            // A session begun before a forward displaced the mapping goes
+            // on from the port it began on.
+            let now = m.last_active;
+            let m = m.for_peer(&peer);
+            m.last_active = now;
             let flags = tcp_flags(pkt, ihl, proto);
             m.peers.note(peer, true, flags, m.last_active);
             (m.outside_port, m.key, m.peers.contains(&peer))
@@ -1909,8 +2009,8 @@ impl Nat {
         // it actually carried from that remote; otherwise an inside host
         // could tear down any session through the NAT, its own or not.
         let outside_port = {
-            let inner = self.inner.lock().unwrap();
-            match inner.mappings.get(&k) {
+            let mut inner = self.inner.lock().unwrap();
+            match inner.mappings.get_mut(&k).map(|m| m.for_peer(&remote)) {
                 Some(m) if m.peers.contains(&remote) => m.outside_port,
                 _ => return,
             }
@@ -2114,10 +2214,10 @@ impl Nat {
                 k
             };
             let peer = SocketAddrV4::new(src_ip, src_port);
-            let tracked = inner
-                .mappings
-                .get_mut(&k)
-                .is_some_and(|m| m.note_inbound(peer, tcp_flags(pkt, ihl, proto), now));
+            let tracked = inner.mappings.get_mut(&k).is_some_and(|m| {
+                m.for_port(dst_port)
+                    .note_inbound(peer, tcp_flags(pkt, ihl, proto), now)
+            });
             (k, dst_port, tracked)
         };
 
@@ -2214,7 +2314,7 @@ impl Nat {
                     if let Some(m) = inner.mappings.get_mut(&k) {
                         let peer =
                             SocketAddrV4::new(Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]), 0);
-                        m.note_inbound(peer, None, Instant::now());
+                        m.for_port(id).note_inbound(peer, None, Instant::now());
                     }
                     k
                 };
@@ -2297,7 +2397,7 @@ impl Nat {
             port: emb_port,
         };
         let mapping_key = {
-            let inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock().unwrap();
             let k = match inner.reverse.get(&rk).copied() {
                 Some(k) => k,
                 None => return,
@@ -2305,7 +2405,7 @@ impl Nat {
             // The error must be about traffic this mapping actually sent;
             // anyone can otherwise forge errors that tear down or confuse
             // an inside host's sessions.
-            match inner.mappings.get(&k) {
+            match inner.mappings.get_mut(&k).map(|m| m.for_port(emb_port)) {
                 Some(m) if m.peers.contains(&remote) => {}
                 _ => return,
             }
@@ -2819,7 +2919,7 @@ fn update_icmp_checksum(pkt: &mut [u8], ihl: usize, old_id: u16, new_id: u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nat::track::UDP_TIMEOUT;
+    use crate::nat::track::{TCP_ESTABLISHED_TIMEOUT, UDP_TIMEOUT};
     use crate::{IpPrefix, L3Device, Packet};
     use std::sync::Mutex as StdMutex;
 
@@ -3319,7 +3419,7 @@ mod tests {
     }
 
     #[test]
-    fn forward_replacing_a_mapping_leaves_no_stale_reverse_entry() {
+    fn a_forward_keeps_the_mapping_it_displaces_until_its_sessions_end() {
         let (nat, i, o) = setup();
         let server = Ipv4Addr::new(10, 0, 0, 50);
         let p = build_tcp(server, 80, REMOTE, 5555, 0x02);
@@ -3332,10 +3432,34 @@ mod tests {
         nat.outside().send(Packet::from_slice(&syn)).unwrap();
         assert_eq!(i.lock().unwrap().len(), 1);
 
-        // The displaced port no longer leads anywhere.
+        // The session begun before the forward goes on, both ways, on the
+        // port it began on...
+        let reply = build_tcp(REMOTE, 5555, PUBLIC, old, 0x12);
+        nat.outside().send(Packet::from_slice(&reply)).unwrap();
+        assert_eq!(i.lock().unwrap().len(), 2);
+        let ack = build_tcp(server, 80, REMOTE, 5555, 0x10);
+        nat.inside().send(Packet::from_slice(&ack)).unwrap();
+        assert_eq!(src_port(o.lock().unwrap().last().unwrap()), old);
+        // ...while the forward's leaves from its own.
+        let synack = build_tcp(server, 80, REMOTE, 4444, 0x12);
+        nat.inside().send(Packet::from_slice(&synack)).unwrap();
+        assert_eq!(src_port(o.lock().unwrap().last().unwrap()), 8080);
+        assert_eq!(mapped(&nat), 1);
+
+        // Once its sessions idle out, the displaced port leads nowhere.
+        {
+            let mut inner = nat.inner.lock().unwrap();
+            let m = inner.mappings.values_mut().next().unwrap();
+            let a = m.alias.as_mut().unwrap();
+            let by = TCP_ESTABLISHED_TIMEOUT + Duration::from_secs(1);
+            a.last_active -= by;
+            a.peers.backdate(by);
+        }
+        nat.sweep();
         let stale = build_tcp(REMOTE, 5555, PUBLIC, old, 0x10);
         nat.outside().send(Packet::from_slice(&stale)).unwrap();
-        assert_eq!(i.lock().unwrap().len(), 1);
+        assert_eq!(i.lock().unwrap().len(), 2);
+        assert!(nat.inner.lock().unwrap().ports.is_free(old));
     }
 
     #[test]
@@ -3722,20 +3846,23 @@ mod tests {
             nat.inside().send(Packet::from_slice(&p)).unwrap();
             src_port(o.lock().unwrap().last().unwrap())
         };
-        // Preserved when free and in the pool.
+        // Preserved when free and unprivileged, in the pool or not.
         assert_eq!(out_port(INSIDE, 40001), 40001);
+        assert_eq!(out_port(INSIDE, 6881), 6881);
         // Taken: same parity (RFC 4787 REQ-4).
         let p = out_port(other, 40001);
         assert!(p >= NAT_PORT_MIN && p % 2 == 1, "{p}");
-        // Below the pool: never preserved, parity kept.
-        for sport in [5060, 123, 1022] {
+        let p = out_port(other, 6881);
+        assert!(p >= NAT_PORT_MIN && p % 2 == 1, "{p}");
+        // Privileged: never preserved, parity kept.
+        for sport in [123, 1022] {
             let p = out_port(INSIDE, sport);
             assert!(p >= NAT_PORT_MIN && p % 2 == sport % 2, "{sport} -> {p}");
         }
     }
 
     #[test]
-    fn hosts_cannot_squat_ports_below_the_pool() {
+    fn hosts_cannot_squat_privileged_ports() {
         let (nat, i, _o) = setup();
         // Hosts sending from well-known ports, or from every privileged
         // one, take none of them from the outside address...
@@ -5204,5 +5331,47 @@ mod tests {
             port: 5000,
         };
         assert!(!inner.mappings[&k].is_open(Instant::now()));
+    }
+
+    #[test]
+    fn forwarding_a_hosts_own_listening_port_keeps_its_sessions() {
+        let (nat, i, o) = setup();
+        // A BitTorrent client talks from its listening port...
+        let p = build_udp(INSIDE, 6881, REMOTE, 6881, b"dht");
+        nat.inside().send(Packet::from_slice(&p)).unwrap();
+        let port = src_port(&o.lock().unwrap()[0]);
+        // ...then the admin (or UPnP) forwards that port to it.
+        nat.add_port_forward(PortForward::new(PROTO_UDP, 6881, INSIDE, 6881))
+            .unwrap();
+        let p = build_udp(Ipv4Addr::new(192, 0, 2, 77), 1234, PUBLIC, 6881, b"hi");
+        nat.outside().send(Packet::from_slice(&p)).unwrap();
+        assert_eq!(i.lock().unwrap().len(), 1);
+        // The session it had goes on, both ways.
+        let p = build_udp(REMOTE, 6881, PUBLIC, port, b"re");
+        nat.outside().send(Packet::from_slice(&p)).unwrap();
+        assert_eq!(i.lock().unwrap().len(), 2);
+        let p = build_udp(INSIDE, 6881, REMOTE, 6881, b"dht");
+        nat.inside().send(Packet::from_slice(&p)).unwrap();
+        assert_eq!(src_port(o.lock().unwrap().last().unwrap()), port);
+    }
+
+    #[test]
+    fn removing_a_forward_hands_back_the_mapping_it_displaced() {
+        let (nat, i, o) = setup();
+        let p = build_udp(INSIDE, 6881, REMOTE, 6881, b"dht");
+        nat.inside().send(Packet::from_slice(&p)).unwrap();
+        let old = src_port(&o.lock().unwrap()[0]);
+        nat.add_port_forward(PortForward::new(PROTO_UDP, 7000, INSIDE, 6881))
+            .unwrap();
+        let p = build_udp(Ipv4Addr::new(192, 0, 2, 77), 1234, PUBLIC, 7000, b"hi");
+        nat.outside().send(Packet::from_slice(&p)).unwrap();
+        nat.remove_port_forward(PROTO_UDP, 7000);
+        let p = build_udp(REMOTE, 6881, PUBLIC, old, b"re");
+        nat.outside().send(Packet::from_slice(&p)).unwrap();
+        assert_eq!(i.lock().unwrap().len(), 2);
+        let p = build_udp(INSIDE, 6881, REMOTE, 6881, b"dht");
+        nat.inside().send(Packet::from_slice(&p)).unwrap();
+        assert_eq!(src_port(o.lock().unwrap().last().unwrap()), old);
+        assert!(nat.inner.lock().unwrap().ports.is_free(7000));
     }
 }

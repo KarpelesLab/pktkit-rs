@@ -578,6 +578,11 @@ impl Peers {
         self.map.contains_key(peer)
     }
 
+    /// True if no remote is tracked.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
     /// Make every remote look idle for `by` longer.
     #[cfg(test)]
     pub(crate) fn backdate(&mut self, by: Duration) {

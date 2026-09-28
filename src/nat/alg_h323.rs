@@ -302,10 +302,10 @@ mod tests {
         let p = payload_of(&out[0]);
         // IP at offset 2 rewritten to outside.
         assert_eq!(&p[2..6], &[203, 0, 113, 1]);
-        // Port at offset 6: the one mapped. The inside port is below the
-        // dynamic pool, so not kept, but its parity is.
+        // Port at offset 6: the one mapped, which keeps the inside port's
+        // number, that being free and unprivileged.
         let mapped = u16::from_be_bytes([p[6], p[7]]);
-        assert!(mapped >= 10000 && mapped.is_multiple_of(2), "{mapped}");
+        assert_eq!(mapped, 0x1234);
         assert!(
             crate::nat::l4::v4_l4_checksum_ok(&out[0], 20),
             "rewritten H.225 segment must carry a valid TCP checksum"
@@ -386,11 +386,8 @@ mod tests {
     }
 
     /// Sends one H.225 segment from 10.0.0.5 announcing `ports`, and returns
-    /// how many of them came out mapped to another port. Ports below the
-    /// NAT's pool never keep their number, so a mapped one shows as
-    /// rewritten.
+    /// how many of them were opened (have an expectation registered).
     fn announce(nat: &Nat, h: &H323Helper, ports: std::ops::Range<u16>) -> usize {
-        assert!(ports.end <= 10000);
         let inside = Ipv4Addr::new(10, 0, 0, 5);
         let mut body = Vec::new();
         for p in ports.clone() {
@@ -413,7 +410,7 @@ mod tests {
             .filter(|&(i, port)| {
                 let at = i * 7 + 1;
                 assert_eq!(&p[at..at + 4], &[203, 0, 113, 1]);
-                u16::from_be_bytes([p[at + 4], p[at + 5]]) != port
+                nat.take_expectation(PROTO_TCP, inside, port).is_some()
             })
             .count()
     }
