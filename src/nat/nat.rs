@@ -843,16 +843,16 @@ impl Nat {
     }
 
     /// The live forward at position `idx` among those
-    /// [`list_port_forwards`](Self::list_port_forwards) would list, in the
-    /// same order while the table is unchanged, without copying out the
-    /// rest.
-    pub(crate) fn port_forward_at(&self, idx: usize) -> Option<PortForward> {
+    /// [`list_port_forwards`](Self::list_port_forwards) would list that
+    /// lead into inside namespace `ns`, in the same order while the table
+    /// is unchanged, without copying out the rest.
+    pub(crate) fn port_forward_at(&self, ns: u64, idx: usize) -> Option<PortForward> {
         let now = Instant::now();
         let inner = self.inner.lock().unwrap();
         inner
             .forwards
             .values()
-            .filter(|pf| pf.expires.is_none_or(|e| e > now))
+            .filter(|pf| pf.namespace == ns && pf.expires.is_none_or(|e| e > now))
             .nth(idx)
             .cloned()
     }
@@ -1543,15 +1543,14 @@ impl Nat {
 
     fn handle_outbound(&self, ns: u64, pkt_in: &[u8]) {
         self.maybe_sweep();
-        // A fragment from a source the NAT does not serve would be dropped
-        // once whole; it must not take part in reassembly meanwhile either,
-        // where it could fill the table or complete someone else's datagram.
-        let (more, offset) = frag_info(pkt_in);
-        if (more || offset != 0)
-            && !self.inside_source_ok(Ipv4Addr::new(
-                pkt_in[12], pkt_in[13], pkt_in[14], pkt_in[15],
-            ))
-        {
+        // Only sources the NAT serves, before anything else looks at the
+        // packet: reassembly, where a spoofed fragment could fill the table
+        // or complete someone else's datagram, and local helpers, which
+        // take the source for the requesting host's address (UPnP forwards
+        // to it).
+        if !self.inside_source_ok(Ipv4Addr::new(
+            pkt_in[12], pkt_in[13], pkt_in[14], pkt_in[15],
+        )) {
             return;
         }
         let owned;
@@ -1605,10 +1604,6 @@ impl Nat {
             }
             return;
         }
-        if !self.inside_source_ok(Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15])) {
-            return;
-        }
-
         // The NAT forwards what it translates, so, as any router must (RFC
         // 1812 §5.3.1), it spends a hop of it, and owes the sender a Time
         // Exceeded when none is left. A ping to the public address is the

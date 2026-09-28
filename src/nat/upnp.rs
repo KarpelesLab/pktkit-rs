@@ -651,8 +651,8 @@ EXT:\r\n\r\n",
             "GetExternalIPAddress" => self.action_get_external_ip(nat),
             "AddPortMapping" => self.action_add_port_mapping(nat, ns, body, client_ip),
             "DeletePortMapping" => self.action_delete_port_mapping(nat, ns, body, client_ip),
-            "GetGenericPortMappingEntry" => self.action_get_generic(nat, body),
-            "GetSpecificPortMappingEntry" => self.action_get_specific(nat, body),
+            "GetGenericPortMappingEntry" => self.action_get_generic(nat, ns, body),
+            "GetSpecificPortMappingEntry" => self.action_get_specific(nat, ns, body),
             _ => soap_fault(401, "Invalid Action"),
         }
     }
@@ -803,14 +803,17 @@ EXT:\r\n\r\n",
         )
     }
 
-    fn action_get_generic(&self, nat: &Nat, body: &[u8]) -> SoapResult {
+    /// Mappings are listed only to clients of the namespace they lead
+    /// into: another tenant's would tell a client what that tenant runs,
+    /// and on which ports.
+    fn action_get_generic(&self, nat: &Nat, ns: u64, body: &[u8]) -> SoapResult {
         let xml = String::from_utf8_lossy(body);
         let idx: Option<usize> =
             xml_field(&xml, "NewPortMappingIndex").and_then(|s| s.trim().parse().ok());
         // Only the entry asked for is copied out: a client walks the table
         // one index at a time, and each request copying all of it would
         // make the walk quadratic in the table's size.
-        match idx.and_then(|i| nat.port_forward_at(i)) {
+        match idx.and_then(|i| nat.port_forward_at(ns, i)) {
             Some(pf) => soap_response(&port_mapping_entry_xml(
                 &pf,
                 "GetGenericPortMappingEntryResponse",
@@ -819,7 +822,7 @@ EXT:\r\n\r\n",
         }
     }
 
-    fn action_get_specific(&self, nat: &Nat, body: &[u8]) -> SoapResult {
+    fn action_get_specific(&self, nat: &Nat, ns: u64, body: &[u8]) -> SoapResult {
         let xml = String::from_utf8_lossy(body);
         let proto = match parse_protocol(&xml_field(&xml, "NewProtocol").unwrap_or_default()) {
             Some(p) => p,
@@ -828,7 +831,10 @@ EXT:\r\n\r\n",
         let ext_port: u16 = xml_field(&xml, "NewExternalPort")
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(0);
-        match nat.port_forward(proto, ext_port) {
+        match nat
+            .port_forward(proto, ext_port)
+            .filter(|pf| pf.namespace == ns)
+        {
             Some(pf) => soap_response(&port_mapping_entry_xml(
                 &pf,
                 "GetSpecificPortMappingEntryResponse",
@@ -2383,5 +2389,62 @@ Content-Length: {}\r\n\r\n",
             Some("10.0.0.50".parse().unwrap()),
         );
         assert_eq!(r.status, 200, "another tenant is still served");
+    }
+
+    #[test]
+    fn tenants_see_only_their_own_mappings() {
+        let nat = Nat::new(pfx("10.0.0.1/24"), pfx("203.0.113.1/24"));
+        let h = UPnPHelper::new(UPnPConfig::default());
+        let victim = Some("10.0.0.50".parse().unwrap());
+        let body = add_body(30000, 22, "10.0.0.50", "TCP", 3600);
+        assert_eq!(h.soap(&nat, 2, "AddPortMapping", &body, victim).status, 200);
+        let generic = |ns, i: usize| {
+            let body = format!("<NewPortMappingIndex>{i}</NewPortMappingIndex>");
+            h.soap(
+                &nat,
+                ns,
+                "GetGenericPortMappingEntry",
+                body.as_bytes(),
+                None,
+            )
+            .status
+        };
+        let specific = |ns| {
+            let body = b"<NewExternalPort>30000</NewExternalPort><NewProtocol>TCP</NewProtocol>";
+            h.soap(&nat, ns, "GetSpecificPortMappingEntry", body, None)
+                .status
+        };
+        assert_eq!((generic(2, 0), specific(2)), (200, 200));
+        assert_ne!(generic(1, 0), 200);
+        assert_ne!(specific(1), 200);
+        assert_ne!(generic(0, 0), 200);
+    }
+
+    #[test]
+    fn spoofed_sources_get_no_upnp_service() {
+        let nat = Nat::new(pfx("10.0.0.1/24"), pfx("203.0.113.1/24"));
+        nat.add_local_helper(Arc::new(UPnPHelper::new(UPnPConfig::default())));
+        let injected = Arc::new(StdMutex::new(Vec::<Vec<u8>>::new()));
+        let i = injected.clone();
+        nat.inside().set_handler(Arc::new(move |p| {
+            i.lock().unwrap().push(p.as_bytes().to_vec());
+            Ok(())
+        }));
+        let payload = b"M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n\
+MAN: \"ssdp:discover\"\r\nST: urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\n\r\n";
+        for src in [Ipv4Addr::new(192, 168, 9, 9), Ipv4Addr::new(10, 0, 0, 1)] {
+            let pkt = build_udp_packet(src, 40000, SSDP_MCAST, SSDP_PORT, payload);
+            nat.inside().send(crate::Packet::from_slice(&pkt)).unwrap();
+        }
+        assert!(injected.lock().unwrap().is_empty());
+        let pkt = build_udp_packet(
+            Ipv4Addr::new(10, 0, 0, 50),
+            40000,
+            SSDP_MCAST,
+            SSDP_PORT,
+            payload,
+        );
+        nat.inside().send(crate::Packet::from_slice(&pkt)).unwrap();
+        assert_eq!(injected.lock().unwrap().len(), 1);
     }
 }
