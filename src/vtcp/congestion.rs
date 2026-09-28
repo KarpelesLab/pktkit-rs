@@ -7,7 +7,7 @@
 //! start takes up to L = 2*SMSS per ACK (RFC 3465 §2.2), enough to double
 //! the window per round trip against a delayed-ACK receiver without
 //! letting one stretch ACK burst the window open; CUBIC's HyStart++ takes
-//! RFC 9406's L = 8.
+//! RFC 9406's L = 8, or no limit when paced.
 
 use crate::time::Instant;
 use std::time::Duration;
@@ -59,6 +59,11 @@ impl Ack {
 pub trait CongestionController: Send {
     /// A cumulative ACK outside fast recovery.
     fn on_ack(&mut self, ack: &Ack);
+    /// Sending is paced: slow start need not limit the growth per ACK
+    /// against bursts (RFC 9406 §4.3's L).
+    fn set_paced(&mut self, paced: bool) {
+        let _ = paced;
+    }
     /// A loss was detected with `flight_size` bytes outstanding: set
     /// ssthresh. The connection then brings cwnd down to it.
     fn on_loss(&mut self, flight_size: u32);

@@ -35,7 +35,8 @@ const ALPHA: f64 = 3.0 * (1.0 - BETA) / (1.0 + BETA);
 /// Fast convergence (RFC 9438 §4.7). The RFC would have it off for a flow
 /// alone on its path, which a sender cannot know; Linux has it on.
 const FAST_CONVERGENCE: bool = true;
-/// Slow start's L (RFC 9406 §4.3), for a sender that does not pace.
+/// Slow start's L (RFC 9406 §4.3), for a sender that does not pace. One
+/// that does has none: pacing, not the ACK, spreads out what cwnd lets go.
 const SS_LIMIT: u32 = 8;
 
 // HyStart++'s constants (RFC 9406 §4.3).
@@ -90,6 +91,8 @@ pub struct Cubic {
     last_ack: Option<Instant>,
     hystart: HyStart,
     saved: Option<Saved>,
+    /// Sending is paced (see [`SS_LIMIT`]).
+    paced: bool,
 }
 
 impl Cubic {
@@ -108,6 +111,7 @@ impl Cubic {
             last_ack: None,
             hystart: HyStart::new(),
             saved: None,
+            paced: false,
         }
     }
 
@@ -195,6 +199,10 @@ impl CongestionController for Cubic {
         self.mss = mss.max(1);
     }
 
+    fn set_paced(&mut self, paced: bool) {
+        self.paced = paced;
+    }
+
     fn on_ack(&mut self, a: &Ack) {
         if let Some(rtt) = a.rtt
             && !rtt.is_zero()
@@ -213,7 +221,12 @@ impl CongestionController for Cubic {
         if self.cwnd < self.ssthresh {
             let (divisor, exit) = self.hystart.on_ack(a, self.ssthresh == u32::MAX);
             if limited {
-                let inc = a.bytes_acked.min(SS_LIMIT.saturating_mul(self.mss)) / divisor;
+                let limit = if self.paced {
+                    u32::MAX
+                } else {
+                    SS_LIMIT.saturating_mul(self.mss)
+                };
+                let inc = a.bytes_acked.min(limit) / divisor;
                 self.cwnd = self.cwnd.saturating_add(inc);
             }
             if exit {
@@ -771,5 +784,20 @@ mod tests {
             c.on_ack(&ack(t0 + Duration::from_millis(i), 2 * MSS, w / 2));
         }
         assert_eq!(c.cwnd(), w);
+    }
+
+    /// Unpaced, slow start takes at most L = 8 segments per ACK, so that a
+    /// stretch ACK cannot let a burst go; paced it takes all it is told
+    /// of (RFC 9406 §4.3's L = infinity), pacing spreading what follows.
+    #[test]
+    fn paced_slow_start_takes_stretch_acks_whole() {
+        let mut c = Cubic::new(MSS);
+        let w = c.cwnd();
+        c.on_ack(&ack(Instant::now(), 20 * MSS, w));
+        assert_eq!(c.cwnd(), w + 8 * MSS);
+        let mut c = Cubic::new(MSS);
+        c.set_paced(true);
+        c.on_ack(&ack(Instant::now(), 20 * MSS, w));
+        assert_eq!(c.cwnd(), w + 20 * MSS);
     }
 }

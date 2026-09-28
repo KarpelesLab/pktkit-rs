@@ -5,7 +5,8 @@
 //! and Ethernet-agnostic — callers feed inbound segments via
 //! [`Conn::handle_segment`] and transmit whatever the connection returns.
 //! [`Conn::tick`] drives the RTO, RACK's reordering timer, the tail loss
-//! probe, persist, keepalive, FIN-WAIT-2 and TIME-WAIT timers; there is no background thread. Call it
+//! probe, pacing, persist, keepalive, FIN-WAIT-2 and TIME-WAIT timers;
+//! there is no background thread. Call it
 //! when [`Conn::next_deadline`] comes due: a timer fires only as precisely
 //! as it is driven.
 //!
@@ -28,6 +29,8 @@
 //!   runs RFC 9406 HyStart++, which leaves slow start when the round trip
 //!   rises rather than when the bottleneck's queue overflows. NewReno and
 //!   RFC 3649 HighSpeed TCP are the others.
+//! - Pacing, as Linux's: each round trip's data goes out spread over it, a
+//!   millisecond's worth at a time, not in bursts as ACKs let it go.
 //! - RFC 7661: congestion window validation. No cwnd growth while the
 //!   sender is application-limited; a window left unused (pipeACK under
 //!   half of it) is kept for five minutes, a loss meanwhile answered from

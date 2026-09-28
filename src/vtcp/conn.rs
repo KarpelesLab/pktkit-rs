@@ -260,12 +260,16 @@ pub enum CongestionKind {
     HighSpeed,
 }
 
-fn make_cc(kind: CongestionKind, mss: u32) -> Box<dyn CongestionController> {
-    match kind {
+/// A controller of `kind` for segments of `mss` bytes, told whether
+/// sending is paced.
+fn make_cc(kind: CongestionKind, mss: u32, paced: bool) -> Box<dyn CongestionController> {
+    let mut cc: Box<dyn CongestionController> = match kind {
         CongestionKind::Cubic => Box::new(Cubic::new(mss)),
         CongestionKind::NewReno => Box::new(NewReno::new(mss)),
         CongestionKind::HighSpeed => Box::new(HighSpeed::new(mss)),
-    }
+    };
+    cc.set_paced(paced);
+    cc
 }
 
 /// Connection configuration.
@@ -303,6 +307,14 @@ pub struct ConnConfig {
     pub enable_sack: bool,
     /// The congestion controller. CUBIC by default.
     pub congestion: CongestionKind,
+    /// Pace sending (as Linux's `fq` does, or its internal pacing): spread
+    /// each round trip's data over the round trip at about the rate cwnd
+    /// allows (twice cwnd/SRTT in slow start, 1.2 times after), a
+    /// millisecond's worth at a time, rather than send what each ACK lets
+    /// go at once. Bursts that overflow a shallow bottleneck queue go away,
+    /// slow start's included. The timer it runs on is part of
+    /// [`Conn::next_deadline`]. On by default.
+    pub pacing: bool,
     /// Start again from the initial window after sending nothing for an
     /// RTO (RFC 5681 §4.1): the window halves for every RTO of the spell,
     /// down to the initial window, as on Linux with
@@ -384,6 +396,7 @@ setters! {
         set enable_timestamps: bool;
         set enable_sack: bool;
         set congestion: CongestionKind;
+        set pacing: bool;
         set slow_start_after_idle: bool;
         set keepalive: bool;
         set keepalive_idle: Duration;
@@ -412,6 +425,7 @@ impl Default for ConnConfig {
             enable_timestamps: true,
             enable_sack: true,
             congestion: CongestionKind::default(),
+            pacing: true,
             slow_start_after_idle: true,
             keepalive: false,
             keepalive_idle: DEFAULT_KEEPALIVE_IDLE,
@@ -553,6 +567,16 @@ pub struct Conn {
     /// An RTT sample came in since the last probe (RFC 8985 §7.3), so
     /// probes cannot keep SRTT from following a longer path.
     rtt_sampled: bool,
+
+    // Pacing: a token bucket filled at the pacing rate, holding up to two
+    // send quanta (see `pace_quantum`).
+    /// Bytes that may go now; negative once a segment overdrew it.
+    pace_credit: f64,
+    /// When the credit was last brought up to date.
+    pace_stamp: Instant,
+    /// When enough credit will have built up to send again, while data is
+    /// held back by pacing alone.
+    pace_deadline: std::option::Option<Instant>,
 
     // Delayed ACK (RFC 9293 §3.8.6.3, RFC 5681 §4.2).
     /// When the ACK held back for data received goes out on its own,
@@ -696,7 +720,7 @@ impl Conn {
         let now = wall_clock();
         let rcv_shift = cfg.rcv_wscale();
         let mss = cfg.mss.max(1);
-        let cc = make_cc(cfg.congestion, mss as u32);
+        let cc = make_cc(cfg.congestion, mss as u32, cfg.pacing);
         let ts_offset = super::secret::keyed_hash((
             "tsval",
             cfg.local_addr.map(|a| a.ip()),
@@ -738,6 +762,9 @@ impl Conn {
             nvp_since: None,
             last_data_sent: None,
             rtt_sampled: false,
+            pace_credit: 0.0,
+            pace_stamp: now,
+            pace_deadline: None,
             delack_deadline: None,
             quick_acks: 0,
             pingpong: false,
@@ -1156,7 +1183,7 @@ impl Conn {
     /// made one.
     fn set_mss(&mut self, mss: u16) {
         self.mss = mss.min(self.cfg.mss.max(1)).min(self.path_mss);
-        self.cc = make_cc(self.cfg.congestion, self.mss as u32);
+        self.cc = make_cc(self.cfg.congestion, self.mss as u32, self.cfg.pacing);
     }
 
     fn is_ipv6(&self) -> bool {
@@ -2740,11 +2767,14 @@ impl Conn {
         self.cc.set_cwnd(pipe.saturating_add(sndcnt));
     }
 
-    /// Count `len` bytes sent, for PRR.
+    /// Count `len` bytes sent, for PRR and pacing.
     #[inline]
     fn note_sent(&mut self, len: u32) {
         if self.ca == CaState::Recovery {
             self.prr_out += u64::from(len);
+        }
+        if self.pacing_on() {
+            self.pace_credit -= f64::from(len);
         }
     }
 
@@ -3123,6 +3153,10 @@ impl Conn {
             if seq != una && !seq_before(seq, una.wrapping_add(self.snd_wnd)) {
                 break;
             }
+            if !self.pace_ready() {
+                self.pace_wait();
+                break;
+            }
             self.resend(seq, len, fin);
         }
     }
@@ -3169,6 +3203,8 @@ impl Conn {
     }
 
     fn flush_send_queue(&mut self) {
+        // Anything held back by pacing is looked at again now.
+        self.pace_deadline = None;
         // Lost data before new data: the receiver can deliver nothing past
         // the first hole until it is filled.
         self.retransmit_lost();
@@ -3212,6 +3248,10 @@ impl Conn {
             if !big_enough && self.send_buf.as_ref().unwrap().unacked() > 0 && !self.fin_queued {
                 break;
             }
+            if !self.pace_ready() {
+                self.pace_wait();
+                break;
+            }
             self.send_new(n, opts);
             sent_new = true;
         }
@@ -3250,6 +3290,71 @@ impl Conn {
             // RFC 8985 §7.2: after new data goes out.
             self.schedule_loss_probe();
         }
+    }
+
+    // --- Pacing ---------------------------------------------------------------
+
+    /// Whether sending is paced.
+    fn pacing_on(&self) -> bool {
+        self.cfg.pacing
+    }
+
+    /// The pacing rate in bytes per second, if pacing: Linux's
+    /// (`tcp_update_pacing_rate`): cwnd (or what is
+    /// outstanding, if more) per SRTT, doubled while cwnd is under half
+    /// of ssthresh so slow start can still double it each round trip, and
+    /// 1.2 times after, a little ahead of the ACK clock. None before a
+    /// round trip has been measured: there is nothing to pace by.
+    fn pace_rate(&self) -> Option<u64> {
+        if !self.pacing_on() {
+            return None;
+        }
+        let srtt = self.rto.srtt();
+        if srtt.is_zero() {
+            return None;
+        }
+        let unacked = self.send_buf.as_ref().map_or(0, |s| s.unacked() as u32);
+        let cwnd = self.cc.cwnd().max(unacked);
+        let gain = if self.cc.cwnd() < self.cc.ssthresh() / 2 {
+            2.0
+        } else {
+            1.2
+        };
+        Some(((f64::from(cwnd) * gain / srtt.as_secs_f64()) as u64).max(1))
+    }
+
+    /// What pacing sends at a time: a millisecond's worth at `rate`, and at
+    /// least two segments, as Linux's TSO autosizing (`sk_pacing_shift`)
+    /// has it. Not capped at 64 KB as it is there: the timer that releases
+    /// the next quantum fires no sooner than a millisecond later (see the
+    /// drivers' alarm), and a smaller quantum would cap the rate.
+    fn pace_quantum(&self, rate: u64) -> f64 {
+        (rate as f64 / 1000.0).max(2.0 * f64::from(self.mss))
+    }
+
+    /// Whether pacing lets a segment go now. The credit grows at the
+    /// pacing rate to two quanta: one to send, one more to make up for a
+    /// timer that fired late, without which a coarse clock would cap the
+    /// rate below what was asked. A sender idle for a while may thus burst
+    /// two quanta, no more.
+    fn pace_ready(&mut self) -> bool {
+        let Some(rate) = self.pace_rate() else {
+            return true;
+        };
+        let cap = 2.0 * self.pace_quantum(rate);
+        let dt = self.now.saturating_duration_since(self.pace_stamp);
+        self.pace_stamp = self.now;
+        self.pace_credit = (self.pace_credit + rate as f64 * dt.as_secs_f64()).min(cap);
+        self.pace_credit > 0.0
+    }
+
+    /// Pacing holds data back: send again once a quantum has built up.
+    fn pace_wait(&mut self) {
+        let Some(rate) = self.pace_rate() else {
+            return;
+        };
+        let need = (self.pace_quantum(rate) - self.pace_credit).max(0.0);
+        self.pace_deadline = Some(self.now + Duration::from_secs_f64(need / rate as f64));
     }
 
     // --- Timers (synchronous, deadline-based) -----------------------------
@@ -3353,6 +3458,7 @@ impl Conn {
         if live {
             consider(self.reo_deadline);
             consider(self.pto_deadline);
+            consider(self.pace_deadline);
             consider(self.rto_deadline);
             consider(self.persist_deadline);
             consider(self.keepalive_deadline);
@@ -3397,6 +3503,15 @@ impl Conn {
             && live
         {
             self.on_loss_probe();
+        }
+        // Pacing released what it held back.
+        if let Some(d) = self.pace_deadline
+            && now >= d
+        {
+            self.pace_deadline = None;
+            if live && self.state.is_synchronized() && self.send_buf.is_some() {
+                self.flush_send_queue();
+            }
         }
         // RTO.
         if let Some(d) = self.rto_deadline
@@ -4046,6 +4161,9 @@ mod tests {
             // And segments in whole MSS, which timestamps take 12 bytes
             // of; the tests of timestamps turn them on.
             enable_timestamps: false,
+            // And expect what the window allows to go out at once; the
+            // tests of pacing turn it on.
+            pacing: false,
             ..Default::default()
         }
     }
@@ -4849,6 +4967,7 @@ mod tests {
         let mut small = |port| {
             let mut c = cfg(port, 80);
             c.congestion = CONTROLLERS[cc_rng.below(3) as usize];
+            c.pacing = cc_rng.below(2) == 0;
             c.enable_timestamps = ts;
             c.enable_sack = sack;
             c.mss = 536;
@@ -4981,6 +5100,9 @@ mod tests {
                     }
                     if c.delack_deadline.is_some() {
                         c.delack_deadline = Some(now);
+                    }
+                    if c.pace_deadline.is_some() {
+                        c.pace_deadline = Some(now);
                     }
                     links[i].extend(c.tick());
                 }
@@ -5150,7 +5272,7 @@ mod tests {
         // After the lost SYN data starts from one segment. Stand in for the
         // round trips of slow start that would grow it, without the new
         // ACKs that would also clear any stale loss state.
-        client.cc = make_cc(client.cfg.congestion, client.mss as u32);
+        client.cc = make_cc(client.cfg.congestion, client.mss as u32, client.cfg.pacing);
 
         let (_, segs) = client.write(&[4; 10_000]);
         assert_eq!(segs.len(), 10);
@@ -7418,6 +7540,7 @@ mod tests {
         autotune: [bool; 2],
         congestion: [CongestionKind; 2],
         ss_after_idle: [bool; 2],
+        pacing: [bool; 2],
     }
 
     impl StressCfg {
@@ -7445,6 +7568,7 @@ mod tests {
                     CONTROLLERS[r.below(3) as usize],
                 ],
                 ss_after_idle: pair(&mut r),
+                pacing: pair(&mut r),
             }
         }
     }
@@ -7546,6 +7670,7 @@ mod tests {
                 .autotune(sc.autotune[i])
                 .congestion(sc.congestion[i])
                 .slow_start_after_idle(sc.ss_after_idle[i])
+                .pacing(sc.pacing[i])
                 .send_buf_max(sc.buf * 4)
                 .recv_buf_max(sc.buf * 4)
         };
@@ -7694,6 +7819,7 @@ mod tests {
                         &mut c.reo_deadline,
                         &mut c.pto_deadline,
                         &mut c.delack_deadline,
+                        &mut c.pace_deadline,
                     ] {
                         if d.is_some() {
                             *d = Some(now);
@@ -8156,5 +8282,265 @@ mod tests {
                 ahead.wrapping_neg()
             );
         }
+    }
+
+    // --- Pacing ---------------------------------------------------------------
+
+    fn paced(local: u16, remote: u16) -> ConnConfig {
+        big(local, remote).pacing(true)
+    }
+
+    /// Paced, a write the window would let out at once goes out a quantum
+    /// at a time: first the burst allowance, then a quantum per timer.
+    #[test]
+    fn pacing_spaces_out_what_the_window_allows() {
+        let rtt = Duration::from_millis(100);
+        let (mut client, _server) = rtt_pair(paced, 40700, rtt);
+        client.cc.set_cwnd(400 * 1000);
+        let rate = client
+            .pace_rate()
+            .expect("pacing once a round trip is known");
+        // 400 kB over 100 ms, twice over in slow start (cwnd under half of
+        // ssthresh), 1.2 times after.
+        assert!((7_700_000..=8_100_000).contains(&rate), "{rate}");
+        client.cc.on_loss(800 * 1000);
+        let rate = client.pace_rate().unwrap();
+        assert!((4_600_000..=4_900_000).contains(&rate), "{rate}");
+        let quantum = client.pace_quantum(rate);
+        assert_eq!(quantum as u64, rate / 1000, "a millisecond's worth");
+
+        // Idle long enough to have banked the whole allowance, two quanta,
+        // but not for the window to decay.
+        advance(Duration::from_millis(20));
+        let (_, burst) = client.write(&vec![1; 60_000]);
+        let sent: usize = burst.iter().map(|p| parse(p).payload.len()).sum();
+        assert!(
+            sent as f64 <= 2.0 * quantum + 1000.0 && sent as f64 >= 2.0 * quantum - 1000.0,
+            "burst of {sent} for a quantum of {quantum}"
+        );
+        let due = client
+            .pace_deadline
+            .expect("the rest waits for the pacing timer");
+        assert_eq!(client.next_deadline(), Some(due), "the earliest timer");
+        assert!(client.tick().is_empty(), "not before it is due");
+
+        // From here on a quantum per timer, spaced by a quantum's time.
+        let mut last = test_now();
+        for _ in 0..5 {
+            let due = client.pace_deadline.expect("still pacing");
+            let wait = due.saturating_duration_since(last);
+            assert!(
+                wait >= Duration::from_micros(900) && wait <= Duration::from_micros(1100),
+                "{wait:?}"
+            );
+            advance(due.saturating_duration_since(test_now()));
+            last = test_now();
+            let out = client.tick();
+            let sent: usize = out.iter().map(|p| parse(p).payload.len()).sum();
+            assert!(
+                (sent as f64 - quantum).abs() <= 1000.0,
+                "{sent} sent for a quantum of {quantum}"
+            );
+        }
+    }
+
+    /// At a low rate the quantum is two segments, not a millisecond's
+    /// worth of a fraction of one.
+    #[test]
+    fn pacing_quantum_is_at_least_two_segments() {
+        let rtt = Duration::from_millis(400);
+        let (mut client, _server) = rtt_pair(paced, 40701, rtt);
+        let rate = client.pace_rate().unwrap();
+        assert!(rate < 1_000_000);
+        assert_eq!(client.pace_quantum(rate), 2000.0);
+        advance(Duration::from_secs(1));
+        let (_, burst) = client.write(&vec![1; 20_000]);
+        assert_eq!(burst.len(), 4, "two quanta of two segments");
+        let due = client.pace_deadline.unwrap();
+        advance(due.saturating_duration_since(test_now()));
+        // A quantum, and a segment more if the real clock moved meanwhile:
+        // one that finds credit left goes, overdrawing it.
+        let n = client.tick().len();
+        assert!((2..=3).contains(&n), "then a quantum: {n}");
+    }
+
+    /// Before any round trip is known there is nothing to pace by; off,
+    /// nothing is paced; and a paced sender keeps its slow start whole: a
+    /// full window goes out over the round trip, not a burst.
+    #[test]
+    fn pacing_waits_for_a_round_trip_and_can_be_off() {
+        let mut c = Conn::new(paced(40702, 80));
+        assert_eq!(c.pace_rate(), None);
+        let rtt = Duration::from_millis(50);
+        let (mut client, _server) = rtt_pair(big, 40703, rtt);
+        assert!(!client.cfg.pacing);
+        assert_eq!(client.pace_rate(), None);
+        let (_, all) = client.write(&vec![1; 10_000]);
+        assert_eq!(all.len(), 10, "the whole initial window at once");
+        assert_eq!(client.pace_deadline, None);
+        c.abort();
+    }
+
+    /// A path through a bottleneck of `rate` bytes per second with a
+    /// drop-tail queue of `queue` bytes and `delay` each way, from `a`
+    /// (which always has data to send) to `b` (which reads all it gets).
+    /// Time is the test clock, moved from event to event.
+    struct Path {
+        a: Conn,
+        b: Conn,
+        rate: f64,
+        queue: f64,
+        delay: Duration,
+        /// Random loss before the bottleneck, in parts per million.
+        loss_ppm: u64,
+        rng: Rng,
+        busy_until: Instant,
+        fwd: std::collections::VecDeque<(Instant, Vec<u8>)>,
+        rev: std::collections::VecDeque<(Instant, Vec<u8>)>,
+        received: u64,
+        drops: u64,
+        /// Packets lost at random.
+        lost: u64,
+        /// Queueing delay each packet met at the bottleneck.
+        queue_delays: Vec<Duration>,
+    }
+
+    impl Path {
+        fn new(conf: ConnConfig, rate: f64, queue: f64, delay: Duration, port: u16) -> Path {
+            let mut a = Conn::new(conf.clone().local_port(port).remote_port(80));
+            let b = Conn::new(conf.local_port(80).remote_port(port).recv_buf_max(64 << 20));
+            let syn = a.connect();
+            let now = test_now();
+            let mut p = Path {
+                a,
+                b,
+                rate,
+                queue,
+                delay,
+                loss_ppm: 0,
+                rng: Rng(0x5EED | 1),
+                busy_until: now,
+                fwd: Default::default(),
+                rev: Default::default(),
+                received: 0,
+                drops: 0,
+                lost: 0,
+                queue_delays: Vec::new(),
+            };
+            p.send(syn);
+            p
+        }
+
+        fn send(&mut self, pkts: Vec<Vec<u8>>) {
+            let now = test_now();
+            for pkt in pkts {
+                if self.loss_ppm > 0 && self.rng.below(1_000_000) < self.loss_ppm {
+                    self.lost += 1;
+                    continue;
+                }
+                let start = self.busy_until.max(now);
+                let wait = start.saturating_duration_since(now);
+                if wait.as_secs_f64() * self.rate > self.queue {
+                    self.drops += 1;
+                    continue;
+                }
+                self.queue_delays.push(wait);
+                let done = start + Duration::from_secs_f64(pkt.len() as f64 / self.rate);
+                self.busy_until = done;
+                self.fwd.push_back((done + self.delay, pkt));
+            }
+        }
+
+        /// Run until `until` has passed on the test clock.
+        fn run_for(&mut self, d: Duration) {
+            let end = test_now() + d;
+            let chunk = vec![7u8; 1 << 16];
+            loop {
+                let (_, out) = self.a.write(&chunk);
+                self.send(out);
+                let next = [
+                    self.fwd.front().map(|x| x.0),
+                    self.rev.front().map(|x| x.0),
+                    self.a.next_deadline(),
+                    self.b.next_deadline(),
+                ]
+                .into_iter()
+                .flatten()
+                .min()
+                .unwrap_or(end)
+                .min(end);
+                let now = test_now();
+                if next > now {
+                    advance(next - now);
+                }
+                let now = test_now();
+                if now >= end {
+                    return;
+                }
+                while self.fwd.front().is_some_and(|x| x.0 <= now) {
+                    let (_, pkt) = self.fwd.pop_front().unwrap();
+                    let seg = parse(&pkt);
+                    let mut out = if self.b.state() == State::Closed && !self.b.is_closed() {
+                        self.b.accept_syn(&seg)
+                    } else {
+                        self.b.handle_segment(&seg)
+                    };
+                    let got = read_all(&mut self.b);
+                    self.received += got.len() as u64;
+                    out.extend(self.b.take_outgoing());
+                    for p in out {
+                        self.rev.push_back((now + self.delay, p));
+                    }
+                }
+                while self.rev.front().is_some_and(|x| x.0 <= now) {
+                    let (_, pkt) = self.rev.pop_front().unwrap();
+                    let out = self.a.handle_segment(&parse(&pkt));
+                    self.send(out);
+                }
+                let out = self.a.tick();
+                self.send(out);
+                for p in self.b.tick() {
+                    self.rev.push_back((now + self.delay, p));
+                }
+            }
+        }
+
+        /// Goodput over `d`, in bytes per second.
+        fn goodput(&mut self, d: Duration) -> f64 {
+            let before = self.received;
+            self.run_for(d);
+            (self.received - before) as f64 / d.as_secs_f64()
+        }
+    }
+
+    /// A bulk transfer over 10 Mbit/s with 40 ms of round trip.
+    fn bulk(conf: ConnConfig, queue_bdps: f64, port: u16) -> Path {
+        let rate = 1_250_000.0;
+        let rtt = Duration::from_millis(40);
+        let queue = queue_bdps * rate * rtt.as_secs_f64();
+        let conf = conf.mss(1460).send_buf_size(1 << 20).recv_buf_size(1 << 20);
+        Path::new(conf, rate, queue.max(3000.0), rtt / 2, port)
+    }
+
+    /// Into a queue of a tenth of the BDP, CUBIC's slow start overflows it
+    /// with every burst unless paced. Paced, it loses fewer packets and
+    /// moves at least as much.
+    #[test]
+    fn pacing_spares_a_shallow_queue() {
+        let run = |pacing, port| {
+            let mut p = bulk(ConnConfig::default().pacing(pacing), 0.1, port);
+            let goodput = p.goodput(Duration::from_secs(8));
+            (goodput, p.drops)
+        };
+        let (paced_goodput, paced_drops) = run(true, 40713);
+        let (bursty_goodput, bursty_drops) = run(false, 40714);
+        assert!(
+            paced_drops < bursty_drops,
+            "drops paced {paced_drops}, not {bursty_drops}"
+        );
+        assert!(
+            paced_goodput >= 0.95 * bursty_goodput,
+            "goodput paced {paced_goodput}, not {bursty_goodput}"
+        );
     }
 }
