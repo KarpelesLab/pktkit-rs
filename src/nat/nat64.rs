@@ -19,7 +19,7 @@ use crate::{
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddrV4};
 use std::sync::atomic::{AtomicU16, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 const IPV6_HEADER_LEN: usize = 40;
 const IPV4_MIN_HEADER: usize = 20;
@@ -99,6 +99,10 @@ pub struct Nat64 {
     /// Largest IPv6 packet sent inside from an IPv4 one that may be
     /// fragmented (see [`set_ipv6_mtu`](Nat64::set_ipv6_mtu)).
     ipv6_mtu: AtomicU16,
+    /// The inside networks whose hosts are translated; empty for any
+    /// source that could be one (see
+    /// [`set_inside_routes`](Nat64::set_inside_routes)).
+    inside_routes: RwLock<Vec<IpPrefix>>,
 }
 
 struct Nat64Inner {
@@ -159,6 +163,7 @@ impl Nat64 {
             next_sweep: Mutex::new(Instant::now() + SWEEP_INTERVAL),
             icmp_source: Mutex::new(None),
             ipv6_mtu: AtomicU16::new(IPV6_MIN_MTU),
+            inside_routes: RwLock::new(Vec::new()),
         })
     }
 
@@ -211,6 +216,44 @@ impl Nat64 {
             h.set_limits(&limits);
         }
         inner.limits = limits;
+    }
+
+    /// The inside IPv6 networks whose hosts the NAT64 translates.
+    ///
+    /// Outbound packets from any other source are dropped: they are
+    /// spoofed, or from a network the NAT64 was not set up to serve, and
+    /// every such address would count as a host of its own against the
+    /// per-host caps. Replaces any list set before. Empty (the default)
+    /// takes any source an inside host could send from, which excludes
+    /// only what no host can: the unspecified, loopback, multicast,
+    /// link-local and IPv4-mapped addresses, and addresses under the
+    /// NAT64 prefix, which stand for IPv4 hosts. IPv4 prefixes are ignored.
+    pub fn set_inside_routes(&self, routes: Vec<IpPrefix>) {
+        let v6: Vec<IpPrefix> = routes.into_iter().filter(|r| !r.is_v4()).collect();
+        *self
+            .inside_routes
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = v6;
+    }
+
+    /// Whether `ip` may be translated as the source of an inside host (see
+    /// [`set_inside_routes`](Self::set_inside_routes)).
+    fn inside_source_ok(&self, ip: Ipv6Addr) -> bool {
+        let a = IpAddr::V6(ip);
+        if ip.is_unspecified()
+            || ip.is_loopback()
+            || ip.is_multicast()
+            || ip.is_unicast_link_local()
+            || ip.to_ipv4_mapped().is_some()
+            || self.inside.addr().contains(a)
+        {
+            return false;
+        }
+        let routes = self
+            .inside_routes
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        routes.is_empty() || routes.iter().any(|r| r.contains(a))
     }
 
     pub fn inside(&self) -> Arc<dyn L3Device> {
@@ -304,6 +347,11 @@ impl Nat64 {
         };
         let payload_len = u16::from_be_bytes([pkt[4], pkt[5]]) as usize;
         let src_v6 = read_v6(&pkt[8..24]);
+        // Before anything is answered, too: an error sent to a spoofed
+        // source goes to whoever it names.
+        if !self.inside_source_ok(src_v6) {
+            return;
+        }
 
         if pkt.len() < IPV6_HEADER_LEN + payload_len {
             return;
@@ -2242,6 +2290,37 @@ mod tests {
             nat.inside().send(Packet::from_slice(&pkt)).unwrap();
         }
         assert_eq!(outside.lock().unwrap().len(), 50);
+    }
+
+    #[test]
+    fn spoofed_inside_sources_are_not_translated() {
+        let (nat, _inside, outside) = wired();
+        let sent = |src: &str| {
+            let before = outside.lock().unwrap().len();
+            let pkt = build_v6_udp(src.parse().unwrap(), 20000, wkp(SERVER), 53, b"q");
+            nat.inside().send(Packet::from_slice(&pkt)).unwrap();
+            outside.lock().unwrap().len() > before
+        };
+        for bad in [
+            "::",
+            "::1",
+            "ff02::1",
+            "fe80::1",
+            "::ffff:10.0.0.1",
+            "64:ff9b::8.8.4.4",
+        ] {
+            assert!(!sent(bad), "{bad} translated");
+        }
+        assert!(sent("2001:db8::5"));
+        assert!(sent("fd00::5"));
+
+        // Given its networks, the NAT64 serves those alone.
+        nat.set_inside_routes(vec![pfx("2001:db8:1::/48"), pfx("10.0.0.0/8")]);
+        assert!(sent("2001:db8:1:2::5"));
+        assert!(!sent("2001:db8::5"));
+        assert!(!sent("fd00::5"));
+        nat.set_inside_routes(Vec::new());
+        assert!(sent("2001:db8::7"));
     }
 
     #[test]
