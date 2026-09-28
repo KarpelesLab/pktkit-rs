@@ -446,9 +446,12 @@ EXT:\r\n\r\n",
                     // A request past MAX_REQUEST_BYTES is refused anyway,
                     // and a response is a few KiB: the engine's 1 MiB
                     // defaults would only let each of the connections any
-                    // SYN opens hold that much out-of-order data.
+                    // SYN opens hold that much out-of-order data. Nor is
+                    // there a transfer worth growing them for.
                     recv_buf_size: MAX_REQUEST_BYTES,
                     send_buf_size: MAX_REQUEST_BYTES,
+                    recv_buf_max: MAX_REQUEST_BYTES,
+                    send_buf_max: MAX_REQUEST_BYTES,
                     ..Default::default()
                 };
                 table.insert(
