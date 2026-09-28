@@ -6,7 +6,8 @@
 //! all I/O happens in [`super::server::Server`].
 
 use crate::time::Instant;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicU64;
@@ -28,6 +29,52 @@ use crate::wg::transport::EncryptError;
 /// it. Its sessions stop at expiry; until then it is still reported
 /// ([`Handler::get_peer_info`]) and a refresh keeps its replay state.
 pub(crate) const EXPIRED_PEER_GRACE: Duration = REJECT_AFTER_TIME;
+
+/// Removed peers whose last initiation timestamp is remembered. A handful
+/// of bytes each; past this many the one removed longest ago is forgotten.
+const MAX_TOMBSTONES: usize = 4096;
+
+/// The last initiation timestamps of peers recently removed from the table.
+/// A peer authorized again starts from its old one, as it would had it never
+/// left: from zero, any initiation it ever sent, recorded by anyone on the
+/// path, would be accepted once, and the server would move the peer's
+/// endpoint to wherever the replay came from until the peer next
+/// authenticated. The reference forgets on removal too; being told to
+/// forget a key is no reason to accept its old handshakes.
+#[derive(Default)]
+struct Tombstones {
+    last: HashMap<NoisePublicKey, [u8; TAI64N_TIMESTAMP_SIZE]>,
+    /// First removals, oldest first, for eviction.
+    order: VecDeque<NoisePublicKey>,
+}
+
+impl Tombstones {
+    fn record(&mut self, p: &PeerEntry) {
+        if !p.has_timestamp {
+            return;
+        }
+        if let Some(ts) = self.last.get_mut(&p.public_key) {
+            if p.last_timestamp > *ts {
+                *ts = p.last_timestamp;
+            }
+            return;
+        }
+        if self.last.len() >= MAX_TOMBSTONES
+            && let Some(old) = self.order.pop_front()
+        {
+            self.last.remove(&old);
+        }
+        self.last.insert(p.public_key, p.last_timestamp);
+        self.order.push_back(p.public_key);
+    }
+
+    fn restore(&self, p: &mut PeerEntry) {
+        if let Some(ts) = self.last.get(&p.public_key) {
+            p.last_timestamp = *ts;
+            p.has_timestamp = true;
+        }
+    }
+}
 
 thread_local! {
     /// Set while [`Handler::accept_unknown_peer`] (or the adapter's) re-runs
@@ -290,6 +337,8 @@ pub struct Handler {
     /// Who to tell when peers leave the table. Held weakly, so a server or
     /// adapter that goes away stops being told without having to unregister.
     removal_hooks: Mutex<Vec<Weak<PeerRemovedFn>>>,
+    /// Taken after `peers`, never before.
+    tombstones: Mutex<Tombstones>,
 }
 
 impl std::fmt::Debug for Handler {
@@ -331,6 +380,7 @@ impl Handler {
             ratelimiter: Mutex::default(),
             group: RwLock::new(Weak::new()),
             removal_hooks: Mutex::default(),
+            tombstones: Mutex::default(),
         }))
     }
 
@@ -359,7 +409,7 @@ impl Handler {
     /// with [`accept_unknown_peer`](Self::accept_unknown_peer) are dropped
     /// by the handler itself.
     pub fn add_peer(&self, peer_key: NoisePublicKey) {
-        Self::add_peer_locked(
+        self.add_peer_locked(
             &mut self.peers.write().expect("peers lock"),
             peer_key,
             false,
@@ -367,6 +417,7 @@ impl Handler {
     }
 
     fn add_peer_locked(
+        &self,
         peers: &mut HashMap<NoisePublicKey, PeerEntry>,
         peer_key: NoisePublicKey,
         accepted_unknown: bool,
@@ -380,10 +431,32 @@ impl Handler {
                 p.accepted_unknown &= accepted_unknown;
             }
             None => {
-                let mut p = PeerEntry::new(peer_key, NoisePresharedKey::zero(), false);
+                let mut p = self.new_entry(peer_key, NoisePresharedKey::zero(), false);
                 p.accepted_unknown = accepted_unknown;
                 peers.insert(peer_key, p);
             }
+        }
+    }
+
+    /// A fresh table entry, carrying over the replay state of a key removed
+    /// before.
+    fn new_entry(&self, key: NoisePublicKey, psk: NoisePresharedKey, has_psk: bool) -> PeerEntry {
+        let mut p = PeerEntry::new(key, psk, has_psk);
+        self.tombstones
+            .lock()
+            .expect("tombstones lock")
+            .restore(&mut p);
+        p
+    }
+
+    /// Take `key` out of the table, remembering its replay state.
+    fn take_peer_locked(
+        &self,
+        peers: &mut HashMap<NoisePublicKey, PeerEntry>,
+        key: &NoisePublicKey,
+    ) {
+        if let Some(p) = peers.remove(key) {
+            self.tombstones.lock().expect("tombstones lock").record(&p);
         }
     }
 
@@ -411,7 +484,8 @@ impl Handler {
                 p.accepted_unknown = false;
             }
             None => {
-                peers.insert(peer_key, PeerEntry::new(peer_key, psk, true));
+                let p = self.new_entry(peer_key, psk, true);
+                peers.insert(peer_key, p);
             }
         }
     }
@@ -419,12 +493,14 @@ impl Handler {
     /// Remove a peer and tear down all session state belonging to it,
     /// including initiations still waiting for an answer: a response to one
     /// would otherwise install a session for the revoked key, even after the
-    /// peer is authorized again under new terms.
+    /// peer is authorized again under new terms. Its last initiation
+    /// timestamp is remembered (for the last few thousand keys removed), so
+    /// an initiation recorded before cannot be replayed once it is back.
     pub fn remove_peer(&self, peer_key: &NoisePublicKey) {
         // Deauthorize first: install() checks authorization under the
         // sessions lock, so a handshake finishing concurrently either sees
         // the peer gone or installs before the sweep below removes it.
-        self.peers.write().expect("peers lock").remove(peer_key);
+        self.take_peer_locked(&mut self.peers.write().expect("peers lock"), peer_key);
         self.forget_peers(std::slice::from_ref(peer_key));
     }
 
@@ -819,7 +895,7 @@ impl Handler {
                 .map(|p| p.public_key)
                 .collect();
             for k in &gone {
-                peers.remove(k);
+                self.take_peer_locked(&mut peers, k);
             }
             gone
         };
@@ -1319,10 +1395,10 @@ impl Handler {
                     .min_by_key(|(exp, _)| *exp)
                     .map(|(_, p)| p.public_key)
                     .ok_or_else(|| io::Error::other("peer table full"))?;
-                peers.remove(&victim);
+                self.take_peer_locked(&mut peers, &victim);
                 evicted = Some(victim);
             }
-            Self::add_peer_locked(&mut peers, peer_key, true);
+            self.add_peer_locked(&mut peers, peer_key, true);
             evicted
         };
         if let Some(victim) = evicted {
@@ -2276,6 +2352,38 @@ mod tests {
         assert!(b.get_peer_info(&recent.public_key()).is_some());
         assert!(b.get_peer_info(&never.public_key()).is_some());
         assert!(holds_state_for(&b, &never.public_key()));
+    }
+
+    /// A recorded initiation replayed after its peer was removed and added
+    /// again is refused, however the peer went and came back. Before, the
+    /// new entry started with no timestamp, the replay was consumed, and
+    /// the server moved the peer's endpoint to wherever it came from until
+    /// the peer next authenticated.
+    #[test]
+    fn a_removed_peers_initiation_cannot_be_replayed_after_re_adding_it() {
+        let (a, b) = pair();
+        let (good, evil) = (loopback(), "6.6.6.6:6".parse().unwrap());
+        let init = a.initiate_handshake(&b.public_key()).unwrap();
+        b.process_packet(&init, &good).unwrap();
+        b.remove_peer(&a.public_key());
+        pace();
+        b.add_peer(a.public_key());
+        assert!(b.process_packet(&init, &evil).is_err(), "via add_peer");
+
+        b.remove_peer(&a.public_key());
+        let err = b.accept_unknown_peer(a.public_key(), &init, &evil);
+        assert!(err.is_err(), "via accept_unknown_peer");
+        // Pruned, then taken again.
+        let long_ago = Instant::now() - EXPIRED_PEER_GRACE - Duration::from_secs(1);
+        b.set_peer_expiry(&a.public_key(), long_ago);
+        b.maintenance();
+        assert!(!b.has_peer(&a.public_key()));
+        let err = b.accept_unknown_peer(a.public_key(), &init, &evil);
+        assert!(err.is_err(), "after pruning");
+
+        // The peer's own next initiation still goes through.
+        let fresh = a.initiate_handshake(&b.public_key()).unwrap();
+        assert!(b.accept_unknown_peer(a.public_key(), &fresh, &good).is_ok());
     }
 
     /// A keypair for `peer`, indexed nowhere yet, without a handshake.
