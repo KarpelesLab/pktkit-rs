@@ -557,9 +557,11 @@ impl Conn {
     ///
     /// The caller must have matched the quoted IP and TCP headers to this
     /// connection's addresses and ports. What is checked here is RFC 5927
-    /// §4.1's defence against a forged message: `seq` has to be one we
-    /// sent and have not had acknowledged (between SND.UNA and SND.NXT, as
-    /// Linux's `tcp_v4_err` has it). Anything else is ignored.
+    /// §4.1's defence against a forged message: `seq` has to start a
+    /// segment we sent and have not had acknowledged, SND.UNA <= SEQ <
+    /// SND.NXT. (Linux's `tcp_v4_err` lets SND.NXT itself through too, but
+    /// nothing we sent starts there: a segment that did would have moved
+    /// SND.NXT past it.) Anything else is ignored.
     pub fn on_icmp_too_big(&mut self, mtu: u32, seq: u32) -> Vec<Vec<u8>> {
         if self.closed || matches!(self.state, State::Closed | State::Listen | State::TimeWait) {
             return Vec::new();
@@ -567,7 +569,7 @@ impl Conn {
         let Some(sb) = self.send_buf.as_ref() else {
             return Vec::new();
         };
-        if !seq_in_range_inclusive(seq, sb.una(), sb.nxt()) {
+        if !seq_in_range(seq, sb.una(), sb.nxt()) {
             return Vec::new();
         }
         self.set_path_mtu(mtu)
@@ -5278,6 +5280,9 @@ mod tests {
                 .on_icmp_too_big(1400, first.seq.wrapping_sub(1))
                 .is_empty()
         );
+        // So is one quoting SND.NXT, where nothing we sent starts.
+        let nxt = client.send_buf.as_ref().unwrap().nxt();
+        assert!(client.on_icmp_too_big(1400, nxt).is_empty());
         assert_eq!(client.mss(), 1440);
         let resent = client.on_icmp_too_big(1400, first.seq);
         assert_eq!((client.mss(), client.path_mtu()), (1340, 1400));
