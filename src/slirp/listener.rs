@@ -41,9 +41,11 @@ impl Drop for HalfOpenSlot {
     }
 }
 
-/// Established connections a full accept queue had no room for, in the
-/// order they found it full, offered again as `accept` makes room (see
-/// `ConnState::complete_accept`).
+/// Connections a full accept queue had no room for, in the order they
+/// found it full, offered again as `accept` makes room (see
+/// `ConnState::complete_accept`): handshakes held back in SYN-RECEIVED
+/// (`ConnState::held_back`), and ones that completed just as another took
+/// the last place.
 ///
 /// Every tick offers each of them again, up to [`HALF_OPEN_CAP`] per
 /// listener, so the check that one is already listed is a set lookup rather
@@ -137,7 +139,7 @@ pub struct Listener {
     queue: Mutex<VecDeque<Arc<ConnState>>>,
     /// Signalled when a connection is enqueued or the listener is closed.
     signal: Condvar,
-    /// Established connections the full queue had no room for.
+    /// Connections the full queue had no room for.
     waiting: Mutex<Waiting>,
     /// Removes this listener from the stack's table; taken by the first close.
     unregister: Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -199,6 +201,18 @@ impl Listener {
         self.waiting.lock().expect("poisoned").remove(state);
         self.signal.notify_one();
         Offer::Taken
+    }
+
+    /// Whether the accept queue has no room for `state`; if it has none,
+    /// `state` is listed to be offered the room `accept` makes (see
+    /// `ConnState::held_back`).
+    pub(crate) fn hold(&self, state: &Arc<ConnState>) -> bool {
+        let q = self.queue.lock().expect("poisoned");
+        if q.len() < ACCEPT_QUEUE_CAP || self.closed.load(Ordering::Acquire) {
+            return false;
+        }
+        self.waiting.lock().expect("poisoned").add(state);
+        true
     }
 
     /// A half-open slot for a new connection, or `None` when the listener

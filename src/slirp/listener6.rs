@@ -32,7 +32,7 @@ pub struct Listener6 {
     queue: Mutex<VecDeque<Arc<ConnState>>>,
     /// Signalled when a connection is enqueued or the listener is closed.
     signal: Condvar,
-    /// Established connections the full queue had no room for.
+    /// Connections the full queue had no room for.
     waiting: Mutex<Waiting>,
     /// Removes this listener from the stack's table; taken by the first close.
     unregister: Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -94,6 +94,18 @@ impl Listener6 {
         self.waiting.lock().expect("poisoned").remove(state);
         self.signal.notify_one();
         Offer::Taken
+    }
+
+    /// Whether the accept queue has no room for `state`; if it has none,
+    /// `state` is listed to be offered the room `accept` makes (see
+    /// `ConnState::held_back`).
+    pub(crate) fn hold(&self, state: &Arc<ConnState>) -> bool {
+        let q = self.queue.lock().expect("poisoned");
+        if q.len() < ACCEPT_QUEUE_CAP || self.closed.load(Ordering::Acquire) {
+            return false;
+        }
+        self.waiting.lock().expect("poisoned").add(state);
+        true
     }
 
     /// A half-open slot for a new connection, or `None` when the listener

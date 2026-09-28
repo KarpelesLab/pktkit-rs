@@ -119,7 +119,11 @@ pub(crate) struct ConnState {
     outbox: Mutex<Outbox>,
     /// For a passively opened connection: hands it to its listener once the
     /// handshake completes, unless the deadline passes first.
-    pending_accept: Mutex<Option<(Instant, AcceptFn)>>,
+    pending_accept: Mutex<Option<PendingAccept>>,
+    /// The latest segment that would have completed the handshake had the
+    /// listener had room (see [`held_back`](Self::held_back)), delivered
+    /// once it has.
+    held: Mutex<Option<Segment>>,
     /// Why the connection ended, if not by an orderly close: a reset from
     /// the peer, or our timers giving up. Reads report it instead of a clean
     /// end of stream, so a truncated transfer is not mistaken for a whole one.
@@ -150,6 +154,18 @@ pub(crate) enum Offer {
 /// half-open slot), or when the handshake runs out of time.
 pub(crate) type AcceptFn = Box<dyn FnMut(&Arc<ConnState>) -> Offer + Send>;
 
+/// Whether the listener's accept queue is full; if it is, the listener
+/// also lists the connection to be offered the room `accept` makes.
+pub(crate) type HoldFn = Box<dyn Fn(&Arc<ConnState>) -> bool + Send>;
+
+/// A passively opened connection's way into its listener's accept queue.
+pub(crate) struct PendingAccept {
+    /// When the handshake, and the wait for room, run out of time.
+    deadline: Instant,
+    accept: AcceptFn,
+    hold: HoldFn,
+}
+
 /// How long a passively opened connection may take to complete its
 /// handshake, and to find room in the listener's accept queue, before it is
 /// dropped.
@@ -168,6 +184,7 @@ impl ConnState {
             sink,
             outbox: Mutex::new(Outbox::default()),
             pending_accept: Mutex::new(None),
+            held: Mutex::new(None),
             error: Mutex::new(None),
         })
     }
@@ -183,32 +200,74 @@ impl ConnState {
 
     /// Queue the connection on a listener, through `accept`, once its
     /// handshake completes (see [`complete_accept`](Self::complete_accept)).
-    pub(crate) fn set_pending_accept(&self, accept: AcceptFn) {
-        *self.pending_accept.lock().expect("poisoned") =
-            Some((Instant::now() + ACCEPT_HANDSHAKE_TIMEOUT, accept));
+    pub(crate) fn set_pending_accept(&self, accept: AcceptFn, hold: HoldFn) {
+        *self.pending_accept.lock().expect("poisoned") = Some(PendingAccept {
+            deadline: Instant::now() + ACCEPT_HANDSHAKE_TIMEOUT,
+            accept,
+            hold,
+        });
+    }
+
+    /// Whether `seg` is the ACK that would complete the handshake of a
+    /// connection whose listener has no room to accept it, and so must not
+    /// go in yet. Linux drops that ACK (unless told to abort on overflow),
+    /// which keeps the connection in SYN-RECEIVED: nothing the peer sends
+    /// is acknowledged while nobody could read it, and a reset would fail a
+    /// connection that is merely early. If the application never makes
+    /// room, the handshake deadline ends it.
+    ///
+    /// Linux then waits for the peer's next segment, prompted by a
+    /// retransmitted SYN-ACK, to complete the handshake. With a queue as
+    /// short as a slirp listener's, a burst of clients would spend most of
+    /// that deadline waiting on backed-off retransmissions while `accept`
+    /// sat idle, so the segment is kept (the latest one, which a later one
+    /// replaces) and delivered as soon as `accept` makes room.
+    fn held_back(self: &Arc<Self>, seg: &Segment) -> bool {
+        use crate::vtcp::segment::flags;
+        if seg.flags & (flags::ACK | flags::SYN | flags::RST) != flags::ACK {
+            return false;
+        }
+        let pending = self.pending_accept.lock().expect("poisoned");
+        let Some(p) = pending.as_ref() else {
+            return false;
+        };
+        let hold =
+            self.conn.lock().expect("poisoned").state() == State::SynReceived && (p.hold)(self);
+        // Let in, this one completes the handshake, and one held earlier
+        // would only come after it as a stale duplicate.
+        *self.held.lock().expect("poisoned") = hold.then(|| seg.clone());
+        hold
     }
 
     /// Hand a passively opened connection to its listener if its handshake
-    /// has completed. Call it after every inbound segment, and on every
-    /// tick: a connection the full accept queue had no room for waits,
-    /// established, to be offered again.
+    /// has completed, first delivering the segment that would have
+    /// completed it had the listener had room (see
+    /// [`held_back`](Self::held_back)). Call it after every inbound
+    /// segment, and on every tick: a connection the full accept queue had
+    /// no room for waits to be offered again.
     ///
-    /// Waiting is what Linux does by default (`tcp_abort_on_overflow` = 0),
-    /// not resetting: a queue that is full now is usually drained a moment
-    /// later, and a burst of clients that all completed their handshakes
-    /// would otherwise see every connection past the queue's depth reset.
-    /// The half-open slot the connection keeps meanwhile bounds how many
-    /// can wait, and the handshake deadline how long.
+    /// A handshake does not complete while the queue is full, but one
+    /// completing just as another thread takes the last place can find no
+    /// room. It then waits, established, rather than being reset, as a
+    /// connection the application would have accepted a moment later: the
+    /// half-open slot it keeps meanwhile bounds how many can wait, and the
+    /// handshake deadline how long.
     ///
     /// Returns `false` when the connection is finished with: the listener
     /// refused it, so it has been aborted and the caller should drop it from
     /// its table.
     pub(crate) fn complete_accept(self: &Arc<Self>) -> bool {
+        // Taken before the pending lock, which delivering it takes. Held
+        // back again if there is still no room.
+        let held = self.held.lock().expect("poisoned").take();
+        if let Some(seg) = held {
+            self.deliver(&seg);
+        }
         // The offer is made under the lock, which the tick also takes to
         // expire the handshake, so the listener never gets a connection that
         // is being reset for running out of time.
         let mut pending = self.pending_accept.lock().expect("poisoned");
-        let Some((_, accept)) = pending.as_mut() else {
+        let Some(PendingAccept { accept, .. }) = pending.as_mut() else {
             return true;
         };
         if !self
@@ -280,7 +339,10 @@ impl ConnState {
 
     /// Feed an inbound segment to the engine, transmit its replies, and wake
     /// any blocked reader/writer.
-    pub(crate) fn deliver(&self, seg: &Segment) {
+    pub(crate) fn deliver(self: &Arc<Self>, seg: &Segment) {
+        if self.held_back(seg) {
+            return;
+        }
         let mut conn = self.conn.lock().expect("poisoned");
         // A FIN before the RST means the stream had already ended whole.
         let ended = conn.fin_received();
@@ -520,13 +582,13 @@ pub(crate) fn tick_conn(state: &Arc<ConnState>) -> bool {
     let expired = {
         let mut pending = state.pending_accept.lock().expect("poisoned");
         match &*pending {
-            Some((deadline, _)) if Instant::now() >= *deadline => pending.take(),
+            Some(p) if Instant::now() >= p.deadline => pending.take(),
             _ => None,
         }
     };
-    if let Some((_, accept)) = expired {
+    if let Some(p) = expired {
         // Dropped, which gives the listener's backlog slot back.
-        drop(accept);
+        drop(p);
         state.abort();
     } else {
         // Offer again a connection the accept queue had no room for.
@@ -589,7 +651,7 @@ mod tests {
         (state, out)
     }
 
-    fn pump(state: &ConnState, out: &Mutex<Vec<Vec<u8>>>, peer: &mut Conn) {
+    fn pump(state: &Arc<ConnState>, out: &Mutex<Vec<Vec<u8>>>, peer: &mut Conn) {
         loop {
             let sent = std::mem::take(&mut *out.lock().unwrap());
             if sent.is_empty() {
@@ -607,6 +669,80 @@ mod tests {
         Conn::new(ConnConfig::default().local_port(5000).remote_port(80))
     }
 
+    /// While the listener's accept queue is full, the ACK completing a
+    /// handshake is not let in, as on Linux: the connection stays in
+    /// SYN-RECEIVED and acknowledges none of the peer's data. Once
+    /// `accept` makes room, the handshake completes and the data is taken.
+    #[test]
+    fn a_full_accept_queue_holds_the_handshake_back() {
+        use crate::slirp::listener::{ACCEPT_QUEUE_CAP, Listener};
+        let listener = Arc::new(Listener::new("10.0.0.1:80".parse().unwrap()));
+        let out: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
+        let o = out.clone();
+        let endpoints = Endpoints::V4 {
+            local_ip: Ipv4Addr::new(10, 0, 0, 1),
+            local_port: 80,
+            remote_ip: Ipv4Addr::new(10, 0, 0, 5),
+            remote_port: 5000,
+        };
+        let filler = || {
+            ConnState::new(
+                endpoints,
+                Conn::new(ConnConfig::default()),
+                Arc::new(|_: &[u8]| {}),
+            )
+        };
+        for _ in 0..ACCEPT_QUEUE_CAP {
+            assert_eq!(listener.enqueue(&filler()), Offer::Taken);
+        }
+        let state = ConnState::new(
+            endpoints,
+            Conn::new(ConnConfig::default().local_port(80).remote_port(5000)),
+            Arc::new(move |p: &[u8]| o.lock().unwrap().push(p[20..].to_vec())),
+        );
+        let (l1, l2) = (Arc::downgrade(&listener), Arc::downgrade(&listener));
+        state.set_pending_accept(
+            Box::new(move |s| l1.upgrade().map_or(Offer::Refused, |l| l.enqueue(s))),
+            Box::new(move |s| l2.upgrade().is_some_and(|l| l.hold(s))),
+        );
+        let mut peer = peer();
+        let syn = Segment::parse(&peer.connect()[0]).unwrap();
+        let synack = state.conn.lock().unwrap().accept_syn(&syn);
+        state.send(synack);
+        // The peer takes the SYN-ACK, ACKs it and sends data at once.
+        let synack = Segment::parse(&out.lock().unwrap().remove(0)).unwrap();
+        let mut from_peer = peer.handle_segment(&synack);
+        from_peer.extend(peer.write(b"hello").1);
+        assert!(!from_peer.is_empty());
+        for seg in &from_peer {
+            state.deliver(&Segment::parse(seg).unwrap());
+            assert!(state.complete_accept());
+        }
+        assert_eq!(state.conn.lock().unwrap().state(), State::SynReceived);
+        assert!(
+            out.lock().unwrap().is_empty(),
+            "answered a held-back segment"
+        );
+
+        // Room made: the handshake completes, and the stream is queued.
+        let first = listener.accept().unwrap();
+        drop(first);
+        assert!(state.conn.lock().unwrap().state().is_synchronized());
+        let mut accepted = None;
+        for _ in 0..ACCEPT_QUEUE_CAP {
+            let s = listener.accept().unwrap();
+            if s.peer_addr().port() == 5000 && Arc::ptr_eq(&s.state, &state) {
+                accepted = Some(s);
+            }
+        }
+        let accepted = accepted.expect("the held-back connection was not queued");
+        // The held segment carried the data, which a retransmission would
+        // bring in any case.
+        let mut buf = [0; 8];
+        let n = accepted.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"hello");
+    }
+
     /// A handshake that completes just as its deadline passes is either
     /// handed to the listener or dropped, never both: the tick must not
     /// reset a connection the listener has just accepted.
@@ -620,13 +756,14 @@ mod tests {
             let accepted = Arc::new(AtomicBool::new(false));
             let a = accepted.clone();
             // Already due, as when the tick and the final ACK meet.
-            *state.pending_accept.lock().unwrap() = Some((
-                Instant::now(),
-                Box::new(move |_| {
+            *state.pending_accept.lock().unwrap() = Some(PendingAccept {
+                deadline: Instant::now(),
+                accept: Box::new(move |_| {
                     a.store(true, Ordering::SeqCst);
                     Offer::Taken
                 }),
-            ));
+                hold: Box::new(|_| false),
+            });
             let barrier = Arc::new(Barrier::new(2));
             let ticked = Arc::new(AtomicBool::new(false));
             let (s2, b2, t2) = (state.clone(), barrier.clone(), ticked.clone());

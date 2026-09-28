@@ -440,9 +440,11 @@ impl Stack {
     ///
     /// A listener holds at most 128 connections in the middle of their
     /// handshake, as a listen backlog does, and at most 10 completed ones
-    /// waiting for `accept`. A SYN that finds the handshakes at their cap, or
-    /// the accept queue full or one short of it, is dropped for the peer to
-    /// retransmit.
+    /// waiting for `accept`. A SYN that finds the handshakes at their cap is
+    /// dropped for the peer to retransmit. While the accept queue is full,
+    /// a handshake is not completed, as on Linux: its connection stays half
+    /// open, and what the peer sends unacknowledged, until `accept` makes
+    /// room.
     ///
     /// Fails with `AddrInUse` if a live listener already has the address,
     /// and with `NotConnected` once the stack has been
@@ -498,9 +500,11 @@ impl Stack {
     ///
     /// A listener holds at most 128 connections in the middle of their
     /// handshake, as a listen backlog does, and at most 10 completed ones
-    /// waiting for `accept`. A SYN that finds the handshakes at their cap, or
-    /// the accept queue full or one short of it, is dropped for the peer to
-    /// retransmit.
+    /// waiting for `accept`. A SYN that finds the handshakes at their cap is
+    /// dropped for the peer to retransmit. While the accept queue is full,
+    /// a handshake is not completed, as on Linux: its connection stays half
+    /// open, and what the peer sends unacknowledged, until `accept` makes
+    /// room.
     ///
     /// Fails with `AddrInUse` if a live listener already has the address,
     /// and with `NotConnected` once the stack has been
@@ -958,8 +962,9 @@ impl Stack {
         }
         // A full backlog drops the SYN, as Linux does: the peer retransmits,
         // and by then a slot may have freed up. The accept queue being full
-        // is no reason to: a connection that completes its handshake then
-        // waits, holding its half-open slot, for `accept` to make room.
+        // is no reason to here, unlike on Linux: the handshake waits in
+        // SYN-RECEIVED, holding its half-open slot, for `accept` to make
+        // room (see `ConnState::held_back`).
         // Dropping SYNs on a full queue as well would, with a queue this
         // short, let through only a queue's worth of each synchronized wave
         // of retransmitted SYNs from a burst of clients.
@@ -999,12 +1004,16 @@ impl Stack {
             sink,
         );
         let listener = Arc::downgrade(&listener);
-        state.set_pending_accept(Box::new(move |s| {
-            // The half-open slot goes with the closure, once the listener
-            // has taken or refused the connection.
-            let _held = &slot;
-            listener.upgrade().map_or(Offer::Refused, |l| l.enqueue(s))
-        }));
+        let hold = listener.clone();
+        state.set_pending_accept(
+            Box::new(move |s| {
+                // The half-open slot goes with the closure, once the
+                // listener has taken or refused the connection.
+                let _held = &slot;
+                listener.upgrade().map_or(Offer::Refused, |l| l.enqueue(s))
+            }),
+            Box::new(move |s| hold.upgrade().is_some_and(|l| l.hold(s))),
+        );
         inner
             .virt_tcp
             .lock()
@@ -1311,8 +1320,9 @@ impl Stack {
         }
         // A full backlog drops the SYN, as Linux does: the peer retransmits,
         // and by then a slot may have freed up. The accept queue being full
-        // is no reason to: a connection that completes its handshake then
-        // waits, holding its half-open slot, for `accept` to make room.
+        // is no reason to here, unlike on Linux: the handshake waits in
+        // SYN-RECEIVED, holding its half-open slot, for `accept` to make
+        // room (see `ConnState::held_back`).
         // Dropping SYNs on a full queue as well would, with a queue this
         // short, let through only a queue's worth of each synchronized wave
         // of retransmitted SYNs from a burst of clients.
@@ -1352,12 +1362,16 @@ impl Stack {
             sink,
         );
         let listener = Arc::downgrade(&listener);
-        state.set_pending_accept(Box::new(move |s| {
-            // The half-open slot goes with the closure, once the listener
-            // has taken or refused the connection.
-            let _held = &slot;
-            listener.upgrade().map_or(Offer::Refused, |l| l.enqueue(s))
-        }));
+        let hold = listener.clone();
+        state.set_pending_accept(
+            Box::new(move |s| {
+                // The half-open slot goes with the closure, once the
+                // listener has taken or refused the connection.
+                let _held = &slot;
+                listener.upgrade().map_or(Offer::Refused, |l| l.enqueue(s))
+            }),
+            Box::new(move |s| hold.upgrade().is_some_and(|l| l.hold(s))),
+        );
         inner
             .virt_tcp6
             .lock()
