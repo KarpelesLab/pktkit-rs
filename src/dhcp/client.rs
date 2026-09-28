@@ -234,7 +234,7 @@ impl Inner {
     /// Start over from INIT: a fresh transaction, DISCOVER due now.
     fn restart(&mut self, now: Instant) -> Out {
         self.state = State::Selecting;
-        self.xid = crate::rand::u32();
+        self.xid = crate::rand::unpredictable_u32();
         self.offered_ip = None;
         self.server_ip = None;
         self.lease = None;
@@ -454,7 +454,7 @@ impl Client {
             let left = Left::of(i.state);
             let out = match (release && left.lease, i.offered_ip, i.server_ip) {
                 (true, Some(ip), Some(server)) => Some(Out::Release {
-                    xid: crate::rand::u32(),
+                    xid: crate::rand::unpredictable_u32(),
                     ip,
                     server,
                 }),
@@ -864,7 +864,7 @@ fn step(i: &mut Inner, now: Instant, conflict: bool) -> (Option<Event>, Option<O
                     // new transaction; from RENEWING it carries on the same
                     // one, so a late answer to a renewal still counts.
                     if i.state == State::Bound {
-                        i.xid = crate::rand::u32();
+                        i.xid = crate::rand::unpredictable_u32();
                         i.requested_at = Some(now);
                     }
                     i.state = State::Rebinding;
@@ -879,7 +879,7 @@ fn step(i: &mut Inner, now: Instant, conflict: bool) -> (Option<Event>, Option<O
             if lease.t1 <= now {
                 if i.state == State::Bound {
                     i.state = State::Renewing;
-                    i.xid = crate::rand::u32();
+                    i.xid = crate::rand::unpredictable_u32();
                     i.requested_at = Some(now);
                     i.next_tx = Some(now);
                 }
@@ -1177,6 +1177,19 @@ mod tests {
         assert_eq!(state(&c), State::Bound);
         sent(&r);
         (r, c)
+    }
+
+    #[test]
+    fn transaction_ids_do_not_come_from_the_guessable_generator() {
+        // crate::rand is seeded from the clock and gives its state away to
+        // whoever sees its output; an xid from it lets an off-path host
+        // forge the server's answers (RFC 2131 §4.1 wants xids random).
+        crate::rand::seed(0x1234_5678);
+        let predicted = crate::rand::u32();
+        crate::rand::seed(0x1234_5678);
+        let (_r, c) = setup();
+        c.begin(false);
+        assert_ne!(xid(&c), predicted, "the xid was the generator's next value");
     }
 
     #[test]

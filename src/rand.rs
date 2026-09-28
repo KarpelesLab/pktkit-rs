@@ -60,6 +60,13 @@ fn next() -> u64 {
     })
 }
 
+/// Set this thread's state, so a test can know what comes next.
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn seed(x: u64) {
+    STATE.with(|s| s.set(x.max(1)));
+}
+
 /// Return a `u32` of non-crypto random bits: the high half of the output,
 /// the better-mixed one for this generator.
 /// Unused under some feature sets.
