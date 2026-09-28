@@ -18,6 +18,11 @@ const DEFAULT_LEASE: Duration = Duration::from_secs(3600);
 /// cheap to forge as a DISCOVER; a real client renews at half of it and
 /// then gets the full lease, a forger has to keep asking.
 const PROVISIONAL_LEASE: Duration = OFFER_HOLD;
+/// How long a provisional lease must have been held before a renewal makes
+/// it whole: the half of it at which a real client renews (RFC 2131 T1).
+/// Anything sooner is a client asking again, not renewing, and stays
+/// provisional.
+const PROVISIONAL_MIN_AGE: Duration = Duration::from_secs(PROVISIONAL_LEASE.as_secs() / 2);
 
 /// Configure a [`Server`].
 #[derive(Clone)]
@@ -124,6 +129,10 @@ struct Lease {
     ip: Ipv4Addr,
     expiry: Instant,
     bound: bool,
+    /// For a lease granted on the client's word alone (see
+    /// [`PROVISIONAL_LEASE`]), when it was first granted. `None` for a
+    /// full lease, or an offer.
+    provisional: Option<Instant>,
 }
 
 /// The lease table, indexed by address too, so that whether an address is
@@ -412,6 +421,7 @@ impl Server {
                 ip,
                 expiry: now + OFFER_HOLD,
                 bound: false,
+                provisional: None,
             },
         );
         Some(ip)
@@ -468,6 +478,7 @@ impl Server {
             ip,
             expiry: self.lease_end(now),
             bound: true,
+            provisional: None,
         };
         if !self.on_our_subnet(ip) {
             return Answer::Nak; // the client moved here from another network
@@ -481,7 +492,30 @@ impl Server {
         }
 
         let held = self.held_by_others(leases, (key, res), ip);
-        match leases.get(key) {
+        match leases.get(key).copied() {
+            // A provisional lease is made whole only by what a real client
+            // does and a forger cannot hurry: a renewal (ciaddr set, from
+            // the address itself) once half of it has passed. The same
+            // REQUEST again, or a renewal straight away, costs nothing to
+            // send, and would otherwise turn a minute's lease into a full
+            // one on the spot. Until then it stays provisional, counted
+            // from when it was first granted.
+            Some(l) if l.ip == ip && !held && l.provisional.is_some() => {
+                let since = l.provisional.unwrap_or(now);
+                if renewing && now.saturating_duration_since(since) >= PROVISIONAL_MIN_AGE {
+                    leases.insert(key.clone(), lease);
+                    return Answer::Ack(ip, self.lease_secs());
+                }
+                let provisional = self.cfg.lease_time.min(PROVISIONAL_LEASE);
+                leases.insert(
+                    key.clone(),
+                    Lease {
+                        expiry: now + provisional,
+                        ..l
+                    },
+                );
+                return Answer::Ack(ip, provisional.as_secs() as u32);
+            }
             Some(l) if l.ip == ip && !held => {
                 leases.insert(key.clone(), lease);
                 return Answer::Ack(ip, self.lease_secs());
@@ -536,6 +570,7 @@ impl Server {
             key.clone(),
             Lease {
                 expiry: now + provisional,
+                provisional: Some(now),
                 ..lease
             },
         );
@@ -1002,6 +1037,7 @@ mod tests {
                         ip: Ipv4Addr::new(10, 0, 0, 10),
                         expiry: gone,
                         bound: true,
+                        provisional: None,
                     },
                 );
             }
@@ -1142,6 +1178,27 @@ mod tests {
         assert_eq!(replies(&r)[0].msg_type, wire::MSG_OFFER, "pool drained");
     }
 
+    /// Age every provisional lease by `by`, as if granted that long ago.
+    fn age_provisional(s: &Server, by: Duration) {
+        let mut leases = s.leases.lock().unwrap();
+        let aged: Vec<_> = leases
+            .iter()
+            .filter_map(|(k, l)| {
+                let since = l.provisional?.checked_sub(by)?;
+                Some((
+                    k.clone(),
+                    Lease {
+                        provisional: Some(since),
+                        ..*l
+                    },
+                ))
+            })
+            .collect();
+        for (k, l) in aged {
+            leases.insert(k, l);
+        }
+    }
+
     #[test]
     fn a_provisional_lease_is_made_whole_on_renewal() {
         let (s, r) = recording(one_address_pool());
@@ -1155,12 +1212,55 @@ mod tests {
         assert_eq!(got[0].msg_type, wire::MSG_ACK);
         assert_eq!(got[0].lease_time, Some(PROVISIONAL_LEASE.as_secs() as u32));
 
+        // Renewing at T1, as a real client does.
+        age_provisional(&s, PROVISIONAL_MIN_AGE);
         let mut m = wire::Builder::new(1, 2, mac);
         m.message_type(wire::MSG_REQUEST).ciaddr(ip);
         s.handle_dhcp(&m.finish());
         let got = replies(&r);
         assert_eq!(got[0].msg_type, wire::MSG_ACK);
         assert_eq!(got[0].lease_time, Some(DEFAULT_LEASE.as_secs() as u32));
+    }
+
+    /// Asking again costs a forger nothing, so it must not buy the full
+    /// lease: neither the same INIT-REBOOT REQUEST repeated, nor a renewal
+    /// sent before half the provisional lease has passed.
+    #[test]
+    fn a_provisional_lease_is_not_made_whole_by_asking_again() {
+        let (s, r) = recording(one_address_pool());
+        let mac = MacAddr([2, 0, 0, 0, 0, 1]);
+        let ip = Ipv4Addr::new(10, 0, 0, 10);
+        let provisional = Some(PROVISIONAL_LEASE.as_secs() as u32);
+        for xid in 1..=3 {
+            let mut m = wire::Builder::new(1, xid, mac);
+            m.message_type(wire::MSG_REQUEST)
+                .ipv4_option(wire::OPT_REQUESTED_IP, ip);
+            s.handle_dhcp(&m.finish());
+            let got = replies(&r);
+            assert_eq!(got[0].msg_type, wire::MSG_ACK);
+            assert_eq!(got[0].lease_time, provisional, "REQUEST #{xid}");
+        }
+        // Old enough, but still not a renewal.
+        age_provisional(&s, PROVISIONAL_MIN_AGE);
+        let mut m = wire::Builder::new(1, 4, mac);
+        m.message_type(wire::MSG_REQUEST)
+            .ipv4_option(wire::OPT_REQUESTED_IP, ip);
+        s.handle_dhcp(&m.finish());
+        assert_eq!(replies(&r)[0].lease_time, provisional);
+
+        // A renewal straight away, on a fresh provisional lease.
+        let (s, r) = recording(one_address_pool());
+        let mut m = wire::Builder::new(1, 1, mac);
+        m.message_type(wire::MSG_REQUEST)
+            .ipv4_option(wire::OPT_REQUESTED_IP, ip);
+        s.handle_dhcp(&m.finish());
+        replies(&r);
+        let mut m = wire::Builder::new(1, 2, mac);
+        m.message_type(wire::MSG_REQUEST).ciaddr(ip);
+        s.handle_dhcp(&m.finish());
+        let got = replies(&r);
+        assert_eq!(got[0].msg_type, wire::MSG_ACK);
+        assert_eq!(got[0].lease_time, provisional, "renewed too soon");
     }
 
     #[test]
