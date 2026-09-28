@@ -191,9 +191,15 @@ impl PacketHelper for PptpHelper {
                 }
                 let server_call_id = u16::from_be_bytes([payload[12], payload[13]]);
                 let peer_call_id = u16::from_be_bytes([payload[14], payload[15]]);
-                {
-                    let mut calls = self.calls.lock().unwrap();
-                    if let Some(info) = calls.by_id.get_mut(&peer_call_id) {
+                // Only a live call of the host the reply reached: sweeps
+                // are lazy, so a lapsed call, or one whose ID another host
+                // has since reused, may still be listed.
+                let now = Instant::now();
+                let mut calls = self.calls.lock().unwrap();
+                if let Some(info) = calls.by_id.get_mut(&peer_call_id) {
+                    if now.saturating_duration_since(info.created) > PPTP_GRE_TIMEOUT {
+                        calls.by_id.remove(&peer_call_id);
+                    } else if info.inside_ip == inside_ip {
                         info.peer_call_id = server_call_id;
                     }
                 }
@@ -375,6 +381,48 @@ mod tests {
             .get(&0x3333)
             .expect("call should still be tracked");
         assert_eq!(info.peer_call_id, 0x9999);
+    }
+
+    #[test]
+    fn a_reply_matches_only_a_live_call_of_its_host() {
+        let nat = Nat::new(pfx("10.0.0.1/24"), pfx("203.0.113.1/24"));
+        let h = PptpHelper::new();
+        let inside = Ipv4Addr::new(10, 0, 0, 5);
+        let server = Ipv4Addr::new(198, 51, 100, 9);
+        for (id, host) in [(0x3333, inside), (0x4444, Ipv4Addr::new(10, 0, 0, 6))] {
+            let req = build_pptp(
+                host,
+                60000,
+                server,
+                PPTP_PORT,
+                &pptp_payload(PPTP_OUTGOING_CALL_REQ, id, 0),
+            );
+            h.process_outbound(&nat, req, &mapping(host));
+        }
+        // The first call lapsed, unswept.
+        let old = Instant::now() - PPTP_GRE_TIMEOUT - Duration::from_secs(1);
+        h.calls
+            .lock()
+            .unwrap()
+            .by_id
+            .get_mut(&0x3333)
+            .unwrap()
+            .created = old;
+        let reply = |peer: u16| {
+            let pkt = build_pptp(
+                server,
+                PPTP_PORT,
+                Ipv4Addr::new(203, 0, 113, 1),
+                20000,
+                &pptp_payload(PPTP_OUTGOING_CALL_REPLY, 0x9999, peer),
+            );
+            h.process_inbound(&nat, pkt, &mapping(inside));
+        };
+        reply(0x3333);
+        reply(0x4444);
+        let calls = h.calls.lock().unwrap();
+        assert!(!calls.by_id.contains_key(&0x3333), "stale call kept");
+        assert_eq!(calls.by_id[&0x4444].peer_call_id, 0, "another host's call");
     }
 
     #[test]
