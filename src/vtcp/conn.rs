@@ -16,6 +16,7 @@ use crate::time::Instant;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use super::autotune::{self, Budget, RcvSpace};
 use super::congestion::{CongestionController, HighSpeed, NewReno};
 use super::options::{
     self, TcpOption, get_sack_blocks, get_timestamp, get_wscale, has_sack_perm, mss_option,
@@ -36,10 +37,16 @@ use super::seqspace::{
 pub const DEFAULT_MSS: u16 = 1460;
 /// Default advertised window when no SACK / Window Scale negotiated.
 pub const DEFAULT_WINDOW_SIZE: u16 = 65535;
-/// Default 1 MiB send buffer.
+/// Default initial send buffer, 1 MiB: enough for a link of short round
+/// trip without auto-tuning having to grow it.
 pub const DEFAULT_SEND_BUF: usize = 1 << 20;
-/// Default 1 MiB receive buffer.
+/// Default initial receive buffer, 1 MiB.
 pub const DEFAULT_RECV_BUF: usize = 1 << 20;
+/// Default most auto-tuning grows the send buffer to, 16 MiB: a window of
+/// over 500 Mbit/s at a 250 ms round trip.
+pub const DEFAULT_SEND_BUF_MAX: usize = 16 << 20;
+/// Default most auto-tuning grows the receive buffer to, 16 MiB.
+pub const DEFAULT_RECV_BUF_MAX: usize = 16 << 20;
 
 /// Maximum retransmission attempts before declaring the connection dead.
 pub const MAX_RETRIES: u32 = 8;
@@ -191,12 +198,36 @@ pub struct ConnConfig {
     /// Unanswered keepalive probes before the connection is reset. 3 by
     /// default.
     pub keepalive_count: u32,
-    /// Send buffer size in bytes: written data queued or not yet
-    /// acknowledged. 1 MiB by default.
+    /// Initial send buffer size in bytes: written data queued or not yet
+    /// acknowledged. [Auto-tuning](Self::autotune) grows it up to
+    /// `send_buf_max`. 1 MiB by default.
     pub send_buf_size: usize,
-    /// Receive buffer size in bytes, which bounds the advertised window.
-    /// 1 MiB by default.
+    /// Initial receive buffer size in bytes, which bounds the advertised
+    /// window. [Auto-tuning](Self::autotune) grows it up to
+    /// `recv_buf_max`. 1 MiB by default.
     pub recv_buf_size: usize,
+    /// The most auto-tuning grows the send buffer to. At or below
+    /// `send_buf_size`, the send buffer keeps that size. 16 MiB by default.
+    pub send_buf_max: usize,
+    /// The most auto-tuning grows the receive buffer to, which also sets
+    /// the window scale offered in the handshake (RFC 7323): the window
+    /// can only grow as far as that lets it be advertised. At or below
+    /// `recv_buf_size`, the receive buffer keeps that size. 16 MiB by
+    /// default.
+    pub recv_buf_max: usize,
+    /// Grow the buffers as the path needs, as Linux does. The receive
+    /// buffer follows what the application reads per round trip (dynamic
+    /// right-sizing), to twice that and more, so the window never holds a
+    /// sender back that the application keeps up with; the send buffer
+    /// follows the congestion window, to twice it, so the application can
+    /// keep a growing window full. Without it, a connection moves at most
+    /// one buffer per round trip: 1 MiB at 250 ms is 33 Mbit/s.
+    ///
+    /// Buffers only grow while data flows, and go back to their initial
+    /// sizes when the connection closes. What all connections grow by
+    /// together is bounded process-wide (256 MiB); past that they stay as
+    /// they are. On by default.
+    pub autotune: bool,
     /// How long FIN-WAIT-2 may go without hearing from the peer before the
     /// connection is reset, once it has been [released](Conn::release).
     /// RFC 9293 §3.10.7.4 allows a timeout here; a peer that never sends
@@ -236,6 +267,9 @@ setters! {
         set keepalive_count: u32;
         set send_buf_size: usize;
         set recv_buf_size: usize;
+        set send_buf_max: usize;
+        set recv_buf_max: usize;
+        set autotune: bool;
         set fin_wait2_timeout: Option<Duration>;
         set time_wait: Duration;
         set nodelay: bool;
@@ -260,10 +294,54 @@ impl Default for ConnConfig {
             keepalive_count: DEFAULT_KEEPALIVE_COUNT,
             send_buf_size: DEFAULT_SEND_BUF,
             recv_buf_size: DEFAULT_RECV_BUF,
+            send_buf_max: DEFAULT_SEND_BUF_MAX,
+            recv_buf_max: DEFAULT_RECV_BUF_MAX,
+            autotune: true,
             fin_wait2_timeout: Some(DEFAULT_FIN_WAIT2_TIMEOUT),
             time_wait: TIME_WAIT_DURATION,
             nodelay: false,
         }
+    }
+}
+
+impl ConnConfig {
+    /// The most the send buffer grows to.
+    fn send_max(&self) -> usize {
+        if self.autotune {
+            self.send_buf_max.max(self.send_buf_size)
+        } else {
+            self.send_buf_size
+        }
+    }
+
+    /// The most the receive buffer grows to.
+    fn recv_max(&self) -> usize {
+        if self.autotune {
+            self.recv_buf_max.max(self.recv_buf_size)
+        } else {
+            self.recv_buf_size
+        }
+    }
+
+    /// The window scale to offer: enough to advertise the largest receive
+    /// buffer (RFC 7323 §2.3), so it can grow after the handshake has fixed
+    /// the shift. But no coarser than half the initial buffer: the window
+    /// is advertised in whole units, rounded up, so the buffer takes up to
+    /// a unit more than its size, and a small one would take several times
+    /// its size.
+    fn rcv_wscale(&self) -> u8 {
+        if self.no_window_scaling {
+            return 0;
+        }
+        let max = self.recv_max();
+        let mut shift = 0u8;
+        while shift < 14 && max >> shift > 65535 {
+            shift += 1;
+        }
+        while shift > 0 && 1usize << shift > self.recv_buf_size / 2 {
+            shift -= 1;
+        }
+        shift
     }
 }
 
@@ -326,6 +404,17 @@ pub struct Conn {
     /// When a pending Early Retransmit goes out, unless a new ACK comes
     /// first (RFC 5827 §6's delay against reordering).
     er_deadline: std::option::Option<Instant>,
+
+    // Buffer auto-tuning.
+    /// Where buffer growth is drawn from, process-wide.
+    budget: &'static Budget,
+    /// What this connection's buffers have grown by, drawn from `budget`.
+    grown: usize,
+    /// The application's last write did not fit the send buffer (Linux's
+    /// `SOCK_NOSPACE`): only then can a larger one help.
+    snd_nospace: bool,
+    /// Dynamic right-sizing of the receive buffer.
+    rcv_space: RcvSpace,
 
     // Window scaling (RFC 7323).
     snd_wnd_shift: u8,
@@ -418,18 +507,7 @@ impl Conn {
     /// A connection in CLOSED, configured by `cfg`. Open it with
     /// [`connect`](Self::connect) or [`accept_syn`](Self::accept_syn).
     pub fn new(cfg: ConnConfig) -> Self {
-        // Pick a window scale that lets the recv buffer fit into a 16-bit
-        // advertised window after scaling.
-        let mut rcv_shift = 0u8;
-        if !cfg.no_window_scaling {
-            for s in 0u8..=14 {
-                rcv_shift = s;
-                if cfg.recv_buf_size >> s <= 65535 {
-                    break;
-                }
-            }
-        }
-
+        let rcv_shift = cfg.rcv_wscale();
         let mss = cfg.mss.max(1);
         let cc = make_cc(cfg.congestion, mss as u32);
         let ts_offset = super::secret::keyed_hash((
@@ -463,6 +541,11 @@ impl Conn {
             high_rxt: 0,
             limited_transmit: 0,
             er_deadline: None,
+            budget: &autotune::GLOBAL,
+            grown: 0,
+            snd_nospace: false,
+            // What the peer's initial window brings in the first round trip.
+            rcv_space: RcvSpace::new(10 * mss as usize),
             snd_wnd_shift: 0,
             rcv_wnd_shift: rcv_shift,
             wscale_ok: false,
@@ -960,7 +1043,11 @@ impl Conn {
     // --- Outgoing helpers -------------------------------------------------
 
     fn sws_thresh(&self) -> u32 {
-        let half = self.cfg.recv_buf_size / 2;
+        let size = self
+            .recv_buf
+            .as_ref()
+            .map_or(self.cfg.recv_buf_size, |rb| rb.limit());
+        let half = size / 2;
         (self.mss as usize).min(half.max(1)) as u32
     }
 
@@ -990,7 +1077,14 @@ impl Conn {
     fn rcv_window(&self) -> u16 {
         let mut w = self.rcv_wnd_bytes() as usize;
         if self.wscale_ok {
-            w >>= self.rcv_wnd_shift;
+            // Rounded up, not down: down, a window smaller than a unit
+            // would read as closed, and a peer with just a FIN or a few
+            // bytes left to send would wait on a window that is open. Up
+            // overshoots the buffer by less than a unit, which the buffer
+            // takes (RecvBuf::set_adv_edge). The edge is rounded from the
+            // buffer's end each time, not from the last edge, so it never
+            // passes that end by more, however often it is sent.
+            w = w.div_ceil(1 << self.rcv_wnd_shift);
         }
         w.min(65535) as u16
     }
@@ -1011,6 +1105,9 @@ impl Conn {
             let edge = seg.ack.wrapping_add((seg.window as u32) << shift);
             if self.rcv_adv.is_none_or(|adv| seq_after(edge, adv)) {
                 self.rcv_adv = Some(edge);
+            }
+            if let Some(rb) = self.recv_buf.as_mut() {
+                rb.set_adv_edge(edge);
             }
         }
         self.outgoing.push(seg.marshal());
@@ -1677,6 +1774,9 @@ impl Conn {
             .as_mut()
             .unwrap()
             .insert(seg.seq, &seg.payload);
+        if n > 0 && self.cfg.autotune {
+            self.rcv_rtt_measure(seg);
+        }
 
         let mut fin_ready = false;
         if self.fin_pending && self.pending_fin_seq == self.recv_buf.as_ref().unwrap().nxt() {
@@ -1690,6 +1790,115 @@ impl Conn {
         if fin_ready {
             self.process_fin_transition();
         }
+    }
+
+    /// Time the round trip from the receiving end, for dynamic right-sizing:
+    /// a connection that only receives has nothing of its own to time. With
+    /// timestamps, a full-sized segment echoes the TSval of the ACK that
+    /// let it be sent; without, the time to fill a window will do.
+    fn rcv_rtt_measure(&mut self, seg: &Segment) {
+        if self.ts_ok {
+            // A short segment may have been held back by the application,
+            // not the window, and its echo be older than the round trip.
+            if seg.payload.len() >= options::MIN_MSS as usize
+                && let Some((_, ecr)) = get_timestamp(&seg.options)
+                && ecr != 0
+            {
+                let ms = self.ts_now().wrapping_sub(ecr);
+                // A wild echo reads as a huge (or negative) delay.
+                if ms < 1 << 20 {
+                    self.rcv_space
+                        .measure_ts(Duration::from_millis(u64::from(ms)));
+                }
+            }
+            return;
+        }
+        let nxt = self.recv_buf.as_ref().unwrap().nxt();
+        let edge = self
+            .rcv_adv
+            .filter(|&adv| seq_after(adv, nxt))
+            .unwrap_or(nxt);
+        self.rcv_space.measure_window(nxt, edge, Instant::now());
+    }
+
+    /// Dynamic right-sizing, after a read: grow the receive buffer to what
+    /// the application now reads per round trip calls for.
+    fn rcv_space_adjust(&mut self) {
+        let srtt = Some(self.rto.srtt()).filter(|d| !d.is_zero());
+        let mss = self.cfg.mss.max(1) as usize;
+        if let Some(want) = self.rcv_space.adjust(Instant::now(), srtt, mss) {
+            self.grow_recv(want);
+        }
+    }
+
+    /// Grow the receive buffer towards `want` bytes, as far as the
+    /// configured maximum, the advertisable window and the budget allow.
+    fn grow_recv(&mut self, want: usize) {
+        // Past what the negotiated window scale can advertise, a larger
+        // buffer would never be filled.
+        let advertisable = if self.wscale_ok {
+            65535usize << self.rcv_wnd_shift
+        } else {
+            65535
+        };
+        let want = want.min(self.cfg.recv_max()).min(advertisable);
+        let budget = self.budget;
+        let Some(rb) = self.recv_buf.as_mut() else {
+            return;
+        };
+        let cur = rb.limit();
+        // Zero is no limit at all.
+        if cur == 0 || want <= cur {
+            return;
+        }
+        let got = budget.reserve(want - cur);
+        rb.set_limit(cur + got);
+        self.grown += got;
+    }
+
+    /// Send-buffer auto-tuning after an ACK (Linux's `tcp_sndbuf_expand`):
+    /// grow it to twice the congestion window, but only while it is what
+    /// holds the sender back: the application found it full, and everything
+    /// in it has been sent with room to spare in both windows. Against a
+    /// peer that does not read, or a full cwnd, a larger buffer would only
+    /// hold more data waiting. Less than a segment left unsent is the tail
+    /// that sender SWS avoidance holds back, not a window's doing.
+    fn sndbuf_expand(&mut self) {
+        if !self.cfg.autotune || !self.snd_nospace {
+            return;
+        }
+        let cwnd = self.cc.send_window();
+        let sb = self.send_buf.as_ref().unwrap();
+        if sb.pending() >= self.mss as usize
+            || sb.unacked() as u32 >= self.snd_wnd
+            || self.in_flight() >= cwnd
+        {
+            return;
+        }
+        let want = autotune::sndbuf_target(cwnd, self.mss as u32).min(self.cfg.send_max());
+        let budget = self.budget;
+        let Some(sb) = self.send_buf.as_mut() else {
+            return;
+        };
+        let cur = sb.capacity();
+        if want <= cur {
+            return;
+        }
+        let got = budget.reserve(want - cur);
+        sb.set_capacity(cur + got);
+        self.grown += got;
+    }
+
+    /// Put the buffers back to their initial sizes and return what they
+    /// grew by to the budget.
+    fn release_growth(&mut self) {
+        if let Some(sb) = self.send_buf.as_mut() {
+            sb.set_capacity(self.cfg.send_buf_size);
+        }
+        if let Some(rb) = self.recv_buf.as_mut() {
+            rb.set_limit(self.cfg.recv_buf_size);
+        }
+        self.budget.release(std::mem::take(&mut self.grown));
     }
 
     /// Apply the segment's window, per RFC 9293 §3.10.7.4: only from a
@@ -1852,6 +2061,9 @@ impl Conn {
         }
 
         self.flush_send_queue();
+        // After the flush, as Linux's tcp_check_space: only once what the
+        // buffer held has gone out does it show whether it ran dry.
+        self.sndbuf_expand();
         true
     }
 
@@ -2576,6 +2788,17 @@ impl Conn {
             return 0;
         };
         let n = rb.read(buf);
+        if n > 0
+            && self.cfg.autotune
+            && matches!(
+                self.state,
+                State::Established | State::FinWait1 | State::FinWait2
+            )
+        {
+            self.rcv_space.on_read(n);
+            self.rcv_space_adjust();
+        }
+        let rb = self.recv_buf.as_ref().unwrap();
         let nxt = rb.nxt();
         let remaining = self
             .rcv_adv
@@ -2608,6 +2831,7 @@ impl Conn {
             return (0, Vec::new());
         }
         let n = self.send_buf.as_mut().unwrap().write(buf);
+        self.snd_nospace = n < buf.len();
         if n > 0 {
             self.flush_send_queue();
         }
@@ -2753,6 +2977,7 @@ impl Conn {
     /// application has yet to read stays until it is read, unless it was
     /// [released](Self::release) and nobody will.
     fn release_buffers(&mut self) {
+        self.release_growth();
         if let Some(sb) = self.send_buf.as_mut() {
             sb.release_memory();
         }
@@ -2767,6 +2992,12 @@ impl Conn {
     }
     fn signal_fin_recvd(&mut self) {
         self.fin_recvd_signaled = true;
+    }
+}
+
+impl Drop for Conn {
+    fn drop(&mut self) {
+        self.budget.release(self.grown);
     }
 }
 
@@ -2791,6 +3022,8 @@ mod tests {
             mss: 1460,
             send_buf_size: 4096,
             recv_buf_size: 4096,
+            // These tests count the window in bytes, unscaled.
+            autotune: false,
             ..Default::default()
         }
     }
@@ -5599,21 +5832,29 @@ mod tests {
         wscale: [bool; 2],
         loss_pct: u64,
         blackout: bool,
+        autotune: [bool; 2],
     }
 
     impl StressCfg {
         fn new(seed: u64) -> Self {
             let mut r = Rng(splitmix(seed ^ 0xABCDEF) | 1);
-            let mut pair = || [r.below(2) == 0, r.below(2) == 0];
-            let (ts, sack, wscale) = (pair(), pair(), pair());
+            let pair = |r: &mut Rng| [r.below(2) == 0, r.below(2) == 0];
+            let (ts, sack, wscale) = (pair(&mut r), pair(&mut r), pair(&mut r));
+            // In this order, so each seed keeps what it drew before
+            // `autotune` was added.
+            let buf = [4096, 65536, 1 << 18, 1 << 20][r.below(4) as usize];
+            let mss = [536, 1000, 1460][r.below(3) as usize];
+            let loss_pct = [0, 2, 10, 30][r.below(4) as usize];
+            let blackout = r.below(2) == 0;
             Self {
-                buf: [4096, 65536, 1 << 18, 1 << 20][r.below(4) as usize],
-                mss: [536, 1000, 1460][r.below(3) as usize],
+                buf,
+                mss,
                 ts,
                 sack,
                 wscale,
-                loss_pct: [0, 2, 10, 30][r.below(4) as usize],
-                blackout: r.below(2) == 0,
+                loss_pct,
+                blackout,
+                autotune: pair(&mut r),
             }
         }
     }
@@ -5654,6 +5895,20 @@ mod tests {
         if let Some(r) = c.timeout_recover {
             assert!(seq_before_eq(r, nxt), "{}: recover past SND.NXT", ctx());
         }
+        if let Some(rb) = c.recv_buf.as_ref() {
+            let grown = (sb.capacity() - c.cfg.send_buf_size) + (rb.limit() - c.cfg.recv_buf_size);
+            assert_eq!(grown, c.grown, "{}: growth not accounted", ctx());
+            assert!(
+                sb.capacity() <= c.cfg.send_max(),
+                "{}: send buffer past max",
+                ctx()
+            );
+            assert!(
+                rb.limit() <= c.cfg.recv_max(),
+                "{}: recv buffer past max",
+                ctx()
+            );
+        }
     }
 
     /// A harsher [`lossy_run`]: buffers up to a megabyte (so window
@@ -5672,6 +5927,9 @@ mod tests {
                 .no_window_scaling(!sc.wscale[i])
                 .send_buf_size(sc.buf)
                 .recv_buf_size(sc.buf)
+                .autotune(sc.autotune[i])
+                .send_buf_max(sc.buf * 4)
+                .recv_buf_max(sc.buf * 4)
         };
         let mut a = Conn::new(mk(40300, 80, 0));
         let b = Conn::new(mk(80, 40300, 1));
@@ -5855,5 +6113,183 @@ mod tests {
         for seed in seeds {
             stress_run(seed);
         }
+    }
+
+    // --- Buffer auto-tuning ------------------------------------------------
+
+    /// A budget of its own, so that a test neither starves nor is starved
+    /// by the others running at the same time.
+    fn own_budget(cap: usize) -> &'static Budget {
+        Box::leak(Box::new(Budget::new(cap)))
+    }
+
+    fn tuned(local: u16, remote: u16) -> ConnConfig {
+        big(local, remote)
+            .autotune(true)
+            .send_buf_max(1 << 20)
+            .recv_buf_max(1 << 20)
+    }
+
+    fn tuned_pair(port: u16, conf: impl Fn(u16, u16) -> ConnConfig, budget: usize) -> (Conn, Conn) {
+        let mut client = Conn::new(conf(port, 80));
+        let mut server = Conn::new(conf(80, port));
+        let budget = own_budget(budget);
+        client.budget = budget;
+        server.budget = budget;
+        drive_handshake(&mut client, &mut server);
+        (client, server)
+    }
+
+    /// Stream from `tx` to `rx` for `rounds` round trips, `tx` writing
+    /// `chunk` bytes each time and `rx` reading everything as if a round
+    /// trip had passed. Returns `rx`'s last ACKs.
+    fn tuned_rounds(tx: &mut Conn, rx: &mut Conn, chunk: usize, rounds: usize) -> Vec<Vec<u8>> {
+        let chunk = vec![7u8; chunk];
+        let (_, mut out) = tx.write(&chunk);
+        let mut acks = Vec::new();
+        for _ in 0..rounds {
+            acks = deliver(rx, &out);
+            rx.rcv_space.backdate(Duration::from_secs(1));
+            read_all(rx);
+            acks.extend(rx.take_outgoing());
+            out = deliver(tx, &acks);
+            out.extend(tx.write(&chunk).1);
+        }
+        acks
+    }
+
+    /// The receive buffer grows to what the application reads per round
+    /// trip calls for, and the window advertised follows it past the
+    /// initial size, but not past the maximum.
+    #[test]
+    fn receive_buffer_grows_with_what_is_read() {
+        let (mut client, mut server) = tuned_pair(40500, tuned, usize::MAX);
+        let acks = tuned_rounds(&mut client, &mut server, 1 << 18, 12);
+        let limit = server.recv_buf.as_ref().unwrap().limit();
+        assert!(limit > 1 << 16, "not grown: {limit}");
+        assert_eq!(limit, 1 << 20, "not grown to the maximum");
+        let wnd = (parse(acks.last().unwrap()).window as usize) << server.rcv_wnd_shift;
+        assert!(
+            wnd > 1 << 16,
+            "window not advertised past the initial size: {wnd}"
+        );
+        assert_eq!(
+            server.grown,
+            limit - (1 << 16) + (server.send_buf.as_ref().unwrap().capacity() - (1 << 16))
+        );
+
+        // Without auto-tuning, it stays put.
+        let fixed = |l, r| tuned(l, r).autotune(false);
+        let (mut client, mut server) = tuned_pair(40501, fixed, usize::MAX);
+        tuned_rounds(&mut client, &mut server, 1 << 18, 12);
+        assert_eq!(server.recv_buf.as_ref().unwrap().limit(), 1 << 16);
+        assert_eq!(client.send_buf.as_ref().unwrap().capacity(), 1 << 16);
+        assert_eq!((client.grown, server.grown), (0, 0));
+    }
+
+    /// An application that reads no faster than before gets no more.
+    #[test]
+    fn receive_buffer_stays_for_a_slow_reader() {
+        let (mut client, mut server) = tuned_pair(40502, tuned, usize::MAX);
+        tuned_rounds(&mut client, &mut server, 5000, 12);
+        assert_eq!(server.recv_buf.as_ref().unwrap().limit(), 1 << 16);
+    }
+
+    /// The window scale is chosen for the largest buffer auto-tuning may
+    /// reach, since it cannot change after the handshake, but no coarser
+    /// than half the initial buffer.
+    #[test]
+    fn window_scale_is_chosen_from_the_maximum() {
+        let wscale = |c: ConnConfig| {
+            let syn = parse(&Conn::new(c).connect()[0]);
+            get_wscale(&syn.options).unwrap()
+        };
+        let c = ConnConfig::default().local_port(40503).remote_port(80);
+        // 16 MiB >> 8 is 65536, one past the largest window.
+        assert_eq!(wscale(c.clone()), 9);
+        assert_eq!(wscale(c.clone().recv_buf_max(1 << 20)), 5);
+        assert_eq!(wscale(c.clone().autotune(false)), 5);
+        // A maximum below the initial size is no maximum.
+        assert_eq!(wscale(c.clone().recv_buf_max(1000)), 5);
+        assert_eq!(wscale(c.clone().recv_buf_size(600)), 8);
+        assert_eq!(wscale(c.clone().recv_buf_size(0)), 0);
+        assert_eq!(wscale(c.recv_buf_max(1 << 30)), 14);
+    }
+
+    /// With a scale larger than the buffer calls for, a window smaller than
+    /// a unit is rounded up, not advertised as closed, and what the peer
+    /// sends into the rounded-up part is taken.
+    #[test]
+    fn scaled_window_smaller_than_a_unit_stays_open() {
+        let conf = |l, r| cfg(l, r).autotune(true).recv_buf_max(16 << 20);
+        let (mut client, mut server) = tuned_pair(40504, conf, usize::MAX);
+        assert_eq!(server.rcv_wnd_shift, 9);
+        let (_, mut pkts) = client.write(&[1; 3996]);
+        let mut last_ack = None;
+        while !pkts.is_empty() {
+            let acks = deliver(&mut server, &pkts);
+            last_ack = acks.last().cloned().or(last_ack);
+            pkts = deliver(&mut client, &acks);
+        }
+        assert_eq!(
+            parse(&last_ack.unwrap()).window,
+            1,
+            "100 bytes left, advertised as one unit"
+        );
+        let (_, pkts) = client.write(&[2; 500]);
+        assert!(!pkts.is_empty());
+        deliver(&mut server, &pkts);
+        assert_eq!(server.recv_buf.as_ref().unwrap().readable(), 4496);
+    }
+
+    /// The send buffer grows with cwnd while the application keeps it full,
+    /// and not for one that writes little.
+    #[test]
+    fn send_buffer_grows_with_the_congestion_window() {
+        let (mut client, mut server) = tuned_pair(40505, tuned, usize::MAX);
+        tuned_rounds(&mut client, &mut server, 1 << 18, 12);
+        let cap = client.send_buf.as_ref().unwrap().capacity();
+        assert!(cap > 1 << 16, "not grown: {cap}");
+        assert!(cap <= 1 << 20);
+        let cwnd = client.cc.send_window() as usize;
+        assert!(cap <= 2 * cwnd, "grown past twice cwnd: {cap} for {cwnd}");
+
+        let (mut client, mut server) = tuned_pair(40506, tuned, usize::MAX);
+        tuned_rounds(&mut client, &mut server, 1000, 30);
+        assert_eq!(client.send_buf.as_ref().unwrap().capacity(), 1 << 16);
+    }
+
+    /// Growth stops where the budget runs out, without failing anything,
+    /// and is given back when the connection frees its buffers or goes
+    /// away.
+    #[test]
+    fn budget_bounds_growth_and_is_given_back() {
+        let (mut client, mut server) = tuned_pair(40507, tuned, 100_000);
+        let budget = client.budget;
+        let acks = tuned_rounds(&mut client, &mut server, 1 << 18, 12);
+        assert_eq!(budget.used(), 100_000);
+        assert_eq!(client.grown + server.grown, 100_000);
+        let total = |c: &Conn| {
+            c.send_buf.as_ref().unwrap().capacity() + c.recv_buf.as_ref().unwrap().limit()
+        };
+        assert_eq!(total(&client) + total(&server), 4 * (1 << 16) + 100_000);
+        // Still moving data.
+        assert!(!acks.is_empty());
+        assert!(read_all(&mut server).is_empty());
+
+        // Closed: back to the initial sizes, and the budget freed.
+        assert!(server.grown > 0);
+        server.abort();
+        assert_eq!(total(&server), 2 * (1 << 16));
+        assert_eq!(server.grown, 0);
+        assert_eq!(budget.used(), client.grown);
+
+        // Dropped without closing.
+        let (mut client, mut server) = tuned_pair(40508, tuned, 100_000);
+        let budget = client.budget;
+        tuned_rounds(&mut client, &mut server, 1 << 18, 12);
+        assert!(server.grown > 0);
+        drop(server);
+        assert_eq!(budget.used(), client.grown);
     }
 }

@@ -885,7 +885,10 @@ mod tests {
     #[test]
     fn a_read_after_a_zero_window_updates_it_at_once() {
         let mut peer = peer();
-        let (state, out) = accepted_with(&mut peer, ConnConfig::default().recv_buf_size(4096));
+        // Fixed, so the window is not scaled for a larger buffer and takes
+        // exactly 4096 bytes.
+        let cfg = ConnConfig::default().recv_buf_size(4096).autotune(false);
+        let (state, out) = accepted_with(&mut peer, cfg);
         let stream = TcpStream::new(state.clone());
         let (_, segs) = peer.write(&[7u8; 16384]);
         for seg in segs {

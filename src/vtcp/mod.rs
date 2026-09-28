@@ -46,6 +46,7 @@
 //! hand back outgoing bytes (`take_outgoing`) rather than calling a sink, so the
 //! caller drains them explicitly and the borrow checker keeps re-entrancy out.
 
+pub(crate) mod autotune;
 pub(crate) mod congestion;
 pub(crate) mod conn;
 pub(crate) mod options;

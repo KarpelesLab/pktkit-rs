@@ -55,6 +55,11 @@ pub struct RecvBuf {
     /// out-of-order ranges, newest first. RFC 2018 orders SACK blocks by it.
     recent: Vec<u32>,
     window_size: usize,
+    /// The right edge of the window as last advertised, which may lie past
+    /// `window_size`: a scaled window is rounded up to a whole unit rather
+    /// than pull the edge back (RFC 7323 §2.4), and what the peer was told
+    /// it may send must still be taken.
+    adv_edge: Option<u32>,
 }
 
 impl RecvBuf {
@@ -66,6 +71,27 @@ impl RecvBuf {
             ooo: Vec::new(),
             recent: Vec::new(),
             window_size,
+            adv_edge: None,
+        }
+    }
+
+    /// The buffer size: in-order data not yet read, and the window, fit in
+    /// it. Zero if unbounded.
+    #[inline]
+    pub fn limit(&self) -> usize {
+        self.window_size
+    }
+
+    /// Resize the buffer. Shrinking it does not pull back an edge already
+    /// advertised, which stays open (see [`set_adv_edge`](Self::set_adv_edge)).
+    pub fn set_limit(&mut self, limit: usize) {
+        self.window_size = limit;
+    }
+
+    /// Record the right edge of the window just advertised.
+    pub fn set_adv_edge(&mut self, edge: u32) {
+        if self.adv_edge.is_none_or(|e| seq_after(edge, e)) {
+            self.adv_edge = Some(edge);
         }
     }
 
@@ -109,7 +135,12 @@ impl RecvBuf {
         // is still held to the 65535 bytes advertised: nothing else bounds
         // the reassembly queue.
         if self.window_size > 0 || seq != self.nxt {
-            let right_edge = self.nxt.wrapping_add(self.window());
+            let mut right_edge = self.nxt.wrapping_add(self.window());
+            if let Some(adv) = self.adv_edge
+                && seq_after(adv, right_edge)
+            {
+                right_edge = adv;
+            }
             if seq_after(end_seq, right_edge) {
                 let trim = end_seq.wrapping_sub(right_edge) as usize;
                 if trim >= (end - start) {

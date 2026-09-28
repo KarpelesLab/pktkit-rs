@@ -405,6 +405,18 @@ impl SendBuf {
     pub fn available(&self) -> usize {
         self.cap.saturating_sub(self.data().len())
     }
+
+    /// The most data the buffer holds, in bytes.
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.cap
+    }
+
+    /// Resize the buffer. Data already in it past a smaller capacity stays,
+    /// and only keeps more from being written.
+    pub fn set_capacity(&mut self, cap: usize) {
+        self.cap = cap;
+    }
 }
 
 #[cfg(test)]
