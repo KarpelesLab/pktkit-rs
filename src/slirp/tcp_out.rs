@@ -144,6 +144,13 @@ impl TcpOutConn {
             remote_port,
             mss,
             keepalive: true,
+            // Whether to hold small writes back is the host application's
+            // call, made on its own socket (TCP_NODELAY or not) and already
+            // applied by the host kernel: the pump passes on each read as
+            // it arrives. Nagle here would add a round trip to the guest on
+            // top, for every small write sent with data in flight, which an
+            // application that set TCP_NODELAY asked not to wait.
+            nodelay: true,
             send_buf_size: BRIDGE_BUF,
             recv_buf_size: BRIDGE_BUF,
             ..Default::default()

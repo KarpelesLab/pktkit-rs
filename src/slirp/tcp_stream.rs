@@ -341,6 +341,22 @@ impl TcpStream {
         self.state.endpoints.peer_addr()
     }
 
+    /// Turn the Nagle algorithm off (`true`) or back on, as
+    /// [`std::net::TcpStream::set_nodelay`]. With it off, a write shorter
+    /// than a segment goes out at once even while earlier data is still
+    /// unacknowledged; turning it off also sends whatever it was holding.
+    pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
+        let mut conn = self.state.conn.lock().expect("poisoned");
+        let segs = conn.set_nodelay(nodelay);
+        self.state.emit(conn, segs);
+        Ok(())
+    }
+
+    /// Whether the Nagle algorithm is off (see [`set_nodelay`](Self::set_nodelay)).
+    pub fn nodelay(&self) -> io::Result<bool> {
+        Ok(self.state.conn.lock().expect("poisoned").nodelay())
+    }
+
     /// Set a read timeout. `None` blocks indefinitely.
     pub fn set_read_timeout(&self, t: Option<Duration>) {
         *self.read_timeout.lock().expect("poisoned") = t;

@@ -4457,4 +4457,33 @@ mod tests {
         assert_eq!(sent[0].len(), 1280);
         assert!(sent.iter().all(|p| p.len() <= 1280));
     }
+
+    /// An accepted stream holds a small write back while data is in flight
+    /// (Nagle) until `set_nodelay` turns that off, which sends it at once.
+    #[test]
+    fn set_nodelay_releases_a_small_write() {
+        let stack = Stack::new();
+        stack
+            .set_addr(IpPrefix::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 24))
+            .unwrap();
+        let captured = capture(&stack);
+        let (stream, _) = accepted_v4(&stack, &captured);
+        assert!(!stream.nodelay().unwrap());
+        stream.write(&[1; 10]).unwrap();
+        stream.write(&[2; 10]).unwrap();
+        let payloads = |c: &Mutex<Vec<Vec<u8>>>| -> Vec<Vec<u8>> {
+            c.lock()
+                .unwrap()
+                .drain(..)
+                .map(|p| Segment::parse(&p[20..]).unwrap().payload)
+                .filter(|p| !p.is_empty())
+                .collect()
+        };
+        assert_eq!(payloads(&captured), [vec![1; 10]], "Nagle held nothing");
+        stream.set_nodelay(true).unwrap();
+        assert!(stream.nodelay().unwrap());
+        assert_eq!(payloads(&captured), [vec![2; 10]]);
+        stream.write(&[3; 10]).unwrap();
+        assert_eq!(payloads(&captured), [vec![3; 10]]);
+    }
 }

@@ -149,6 +149,83 @@ fn a_dial_through_a_shut_down_stack_fails_fast() {
     assert!(started.elapsed() < Duration::from_secs(4));
 }
 
+/// A host server that writes a message in two small pieces, with
+/// TCP_NODELAY set, gets its answer from the guest a round trip sooner
+/// than if the bridge re-imposed Nagle: that would hold the second piece
+/// until the guest had acknowledged the first.
+#[cfg(feature = "impair")]
+#[test]
+fn the_bridge_adds_no_nagle_delay_to_small_writes() {
+    use pktkit::impair::{ImpairL3, Impairment};
+    const ONE_WAY: Duration = Duration::from_millis(25);
+    let stack = pktkit::slirp::Stack::new();
+    stack
+        .set_addr(IpPrefix::new(IpAddr::V4(STACK_IP), 24))
+        .unwrap();
+    let client =
+        Client::new(ClientConfig::default().prefix(IpPrefix::new(IpAddr::V4(CLIENT_IP), 24)));
+    let link = ImpairL3::new(
+        client.clone() as Arc<dyn L3Device>,
+        Impairment::default().delay(ONE_WAY),
+    );
+    connect_l3(stack.clone(), Delayed(link));
+
+    let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let dest = server.local_addr().unwrap();
+    let rounds = std::thread::spawn(move || {
+        let (mut s, _) = server.accept().unwrap();
+        s.set_nodelay(true).unwrap();
+        let mut times = Vec::new();
+        for _ in 0..3 {
+            let start = std::time::Instant::now();
+            s.write_all(&[1; 10]).unwrap();
+            std::thread::sleep(Duration::from_millis(5));
+            s.write_all(&[2; 10]).unwrap();
+            let mut b = [0u8; 1];
+            s.read_exact(&mut b).unwrap();
+            times.push(start.elapsed());
+        }
+        times
+    });
+    let mut c = client.dial_tcp(dest).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10)));
+    for _ in 0..3 {
+        let mut msg = [0u8; 20];
+        c.read_exact(&mut msg).unwrap();
+        c.write_all(b"k").unwrap();
+    }
+    let best = rounds.join().unwrap().into_iter().min().unwrap();
+    // Two one-way trips (≈ 50 ms) without Nagle, four with it.
+    assert!(
+        best < ONE_WAY * 3,
+        "answer took {best:?}: the second piece waited on an ACK"
+    );
+}
+
+/// `connect_l3` takes its second device by value.
+#[cfg(feature = "impair")]
+#[derive(Debug)]
+struct Delayed(Arc<pktkit::impair::ImpairL3>);
+
+#[cfg(feature = "impair")]
+impl L3Device for Delayed {
+    fn set_handler(&self, h: L3Handler) {
+        self.0.set_handler(h)
+    }
+    fn send(&self, p: &Packet) -> pktkit::Result<()> {
+        self.0.send(p)
+    }
+    fn addr(&self) -> IpPrefix {
+        self.0.addr()
+    }
+    fn set_addr(&self, p: IpPrefix) -> pktkit::Result<()> {
+        self.0.set_addr(p)
+    }
+    fn close(&self) -> pktkit::Result<()> {
+        self.0.close()
+    }
+}
+
 /// The guest's end of a narrower link: packets from the stack larger than
 /// `mtu` are dropped at the hop and answered with a Packet Too Big, as an
 /// IPv6 router must (RFC 8201), and never fragmented.
