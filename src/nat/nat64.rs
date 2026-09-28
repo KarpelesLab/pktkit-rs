@@ -82,7 +82,7 @@ pub struct Nat64 {
 
     inner: Mutex<Nat64Inner>,
     /// IPv4 Identification for packets translated from unfragmented IPv6.
-    next_id: AtomicU16,
+    ip_ids: IpIds,
     /// Inbound fragmented datagrams: the inside host each one's first
     /// fragment went to, by source, IP ID and protocol.
     frags: Mutex<FragTable<(Ipv4Addr, u16, u8), Ipv6Addr>>,
@@ -157,7 +157,7 @@ impl Nat64 {
                 peer_quota: Arc::new(Quota::new(NatLimits::default().max_peers)),
                 limits: NatLimits::default(),
             }),
-            next_id: AtomicU16::new(crate::rand::u32() as u16),
+            ip_ids: IpIds::new(),
             frags: Mutex::new(FragTable::default()),
             out_frags: Mutex::new(FragTable::default()),
             next_sweep: Mutex::new(Instant::now() + SWEEP_INTERVAL),
@@ -576,7 +576,9 @@ impl Nat64 {
 
         let (id, flags) = match frag {
             Some(f) => (f.id as u16, if f.more { 0x2000 } else { 0 }),
-            None => self.unfragmented_v4_id(IPV4_MIN_HEADER + l4.len()),
+            None => {
+                self.unfragmented_v4_id((outside_ip, dst_v4, proto), IPV4_MIN_HEADER + l4.len())
+            }
         };
         let mut out = v4_header(outside_ip, dst_v4, proto, hop, l4.len(), id, flags);
         out.extend_from_slice(&l4);
@@ -589,8 +591,10 @@ impl Nat64 {
     /// once the packet exceeds 1260 bytes, beyond which IPv6's 1280-byte
     /// minimum MTU no longer guarantees it fits; below that it may be
     /// fragmented and needs an ID unique enough to reassemble (RFC 6864).
-    fn unfragmented_v4_id(&self, total: usize) -> (u16, u16) {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+    /// `flow` is the packet's source, destination and protocol, which the
+    /// ID need only be unique within.
+    fn unfragmented_v4_id(&self, flow: (Ipv4Addr, Ipv4Addr, u8), total: usize) -> (u16, u16) {
+        let id = self.ip_ids.next(flow);
         (id, if total > 1260 { 0x4000 } else { 0 })
     }
 
@@ -657,7 +661,8 @@ impl Nat64 {
         let cs = checksum(&msg);
         msg[2..4].copy_from_slice(&cs.to_be_bytes());
 
-        let (ip_id, flags) = self.unfragmented_v4_id(IPV4_MIN_HEADER + msg.len());
+        let flow = (outside_ip, dst_v4, PROTO_ICMP);
+        let (ip_id, flags) = self.unfragmented_v4_id(flow, IPV4_MIN_HEADER + msg.len());
         let mut out = v4_header(outside_ip, dst_v4, PROTO_ICMP, hop, msg.len(), ip_id, flags);
         out.extend_from_slice(&msg);
         self.send_v4(&out);
@@ -788,7 +793,8 @@ impl Nat64 {
         msg.extend_from_slice(&quote);
         let cs = checksum(&msg);
         msg[2..4].copy_from_slice(&cs.to_be_bytes());
-        let (ip_id, flags) = self.unfragmented_v4_id(IPV4_MIN_HEADER + msg.len());
+        let flow = (outside_ip, dst_v4, PROTO_ICMP);
+        let (ip_id, flags) = self.unfragmented_v4_id(flow, IPV4_MIN_HEADER + msg.len());
         let mut out = v4_header(outside_ip, dst_v4, PROTO_ICMP, hop, msg.len(), ip_id, flags);
         out.extend_from_slice(&msg);
         self.send_v4(&out);
@@ -1407,6 +1413,39 @@ fn read_v6(b: &[u8]) -> Ipv6Addr {
     let mut a = [0u8; 16];
     a.copy_from_slice(&b[..16]);
     Ipv6Addr::from(a)
+}
+
+/// Counters [`IpIds`] spreads flows over.
+const IP_ID_BUCKETS: usize = 2048;
+
+/// IPv4 Identification values, made as Linux's `ip_idents` makes them:
+/// a counter per bucket of flows, chosen by a keyed hash of the packet's
+/// source, destination and protocol, offset by more of that hash. One
+/// counter for every packet would let any remote the NAT64 talks to read
+/// off how much traffic it sends to everyone else, and predict the IDs of
+/// packets to a third party well enough to forge fragments that poison
+/// their reassembly (RFC 7739 §5). IDs need only be unique per flow while
+/// a datagram is in flight (RFC 6864), which a counter per flow keeps.
+struct IpIds {
+    /// SipHash with a key of its own, chosen at random by std.
+    key: std::collections::hash_map::RandomState,
+    counters: Box<[AtomicU16]>,
+}
+
+impl IpIds {
+    fn new() -> IpIds {
+        IpIds {
+            key: std::collections::hash_map::RandomState::new(),
+            counters: (0..IP_ID_BUCKETS).map(|_| AtomicU16::new(0)).collect(),
+        }
+    }
+
+    fn next(&self, flow: (Ipv4Addr, Ipv4Addr, u8)) -> u16 {
+        use std::hash::BuildHasher;
+        let h = self.key.hash_one(flow);
+        let n = self.counters[h as usize % IP_ID_BUCKETS].fetch_add(1, Ordering::Relaxed);
+        n.wrapping_add((h >> 48) as u16)
+    }
 }
 
 /// A NAT64 prefix and the RFC 6052 §2.2 layout that goes with its length.
@@ -3088,5 +3127,41 @@ mod tests {
         // A private address is fine under a network-specific prefix.
         send([10, 0, 0, 1]);
         assert_eq!(captured.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ipv4_ids_do_not_leak_across_destinations() {
+        let nat = Nat64::new(pfx("64:ff9b::/96"), pfx("198.51.100.1/24"));
+        let captured = Arc::new(StdMutex::new(Vec::<Vec<u8>>::new()));
+        let c = captured.clone();
+        nat.outside().set_handler(Arc::new(move |p| {
+            c.lock().unwrap().push(p.as_bytes().to_vec());
+            Ok(())
+        }));
+        let client: Ipv6Addr = "2001:db8::100".parse().unwrap();
+        let send = |host: u8| {
+            let dst = wkp(Ipv4Addr::new(192, 0, 2, host));
+            let pkt = build_v6_udp(client, 5555, dst, 53, b"x");
+            nat.inside().send(Packet::from_slice(&pkt)).unwrap();
+        };
+        for host in 1..=8 {
+            send(host);
+        }
+        send(1);
+        let ids: Vec<u16> = captured
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|p| u16::from_be_bytes([p[4], p[5]]))
+            .collect();
+        assert_eq!(ids.len(), 9);
+        // Another destination's packets tell nothing of how many went to
+        // the others...
+        assert!(
+            ids[..8].windows(2).any(|w| w[1] != w[0].wrapping_add(1)),
+            "{ids:?}"
+        );
+        // ...while one destination's are still told apart.
+        assert_eq!(ids[8], ids[0].wrapping_add(1));
     }
 }
