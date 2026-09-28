@@ -8,8 +8,12 @@ use super::seqspace::{seq_after, seq_after_eq, seq_before, seq_before_eq};
 
 /// Cap on the number of out-of-order ranges. Adjacent and overlapping
 /// segments merge into one range, so this counts holes in the stream, not
-/// segments; the bytes they hold are bounded by the window.
-const MAX_OOO_ENTRIES: usize = 128;
+/// segments; the bytes they hold are bounded by the window. Past it the
+/// range furthest out is dropped, reneging on its SACK, which costs the
+/// sender a timeout to notice; a drop-tail queue overflowing in slow start
+/// loses every other segment of a burst, so a window of megabytes can hold
+/// a thousand holes.
+const MAX_OOO_ENTRIES: usize = 1024;
 
 /// SACK blocks that fit in the 40 option bytes: four alone (34 bytes), three
 /// beside a timestamp option (RFC 2018 §3).
@@ -220,9 +224,10 @@ impl RecvBuf {
 
     /// The out-of-order range holding `seq`, if any.
     fn range_of(&self, seq: u32) -> Option<&OooEntry> {
-        self.ooo
-            .iter()
-            .find(|e| seq_before_eq(e.seq, seq) && seq_before(seq, e.end()))
+        // Sorted and disjoint: the first range ending past `seq` is the
+        // only one that can hold it.
+        let i = self.ooo.partition_point(|e| seq_before_eq(e.end(), seq));
+        self.ooo.get(i).filter(|e| seq_before_eq(e.seq, seq))
     }
 
     /// Record that the range holding `seq` was just extended, displacing any

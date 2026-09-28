@@ -65,6 +65,9 @@ pub const ORPHAN_RETRIES: u32 = 8;
 /// die out before a new one can take its 4-tuple. A new connection that
 /// needs the 4-tuple sooner can have it (see [`Conn::accepts_new_syn`]).
 pub const TIME_WAIT_DURATION: Duration = Duration::from_secs(60);
+/// The least a sender waits before acting on SACKs the receiver has
+/// reneged on: Linux's, in `tcp_check_sack_reneging`.
+const RENEGE_DELAY: Duration = Duration::from_millis(10);
 /// What a loss probe allows for the delayed ACK of a lone segment (RFC
 /// 8985 §7.2's TLP.max_ack_delay): Linux's, `TCP_RTO_MIN`, which covers
 /// the 200 ms some receivers delay by.
@@ -2242,10 +2245,19 @@ impl Conn {
             self.stop_persist();
         }
         if advanced {
-            if self.send_buf.as_ref().unwrap().unacked() > 0 {
-                self.start_rto();
-            } else {
+            if self.send_buf.as_ref().unwrap().unacked() == 0 {
                 self.stop_rto();
+            } else if self.score.head_sacked() {
+                // The receiver would have acknowledged the first segment
+                // had it kept it: it has dropped what it SACKed (reneged,
+                // RFC 2018 §8). The RTO forgets the SACKs; let it fire a
+                // moment from now, as Linux's tcp_check_sack_reneging does,
+                // rather than a whole RTO, so a transient renege does not
+                // draw a burst of retransmissions.
+                let delay = (self.rto.srtt() / 2).max(RENEGE_DELAY);
+                self.rto_deadline = Some(self.now + delay);
+            } else {
+                self.start_rto();
             }
         }
 
@@ -5127,6 +5139,38 @@ mod tests {
         // No second probe while the first is out.
         client.pto_deadline = Some(test_now());
         assert!(tick_due(&mut client).is_empty());
+    }
+
+    /// The receiver SACKed segment 1, then acknowledged only segment 0:
+    /// it has dropped segment 1 (reneged). The RTO, which forgets SACKs,
+    /// fires a moment later rather than a whole RTO later, and resends it.
+    #[test]
+    fn reneged_sacks_are_acted_on_soon() {
+        let rtt = Duration::from_millis(100);
+        let (mut client, server) = rtt_pair(big, 40720, rtt);
+        let (_, segs) = client.write(&[4; 5000]);
+        let seq = |i: usize| parse(&segs[i]).seq;
+        let mut sack = bare_ack(&client, &server, seq(0), 0xFFFF);
+        sack.options = vec![sack_option(&[SackBlock {
+            left: seq(1),
+            right: seq(2),
+        }])];
+        advance(rtt);
+        client.handle_segment(&sack);
+        client.handle_segment(&bare_ack(&client, &server, seq(1), 64));
+        let wait = client
+            .rto_deadline
+            .unwrap()
+            .saturating_duration_since(test_now());
+        assert!(
+            wait <= client.rto.srtt() / 2 + Duration::from_millis(1),
+            "{wait:?}"
+        );
+        advance(wait);
+        client.pto_deadline = None;
+        let out = client.tick();
+        assert_eq!(seqs(&out), vec![seq(1)]);
+        assert_eq!(client.score.sacked_segs(), 0, "SACKs forgotten");
     }
 
     // --- PRR (RFC 6937) ---------------------------------------------------
