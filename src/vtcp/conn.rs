@@ -207,8 +207,9 @@ struct Undo {
     /// TSval of the episode's first retransmission: RFC 3522's
     /// RetransmitTS.
     retrans_ts: Option<u32>,
-    /// The first ACK after it has not come yet: the one Eifel looks at.
-    eifel_pending: bool,
+    /// The first ACK of that retransmission, which ends here, has not come
+    /// yet: the one Eifel looks at. `None` once it has.
+    eifel_end: Option<u32>,
     /// What the episode retransmitted and no D-SACK has reported yet (RFC
     /// 3708); `None` once there is too much to follow.
     retrans: Option<Vec<(u32, u32)>>,
@@ -2427,8 +2428,15 @@ impl Conn {
             {
                 undone = self.undo_recovery(acked);
             }
-            if !undone && advanced && self.undo.eifel_pending {
-                self.undo.eifel_pending = false;
+            // Only the ACK of the retransmission itself tells: one that
+            // advances SND.UNA short of it may echo an older segment, such
+            // as one resent in an earlier episode and still outstanding.
+            if !undone
+                && advanced
+                && let Some(end) = self.undo.eifel_end
+                && seq_after_eq(ack, end)
+            {
+                self.undo.eifel_end = None;
                 if self.ca != CaState::Open
                     && let (Some(e), Some(ts)) = (ecr, self.undo.retrans_ts)
                     && (e.wrapping_sub(ts) as i32) < 0
@@ -2498,7 +2506,7 @@ impl Conn {
             srtt_prev: self.rto.srtt() + 2 * CLOCK_TICK,
             rttvar_prev: self.rto.rttvar(),
             retrans_ts: None,
-            eifel_pending: false,
+            eifel_end: None,
             retrans: Some(Vec::new()),
         };
     }
@@ -2509,11 +2517,11 @@ impl Conn {
         if self.ca == CaState::Open || self.undo.marker.is_none() {
             return;
         }
+        let end = seq.wrapping_add(len);
         if self.undo.retrans_ts.is_none() {
             self.undo.retrans_ts = Some(tsval);
-            self.undo.eifel_pending = true;
+            self.undo.eifel_end = Some(end);
         }
-        let end = seq.wrapping_add(len);
         let Some(r) = self.undo.retrans.as_mut() else {
             return;
         };
@@ -2956,7 +2964,11 @@ impl Conn {
         // A zero window is the persist timer's and the RTO's to probe.
         // F-RTO holds retransmissions back until it knows the timeout was
         // not spurious (RFC 5682 §2.1 step 2b).
-        if self.snd_wnd == 0 || !self.state.is_synchronized() || self.frto != Frto::Off {
+        if self.snd_wnd == 0
+            || !self.state.is_synchronized()
+            || self.frto != Frto::Off
+            || self.score.lost_bytes() == 0
+        {
             return;
         }
         while self.in_flight() < self.cc.cwnd() {
@@ -5501,6 +5513,22 @@ mod tests {
     }
 
     // --- Spurious retransmissions (RFC 3708, 3522, 5682, 4015) ------------
+
+    /// Eifel looks at the ACK of the retransmission, not at the first one
+    /// advancing SND.UNA: one short of it may acknowledge a segment resent
+    /// in an earlier episode, and echo that segment's older timestamp.
+    #[test]
+    fn eifel_waits_for_the_ack_of_the_retransmission() {
+        let (mut client, _server, segs, late_and_rexmit) = spurious_fast_retransmit(true, 40735);
+        // Stand in for a first retransmission ending past what this ACK
+        // covers.
+        let end = parse(&segs[9]).seq;
+        client.undo.eifel_end = Some(end);
+        advance(Duration::from_millis(50));
+        deliver(&mut client, &late_and_rexmit[..1]);
+        assert!(client.in_recovery(), "undone on the wrong ACK");
+        assert_eq!(client.undo.eifel_end, Some(end), "still waiting");
+    }
 
     /// Segment 0 is only delayed, past three later ones: RACK has fast
     /// recovery resend it and halve ssthresh. `ts` turns timestamps on.
