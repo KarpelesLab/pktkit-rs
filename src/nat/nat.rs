@@ -886,9 +886,10 @@ impl Nat {
     }
 
     /// Choose the outside port for a connection an ALG expects from one
-    /// known remote, `remote_ip`, to inside endpoint
-    /// `inside_ip:inside_port`, and register the expectation on it. Returns
-    /// the port, or `None` if the pool is exhausted.
+    /// remote, `remote_ip` (unspecified: whichever connects first), to
+    /// inside endpoint `inside_ip:inside_port`, and register the
+    /// expectation on it. Returns the port, or `None` if the pool is
+    /// exhausted.
     ///
     /// Unlike [`create_mapping_in`](Self::create_mapping_in) this opens
     /// nothing yet: a mapping delivers whatever reaches its port, so one
@@ -935,9 +936,10 @@ impl Nat {
                 },
             },
         };
-        let e = Expectation::new(proto, inside_ip, inside_port, port, expires)
+        let mut e = Expectation::new(proto, inside_ip, inside_port, port, expires)
             .remote_ip(remote_ip)
             .namespace(namespace);
+        e.one_remote = true;
         Self::add_expectation_locked(inner, e, NatRevKey { proto, port }, k);
         Some(port)
     }
@@ -2092,7 +2094,7 @@ impl Nat {
                 }
                 // Made for one remote: only its traffic keeps the mapping
                 // alive, as on a mapping the host opened itself.
-                if !e.remote_ip.is_unspecified()
+                if (e.one_remote || !e.remote_ip.is_unspecified())
                     && let Some(m) = inner.mappings.get_mut(&k)
                 {
                     m.open = false;
@@ -5180,5 +5182,27 @@ mod tests {
         let p = build_udp(INSIDE, 1000, REMOTE, 53, b"q");
         nat.inside().send(Packet::from_slice(&p)).unwrap();
         assert_eq!(o.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_connection_expected_from_anyone_opens_its_mapping_to_that_peer_only() {
+        let (nat, i, _o) = setup();
+        let expires = Instant::now() + Duration::from_secs(60);
+        let port = nat
+            .expect_from_in(0, PROTO_TCP, (INSIDE, 5000), Ipv4Addr::UNSPECIFIED, expires)
+            .unwrap();
+        let syn = build_tcp(REMOTE, 4444, PUBLIC, port, 0x02);
+        nat.outside().send(Packet::from_slice(&syn)).unwrap();
+        assert_eq!(i.lock().unwrap().len(), 1);
+        // No one else's traffic keeps the listener alive: it idles out once
+        // the peer is done.
+        let inner = nat.inner.lock().unwrap();
+        let k = NatKey {
+            ns: 0,
+            proto: PROTO_TCP,
+            ip: INSIDE,
+            port: 5000,
+        };
+        assert!(!inner.mappings[&k].is_open(Instant::now()));
     }
 }

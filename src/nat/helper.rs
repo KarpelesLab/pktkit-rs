@@ -212,6 +212,10 @@ pub struct Expectation {
     /// Inside namespace of `inside_ip` (see [`NatMapping::namespace`]).
     pub namespace: u64,
     pub expires: Instant,
+    /// The connection is expected from one remote, even if which one is
+    /// not known (`remote_ip` unspecified): the mapping it makes is kept
+    /// alive by that remote's traffic only, not left open to anyone.
+    pub(crate) one_remote: bool,
 }
 
 impl Expectation {
@@ -233,6 +237,7 @@ impl Expectation {
             outside_port,
             namespace: 0,
             expires,
+            one_remote: false,
         }
     }
 }

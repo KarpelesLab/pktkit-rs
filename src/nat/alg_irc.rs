@@ -3,9 +3,14 @@
 //! Rewrites the IP (as a 32-bit decimal) and port in `\x01DCC SEND ...\x01`
 //! and `\x01DCC CHAT ...\x01` payloads and registers an expectation so the
 //! incoming DCC connection is forwarded to the inside client.
+//!
+//! The peer that will connect is not known (the offer goes through the IRC
+//! server), so the advertised port takes one connection from anyone, for
+//! [`IRC_EXPECT_TIMEOUT`]; nothing is opened until it comes, and the
+//! mapping it makes then serves that peer alone.
 
 use crate::nat::alg_ftp::is_own_endpoint;
-use crate::nat::helper::{Expectation, Helper, NatMapping, PROTO_TCP, PacketHelper};
+use crate::nat::helper::{Helper, NatMapping, OpenedPorts, PROTO_TCP, PacketHelper};
 use crate::nat::l4::replace_payload;
 use crate::nat::nat::Nat;
 use crate::time::Instant;
@@ -14,6 +19,11 @@ use std::net::Ipv4Addr;
 use std::time::Duration;
 
 const IRC_EXPECT_TIMEOUT: Duration = Duration::from_secs(60);
+/// Cap on the DCC offers one inside host may have pending at a time: each
+/// lets any Internet host connect to a port of its choosing, and a message
+/// is the host's to write, so a stream of them could otherwise open
+/// listeners across the NAT's port pool. Real clients offer a few at once.
+const MAX_PORTS_PER_HOST: usize = 8;
 
 /// IRC DCC ALG: rewrites the address in `DCC SEND` / `DCC CHAT` offers and
 /// opens the port they announce. Construct with [`new`](Self::new) and
@@ -22,6 +32,8 @@ const IRC_EXPECT_TIMEOUT: Duration = Duration::from_secs(60);
 #[derive(Debug)]
 pub struct IrcHelper {
     ports: HashSet<u16>,
+    /// The inside ports each host has offered lately.
+    opened: OpenedPorts,
 }
 
 impl IrcHelper {
@@ -32,7 +44,10 @@ impl IrcHelper {
         } else {
             ports.iter().copied().collect()
         };
-        IrcHelper { ports: set }
+        IrcHelper {
+            ports: set,
+            opened: OpenedPorts::new(MAX_PORTS_PER_HOST, IRC_EXPECT_TIMEOUT),
+        }
     }
 }
 
@@ -109,23 +124,27 @@ impl PacketHelper for IrcHelper {
         if !is_own_endpoint(m, inside_ip, port_val) {
             return pkt;
         }
-        let outside_port = match nat.create_mapping_in(m.namespace, PROTO_TCP, inside_ip, port_val)
-        {
-            Some(p) => p,
-            None => return pkt,
+        let now = Instant::now();
+        let host = (m.namespace, inside_ip);
+        let Some(counted) = self.opened.admit(host, &[port_val], now) else {
+            return pkt;
         };
-        // The DCC peer is not known yet: any remote may connect, but only to
-        // the port advertised in the rewritten message.
-        nat.add_expectation(
-            Expectation::new(
-                PROTO_TCP,
-                inside_ip,
-                port_val,
-                outside_port,
-                Instant::now() + IRC_EXPECT_TIMEOUT,
-            )
-            .namespace(m.namespace),
-        );
+        // The DCC peer is not known yet: the first remote to connect to the
+        // port advertised in the rewritten message, within the window, is
+        // taken for it.
+        let outside_port = match nat.expect_from_in(
+            m.namespace,
+            PROTO_TCP,
+            (inside_ip, port_val),
+            Ipv4Addr::UNSPECIFIED,
+            now + IRC_EXPECT_TIMEOUT,
+        ) {
+            Some(p) => p,
+            None => {
+                self.opened.refund(host, &counted);
+                return pkt;
+            }
+        };
 
         let outside_octets = match nat.outside_addr() {
             Some(a) => a.octets(),
@@ -257,5 +276,35 @@ mod tests {
         let out = captured.lock().unwrap();
         assert_eq!(&out[0][40..], msg.as_bytes());
         assert!(nat.take_expectation(PROTO_TCP, victim, 22).is_none());
+    }
+
+    #[test]
+    fn dcc_offers_open_few_ports() {
+        let (nat, _captured) = setup();
+        let reached = Arc::new(StdMutex::new(Vec::<Vec<u8>>::new()));
+        let r = reached.clone();
+        nat.inside().set_handler(Arc::new(move |p| {
+            r.lock().unwrap().push(p.as_bytes().to_vec());
+            Ok(())
+        }));
+        let inside = Ipv4Addr::new(10, 0, 0, 5);
+        let server = Ipv4Addr::new(198, 51, 100, 9);
+        for port in 20000..20100u16 {
+            let msg = format!(
+                "PRIVMSG bob :\x01DCC CHAT chat {} {}\x01\r\n",
+                u32::from(inside),
+                port
+            );
+            let pkt = build_irc(inside, 40000, server, 6667, msg.as_bytes());
+            nat.inside().send(Packet::from_slice(&pkt)).unwrap();
+        }
+        // Strangers try every port offered.
+        let public = Ipv4Addr::new(203, 0, 113, 1);
+        let stranger = Ipv4Addr::new(192, 0, 2, 66);
+        for port in 20000..20100u16 {
+            let syn = build_irc(stranger, 1234, public, port, b"");
+            nat.outside().send(Packet::from_slice(&syn)).unwrap();
+        }
+        assert_eq!(reached.lock().unwrap().len(), MAX_PORTS_PER_HOST);
     }
 }
