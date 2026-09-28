@@ -15,6 +15,10 @@ use std::time::Duration;
 
 const IRC_EXPECT_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// IRC DCC ALG: rewrites the address in `DCC SEND` / `DCC CHAT` offers and
+/// opens the port they announce. Construct with [`new`](Self::new) and
+/// register with
+/// [`Nat::add_packet_helper`](crate::nat::Nat::add_packet_helper).
 #[derive(Debug)]
 pub struct IrcHelper {
     ports: HashSet<u16>,

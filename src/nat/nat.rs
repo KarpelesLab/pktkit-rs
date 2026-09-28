@@ -509,7 +509,10 @@ impl Nat {
         *d = Some(Arc::new(Defragger::new()));
     }
 
-    /// Register a packet-level helper (FTP, SIP, …).
+    /// Register a packet-level helper: one of the ALGs this module provides
+    /// ([`FtpHelper`](super::FtpHelper), [`SipHelper`](super::SipHelper),
+    /// [`H323Helper`](super::H323Helper), [`IrcHelper`](super::IrcHelper),
+    /// [`PptpHelper`](super::PptpHelper), [`TftpHelper`](super::TftpHelper)).
     pub fn add_packet_helper<H: PacketHelper + 'static>(&self, h: Arc<H>) {
         struct PacketKind<H: PacketHelper>(Arc<H>);
         impl<H: PacketHelper + 'static> Helper for PacketKind<H> {
@@ -529,7 +532,8 @@ impl Nat {
         self.inner.lock().unwrap().helpers.push(kind);
     }
 
-    /// Register a local-traffic helper (UPnP, SSDP, …).
+    /// Register a helper that answers traffic addressed to the NAT itself:
+    /// [`UPnPHelper`](super::UPnPHelper).
     pub fn add_local_helper<H: LocalHelper + 'static>(&self, h: Arc<H>) {
         struct LocalKind<H: LocalHelper>(Arc<H>);
         impl<H: LocalHelper + 'static> Helper for LocalKind<H> {
@@ -556,7 +560,7 @@ impl Nat {
     /// endpoint (a live mapping or a port forward): the connection could never
     /// reach the expected host. Registering the same expectation again only
     /// extends its lifetime.
-    pub fn add_expectation(&self, e: Expectation) {
+    pub(crate) fn add_expectation(&self, e: Expectation) {
         let rk = NatRevKey {
             proto: e.proto,
             port: e.outside_port,
@@ -632,9 +636,9 @@ impl Nat {
     /// Find and remove the first non-expired expectation matching the given
     /// inside target `(proto, inside_ip, inside_port)`, returning it.
     ///
-    /// Lets an ALG withdraw an expectation it registered, and tests assert
-    /// that one was registered.
-    pub fn take_expectation(
+    /// Tests use it to assert that one was registered.
+    #[cfg(test)]
+    pub(crate) fn take_expectation(
         &self,
         proto: u8,
         inside_ip: Ipv4Addr,
@@ -810,7 +814,13 @@ impl Nat {
     /// tracked. A new mapping stays that way; an existing one the host was
     /// already using for its own traffic only for the next two minutes,
     /// after which only remotes it has exchanged traffic with count again.
-    pub fn create_mapping(&self, proto: u8, inside_ip: Ipv4Addr, inside_port: u16) -> Option<u16> {
+    #[cfg(test)]
+    pub(crate) fn create_mapping(
+        &self,
+        proto: u8,
+        inside_ip: Ipv4Addr,
+        inside_port: u16,
+    ) -> Option<u16> {
         self.create_mapping_in(0, proto, inside_ip, inside_port)
     }
 
@@ -873,7 +883,7 @@ impl Nat {
 
     /// [`create_mapping`](Self::create_mapping) for a host in inside
     /// namespace `namespace` (see [`NatMapping::namespace`]).
-    pub fn create_mapping_in(
+    pub(crate) fn create_mapping_in(
         &self,
         namespace: u64,
         proto: u8,
@@ -948,15 +958,9 @@ impl Nat {
         Some(p)
     }
 
-    /// Inject a packet onto the inside interface (used by helpers that
-    /// synthesize traffic destined for an inside host).
-    pub fn send_inside(&self, pkt: &Packet) {
-        self.inside.deliver(pkt);
-    }
-
     /// Inject a packet into inside namespace `namespace` (see
     /// [`NatMapping::namespace`]); 0 is the inside interface.
-    pub fn send_inside_in(&self, namespace: u64, pkt: &Packet) {
+    pub(crate) fn send_inside_in(&self, namespace: u64, pkt: &Packet) {
         self.send_ns(namespace, pkt);
     }
 

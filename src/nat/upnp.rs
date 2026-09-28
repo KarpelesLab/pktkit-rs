@@ -6,10 +6,10 @@
 //! - **SSDP discovery** (`M-SEARCH` over UDP multicast to
 //!   `239.255.255.250:1900`) is handled entirely at the L3 packet level: the
 //!   responder builds a raw IPv4+UDP reply and injects it back onto the inside
-//!   via [`Nat::send_inside`]. No OS sockets, std-only.
+//!   via [`Nat::send_inside_in`]. No OS sockets, std-only.
 //! - **SOAP control** (`AddPortMapping`, `DeletePortMapping`,
 //!   `GetExternalIPAddress`, and the port-mapping query actions) is implemented
-//!   as a pure request handler ([`UPnPHelper::handle_soap`]) that parses a SOAP
+//!   as a pure request handler (`UPnPHelper::soap`) that parses a SOAP
 //!   body and returns the response/fault body plus any NAT mutation. It is
 //!   driven by the unit tests directly.
 //!
@@ -20,13 +20,13 @@
 //! handshake, accumulates the HTTP/1.1 request bytes off the established
 //! stream, and parses the request line + headers + Content-Length body. A GET
 //! of the SSDP `LOCATION` (`/rootDesc.xml`) returns the device description
-//! ([`UPnPHelper::root_desc`]), a GET of the service description it names
+//! (`UPnPHelper::root_desc`), a GET of the service description it names
 //! returns that, and a POST to its control URL is a SOAP action handled as
-//! [`UPnPHelper::handle_soap`] does; anything else draws a 404 or 405. The
+//! `UPnPHelper::soap` does; anything else draws a 404 or 405. The
 //! HTTP/1.1 response is written back over the connection, which then closes.
 //! This is a minimal embedded HTTP/1.1 server over a single vtcp connection:
 //! one request/response, then close. Outgoing segments are wrapped in IPv4 (with correct IP + TCP
-//! checksums) and injected onto the inside via [`Nat::send_inside`].
+//! checksums) and injected onto the inside via [`Nat::send_inside_in`].
 
 use crate::nat::helper::{Helper, LocalHelper, PROTO_TCP, PROTO_UDP, PortForward};
 use crate::nat::nat::Nat;
@@ -136,9 +136,9 @@ impl Default for UPnPConfig {
 /// Outcome of a SOAP action: an HTTP-ish status code and an XML body. A code of
 /// 200 is a success response; anything else is a SOAP fault.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SoapResult {
-    pub status: u16,
-    pub body: String,
+pub(crate) struct SoapResult {
+    pub(crate) status: u16,
+    pub(crate) body: String,
 }
 
 /// Identifies a control-port TCP connection by the inside client's 4-tuple
@@ -286,6 +286,8 @@ pub struct UPnPHelper {
 }
 
 impl UPnPHelper {
+    /// A UPnP IGD service configured by `cfg`. It does nothing until
+    /// registered with [`Nat::add_local_helper`].
     pub fn new(cfg: UPnPConfig) -> UPnPHelper {
         let mut cfg = cfg;
         if cfg.control_port == 0 {
@@ -298,7 +300,8 @@ impl UPnPHelper {
         }
     }
 
-    pub fn config(&self) -> &UPnPConfig {
+    #[cfg(test)]
+    pub(crate) fn config(&self) -> &UPnPConfig {
         &self.cfg
     }
 
@@ -557,7 +560,7 @@ EXT:\r\n\r\n",
     // ---- SOAP ----------------------------------------------------------
 
     /// The device description document a client fetches from `LOCATION`.
-    pub fn root_desc(&self, inside_ip: Ipv4Addr) -> String {
+    pub(crate) fn root_desc(&self, inside_ip: Ipv4Addr) -> String {
         let control_url = format!(
             "http://{}:{}{}",
             inside_ip, self.cfg.control_port, CONTROL_PATH
@@ -596,7 +599,8 @@ EXT:\r\n\r\n",
     /// tolerated). `body` is the raw XML request body. `client_ip` is the
     /// requesting host (the inside client), used to enforce that a client only
     /// forwards to itself.
-    pub fn handle_soap(
+    #[cfg(test)]
+    pub(crate) fn handle_soap(
         &self,
         nat: &Nat,
         soap_action: &str,
@@ -606,8 +610,11 @@ EXT:\r\n\r\n",
         self.soap(nat, 0, soap_action, body, client_ip)
     }
 
-    /// [`handle_soap`](Self::handle_soap) for a client in inside namespace
-    /// `ns`, where the forwards it creates must point.
+    /// Dispatch a SOAP control action for a client in inside namespace `ns`,
+    /// where the forwards it creates must point. `soap_action` is the value
+    /// of the `SOAPAction` HTTP header (quotes and the leading service URN
+    /// are tolerated), `body` the raw XML request body, and `client_ip` the
+    /// requesting inside host, which may only forward to itself.
     fn soap(
         &self,
         nat: &Nat,

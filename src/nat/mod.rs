@@ -9,14 +9,16 @@
 //! - [`Nat64`] — RFC 6146 stateful translation between an IPv6 inside and an
 //!   IPv4 outside, with IPv4 hosts mapped into a NAT64 prefix (RFC 6052).
 //!
-//! Optional pieces:
+//! Optional pieces, each switched on per NAT:
 //!
-//! - [`Defragger`] — IPv4 reassembly, enabled per-NAT via
-//!   [`Nat::enable_defrag`].
-//! - ALGs: [`FtpHelper`], [`TftpHelper`], [`IrcHelper`], [`SipHelper`],
-//!   [`H323Helper`], [`PptpHelper`].
-//! - [`UPnPHelper`] / [`UPnPConfig`] — SSDP discovery plus a SOAP control
-//!   handler ([`UPnPHelper::handle_soap`] returning [`SoapResult`]). The
+//! - IPv4 reassembly, via [`Nat::enable_defrag`].
+//! - ALGs, registered with [`Nat::add_packet_helper`]: [`FtpHelper`],
+//!   [`TftpHelper`], [`IrcHelper`], [`SipHelper`], [`H323Helper`],
+//!   [`PptpHelper`].
+//! - Static port forwards ([`PortForward`], [`Nat::add_port_forward`]).
+//! - [`UPnPHelper`] / [`UPnPConfig`], registered with
+//!   [`Nat::add_local_helper`]: SSDP discovery plus the IGD SOAP control
+//!   port, through which inside hosts add their own port forwards. The
 //!   control port is terminated with the in-tree `vtcp` engine and a minimal
 //!   one-shot HTTP/1.1 server; pipelined / chunked requests are not handled
 //!   (see `TODO(nat)` in `upnp.rs`).
@@ -43,9 +45,8 @@ pub use alg_irc::IrcHelper;
 pub use alg_pptp::PptpHelper;
 pub use alg_sip::SipHelper;
 pub use alg_tftp::TftpHelper;
-pub use defrag::Defragger;
-pub use helper::{Expectation, Helper, LocalHelper, NatMapping, PacketHelper, PortForward};
+pub use helper::PortForward;
 pub use nat::Nat;
 pub use nat64::Nat64;
 pub use track::NatLimits;
-pub use upnp::{SoapResult, UPnPConfig, UPnPHelper};
+pub use upnp::{UPnPConfig, UPnPHelper};

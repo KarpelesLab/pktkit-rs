@@ -15,10 +15,15 @@
 
 use crate::nat::helper::{Helper, PROTO_UDP, PacketHelper};
 
+/// TFTP ALG. TFTP needs nothing from an ALG behind this NAT, so it passes
+/// packets through untouched; it is kept so code registering it keeps
+/// working. Register via
+/// [`Nat::add_packet_helper`](crate::nat::Nat::add_packet_helper).
 #[derive(Debug, Default)]
 pub struct TftpHelper;
 
 impl TftpHelper {
+    /// A new TFTP helper.
     pub fn new() -> TftpHelper {
         TftpHelper
     }

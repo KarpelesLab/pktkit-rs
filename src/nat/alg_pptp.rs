@@ -43,6 +43,11 @@ struct PptpCallInfo {
     created: Instant,
 }
 
+/// PPTP ALG: tracks the calls on the TCP 1723 control channel. The NAT does
+/// not translate GRE, so this only records them (see the module notes in
+/// `alg_pptp.rs`). Construct with [`new`](Self::new) and
+/// register with
+/// [`Nat::add_packet_helper`](crate::nat::Nat::add_packet_helper).
 #[derive(Debug)]
 pub struct PptpHelper {
     calls: Mutex<Calls>,
@@ -77,6 +82,7 @@ impl Default for PptpHelper {
 }
 
 impl PptpHelper {
+    /// A new PPTP helper.
     pub fn new() -> PptpHelper {
         PptpHelper {
             calls: Mutex::new(Calls {

@@ -195,6 +195,7 @@ impl Defragger {
     /// - Fragmented and incomplete: buffers it and returns `None`.
     /// - Last fragment that completes the datagram: returns the reassembled
     ///   packet as a fresh `Vec`.
+    #[cfg(any(test, feature = "fuzzing"))]
     pub fn process(&self, pkt: &[u8]) -> Option<Vec<u8>> {
         self.reassemble(pkt).map(|(p, _)| p)
     }

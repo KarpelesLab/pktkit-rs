@@ -256,9 +256,12 @@ impl Nat64 {
         routes.is_empty() || routes.iter().any(|r| r.contains(a))
     }
 
+    /// The inside L3 device, facing the IPv6 network.
     pub fn inside(&self) -> Arc<dyn L3Device> {
         self.inside.clone()
     }
+
+    /// The outside L3 device, facing the IPv4 network.
     pub fn outside(&self) -> Arc<dyn L3Device> {
         self.outside.clone()
     }

@@ -20,6 +20,7 @@ const FTP_EXPECT_TIMEOUT: Duration = Duration::from_secs(60);
 pub struct FtpHelper;
 
 impl FtpHelper {
+    /// A new FTP helper.
     pub fn new() -> FtpHelper {
         FtpHelper
     }

@@ -31,6 +31,10 @@ const MAX_PORTS_PER_MESSAGE: usize = 8;
 /// mappings across the NAT's port pool either.
 const MAX_PORTS_PER_HOST: usize = 32;
 
+/// SIP ALG for port 5060 over UDP and TCP: rewrites the addresses in the
+/// signalling and its SDP, and opens the RTP/RTCP ports it announces.
+/// Construct with [`new`](Self::new) and register with
+/// [`Nat::add_packet_helper`](crate::nat::Nat::add_packet_helper).
 #[derive(Debug)]
 pub struct SipHelper {
     /// The inside media ports each host has opened.
@@ -46,6 +50,7 @@ impl Default for SipHelper {
 }
 
 impl SipHelper {
+    /// A new SIP helper.
     pub fn new() -> SipHelper {
         SipHelper::default()
     }

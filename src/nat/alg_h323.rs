@@ -33,6 +33,10 @@ const MAX_PORTS_PER_MESSAGE: usize = 8;
 /// open mappings across the NAT's port pool either.
 const MAX_PORTS_PER_HOST: usize = 32;
 
+/// H.323 ALG for call signalling on TCP 1720: rewrites the addresses it
+/// carries and opens the H.245 and media ports they announce. Construct with
+/// [`new`](Self::new) and register with
+/// [`Nat::add_packet_helper`](crate::nat::Nat::add_packet_helper).
 #[derive(Debug)]
 pub struct H323Helper {
     /// The inside ports each host has opened (a port already open counts
@@ -49,6 +53,7 @@ impl Default for H323Helper {
 }
 
 impl H323Helper {
+    /// A new H.323 helper.
     pub fn new() -> H323Helper {
         H323Helper::default()
     }

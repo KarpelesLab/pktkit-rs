@@ -100,9 +100,14 @@ impl OpenedPorts {
     }
 }
 
+// The helper traits are the interface between the NAT and the ALGs in this
+// module. They are `pub` only so that `Nat::add_packet_helper` and
+// `Nat::add_local_helper` can name them in their bounds: this module is
+// private and they are not re-exported, so no other crate can name or
+// implement them. Their methods hand a helper the NAT's own state (mappings,
+// expectations), which is not an interface to commit to.
+
 /// Common base every NAT helper exposes.
-///
-/// Mirrors Go's `nat.Helper`.
 pub trait Helper: Send + Sync {
     fn name(&self) -> &str;
     fn close(&self) -> crate::Result<()> {
@@ -235,7 +240,6 @@ impl Expectation {
 setters! {
     Expectation {
         set remote_ip: Ipv4Addr;
-        set remote_port: u16;
         set namespace: u64;
     }
 }
@@ -244,14 +248,21 @@ setters! {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct PortForward {
+    /// IP protocol number: 6 for TCP, 17 for UDP.
     pub proto: u8,
+    /// Port on the NAT's outside address that is forwarded.
     pub outside_port: u16,
+    /// Inside host the traffic goes to.
     pub inside_ip: Ipv4Addr,
+    /// Port on the inside host the traffic goes to.
     pub inside_port: u16,
+    /// Free-form label, e.g. the UPnP `NewPortMappingDescription`.
     pub description: String,
     /// `None` = permanent.
     pub expires: Option<Instant>,
-    /// Inside namespace of `inside_ip` (see [`NatMapping::namespace`]).
+    /// Inside namespace of `inside_ip`: 0 for the NAT's own inside
+    /// interface, otherwise the attachment made through
+    /// [`L3Connector::connect_l3`](crate::L3Connector::connect_l3).
     pub namespace: u64,
     /// Which [`Nat::add_port_forward`](super::Nat::add_port_forward) call
     /// installed this forward, assigned by the NAT. Whoever added a forward
