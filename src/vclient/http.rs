@@ -19,7 +19,9 @@ use std::time::Duration;
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct Response {
+    /// The status code, such as 200.
     pub status: u16,
+    /// The reason phrase from the status line, such as `OK`.
     pub reason: String,
     /// Header fields by lowercase name. A field sent more than once maps to
     /// its values joined by `", "`, the list they stand for — except
@@ -29,6 +31,7 @@ pub struct Response {
     /// one list (their values contain commas, as in `Expires=`), so RFC 9110
     /// §5.3 keeps them apart.
     pub set_cookies: Vec<String>,
+    /// The body, with any chunked transfer coding removed.
     pub body: Vec<u8>,
 }
 
