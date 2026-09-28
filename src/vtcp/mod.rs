@@ -25,8 +25,8 @@
 //! - RFC 6191: a new SYN may reuse a 4-tuple in TIME-WAIT when its
 //!   timestamps show it is newer.
 //! - RFC 6528: initial sequence numbers from a keyed hash and a clock.
-//! - RFC 4987: SYN cookies ([`SynCookies`]) for stateless half-open
-//!   completion.
+//! - RFC 4987: SYN cookies for stateless half-open completion (used by
+//!   `vclient`'s listener).
 //! - RFC 2525 §2.17: releasing a connection with unread data resets it.
 //!
 //! # Layering: blocking I/O and accept live above this engine
@@ -39,37 +39,30 @@
 //! - Blocking, `std::io::Read`/`Write` connection handles: `vclient::TcpConn`
 //!   (client side) and `slirp::TcpStream` (server side) wrap a `Conn` with a
 //!   `Condvar` and a tick thread (enable the `vclient` / `slirp` features).
-//! - Accept queues: `slirp::Listener` builds one on top of
-//!   [`Conn::accept_syn`], and [`syncookie::SynCookies`] is available for the
-//!   stateless-completion variant.
+//! - Accept queues: `slirp::Listener` and `vclient::Listener` build them on
+//!   top of [`Conn::accept_syn`].
 //!
 //! Synchronous mutual recursion is avoided by the return-segments API: methods
 //! hand back outgoing bytes (`take_outgoing`) rather than calling a sink, so the
 //! caller drains them explicitly and the borrow checker keeps re-entrancy out.
 
-pub mod congestion;
-pub mod conn;
-pub mod options;
-pub mod recvbuf;
-pub mod rto;
+pub(crate) mod congestion;
+pub(crate) mod conn;
+pub(crate) mod options;
+pub(crate) mod recvbuf;
+pub(crate) mod rto;
 pub(crate) mod secret;
-pub mod segment;
-pub mod sendbuf;
-pub mod seqspace;
-pub mod syncookie;
+pub(crate) mod segment;
+pub(crate) mod sendbuf;
+pub(crate) mod seqspace;
+// Only vclient's listener answers SYNs statelessly so far.
+#[cfg(any(feature = "vclient", test))]
+pub(crate) mod syncookie;
 
-pub use congestion::{CongestionController, HighSpeed, NewReno};
 pub use conn::{CongestionKind, Conn, ConnConfig, State};
-pub use options::{
-    SackBlock, TcpOption, build_options, get_mss, get_sack_blocks, get_timestamp, get_wscale,
-    has_sack_perm, kind, mss_option, parse_options, sack_option, sack_perm_option,
-    timestamp_option, wscale_option,
-};
-pub use recvbuf::RecvBuf;
-pub use rto::{DEFAULT_RTO, MAX_RTO, MIN_RTO, RtoState};
+pub use options::{TcpOption, kind};
 pub use segment::{Segment, flags};
-pub use sendbuf::SendBuf;
-pub use seqspace::{
-    seq_after, seq_after_eq, seq_before, seq_before_eq, seq_in_range, seq_in_range_inclusive,
-};
-pub use syncookie::SynCookies;
+
+// nat's UPnP tests read the window scale off a SYN-ACK.
+#[cfg(all(test, feature = "nat"))]
+pub(crate) use options::get_wscale;

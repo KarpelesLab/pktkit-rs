@@ -309,6 +309,7 @@ impl RecvBuf {
 
     /// Up to 3 SACK blocks describing out-of-order data: as many as fit
     /// beside a timestamp option. See [`sack_blocks_up_to`](Self::sack_blocks_up_to).
+    #[cfg(test)]
     pub fn sack_blocks(&self) -> Vec<SackBlock> {
         self.sack_blocks_up_to(3)
     }

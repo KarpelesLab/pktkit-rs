@@ -92,20 +92,34 @@ const MTU_PLATEAUS: [u32; 10] = [32000, 17914, 8166, 4352, 2002, 1492, 1006, 508
 /// TCP state per RFC 9293 §3.3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
+    /// No connection: not yet opened, or finished.
     Closed,
+    /// Waiting for a SYN.
     Listen,
+    /// SYN sent ([`Conn::connect`]), waiting for the SYN-ACK.
     SynSent,
+    /// SYN received and SYN-ACK sent, waiting for the final ACK.
     SynReceived,
+    /// Open: data flows both ways.
     Established,
+    /// We closed; our FIN is not yet acknowledged.
     FinWait1,
+    /// We closed and our FIN is acknowledged; waiting for the peer's.
     FinWait2,
+    /// The peer closed; we may still send until we close.
     CloseWait,
+    /// Both sides closed at once; waiting for our FIN's ACK.
     Closing,
+    /// The peer closed first, then we did; waiting for our FIN's ACK.
     LastAck,
+    /// Both FINs exchanged; waiting out stray segments before the 4-tuple
+    /// can be reused ([`ConnConfig::time_wait`]).
     TimeWait,
 }
 
 impl State {
+    /// True in the states past the handshake (RFC 9293's synchronized
+    /// states): ESTABLISHED and every closing state.
     pub fn is_synchronized(self) -> bool {
         matches!(
             self,
@@ -123,6 +137,7 @@ impl State {
 /// Choice of congestion controller.
 #[derive(Debug, Clone, Copy, Default)]
 pub enum CongestionKind {
+    /// NewReno (RFC 5681, with RFC 6582's partial-ACK handling).
     NewReno,
     /// HighSpeed TCP (RFC 3649). Default.
     #[default]
@@ -137,26 +152,50 @@ fn make_cc(kind: CongestionKind, mss: u32) -> Box<dyn CongestionController> {
 }
 
 /// Connection configuration.
+///
+/// Build one from `ConnConfig::default()` with the chainable setters:
+/// `ConnConfig::default().local_port(40000).remote_port(80)`.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct ConnConfig {
+    /// Our address. The engine never writes IP headers; the addresses key
+    /// the initial sequence number, and give the address family the path
+    /// MTU floor depends on. `None` by default.
     pub local_addr: std::option::Option<SocketAddr>,
+    /// The peer's address, as for `local_addr`. `None` by default.
     pub remote_addr: std::option::Option<SocketAddr>,
+    /// Our TCP port.
     pub local_port: u16,
+    /// The peer's TCP port.
     pub remote_port: u16,
+    /// The largest segment we accept, advertised in our SYN, and the cap
+    /// on what we send. 1460 by default.
     pub mss: u16,
+    /// Do not offer window scaling (RFC 7323), which is offered by default.
     pub no_window_scaling: bool,
+    /// Offer timestamps (RFC 7323), for RTT measurement and PAWS. Off by
+    /// default.
     pub enable_timestamps: bool,
     /// Offer SACK (RFC 2018); used only if the peer offers it too. On by
     /// default: without it a receiver can only report the first hole in the
     /// stream, and a sender repairs one hole per round trip.
     pub enable_sack: bool,
+    /// The congestion controller. HighSpeed by default.
     pub congestion: CongestionKind,
+    /// Probe an idle connection with keepalives. Off by default.
     pub keepalive: bool,
+    /// Idle time before the first keepalive probe. 300 s by default.
     pub keepalive_idle: Duration,
+    /// Time between unanswered keepalive probes. 15 s by default.
     pub keepalive_interval: Duration,
+    /// Unanswered keepalive probes before the connection is reset. 3 by
+    /// default.
     pub keepalive_count: u32,
+    /// Send buffer size in bytes: written data queued or not yet
+    /// acknowledged. 1 MiB by default.
     pub send_buf_size: usize,
+    /// Receive buffer size in bytes, which bounds the advertised window.
+    /// 1 MiB by default.
     pub recv_buf_size: usize,
     /// How long FIN-WAIT-2 may go without hearing from the peer before the
     /// connection is reset, once it has been [released](Conn::release).
@@ -166,8 +205,10 @@ pub struct ConnConfig {
     /// ([`Conn::close`]): the application is still reading, and the peer
     /// may send for as long as it likes. Measured from the release or the
     /// last segment received, whichever is later. `None` waits forever.
+    /// 60 s by default.
     pub fin_wait2_timeout: Option<Duration>,
-    /// How long TIME-WAIT lasts ([`TIME_WAIT_DURATION`] by default).
+    /// How long TIME-WAIT lasts. 60 s by default, as on Linux; RFC 9293
+    /// asks for 2*MSL (4 minutes).
     pub time_wait: Duration,
     /// Turn off the Nagle algorithm (RFC 9293 §3.7.4), as `TCP_NODELAY`
     /// does: a write shorter than a segment goes out at once even with data
@@ -374,6 +415,8 @@ impl std::fmt::Debug for Conn {
 }
 
 impl Conn {
+    /// A connection in CLOSED, configured by `cfg`. Open it with
+    /// [`connect`](Self::connect) or [`accept_syn`](Self::accept_syn).
     pub fn new(cfg: ConnConfig) -> Self {
         // Pick a window scale that lets the recv buffer fit into a 16-bit
         // advertised window after scaling.
@@ -456,11 +499,14 @@ impl Conn {
 
     // --- Accessors ---------------------------------------------------------
 
+    /// The current state.
     #[inline]
     pub fn state(&self) -> State {
         self.state
     }
 
+    /// True once the connection has ended: closed, reset, aborted or timed
+    /// out. A connection not yet opened is not closed.
     #[inline]
     pub fn is_closed(&self) -> bool {
         self.closed
@@ -478,10 +524,12 @@ impl Conn {
         self.fin_recvd_signaled
     }
 
+    /// [`ConnConfig::local_addr`].
     #[inline]
     pub fn local_addr(&self) -> std::option::Option<SocketAddr> {
         self.cfg.local_addr
     }
+    /// [`ConnConfig::remote_addr`].
     #[inline]
     pub fn remote_addr(&self) -> std::option::Option<SocketAddr> {
         self.cfg.remote_addr
@@ -513,7 +561,7 @@ impl Conn {
     /// The path MTU only ever goes down (RFC 1191 §6.3, RFC 8201 §4): an
     /// `mtu` at or above [`path_mtu`](Self::path_mtu) changes nothing. Nor
     /// does it go below the family's floor: 1280 for IPv6, the minimum link
-    /// MTU (RFC 8201 §4), and [`IPV4_MIN_PATH_MTU`] for IPv4. An IPv4 `mtu`
+    /// MTU (RFC 8201 §4), and 552 for IPv4 (Linux's `ip_rt_min_pmtu`). An IPv4 `mtu`
     /// below 68, such as the 0 that a router predating RFC 1191 reports, is
     /// no MTU at all; the next plateau below the current path MTU (RFC 1191
     /// §7) is taken instead.
@@ -677,7 +725,8 @@ impl Conn {
     /// would find no connection and be reset. It negotiates what a cookie
     /// can carry: the MSS, and no window scaling, SACK or timestamps.
     /// Nothing is sent now; the SYN-ACK went out, statelessly, already.
-    pub fn accept_cookie_syn_received(&mut self, ack: &Segment, our_iss: u32, mss: u16) {
+    #[cfg_attr(not(feature = "vclient"), allow(dead_code))]
+    pub(crate) fn accept_cookie_syn_received(&mut self, ack: &Segment, our_iss: u32, mss: u16) {
         let syn = Segment {
             src_port: ack.src_port,
             dst_port: ack.dst_port,
@@ -731,7 +780,8 @@ impl Conn {
     /// completed it, which [`SynCookies::validate_ack`](super::SynCookies::validate_ack)
     /// accepted with `mss`. Its payload, if any, is taken as data, and its
     /// window as the peer's (unscaled: a cookie cannot carry window scaling).
-    pub fn accept_cookie(&mut self, ack: &Segment, our_iss: u32, mss: u16) -> Vec<Vec<u8>> {
+    #[cfg_attr(not(feature = "vclient"), allow(dead_code))]
+    pub(crate) fn accept_cookie(&mut self, ack: &Segment, our_iss: u32, mss: u16) -> Vec<Vec<u8>> {
         let remote_seq = ack.seq;
         let initial_data = &ack.payload[..];
         if self.state != State::Closed && self.state != State::Listen {

@@ -10,7 +10,7 @@ use std::net::{IpAddr, Ipv6Addr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use pktkit::vtcp::segment::Segment;
+use pktkit::vtcp::Segment;
 use pktkit::vtcp::{Conn, ConnConfig, State};
 use pktkit::{IpPrefix, L3Device, Packet, Protocol};
 

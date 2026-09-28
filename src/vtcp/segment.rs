@@ -5,13 +5,19 @@ use std::io;
 
 use super::options::{self, TcpOption};
 
-/// TCP header flag bits.
+/// TCP header flag bits, for [`Segment::flags`] and [`Segment::has_flag`].
 pub mod flags {
+    /// No more data from the sender.
     pub const FIN: u8 = 0x01;
+    /// Synchronize sequence numbers.
     pub const SYN: u8 = 0x02;
+    /// Reset the connection.
     pub const RST: u8 = 0x04;
+    /// Push.
     pub const PSH: u8 = 0x08;
+    /// The acknowledgment field is significant.
     pub const ACK: u8 = 0x10;
+    /// The urgent pointer is significant.
     pub const URG: u8 = 0x20;
 }
 
@@ -22,15 +28,25 @@ pub mod flags {
 /// the segment alone does not have).
 #[derive(Debug, Clone, Default)]
 pub struct Segment {
+    /// Source port.
     pub src_port: u16,
+    /// Destination port.
     pub dst_port: u16,
+    /// Sequence number.
     pub seq: u32,
+    /// Acknowledgment number.
     pub ack: u32,
+    /// Flag bits; see [`flags`].
     pub flags: u8,
+    /// Advertised window, unscaled as on the wire.
     pub window: u16,
+    /// Checksum as parsed; ignored by [`marshal`](Self::marshal).
     pub checksum: u16,
+    /// Urgent pointer.
     pub urgent: u16,
+    /// Options, in wire order.
     pub options: Vec<TcpOption>,
+    /// Payload bytes.
     pub payload: Vec<u8>,
 }
 

@@ -1,7 +1,7 @@
 //! Sender-side byte buffer with SACK scoreboard.
 
 use super::options::SackBlock;
-use super::seqspace::{seq_after, seq_after_eq, seq_before, seq_before_eq};
+use super::seqspace::{seq_after, seq_before, seq_before_eq};
 
 /// Cap on the SACK scoreboard. Each entry is a range the receiver reported
 /// separately, so this bounds how many holes a peer can make us track.
@@ -218,10 +218,11 @@ impl SendBuf {
     }
 
     /// True iff `seq` lies within any SACK block.
+    #[cfg(test)]
     pub fn is_sacked(&self, seq: u32) -> bool {
         self.sacked
             .iter()
-            .any(|b| seq_after_eq(seq, b.left) && seq_before(seq, b.right))
+            .any(|b| super::seqspace::seq_after_eq(seq, b.left) && seq_before(seq, b.right))
     }
 
     /// The first hole in the in-flight data, for retransmission: its
@@ -382,7 +383,7 @@ impl SendBuf {
     }
 
     /// True if no data is buffered, unacknowledged or not yet sent.
-    #[inline]
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.data().is_empty()
     }
@@ -397,12 +398,6 @@ impl SendBuf {
     #[inline]
     pub fn nxt(&self) -> u32 {
         self.nxt
-    }
-
-    /// The most bytes the buffer holds.
-    #[inline]
-    pub fn capacity(&self) -> usize {
-        self.cap
     }
 
     /// Room left for more data, in bytes.

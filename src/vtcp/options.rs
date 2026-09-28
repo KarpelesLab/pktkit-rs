@@ -1,14 +1,21 @@
 //! TCP option codec (RFCs 793, 2018, 7323).
 
-/// TCP option kinds.
+/// TCP option kinds, the values of [`TcpOption::kind`].
 #[allow(non_upper_case_globals)]
 pub mod kind {
+    /// End of option list.
     pub const End: u8 = 0;
+    /// No-operation (padding).
     pub const Nop: u8 = 1;
+    /// Maximum segment size (RFC 9293).
     pub const Mss: u8 = 2;
+    /// Window scale (RFC 7323).
     pub const WScale: u8 = 3;
+    /// SACK permitted (RFC 2018).
     pub const SackPerm: u8 = 4;
+    /// SACK blocks (RFC 2018).
     pub const Sack: u8 = 5;
+    /// Timestamps (RFC 7323).
     pub const Timestamp: u8 = 8;
 }
 
@@ -16,7 +23,9 @@ pub mod kind {
 /// bytes for kinds that carry a length).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TcpOption {
+    /// The option kind; see [`kind`].
     pub kind: u8,
+    /// The option's payload, without its kind and length bytes.
     pub data: Vec<u8>,
 }
 

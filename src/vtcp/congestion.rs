@@ -94,6 +94,7 @@ impl NewReno {
     }
 
     /// The slow-start threshold, in bytes; `u32::MAX` until the first loss.
+    #[cfg(test)]
     pub fn ssthresh(&self) -> u32 {
         self.ssthresh
     }
@@ -244,6 +245,7 @@ impl HighSpeed {
     }
 
     /// The slow-start threshold, in bytes; `u32::MAX` until the first loss.
+    #[cfg(test)]
     pub fn ssthresh(&self) -> u32 {
         self.ssthresh
     }

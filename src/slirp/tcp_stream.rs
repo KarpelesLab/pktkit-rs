@@ -364,8 +364,8 @@ impl ConnState {
 ///
 /// After the drop nobody is left to read, so the peer is reset if it sends
 /// more data, or if it ACKs our FIN but then goes quiet without sending its
-/// own for vtcp's FIN-WAIT-2 timeout
-/// ([`DEFAULT_FIN_WAIT2_TIMEOUT`](crate::vtcp::conn::DEFAULT_FIN_WAIT2_TIMEOUT)),
+/// own for vtcp's FIN-WAIT-2 timeout (60 s; see
+/// [`ConnConfig::fin_wait2_timeout`](crate::vtcp::ConnConfig::fin_wait2_timeout)),
 /// as Linux does for an orphaned socket. [`close`](Self::close) alone is a
 /// half-close: the handle can still read, and the peer may take as long as
 /// it likes.

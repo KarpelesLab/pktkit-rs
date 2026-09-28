@@ -324,7 +324,7 @@ pub fn vtcp_segment(data: &[u8]) {
     if let Ok(seg) = crate::vtcp::Segment::parse(data) {
         let _ = format!("{:?}", seg);
     }
-    let _ = crate::vtcp::parse_options(data);
+    let _ = crate::vtcp::options::parse_options(data);
 }
 
 /// A TCP conversation between two engines, with the fuzzer as the network

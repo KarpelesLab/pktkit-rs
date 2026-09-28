@@ -9,7 +9,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use pktkit::vtcp::segment::Segment;
+use pktkit::vtcp::Segment;
 use pktkit::vtcp::{Conn, ConnConfig};
 use pktkit::{IpPrefix, L3Device, Packet, Protocol};
 
@@ -63,8 +63,8 @@ fn dial_handshake_and_bidirectional_data() {
         let mut srv = server_for_handler.lock().unwrap();
         // Set the server's remote port from the first SYN we see.
         let resp = if srv.state() == pktkit::vtcp::State::Closed
-            && seg.has_flag(pktkit::vtcp::segment::flags::SYN)
-            && !seg.has_flag(pktkit::vtcp::segment::flags::ACK)
+            && seg.has_flag(pktkit::vtcp::flags::SYN)
+            && !seg.has_flag(pktkit::vtcp::flags::ACK)
         {
             // Re-create the server conn now that we know the client's port.
             *srv = Conn::new(
@@ -299,10 +299,11 @@ fn handshake_completing_after_listener_closed_is_reset() {
     listener.close();
     deliver(peer.handle_segment(&Segment::parse(&synack).unwrap()));
     assert_eq!(peer.state(), pktkit::vtcp::State::Established);
-    let rst =
-        sent.lock().unwrap().iter().any(|s| {
-            Segment::parse(s).is_ok_and(|s| s.has_flag(pktkit::vtcp::segment::flags::RST))
-        });
+    let rst = sent
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|s| Segment::parse(s).is_ok_and(|s| s.has_flag(pktkit::vtcp::flags::RST)));
     assert!(rst, "the orphaned connection was not reset");
 }
 
