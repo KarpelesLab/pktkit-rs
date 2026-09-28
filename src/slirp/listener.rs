@@ -8,11 +8,15 @@
 
 use crate::Result;
 use crate::slirp::tcp_stream::{ConnState, Offer, TcpStream};
+use crate::time::Instant;
+use crate::vtcp::Segment;
+use crate::vtcp::syncookie::SynCookies;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::time::Duration;
 
 /// Bounded accept-queue depth; mirrors the Go `acceptCh` buffer of 10.
 pub(crate) const ACCEPT_QUEUE_CAP: usize = 10;
@@ -24,8 +28,80 @@ pub(crate) const ACCEPT_QUEUE_CAP: usize = 10;
 ///
 /// Like the stack's other caps, it is shared out between namespaces (see
 /// `usernat::NS_SHARE`): one guest sending SYNs it never completes would
-/// otherwise keep the backlog full for every guest.
+/// otherwise keep the backlog full for every guest. SYNs past it are
+/// answered with a SYN cookie (see [`CookieJar`]).
 pub(crate) const HALF_OPEN_CAP: usize = 128;
+
+/// Half-open connections a listener holds counting those rebuilt from a
+/// SYN cookie whose ACK came in while the accept queue was full. The
+/// backlog is full then (or the SYN would not have had a cookie), and
+/// without this headroom the cookie's peer would be reset as soon as it
+/// sent a second segment. Such a peer has shown it receives at its
+/// address, which a flood of SYNs does not, but a bound is still needed
+/// against one that opens and abandons connections on purpose.
+pub(crate) const COOKIE_HALF_OPEN_CAP: usize = 2 * HALF_OPEN_CAP;
+
+/// How long after the last cookie went out an ACK is still checked for one:
+/// a cookie is valid for 64 to 128 s (two counter periods of vtcp's
+/// `SynCookies`).
+const COOKIE_WINDOW: Duration = Duration::from_secs(128);
+
+/// A listener's SYN cookies: past its backlog, a SYN is answered with a
+/// SYN-ACK that carries the handshake's state in its sequence number and
+/// keeps none here, so SYNs that are never completed cannot lock out the
+/// peers that do complete theirs.
+#[derive(Debug, Default)]
+pub(crate) struct CookieJar {
+    cookies: SynCookies,
+    /// When the last cookie went out. Only an ACK arriving soon enough
+    /// after is checked for one, so stray ACKs are not hashed otherwise.
+    sent: Mutex<Option<Instant>>,
+}
+
+impl CookieJar {
+    /// The SYN-ACK answering `syn`, received at `local` from `remote`, with
+    /// a cookie for its ISS. `mss` is the MSS we advertise.
+    pub(crate) fn syn_ack(
+        &self,
+        syn: &Segment,
+        local: IpAddr,
+        remote: IpAddr,
+        mss: u16,
+    ) -> Segment {
+        *self.sent.lock().expect("poisoned") = Some(Instant::now());
+        self.cookies.generate_syn_ack(syn, local, remote, mss)
+    }
+
+    /// The MSS to send with, if `ack`, received at `local` from `remote`,
+    /// completes a cookie handshake.
+    pub(crate) fn validate(&self, ack: &Segment, local: IpAddr, remote: IpAddr) -> Option<u16> {
+        let recent = self
+            .sent
+            .lock()
+            .expect("poisoned")
+            .is_some_and(|t| Instant::now().saturating_duration_since(t) < COOKIE_WINDOW);
+        if !recent {
+            return None;
+        }
+        let (mss, _) = self.cookies.validate_ack(ack, local, remote)?;
+        Some(mss)
+    }
+}
+
+/// What the stack's accept path needs of a listener, IPv4 or IPv6.
+pub(crate) trait Backlog: Send + Sync + 'static {
+    /// Enqueue a connection whose handshake has completed.
+    fn enqueue(&self, state: &Arc<ConnState>) -> Offer;
+    /// Whether the accept queue has no room for `state`, listing it to be
+    /// offered room once it has.
+    fn hold(&self, state: &Arc<ConnState>) -> bool;
+    /// Whether the accept queue is full.
+    fn queue_full(&self) -> bool;
+    /// A half-open slot for namespace `ns`, unless the listener has `cap`
+    /// in use, or `ns` has `ns_cap`.
+    fn half_open_slot(&self, ns: u64, cap: usize, ns_cap: usize) -> Option<HalfOpenSlot>;
+    fn cookies(&self) -> &CookieJar;
+}
 
 /// A listener's half-open connections, in all and per namespace.
 #[derive(Debug, Default)]
@@ -44,15 +120,16 @@ pub(crate) struct HalfOpenSlot {
 
 impl HalfOpenSlot {
     /// Take a slot for namespace `ns` from `table`, unless the listener has
-    /// all [`HALF_OPEN_CAP`] in use or `ns` already holds `ns_cap`.
+    /// `cap` in use or `ns` already holds `ns_cap`.
     pub(crate) fn take(
         table: &Arc<Mutex<HalfOpen>>,
         ns: u64,
+        cap: usize,
         ns_cap: usize,
     ) -> Option<HalfOpenSlot> {
         let mut t = table.lock().expect("poisoned");
         let mine = t.per_ns.get(&ns).copied().unwrap_or(0);
-        if t.all >= HALF_OPEN_CAP || mine >= ns_cap {
+        if t.all >= cap || mine >= ns_cap {
             return None;
         }
         t.all += 1;
@@ -181,6 +258,7 @@ pub struct Listener {
     unregister: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Connections still in their handshake; see [`HalfOpenSlot`].
     half_open: Arc<Mutex<HalfOpen>>,
+    cookies: CookieJar,
 }
 
 impl core::fmt::Debug for Listener {
@@ -202,6 +280,7 @@ impl Listener {
             waiting: Mutex::new(Waiting::default()),
             unregister: Mutex::new(None),
             half_open: Arc::default(),
+            cookies: CookieJar::default(),
         }
     }
 
@@ -251,11 +330,8 @@ impl Listener {
         true
     }
 
-    /// A half-open slot for a new connection from namespace `ns`, or `None`
-    /// when the listener already has [`HALF_OPEN_CAP`] handshakes under way,
-    /// or `ns` has `ns_cap` of them.
-    pub(crate) fn half_open_slot(&self, ns: u64, ns_cap: usize) -> Option<HalfOpenSlot> {
-        HalfOpenSlot::take(&self.half_open, ns, ns_cap)
+    fn queue_full(&self) -> bool {
+        self.queue.lock().expect("poisoned").len() >= ACCEPT_QUEUE_CAP
     }
 
     /// Block until a connection is available, returning the accepted stream.
@@ -305,6 +381,24 @@ impl Listener {
         }
         self.signal.notify_all();
         Ok(())
+    }
+}
+
+impl Backlog for Listener {
+    fn enqueue(&self, state: &Arc<ConnState>) -> Offer {
+        Listener::enqueue(self, state)
+    }
+    fn hold(&self, state: &Arc<ConnState>) -> bool {
+        Listener::hold(self, state)
+    }
+    fn queue_full(&self) -> bool {
+        Listener::queue_full(self)
+    }
+    fn half_open_slot(&self, ns: u64, cap: usize, ns_cap: usize) -> Option<HalfOpenSlot> {
+        HalfOpenSlot::take(&self.half_open, ns, cap, ns_cap)
+    }
+    fn cookies(&self) -> &CookieJar {
+        &self.cookies
     }
 }
 

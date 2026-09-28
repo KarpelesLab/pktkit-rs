@@ -41,7 +41,7 @@ pub(crate) enum Endpoints {
 impl Endpoints {
     /// Wrap a marshaled TCP segment in IP with correct checksums. The segment
     /// travels local→remote (server→client).
-    fn wrap(&self, seg: &[u8]) -> Vec<u8> {
+    pub(crate) fn wrap(&self, seg: &[u8]) -> Vec<u8> {
         match self {
             Endpoints::V4 {
                 local_ip,
@@ -72,7 +72,7 @@ impl Endpoints {
         }
     }
 
-    fn local_addr(&self) -> SocketAddr {
+    pub(crate) fn local_addr(&self) -> SocketAddr {
         match self {
             Endpoints::V4 {
                 local_ip,
@@ -87,7 +87,7 @@ impl Endpoints {
         }
     }
 
-    fn peer_addr(&self) -> SocketAddr {
+    pub(crate) fn peer_addr(&self) -> SocketAddr {
         match self {
             Endpoints::V4 {
                 remote_ip,

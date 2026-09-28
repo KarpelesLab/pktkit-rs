@@ -725,7 +725,7 @@ impl Conn {
     /// would find no connection and be reset. It negotiates what a cookie
     /// can carry: the MSS, and no window scaling, SACK or timestamps.
     /// Nothing is sent now; the SYN-ACK went out, statelessly, already.
-    #[cfg_attr(not(feature = "vclient"), allow(dead_code))]
+    #[cfg_attr(not(any(feature = "vclient", feature = "slirp")), allow(dead_code))]
     pub(crate) fn accept_cookie_syn_received(&mut self, ack: &Segment, our_iss: u32, mss: u16) {
         let syn = Segment {
             src_port: ack.src_port,
@@ -780,7 +780,7 @@ impl Conn {
     /// completed it, which [`SynCookies::validate_ack`](super::SynCookies::validate_ack)
     /// accepted with `mss`. Its payload, if any, is taken as data, and its
     /// window as the peer's (unscaled: a cookie cannot carry window scaling).
-    #[cfg_attr(not(feature = "vclient"), allow(dead_code))]
+    #[cfg_attr(not(any(feature = "vclient", feature = "slirp")), allow(dead_code))]
     pub(crate) fn accept_cookie(&mut self, ack: &Segment, our_iss: u32, mss: u16) -> Vec<Vec<u8>> {
         let remote_seq = ack.seq;
         let initial_data = &ack.payload[..];

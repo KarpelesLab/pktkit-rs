@@ -8,7 +8,9 @@
 //! queue.
 
 use crate::Result;
-use crate::slirp::listener::{ACCEPT_QUEUE_CAP, HalfOpen, HalfOpenSlot, Waiting};
+use crate::slirp::listener::{
+    ACCEPT_QUEUE_CAP, Backlog, CookieJar, HalfOpen, HalfOpenSlot, Waiting,
+};
 use crate::slirp::tcp_stream::{ConnState, Offer, TcpStream};
 use std::collections::VecDeque;
 use std::io;
@@ -38,6 +40,7 @@ pub struct Listener6 {
     unregister: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Connections still in their handshake; see [`HalfOpenSlot`].
     half_open: Arc<Mutex<HalfOpen>>,
+    cookies: CookieJar,
 }
 
 impl core::fmt::Debug for Listener6 {
@@ -59,6 +62,7 @@ impl Listener6 {
             waiting: Mutex::new(Waiting::default()),
             unregister: Mutex::new(None),
             half_open: Arc::default(),
+            cookies: CookieJar::default(),
         }
     }
 
@@ -108,12 +112,8 @@ impl Listener6 {
         true
     }
 
-    /// A half-open slot for a new connection from namespace `ns`, or `None`
-    /// when the listener already has
-    /// [`HALF_OPEN_CAP`](super::listener::HALF_OPEN_CAP) handshakes under
-    /// way, or `ns` has `ns_cap` of them.
-    pub(crate) fn half_open_slot(&self, ns: u64, ns_cap: usize) -> Option<HalfOpenSlot> {
-        HalfOpenSlot::take(&self.half_open, ns, ns_cap)
+    fn queue_full(&self) -> bool {
+        self.queue.lock().expect("poisoned").len() >= ACCEPT_QUEUE_CAP
     }
 
     /// Block until a connection is available, returning the accepted stream.
@@ -163,6 +163,24 @@ impl Listener6 {
         }
         self.signal.notify_all();
         Ok(())
+    }
+}
+
+impl Backlog for Listener6 {
+    fn enqueue(&self, state: &Arc<ConnState>) -> Offer {
+        Listener6::enqueue(self, state)
+    }
+    fn hold(&self, state: &Arc<ConnState>) -> bool {
+        Listener6::hold(self, state)
+    }
+    fn queue_full(&self) -> bool {
+        Listener6::queue_full(self)
+    }
+    fn half_open_slot(&self, ns: u64, cap: usize, ns_cap: usize) -> Option<HalfOpenSlot> {
+        HalfOpenSlot::take(&self.half_open, ns, cap, ns_cap)
+    }
+    fn cookies(&self) -> &CookieJar {
+        &self.cookies
     }
 }
 

@@ -26,7 +26,9 @@ use crate::slirp::checksum::{tcp_ok, udp_ok};
 use crate::slirp::icmpv4::build_icmpv4_echo_reply;
 use crate::slirp::icmpv6::build_icmpv6_echo_reply;
 use crate::slirp::ipv6::skip_extension_headers;
-use crate::slirp::listener::{HALF_OPEN_CAP, Listener, ListenerKey, resolve_v4};
+use crate::slirp::listener::{
+    Backlog, COOKIE_HALF_OPEN_CAP, HALF_OPEN_CAP, HalfOpenSlot, Listener, ListenerKey, resolve_v4,
+};
 use crate::slirp::listener6::{Listener6, ListenerKey6, resolve_v6};
 use crate::slirp::ns_table::{NsKey, NsTable};
 use crate::slirp::packet::{DEFAULT_MTU, MIN_MTU, fit_link, mss_for_mtu};
@@ -439,9 +441,12 @@ impl Stack {
     /// use [`listen6`](Self::listen6).
     ///
     /// A listener holds at most 128 connections in the middle of their
-    /// handshake, as a listen backlog does, and at most 10 completed ones
-    /// waiting for `accept`. A SYN that finds the handshakes at their cap is
-    /// dropped for the peer to retransmit. While the accept queue is full,
+    /// handshake, as a listen backlog does (a peer attached through
+    /// `connect_l3` a quarter of them, as for the stack's other caps), and
+    /// at most 10 completed ones waiting for `accept`. A SYN past the
+    /// backlog is answered with a SYN cookie, and the connection opened
+    /// only once the peer's ACK brings the cookie back; it does without
+    /// window scaling, SACK and timestamps. While the accept queue is full,
     /// a handshake is not completed, as on Linux: its connection stays half
     /// open, and what the peer sends unacknowledged, until `accept` makes
     /// room.
@@ -499,9 +504,12 @@ impl Stack {
     /// `"[]:port"` for every address.
     ///
     /// A listener holds at most 128 connections in the middle of their
-    /// handshake, as a listen backlog does, and at most 10 completed ones
-    /// waiting for `accept`. A SYN that finds the handshakes at their cap is
-    /// dropped for the peer to retransmit. While the accept queue is full,
+    /// handshake, as a listen backlog does (a peer attached through
+    /// `connect_l3` a quarter of them, as for the stack's other caps), and
+    /// at most 10 completed ones waiting for `accept`. A SYN past the
+    /// backlog is answered with a SYN cookie, and the connection opened
+    /// only once the peer's ACK brings the cookie back; it does without
+    /// window scaling, SACK and timestamps. While the accept queue is full,
     /// a handshake is not completed, as on Linux: its connection stays half
     /// open, and what the peer sends unacknowledged, until `accept` makes
     /// room.
@@ -851,6 +859,30 @@ impl Stack {
             return c.handle_segment(tcp);
         }
 
+        // The ACK completing a handshake a listener answered with a cookie?
+        if flags & (tcp_flags::SYN | tcp_flags::ACK | tcp_flags::RST) == tcp_flags::ACK
+            && let Some(listener) = Self::find_listener(inner, dst, dst_port)
+            && let Ok(seg) = Segment::parse(tcp)
+            && let Some(mss) = listener.cookies().validate(&seg, dst.into(), src.into())
+        {
+            let endpoints = Endpoints::V4 {
+                local_ip: dst,
+                local_port: dst_port,
+                remote_ip: src,
+                remote_port: src_port,
+            };
+            return Self::accept_cookie(
+                inner,
+                ns,
+                &inner.virt_tcp,
+                key,
+                endpoints,
+                &seg,
+                mss,
+                &listener,
+            );
+        }
+
         // Anything but a bare SYN to an unknown connection takes the
         // CLOSED-state path of RFC 9293 §3.10.7.1.
         if !opens_connection(flags) {
@@ -934,9 +966,7 @@ impl Stack {
     }
 
     /// Passive-open a server-side `vtcp::Conn` for an inbound SYN to a virtual
-    /// listener. Drives the SYN-ACK out, registers the connection, and spawns a
-    /// short-lived thread that enqueues the [`TcpStream`](super::TcpStream)
-    /// onto the listener once the handshake reaches ESTABLISHED.
+    /// listener; see [`accept_syn`](Self::accept_syn).
     #[allow(clippy::too_many_arguments)]
     fn accept_syn_v4(
         inner: &Arc<Inner>,
@@ -955,57 +985,133 @@ impl Stack {
             dst_ip: dst.octets(),
             dst_port,
         };
-        let cap = ns_cap(inner, ns, MAX_VIRT_TCP_CONNS);
-        let full = |t: &NsTable<Key, _>| t.len() >= MAX_VIRT_TCP_CONNS || t.ns_len(ns) >= cap;
-        if full(&inner.virt_tcp.lock().expect("poisoned")) {
-            return Ok(()); // silently drop; client will retransmit
-        }
-        // A full backlog, or the namespace's share of it (see [`NS_SHARE`]),
-        // drops the SYN, as Linux does: the peer retransmits,
-        // and by then a slot may have freed up. The accept queue being full
-        // is no reason to here, unlike on Linux: the handshake waits in
-        // SYN-RECEIVED, holding its half-open slot, for `accept` to make
-        // room (see `ConnState::held_back`).
-        // Dropping SYNs on a full queue as well would, with a queue this
-        // short, let through only a queue's worth of each synchronized wave
-        // of retransmitted SYNs from a burst of clients.
-        // TODO(slirp): past the backlog, answer with a stateless SYN-cookie
-        // (vtcp::SynCookies) SYN-ACK instead of dropping.
-        let backlog = ns_cap(inner, ns, HALF_OPEN_CAP);
-        let Some(slot) = listener.half_open_slot(ns, backlog) else {
-            return Ok(());
-        };
-        let seg = match Segment::parse(tcp) {
-            Ok(s) => s,
-            Err(_) => return Ok(()),
-        };
-
-        // Sink: wrap engine segments (built by ConnState) and inject them.
-        let sink = Self::sink(inner, ns);
-
-        let cfg = ConnConfig {
-            local_addr: Some(SocketAddr::new(std::net::IpAddr::V4(dst), dst_port)),
-            remote_addr: Some(SocketAddr::new(std::net::IpAddr::V4(src), src_port)),
+        let endpoints = Endpoints::V4 {
+            local_ip: dst,
             local_port: dst_port,
+            remote_ip: src,
             remote_port: src_port,
-            mss: Self::mss(inner, false),
+        };
+        Self::accept_syn(inner, ns, &inner.virt_tcp, key, endpoints, tcp, &listener)
+    }
+
+    /// Whether namespace `ns` may open no more virtual connections in `table`.
+    fn virt_full<K: NsKey, V>(inner: &Inner, ns: u64, table: &Mutex<NsTable<K, V>>) -> bool {
+        let cap = ns_cap(inner, ns, MAX_VIRT_TCP_CONNS);
+        let t = table.lock().expect("poisoned");
+        t.len() >= MAX_VIRT_TCP_CONNS || t.ns_len(ns) >= cap
+    }
+
+    /// The configuration of a connection passively opened at `endpoints`.
+    fn passive_config(inner: &Inner, endpoints: &Endpoints) -> ConnConfig {
+        let (local, remote) = (endpoints.local_addr(), endpoints.peer_addr());
+        ConnConfig {
+            local_addr: Some(local),
+            remote_addr: Some(remote),
+            local_port: local.port(),
+            remote_port: remote.port(),
+            mss: Self::mss(inner, local.is_ipv6()),
             keepalive: true,
             ..Default::default()
-        };
-        let mut conn = Conn::new(cfg);
-        let synack = conn.accept_syn(&seg);
+        }
+    }
 
-        let state = ConnState::new(
-            Endpoints::V4 {
-                local_ip: dst,
-                local_port: dst_port,
-                remote_ip: src,
-                remote_port: src_port,
-            },
-            conn,
-            sink,
-        );
-        let listener = Arc::downgrade(&listener);
+    /// Passive-open a server-side `vtcp::Conn` for an inbound SYN to
+    /// `listener`, register it in `table` and send the SYN-ACK. The
+    /// connection joins the listener's queue when an inbound segment
+    /// completes the handshake (see `ConnState::complete_accept`).
+    fn accept_syn<K: NsKey, L: Backlog>(
+        inner: &Arc<Inner>,
+        ns: u64,
+        table: &Mutex<NsTable<K, Arc<ConnState>>>,
+        key: K,
+        endpoints: Endpoints,
+        tcp: &[u8],
+        listener: &Arc<L>,
+    ) -> Result<()> {
+        if Self::virt_full(inner, ns, table) {
+            return Ok(()); // silently drop; client will retransmit
+        }
+        let Ok(seg) = Segment::parse(tcp) else {
+            return Ok(());
+        };
+        // Past the backlog, or the namespace's share of it (see
+        // [`NS_SHARE`]), the SYN is answered with a cookie and no state is
+        // kept, so SYNs that are never completed, from this namespace or
+        // any other, cannot lock out peers that complete theirs. The
+        // accept queue being full is no reason to do so, unlike on Linux:
+        // the handshake waits in SYN-RECEIVED, holding its half-open slot,
+        // for `accept` to make room (see `ConnState::held_back`). Answering
+        // SYNs on a full queue with cookies instead would, with a queue
+        // this short, have most handshakes of a burst of clients rebuilt
+        // from cookies, without the options a cookie cannot carry.
+        let backlog = ns_cap(inner, ns, HALF_OPEN_CAP);
+        let Some(slot) = listener.half_open_slot(ns, HALF_OPEN_CAP, backlog) else {
+            let (local, remote) = (endpoints.local_addr(), endpoints.peer_addr());
+            let mss = Self::mss(inner, local.is_ipv6());
+            let synack = listener
+                .cookies()
+                .syn_ack(&seg, local.ip(), remote.ip(), mss);
+            return Self::dispatch_fitted(inner, ns, &endpoints.wrap(&synack.marshal()));
+        };
+        let mut conn = Conn::new(Self::passive_config(inner, &endpoints));
+        let synack = conn.accept_syn(&seg);
+        let state = ConnState::new(endpoints, conn, Self::sink(inner, ns));
+        Self::register_passive(table, key, state, listener, Some(slot), synack);
+        Ok(())
+    }
+
+    /// Open a connection from `ack`, the ACK completing a cookie handshake
+    /// with `listener`, which [`CookieJar::validate`](crate::slirp::listener::CookieJar::validate)
+    /// accepted with `mss`, and register it in `table`.
+    #[allow(clippy::too_many_arguments)]
+    fn accept_cookie<K: NsKey, L: Backlog>(
+        inner: &Arc<Inner>,
+        ns: u64,
+        table: &Mutex<NsTable<K, Arc<ConnState>>>,
+        key: K,
+        endpoints: Endpoints,
+        ack: &Segment,
+        mss: u16,
+        listener: &Arc<L>,
+    ) -> Result<()> {
+        if Self::virt_full(inner, ns, table) {
+            return Ok(());
+        }
+        let mut conn = Conn::new(Self::passive_config(inner, &endpoints));
+        let iss = ack.ack.wrapping_sub(1);
+        let (slot, segs) = if !listener.queue_full() {
+            (None, conn.accept_cookie(ack, iss, mss))
+        } else {
+            // No room to accept it yet: the ACK is not taken, as for a
+            // handshake held back (see `ConnState::held_back`), but the
+            // SYN-RECEIVED state the cookie stood for is kept from here
+            // on, holding a half-open slot of the larger cookie budget.
+            // Dropped with no state, the peer's next segments, which carry
+            // no cookie, would be reset.
+            let cap = ns_cap(inner, ns, COOKIE_HALF_OPEN_CAP);
+            let Some(slot) = listener.half_open_slot(ns, COOKIE_HALF_OPEN_CAP, cap) else {
+                return Ok(()); // dropped, as Linux does
+            };
+            conn.accept_cookie_syn_received(ack, iss, mss);
+            (Some(slot), Vec::new())
+        };
+        let state = ConnState::new(endpoints, conn, Self::sink(inner, ns));
+        Self::register_passive(table, key, state, listener, slot, segs);
+        Ok(())
+    }
+
+    /// Put a passively opened connection in `table` under `key`, to be
+    /// handed to `listener` once its handshake completes, and send `segs`.
+    /// `slot` is the half-open slot it holds until then, if any.
+    fn register_passive<K: NsKey, L: Backlog>(
+        table: &Mutex<NsTable<K, Arc<ConnState>>>,
+        key: K,
+        state: Arc<ConnState>,
+        listener: &Arc<L>,
+        slot: Option<HalfOpenSlot>,
+        segs: Vec<Vec<u8>>,
+    ) {
+        let listener = Arc::downgrade(listener);
         let hold = listener.clone();
         state.set_pending_accept(
             Box::new(move |s| {
@@ -1016,15 +1122,12 @@ impl Stack {
             }),
             Box::new(move |s| hold.upgrade().is_some_and(|l| l.hold(s))),
         );
-        inner
-            .virt_tcp
-            .lock()
-            .expect("poisoned")
-            .insert(key, state.clone());
-        // Emit the SYN-ACK. The connection joins the listener's queue when an
-        // inbound segment completes the handshake (see `complete_accept`).
-        state.send(synack);
-        Ok(())
+        table.lock().expect("poisoned").insert(key, state.clone());
+        state.send(segs);
+        // A connection from a cookie is established already.
+        if !state.complete_accept() {
+            table.lock().expect("poisoned").remove(&key);
+        }
     }
 
     fn handle_ipv4_udp(
@@ -1229,6 +1332,30 @@ impl Stack {
             return c.handle_segment(tcp);
         }
 
+        // The ACK completing a cookie handshake, as in the IPv4 path.
+        if flags & (tcp_flags::SYN | tcp_flags::ACK | tcp_flags::RST) == tcp_flags::ACK
+            && let Some(listener) = Self::find_listener6(inner, dst, dst_port)
+            && let Ok(seg) = Segment::parse(tcp)
+            && let Some(mss) = listener.cookies().validate(&seg, dst.into(), src.into())
+        {
+            let endpoints = Endpoints::V6 {
+                local_ip: dst,
+                local_port: dst_port,
+                remote_ip: src,
+                remote_port: src_port,
+            };
+            return Self::accept_cookie(
+                inner,
+                ns,
+                &inner.virt_tcp6,
+                key,
+                endpoints,
+                &seg,
+                mss,
+                &listener,
+            );
+        }
+
         if !opens_connection(flags) {
             if let Some(rst) = build_rst_for_stray(tcp, dst_port, src_port) {
                 let pkt = crate::slirp::packet::build_packet6(dst, src, &rst);
@@ -1293,10 +1420,7 @@ impl Stack {
             .find(|l| !l.closed.load(Ordering::Acquire))
     }
 
-    /// IPv6 analogue of [`accept_syn_v4`](Self::accept_syn_v4): passive-open a
-    /// server-side `vtcp::Conn` for an inbound SYN to a virtual `Listener6`,
-    /// emit the SYN-ACK, register the connection in `virt_tcp6`, and spawn a
-    /// waiter that enqueues the [`TcpStream`](super::TcpStream) once ESTABLISHED.
+    /// IPv6 analogue of [`accept_syn_v4`](Self::accept_syn_v4).
     #[allow(clippy::too_many_arguments)]
     fn accept_syn_v6(
         inner: &Arc<Inner>,
@@ -1315,76 +1439,13 @@ impl Stack {
             dst_ip: dst.octets(),
             dst_port,
         };
-        let cap = ns_cap(inner, ns, MAX_VIRT_TCP_CONNS);
-        let full = |t: &NsTable<Key6, _>| t.len() >= MAX_VIRT_TCP_CONNS || t.ns_len(ns) >= cap;
-        if full(&inner.virt_tcp6.lock().expect("poisoned")) {
-            return Ok(()); // silently drop; client will retransmit
-        }
-        // A full backlog, or the namespace's share of it (see [`NS_SHARE`]),
-        // drops the SYN, as Linux does: the peer retransmits,
-        // and by then a slot may have freed up. The accept queue being full
-        // is no reason to here, unlike on Linux: the handshake waits in
-        // SYN-RECEIVED, holding its half-open slot, for `accept` to make
-        // room (see `ConnState::held_back`).
-        // Dropping SYNs on a full queue as well would, with a queue this
-        // short, let through only a queue's worth of each synchronized wave
-        // of retransmitted SYNs from a burst of clients.
-        // TODO(slirp): past the backlog, answer with a stateless SYN-cookie
-        // (vtcp::SynCookies) SYN-ACK instead of dropping.
-        let backlog = ns_cap(inner, ns, HALF_OPEN_CAP);
-        let Some(slot) = listener.half_open_slot(ns, backlog) else {
-            return Ok(());
-        };
-        let seg = match Segment::parse(tcp) {
-            Ok(s) => s,
-            Err(_) => return Ok(()),
-        };
-
-        // Sink: wrap engine segments (built by ConnState) and inject them.
-        let sink = Self::sink(inner, ns);
-
-        let cfg = ConnConfig {
-            local_addr: Some(SocketAddr::new(std::net::IpAddr::V6(dst), dst_port)),
-            remote_addr: Some(SocketAddr::new(std::net::IpAddr::V6(src), src_port)),
+        let endpoints = Endpoints::V6 {
+            local_ip: dst,
             local_port: dst_port,
+            remote_ip: src,
             remote_port: src_port,
-            mss: Self::mss(inner, true),
-            keepalive: true,
-            ..Default::default()
         };
-        let mut conn = Conn::new(cfg);
-        let synack = conn.accept_syn(&seg);
-
-        let state = ConnState::new(
-            Endpoints::V6 {
-                local_ip: dst,
-                local_port: dst_port,
-                remote_ip: src,
-                remote_port: src_port,
-            },
-            conn,
-            sink,
-        );
-        let listener = Arc::downgrade(&listener);
-        let hold = listener.clone();
-        state.set_pending_accept(
-            Box::new(move |s| {
-                // The half-open slot goes with the closure, once the
-                // listener has taken or refused the connection.
-                let _held = &slot;
-                listener.upgrade().map_or(Offer::Refused, |l| l.enqueue(s))
-            }),
-            Box::new(move |s| hold.upgrade().is_some_and(|l| l.hold(s))),
-        );
-        inner
-            .virt_tcp6
-            .lock()
-            .expect("poisoned")
-            .insert(key, state.clone());
-        // Emit the SYN-ACK. The connection joins the listener's queue when an
-        // inbound segment completes the handshake (see `complete_accept`).
-        state.send(synack);
-        Ok(())
+        Self::accept_syn(inner, ns, &inner.virt_tcp6, key, endpoints, tcp, &listener)
     }
 
     fn handle_ipv6_udp(
@@ -3553,48 +3614,176 @@ mod tests {
         assert_eq!(s.inner.virt_tcp.lock().unwrap().len(), HALF_OPEN_CAP);
     }
 
+    fn syn_to_80(src_port: u16) -> Vec<u8> {
+        let syn = Segment {
+            src_port,
+            dst_port: 80,
+            seq: 1,
+            flags: tcp_flags::SYN,
+            window: 65535,
+            ..Default::default()
+        };
+        crate::slirp::packet::build_packet4(
+            Ipv4Addr::new(10, 0, 0, 5),
+            Ipv4Addr::new(10, 0, 0, 1),
+            &syn.marshal(),
+        )
+    }
+
+    /// Attach a recording peer to `s`: its recorder, its handle, and the
+    /// handler that injects packets from it.
+    fn attach_recorder(s: &Stack) -> (Arc<Recorder>, Cleanup, L3Handler) {
+        let r = Arc::new(Recorder::default());
+        let c = L3Connector::connect_l3(s, r.clone()).unwrap();
+        let inject = r.handler.lock().unwrap().clone().unwrap();
+        (r, c, inject)
+    }
+
     /// A listener's backlog is shared out between namespaces like the
     /// stack's other caps: guests sending SYNs they never complete fill
-    /// their own share of it, not the whole, and another guest's SYN is
-    /// still answered.
+    /// their own share of it, not the whole, and another guest's SYN still
+    /// finds room there.
     #[test]
     fn half_open_slots_are_shared_between_namespaces() {
         let s = Stack::new();
         let _l = s.listen("tcp", "10.0.0.1:80").unwrap();
-        let attach = || {
-            let r = Arc::new(Recorder::default());
-            let c = L3Connector::connect_l3(&*s, r.clone()).unwrap();
-            let inject = r.handler.lock().unwrap().clone().unwrap();
-            (r, c, inject)
-        };
-        let us = Ipv4Addr::new(10, 0, 0, 1);
-        let syn = |port: u16| {
-            let syn = Segment {
-                src_port: port,
-                dst_port: 80,
-                seq: 1,
-                flags: tcp_flags::SYN,
-                window: 65535,
-                ..Default::default()
-            };
-            crate::slirp::packet::build_packet4(Ipv4Addr::new(10, 0, 0, 5), us, &syn.marshal())
-        };
         // Enough flooding namespaces to fill the whole backlog were it not
         // shared; each sends as many SYNs as the backlog holds.
-        let floods: Vec<_> = (0..NS_SHARE / 2 + 1).map(|_| attach()).collect();
-        for (r, _, inject) in &floods {
+        let floods: Vec<_> = (0..NS_SHARE / 2 + 1).map(|_| attach_recorder(&s)).collect();
+        for (_, _, inject) in &floods {
             for port in 0..HALF_OPEN_CAP as u16 {
-                inject(Packet::from_slice(&syn(10000 + port))).unwrap();
+                inject(Packet::from_slice(&syn_to_80(10000 + port))).unwrap();
             }
-            let answered = r.got.lock().unwrap().len();
-            assert_eq!(answered, HALF_OPEN_CAP / NS_SHARE);
         }
-        let (good, _c, inject) = attach();
-        inject(Packet::from_slice(&syn(5555))).unwrap();
-        let got = good.got.lock().unwrap();
-        assert_eq!(got.len(), 1, "another namespace's SYN went unanswered");
-        let synack = Segment::parse(&got[0][20..]).unwrap();
+        assert_eq!(
+            s.inner.virt_tcp.lock().unwrap().len(),
+            floods.len() * HALF_OPEN_CAP / NS_SHARE
+        );
+        let (_good, _c, inject) = attach_recorder(&s);
+        inject(Packet::from_slice(&syn_to_80(5555))).unwrap();
+        let held = s.inner.virt_tcp.lock().unwrap();
+        assert!(
+            held.keys().any(|k| k.src_port == 5555),
+            "another namespace's SYN found no room"
+        );
+    }
+
+    /// Past the backlog, a SYN is answered with a cookie and no state; the
+    /// ACK carrying the cookie back opens the connection, with the data it
+    /// carries, and one that does not is reset.
+    #[test]
+    fn a_full_backlog_answers_with_syn_cookies() {
+        let s = Stack::new();
+        let l = s.listen("tcp", "10.0.0.1:80").unwrap();
+        let captured = capture(&s);
+        let inject = |p: &[u8]| L3Device::send(&*s, Packet::from_slice(p)).unwrap();
+        for port in 0..HALF_OPEN_CAP as u16 {
+            inject(&syn_to_80(10000 + port));
+        }
+        captured.lock().unwrap().clear();
+        inject(&syn_to_80(30000));
+        assert_eq!(s.inner.virt_tcp.lock().unwrap().len(), HALF_OPEN_CAP);
+        let synack = Segment::parse(&captured.lock().unwrap().remove(0)[20..]).unwrap();
         assert_eq!(synack.flags, tcp_flags::SYN | tcp_flags::ACK);
+        assert_eq!(synack.ack, 2);
+
+        let (peer, us) = (Ipv4Addr::new(10, 0, 0, 5), Ipv4Addr::new(10, 0, 0, 1));
+        let ack =
+            |ack: u32| build_tcp_v4_packet(peer, 30000, us, 80, 2, ack, tcp_flags::ACK, b"hi");
+        inject(&ack(synack.seq.wrapping_add(2)));
+        let rst = Segment::parse(&captured.lock().unwrap().remove(0)[20..]).unwrap();
+        assert_eq!(
+            rst.flags & tcp_flags::RST,
+            tcp_flags::RST,
+            "a forged ACK was taken"
+        );
+        assert_eq!(s.inner.virt_tcp.lock().unwrap().len(), HALF_OPEN_CAP);
+
+        inject(&ack(synack.seq.wrapping_add(1)));
+        let stream = l.accept().unwrap();
+        assert_eq!(stream.peer_addr().port(), 30000);
+        let mut buf = [0; 8];
+        assert_eq!(stream.read(&mut buf).unwrap(), 2);
+        assert_eq!(&buf[..2], b"hi");
+    }
+
+    /// Guests flooding a listener from every share of its backlog still
+    /// do not lock another guest out: its SYN gets a cookie.
+    #[test]
+    fn a_namespace_past_a_flooded_backlog_connects_with_a_cookie() {
+        let s = Stack::new();
+        let l = s.listen("tcp", "10.0.0.1:80").unwrap();
+        let floods: Vec<_> = (0..NS_SHARE).map(|_| attach_recorder(&s)).collect();
+        for (_, _, inject) in &floods {
+            for port in 0..HALF_OPEN_CAP as u16 {
+                inject(Packet::from_slice(&syn_to_80(10000 + port))).unwrap();
+            }
+        }
+        assert_eq!(s.inner.virt_tcp.lock().unwrap().len(), HALF_OPEN_CAP);
+        let (good, _c, inject) = attach_recorder(&s);
+        inject(Packet::from_slice(&syn_to_80(5555))).unwrap();
+        let synack = Segment::parse(&good.got.lock().unwrap()[0][20..]).unwrap();
+        let (peer, us) = (Ipv4Addr::new(10, 0, 0, 5), Ipv4Addr::new(10, 0, 0, 1));
+        let ack = synack.seq.wrapping_add(1);
+        let ack = build_tcp_v4_packet(peer, 5555, us, 80, 2, ack, tcp_flags::ACK, &[]);
+        inject(Packet::from_slice(&ack)).unwrap();
+        assert_eq!(l.accept().unwrap().peer_addr().port(), 5555);
+    }
+
+    /// A cookie's ACK arriving while the accept queue is full opens the
+    /// connection in SYN-RECEIVED, where it waits for room as a handshake
+    /// held back does, and the peer's next segment, which carries no
+    /// cookie, completes it once `accept` makes room.
+    #[test]
+    fn a_cookie_connection_waits_for_room_in_the_accept_queue() {
+        use crate::slirp::listener::ACCEPT_QUEUE_CAP;
+        let s = Stack::new();
+        let l = s.listen("tcp", "10.0.0.1:80").unwrap();
+        let captured = capture(&s);
+        let inject = |p: &[u8]| L3Device::send(&*s, Packet::from_slice(p)).unwrap();
+        let (peer, us) = (Ipv4Addr::new(10, 0, 0, 5), Ipv4Addr::new(10, 0, 0, 1));
+        let last_synack = || {
+            let p = captured.lock().unwrap().pop().unwrap();
+            Segment::parse(&p[20..]).unwrap()
+        };
+        let ack = |port: u16, seq: u32, ack: u32, data: &[u8]| {
+            build_tcp_v4_packet(peer, port, us, 80, seq, ack, tcp_flags::ACK, data)
+        };
+        for port in 0..ACCEPT_QUEUE_CAP as u16 {
+            inject(&syn_to_80(20000 + port));
+            let synack = last_synack();
+            inject(&ack(20000 + port, 2, synack.seq.wrapping_add(1), &[]));
+        }
+        for port in 0..HALF_OPEN_CAP as u16 {
+            inject(&syn_to_80(10000 + port));
+        }
+        inject(&syn_to_80(30000));
+        let cookie = last_synack().seq.wrapping_add(1);
+        inject(&ack(30000, 2, cookie, &[]));
+        let key = |k: &Key| k.src_port == 30000;
+        let state = s
+            .inner
+            .virt_tcp
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(k, _)| key(k))
+            .map(|(_, v)| v.clone());
+        let state = state.expect("the cookie's ACK opened nothing");
+        assert_eq!(
+            state.conn.lock().unwrap().state(),
+            crate::vtcp::State::SynReceived
+        );
+
+        inject(&ack(30000, 2, cookie, b"ab"));
+        for _ in 0..ACCEPT_QUEUE_CAP {
+            assert_ne!(l.accept().unwrap().peer_addr().port(), 30000);
+        }
+        let stream = l.accept().unwrap();
+        assert_eq!(stream.peer_addr().port(), 30000);
+        let mut buf = [0; 8];
+        assert_eq!(stream.read(&mut buf).unwrap(), 2);
+        assert_eq!(&buf[..2], b"ab");
     }
 
     #[test]

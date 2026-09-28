@@ -55,8 +55,8 @@ pub(crate) mod secret;
 pub(crate) mod segment;
 pub(crate) mod sendbuf;
 pub(crate) mod seqspace;
-// Only vclient's listener answers SYNs statelessly so far.
-#[cfg(any(feature = "vclient", test))]
+// The listeners that answer SYNs statelessly past their backlog.
+#[cfg(any(feature = "vclient", feature = "slirp", test))]
 pub(crate) mod syncookie;
 
 pub use conn::{CongestionKind, Conn, ConnConfig, State};
