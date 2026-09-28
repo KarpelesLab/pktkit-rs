@@ -945,10 +945,17 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(5));
         }
-        let peers = a.peers.read().unwrap();
-        assert!(peers.contains_key(&known.public_key()));
-        assert!(peers.contains_key(&stranger.public_key()));
-        drop(peers);
+        // The connector has run; the adapter records each device once its
+        // connect returns, just after.
+        let both = || {
+            let peers = a.peers.read().unwrap();
+            peers.contains_key(&known.public_key()) && peers.contains_key(&stranger.public_key())
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !both() {
+            assert!(std::time::Instant::now() < deadline, "a peer was not wired");
+            thread::sleep(Duration::from_millis(5));
+        }
         a.close().unwrap();
     }
 
