@@ -47,7 +47,8 @@ pub struct L2AdapterConfig {
     pub gateway_v4: Option<Ipv4Addr>,
     /// Initial IPv6 gateway, the next hop for off-link destinations: those
     /// outside the L3 device's IPv6 prefix, other than link-local. Without
-    /// one they are dropped (RFC 4943). DHCP, being IPv4 only, leaves it
+    /// one they are dropped (RFC 4943), and the sender told so with an
+    /// ICMPv6 no route to destination. DHCP, being IPv4 only, leaves it
     /// alone.
     pub gateway_v6: Option<Ipv6Addr>,
 }
@@ -98,6 +99,11 @@ pub struct L2Adapter {
     /// Paces the ICMP errors for packets that could not be delivered (RFC
     /// 4443 §2.4(f), RFC 1812 §4.3.2.8).
     icmp_limit: RateLimiter,
+    /// ICMP errors for packets dropped as they were sent, waiting for the
+    /// timers to deliver them. The drop happens inside the L3 device's own
+    /// call to its handler, which may hold the device's locks: handing it
+    /// a packet from there could deadlock it.
+    deferred_icmp: Mutex<Vec<Vec<u8>>>,
 
     // Self-Arc, for use by closures that need to refer back to us.
     weak_self: Mutex<Weak<L2Adapter>>,
@@ -160,6 +166,7 @@ impl L2Adapter {
             // A whole queue's worth at once, so one failed resolution is
             // reported in full.
             icmp_limit: RateLimiter::new(10, arp::PENDING_MAX_PKTS as u32),
+            deferred_icmp: Mutex::new(Vec::new()),
             weak_self: Mutex::new(Weak::new()),
             #[cfg(not(target_family = "wasm"))]
             timer_stop: Arc::default(),
@@ -280,6 +287,10 @@ impl L2Adapter {
 
     /// The neighbour timers, as of `now`.
     fn run_timers(&self, now: Instant) {
+        let deferred = std::mem::take(&mut *self.deferred_icmp.lock().unwrap());
+        for reply in deferred {
+            let _ = self.l3.send(Packet::from_slice(&reply));
+        }
         for (ip, mac) in self.arp.poll(now) {
             self.send_arp_request_to(ip, mac);
         }
@@ -306,40 +317,60 @@ impl L2Adapter {
     /// it a sender learns of the failure only by timing out.
     fn report_unreachable(&self, pkts: Vec<Vec<u8>>) {
         for buf in pkts {
-            let pkt = Packet::from_slice(&buf);
-            // The DHCP client's own messages were never the host's, and
-            // the client retransmits on its own timers.
-            #[cfg(feature = "dhcp")]
-            if is_dhcp_to_server(pkt) {
-                continue;
-            }
-            let (from, err) = match (pkt.version(), self.l3.addr().addr()) {
-                (4, IpAddr::V4(a)) if !a.is_unspecified() => (
-                    IpAddr::V4(a),
-                    IcmpError::DestUnreachable(icmpv4::CODE_HOST_UNREACHABLE),
-                ),
-                // Without an address of ours to send from, there is nobody
-                // for the error to come from.
-                (4, _) => continue,
-                (6, addr) => {
-                    let from = match addr {
-                        IpAddr::V6(a) if !a.is_unspecified() => a,
-                        _ => ndp::link_local_from_mac(self.mac),
-                    };
-                    (
-                        IpAddr::V6(from),
-                        IcmpError::DestUnreachable(icmpv6::CODE_ADDR_UNREACHABLE),
-                    )
-                }
-                _ => continue,
-            };
-            // icmp::error refuses what must not be answered (errors,
-            // multicast, later fragments) before a token is spent on it.
-            if let Some(reply) = icmp::error(pkt, from, err)
-                && self.icmp_limit.allow()
-            {
+            let codes = (icmpv4::CODE_HOST_UNREACHABLE, icmpv6::CODE_ADDR_UNREACHABLE);
+            if let Some(reply) = self.unreachable_error(Packet::from_slice(&buf), codes) {
                 let _ = self.l3.send(Packet::from_slice(&reply));
             }
+        }
+    }
+
+    /// The ICMP destination unreachable to send back for `pkt`, with code
+    /// `v4` or `v6` by its version, if one may be sent: not for the DHCP
+    /// client's own messages, not without an address of ours to send it
+    /// from, not for what must not be answered, and within the rate limit.
+    fn unreachable_error(&self, pkt: &Packet, (v4, v6): (u8, u8)) -> Option<Vec<u8>> {
+        // The DHCP client's own messages were never the host's, and the
+        // client retransmits on its own timers.
+        #[cfg(feature = "dhcp")]
+        if is_dhcp_to_server(pkt) {
+            return None;
+        }
+        let (from, err) = match (pkt.version(), self.l3.addr().addr()) {
+            (4, IpAddr::V4(a)) if !a.is_unspecified() => {
+                (IpAddr::V4(a), IcmpError::DestUnreachable(v4))
+            }
+            // Without an address of ours to send from, there is nobody for
+            // the error to come from.
+            (4, _) => return None,
+            (6, addr) => {
+                let from = match addr {
+                    IpAddr::V6(a) if !a.is_unspecified() => a,
+                    _ => ndp::link_local_from_mac(self.mac),
+                };
+                (IpAddr::V6(from), IcmpError::DestUnreachable(v6))
+            }
+            _ => return None,
+        };
+        // icmp::error refuses what must not be answered (errors, multicast,
+        // later fragments) before a token is spent on it.
+        icmp::error(pkt, from, err).filter(|_| self.icmp_limit.allow())
+    }
+
+    /// Report `pkt`, dropped on its way out for want of a route, with ICMPv6
+    /// no route to destination (RFC 4443 §3.1, code 0). Called from inside
+    /// the L3 device's send, so the error is queued for the timers to
+    /// deliver (within a fifth of a second, or at the next
+    /// [`tick`](Self::tick)) rather than handed back to the device from
+    /// within its own call.
+    fn report_no_route(&self, pkt: &Packet) {
+        let Some(reply) = self.unreachable_error(pkt, (0, icmpv6::CODE_NO_ROUTE)) else {
+            return;
+        };
+        let mut q = self.deferred_icmp.lock().unwrap();
+        // The rate limiter bounds it already; this is only a backstop for
+        // a timer that has stopped running.
+        if q.len() < arp::PENDING_MAX_PKTS {
+            q.push(reply);
         }
     }
 
@@ -500,9 +531,13 @@ impl L2Adapter {
                     let target = if self.on_link_v6(dst) {
                         dst
                     } else {
-                        match *self.gateway_v6.lock().unwrap() {
+                        let gw = *self.gateway_v6.lock().unwrap();
+                        match gw {
                             Some(gw) => gw,
-                            None => return,
+                            None => {
+                                self.report_no_route(pkt);
+                                return;
+                            }
                         }
                     };
                     match self.ndp.resolve_at(target, now) {
@@ -1216,6 +1251,36 @@ mod tests {
                 .then(|| IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(&icmp[8..24]).unwrap())))
             })
             .collect()
+    }
+
+    /// An off-link IPv6 destination with no router has no route (RFC
+    /// 4943): the sender is told so with ICMPv6 no route to destination,
+    /// though not from inside its own send, where the device may hold its
+    /// locks, but by the timers after it.
+    #[test]
+    fn off_link_ipv6_without_a_router_is_reported_no_route() {
+        let (host, adapter, out) = host_rig("2001:db8::5/64");
+        let (src, dst): (IpAddr, IpAddr) = (
+            "2001:db8::5".parse().unwrap(),
+            "2001:db9::1".parse().unwrap(),
+        );
+        let udp = crate::build::build_udp(src, dst, 1000, 2000, b"hi");
+        let pkt = crate::build::build_ip(src, dst, Protocol::UDP, 64, &udp).unwrap();
+        host.out(&pkt);
+        assert!(take(&out).is_empty(), "sent without a route");
+        assert!(host.take().is_empty(), "delivered from inside the send");
+
+        adapter.run_timers(Instant::now());
+        let errs = host.take();
+        assert_eq!(errs.len(), 1, "no error reported");
+        let e = Packet::from_slice(&errs[0]);
+        assert_eq!(e.dst_addr(), Some(src));
+        assert_eq!(e.ip_protocol(), Protocol::ICMPV6);
+        let icmp = e.transport_payload();
+        assert_eq!((icmp[0], icmp[1]), (1, 0), "no route to destination");
+        assert_eq!(&icmp[8..8 + pkt.len()], &pkt[..], "original quoted");
+        adapter.run_timers(Instant::now());
+        assert!(host.take().is_empty(), "reported twice");
     }
 
     #[test]
