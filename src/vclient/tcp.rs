@@ -6,12 +6,13 @@
 //! demultiplexed to the matching `ConnState`, fed into the `vtcp::Conn`, and
 //! the segments the engine emits are wrapped back into IP and pushed out the
 //! client's L3 handler. A single tick thread per client drives RTO / keepalive
-//! timers for every connection.
+//! timers for every connection, sleeping until the earliest is due.
 //!
 //! Without threads (`wasm32`) nothing can block and nothing runs in the
 //! background: every handle behaves as if non-blocking, returning
 //! [`WouldBlock`](io::ErrorKind::WouldBlock) where it would have waited, and
-//! the timers run when the caller invokes [`Client::tick`](super::Client::tick).
+//! the timers run when the caller invokes [`Client::tick`](super::Client::tick),
+//! which [`Client::next_timer`](super::Client::next_timer) says when to do.
 
 use crate::time::Instant;
 use crate::vtcp::segment::flags;
@@ -24,6 +25,28 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
+
+#[cfg(not(target_family = "wasm"))]
+use crate::vtcp::alarm::Alarm;
+
+/// Without threads there is no tick thread to wake: the caller polls
+/// [`Client::next_timer`](super::Client::next_timer) instead.
+#[cfg(target_family = "wasm")]
+#[derive(Debug)]
+struct Alarm;
+
+#[cfg(target_family = "wasm")]
+impl Alarm {
+    fn new() -> Self {
+        Alarm
+    }
+    fn arm(&self, _: Option<Instant>) {}
+}
+
+/// Longest the tick thread sleeps: the half-open and TIME-WAIT caps are
+/// checked when it wakes, not on a deadline of their own.
+#[cfg(not(target_family = "wasm"))]
+const HOUSEKEEPING: Duration = Duration::from_millis(100);
 
 /// 4-tuple identifying a connection from the client's point of view.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
@@ -44,6 +67,9 @@ pub(crate) struct ConnState {
     signal: Condvar,
     /// Sink for fully-framed IP packets the engine wants to transmit.
     sink: Arc<dyn Fn(&[u8]) + Send + Sync>,
+    /// The stack's tick thread, woken when this connection's next timer
+    /// comes due before it would otherwise look.
+    alarm: Arc<Alarm>,
     /// Packets on their way to `sink`, in the order the engine made them.
     /// See [`ConnState::queue`].
     outbox: Mutex<Outbox>,
@@ -81,6 +107,7 @@ impl ConnState {
         local_ip: IpAddr,
         conn: Conn,
         sink: Arc<dyn Fn(&[u8]) + Send + Sync>,
+        alarm: Arc<Alarm>,
         pending_accept: Option<PendingAccept>,
     ) -> Arc<ConnState> {
         Arc::new(ConnState {
@@ -89,6 +116,7 @@ impl ConnState {
             conn: Mutex::new(conn),
             signal: Condvar::new(),
             sink,
+            alarm,
             outbox: Mutex::default(),
             connected: AtomicBool::new(false),
             error: Mutex::new(None),
@@ -131,11 +159,14 @@ impl ConnState {
         self.error.lock().unwrap().get_or_insert(kind);
     }
 
-    /// Put what the engine just produced in line to go out. Call it under
-    /// the conn lock, before letting go of it, and [`flush`](Self::flush)
-    /// once that is released: the order segments reach the queue is then
-    /// the order the engine made them in, whichever threads made them.
-    fn queue(&self, segments: Vec<Vec<u8>>) {
+    /// Put what the engine just produced through `conn` in line to go out.
+    /// Call it under the conn lock, before letting go of it, and
+    /// [`flush`](Self::flush) once that is released: the order segments
+    /// reach the queue is then the order the engine made them in,
+    /// whichever threads made them. Whatever made them may also have moved
+    /// the connection's next timer, which the tick thread learns here.
+    fn queue(&self, conn: &Conn, segments: Vec<Vec<u8>>) {
+        self.alarm.arm(conn.next_deadline());
         if segments.is_empty() {
             return;
         }
@@ -189,7 +220,9 @@ impl ConnState {
     /// [`queue`](Self::queue) and [`flush`](Self::flush), for segments
     /// made where no other could be made at the same time.
     fn wrap_and_send(&self, segments: Vec<Vec<u8>>) {
-        self.queue(segments);
+        let conn = self.conn.lock().unwrap();
+        self.queue(&conn, segments);
+        drop(conn);
         self.flush();
     }
 
@@ -240,7 +273,8 @@ impl ConnState {
     /// Send a RST, close, and wake anyone waiting on the connection.
     fn abort(&self) {
         let mut conn = self.conn.lock().unwrap();
-        self.queue(conn.abort());
+        let segs = conn.abort();
+        self.queue(&conn, segs);
         drop(conn);
         self.flush();
         self.signal.notify_all();
@@ -338,7 +372,8 @@ impl TcpConn {
     /// unacknowledged; turning it off also sends whatever it was holding.
     pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
         let mut conn = self.state.conn.lock().unwrap();
-        self.state.queue(conn.set_nodelay(nodelay));
+        let segs = conn.set_nodelay(nodelay);
+        self.state.queue(&conn, segs);
         drop(conn);
         self.state.flush();
         Ok(())
@@ -393,7 +428,7 @@ impl TcpConn {
                 ));
             }
             let (n, segs) = conn.write(&buf[written..]);
-            self.state.queue(segs);
+            self.state.queue(&conn, segs);
             drop(conn);
             if n > 0 {
                 self.state.flush();
@@ -439,7 +474,8 @@ impl TcpConn {
                 // Reading can open the receive window; tell the peer now
                 // rather than on the next tick, which on wasm is whenever
                 // the caller gets round to it.
-                self.state.queue(conn.take_outgoing());
+                let segs = conn.take_outgoing();
+                self.state.queue(&conn, segs);
                 drop(conn);
                 self.state.flush();
                 return Ok(n);
@@ -473,7 +509,8 @@ impl TcpConn {
     /// Initiate a graceful close (sends FIN).
     pub fn close(&self) -> io::Result<()> {
         let mut conn = self.state.conn.lock().unwrap();
-        self.state.queue(conn.close());
+        let segs = conn.close();
+        self.state.queue(&conn, segs);
         drop(conn);
         self.state.flush();
         Ok(())
@@ -503,7 +540,8 @@ impl Drop for TcpConn {
         // keeps sending or whose data was left unread, as Linux does for an
         // orphaned socket.
         let mut conn = self.state.conn.lock().unwrap();
-        self.state.queue(conn.release());
+        let segs = conn.release();
+        self.state.queue(&conn, segs);
         drop(conn);
         self.state.flush();
     }
@@ -771,6 +809,8 @@ pub(crate) struct TcpStack {
     mtu: u32,
     /// Set by `shutdown`: stops the tick thread and refuses new work.
     stop: Arc<Mutex<bool>>,
+    /// Wakes the tick thread when a timer comes due.
+    alarm: Arc<Alarm>,
 }
 
 impl TcpStack {
@@ -789,25 +829,51 @@ impl TcpStack {
             next_port: Mutex::new(0),
             mtu,
             stop: Arc::new(Mutex::new(false)),
+            alarm: Arc::new(Alarm::new()),
         });
-        // Tick thread: drive timers for all connections every 100ms. Without
-        // threads the caller drives them through `Client::tick`.
+        // Tick thread: drive the timers of all connections as they come
+        // due. Each connection arms the alarm with its next deadline as it
+        // is ticked, and again whenever its traffic moves that earlier, so
+        // a retransmission or a delayed ACK goes out on time rather than on
+        // the next of a fixed interval's polls. Without threads the caller
+        // drives them through `Client::tick`.
         #[cfg(not(target_family = "wasm"))]
         {
             let weak = Arc::downgrade(&stack);
             let stop = stack.stop.clone();
+            let alarm = stack.alarm.clone();
             std::thread::spawn(move || {
                 loop {
-                    std::thread::sleep(Duration::from_millis(100));
+                    alarm.sleep_until(Instant::now() + HOUSEKEEPING);
                     if *stop.lock().unwrap() {
                         return;
                     }
                     let Some(stack) = weak.upgrade() else { return };
+                    alarm.begin();
                     stack.tick_all();
                 }
             });
         }
         stack
+    }
+
+    /// When [`tick_all`](Self::tick_all) next has something to do: the
+    /// earliest connection timer, or a half-open connection's expiry.
+    pub fn next_deadline(&self) -> Option<Instant> {
+        let conns: Vec<Arc<ConnState>> = self.conns.lock().unwrap().values().cloned().collect();
+        conns
+            .iter()
+            .filter_map(|cs| {
+                let conn = cs.conn.lock().unwrap();
+                let expiry = (conn.state() == State::SynReceived)
+                    .then(|| cs.opened.checked_add(SYN_RECEIVED_TIMEOUT))
+                    .flatten();
+                match (conn.next_deadline(), expiry) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                }
+            })
+            .min()
     }
 
     pub fn tick_all(&self) {
@@ -833,7 +899,8 @@ impl TcpStack {
                 continue;
             }
             let ended = conn.fin_received();
-            cs.queue(conn.tick());
+            let segs = conn.tick();
+            cs.queue(&conn, segs);
             let closed = conn.is_closed();
             let state = conn.state();
             if closed && !ended {
@@ -913,13 +980,21 @@ impl TcpStack {
             remote: remote.ip(),
             remote_port: remote.port(),
         };
-        let state = ConnState::new(key, local_ip, conn, self.sink.clone(), None);
+        let state = ConnState::new(
+            key,
+            local_ip,
+            conn,
+            self.sink.clone(),
+            self.alarm.clone(),
+            None,
+        );
         conns.insert(key, state.clone());
         drop(conns);
 
         // Send SYN.
         let mut conn = state.conn.lock().unwrap();
-        state.queue(conn.connect());
+        let segs = conn.connect();
+        state.queue(&conn, segs);
         drop(conn);
         state.flush();
         Ok(state)
@@ -1090,7 +1165,7 @@ impl TcpStack {
                 if seg.has_flag(flags::RST) && conn.is_closed() && !ended {
                     state.fail(io::ErrorKind::ConnectionReset);
                 }
-                state.queue(segs);
+                state.queue(&conn, segs);
             }
             // The client's sink contains a panicking handler, but a sink
             // that does not must still not cost this connection its accept
@@ -1213,7 +1288,14 @@ impl TcpStack {
         let mut conn = Conn::new(passive_config(local_ip, remote, syn, self.mss_for(remote)));
         let synack = conn.accept_syn(syn);
         let key = passive_key(remote, syn);
-        let state = ConnState::new(key, local_ip, conn, self.sink.clone(), Some(pending));
+        let state = ConnState::new(
+            key,
+            local_ip,
+            conn,
+            self.sink.clone(),
+            self.alarm.clone(),
+            Some(pending),
+        );
         if self.register(key, &state) {
             state.wrap_and_send(synack);
         }
@@ -1236,7 +1318,14 @@ impl TcpStack {
             listener,
             half_open: false,
         };
-        let state = ConnState::new(key, local_ip, conn, self.sink.clone(), Some(pending));
+        let state = ConnState::new(
+            key,
+            local_ip,
+            conn,
+            self.sink.clone(),
+            self.alarm.clone(),
+            Some(pending),
+        );
         // Data riding on the ACK counts against the listener's budget like
         // any other before the connection is accepted. Past it, the
         // handshake still completes, but the data, and a FIN after it, are
@@ -1282,7 +1371,14 @@ impl TcpStack {
         let mut conn = Conn::new(passive_config(local_ip, remote, ack, self.mss_for(remote)));
         conn.accept_cookie_syn_received(ack, ack.ack.wrapping_sub(1), mss);
         let key = passive_key(remote, ack);
-        let state = ConnState::new(key, local_ip, conn, self.sink.clone(), Some(pending));
+        let state = ConnState::new(
+            key,
+            local_ip,
+            conn,
+            self.sink.clone(),
+            self.alarm.clone(),
+            Some(pending),
+        );
         self.register(key, &state);
     }
 
@@ -1302,6 +1398,8 @@ impl TcpStack {
     /// waiter wakes with an error. Afterwards nothing new can be opened.
     pub fn shutdown(&self) {
         *self.stop.lock().unwrap() = true;
+        #[cfg(not(target_family = "wasm"))]
+        self.alarm.ring();
         let listeners: Vec<_> = self.listeners.lock().unwrap().drain().collect();
         for (_, l) in listeners {
             l.shut();
@@ -1372,7 +1470,8 @@ impl TcpStack {
             return true;
         }
         let mut conn = state.conn.lock().unwrap();
-        state.queue(conn.on_icmp_too_big(mtu, seq));
+        let segs = conn.on_icmp_too_big(mtu, seq);
+        state.queue(&conn, segs);
         drop(conn);
         state.flush();
         true
@@ -1646,6 +1745,7 @@ mod tests {
             old.local_ip,
             Conn::new(ConnConfig::default()),
             stack.sink.clone(),
+            stack.alarm.clone(),
             None,
         );
         stack.conns.lock().unwrap().insert(old.key, new.clone());
@@ -2380,5 +2480,91 @@ mod tests {
         ));
         let mut buf = [0u8; 64];
         assert_eq!(st.conn.lock().unwrap().read(&mut buf), 0);
+    }
+
+    /// Dial a peer that completes the handshake and then goes silent, and
+    /// send it some data. Returns the stack, the connection, and what the
+    /// stack sent, each with when.
+    #[cfg(not(target_family = "wasm"))]
+    #[allow(clippy::type_complexity)]
+    fn silent_peer() -> (
+        Arc<TcpStack>,
+        Arc<ConnState>,
+        Arc<Mutex<Vec<(Instant, Segment)>>>,
+    ) {
+        let out: Arc<Mutex<Vec<(Instant, Segment)>>> = Arc::default();
+        let o = out.clone();
+        let sink: Arc<dyn Fn(&[u8]) + Send + Sync> = Arc::new(move |b: &[u8]| {
+            let ihl = usize::from(b[0] & 0x0f) * 4;
+            let seg = Segment::parse(&b[ihl..]).unwrap();
+            o.lock().unwrap().push((Instant::now(), seg));
+        });
+        let stack = TcpStack::new(sink);
+        let st = stack
+            .start_dial(IpAddr::V4(US), SocketAddr::from((PEER, 80)))
+            .unwrap();
+        let syn = out.lock().unwrap()[0].1.clone();
+        let synack = Segment {
+            src_port: 80,
+            dst_port: syn.src_port,
+            seq: 0x1000_0000,
+            ack: syn.seq.wrapping_add(1),
+            flags: flags::SYN | flags::ACK,
+            window: 65535,
+            ..Default::default()
+        };
+        stack.handle_inbound(Packet::from_slice(&inbound(synack)), IpAddr::V4(US));
+        assert_eq!(st.conn.lock().unwrap().state(), State::Established);
+        TcpConn::new(st.clone()).write(b"hello").unwrap();
+        (stack, st, out)
+    }
+
+    /// Whatever arms a timer arms the tick thread's alarm with it.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn sending_data_arms_the_alarm_with_the_rto() {
+        let (stack, st, _out) = silent_peer();
+        let rto = st.conn.lock().unwrap().next_deadline().unwrap();
+        // The thread may have been ticking meanwhile, and its alarm set
+        // for another connection or its housekeeping, but not for later.
+        stack.tick_all();
+        assert_eq!(stack.next_deadline(), Some(rto));
+    }
+
+    /// The tick thread retransmits as the RTO runs out, not on the next of
+    /// a fixed interval's polls, which would add up to that interval to
+    /// every timeout: measured over three backed-off retransmissions, so
+    /// one late wakeup on a busy machine does not fail it.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn retransmissions_go_out_when_the_rto_runs_out() {
+        let (_stack, _st, out) = silent_peer();
+        let sends = || -> Vec<Instant> {
+            out.lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, s)| !s.payload.is_empty())
+                .map(|(t, _)| *t)
+                .collect()
+        };
+        let start = Instant::now();
+        while sends().len() < 4 {
+            assert!(
+                start.elapsed() < Duration::from_secs(30),
+                "no retransmissions"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let t = sends();
+        // After a round trip of next to nothing, the RTO starts from its
+        // 200 ms floor and doubles with each timeout.
+        let mut late = Duration::ZERO;
+        for (i, rto) in [200, 400, 800].into_iter().enumerate() {
+            let gap = t[i + 1] - t[i];
+            let rto = Duration::from_millis(rto);
+            assert!(gap >= rto, "retransmission {i} early: {gap:?}");
+            late += gap - rto;
+        }
+        assert!(late / 3 < Duration::from_millis(40), "late by {late:?}");
     }
 }

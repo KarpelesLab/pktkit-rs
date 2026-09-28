@@ -138,15 +138,27 @@ impl Client {
         self.tcp.dial_nonblocking(local_ip, addr)
     }
 
-    /// Run the TCP timers (retransmission, persist, keepalive, FIN-WAIT-2
-    /// and TIME-WAIT), and send any segment a connection has queued, such
-    /// as the window update a read leaves behind.
+    /// Run the TCP timers (retransmission, delayed ACK, persist,
+    /// keepalive, FIN-WAIT-2 and TIME-WAIT), and send any segment a
+    /// connection has queued, such as the window update a read leaves
+    /// behind.
     ///
-    /// Where threads exist a background thread already does this every
-    /// 100 ms, and calling it as well is harmless. On `wasm32` nothing else
-    /// will, so call it on a timer — every 100 ms or so, as that thread does.
+    /// Where threads exist a background thread already does this as each
+    /// timer comes due, and calling it as well is harmless. On `wasm32`
+    /// nothing else will: call it when [`next_timer`](Self::next_timer)
+    /// says, and after handing the client packets or using its
+    /// connections, since those move the timers. A timer fires only as
+    /// precisely as this is called: polled every 100 ms, a retransmission
+    /// or a delayed ACK waits up to 100 ms more.
     pub fn tick(&self) {
         self.tcp.tick_all();
+    }
+
+    /// When [`tick`](Self::tick) next has work to do, or `None` if no TCP
+    /// timer is running. It may already have passed. Anything that sends
+    /// or receives on a connection can move it, so read it again after.
+    pub fn next_timer(&self) -> Option<Instant> {
+        self.tcp.next_deadline()
     }
 
     fn local_ip_for(&self, addr: SocketAddr) -> Result<IpAddr> {

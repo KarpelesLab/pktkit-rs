@@ -47,6 +47,12 @@
 //! hand back outgoing bytes (`take_outgoing`) rather than calling a sink, so the
 //! caller drains them explicitly and the borrow checker keeps re-entrancy out.
 
+// The drivers' tick threads.
+#[cfg(all(
+    any(feature = "vclient", feature = "slirp"),
+    not(target_family = "wasm")
+))]
+pub(crate) mod alarm;
 pub(crate) mod autotune;
 pub(crate) mod congestion;
 pub(crate) mod conn;
