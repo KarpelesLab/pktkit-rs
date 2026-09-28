@@ -120,9 +120,12 @@ pub struct ServerConfig {
     pub max_tcp_connections: usize,
     /// Most TCP connections served at once from one source (an IPv4
     /// address or an IPv6 /64, as for
-    /// [`max_unauthenticated_peers_per_source`](Self::max_unauthenticated_peers_per_source)),
-    /// authenticated or not, so that one source cannot take them all.
-    /// Default 16.
+    /// [`max_unauthenticated_peers_per_source`](Self::max_unauthenticated_peers_per_source))
+    /// whose client has not authenticated, so that one source cannot take
+    /// them all. A connection whose client authenticates gives its place
+    /// back: clients behind one NAT address are not limited to this many,
+    /// only [`max_tcp_connections`](Self::max_tcp_connections) bounds
+    /// them. Default 16.
     pub max_tcp_connections_per_source: usize,
     /// Each peer's timers: handshake window, keepalive, renegotiation.
     /// Defaults to OpenVPN's (see [`PeerTimers`]).
@@ -377,6 +380,8 @@ const TCP_QUEUE_LIMIT: usize = 64;
 /// frame is only queued, and dropped when the queue is full.
 struct TcpOut {
     queue: mpsc::SyncSender<Vec<u8>>,
+    /// The connection's id in `Server::tcp_streams`.
+    id: u64,
     /// For shutting the connection down.
     stream: TcpStream,
 }
@@ -385,7 +390,7 @@ impl TcpOut {
     /// Start the writer for `stream`. A write blocked past `write_timeout`
     /// means the client has stopped reading for good: the writer then
     /// closes the connection, which ends its reader and the peer.
-    fn spawn(stream: TcpStream, write_timeout: Option<Duration>) -> io::Result<TcpOut> {
+    fn spawn(stream: TcpStream, id: u64, write_timeout: Option<Duration>) -> io::Result<TcpOut> {
         stream.set_write_timeout(write_timeout)?;
         let w = stream.try_clone()?;
         let (queue, rx) = mpsc::sync_channel::<Vec<u8>>(TCP_QUEUE_LIMIT);
@@ -401,7 +406,7 @@ impl TcpOut {
                     }
                 }
             })?;
-        Ok(TcpOut { queue, stream })
+        Ok(TcpOut { queue, id, stream })
     }
 }
 
@@ -418,8 +423,7 @@ pub struct Server {
     peers: RwLock<HashMap<PeerKey, Arc<PeerEntry>>>,
     /// Every open TCP connection by id, so close() can shut them down --
     /// including those that have not sent a hard reset yet.
-    /// With the source each connection counts against.
-    tcp_streams: Mutex<HashMap<u64, (std::net::IpAddr, TcpStream)>>,
+    tcp_streams: Mutex<HashMap<u64, TcpConn>>,
     next_tcp_id: AtomicU64,
     closed: AtomicBool,
     /// The UDP reader and the TCP acceptor, which close() waits for: the
@@ -608,8 +612,8 @@ impl Server {
         self.udp.write().unwrap().take();
         // A thread blocked reading a TCP connection wakes up to the shutdown
         // and exits; the socket loops notice `closed` on their next poll.
-        for (_, (_, s)) in self.tcp_streams.lock().unwrap().drain() {
-            let _ = s.shutdown(std::net::Shutdown::Both);
+        for (_, c) in self.tcp_streams.lock().unwrap().drain() {
+            let _ = c.stream.shutdown(std::net::Shutdown::Both);
         }
         // The loop calling close() -- from a callback, or dropping the last
         // handle -- lets go of its socket as soon as it returns.
@@ -703,14 +707,22 @@ impl Server {
                 return;
             }
             let source = source_of(addr.ip());
-            let here = streams.values().filter(|(s, _)| *s == source).count();
+            let here = streams
+                .values()
+                .filter(|c| c.source == source && !c.authenticated)
+                .count();
             if streams.len() >= self.cfg.max_tcp_connections
                 || here >= self.cfg.max_tcp_connections_per_source
             {
                 return;
             }
             let id = self.next_tcp_id.fetch_add(1, Ordering::Relaxed);
-            streams.insert(id, (source, handle));
+            let conn = TcpConn {
+                source,
+                authenticated: false,
+                stream: handle,
+            };
+            streams.insert(id, conn);
             id
         };
         // The slot is given back however the connection ends: the thread
@@ -725,7 +737,7 @@ impl Server {
             .name("ovpn-tcp".into())
             .spawn(move || {
                 let _slot = slot;
-                tcp_conn(&weak, stream, addr);
+                tcp_conn(&weak, stream, id, addr);
             });
     }
 
@@ -762,15 +774,27 @@ impl Server {
                 self.remove_entry(&entry);
                 continue;
             };
-            entry
-                .authenticated
-                .store(out.authenticated, Ordering::Relaxed);
+            self.set_authenticated(&entry, out.authenticated);
             for dgram in &out.send {
                 let _ = self.send_raw(&entry, dgram);
             }
             if out.close {
                 self.remove_entry(&entry);
             }
+        }
+    }
+
+    /// Record whether the peer's last output said it has an authenticated
+    /// session. The first time it does, its TCP connection, if any, leaves
+    /// the per-source cap for good: the client has proved who it is.
+    fn set_authenticated(&self, entry: &PeerEntry, authenticated: bool) {
+        let was = entry.authenticated.swap(authenticated, Ordering::Relaxed);
+        if authenticated
+            && !was
+            && let Some(out) = &entry.tcp
+            && let Some(c) = self.tcp_streams.lock().unwrap().get_mut(&out.id)
+        {
+            c.authenticated = true;
         }
     }
 
@@ -1060,9 +1084,7 @@ impl Server {
     /// Act on what the peer produced: send, report, deliver, close.
     fn apply(&self, entry: &Arc<PeerEntry>, mut out: PeerOutput) {
         let key = entry.key();
-        entry
-            .authenticated
-            .store(out.authenticated, Ordering::Relaxed);
+        self.set_authenticated(entry, out.authenticated);
         for dgram in &out.send {
             let _ = self.send_raw(entry, dgram);
         }
@@ -1231,7 +1253,7 @@ fn tcp_loop(server: Weak<Server>, listener: TcpListener) {
 
 /// Serve one TCP connection. The server is only borrowed while handling a
 /// frame, never while blocked reading.
-fn tcp_conn(server: &Weak<Server>, stream: TcpStream, addr: SocketAddr) {
+fn tcp_conn(server: &Weak<Server>, stream: TcpStream, id: u64, addr: SocketAddr) {
     let Some(s) = live(server) else {
         return;
     };
@@ -1277,7 +1299,7 @@ fn tcp_conn(server: &Weak<Server>, stream: TcpStream, addr: SocketAddr) {
             .saturating_mul(2)
             .max(timers.handshake_window)
     });
-    let Ok(out) = TcpOut::spawn(write_half, idle) else {
+    let Ok(out) = TcpOut::spawn(write_half, id, idle) else {
         return;
     };
     let Some(entry) = s.create_peer(key, Transport::Tcp, addr, Some(out), None) else {
@@ -1393,6 +1415,16 @@ fn run_auth(server: &Weak<Server>, next: &Weak<PeerEntry>) {
     if let Some(out) = s.with_peer(&entry, |p| p.complete_auth(&req, verdict)) {
         s.apply(&entry, out);
     }
+}
+
+/// An open TCP connection, as the caps count it.
+struct TcpConn {
+    /// The source it counts against.
+    source: std::net::IpAddr,
+    /// Its client authenticated: it no longer counts against the
+    /// per-source cap.
+    authenticated: bool,
+    stream: TcpStream,
 }
 
 /// A TCP connection's place in `tcp_streams`, given back when dropped.
@@ -1881,7 +1913,7 @@ mod tests {
         let (s, addr) = l.accept().unwrap();
         let on_auth: OnAuth = Arc::new(|_| Err(io::Error::other("unused")));
         let peer = Peer::new(crate::ovpn::tests::server_config(), [1; 8], on_auth).unwrap();
-        let tcp = Some(TcpOut::spawn(s, None).unwrap());
+        let tcp = Some(TcpOut::spawn(s, u64::MAX, None).unwrap());
         let entry = Arc::new(PeerEntry::new(peer, Transport::Tcp, addr, tcp));
         assert!(server.send_raw(&entry, &vec![0u8; 70_000]).is_err());
         server.send_raw(&entry, b"ok").unwrap();
@@ -1934,7 +1966,7 @@ mod tests {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let _old_client = TcpStream::connect(l.local_addr().unwrap()).unwrap();
         let (old, _) = l.accept().unwrap();
-        let old = TcpOut::spawn(old, None).unwrap();
+        let old = TcpOut::spawn(old, u64::MAX, None).unwrap();
         old.stream.shutdown(std::net::Shutdown::Both).unwrap();
         let on_auth: OnAuth = Arc::new(|_| Err(io::Error::other("unused")));
         let peer = Peer::new(crate::ovpn::tests::server_config(), [1; 8], on_auth).unwrap();
@@ -2070,6 +2102,25 @@ mod tests {
                 ) => {}
             other => panic!("third connection must be refused, got {other:?}"),
         }
+        server.close();
+    }
+
+    /// The per-source cap is on connections still handshaking: clients
+    /// that authenticated leave their places to the next from the same
+    /// source (a NAT gateway, say), which the total cap still bounds.
+    #[test]
+    fn authenticated_tcp_connections_leave_the_per_source_cap() {
+        let server = server_configured(auth_ok(), |c| c.max_tcp_connections_per_source(2));
+        // All kept open for the whole test.
+        let mut clients = [TestClient::new(*b"CLIENT-A"), TestClient::new(*b"CLIENT-B")];
+        let conns: Vec<TcpStream> = clients
+            .iter_mut()
+            .map(|c| connect_tcp(&server, c))
+            .collect();
+        let mut third = tcp_client(&server);
+        tcp_send(&mut third, &client_reset(*b"CLIENT-C"));
+        tcp_recv(&mut third).expect("a third client from the source is served");
+        assert_eq!(conns.len(), 2);
         server.close();
     }
 
