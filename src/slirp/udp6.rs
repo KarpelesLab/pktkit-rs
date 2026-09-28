@@ -2,7 +2,7 @@
 
 use crate::Result;
 use crate::slirp::icmpv6::build_icmpv6_port_unreachable;
-use crate::slirp::packet::{build_udp_packet6, fit_link};
+use crate::slirp::packet::build_udp_packet6;
 use crate::slirp::udp::{ClosedOnExit, Refusals, is_transient};
 use crate::time::Instant;
 use std::io::ErrorKind;
@@ -105,9 +105,8 @@ impl UdpConn6 {
                     conn.c_src_port,
                     &buf[..n],
                 );
-                for p in fit_link(pkt) {
-                    let _ = send(&p);
-                }
+                // `send` fragments it to fit the link.
+                let _ = send(&pkt);
                 {
                     if let Ok(mut t) = conn.last_act.lock() {
                         *t = Instant::now();

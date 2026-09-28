@@ -5,7 +5,8 @@
 
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use pktkit::vclient::{Client, ClientConfig};
@@ -146,4 +147,120 @@ fn a_dial_through_a_shut_down_stack_fails_fast() {
     let r = client.dial_tcp_timeout(SocketAddr::from((STACK_IP, 8080)), Duration::from_secs(10));
     assert!(r.is_err());
     assert!(started.elapsed() < Duration::from_secs(4));
+}
+
+/// The guest's end of a narrower link: packets from the stack larger than
+/// `mtu` are dropped at the hop and answered with a Packet Too Big, as an
+/// IPv6 router must (RFC 8201), and never fragmented.
+struct NarrowHop {
+    client: Arc<Client>,
+    to_stack: Mutex<Option<L3Handler>>,
+    mtu: usize,
+    too_big: Arc<AtomicUsize>,
+}
+
+impl std::fmt::Debug for NarrowHop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NarrowHop").field("mtu", &self.mtu).finish()
+    }
+}
+
+impl L3Device for NarrowHop {
+    fn set_handler(&self, h: L3Handler) {
+        *self.to_stack.lock().unwrap() = Some(h.clone());
+        self.client.set_handler(h);
+    }
+    fn send(&self, p: &Packet) -> pktkit::Result<()> {
+        if p.len() <= self.mtu {
+            return self.client.send(p);
+        }
+        self.too_big.fetch_add(1, Ordering::Relaxed);
+        let hop: IpAddr = "fd00::fe".parse().unwrap();
+        let ptb = pktkit::icmp::packet_too_big(p, hop, self.mtu as u32).unwrap();
+        let h = self.to_stack.lock().unwrap().clone();
+        if let Some(h) = h {
+            h(Packet::from_slice(&ptb))?;
+        }
+        Ok(())
+    }
+    fn addr(&self) -> IpPrefix {
+        self.client.addr()
+    }
+    fn set_addr(&self, p: IpPrefix) -> pktkit::Result<()> {
+        self.client.set_addr(p)
+    }
+    fn close(&self) -> pktkit::Result<()> {
+        self.client.close()
+    }
+}
+
+/// An IPv6 stack and client with a 1400-byte hop between them; the count
+/// is of the Packet Too Big messages the hop has sent.
+fn narrow_v6() -> (Arc<pktkit::slirp::Stack>, Arc<Client>, Arc<AtomicUsize>) {
+    let stack = pktkit::slirp::Stack::new();
+    stack
+        .set_addr(IpPrefix::new("fd00::1".parse().unwrap(), 64))
+        .unwrap();
+    let client =
+        Client::new(ClientConfig::default().prefix(IpPrefix::new("fd00::2".parse().unwrap(), 64)));
+    let too_big = Arc::new(AtomicUsize::new(0));
+    let hop = NarrowHop {
+        client: client.clone(),
+        to_stack: Mutex::default(),
+        mtu: 1400,
+        too_big: too_big.clone(),
+    };
+    connect_l3(stack.clone(), hop);
+    (stack, client, too_big)
+}
+
+fn pattern(n: usize) -> Vec<u8> {
+    (0..n).map(|i| (i * 7 + i / 251) as u8).collect()
+}
+
+/// A download from the host through the stack to a guest behind a
+/// narrower IPv6 hop completes: the stack takes the hop's Packet Too Big
+/// and cuts the bridge's segments to fit, rather than resend, for good,
+/// segments the hop can never forward.
+#[test]
+fn a_v6_download_through_a_narrower_hop_completes() {
+    let (_stack, client, too_big) = narrow_v6();
+    let Ok(server) = std::net::TcpListener::bind("[::1]:0") else {
+        return; // no IPv6 loopback on this host
+    };
+    let dest = server.local_addr().unwrap();
+    let data = pattern(1 << 20);
+    let sent = data.clone();
+    std::thread::spawn(move || {
+        let (mut s, _) = server.accept().unwrap();
+        s.write_all(&sent).unwrap();
+    });
+    let mut c = client.dial_tcp(dest).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(20)));
+    let mut got = vec![0u8; data.len()];
+    c.read_exact(&mut got).expect("download stalled");
+    assert!(got == data, "download corrupted");
+    assert!(too_big.load(Ordering::Relaxed) > 0);
+}
+
+/// The same for a connection a guest opens to one of the stack's own
+/// listeners, which the application then writes to.
+#[test]
+fn a_v6_listener_write_through_a_narrower_hop_completes() {
+    let (stack, client, too_big) = narrow_v6();
+    let listener = stack.listen6("[fd00::1]:8080").unwrap();
+    let data = pattern(1 << 20);
+    let sent = data.clone();
+    std::thread::spawn(move || {
+        let mut s = listener.accept().unwrap();
+        s.write_all(&sent).unwrap();
+        // Held until the guest has it all: dropping the stream closes it.
+        std::thread::sleep(Duration::from_secs(30));
+    });
+    let mut c = client.dial_tcp("[fd00::1]:8080".parse().unwrap()).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(20)));
+    let mut got = vec![0u8; data.len()];
+    c.read_exact(&mut got).expect("transfer stalled");
+    assert!(got == data, "transfer corrupted");
+    assert!(too_big.load(Ordering::Relaxed) > 0);
 }

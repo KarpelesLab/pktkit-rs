@@ -9,9 +9,15 @@ use crate::slirp::checksum::{ipv4_header_checksum, ipv6_pseudo_checksum, tcp_v4_
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-/// MTU of the virtual link, which the TCP MSS (1460 / 1440) also assumes.
-/// Datagrams the stack originates are fragmented to fit it.
-pub(crate) const LINK_MTU: usize = 1500;
+/// MTU of the virtual link unless [`Stack::set_mtu`](super::Stack::set_mtu)
+/// says otherwise. Datagrams the stack originates are fragmented to fit the
+/// link, and the MSS of its TCP connections is derived from it.
+pub(crate) const DEFAULT_MTU: u32 = 1500;
+
+/// Narrowest link [`Stack::set_mtu`](super::Stack::set_mtu) accepts: the
+/// datagram every IPv4 host must be able to take (RFC 791), which leaves a
+/// TCP MSS of at least 516 bytes over either family.
+pub(crate) const MIN_MTU: u32 = 576;
 
 /// Identification for the datagrams the stack originates. Fragments of one
 /// datagram share it, so it must differ between datagrams in flight.
@@ -21,12 +27,20 @@ pub(crate) fn next_ip_id() -> u32 {
     NEXT_IP_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Split a packet the stack built into pieces that fit [`LINK_MTU`].
+/// The MSS for TCP to a peer of the given family over a link MTU of `mtu`:
+/// the MTU less the IP and TCP headers (RFC 9293 §3.7.1).
+pub(crate) fn mss_for_mtu(mtu: u32, ipv6: bool) -> u16 {
+    let headers = if ipv6 { 60 } else { 40 };
+    mtu.saturating_sub(headers).min(u32::from(u16::MAX)) as u16
+}
+
+/// Split a packet the stack built into pieces that fit a link MTU of `mtu`
+/// (at least [`MIN_MTU`]).
 ///
 /// IPv4 is fragmented as a router would; for IPv6 the stack is the source
 /// host, which is the one node RFC 8200 lets fragment.
-pub(crate) fn fit_link(pkt: Vec<u8>) -> Vec<Vec<u8>> {
-    if pkt.len() <= LINK_MTU {
+pub(crate) fn fit_link(pkt: Vec<u8>, mtu: usize) -> Vec<Vec<u8>> {
+    if pkt.len() <= mtu {
         return vec![pkt];
     }
     match pkt[0] >> 4 {
@@ -41,12 +55,12 @@ pub(crate) fn fit_link(pkt: Vec<u8>) -> Vec<Vec<u8>> {
             pkt[10..12].copy_from_slice(&[0, 0]);
             let cs = ipv4_header_checksum(&pkt[..ihl]);
             pkt[10..12].copy_from_slice(&cs.to_be_bytes());
-            match fragment_ipv4(Packet::from_slice(&pkt), LINK_MTU) {
+            match fragment_ipv4(Packet::from_slice(&pkt), mtu) {
                 Fragmentation::Fragments(f) => f,
                 _ => vec![pkt],
             }
         }
-        6 => fragment_ipv6(&pkt, LINK_MTU),
+        6 => fragment_ipv6(&pkt, mtu),
         _ => vec![pkt],
     }
 }
@@ -89,8 +103,9 @@ pub(crate) fn build_packet4(src_ip: Ipv4Addr, dst_ip: Ipv4Addr, tcp_seg: &[u8]) 
     ip[0] = (4 << 4) | 5;
     ip[1] = 0;
     ip[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
-    // DF stays clear (the stack does no path-MTU discovery, so a narrower
-    // hop downstream must be free to fragment), which makes the datagram
+    // DF stays clear, as vclient's does: a narrower hop downstream may then
+    // fragment the segment rather than rely on its Fragmentation Needed
+    // reaching us (which the stack does act on). That makes the datagram
     // non-atomic: RFC 6864 §4.1 requires a distinct ID, or reassembly at the
     // guest could splice fragments of two segments together.
     ip[4..6].copy_from_slice(&(next_ip_id() as u16).to_be_bytes());
@@ -302,12 +317,12 @@ mod tests {
         let dst: Ipv6Addr = "fd00::5".parse().unwrap();
         let body: Vec<u8> = (0..4000u32).map(|i| i as u8).collect();
         let pkt = build_udp_packet6(src, 53, dst, 4000, &body);
-        let frags = fit_link(pkt.clone());
+        let frags = fit_link(pkt.clone(), DEFAULT_MTU as usize);
         assert_eq!(frags.len(), 3);
         let mut r = crate::defrag::Reassembler::default();
         let mut whole = None;
         for f in &frags {
-            assert!(f.len() <= LINK_MTU);
+            assert!(f.len() <= DEFAULT_MTU as usize);
             whole = r.push_v6(crate::time::Instant::now(), 0, f, 40);
         }
         assert_eq!(whole.unwrap(), pkt);
@@ -323,9 +338,9 @@ mod tests {
             9,
             &body,
         );
-        let frags = fit_link(pkt);
+        let frags = fit_link(pkt, DEFAULT_MTU as usize);
         assert_eq!(frags.len(), 3);
-        assert!(frags.iter().all(|f| f.len() <= LINK_MTU));
+        assert!(frags.iter().all(|f| f.len() <= DEFAULT_MTU as usize));
     }
 
     #[test]

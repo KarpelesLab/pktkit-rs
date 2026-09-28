@@ -8,7 +8,7 @@
 
 use crate::Result;
 use crate::slirp::icmpv4::build_icmpv4_port_unreachable;
-use crate::slirp::packet::{build_udp_packet4, fit_link};
+use crate::slirp::packet::build_udp_packet4;
 use crate::time::Instant;
 use std::io::ErrorKind;
 use std::net::{Ipv4Addr, UdpSocket};
@@ -174,9 +174,8 @@ impl UdpConn {
                     conn.c_src_port,
                     &buf[..n],
                 );
-                for p in fit_link(pkt) {
-                    let _ = send(&p);
-                }
+                // `send` fragments it to fit the link.
+                let _ = send(&pkt);
                 {
                     if let Ok(mut t) = conn.last_act.lock() {
                         *t = Instant::now();

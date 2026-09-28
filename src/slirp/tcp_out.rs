@@ -38,10 +38,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-/// MSS advertised on the virtual side (mirrors the Go constants).
-const MSS_V4: u16 = 1460;
-const MSS_V6: u16 = 1440;
-
 /// How long to wait for the real destination to accept. Well under the OS's
 /// own connect timeout (75 s to over two minutes), and still longer than a
 /// client usually keeps retransmitting its SYN.
@@ -113,9 +109,10 @@ impl TcpOutConn {
     pub(crate) fn pending(
         endpoints: Endpoints,
         syn: &Segment,
+        mss: u16,
         sink: Arc<dyn Fn(&[u8]) + Send + Sync>,
     ) -> Arc<TcpOutConn> {
-        let (local_addr, remote_addr, local_port, remote_port, mss) = match endpoints {
+        let (local_addr, remote_addr, local_port, remote_port) = match endpoints {
             Endpoints::V4 {
                 local_ip,
                 local_port,
@@ -126,7 +123,6 @@ impl TcpOutConn {
                 SocketAddr::new(IpAddr::V4(remote_ip), remote_port),
                 local_port,
                 remote_port,
-                MSS_V4,
             ),
             Endpoints::V6 {
                 local_ip,
@@ -138,7 +134,6 @@ impl TcpOutConn {
                 SocketAddr::new(IpAddr::V6(remote_ip), remote_port),
                 local_port,
                 remote_port,
-                MSS_V6,
             ),
         };
 
@@ -676,6 +671,7 @@ mod tests {
                 remote_port: 5000,
             },
             &syn,
+            1460,
             Arc::new(|_: &[u8]| {}),
         );
         let mut conn = bridge.state().conn.lock().unwrap();

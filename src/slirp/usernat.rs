@@ -29,7 +29,7 @@ use crate::slirp::ipv6::skip_extension_headers;
 use crate::slirp::listener::{Listener, ListenerKey, resolve_v4};
 use crate::slirp::listener6::{Listener6, ListenerKey6, resolve_v6};
 use crate::slirp::ns_table::{NsKey, NsTable};
-use crate::slirp::packet::fit_link;
+use crate::slirp::packet::{DEFAULT_MTU, MIN_MTU, fit_link, mss_for_mtu};
 use crate::slirp::tcp_out::{TcpOutConn, build_refused_rst, build_rst_for_stray};
 use crate::slirp::tcp_stream::{ConnState, Endpoints, Offer, tick_conn};
 use crate::slirp::udp::{SendFn as UdpSendFn, UdpConn};
@@ -42,7 +42,7 @@ use crate::time::Instant;
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::thread;
 use std::time::Duration;
@@ -228,6 +228,8 @@ struct Inner {
     defrag: Mutex<HashMap<u64, Reassembler>>,
     /// Which host destinations the guests may reach; `None` allows all.
     filter: RwLock<Option<DestFilter>>,
+    /// MTU of the link to the guests; see [`Stack::set_mtu`].
+    mtu: AtomicU32,
     closed: AtomicBool,
 }
 
@@ -323,6 +325,7 @@ impl Stack {
             dials: Arc::new(Mutex::new(Dials::default())),
             defrag: Mutex::new(HashMap::new()),
             filter: RwLock::new(None),
+            mtu: AtomicU32::new(DEFAULT_MTU),
             closed: AtomicBool::new(false),
         });
 
@@ -564,6 +567,36 @@ impl Stack {
         *self.inner.filter.write().expect("poisoned") = filter;
     }
 
+    /// Set the MTU of the link between the stack and its guests (1500 by
+    /// default), for a narrower one such as a tunnel. What the stack sends
+    /// a guest is fragmented to fit it, and TCP connections opened from
+    /// then on advertise, and send with, an MSS derived from it: the MTU
+    /// less 40 bytes of IPv4 and TCP headers (60 over IPv6). Connections
+    /// already open keep their MSS; their segments are fragmented instead.
+    ///
+    /// A narrower hop further along, which answers with an ICMP
+    /// Fragmentation Needed or Packet Too Big, lowers the path MTU of the
+    /// one connection it concerns (RFC 1191, RFC 8201) whatever the link
+    /// MTU is.
+    ///
+    /// Fails with `InvalidInput` outside 576..=65535: 576 is the datagram
+    /// every IPv4 host must be able to take (RFC 791).
+    pub fn set_mtu(&self, mtu: u32) -> Result<()> {
+        if !(MIN_MTU..=u32::from(u16::MAX)).contains(&mtu) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "link MTU must be between 576 and 65535",
+            ));
+        }
+        self.inner.mtu.store(mtu, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// The MTU of the link to the guests; see [`set_mtu`](Self::set_mtu).
+    pub fn mtu(&self) -> u32 {
+        self.inner.mtu.load(Ordering::Relaxed)
+    }
+
     /// The host address to dial for a guest's `dest` over `proto`, or `None`
     /// if the guests may not reach it.
     ///
@@ -636,12 +669,24 @@ impl Stack {
     }
 
     /// Dispatch a packet the stack built, fragmented to fit the link: an
-    /// echo reply is as large as the (possibly reassembled) request.
-    fn dispatch_fitted(inner: &Arc<Inner>, ns: u64, pkt: Vec<u8>) -> Result<()> {
-        for p in fit_link(pkt) {
+    /// echo reply is as large as the (possibly reassembled) request, a UDP
+    /// reply as large as the host's datagram, and a TCP segment of a
+    /// connection opened before [`Stack::set_mtu`] narrowed the link as
+    /// large as the MSS it was opened with.
+    fn dispatch_fitted(inner: &Arc<Inner>, ns: u64, pkt: &[u8]) -> Result<()> {
+        let mtu = inner.mtu.load(Ordering::Relaxed) as usize;
+        if pkt.len() <= mtu {
+            return Self::dispatch(inner, ns, pkt);
+        }
+        for p in fit_link(pkt.to_vec(), mtu) {
             Self::dispatch(inner, ns, &p)?;
         }
         Ok(())
+    }
+
+    /// The MSS a new TCP connection with a peer of the given family uses.
+    fn mss(inner: &Inner, ipv6: bool) -> u16 {
+        mss_for_mtu(inner.mtu.load(Ordering::Relaxed), ipv6)
     }
 
     /// The packet sink handed to a flow, injecting into namespace `ns`.
@@ -653,7 +698,7 @@ impl Stack {
         let weak = Arc::downgrade(inner);
         Arc::new(move |p: &[u8]| {
             if let Some(inner) = weak.upgrade() {
-                let _ = Self::dispatch(&inner, ns, p);
+                let _ = Self::dispatch_fitted(&inner, ns, p);
             }
         })
     }
@@ -724,8 +769,9 @@ impl Stack {
                 // ICMP.
                 let our = inner.addr.read().expect("poisoned").addr();
                 if let Some(reply) = build_icmpv4_echo_reply(pkt, src, dst, ihl, Some(our)) {
-                    return Self::dispatch_fitted(inner, ns, reply);
+                    return Self::dispatch_fitted(inner, ns, &reply);
                 }
+                Self::handle_too_big(inner, ns, pkt);
                 Ok(())
             }
             6 => Self::handle_ipv4_tcp(inner, ns, pkt, src, dst, ihl),
@@ -844,7 +890,7 @@ impl Stack {
             remote_ip: src,
             remote_port: src_port,
         };
-        let conn = TcpOutConn::pending(endpoints, &seg, sink);
+        let conn = TcpOutConn::pending(endpoints, &seg, Self::mss(inner, false), sink);
         // Register before the dial can answer, so the client's ACK of the
         // SYN-ACK resolves to this connection rather than drawing a RST.
         inner
@@ -935,7 +981,7 @@ impl Stack {
             remote_addr: Some(SocketAddr::new(std::net::IpAddr::V4(src), src_port)),
             local_port: dst_port,
             remote_port: src_port,
-            mss: 1460,
+            mss: Self::mss(inner, false),
             keepalive: true,
             ..Default::default()
         };
@@ -1018,7 +1064,7 @@ impl Stack {
             } else {
                 let weak = Arc::downgrade(inner);
                 let send_fn: UdpSendFn = Arc::new(move |p: &[u8]| match weak.upgrade() {
-                    Some(inner) => Self::dispatch(&inner, ns, p),
+                    Some(inner) => Self::dispatch_fitted(&inner, ns, p),
                     None => Ok(()),
                 });
                 let conn = UdpConn::new(src, src_port, dst, dst_port, send_fn)?;
@@ -1098,8 +1144,9 @@ impl Stack {
                 if let Some(reply) =
                     build_icmpv6_echo_reply(pkt, src_addr, dst_addr, transport_off, Some(our))
                 {
-                    return Self::dispatch_fitted(inner, ns, reply);
+                    return Self::dispatch_fitted(inner, ns, &reply);
                 }
+                Self::handle_too_big(inner, ns, pkt);
                 Ok(())
             }
             _ => Ok(()),
@@ -1206,7 +1253,7 @@ impl Stack {
             remote_ip: src,
             remote_port: src_port,
         };
-        let conn = TcpOutConn::pending(endpoints, &seg, sink);
+        let conn = TcpOutConn::pending(endpoints, &seg, Self::mss(inner, true), sink);
         // Register before the dial can answer (see the v4 path).
         inner
             .tcp6
@@ -1287,7 +1334,7 @@ impl Stack {
             remote_addr: Some(SocketAddr::new(std::net::IpAddr::V6(src), src_port)),
             local_port: dst_port,
             remote_port: src_port,
-            mss: 1440,
+            mss: Self::mss(inner, true),
             keepalive: true,
             ..Default::default()
         };
@@ -1363,7 +1410,7 @@ impl Stack {
             } else {
                 let weak = Arc::downgrade(inner);
                 let send_fn: UdpSendFn6 = Arc::new(move |p: &[u8]| match weak.upgrade() {
-                    Some(inner) => Self::dispatch(&inner, ns, p),
+                    Some(inner) => Self::dispatch_fitted(&inner, ns, p),
                     None => Ok(()),
                 });
                 let conn = UdpConn6::new(src, src_port, dst, dst_port, dial, send_fn)?;
@@ -1373,6 +1420,94 @@ impl Stack {
         };
         conn.handle_outbound(pkt, transport_off);
         Ok(())
+    }
+
+    /// Take an ICMPv4 Fragmentation Needed (type 3 code 4) or ICMPv6 Packet
+    /// Too Big (type 2) from the virtual network: a hop between the stack
+    /// and a guest is narrower than the link, and could not forward one of
+    /// the TCP segments the stack sent. The connection it quotes lowers its
+    /// path MTU and resends what no longer fits, cut to size (RFC 1191,
+    /// RFC 8201). Were it ignored, then over IPv6, where routers never
+    /// fragment, every full-size segment would be lost at that hop, and a
+    /// download would stall at the first.
+    ///
+    /// Nothing about the message is authenticated, so it must hold together
+    /// (RFC 5927 §4.1): a valid checksum, sent to the address the stack
+    /// sent the quoted segment from, whose ports and peer match one of the
+    /// namespace's connections, and quoting a SEQ that connection has sent
+    /// and not had acknowledged (which vtcp checks). Anything else is
+    /// dropped, as is every other ICMP error.
+    fn handle_too_big(inner: &Arc<Inner>, ns: u64, pkt: &[u8]) {
+        let pkt = Packet::from_slice(pkt);
+        let v6 = pkt.version() == 6;
+        let msg = pkt.payload();
+        if msg.len() < 8 {
+            return;
+        }
+        let mtu = match (v6, msg[0], msg[1]) {
+            (false, 3, 4) => u32::from(u16::from_be_bytes([msg[6], msg[7]])),
+            (true, 2, _) => u32::from_be_bytes([msg[4], msg[5], msg[6], msg[7]]),
+            _ => return,
+        };
+        if pkt.verify_transport_checksum() != Some(true) {
+            return;
+        }
+        let quoted = Packet::from_slice(&msg[8..]);
+        if quoted.version() != pkt.version() || quoted.ip_protocol() != Protocol::TCP {
+            return;
+        }
+        let off = quoted.transport_offset();
+        let (Some(ours), Some(peer), Some(tcp)) = (
+            quoted.src_addr(),
+            quoted.dst_addr(),
+            quoted.as_bytes().get(off..off + 8),
+        ) else {
+            return;
+        };
+        if pkt.dst_addr() != Some(ours) {
+            return;
+        }
+        let our_port = u16::from_be_bytes([tcp[0], tcp[1]]);
+        let peer_port = u16::from_be_bytes([tcp[2], tcp[3]]);
+        let seq = u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]);
+        // The tables are keyed as the guest sends: from the peer, to us.
+        let state = match (ours, peer) {
+            (IpAddr::V4(ours), IpAddr::V4(peer)) => {
+                let key = Key {
+                    ns,
+                    src_ip: peer.octets(),
+                    src_port: peer_port,
+                    dst_ip: ours.octets(),
+                    dst_port: our_port,
+                };
+                let virt = inner.virt_tcp.lock().expect("poisoned").get(&key).cloned();
+                virt.or_else(|| {
+                    let out = inner.tcp.lock().expect("poisoned").get(&key).cloned();
+                    out.map(|c| c.state().clone())
+                })
+            }
+            (IpAddr::V6(ours), IpAddr::V6(peer)) => {
+                let key = Key6 {
+                    ns,
+                    src_ip: peer.octets(),
+                    src_port: peer_port,
+                    dst_ip: ours.octets(),
+                    dst_port: our_port,
+                };
+                let virt = inner.virt_tcp6.lock().expect("poisoned").get(&key).cloned();
+                virt.or_else(|| {
+                    let out = inner.tcp6.lock().expect("poisoned").get(&key).cloned();
+                    out.map(|c| c.state().clone())
+                })
+            }
+            _ => None,
+        };
+        let Some(state) = state else {
+            return;
+        };
+        let mut conn = state.conn.lock().expect("poisoned");
+        let segs = conn.on_icmp_too_big(mtu, seq);
+        state.emit(conn, segs);
     }
 
     fn cleanup_namespace(inner: &Arc<Inner>, ns: u64) {
@@ -2819,7 +2954,7 @@ mod tests {
         let mut whole = None;
         wait_for("the whole reply", || {
             for p in captured.lock().unwrap().drain(..) {
-                assert!(p.len() <= crate::slirp::packet::LINK_MTU);
+                assert!(p.len() <= crate::slirp::packet::DEFAULT_MTU as usize);
                 whole = whole
                     .take()
                     .or_else(|| r.push_v4(Instant::now(), 0, &p, 20));
@@ -3142,13 +3277,13 @@ mod tests {
         p[8..24].copy_from_slice(&"fd00::5".parse::<Ipv6Addr>().unwrap().octets());
         p[24..40].copy_from_slice(&"fd00::1".parse::<Ipv6Addr>().unwrap().octets());
         p.extend_from_slice(&body);
-        crate::slirp::packet::fit_link(p)
+        crate::slirp::packet::fit_link(p, DEFAULT_MTU as usize)
     }
 
     #[test]
     fn large_echo_replies_fit_the_link() {
         use crate::fragment::{Fragmentation, fragment_ipv4};
-        use crate::slirp::packet::LINK_MTU;
+        const LINK_MTU: usize = DEFAULT_MTU as usize;
 
         // Reassemble what the stack sent, checking every piece fits.
         let collect = |captured: &Arc<Mutex<Vec<Vec<u8>>>>| {
@@ -3810,6 +3945,7 @@ mod tests {
                 remote_port: 5000,
             },
             &syn,
+            1460,
             Arc::new(|_: &[u8]| {}),
         );
         *bridge.remote.lock().unwrap() = Some(Arc::new(ours));
@@ -4106,6 +4242,7 @@ mod tests {
                 remote_port: cport,
             },
             &syn,
+            1460,
             Arc::new(|_: &[u8]| {}),
         );
         {
@@ -4203,5 +4340,121 @@ mod tests {
             .recv_from(&mut buf)
             .expect("namespace 2's datagram was evicted");
         assert_eq!(&buf[..n], &body[..]);
+    }
+
+    /// Open a connection from 10.0.0.5:4000 to a listener of `stack` on
+    /// 10.0.0.1:80, with `captured` recording what the stack sends; the
+    /// SYN-ACK is returned, and nothing is left in `captured`.
+    fn accepted_v4(
+        stack: &Arc<Stack>,
+        captured: &Mutex<Vec<Vec<u8>>>,
+    ) -> (super::super::TcpStream, Segment) {
+        let (us, peer) = (Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 5));
+        let listener = stack.listen("tcp", "10.0.0.1:80").unwrap();
+        let send = |p: &[u8]| L3Device::send(&**stack, Packet::from_slice(p)).unwrap();
+        // Without an MSS option the stack would send 536-byte segments.
+        let syn = Segment {
+            src_port: 4000,
+            dst_port: 80,
+            seq: 1000,
+            flags: tcp_flags::SYN,
+            window: 32768,
+            options: vec![crate::vtcp::options::mss_option(1460)],
+            ..Default::default()
+        };
+        send(&crate::slirp::packet::build_packet4(
+            peer,
+            us,
+            &syn.marshal(),
+        ));
+        let synack = Segment::parse(&captured.lock().unwrap()[0][20..]).unwrap();
+        let ack = synack.seq.wrapping_add(1);
+        send(&build_tcp_v4_packet(
+            peer,
+            4000,
+            us,
+            80,
+            1001,
+            ack,
+            tcp_flags::ACK,
+            &[],
+        ));
+        let stream = listener.accept().unwrap();
+        captured.lock().unwrap().clear();
+        (stream, synack)
+    }
+
+    /// A narrower hop between the stack and a guest answers a segment too
+    /// big for it with a Fragmentation Needed: what was in flight goes
+    /// again, cut to the MTU it reported, and so does what follows. A
+    /// message that does not hold together changes nothing.
+    #[test]
+    fn fragmentation_needed_cuts_a_connections_segments_to_size() {
+        let stack = Stack::new();
+        stack
+            .set_addr(IpPrefix::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 24))
+            .unwrap();
+        let captured = capture(&stack);
+        let (stream, _) = accepted_v4(&stack, &captured);
+        stream.write(&[7u8; 4000]).unwrap();
+        let first = captured.lock().unwrap()[0].clone();
+        assert_eq!(first.len(), 1500, "a full-size segment went out");
+        let router = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 254));
+        let ptb = crate::icmp::packet_too_big(Packet::from_slice(&first), router, 1000).unwrap();
+        let resent = |icmp: &[u8]| {
+            captured.lock().unwrap().clear();
+            L3Device::send(&*stack, Packet::from_slice(icmp)).unwrap();
+            captured.lock().unwrap().clone()
+        };
+
+        let mut corrupt = ptb.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        assert!(resent(&corrupt).is_empty(), "bad checksum acted on");
+        let mut elsewhere = ptb.clone();
+        elsewhere[16..20].copy_from_slice(&[10, 0, 0, 9]);
+        Packet::from_mut(&mut elsewhere).recompute_ipv4_checksum();
+        assert!(resent(&elsewhere).is_empty(), "sent to another address");
+        let mut unsent = ptb.clone();
+        // The quoted SEQ, past what the connection has sent.
+        let seq = 20 + 8 + 20 + 4;
+        unsent[seq..seq + 4].copy_from_slice(&0x4000_0000u32.to_be_bytes());
+        Packet::from_mut(&mut unsent).recompute_transport_checksum();
+        assert!(resent(&unsent).is_empty(), "SEQ never sent acted on");
+
+        let again = resent(&ptb);
+        assert!(!again.is_empty(), "nothing sent again");
+        assert!(again.iter().all(|p| p.len() <= 1000), "still too big");
+        let first_seq = Segment::parse(&first[20..]).unwrap().seq;
+        assert_eq!(Segment::parse(&again[0][20..]).unwrap().seq, first_seq);
+        captured.lock().unwrap().clear();
+        stream.write(&[8u8; 4000]).unwrap();
+        let mut ack = u32::from_be_bytes([again[0][24], again[0][25], again[0][26], again[0][27]]);
+        ack = ack.wrapping_add(8000);
+        let (us, peer) = (Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 5));
+        let ack = build_tcp_v4_packet(peer, 4000, us, 80, 1001, ack, tcp_flags::ACK, &[]);
+        L3Device::send(&*stack, Packet::from_slice(&ack)).unwrap();
+        assert!(captured.lock().unwrap().iter().all(|p| p.len() <= 1000));
+    }
+
+    /// The link MTU sets the MSS the stack advertises and sends with, and
+    /// bounds every packet it sends.
+    #[test]
+    fn the_link_mtu_sets_the_mss() {
+        let stack = Stack::new();
+        stack
+            .set_addr(IpPrefix::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 24))
+            .unwrap();
+        assert_eq!(stack.mtu(), 1500);
+        assert!(stack.set_mtu(575).is_err());
+        assert!(stack.set_mtu(65536).is_err());
+        stack.set_mtu(1280).unwrap();
+        assert_eq!(stack.mtu(), 1280);
+        let captured = capture(&stack);
+        let (stream, synack) = accepted_v4(&stack, &captured);
+        assert_eq!(crate::vtcp::options::get_mss(&synack.options), 1240);
+        stream.write(&[7u8; 4000]).unwrap();
+        let sent = captured.lock().unwrap().clone();
+        assert_eq!(sent[0].len(), 1280);
+        assert!(sent.iter().all(|p| p.len() <= 1280));
     }
 }
