@@ -39,7 +39,9 @@ pub struct SackBlock {
 /// Parse the options portion of a TCP header. Stops at end-of-options or a
 /// malformed entry; never panics.
 pub fn parse_options(raw: &[u8]) -> Vec<TcpOption> {
-    let mut opts = Vec::new();
+    // Room for what a segment usually carries (timestamps and SACK, or a
+    // SYN's four), without growing.
+    let mut opts = Vec::with_capacity(4);
     let mut i = 0;
     while i < raw.len() {
         let k = raw[i];
@@ -73,22 +75,46 @@ pub fn parse_options(raw: &[u8]) -> Vec<TcpOption> {
 }
 
 /// Serialize options into wire format, padding to a 4-byte boundary with
-/// end-of-options bytes.
+/// end-of-options bytes. What the engine sends is written in place
+/// ([`write_options`]); only the tests still build options on their own.
+#[cfg(test)]
 pub fn build_options(opts: &[TcpOption]) -> Vec<u8> {
-    let mut buf = Vec::new();
+    let mut buf = vec![0; options_len(opts)];
+    write_options(opts, &mut buf);
+    buf
+}
+
+/// The length [`build_options`] gives `opts`, padding included, without
+/// building them.
+pub(crate) fn options_len(opts: &[TcpOption]) -> usize {
+    let raw: usize = opts
+        .iter()
+        .map(|o| {
+            if o.kind == kind::Nop {
+                1
+            } else {
+                2 + o.data.len()
+            }
+        })
+        .sum();
+    raw.next_multiple_of(4)
+}
+
+/// Serialize `opts` into `buf`, which is [`options_len`] long, padding
+/// with end-of-options bytes.
+pub(crate) fn write_options(opts: &[TcpOption], buf: &mut [u8]) {
+    let mut i = 0;
     for o in opts {
+        buf[i] = o.kind;
+        i += 1;
         if o.kind == kind::Nop {
-            buf.push(kind::Nop);
             continue;
         }
-        buf.push(o.kind);
-        buf.push((2 + o.data.len()) as u8);
-        buf.extend_from_slice(&o.data);
+        buf[i] = (2 + o.data.len()) as u8;
+        buf[i + 1..i + 1 + o.data.len()].copy_from_slice(&o.data);
+        i += 1 + o.data.len();
     }
-    while buf.len() % 4 != 0 {
-        buf.push(kind::End);
-    }
-    buf
+    buf[i..].fill(kind::End);
 }
 
 /// A Maximum Segment Size option.
@@ -270,6 +296,30 @@ mod tests {
         let raw = build_options(&[sack_option(&blocks)]);
         let parsed = parse_options(&raw);
         assert_eq!(get_sack_blocks(&parsed), blocks);
+    }
+
+    /// The length is what building gives, padding and NOPs included, and
+    /// what is built parses back.
+    #[test]
+    fn options_len_matches_the_built_options() {
+        let nop = TcpOption {
+            kind: kind::Nop,
+            data: Vec::new(),
+        };
+        let block = SackBlock { left: 1, right: 2 };
+        for opts in [
+            vec![],
+            vec![nop.clone()],
+            vec![nop.clone(), nop.clone(), timestamp_option(1, 2)],
+            vec![timestamp_option(1, 2), sack_option(&[block; 3])],
+            vec![mss_option(1460), sack_perm_option(), wscale_option(7)],
+        ] {
+            let raw = build_options(&opts);
+            assert_eq!(raw.len(), options_len(&opts));
+            assert_eq!(raw.len() % 4, 0);
+            let parsed = parse_options(&raw);
+            assert_eq!(parsed, opts);
+        }
     }
 
     #[test]

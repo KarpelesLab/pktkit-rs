@@ -91,12 +91,7 @@ impl Segment {
     /// callers must compute the TCP checksum over IP pseudo-header + segment
     /// and patch bytes 16..18 of the result before transmission.
     pub fn marshal(&self) -> Vec<u8> {
-        let opt_bytes = if self.options.is_empty() {
-            Vec::new()
-        } else {
-            options::build_options(&self.options)
-        };
-        let hdr_len = 20 + opt_bytes.len();
+        let hdr_len = 20 + options::options_len(&self.options);
         let mut out = vec![0u8; hdr_len + self.payload.len()];
         out[0..2].copy_from_slice(&self.src_port.to_be_bytes());
         out[2..4].copy_from_slice(&self.dst_port.to_be_bytes());
@@ -107,9 +102,9 @@ impl Segment {
         out[14..16].copy_from_slice(&self.window.to_be_bytes());
         // checksum left at 0
         out[18..20].copy_from_slice(&self.urgent.to_be_bytes());
-        if !opt_bytes.is_empty() {
-            out[20..hdr_len].copy_from_slice(&opt_bytes);
-        }
+        // Straight into place: an intermediate buffer per segment cost
+        // more than the rest of the header together.
+        options::write_options(&self.options, &mut out[20..hdr_len]);
         if !self.payload.is_empty() {
             out[hdr_len..].copy_from_slice(&self.payload);
         }

@@ -1031,7 +1031,7 @@ impl Conn {
 
     /// The options a segment sent now carries: timestamps and SACK blocks.
     fn segment_options(&self) -> Vec<TcpOption> {
-        let mut opts = Vec::new();
+        let mut opts = Vec::with_capacity(2);
         if self.ts_ok {
             opts.push(timestamp_option(self.ts_now(), self.ts_recent));
         }
@@ -1059,12 +1059,9 @@ impl Conn {
     /// segment with timestamps and SACK blocks would otherwise exceed the
     /// MTU the peer derived its MSS from.
     fn payload_room(&self, opts: &[TcpOption]) -> usize {
-        let opt_len = if opts.is_empty() {
-            0
-        } else {
-            options::build_options(opts).len()
-        };
-        (self.mss as usize).saturating_sub(opt_len).max(1)
+        (self.mss as usize)
+            .saturating_sub(options::options_len(opts))
+            .max(1)
     }
 
     /// [`payload_room`](Self::payload_room) for a segment sent now.
@@ -2555,12 +2552,13 @@ impl Conn {
                 ack: rcv_nxt,
                 flags: flags::ACK | flags::PSH,
                 window: self.rcv_window(),
-                payload: data.clone(),
+                payload: data,
                 options: opts,
                 ..Default::default()
             };
+            let len = seg.payload.len();
             self.queue_seg(seg);
-            self.send_buf.as_mut().unwrap().advance_sent(data.len());
+            self.send_buf.as_mut().unwrap().advance_sent(len);
             // Answering the peer's data within a delayed ACK's time
             // (Linux's tcp_event_data_sent).
             if self
