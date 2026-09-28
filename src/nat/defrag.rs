@@ -1,6 +1,6 @@
 //! IPv4 defragmentation. Port of `defrag.go`.
 //!
-//! Buffers fragments by (src, dst, id, proto), discards on timeout, rejects
+//! Buffers fragments by (zone, src, dst, id, proto), discards on timeout, rejects
 //! overlapping fragments (RFC 5722 best practice), reassembles when the full
 //! datagram is covered.
 //!
@@ -31,6 +31,11 @@ pub(crate) const DEFRAG_MAX_BYTES: usize = 4 << 20;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct FragKey {
+    /// Who sent the fragment, as the caller tells senders apart (the NAT's
+    /// inside namespace). Addresses alone do not: fragments claiming the
+    /// same ones from two namespaces must never be spliced into one
+    /// datagram.
+    zone: u64,
     src_ip: [u8; 4],
     dst_ip: [u8; 4],
     id: u16,
@@ -197,16 +202,22 @@ impl Defragger {
     ///   packet as a fresh `Vec`.
     #[cfg(any(test, feature = "fuzzing"))]
     pub fn process(&self, pkt: &[u8]) -> Option<Vec<u8>> {
-        self.reassemble(pkt).map(|(p, _)| p)
+        self.reassemble(0, pkt).map(|(p, _)| p)
     }
 
-    /// [`process`](Self::process), also returning, for a datagram put
-    /// together from fragments, the size they came in.
-    pub(crate) fn reassemble(&self, pkt: &[u8]) -> Option<(Vec<u8>, Option<FragMax>)> {
-        self.reassemble_at(pkt, Instant::now())
+    /// [`process`](Self::process) for a fragment from `zone`, also
+    /// returning, for a datagram put together from fragments, the size they
+    /// came in. Only fragments from one zone are put together.
+    pub(crate) fn reassemble(&self, zone: u64, pkt: &[u8]) -> Option<(Vec<u8>, Option<FragMax>)> {
+        self.reassemble_at(zone, pkt, Instant::now())
     }
 
-    fn reassemble_at(&self, pkt: &[u8], now: Instant) -> Option<(Vec<u8>, Option<FragMax>)> {
+    fn reassemble_at(
+        &self,
+        zone: u64,
+        pkt: &[u8],
+        now: Instant,
+    ) -> Option<(Vec<u8>, Option<FragMax>)> {
         if pkt.len() < 20 {
             return Some((pkt.to_vec(), None));
         }
@@ -240,6 +251,7 @@ impl Defragger {
         let mut dst = [0u8; 4];
         dst.copy_from_slice(&pkt[16..20]);
         let k = FragKey {
+            zone,
             src_ip: src,
             dst_ip: dst,
             id: u16::from_be_bytes([pkt[4], pkt[5]]),
@@ -541,7 +553,7 @@ mod tests {
         // Lone first fragments whose datagrams never complete fill the table.
         for id in 0..DEFRAG_MAX_ENTRIES as u16 {
             let f = build_ipv4(id, true, 0, &[1u8; 8]);
-            assert!(d.reassemble_at(&f, t0).is_none());
+            assert!(d.reassemble_at(0, &f, t0).is_none());
         }
         // A new datagram still gets through, at once and after they lapse.
         for (id, now) in [
@@ -550,8 +562,8 @@ mod tests {
         ] {
             let f1 = build_ipv4(id, true, 0, &[1u8; 8]);
             let f2 = build_ipv4(id, false, 8, &[2u8; 4]);
-            assert!(d.reassemble_at(&f1, now).is_none());
-            assert!(d.reassemble_at(&f2, now).is_some(), "datagram {id}");
+            assert!(d.reassemble_at(0, &f1, now).is_none());
+            assert!(d.reassemble_at(0, &f2, now).is_some(), "datagram {id}");
         }
         // The lapsed ones are gone without anyone calling sweep().
         assert!(d.inner.lock().unwrap().entries.len() <= 1);

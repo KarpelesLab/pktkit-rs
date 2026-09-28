@@ -150,7 +150,7 @@ pub struct Nat {
 
     inner: Mutex<NatInner>,
     /// `None` until `enable_defrag()` is called.
-    defragger: Mutex<Option<Arc<Defragger>>>,
+    defragger: Mutex<Option<Arc<Defraggers>>>,
 
     /// Allocates IDs for namespace-isolated inside sides.
     ns_counter: AtomicU64,
@@ -354,6 +354,17 @@ impl Expectations {
     }
 }
 
+/// Reassembly, one per direction. A fragment is only ever put together
+/// with others from the same side of the NAT (and, going out, the same
+/// inside namespace): otherwise an inside host could forge the missing
+/// piece of a datagram arriving from outside, or of another namespace's
+/// outbound one, since the addresses a fragment claims prove nothing.
+#[derive(Debug, Default)]
+struct Defraggers {
+    inbound: Defragger,
+    outbound: Defragger,
+}
+
 /// Object-safe enum-like trait so the helper vector can hold both packet and
 /// local helpers in one place.
 trait HelperKind: Helper {
@@ -503,10 +514,12 @@ impl Nat {
     /// Fragmented datagrams are then translated whole, so ALGs see complete
     /// messages, and sent on cut into fragments no larger than the largest
     /// one they arrived in (keeping Don't Fragment if that one had it), as
-    /// Linux conntrack does.
+    /// Linux conntrack does. Each direction, and each inside namespace, is
+    /// reassembled apart: a datagram is only ever made of fragments that
+    /// arrived the same way.
     pub fn enable_defrag(&self) {
         let mut d = self.defragger.lock().unwrap();
-        *d = Some(Arc::new(Defragger::new()));
+        *d = Some(Arc::new(Defraggers::default()));
     }
 
     /// Register a packet-level helper: one of the ALGs this module provides
@@ -1371,7 +1384,8 @@ impl Nat {
         self.out_frags.lock().unwrap().expire(now);
         // Also sweep the defragger if enabled.
         if let Some(d) = self.defragger.lock().unwrap().clone() {
-            d.sweep();
+            d.inbound.sweep();
+            d.outbound.sweep();
         }
     }
 
@@ -1439,9 +1453,20 @@ impl Nat {
 
     fn handle_outbound(&self, ns: u64, pkt_in: &[u8]) {
         self.maybe_sweep();
+        // A fragment from a source the NAT does not serve would be dropped
+        // once whole; it must not take part in reassembly meanwhile either,
+        // where it could fill the table or complete someone else's datagram.
+        let (more, offset) = frag_info(pkt_in);
+        if (more || offset != 0)
+            && !self.inside_source_ok(Ipv4Addr::new(
+                pkt_in[12], pkt_in[13], pkt_in[14], pkt_in[15],
+            ))
+        {
+            return;
+        }
         let owned;
         let (pkt, fmax): (&[u8], _) = if let Some(d) = self.defragger.lock().unwrap().clone() {
-            match d.reassemble(pkt_in) {
+            match d.outbound.reassemble(ns, pkt_in) {
                 Some((v, fmax)) => {
                     owned = v;
                     (&owned, fmax)
@@ -1854,7 +1879,7 @@ impl Nat {
         self.maybe_sweep();
         let owned;
         let (pkt, fmax): (&[u8], _) = if let Some(d) = self.defragger.lock().unwrap().clone() {
-            match d.reassemble(pkt_in) {
+            match d.inbound.reassemble(0, pkt_in) {
                 Some((v, fmax)) => {
                     owned = v;
                     (&owned, fmax)
@@ -4793,5 +4818,87 @@ mod tests {
         assert!(send().is_err());
         assert!(send().is_ok());
         assert_eq!(n.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn inside_fragments_are_never_spliced_into_inbound_datagrams() {
+        let (nat, i, _o) = setup();
+        nat.enable_defrag();
+        let tenant = Arc::new(Tap::default());
+        let _c = nat.connect_l3(tenant.clone()).unwrap();
+        let p = build_udp(INSIDE, 5353, REMOTE, 53, b"q");
+        nat.inside().send(Packet::from_slice(&p)).unwrap();
+        let oport = nat
+            .inner
+            .lock()
+            .unwrap()
+            .mappings
+            .values()
+            .next()
+            .unwrap()
+            .outside_port;
+        let reply = build_udp(REMOTE, 53, PUBLIC, oport, &[b'A'; 128]);
+        let frags = fragments_of(&reply, 68, 0x4242, false);
+        // A tenant forges the reply's second fragment, as if from REMOTE.
+        let mut evil = frags[1].clone();
+        evil[20..].fill(b'X');
+        tenant.inject(&evil);
+        for (n, f) in frags.iter().enumerate() {
+            if n != 1 {
+                nat.outside().send(Packet::from_slice(f)).unwrap();
+            }
+        }
+        // Still missing its second piece: nothing reaches the inside host,
+        // least of all the tenant's bytes.
+        assert!(i.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn namespaces_cannot_complete_each_others_fragmented_datagrams() {
+        let (nat, _i, o) = setup();
+        nat.enable_defrag();
+        let (a, b) = (Arc::new(Tap::default()), Arc::new(Tap::default()));
+        let _ca = nat.connect_l3(a.clone()).unwrap();
+        let _cb = nat.connect_l3(b.clone()).unwrap();
+        let host = Ipv4Addr::new(10, 0, 0, 50);
+        let dgram = build_udp(host, 5353, REMOTE, 53, &[b'A'; 128]);
+        let frags = fragments_of(&dgram, 68, 0x1111, false);
+        let mut evil = frags[1].clone();
+        evil[20..].fill(b'X');
+        a.inject(&evil);
+        for (n, f) in frags.iter().enumerate() {
+            if n != 1 {
+                b.inject(f);
+            }
+        }
+        assert!(o.lock().unwrap().is_empty());
+        // The victim's own fragment completes it, with its own bytes.
+        b.inject(&frags[1]);
+        let whole = reassembled(&o.lock().unwrap(), 1500, false);
+        assert!(whole[28..].iter().all(|&c| c == b'A'));
+    }
+
+    #[test]
+    fn spoofed_fragments_cannot_crowd_out_reassembly() {
+        let (nat, _i, o) = setup();
+        nat.enable_defrag();
+        let good = fragments_of(
+            &build_udp(INSIDE, 5353, REMOTE, 53, &[1; 128]),
+            68,
+            7,
+            false,
+        );
+        nat.inside().send(Packet::from_slice(&good[0])).unwrap();
+        // Enough bogus reassemblies to evict the real one, were they let in.
+        let spoofed = Ipv4Addr::new(192, 168, 7, 7);
+        for id in 0..crate::nat::defrag::DEFRAG_MAX_ENTRIES as u16 {
+            let d = build_udp(spoofed, 5353, REMOTE, 53, &[0; 128]);
+            let f = &fragments_of(&d, 68, 1000 + id, false)[0];
+            nat.inside().send(Packet::from_slice(f)).unwrap();
+        }
+        for f in &good[1..] {
+            nat.inside().send(Packet::from_slice(f)).unwrap();
+        }
+        assert!(!o.lock().unwrap().is_empty());
     }
 }
