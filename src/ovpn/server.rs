@@ -509,12 +509,16 @@ const POLL: Duration = Duration::from_millis(100);
 /// How long close() waits for a socket thread to exit. It normally takes at
 /// most one POLL; this only bounds the wait when a callback running on the
 /// UDP reader is itself stuck -- on a lock close()'s caller holds, say.
-const LOOP_EXIT_WAIT: Duration = Duration::from_secs(1);
+const LOOP_EXIT_WAIT: Duration = EXIT_WAIT;
 
 /// How long close() waits for callbacks under way on other threads: an
 /// on_auth waiting on its backend, an on_connect stuck on a lock close()'s
 /// caller holds.
-const CALL_EXIT_WAIT: Duration = Duration::from_secs(1);
+const CALL_EXIT_WAIT: Duration = EXIT_WAIT;
+
+/// A second; longer in tests, which check that close() waits for threads
+/// and callbacks, and must not see it give up on a busy machine instead.
+const EXIT_WAIT: Duration = Duration::from_secs(if cfg!(test) { 10 } else { 1 });
 
 /// The server, if it still exists and is not closed.
 fn live(server: &Weak<Server>) -> Option<Arc<Server>> {
@@ -1671,21 +1675,19 @@ mod tests {
         )
         .connect_freq_initial((2, Duration::from_secs(600)));
         let server = Server::new(cfg).unwrap();
-        let answered = |sid: [u8; 8]| {
-            let c = udp_client(&server);
-            c.set_read_timeout(Some(Duration::from_millis(300)))
-                .unwrap();
+        let answered = |c: &UdpSocket, sid: [u8; 8]| {
             c.send(&client_reset(sid)).unwrap();
             let mut buf = [0u8; 2048];
             c.recv(&mut buf).is_ok()
         };
-        // Kept open: dropped, its port could be handed to a later client
-        // below, which would then hear the real peer's retransmissions.
+        // All kept open: dropped, a client's port could be handed to a
+        // later one, which would then hear the first one's answers.
         let real = udp_client(&server);
+        let spoofs: Vec<UdpSocket> = (0..3).map(|_| udp_client(&server)).collect();
         assert!(open_udp(&real, *b"REALPEER").1);
-        assert!(answered(*b"SPOOF-01"));
-        assert!(answered(*b"SPOOF-02"));
-        assert!(!answered(*b"SPOOF-03"), "over the limit");
+        assert!(answered(&spoofs[0], *b"SPOOF-01"));
+        assert!(answered(&spoofs[1], *b"SPOOF-02"));
+        assert!(!answered(&spoofs[2], *b"SPOOF-03"), "over the limit");
         server.close();
     }
 
@@ -1717,16 +1719,14 @@ mod tests {
         for _ in 0..5 {
             c.send(&ack.to_bytes(&[0])).unwrap();
         }
-        let answered = |sid: [u8; 8]| {
-            let c = udp_client(&server);
-            c.set_read_timeout(Some(Duration::from_millis(300)))
-                .unwrap();
+        let answered = |c: &UdpSocket, sid: [u8; 8]| {
             c.send(&client_reset(sid)).unwrap();
             let mut buf = [0u8; 2048];
             c.recv(&mut buf).is_ok()
         };
-        assert!(answered(*b"SPOOF-01"));
-        assert!(!answered(*b"SPOOF-02"), "over the limit");
+        let spoofs = [udp_client(&server), udp_client(&server)];
+        assert!(answered(&spoofs[0], *b"SPOOF-01"));
+        assert!(!answered(&spoofs[1], *b"SPOOF-02"), "over the limit");
         assert_eq!(server.peers.read().unwrap().len(), 1);
         server.close();
     }
@@ -2084,7 +2084,7 @@ mod tests {
         };
         let start = std::time::Instant::now();
         let mut closed = [false; 2];
-        while start.elapsed() < Duration::from_secs(4) && closed.contains(&false) {
+        while start.elapsed() < Duration::from_secs(10) && closed.contains(&false) {
             thread::sleep(Duration::from_millis(300));
             for (c, closed) in drips.iter_mut().zip(&mut closed) {
                 *closed = *closed || c.write_all(&[0]).is_err() || is_closed(c);
@@ -2167,8 +2167,7 @@ mod tests {
         client: &mut TestClient,
         done: impl Fn(&TestClient) -> bool,
     ) -> Vec<Vec<u8>> {
-        sock.set_read_timeout(Some(Duration::from_millis(300)))
-            .unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let mut buf = [0u8; 4096];
         let mut data = Vec::new();
         while !done(client) {
@@ -2421,7 +2420,7 @@ mod tests {
         sock.shutdown(std::net::Shutdown::Both).unwrap();
         let _ = client.join();
         let mut gone = false;
-        for _ in 0..50 {
+        for _ in 0..500 {
             if server.get_peer(&key).is_none() && entry.upgrade().is_none() {
                 gone = true;
                 break;
@@ -2566,7 +2565,7 @@ mod tests {
     }
 
     fn wait_for(cond: impl Fn() -> bool) -> bool {
-        for _ in 0..300 {
+        for _ in 0..1000 {
             if cond() {
                 return true;
             }
@@ -3284,7 +3283,8 @@ mod tests {
                 .renegotiate_interval(Duration::MAX)
                 .transition_window(Duration::MAX),
         );
-        assert!(open_udp(&udp_client(&server), *b"CLIENT01").1);
+        let clients = [udp_client(&server), udp_client(&server)];
+        assert!(open_udp(&clients[0], *b"CLIENT01").1);
 
         let mut tcp = tcp_client(&server);
         tcp_send(&mut tcp, &client_reset(*b"CLIENT02"));
@@ -3297,7 +3297,7 @@ mod tests {
         // Let the maintenance thread tick everyone, then check the UDP
         // reader still serves.
         thread::sleep(Duration::from_millis(1500));
-        assert!(open_udp(&udp_client(&server), *b"CLIENT03").1);
+        assert!(open_udp(&clients[1], *b"CLIENT03").1);
         server.close();
     }
 
@@ -3306,7 +3306,11 @@ mod tests {
     #[test]
     fn a_poisoned_peer_is_dropped_and_the_server_survives() {
         let server = server_with(PeerTimers::default());
-        let clients = [udp_client(&server), udp_client(&server)];
+        let clients = [
+            udp_client(&server),
+            udp_client(&server),
+            udp_client(&server),
+        ];
         assert!(open_udp(&clients[0], *b"CLIENT01").1);
         assert!(open_udp(&clients[1], *b"CLIENT02").1);
         let entries: Vec<Arc<PeerEntry>> = server.peers.read().unwrap().values().cloned().collect();
@@ -3328,7 +3332,7 @@ mod tests {
         server.peers.write().unwrap().insert(key, e.clone());
         server.handle_udp(&client_reset(*b"CLIENT02"), e.addr);
         assert_eq!(server.peers.read().unwrap().len(), 0);
-        assert!(open_udp(&udp_client(&server), *b"CLIENT03").1);
+        assert!(open_udp(&clients[2], *b"CLIENT03").1);
         server.close();
     }
 }

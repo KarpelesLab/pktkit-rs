@@ -607,11 +607,7 @@ mod tests {
     /// first answer is stateless, so the client completes the three-way
     /// handshake, then repeats its reset -- which only a peer that holds
     /// it as its packet 0 answers with a bare ACK.
-    fn answers(adapter: &Adapter, sid: [u8; 8]) -> bool {
-        let s = UdpSocket::bind("127.0.0.1:0").unwrap();
-        s.connect(adapter.local_addr().unwrap()).unwrap();
-        s.set_read_timeout(Some(Duration::from_millis(500)))
-            .unwrap();
+    fn answers(s: &UdpSocket, sid: [u8; 8]) -> bool {
         let mut buf = [0u8; 2048];
         s.send(&client_reset(sid)).unwrap();
         let n = s.recv(&mut buf).unwrap();
@@ -621,6 +617,16 @@ mod tests {
         s.send(&client_reset(sid)).unwrap();
         let n = s.recv(&mut buf).unwrap();
         ControlPacket::parse(&buf[..n]).unwrap().opcode == Opcode::ACK_V1
+    }
+
+    /// A client socket for `adapter`. Tests keep theirs open to the end: a
+    /// port given back could go to a later client, which would then hear
+    /// the first one's traffic.
+    fn udp_client(adapter: &Adapter) -> UdpSocket {
+        let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+        s.connect(adapter.local_addr().unwrap()).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        s
     }
 
     /// A tun client may only send from the address it was given: anything
@@ -681,8 +687,9 @@ mod tests {
                 .timers(crate::ovpn::PeerTimers::default().keepalive_interval(Duration::ZERO)),
         )
         .unwrap();
-        assert!(answers(&adapter, *b"CLIENT01"));
-        assert!(!answers(&adapter, *b"CLIENT02"), "peer cap not applied");
+        let clients = [udp_client(&adapter), udp_client(&adapter)];
+        assert!(answers(&clients[0], *b"CLIENT01"));
+        assert!(!answers(&clients[1], *b"CLIENT02"), "peer cap not applied");
         adapter.close();
     }
 
@@ -703,16 +710,16 @@ mod tests {
         let adapter =
             Adapter::new(config(Arc::default()).connect_freq_initial((1, Duration::from_secs(60))))
                 .unwrap();
-        let answered = |sid: [u8; 8]| {
-            let s = UdpSocket::bind("127.0.0.1:0").unwrap();
-            s.connect(adapter.local_addr().unwrap()).unwrap();
-            s.set_read_timeout(Some(Duration::from_millis(300)))
-                .unwrap();
+        let answered = |s: &UdpSocket, sid: [u8; 8]| {
             s.send(&client_reset(sid)).unwrap();
             s.recv(&mut [0u8; 2048]).is_ok()
         };
-        assert!(answered(*b"CLIENT01"));
-        assert!(!answered(*b"CLIENT02"), "rate limit not applied");
+        let clients = [udp_client(&adapter), udp_client(&adapter)];
+        assert!(answered(&clients[0], *b"CLIENT01"));
+        assert!(
+            !answered(&clients[1], *b"CLIENT02"),
+            "rate limit not applied"
+        );
         adapter.close();
     }
 

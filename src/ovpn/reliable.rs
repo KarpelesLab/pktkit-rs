@@ -654,15 +654,17 @@ mod tests {
     #[test]
     fn unacked_past_deadline_is_resent() {
         let mut r = Reliable::new(local());
+        // Sent between the two, however long the machine took.
+        let before = Instant::now();
         let p = r.build_control(b"hello");
-        let start = Instant::now();
+        let after = Instant::now();
 
         // Before the deadline: nothing to resend.
-        let early = r.tick(start + RETRANSMIT_INITIAL - Duration::from_millis(1));
+        let early = r.tick(before + RETRANSMIT_INITIAL - Duration::from_millis(1));
         assert!(early.resend.is_empty());
 
         // Past the deadline: the original packet comes back out verbatim.
-        let late = r.tick(start + RETRANSMIT_INITIAL + Duration::from_millis(1));
+        let late = r.tick(after + RETRANSMIT_INITIAL + Duration::from_millis(1));
         assert_eq!(late.resend.len(), 1);
         assert_eq!(late.resend[0], p.to_bytes(&[]));
     }

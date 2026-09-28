@@ -530,8 +530,12 @@ fn retransmit_fires_when_ack_withheld() {
 
     // Client hard reset -> server. The server replies with its own hard reset
     // (pid 0, an unacked reliable packet). We deliberately do NOT feed it back
-    // to the client, so it never gets ACKed.
+    // to the client, so it never gets ACKed. The reset goes out between
+    // `before` and `after`: its deadline is RETRANSMIT_INITIAL past some
+    // time between them, however long the machine took.
+    let before = Instant::now();
     let out = server.handle_packet(&client.hard_reset()).expect("reset");
+    let after = Instant::now();
     let server_reset = out
         .send
         .iter()
@@ -541,9 +545,8 @@ fn retransmit_fires_when_ack_withheld() {
     assert_eq!(server_reset.pid, Some(0));
 
     // Before the retransmit deadline: tick is quiet.
-    let start = Instant::now();
     let early = server
-        .tick(start + RETRANSMIT_INITIAL - Duration::from_millis(50))
+        .tick(before + RETRANSMIT_INITIAL - Duration::from_millis(50))
         .expect("tick early");
     assert!(early.send.is_empty(), "no retransmit before the deadline");
     assert!(!early.close);
@@ -551,7 +554,7 @@ fn retransmit_fires_when_ack_withheld() {
     // Past the deadline: the unacked hard reset is re-sent. Compare by
     // opcode/pid/payload (the on-wire ACK list may differ from the first send).
     let late = server
-        .tick(start + RETRANSMIT_INITIAL + Duration::from_millis(50))
+        .tick(after + RETRANSMIT_INITIAL + Duration::from_millis(50))
         .expect("tick late");
     assert!(!late.close, "should not be closing yet");
     let resent: Vec<ControlPacket> = late
@@ -573,7 +576,7 @@ fn retransmit_fires_when_ack_withheld() {
 
     // With pid 0 acknowledged, a tick well past any deadline is quiet.
     let quiet = server
-        .tick(start + RETRANSMIT_INITIAL * 8)
+        .tick(after + RETRANSMIT_INITIAL * 8)
         .expect("tick quiet");
     assert!(
         quiet.send.is_empty(),
@@ -1013,11 +1016,13 @@ fn ack_for_another_session_is_ignored() {
 
     let mut server = Peer::new(server_config(), *b"SERVERID", auth_hook()).unwrap();
     let mut client = TestClient::new(*b"CLIENTID");
-    let start = Instant::now();
     server.handle_packet(&client.hard_reset()).unwrap();
 
     let forged = ControlPacket::new(Opcode::ACK_V1, 0, *b"CLIENTID", *b"NOTUS!!!");
     let _ = server.handle_packet(&forged.to_bytes(&[0]));
+    // After the reset went out, so that the tick below is past its
+    // deadline however long the machine took to get here.
+    let start = Instant::now();
 
     let late = server
         .tick(start + RETRANSMIT_INITIAL + Duration::from_millis(50))
@@ -1036,13 +1041,15 @@ fn handshake_window_expires_a_stalled_session() {
     use crate::time::Instant;
     use std::time::Duration;
 
+    // The window opens somewhere between `before` and `after`.
+    let before = Instant::now();
     let mut server = Peer::new(server_config(), *b"SERVERID", auth_hook()).unwrap();
     let mut client = TestClient::new(*b"CLIENTID");
-    let start = Instant::now();
     server.handle_packet(&client.hard_reset()).unwrap();
-    let out = server.tick(start + Duration::from_secs(59)).unwrap();
+    let after = Instant::now();
+    let out = server.tick(before + Duration::from_secs(59)).unwrap();
     assert!(!out.close);
-    let out = server.tick(start + Duration::from_secs(61)).unwrap();
+    let out = server.tick(after + Duration::from_secs(61)).unwrap();
     assert!(out.close, "handshake window should have expired");
 }
 
