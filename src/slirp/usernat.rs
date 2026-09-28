@@ -284,7 +284,8 @@ impl L3Device for NsSide {
 /// Construct one with [`Stack::new`], optionally [`Stack::set_addr`] its
 /// IP prefix, then wire it up either via `connect_l3` (single peer) or via
 /// [`L3Connector::connect_l3`] (multi-tenant, each peer in its own
-/// namespace).
+/// namespace), or [`attach`](Self::attach), which also returns the
+/// namespace's id.
 ///
 /// The stack caps the flows it keeps of each kind (UDP flows, outbound TCP
 /// connections and dials, connections to virtual listeners, TIME-WAIT
@@ -1055,7 +1056,7 @@ impl Stack {
         };
         let mut conn = Conn::new(Self::passive_config(inner, &endpoints));
         let synack = conn.accept_syn(&seg);
-        let state = ConnState::new(endpoints, conn, Self::sink(inner, ns));
+        let state = ConnState::new_in(ns, endpoints, conn, Self::sink(inner, ns));
         Self::register_passive(table, key, state, listener, Some(slot), synack);
         Ok(())
     }
@@ -1095,7 +1096,7 @@ impl Stack {
             conn.accept_cookie_syn_received(ack, iss, mss);
             (Some(slot), Vec::new())
         };
-        let state = ConnState::new(endpoints, conn, Self::sink(inner, ns));
+        let state = ConnState::new_in(ns, endpoints, conn, Self::sink(inner, ns));
         Self::register_passive(table, key, state, listener, slot, segs);
         Ok(())
     }
@@ -1669,6 +1670,19 @@ impl L3Device for Stack {
 
 impl L3Connector for Stack {
     fn connect_l3(&self, dev: Arc<dyn L3Device>) -> Result<Cleanup> {
+        Ok(self.attach(dev)?.1)
+    }
+}
+
+impl Stack {
+    /// Attach `dev` in a namespace of its own, as
+    /// [`L3Connector::connect_l3`] does, and return that namespace's id
+    /// along with the [`Cleanup`] that detaches it. The id is what
+    /// [`TcpStream::namespace`](super::TcpStream::namespace) reports for
+    /// connections from `dev`: it tells peers apart where their addresses,
+    /// which they choose themselves, cannot. It is never 0, which stands
+    /// for the stack's own peer, and a stack never hands it out again.
+    pub fn attach(&self, dev: Arc<dyn L3Device>) -> Result<(u64, Cleanup)> {
         let ns = self.inner.ns_counter.fetch_add(1, Ordering::AcqRel) + 1;
         let side = Arc::new(NsSide {
             stack: self.inner.clone(),
@@ -1684,7 +1698,7 @@ impl L3Connector for Stack {
             .insert(ns, side);
 
         let weak = Arc::downgrade(&self.inner);
-        Ok(Box::new(move || {
+        let cleanup: Cleanup = Box::new(move || {
             if let Some(inner) = weak.upgrade() {
                 // Flows first: the RSTs that closing them sends reach the
                 // peer through its side, which must still be there.
@@ -1692,7 +1706,8 @@ impl L3Connector for Stack {
                 inner.ns_sides.lock().expect("poisoned").remove(&ns);
             }
             Ok(())
-        }))
+        });
+        Ok((ns, cleanup))
     }
 }
 
@@ -3784,6 +3799,49 @@ mod tests {
         let mut buf = [0; 8];
         assert_eq!(stream.read(&mut buf).unwrap(), 2);
         assert_eq!(&buf[..2], b"ab");
+    }
+
+    /// Two peers claiming the same address to a listener are told apart by
+    /// the namespace their connection came from, which `attach` names.
+    #[test]
+    fn accepted_streams_report_their_namespace() {
+        let s = Stack::new();
+        let l = s.listen("tcp", "10.0.0.1:80").unwrap();
+        let (claimed, us) = (Ipv4Addr::new(10, 0, 0, 5), Ipv4Addr::new(10, 0, 0, 1));
+        let mut peers = vec![];
+        for _ in 0..2 {
+            let r = Arc::new(Recorder::default());
+            let (ns, c) = s.attach(r.clone()).unwrap();
+            let inject = r.handler.lock().unwrap().clone().unwrap();
+            inject(Packet::from_slice(&syn_to_80(4000))).unwrap();
+            let synack = Segment::parse(&r.got.lock().unwrap()[0][20..]).unwrap();
+            let ack = synack.seq.wrapping_add(1);
+            let ack = build_tcp_v4_packet(claimed, 4000, us, 80, 2, ack, tcp_flags::ACK, &[]);
+            inject(Packet::from_slice(&ack)).unwrap();
+            let stream = l.accept().unwrap();
+            assert_eq!(stream.peer_addr(), SocketAddr::from((claimed, 4000)));
+            assert_eq!(stream.namespace(), ns);
+            peers.push((ns, r, c));
+        }
+        assert!(peers[0].0 != 0 && peers[0].0 != peers[1].0);
+
+        // The stack's own peer is namespace 0.
+        let captured = capture(&s);
+        let inject = |p: &[u8]| L3Device::send(&*s, Packet::from_slice(p)).unwrap();
+        inject(&syn_to_80(4001));
+        let synack = Segment::parse(&captured.lock().unwrap()[0][20..]).unwrap();
+        let ack = synack.seq.wrapping_add(1);
+        inject(&build_tcp_v4_packet(
+            claimed,
+            4001,
+            us,
+            80,
+            2,
+            ack,
+            tcp_flags::ACK,
+            &[],
+        ));
+        assert_eq!(l.accept().unwrap().namespace(), 0);
     }
 
     #[test]

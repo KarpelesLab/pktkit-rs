@@ -108,6 +108,8 @@ impl Endpoints {
 /// `Arc`. The same `Arc` is enqueued onto the listener's accept queue.
 pub(crate) struct ConnState {
     pub(crate) endpoints: Endpoints,
+    /// The namespace the connection belongs to (see [`TcpStream::namespace`]).
+    ns: u64,
     pub(crate) conn: Mutex<Conn>,
     /// Notified whenever readable/writable/closed status may have changed
     /// (inbound data, state transition, timer tick).
@@ -177,8 +179,19 @@ impl ConnState {
         conn: Conn,
         sink: Arc<dyn Fn(&[u8]) + Send + Sync>,
     ) -> Arc<ConnState> {
+        Self::new_in(0, endpoints, conn, sink)
+    }
+
+    /// A connection of namespace `ns`.
+    pub(crate) fn new_in(
+        ns: u64,
+        endpoints: Endpoints,
+        conn: Conn,
+        sink: Arc<dyn Fn(&[u8]) + Send + Sync>,
+    ) -> Arc<ConnState> {
         Arc::new(ConnState {
             endpoints,
+            ns,
             conn: Mutex::new(conn),
             signal: Condvar::new(),
             sink,
@@ -380,6 +393,7 @@ impl core::fmt::Debug for TcpStream {
         f.debug_struct("slirp::TcpStream")
             .field("local", &self.local_addr())
             .field("peer", &self.peer_addr())
+            .field("namespace", &self.namespace())
             .finish()
     }
 }
@@ -399,8 +413,23 @@ impl TcpStream {
     }
 
     /// Remote (connecting peer) socket address.
+    ///
+    /// This is whatever address the peer put in its packets. Peers in
+    /// different namespaces may use the same one, and nothing stops a peer
+    /// from claiming another's, so it says nothing about who connected on
+    /// its own: pair it with [`namespace`](Self::namespace) before
+    /// trusting it for anything like access control.
     pub fn peer_addr(&self) -> SocketAddr {
         self.state.endpoints.peer_addr()
+    }
+
+    /// The namespace the connection came from: the id
+    /// [`Stack::attach`](super::Stack::attach) returned for the peer
+    /// attached there, or 0 for the stack's own peer (its `send` and
+    /// `set_handler`). Unlike [`peer_addr`](Self::peer_addr), a peer cannot
+    /// choose it.
+    pub fn namespace(&self) -> u64 {
+        self.state.ns
     }
 
     /// Turn the Nagle algorithm off (`true`) or back on, as
