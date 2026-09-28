@@ -1158,6 +1158,12 @@ mod tests {
     }
 
     /// Run the timer as if `after` had passed.
+    ///
+    /// Each call is relative to the moment it is made, and the client's own
+    /// timers to whenever it set them, so a stalled runner makes a tick
+    /// later than meant. Checks that nothing is due yet therefore keep a
+    /// margin of about two seconds to the earliest the timer could fire;
+    /// checks that something is due cannot be hurt by a stall.
     fn tick_after(c: &Client, after: Duration) {
         c.shared.tick(Instant::now() + after);
     }
@@ -1203,7 +1209,7 @@ mod tests {
         c.begin(false);
         assert_eq!(sent(&r).len(), 1);
 
-        tick_after(&c, Duration::from_secs(2));
+        tick_after(&c, Duration::from_secs(1));
         assert!(sent(&r).is_empty(), "the first retry waits 4 s ± 1 s");
 
         tick_after(&c, Duration::from_secs(5));
@@ -1212,7 +1218,7 @@ mod tests {
         assert_eq!(got[0].2.msg_type, wire::MSG_DISCOVER);
 
         // The next wait is doubled: 8 s ± 1 s from the retransmission.
-        tick_after(&c, Duration::from_secs(5 + 6));
+        tick_after(&c, Duration::from_secs(5 + 5));
         assert!(sent(&r).is_empty());
         tick_after(&c, Duration::from_secs(5 + 9));
         assert_eq!(sent(&r).len(), 1);
@@ -1332,7 +1338,7 @@ mod tests {
         let (r, c) = bound();
         let ip = Ipv4Addr::new(192, 168, 1, 100);
 
-        tick_after(&c, Duration::from_secs(1798));
+        tick_after(&c, Duration::from_secs(1797));
         assert!(
             sent(&r).is_empty(),
             "T1 is half of the one-hour lease, give or take a second"
@@ -1560,7 +1566,7 @@ mod tests {
         );
 
         // ANNOUNCE_INTERVAL later, the second and last.
-        tick_after(&c, Duration::from_millis(5300));
+        tick_after(&c, Duration::from_millis(4400));
         assert_eq!(r.announced.lock().unwrap().len(), 1, "too soon");
         tick_after(&c, Duration::from_millis(6300));
         assert_eq!(*r.announced.lock().unwrap(), [IP, IP]);
@@ -1655,7 +1661,7 @@ mod tests {
 
         // RFC 2131 §3.1.5: at least ten seconds before trying again.
         *r.conflict.lock().unwrap() = false;
-        tick_after(&c, Duration::from_secs(9));
+        tick_after(&c, Duration::from_secs(8));
         assert!(sent(&r).is_empty());
         tick_after(&c, Duration::from_secs(11));
         assert_eq!(sent(&r)[0].2.msg_type, wire::MSG_DISCOVER);
