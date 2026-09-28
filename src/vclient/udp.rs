@@ -34,6 +34,10 @@ pub(crate) struct UdpState {
     sink: Arc<dyn Fn(&[u8]) + Send + Sync>,
     /// Set when the owning client closes.
     closed: AtomicBool,
+    /// The remote's port refused a datagram (an ICMP port unreachable came
+    /// back): the next `send` or `recv` reports it, once, as a connected
+    /// socket's pending error (`sk_err` on Linux) is.
+    refused: AtomicBool,
 }
 
 /// Bytes a socket holds for its reader before further datagrams are
@@ -70,6 +74,19 @@ impl RxQueue {
 
 fn client_closed() -> io::Error {
     io::Error::new(io::ErrorKind::NotConnected, "client is closed")
+}
+
+impl UdpState {
+    /// Take the refusal the remote reported, if one is pending.
+    fn take_refusal(&self) -> io::Result<()> {
+        if self.refused.swap(false, Ordering::AcqRel) {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "the remote port refused a datagram",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl UdpState {
@@ -132,10 +149,17 @@ impl UdpConn {
     }
 
     /// Send a datagram to the connected remote.
+    ///
+    /// If the remote refused an earlier datagram (an ICMP port unreachable
+    /// came back) and no `send` or [`recv`](Self::recv) has reported it
+    /// yet, this fails with `ConnectionRefused` instead of sending, as a
+    /// connected socket does on Linux. The socket stays open: the next
+    /// call sends.
     pub fn send(&self, buf: &[u8]) -> io::Result<usize> {
         if self.state.closed.load(Ordering::Acquire) {
             return Err(client_closed());
         }
+        self.state.take_refusal()?;
         // The IPv4 total length and the UDP / IPv6 payload lengths are 16
         // bits: past these, they would wrap and describe another datagram.
         let max = if self.state.key.remote.is_ipv4() {
@@ -163,6 +187,11 @@ impl UdpConn {
     /// Receive the next datagram from the connected remote, blocking until one
     /// arrives or the read timeout elapses. In non-blocking mode, returns
     /// [`WouldBlock`](io::ErrorKind::WouldBlock) when none is queued.
+    ///
+    /// A refusal from the remote not yet reported (see [`send`](Self::send))
+    /// is reported first, as `ConnectionRefused`, and wakes a blocked
+    /// `recv`: without it, a request to a closed port would wait out the
+    /// whole timeout for an answer that is never coming.
     pub fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         let deadline = self
             .read_timeout
@@ -171,6 +200,8 @@ impl UdpConn {
             .and_then(|t| Instant::now().checked_add(t));
         let mut rx = self.state.rx.lock().unwrap();
         loop {
+            // Ahead of what is queued, as Linux checks sk_err first.
+            self.state.take_refusal()?;
             if let Some(dgram) = rx.pop_front() {
                 let n = dgram.len().min(buf.len());
                 buf[..n].copy_from_slice(&dgram[..n]);
@@ -258,6 +289,7 @@ impl UdpStack {
             signal: Condvar::new(),
             sink: self.sink.clone(),
             closed: AtomicBool::new(false),
+            refused: AtomicBool::new(false),
         });
         conns.insert(key, state.clone());
         Ok(UdpConn {
@@ -325,6 +357,66 @@ impl UdpStack {
             None => return false,
         };
         state.deliver(payload);
+        true
+    }
+
+    /// Take an ICMP error about a datagram we sent: an ICMPv4 port
+    /// unreachable (type 3 code 3) or ICMPv6 one (type 1 code 4) quoting a
+    /// datagram of a connected socket marks the socket refused (see
+    /// [`UdpConn::send`]). Returns `true` if the message was one of those,
+    /// whether or not it was acted on.
+    ///
+    /// Nothing on the path is authenticated, so the quote has to match (RFC
+    /// 5927 §4.1 asks as much of TCP): a valid checksum, and a quoted
+    /// datagram from our address to a socket's remote, between its ports.
+    pub fn handle_icmp(&self, pkt: &Packet) -> bool {
+        let v6 = match (pkt.version(), pkt.ip_protocol()) {
+            (4, Protocol::ICMP) => false,
+            (6, Protocol::ICMPV6) => true,
+            _ => return false,
+        };
+        let msg = pkt.payload();
+        if msg.len() < 8 {
+            return false;
+        }
+        match (v6, msg[0], msg[1]) {
+            (false, 3, 3) | (true, 1, 4) => {}
+            _ => return false,
+        }
+        if pkt.verify_transport_checksum() != Some(true) {
+            return true;
+        }
+        let inner = Packet::from_slice(&msg[8..]);
+        if inner.version() != pkt.version() || inner.ip_protocol() != Protocol::UDP {
+            return true;
+        }
+        let off = inner.transport_offset();
+        let (Some(ours), Some(remote), Some(udp)) = (
+            inner.src_addr(),
+            inner.dst_addr(),
+            inner.as_bytes().get(off..off + 4),
+        ) else {
+            return true;
+        };
+        if pkt.dst_addr() != Some(ours) {
+            return true;
+        }
+        let key = UdpKey {
+            local_port: u16::from_be_bytes([udp[0], udp[1]]),
+            remote,
+            remote_port: u16::from_be_bytes([udp[2], udp[3]]),
+        };
+        let Some(state) = self.conns.lock().unwrap().get(&key).cloned() else {
+            return true;
+        };
+        if state.local_ip != ours {
+            return true;
+        }
+        // Under the rx lock, so a reader between its checks and its wait
+        // cannot miss the wakeup.
+        let _rx = state.rx.lock().unwrap();
+        state.refused.store(true, Ordering::Release);
+        state.signal.notify_all();
         true
     }
 }
@@ -659,5 +751,95 @@ mod tests {
             assert_eq!(conn.recv(&mut buf).unwrap(), 0);
         }
         assert_eq!(conn.state.rx.lock().unwrap().bytes, 0);
+    }
+
+    /// A port unreachable quoting one of a socket's datagrams fails its next
+    /// `send` or `recv`, once, with `ConnectionRefused`; the socket stays
+    /// open. One that does not match the socket changes nothing.
+    #[test]
+    fn port_unreachable_is_reported_once() {
+        let sent: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
+        let s = sent.clone();
+        let sink: Arc<dyn Fn(&[u8]) + Send + Sync> =
+            Arc::new(move |b: &[u8]| s.lock().unwrap().push(b.to_vec()));
+        let stack = UdpStack::new(sink);
+        let (us4, peer4) = (Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(10, 0, 0, 1));
+        let (us6, peer6): (Ipv6Addr, Ipv6Addr) =
+            ("fd00::2".parse().unwrap(), "fd00::1".parse().unwrap());
+        for (us, peer) in [
+            (IpAddr::V4(us4), IpAddr::V4(peer4)),
+            (us6.into(), peer6.into()),
+        ] {
+            let conn = stack.dial(us, SocketAddr::new(peer, 53)).unwrap();
+            conn.set_nonblocking(true);
+            conn.send(b"query").unwrap();
+            let dgram = sent.lock().unwrap().pop().unwrap();
+            let unreachable = crate::icmp::port_unreachable(Packet::from_slice(&dgram), peer)
+                .expect("an ICMP error");
+            let refused = |r: io::Result<usize>| {
+                r.is_err_and(|e| e.kind() == io::ErrorKind::ConnectionRefused)
+            };
+
+            let mut corrupt = unreachable.clone();
+            *corrupt.last_mut().unwrap() ^= 1;
+            let mut other_port = dgram.clone();
+            let at = Packet::from_slice(&dgram).transport_offset();
+            other_port[at + 2..at + 4].copy_from_slice(&54u16.to_be_bytes());
+            Packet::from_mut(&mut other_port).recompute_transport_checksum();
+            let other_port =
+                crate::icmp::port_unreachable(Packet::from_slice(&other_port), peer).unwrap();
+            for bogus in [&corrupt, &other_port] {
+                assert!(stack.handle_icmp(Packet::from_slice(bogus)));
+                assert!(!refused(conn.recv(&mut [0; 16])), "bogus error reported");
+            }
+
+            // Reported by `recv`, ahead of a datagram already queued.
+            let reply = wrap_udp(peer, 53, us, conn.local_addr().port(), b"answer");
+            assert!(stack.handle_inbound(Packet::from_slice(&reply)));
+            assert!(stack.handle_icmp(Packet::from_slice(&unreachable)));
+            assert!(refused(conn.recv(&mut [0; 16])));
+            assert_eq!(conn.recv(&mut [0; 16]).unwrap(), 6);
+            assert!(conn.send(b"again").is_ok());
+
+            // Or by `send`, which then sends nothing.
+            sent.lock().unwrap().clear();
+            assert!(stack.handle_icmp(Packet::from_slice(&unreachable)));
+            assert!(refused(conn.send(b"lost")));
+            assert!(sent.lock().unwrap().is_empty());
+            assert!(!refused(conn.recv(&mut [0; 16])));
+            assert!(conn.send(b"sent").is_ok());
+            assert_eq!(sent.lock().unwrap().len(), 1);
+        }
+    }
+
+    /// A refusal wakes a `recv` blocked waiting for the answer.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn port_unreachable_wakes_a_blocked_recv() {
+        let sent: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
+        let s = sent.clone();
+        let sink: Arc<dyn Fn(&[u8]) + Send + Sync> =
+            Arc::new(move |b: &[u8]| s.lock().unwrap().push(b.to_vec()));
+        let stack = UdpStack::new(sink);
+        let peer = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let conn = stack
+            .dial(
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+                SocketAddr::new(peer, 53),
+            )
+            .unwrap();
+        conn.set_read_timeout(Some(Duration::from_secs(10)));
+        conn.send(b"query").unwrap();
+        let dgram = sent.lock().unwrap().pop().unwrap();
+        let unreachable = crate::icmp::port_unreachable(Packet::from_slice(&dgram), peer).unwrap();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            stack.handle_icmp(Packet::from_slice(&unreachable));
+        });
+        let start = Instant::now();
+        let err = conn.recv(&mut [0; 16]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
+        assert!(start.elapsed() < Duration::from_secs(5));
+        t.join().unwrap();
     }
 }

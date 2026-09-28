@@ -211,9 +211,12 @@ impl L3Device for Client {
         };
         let pkt = Packet::from_slice(&whole);
         // Inbound from the L3 network: demux to a TCP connection, then a UDP
-        // socket. ICMP is only read for path MTU discovery; the rest is
-        // dropped.
-        if self.tcp.handle_inbound(pkt, self.addr().addr()) || self.tcp.handle_icmp(pkt) {
+        // socket. ICMP is only read for path MTU discovery and for a UDP
+        // socket's refused datagrams; the rest is dropped.
+        if self.tcp.handle_inbound(pkt, self.addr().addr())
+            || self.tcp.handle_icmp(pkt)
+            || self.udp.handle_icmp(pkt)
+        {
             return Ok(());
         }
         let _ = self.udp.handle_inbound(pkt);

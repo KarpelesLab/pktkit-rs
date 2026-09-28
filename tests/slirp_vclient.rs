@@ -149,6 +149,35 @@ fn a_dial_through_a_shut_down_stack_fails_fast() {
     assert!(started.elapsed() < Duration::from_secs(4));
 }
 
+/// A datagram to a closed host port fails the guest socket's `recv` with
+/// `ConnectionRefused` as soon as the stack's port unreachable comes back,
+/// rather than after the whole read timeout; the socket stays usable.
+#[test]
+fn udp_to_a_closed_host_port_is_refused() {
+    let (_stack, client) = topology();
+    // A port that was just free: nothing listens on it.
+    let dest = std::net::UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let c = client.dial_udp(dest).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10)));
+    let started = std::time::Instant::now();
+    c.send(b"anyone?").unwrap();
+    let err = c.recv(&mut [0; 16]).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "took {:?}",
+        started.elapsed()
+    );
+    // Reported once; the socket still sends.
+    c.set_read_timeout(Some(Duration::from_millis(50)));
+    let again = c.recv(&mut [0; 16]).unwrap_err();
+    assert_eq!(again.kind(), std::io::ErrorKind::WouldBlock);
+    c.send(b"still here").unwrap();
+}
+
 /// A host server that writes a message in two small pieces, with
 /// TCP_NODELAY set, gets its answer from the guest a round trip sooner
 /// than if the bridge re-imposed Nagle: that would hold the second piece
