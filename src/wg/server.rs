@@ -1027,7 +1027,10 @@ mod tests {
         // a moment: wait for it to go, as a strong one never would.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while Arc::strong_count(&s) > 2 {
-            assert!(std::time::Instant::now() < deadline, "the thread holds the server");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the thread holds the server"
+            );
             thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(Arc::strong_count(&s), 2);
