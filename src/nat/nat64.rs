@@ -1187,7 +1187,7 @@ impl Nat64 {
             .or_insert_with(|| Arc::new(HostQuota::new(limits)))
             .clone();
         let hold = MappingHold::take(&host, false)?;
-        let port = Self::alloc_port_locked(inner, k.proto, k.port)?;
+        let port = Self::alloc_port_locked(inner, k.port)?;
         let m = Mapping {
             key: k,
             outside_port: port,
@@ -1222,22 +1222,20 @@ impl Nat64 {
     /// reclaimed first, so a caller that never sweeps does not lose the
     /// pool to them; but at most once a [`RECLAIM_INTERVAL`], as each walks
     /// the whole table.
-    fn alloc_port_locked(inner: &mut Nat64Inner, proto: u8, want: u16) -> Option<u16> {
-        Self::scan_port_locked(inner, proto, want).or_else(|| {
+    fn alloc_port_locked(inner: &mut Nat64Inner, want: u16) -> Option<u16> {
+        Self::scan_port_locked(inner, want).or_else(|| {
             let now = Instant::now();
             if now < inner.next_reclaim {
                 return None;
             }
             inner.next_reclaim = now + RECLAIM_INTERVAL;
             Self::expire_locked(inner, now);
-            Self::scan_port_locked(inner, proto, want)
+            Self::scan_port_locked(inner, want)
         })
     }
 
-    fn scan_port_locked(inner: &mut Nat64Inner, proto: u8, want: u16) -> Option<u16> {
-        let p = inner
-            .ports
-            .choose(proto != PROTO_ICMP, want, inner.next_port)?;
+    fn scan_port_locked(inner: &mut Nat64Inner, want: u16) -> Option<u16> {
+        let p = inner.ports.choose(want, inner.next_port)?;
         if p != want && (NAT_PORT_MIN..=NAT_PORT_MAX).contains(&p) {
             inner.next_port = if p == NAT_PORT_MAX {
                 NAT_PORT_MIN
@@ -1709,7 +1707,7 @@ mod tests {
 
         let client: Ipv6Addr = "2001:db8::100".parse().unwrap();
         let dst = wkp(Ipv4Addr::new(8, 8, 8, 8));
-        let pkt = build_v6_udp(client, 5555, dst, 53, b"hello");
+        let pkt = build_v6_udp(client, 45555, dst, 53, b"hello");
         nat.inside().send(Packet::from_slice(&pkt)).unwrap();
 
         let out = captured.lock().unwrap();
@@ -1720,7 +1718,7 @@ mod tests {
         assert_eq!(&p[16..20], &[8, 8, 8, 8]);
         // Free, so the client's own port is kept.
         let mapped_port = u16::from_be_bytes([p[20], p[21]]);
-        assert_eq!(mapped_port, 5555);
+        assert_eq!(mapped_port, 45555);
         let dport = u16::from_be_bytes([p[22], p[23]]);
         assert_eq!(dport, 53);
         assert!(

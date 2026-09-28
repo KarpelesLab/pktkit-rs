@@ -292,10 +292,10 @@ mod tests {
         let p = payload_of(&out[0]);
         // IP at offset 2 rewritten to outside.
         assert_eq!(&p[2..6], &[203, 0, 113, 1]);
-        // Port at offset 6: the one mapped, the inside port itself, as it
-        // was free (port preservation).
+        // Port at offset 6: the one mapped. The inside port is below the
+        // dynamic pool, so not kept, but its parity is.
         let mapped = u16::from_be_bytes([p[6], p[7]]);
-        assert_eq!(mapped, 0x1234);
+        assert!(mapped >= 10000 && mapped.is_multiple_of(2), "{mapped}");
         assert!(
             crate::nat::l4::v4_l4_checksum_ok(&out[0], 20),
             "rewritten H.225 segment must carry a valid TCP checksum"

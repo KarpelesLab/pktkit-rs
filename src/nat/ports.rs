@@ -132,32 +132,27 @@ impl PortUse {
         self.search(range, from, |bits| bits & mask)
     }
 
-    /// The outside port for a new mapping of inside source port `want` (a
-    /// TCP or UDP port if `l4`, else an ICMP identifier), searching the
-    /// dynamic pool from `from`; `None` if nothing fits.
+    /// The outside port for a new mapping of inside source port (or ICMP
+    /// identifier) `want`, searching the dynamic pool from `from`; `None`
+    /// if nothing fits.
     ///
-    /// `want` itself if it is free: the host chose it, and applications
-    /// that predict their public port from their local one (or that peers
-    /// reach on a well-known one) keep working. Otherwise a port below 1024
-    /// maps into the same privileged range, as RFC 4787 REQ-3 recommends,
-    /// split as Linux does (1-511 and 600-1023, as ports 512-599 are
-    /// assumed to carry credentials), and anything else into the pool.
-    /// Either way with the same parity if one is free (REQ-4), since peers
-    /// take RTP on an even port and RTCP on the odd one above it.
-    pub(crate) fn choose(&self, l4: bool, want: u16, from: u16) -> Option<u16> {
-        if want != 0 && self.is_free(want) {
+    /// `want` itself if it is free and in the pool: the host chose it, and
+    /// applications that predict their public port from their local one
+    /// keep working. Anything else maps into the pool, with the same parity
+    /// if one is free (RFC 4787 REQ-4), since peers take RTP on an even
+    /// port and RTCP on the odd one above it.
+    ///
+    /// Ports below the pool are never preserved, nor mapped into the
+    /// privileged range as RFC 4787 REQ-3 recommends: a host sending from
+    /// 53, 123 or 5060 would take that port on the public address, and the
+    /// forward an administrator then adds for it would fail; one host
+    /// sending from each of 1-1023 would take them all. Those ports are
+    /// left to port forwards.
+    pub(crate) fn choose(&self, want: u16, from: u16) -> Option<u16> {
+        if self.in_pool(want) && self.is_free(want) {
             return Some(want);
         }
         let odd = Some(want & 1 == 1);
-        if l4 && (1..1024).contains(&want) {
-            let range = if want < 512 { (1, 511) } else { (600, 1023) };
-            if let Some(p) = self
-                .find(range, want, odd)
-                .or_else(|| self.find(range, want, None))
-            {
-                return Some(p);
-            }
-        }
         // The counts answer for a full pool without a search.
         if self.pool_free(odd) > 0 {
             return self.find(self.pool, from, odd);
@@ -303,37 +298,24 @@ mod tests {
     }
 
     #[test]
-    fn choose_preserves_the_port_then_its_range_and_parity() {
+    fn choose_preserves_pool_ports_then_parity() {
         let u = PortUse::new(10000, 65535);
-        assert_eq!(u.choose(true, 40001, 10000), Some(40001));
-        assert_eq!(u.choose(true, 5060, 10000), Some(5060));
+        assert_eq!(u.choose(40001, 10000), Some(40001));
         u.acquire(40001);
-        assert_eq!(
-            u.choose(true, 40001, 10000),
-            Some(10001),
-            "odd, from the pool"
-        );
-        u.acquire(5060);
-        assert_eq!(
-            u.choose(true, 5060, 10000),
-            Some(10000),
-            "even, from the pool"
-        );
-        u.acquire(123);
-        assert_eq!(u.choose(true, 123, 10000), Some(125), "odd, below 512");
-        u.acquire(600);
-        assert_eq!(u.choose(true, 600, 10000), Some(602), "even, 600-1023");
-        // ICMP identifiers have no ranges.
-        assert_eq!(u.choose(false, 123, 10000), Some(10001));
+        assert_eq!(u.choose(40001, 10000), Some(10001), "odd, from the pool");
+        // Below the pool: into it, parity kept, even when free.
+        assert_eq!(u.choose(5060, 10000), Some(10000), "even, from the pool");
+        assert_eq!(u.choose(123, 10000), Some(10001), "odd, from the pool");
+        assert_eq!(u.choose(0, 10000), Some(10000));
         // No port of its parity left: any will do.
         for p in (10001..=65535).step_by(2) {
             u.acquire(p);
         }
-        assert_eq!(u.choose(true, 40001, 20000), Some(20000));
+        assert_eq!(u.choose(40001, 20000), Some(20000));
         for p in (10000..=65534).step_by(2) {
             u.acquire(p);
         }
-        assert_eq!(u.choose(true, 40001, 20000), None);
+        assert_eq!(u.choose(40001, 20000), None);
     }
 
     #[test]

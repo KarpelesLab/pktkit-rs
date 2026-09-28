@@ -641,9 +641,13 @@ impl Nat {
     /// holds it: taking the port over would hand that session's traffic to
     /// the forward's host. A dynamic mapping of the forward's own inside
     /// endpoint is no conflict, and becomes the forward's, sessions and
-    /// all. Also fails with `AddrInUse` if another port is already
-    /// forwarded to the same inside endpoint: the NAT gives each inside
-    /// endpoint a single public port, from which all its traffic leaves.
+    /// all. Dynamic mappings only take ports in the pool (10000-65535), so
+    /// a forward of a port below it never meets one; one in the pool can,
+    /// and is refused rather than break the other host's session.
+    ///
+    /// Also fails with `AddrInUse` if another port is already forwarded to
+    /// the same inside endpoint: the NAT gives each inside endpoint a
+    /// single public port, from which all its traffic leaves.
     pub fn add_port_forward(&self, pf: PortForward) -> Result<()> {
         self.add_port_forward_id(pf).map(|_| ())
     }
@@ -839,7 +843,7 @@ impl Nat {
                 Some(p) => p,
                 None => match Self::forward_port_for_locked(inner, k, now) {
                     Some(p) => p,
-                    None => Self::alloc_port_locked(inner, proto, inside_port)?,
+                    None => Self::alloc_port_locked(inner, inside_port)?,
                 },
             },
         };
@@ -1076,7 +1080,7 @@ impl Nat {
         // The host's quota first: a host at its cap must not cost the
         // others a reclaim sweep.
         let mut m = Self::new_mapping_locked(inner, k, 0, now, false)?;
-        let port = Self::alloc_port_locked(inner, k.proto, k.port)?;
+        let port = Self::alloc_port_locked(inner, k.port)?;
         m.outside_port = port;
         inner.reverse.insert(
             NatRevKey {
@@ -1105,16 +1109,13 @@ impl Nat {
     /// A port is free when nothing holds it for any protocol: ports a
     /// forward or a pending expectation will receive traffic on count too,
     /// or that traffic would reach a new session.
-    fn alloc_port_locked(inner: &mut NatInner, proto: u8, want: u16) -> Option<u16> {
-        Self::scan_port_locked(inner, proto, want).or_else(|| {
-            Self::reclaim_locked(inner).then(|| Self::scan_port_locked(inner, proto, want))?
-        })
+    fn alloc_port_locked(inner: &mut NatInner, want: u16) -> Option<u16> {
+        Self::scan_port_locked(inner, want)
+            .or_else(|| Self::reclaim_locked(inner).then(|| Self::scan_port_locked(inner, want))?)
     }
 
-    fn scan_port_locked(inner: &mut NatInner, proto: u8, want: u16) -> Option<u16> {
-        let p = inner
-            .ports
-            .choose(proto != PROTO_ICMP, want, inner.next_port)?;
+    fn scan_port_locked(inner: &mut NatInner, want: u16) -> Option<u16> {
+        let p = inner.ports.choose(want, inner.next_port)?;
         if p != want && (NAT_PORT_MIN..=NAT_PORT_MAX).contains(&p) {
             inner.next_port = if p == NAT_PORT_MAX {
                 NAT_PORT_MIN
@@ -2927,12 +2928,12 @@ mod tests {
         let nat = Nat::new(pfx("10.0.0.1/24"), pfx("203.0.113.1/24"));
         for i in 0..16 {
             let port = nat
-                .create_mapping(PROTO_TCP, Ipv4Addr::new(10, 0, 0, 2 + i), 1234)
+                .create_mapping(PROTO_TCP, Ipv4Addr::new(10, 0, 0, 2 + i), 12344)
                 .unwrap();
             // The first keeps its port; the others get one from the pool,
             // as even.
             if i == 0 {
-                assert_eq!(port, 1234);
+                assert_eq!(port, 12344);
             } else {
                 assert!((NAT_PORT_MIN..=NAT_PORT_MAX).contains(&port));
                 assert_eq!(port % 2, 0);
@@ -3538,21 +3539,36 @@ mod tests {
             nat.inside().send(Packet::from_slice(&p)).unwrap();
             src_port(o.lock().unwrap().last().unwrap())
         };
-        // Preserved when free, in the pool or not.
+        // Preserved when free and in the pool.
         assert_eq!(out_port(INSIDE, 40001), 40001);
-        assert_eq!(out_port(INSIDE, 5060), 5060);
-        assert_eq!(out_port(INSIDE, 123), 123);
-        // Taken: same range and parity (RFC 4787 REQ-3, REQ-4).
+        // Taken: same parity (RFC 4787 REQ-4).
         let p = out_port(other, 40001);
         assert!(p >= NAT_PORT_MIN && p % 2 == 1, "{p}");
-        let p = out_port(other, 5060);
-        assert!(p >= NAT_PORT_MIN && p % 2 == 0, "{p}");
-        let p = out_port(other, 123);
-        assert!((1..512).contains(&p) && p % 2 == 1, "{p}");
-        let p = out_port(other, 1022);
-        assert_eq!(p, 1022);
-        let q = out_port(Ipv4Addr::new(10, 0, 0, 7), 1022);
-        assert!((600..1024).contains(&q) && q % 2 == 0, "{q}");
+        // Below the pool: never preserved, parity kept.
+        for sport in [5060, 123, 1022] {
+            let p = out_port(INSIDE, sport);
+            assert!(p >= NAT_PORT_MIN && p % 2 == sport % 2, "{sport} -> {p}");
+        }
+    }
+
+    #[test]
+    fn hosts_cannot_squat_ports_below_the_pool() {
+        let (nat, i, _o) = setup();
+        // Hosts sending from well-known ports, or from every privileged
+        // one, take none of them from the outside address...
+        for sport in 1..1024 {
+            let p = build_udp(INSIDE, sport, REMOTE, 53, b"q");
+            nat.inside().send(Packet::from_slice(&p)).unwrap();
+        }
+        // ...so the admin can still forward them to another host.
+        let server = Ipv4Addr::new(10, 0, 0, 7);
+        for port in [53, 123, 5060] {
+            nat.add_port_forward(PortForward::new(PROTO_UDP, port, server, port))
+                .unwrap();
+        }
+        let p = build_udp(REMOTE, 53, PUBLIC, 123, b"ntp");
+        nat.outside().send(Packet::from_slice(&p)).unwrap();
+        assert_eq!(dst_port(&i.lock().unwrap()[0]), 123);
     }
 
     #[test]
