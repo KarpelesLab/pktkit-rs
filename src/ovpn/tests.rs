@@ -1160,6 +1160,65 @@ fn auth_failure_sends_auth_failed_and_stops() {
     assert!(server.peer_config().is_none());
 }
 
+/// on_auth sees the client certificate the TLS handshake verified -- the
+/// chain, leaf first, and its subject CN -- so that it can decide on it and
+/// tie the username to it. Without it, a certificate-authenticated client
+/// could claim any username.
+#[test]
+fn on_auth_sees_the_client_certificate() {
+    use std::sync::Mutex;
+    let cert = der(TEST_CERT, "CERTIFICATE");
+    let mut roots = purecrypto::tls::RootCertStore::new();
+    roots.add_der(cert.clone()).unwrap();
+    let key =
+        purecrypto::rsa::BoxedRsaPrivateKey::from_pkcs8_der(&der(TEST_KEY, "PRIVATE KEY")).unwrap();
+    let server_tls = Arc::new(
+        TlsConfig::builder()
+            .versions(ProtocolVersion::TLSv1_2, ProtocolVersion::TLSv1_2)
+            .rng(Arc::new(purecrypto::rng::OsRng))
+            .identity(
+                vec![cert.clone()],
+                purecrypto::tls::SigningKey::Rsa(key.clone()),
+            )
+            .client_auth(purecrypto::tls::ClientAuth::new(roots, true))
+            .build(),
+    );
+    let client_tls = Arc::new(
+        TlsConfig::builder()
+            .versions(ProtocolVersion::TLSv1_2, ProtocolVersion::TLSv1_2)
+            .rng(Arc::new(purecrypto::rng::OsRng))
+            .server_name("ovpn-test")
+            .verify_certificates(false)
+            .identity(vec![cert.clone()], purecrypto::tls::SigningKey::Rsa(key))
+            .build(),
+    );
+    let seen: Arc<Mutex<Option<AuthInfo>>> = Arc::default();
+    let s = seen.clone();
+    let hook: OnAuth = Arc::new(move |info: &AuthInfo| {
+        *s.lock().unwrap() = Some(info.clone());
+        auth_hook()(info)
+    });
+    let mut server = Peer::new(server_tls, *b"SERVERID", hook).unwrap();
+    let mut client = TestClient::with_config(*b"CLIENTID", client_tls);
+    connect(&mut server, &mut client);
+    let info = seen.lock().unwrap().take().expect("on_auth called");
+    assert_eq!(info.peer_certificates, vec![cert]);
+    assert_eq!(info.common_name.as_deref(), Some("ovpn-test"));
+
+    // No client certificate asked for: none to see.
+    let seen: Arc<Mutex<Option<AuthInfo>>> = Arc::default();
+    let s = seen.clone();
+    let hook: OnAuth = Arc::new(move |info: &AuthInfo| {
+        *s.lock().unwrap() = Some(info.clone());
+        auth_hook()(info)
+    });
+    let mut server = Peer::new(server_config(), *b"SERVERID", hook).unwrap();
+    connect(&mut server, &mut TestClient::new(*b"CLIENTID"));
+    let info = seen.lock().unwrap().take().expect("on_auth called");
+    assert!(info.peer_certificates.is_empty());
+    assert_eq!(info.common_name, None);
+}
+
 /// With deferred authentication the peer never calls on_auth: it hands the
 /// credentials out and holds the key exchange (and whatever the client says
 /// meanwhile) until complete_auth brings the verdict.

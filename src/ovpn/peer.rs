@@ -57,8 +57,18 @@ fn invalid(msg: impl Into<String>) -> io::Error {
 ///
 /// Built by the crate and read by [`OnAuth`], so it is `#[non_exhaustive]`:
 /// more of what the client presents can be added without breaking anyone.
-/// Every field is what the client sent, as it sent it: checking it is the
-/// callback's job.
+/// Every field but the certificate chain is what the client sent, as it sent
+/// it: checking it is the callback's job.
+///
+/// With certificate authentication (a TLS config with `client_auth`), the
+/// TLS layer has verified [`peer_certificates`](Self::peer_certificates)
+/// against the configured roots, but nothing ties the `auth-user-pass`
+/// username to that certificate: a client holding a valid certificate may
+/// send anyone's username. If both are used, the callback should check that
+/// they belong together -- for instance that the username equals
+/// [`common_name`](Self::common_name), as OpenVPN's
+/// `username-as-common-name` arranges -- and base its decision on the
+/// certificate, not on the username alone.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct AuthInfo {
@@ -72,6 +82,14 @@ pub struct AuthInfo {
     /// The `dev-type` from the client's options string: `"tun"` or
     /// `"tap"`.
     pub dev_type: String,
+    /// The client's certificate chain, DER, leaf first, as the TLS
+    /// handshake received and verified it against the TLS config's
+    /// `client_auth` roots. Empty when the config asks for no client
+    /// certificate, or allows clients without one and this one sent none.
+    pub peer_certificates: Vec<Vec<u8>>,
+    /// The subject common name (CN) of the leaf certificate, if there is a
+    /// leaf and it names one: what OpenVPN calls the client's common name.
+    pub common_name: Option<String>,
 }
 
 /// IP configuration the server pushes back to an authenticated client.
@@ -1456,11 +1474,17 @@ impl Session {
         if let Some(why) = parsed.cipher_refused.clone() {
             return self.apply_auth(parsed, Err(why));
         }
+        // The handshake is complete by now: the client's key exchange
+        // arrived over it.
+        let peer_certificates = self.primary.tls()?.peer_certificates().to_vec();
+        let common_name = peer_certificates.first().and_then(|leaf| common_name(leaf));
         let info = AuthInfo {
             username: parsed.username.clone(),
             password: parsed.password.clone(),
             peer_info: parsed.peer_info.clone(),
             dev_type: parsed.opts.dev_type.clone(),
+            peer_certificates,
+            common_name,
         };
         match auth {
             AuthMode::Inline(on_auth) => {
@@ -1868,6 +1892,15 @@ fn parse_peer_info(raw: &str) -> io::Result<std::collections::HashMap<String, St
         }
     }
     Ok(peer_info)
+}
+
+/// The subject CN of a DER certificate, if it parses and has one.
+fn common_name(der: &[u8]) -> Option<String> {
+    purecrypto::x509::Certificate::from_der(der.to_vec())
+        .ok()?
+        .subject()
+        .ok()?
+        .common_name
 }
 
 /// Cryptographic randomness for IVs and session material.
