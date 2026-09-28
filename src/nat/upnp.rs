@@ -70,6 +70,8 @@ const CTRL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_MAX_MAPPINGS: usize = 1024;
 /// Default [`UPnPConfig::max_per_client`].
 const DEFAULT_MAX_PER_CLIENT: usize = 128;
+/// Default [`UPnPConfig::max_per_namespace`].
+const DEFAULT_MAX_PER_NAMESPACE: usize = 256;
 /// Default [`UPnPConfig::lease_duration`]: 7 days, the longest lease
 /// WANIPConnection:2 allows.
 const DEFAULT_MAX_LEASE: Duration = Duration::from_secs(604_800);
@@ -89,7 +91,9 @@ const CONTROL_PATH: &str = "/ctl/WANIPConnection";
 /// none for anyone else's traffic. By default there are at most 1024
 /// mappings in all (under 2% of that range) and 128 per host, on
 /// unprivileged ports only (1024-65535, as in miniupnpd's sample
-/// configuration), each for at most 7 days.
+/// configuration), each for at most 7 days. A tenant namespace, which may
+/// send from any address and so claim to be any number of hosts, has at
+/// most 256 in all.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct UPnPConfig {
@@ -104,6 +108,12 @@ pub struct UPnPConfig {
     /// Maximum mappings made through UPnP per inside host (0 = unlimited).
     /// Default: 128.
     pub max_per_client: usize,
+    /// Maximum mappings made through UPnP for the hosts of one inside
+    /// namespace attached through
+    /// [`connect_l3`](crate::L3Connector::connect_l3), together (0 =
+    /// unlimited). The NAT's own inside interface (namespace 0) is bound by
+    /// the other caps only. Default: 256.
+    pub max_per_namespace: usize,
     /// Longest lease granted; a longer request is cut to it, and a request
     /// for 0 (permanent, in IGD:1) gets it. `None` grants permanent
     /// mappings. Default: 7 days, the longest lease WANIPConnection:2
@@ -117,6 +127,7 @@ setters! {
         set allowed_ports: Vec<(u16, u16)>;
         set max_mappings: usize;
         set max_per_client: usize;
+        set max_per_namespace: usize;
         some lease_duration: Duration;
     }
 }
@@ -128,6 +139,7 @@ impl Default for UPnPConfig {
             allowed_ports: vec![(1024, 65535)],
             max_mappings: DEFAULT_MAX_MAPPINGS,
             max_per_client: DEFAULT_MAX_PER_CLIENT,
+            max_per_namespace: DEFAULT_MAX_PER_NAMESPACE,
             lease_duration: Some(DEFAULT_MAX_LEASE),
         }
     }
@@ -251,6 +263,17 @@ impl OwnedTable {
             self.remove(k);
         }
         self.by_client.get(&client).map_or(0, HashSet::len)
+    }
+
+    /// How many live mappings the hosts of namespace `ns` have together.
+    fn count_in_ns(&mut self, nat: &Nat, ns: u64) -> usize {
+        let clients: Vec<(u64, Ipv4Addr)> = self
+            .by_client
+            .keys()
+            .filter(|c| c.0 == ns)
+            .copied()
+            .collect();
+        clients.into_iter().map(|c| self.count_for(nat, c)).sum()
     }
 
     /// How many live mappings there are, counted exactly only once the
@@ -704,6 +727,13 @@ EXT:\r\n\r\n",
         if !renewal
             && self.cfg.max_per_client > 0
             && owned.count_for(nat, (ns, inside_ip)) >= self.cfg.max_per_client
+        {
+            return soap_fault(728, "Too many port mappings for this client");
+        }
+        if !renewal
+            && ns != 0
+            && self.cfg.max_per_namespace > 0
+            && owned.count_in_ns(nat, ns) >= self.cfg.max_per_namespace
         {
             return soap_fault(728, "Too many port mappings for this client");
         }
@@ -2323,5 +2353,35 @@ Content-Length: {}\r\n\r\n",
         );
         assert!(resp.starts_with(b"HTTP/1.1 200 "));
         assert_eq!(nat.list_port_forwards().len(), 1);
+    }
+
+    #[test]
+    fn a_tenant_cannot_take_every_upnp_mapping() {
+        let nat = Nat::new(pfx("10.0.0.1/24"), pfx("203.0.113.1/24"));
+        let h = UPnPHelper::new(UPnPConfig::default());
+        let mut ok = 0;
+        for host in 2..=10u8 {
+            let ip = format!("10.0.0.{host}");
+            for i in 0..128u16 {
+                let ext = 20000 + u16::from(host) * 200 + i;
+                let body = add_body(ext, ext, &ip, "UDP", 3600);
+                if h.soap(&nat, 1, "AddPortMapping", &body, Some(ip.parse().unwrap()))
+                    .status
+                    == 200
+                {
+                    ok += 1;
+                }
+            }
+        }
+        assert_eq!(ok, 256);
+        let body = add_body(30001, 23, "10.0.0.50", "TCP", 3600);
+        let r = h.soap(
+            &nat,
+            2,
+            "AddPortMapping",
+            &body,
+            Some("10.0.0.50".parse().unwrap()),
+        );
+        assert_eq!(r.status, 200, "another tenant is still served");
     }
 }

@@ -37,6 +37,17 @@ const DEFAULT_MAX_PEERS_PER_HOST: usize = 65536;
 const DEFAULT_MAX_PEERS: usize = 262_144;
 /// Default for [`NatLimits::max_expectations_per_host`].
 const DEFAULT_MAX_EXPECTATIONS_PER_HOST: usize = 128;
+/// Default for [`NatLimits::max_mappings_per_namespace`]: what one host
+/// may have, so that a tenant with many addresses gets no more than one
+/// with a single address.
+const DEFAULT_MAX_MAPPINGS_PER_NAMESPACE: usize = DEFAULT_MAX_MAPPINGS_PER_HOST;
+/// Default for [`NatLimits::max_peers_per_namespace`].
+const DEFAULT_MAX_PEERS_PER_NAMESPACE: usize = DEFAULT_MAX_PEERS_PER_HOST;
+/// Default for [`NatLimits::max_expectations_per_namespace`]: a quarter
+/// of the table.
+const DEFAULT_MAX_EXPECTATIONS_PER_NAMESPACE: usize = 256;
+/// Default for [`NatLimits::max_hosts_per_namespace`].
+const DEFAULT_MAX_HOSTS_PER_NAMESPACE: usize = 256;
 /// Default for [`NatLimits::host_prefix_v6`]: a /64, the subnet size
 /// SLAAC hosts pick their addresses in (RFC 4291 §2.5.1).
 const DEFAULT_HOST_PREFIX_V6: u8 = 64;
@@ -53,6 +64,17 @@ const DEFAULT_HOST_PREFIX_V6: u8 = 64;
 ///
 /// The defaults allow one host 16384 mappings (under a third of the port
 /// pool) and 65536 tracked remotes, and 262144 remotes in all, some 20 MB.
+///
+/// The per-host caps take a host at the address it sends from, which the
+/// NAT only checks lies in the inside network. On the NAT's own inside
+/// interface (namespace 0) that network is the operator's, and those caps
+/// are all there is: a single-tenant NAT keeps the whole port pool for its
+/// hosts. An inside namespace attached through
+/// [`connect_l3`](crate::L3Connector::connect_l3), though, is a tenant that
+/// may send from any address in the prefix, and so claim to be any number
+/// of hosts; the `*_per_namespace` caps bound what one tenant holds in all,
+/// whatever addresses it uses. By default a tenant gets what one host
+/// does, from at most 256 source addresses.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct NatLimits {
@@ -78,6 +100,22 @@ pub struct NatLimits {
     /// Past 128 counts as 128; a change applies to mappings made after it.
     /// Default: 64.
     pub host_prefix_v6: u8,
+    /// Most mappings one inside namespace attached through
+    /// [`connect_l3`](crate::L3Connector::connect_l3) may have, over all
+    /// its hosts (NAT44 only; namespace 0 is not capped). Those made for
+    /// port forwards and ALG expectations count, but are never refused.
+    /// Default: 16384.
+    pub max_mappings_per_namespace: usize,
+    /// Most remotes tracked for one such namespace, over all its hosts.
+    /// Default: 65536.
+    pub max_peers_per_namespace: usize,
+    /// Most pending ALG expectations one such namespace may have; past it,
+    /// a new one replaces the namespace's closest to lapsing. Default: 256.
+    pub max_expectations_per_namespace: usize,
+    /// Most distinct source addresses one such namespace may send from at
+    /// a time; a new one is dropped until an old one holds nothing any
+    /// more. Default: 256.
+    pub max_hosts_per_namespace: usize,
 }
 
 setters! {
@@ -87,6 +125,10 @@ setters! {
         set max_peers: usize;
         set max_expectations_per_host: usize;
         set host_prefix_v6: u8;
+        set max_mappings_per_namespace: usize;
+        set max_peers_per_namespace: usize;
+        set max_expectations_per_namespace: usize;
+        set max_hosts_per_namespace: usize;
     }
 }
 
@@ -98,6 +140,10 @@ impl Default for NatLimits {
             max_peers: DEFAULT_MAX_PEERS,
             max_expectations_per_host: DEFAULT_MAX_EXPECTATIONS_PER_HOST,
             host_prefix_v6: DEFAULT_HOST_PREFIX_V6,
+            max_mappings_per_namespace: DEFAULT_MAX_MAPPINGS_PER_NAMESPACE,
+            max_peers_per_namespace: DEFAULT_MAX_PEERS_PER_NAMESPACE,
+            max_expectations_per_namespace: DEFAULT_MAX_EXPECTATIONS_PER_NAMESPACE,
+            max_hosts_per_namespace: DEFAULT_MAX_HOSTS_PER_NAMESPACE,
         }
     }
 }
@@ -159,11 +205,39 @@ impl Quota {
     }
 }
 
+/// What one inside namespace holds, over all its hosts.
+#[derive(Debug, Default)]
+pub(crate) struct NsQuota {
+    pub(crate) mappings: Quota,
+    pub(crate) peers: Quota,
+    /// Hosts, by source address, holding anything.
+    pub(crate) hosts: Quota,
+}
+
+impl NsQuota {
+    pub(crate) fn new(limits: &NatLimits) -> NsQuota {
+        NsQuota {
+            mappings: Quota::new(limits.max_mappings_per_namespace),
+            peers: Quota::new(limits.max_peers_per_namespace),
+            hosts: Quota::new(limits.max_hosts_per_namespace),
+        }
+    }
+
+    pub(crate) fn set_limits(&self, limits: &NatLimits) {
+        self.mappings.set_max(limits.max_mappings_per_namespace);
+        self.peers.set_max(limits.max_peers_per_namespace);
+        self.hosts.set_max(limits.max_hosts_per_namespace);
+    }
+}
+
 /// What one inside host holds.
 #[derive(Debug, Default)]
 pub(crate) struct HostQuota {
     pub(crate) mappings: Quota,
     pub(crate) peers: Quota,
+    /// The namespace the host counts against too, if it is capped; the
+    /// host is one of its `hosts` while it lives.
+    ns: Option<Arc<NsQuota>>,
 }
 
 impl HostQuota {
@@ -171,12 +245,82 @@ impl HostQuota {
         HostQuota {
             mappings: Quota::new(limits.max_mappings_per_host),
             peers: Quota::new(limits.max_peers_per_host),
+            ns: None,
+        }
+    }
+
+    /// A host of namespace `ns`, which must already count it among its
+    /// hosts.
+    pub(crate) fn in_namespace(limits: &NatLimits, ns: Arc<NsQuota>) -> HostQuota {
+        HostQuota {
+            mappings: Quota::new(limits.max_mappings_per_host),
+            peers: Quota::new(limits.max_peers_per_host),
+            ns: Some(ns),
         }
     }
 
     pub(crate) fn set_limits(&self, limits: &NatLimits) {
         self.mappings.set_max(limits.max_mappings_per_host);
         self.peers.set_max(limits.max_peers_per_host);
+    }
+
+    /// Count one more mapping, refused past the host's or its namespace's
+    /// cap unless `force`.
+    fn take_mapping(&self, force: bool) -> bool {
+        if force {
+            self.mappings.force();
+            if let Some(ns) = &self.ns {
+                ns.mappings.force();
+            }
+            return true;
+        }
+        if !self.mappings.take() {
+            return false;
+        }
+        if let Some(ns) = &self.ns
+            && !ns.mappings.take()
+        {
+            self.mappings.give(1);
+            return false;
+        }
+        true
+    }
+
+    fn give_mapping(&self) {
+        self.mappings.give(1);
+        if let Some(ns) = &self.ns {
+            ns.mappings.give(1);
+        }
+    }
+
+    /// Count one more tracked remote, if the host's and its namespace's
+    /// caps allow.
+    fn take_peer(&self) -> bool {
+        if !self.peers.take() {
+            return false;
+        }
+        if let Some(ns) = &self.ns
+            && !ns.peers.take()
+        {
+            self.peers.give(1);
+            return false;
+        }
+        true
+    }
+
+    fn give_peers(&self, n: usize) {
+        self.peers.give(n);
+        if let Some(ns) = &self.ns {
+            ns.peers.give(n);
+        }
+    }
+}
+
+impl Drop for HostQuota {
+    fn drop(&mut self) {
+        if let Some(ns) = &self.ns {
+            ns.hosts.give(1);
+        }
     }
 }
 
@@ -186,26 +330,21 @@ impl HostQuota {
 pub(crate) struct MappingHold(Arc<HostQuota>);
 
 impl MappingHold {
-    /// Count a new mapping for `host`, refused past its cap unless
-    /// `force`.
+    /// Count a new mapping for `host`, refused past its cap (or its
+    /// namespace's) unless `force`.
     pub(crate) fn take(host: &Arc<HostQuota>, force: bool) -> Option<MappingHold> {
-        if force {
-            host.mappings.force();
-        } else if !host.mappings.take() {
-            return None;
-        }
-        Some(MappingHold(host.clone()))
+        host.take_mapping(force).then(|| MappingHold(host.clone()))
     }
 }
 
 impl Drop for MappingHold {
     fn drop(&mut self) {
-        self.0.mappings.give(1);
+        self.0.give_mapping();
     }
 }
 
-/// The quotas a mapping's remotes count against: its inside host's and the
-/// NAT's.
+/// The quotas a mapping's remotes count against: its inside host's (and
+/// through it its namespace's) and the NAT's.
 #[derive(Debug, Clone)]
 pub(crate) struct PeerQuotas {
     pub(crate) global: Arc<Quota>,
@@ -214,11 +353,11 @@ pub(crate) struct PeerQuotas {
 
 impl PeerQuotas {
     fn take(&self) -> bool {
-        if !self.host.peers.take() {
+        if !self.host.take_peer() {
             return false;
         }
         if !self.global.take() {
-            self.host.peers.give(1);
+            self.host.give_peers(1);
             return false;
         }
         true
@@ -226,7 +365,7 @@ impl PeerQuotas {
 
     fn give(&self, n: usize) {
         if n > 0 {
-            self.host.peers.give(n);
+            self.host.give_peers(n);
             self.global.give(n);
         }
     }

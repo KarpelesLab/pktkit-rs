@@ -14,7 +14,9 @@ use crate::nat::helper::{
     PortForward,
 };
 use crate::nat::ports::{PortKey, PortMap, PortUse};
-use crate::nat::track::{HostQuota, MappingHold, NatLimits, PeerQuotas, Peers, Quota, SeqAdj};
+use crate::nat::track::{
+    HostQuota, MappingHold, NatLimits, NsQuota, PeerQuotas, Peers, Quota, SeqAdj,
+};
 use crate::time::Instant;
 use crate::{
     IpPrefix, L3Connector, L3Device, L3Handler, Packet, Result, checksum, connect_l3,
@@ -205,6 +207,9 @@ struct NatInner {
     /// What each inside host, by namespace and address, holds; an entry
     /// goes once nothing refers to it.
     hosts: HashMap<(u64, Ipv4Addr), Arc<HostQuota>>,
+    /// What each inside namespace but 0 holds, over all its hosts (see
+    /// [`NatLimits`]); an entry goes once no host refers to it.
+    namespaces: HashMap<u64, Arc<NsQuota>>,
     /// Remotes tracked over all mappings.
     peer_quota: Arc<Quota>,
     limits: NatLimits,
@@ -408,6 +413,7 @@ impl Nat {
                 expectations: Expectations::new(ports.clone()),
                 ports,
                 hosts: HashMap::new(),
+                namespaces: HashMap::new(),
                 peer_quota: Arc::new(Quota::new(NatLimits::default().max_peers)),
                 limits: NatLimits::default(),
             }),
@@ -472,6 +478,9 @@ impl Nat {
         inner.peer_quota.set_max(limits.max_peers);
         for h in inner.hosts.values() {
             h.set_limits(&limits);
+        }
+        for n in inner.namespaces.values() {
+            n.set_limits(&limits);
         }
         inner.limits = limits;
     }
@@ -608,36 +617,59 @@ impl Nat {
         }
         // ALGs add expectations on what inside hosts send, so one host
         // could otherwise fill the table and push everyone else's out. It
-        // makes room from its own when at its cap; only when the table
-        // itself is full does the busiest host give one up.
+        // makes room from its own when at its cap, as does a namespace
+        // (whose hosts are whatever addresses it sends from); only when the
+        // table itself is full does the busiest host give one up.
         let host = (e.namespace, e.inside_ip);
         let of_host = |x: &Expectation| (x.namespace, x.inside_ip) == host;
+        let of_ns = |x: &Expectation| x.namespace == host.0;
         let per_host = inner.limits.max_expectations_per_host;
-        let full_for_host =
-            per_host != 0 && inner.expectations.iter().filter(|x| of_host(x)).count() >= per_host;
-        if full_for_host || inner.expectations.len() >= MAX_EXPECTATIONS {
+        let per_ns = if host.0 == 0 {
+            0
+        } else {
+            inner.limits.max_expectations_per_namespace
+        };
+        let full = |inner: &NatInner| {
+            let n = |f: &dyn Fn(&Expectation) -> bool| {
+                inner.expectations.iter().filter(|x| f(x)).count()
+            };
+            if per_host != 0 && n(&of_host) >= per_host {
+                Some(Some(host))
+            } else if per_ns != 0 && n(&of_ns) >= per_ns {
+                Some(None)
+            } else {
+                None
+            }
+        };
+        if full(inner).is_some() || inner.expectations.len() >= MAX_EXPECTATIONS {
             let now = Instant::now();
             inner.expectations.retain(|e| now <= e.expires);
         }
-        let mine = inner.expectations.iter().filter(|x| of_host(x)).count();
-        let victim = if per_host != 0 && mine >= per_host {
-            Some(host)
-        } else if inner.expectations.len() >= MAX_EXPECTATIONS {
+        // Whose expectation goes: the host's own, the namespace's (`None`),
+        // or the busiest host's.
+        let victim = full(inner).or_else(|| {
+            if inner.expectations.len() < MAX_EXPECTATIONS {
+                return None;
+            }
             let mut counts: HashMap<(u64, Ipv4Addr), usize> = HashMap::new();
             for x in inner.expectations.iter() {
                 *counts.entry((x.namespace, x.inside_ip)).or_default() += 1;
             }
-            counts.into_iter().max_by_key(|&(_, n)| n).map(|(h, _)| h)
-        } else {
-            None
-        };
+            counts
+                .into_iter()
+                .max_by_key(|&(_, n)| n)
+                .map(|(h, _)| Some(h))
+        });
         // Of the victim's, the one closest to lapsing is the least likely
         // to be used.
         if let Some(victim) = victim
             && let Some(pos) = (0..inner.expectations.len())
                 .filter(|&i| {
                     let x = &inner.expectations[i];
-                    (x.namespace, x.inside_ip) == victim
+                    match victim {
+                        Some(h) => (x.namespace, x.inside_ip) == h,
+                        None => of_ns(x),
+                    }
                 })
                 .min_by_key(|&i| inner.expectations[i].expires)
         {
@@ -980,9 +1012,9 @@ impl Nat {
     // -- Internal --------------------------------------------------------
 
     /// A new mapping of inside endpoint `k` to outside port `port`,
-    /// counted against its host's quotas. Refused if the host is at its
-    /// cap, unless `force`: a port forward or an expectation is a mapping
-    /// the NAT was told to make.
+    /// counted against its host's quotas, and its namespace's. Refused if
+    /// either is at its cap, unless `force`: a port forward or an
+    /// expectation is a mapping the NAT was told to make.
     fn new_mapping_locked(
         inner: &mut NatInner,
         k: NatKey,
@@ -990,18 +1022,51 @@ impl Nat {
         now: Instant,
         force: bool,
     ) -> Option<Mapping> {
-        let limits = &inner.limits;
-        let host = inner
-            .hosts
-            .entry((k.ns, k.ip))
-            .or_insert_with(|| Arc::new(HostQuota::new(limits)))
-            .clone();
+        let host = Self::host_locked(inner, (k.ns, k.ip), force)?;
         let hold = MappingHold::take(&host, force)?;
         let peers = Peers::new(PeerQuotas {
             global: inner.peer_quota.clone(),
             host,
         });
         Some(Mapping::new(k, port, now, hold, peers))
+    }
+
+    /// The quotas of inside host `host`, made if it has none yet. A
+    /// namespace attached through `connect_l3` may send from any address,
+    /// so a new one there counts against the namespace's cap on hosts, and
+    /// is refused past it unless `force`.
+    fn host_locked(
+        inner: &mut NatInner,
+        host: (u64, Ipv4Addr),
+        force: bool,
+    ) -> Option<Arc<HostQuota>> {
+        if let Some(h) = inner.hosts.get(&host) {
+            return Some(h.clone());
+        }
+        let limits = &inner.limits;
+        let quota = if host.0 == 0 {
+            HostQuota::new(limits)
+        } else {
+            let ns = inner
+                .namespaces
+                .entry(host.0)
+                .or_insert_with(|| Arc::new(NsQuota::new(limits)))
+                .clone();
+            if force {
+                ns.hosts.force();
+            } else if !ns.hosts.take() {
+                // Hosts that hold nothing any more only go at a sweep;
+                // make room from them first.
+                inner.hosts.retain(|_, h| Arc::strong_count(h) > 1);
+                if !ns.hosts.take() {
+                    return None;
+                }
+            }
+            HostQuota::in_namespace(&inner.limits, ns)
+        };
+        let quota = Arc::new(quota);
+        inner.hosts.insert(host, quota.clone());
+        Some(quota)
     }
 
     /// Drop whatever mapping owns outside port `rk`, in both tables.
@@ -1414,8 +1479,10 @@ impl Nat {
             inner.forwards.remove(&rk);
             Self::remove_mapping_at_locked(inner, rk);
         }
-        // A host nothing counts against any more.
+        // A host nothing counts against any more, and a namespace with no
+        // such host.
         inner.hosts.retain(|_, h| Arc::strong_count(h) > 1);
+        inner.namespaces.retain(|_, n| Arc::strong_count(n) > 1);
     }
 
     fn cleanup_namespace(&self, ns: u64) {
@@ -4900,5 +4967,124 @@ mod tests {
             nat.inside().send(Packet::from_slice(f)).unwrap();
         }
         assert!(!o.lock().unwrap().is_empty());
+    }
+
+    fn tenant(nat: &Arc<Nat>) -> (Arc<Tap>, crate::Cleanup) {
+        let tap = Arc::new(Tap::default());
+        let c = nat.connect_l3(tap.clone()).unwrap();
+        (tap, c)
+    }
+
+    #[test]
+    fn a_tenant_cannot_take_the_pool_by_rotating_addresses() {
+        let (nat, _i, o) = setup();
+        let (atk, _c1) = tenant(&nat);
+        let (vic, _c2) = tenant(&nat);
+        // Four addresses, each at the per-host cap: more than the pool.
+        for host in 2..=5u8 {
+            let src = Ipv4Addr::new(10, 0, 0, host);
+            for sport in 1..=16384u16 {
+                atk.inject(&build_udp(src, sport, REMOTE, 53, b"q"));
+            }
+        }
+        let sent = o.lock().unwrap().len();
+        assert_eq!(sent, 16384);
+        vic.inject(&build_udp(
+            Ipv4Addr::new(10, 0, 0, 50),
+            40000,
+            REMOTE,
+            53,
+            b"v",
+        ));
+        assert_eq!(
+            o.lock().unwrap().len(),
+            sent + 1,
+            "the other tenant is served"
+        );
+        // The inside interface is one operator's network, capped per host
+        // only.
+        for host in 2..=4u8 {
+            for sport in 1..=4000u16 {
+                let p = build_udp(Ipv4Addr::new(10, 0, 0, host), sport, REMOTE, 53, b"q");
+                nat.inside().send(Packet::from_slice(&p)).unwrap();
+            }
+        }
+        assert_eq!(o.lock().unwrap().len(), sent + 1 + 12000);
+    }
+
+    #[test]
+    fn a_tenant_cannot_track_every_remote() {
+        let (nat, _i, _o) = setup();
+        nat.set_limits(
+            NatLimits::default()
+                .max_peers(4096)
+                .max_peers_per_host(1024)
+                .max_peers_per_namespace(1500),
+        );
+        let (atk, _c1) = tenant(&nat);
+        for host in 2..=5u8 {
+            for r in 0..1024u32 {
+                let dst = Ipv4Addr::from(0xC633_6500 + r);
+                atk.inject(&build_udp(
+                    Ipv4Addr::new(10, 0, 0, host),
+                    1000,
+                    dst,
+                    53,
+                    b"q",
+                ));
+            }
+        }
+        assert_eq!(nat.inner.lock().unwrap().peer_quota.used(), 1500);
+    }
+
+    #[test]
+    fn a_tenant_sends_from_a_bounded_number_of_addresses() {
+        let (nat, _i, o) = setup();
+        nat.set_limits(NatLimits::default().max_hosts_per_namespace(8));
+        let (atk, _c1) = tenant(&nat);
+        for host in 2..=11u8 {
+            atk.inject(&build_udp(
+                Ipv4Addr::new(10, 0, 0, host),
+                1000,
+                REMOTE,
+                53,
+                b"q",
+            ));
+        }
+        assert_eq!(o.lock().unwrap().len(), 8);
+        // A known address may still open new flows; once its hosts' flows
+        // idle out, the namespace may use new addresses.
+        atk.inject(&build_udp(
+            Ipv4Addr::new(10, 0, 0, 2),
+            1001,
+            REMOTE,
+            53,
+            b"q",
+        ));
+        assert_eq!(o.lock().unwrap().len(), 9);
+        age_mappings(&nat, UDP_TIMEOUT + Duration::from_secs(1));
+        nat.sweep();
+        atk.inject(&build_udp(
+            Ipv4Addr::new(10, 0, 0, 11),
+            1000,
+            REMOTE,
+            53,
+            b"q",
+        ));
+        assert_eq!(o.lock().unwrap().len(), 10);
+    }
+
+    #[test]
+    fn a_tenant_cannot_fill_the_expectation_table() {
+        let nat = Nat::new(pfx("10.0.0.1/24"), pfx("203.0.113.1/24"));
+        for host in 2..=9u8 {
+            for i in 0..128u16 {
+                let ip = Ipv4Addr::new(10, 0, 0, host);
+                let port = 20000 + u16::from(host) * 200 + i;
+                nat.add_expectation(Expectation::new(PROTO_UDP, ip, i, port, soon()).namespace(1));
+            }
+        }
+        let inner = nat.inner.lock().unwrap();
+        assert_eq!(inner.expectations.len(), 256);
     }
 }
