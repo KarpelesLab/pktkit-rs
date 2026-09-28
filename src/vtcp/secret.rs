@@ -46,8 +46,13 @@ pub(crate) fn keyed_hash<T: Hash>(v: T) -> u64 {
     k.state.hash_one((k.salt, v))
 }
 
-/// Time since the key was made: a monotonic clock shared by ISNs and cookie
-/// counters.
+/// When the key was made: the origin of the monotonic clock shared by
+/// ISNs, cookie counters and TCP timestamps.
+pub(crate) fn epoch() -> Instant {
+    key().epoch
+}
+
+/// Time since the key was made.
 pub(crate) fn elapsed() -> std::time::Duration {
     key().epoch.elapsed()
 }

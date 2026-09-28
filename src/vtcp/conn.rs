@@ -459,8 +459,12 @@ pub struct Conn {
     ts_recent_stamp: Instant,
     /// TSval is milliseconds since `ts_base` plus `ts_offset`: monotonic,
     /// since a wall clock stepped back by NTP would have the peer's PAWS
-    /// drop everything we send, and offset per connection so TSvals do not
-    /// reveal the host's clock (RFC 7323 §7.1).
+    /// drop everything we send, and offset so TSvals do not reveal the
+    /// host's clock (RFC 7323 §7.1). The clock is the process's and the
+    /// offset is per pair of addresses, not per connection, as on Linux:
+    /// a new connection to a host then carries TSvals past the last one's,
+    /// which is what lets its SYN take over a 4-tuple in TIME-WAIT (RFC
+    /// 6191), and a per-connection offset would have refused half of them.
     ts_base: Instant,
     ts_offset: u32,
     /// Last.ACK.sent (RFC 7323 §4.3): the ACK field we last sent.
@@ -542,11 +546,8 @@ impl Conn {
         let cc = make_cc(cfg.congestion, mss as u32);
         let ts_offset = super::secret::keyed_hash((
             "tsval",
-            cfg.local_addr,
-            cfg.local_port,
-            cfg.remote_addr,
-            cfg.remote_port,
-            Instant::now(),
+            cfg.local_addr.map(|a| a.ip()),
+            cfg.remote_addr.map(|a| a.ip()),
         )) as u32;
 
         Self {
@@ -591,7 +592,7 @@ impl Conn {
             ts_ok: false,
             ts_recent: 0,
             ts_recent_stamp: Instant::now(),
-            ts_base: Instant::now(),
+            ts_base: super::secret::epoch(),
             ts_offset,
             last_ack_sent: None,
             sack_enabled: cfg.enable_sack,
@@ -6759,5 +6760,29 @@ mod tests {
         let acks = deliver(&mut server, &segs);
         assert_eq!(parse(acks.last().unwrap()).window, 0);
         assert_eq!(server.delack_deadline, None);
+    }
+
+    /// A later connection between the same two hosts sends TSvals past an
+    /// earlier one's, whatever the ports, so its SYN passes RFC 6191's test
+    /// against the old one in TIME-WAIT.
+    #[test]
+    fn tsvals_run_on_across_connections() {
+        let addr = |port| SocketAddr::from(([10, 0, 0, 1], port));
+        let conf = |port| {
+            ConnConfig::default()
+                .local_addr(addr(port))
+                .remote_addr(SocketAddr::from(([10, 0, 0, 2], 80)))
+        };
+        let old = Conn::new(conf(1000));
+        std::thread::sleep(Duration::from_millis(2));
+        for port in 1000..1016 {
+            let new = Conn::new(conf(port));
+            let ahead = new.ts_now().wrapping_sub(old.ts_now());
+            assert!(
+                ahead < 1 << 31,
+                "port {port}: behind by {}",
+                ahead.wrapping_neg()
+            );
+        }
     }
 }
