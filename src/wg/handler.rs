@@ -1633,7 +1633,7 @@ mod tests {
         rewind(&a, &b.public_key(), Duration::from_secs(6));
         assert_eq!(timer_actions(&a), ["handshake"]);
         a.with_timers(&b.public_key(), |t| {
-            t.attempts = crate::wg::MAX_TIMER_HANDSHAKES + 1;
+            t.attempts = crate::wg::timers::MAX_TIMER_HANDSHAKES + 1;
         });
         rewind(&a, &b.public_key(), Duration::from_secs(6));
         assert_eq!(timer_actions(&a), ["failed"]);
@@ -1669,7 +1669,7 @@ mod tests {
         let pkt = a.encrypt(b"ping", &b.public_key()).unwrap();
         b.process_packet(&pkt, &loopback()).unwrap();
         assert!(timer_actions(&b).is_empty());
-        rewind(&b, &a.public_key(), crate::wg::KEEPALIVE_TIMEOUT);
+        rewind(&b, &a.public_key(), crate::wg::timers::KEEPALIVE_TIMEOUT);
         assert_eq!(timer_actions(&b), ["keepalive"]);
     }
 
@@ -2029,7 +2029,7 @@ mod tests {
         let t0 = Instant::now();
         a.with_timers(&b.public_key(), |t| t.keepalive_due_since = Some(t0));
         let (inits, failed, _) = run_timers(&a, t0, 3600);
-        assert_eq!(inits, crate::wg::MAX_TIMER_HANDSHAKES as usize + 2);
+        assert_eq!(inits, crate::wg::timers::MAX_TIMER_HANDSHAKES as usize + 2);
         assert_eq!(failed, 1);
     }
 
@@ -2058,7 +2058,7 @@ mod tests {
         assert!(inits > 20, "stopped after {inits} initiations");
         assert!(
             at.windows(2)
-                .all(|w| w[1] - w[0] >= crate::wg::REKEY_TIMEOUT),
+                .all(|w| w[1] - w[0] >= crate::wg::timers::REKEY_TIMEOUT),
             "{at:?}"
         );
         // Each give-up is followed by one wait of at least the interval --
@@ -2066,7 +2066,7 @@ mod tests {
         // falls outside it.
         let gaps = at.windows(2).filter(|w| w[1] - w[0] >= every).count();
         let tail = Duration::from_secs(600) - *at.last().unwrap();
-        let last_gap_in_run = tail >= every + crate::wg::REKEY_TIMEOUT * 2;
+        let last_gap_in_run = tail >= every + crate::wg::timers::REKEY_TIMEOUT * 2;
         assert!(
             gaps == failed || (gaps + 1 == failed && !last_gap_in_run),
             "{gaps} long gaps for {failed} give-ups: {at:?}"
@@ -2138,7 +2138,7 @@ mod tests {
         let c1 = a.encrypt(b"one", &b.public_key()).unwrap();
         let c2 = a.encrypt(b"two", &b.public_key()).unwrap();
         assert_ne!(c1, c2);
-        assert_eq!(crate::wg::encrypted_size(3), c1.len());
+        assert_eq!(crate::wg::transport::encrypted_size(3), c1.len());
 
         // Receive c1, then a replay of c1 should be rejected.
         let r1 = b.process_packet(&c1, &addr).unwrap();

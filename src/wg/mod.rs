@@ -52,18 +52,10 @@ mod transport;
 
 #[cfg(not(target_family = "wasm"))]
 pub use adapter::{Adapter, AdapterConfig};
-pub use constants::{
-    COOKIE_REFRESH_TIME, NOISE_PRESHARED_KEY_SIZE, NOISE_PRIVATE_KEY_SIZE, NOISE_PUBLIC_KEY_SIZE,
-    NoisePresharedKey, NoisePrivateKey, NoisePublicKey, REJECT_AFTER_MESSAGES, REJECT_AFTER_TIME,
-    REKEY_AFTER_MESSAGES, REKEY_AFTER_TIME, WINDOW_SIZE,
-};
+pub use constants::{NoisePresharedKey, NoisePrivateKey, NoisePublicKey};
 pub use crypto::{generate_preshared_key, generate_private_key};
 pub use handler::{Config, Handler, PacketResult, PacketType, PeerInfo, UnknownPeerFn};
 pub use multihandler::{MultiHandler, MultiPacketResult};
-pub use replay::SlidingWindow;
 #[cfg(not(target_family = "wasm"))]
 pub use server::{OnPacketFn, OnPeerConnectedFn, Server, ServerConfig};
-pub use timers::{
-    KEEPALIVE_TIMEOUT, MAX_TIMER_HANDSHAKES, REKEY_ATTEMPT_TIME, REKEY_TIMEOUT, TimerAction,
-};
-pub use transport::{EncryptError, encrypted_size};
+pub use timers::TimerAction;

@@ -20,7 +20,7 @@ use crate::wg::timers::{KEEPALIVE_TIMEOUT, REKEY_TIMEOUT};
 /// Total wire size of an encrypted WireGuard packet for the given plaintext
 /// length: 16-byte header + plaintext + 16-byte tag.
 #[inline]
-pub fn encrypted_size(plaintext_len: usize) -> usize {
+pub(crate) fn encrypted_size(plaintext_len: usize) -> usize {
     MESSAGE_TRANSPORT_HEADER_SIZE + plaintext_len + CHACHAPOLY_OVERHEAD
 }
 
@@ -213,7 +213,7 @@ pub(crate) fn encrypt_into(
 
 /// Errors returned by the transport-encrypt path.
 #[derive(Debug)]
-pub enum EncryptError {
+pub(crate) enum EncryptError {
     NoSession,
     KeypairExpired,
     MessageLimitExceeded,

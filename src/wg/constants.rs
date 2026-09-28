@@ -56,7 +56,7 @@ pub(crate) const MESSAGE_TRANSPORT_HEADER_SIZE: usize = 16;
 // === Timers (WireGuard spec §6 / §5.1) =====================================
 
 /// Maximum lifetime of a cookie secret.
-pub const COOKIE_REFRESH_TIME: Duration = Duration::from_secs(120);
+pub(crate) const COOKIE_REFRESH_TIME: Duration = Duration::from_secs(120);
 
 /// How much sooner than [`COOKIE_REFRESH_TIME`] an initiator stops using a
 /// cookie it received (the reference's `COOKIE_SECRET_LATENCY`): the
@@ -66,16 +66,16 @@ pub(crate) const COOKIE_SECRET_LATENCY: Duration = Duration::from_secs(5);
 
 /// How long sessions and pending handshakes stick around before maintenance
 /// removes them.
-pub const REJECT_AFTER_TIME: Duration = Duration::from_secs(180);
+pub(crate) const REJECT_AFTER_TIME: Duration = Duration::from_secs(180);
 
 /// Initiate a rekey once a keypair has encrypted this many messages.
-pub const REKEY_AFTER_MESSAGES: u64 = 1u64 << 60;
+pub(crate) const REKEY_AFTER_MESSAGES: u64 = 1u64 << 60;
 
 /// Hard limit; a keypair beyond this counter must be retired.
-pub const REJECT_AFTER_MESSAGES: u64 = u64::MAX - (1u64 << 13);
+pub(crate) const REJECT_AFTER_MESSAGES: u64 = u64::MAX - (1u64 << 13);
 
 /// Initiate a rekey when the keypair is older than this.
-pub const REKEY_AFTER_TIME: Duration = Duration::from_secs(120);
+pub(crate) const REKEY_AFTER_TIME: Duration = Duration::from_secs(120);
 
 // === DoS mitigation thresholds =============================================
 
@@ -90,7 +90,7 @@ pub(crate) const MIN_INITIATION_INTERVAL: Duration =
     Duration::from_nanos(1_000_000_000 / INITIATIONS_PER_SECOND as u64);
 
 /// Size of the per-keypair replay window.
-pub const WINDOW_SIZE: usize = 8192;
+pub(crate) const WINDOW_SIZE: usize = 8192;
 
 /// Maximum number of in-flight handshakes per handler before new entries are
 /// rejected.
@@ -105,15 +105,15 @@ pub(crate) const DEFAULT_UNKNOWN_PEER_LIMIT: usize = MAX_SESSIONS;
 
 // === Key sizes =============================================================
 
-pub const NOISE_PUBLIC_KEY_SIZE: usize = 32;
-pub const NOISE_PRIVATE_KEY_SIZE: usize = 32;
-pub const NOISE_PRESHARED_KEY_SIZE: usize = 32;
+pub(crate) const NOISE_PUBLIC_KEY_SIZE: usize = 32;
+pub(crate) const NOISE_PRIVATE_KEY_SIZE: usize = 32;
+pub(crate) const NOISE_PRESHARED_KEY_SIZE: usize = 32;
 
 // === Key newtypes ==========================================================
 
 /// A Curve25519 public key. Equality and hashing operate on the raw bytes.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct NoisePublicKey(pub [u8; NOISE_PUBLIC_KEY_SIZE]);
+pub struct NoisePublicKey(pub(crate) [u8; NOISE_PUBLIC_KEY_SIZE]);
 
 impl NoisePublicKey {
     /// The all-zero public key.
@@ -155,7 +155,7 @@ impl fmt::Debug for NoisePublicKey {
 
 /// A Curve25519 private key. Bytes are zeroed on drop.
 #[derive(Clone, Default)]
-pub struct NoisePrivateKey(pub [u8; NOISE_PRIVATE_KEY_SIZE]);
+pub struct NoisePrivateKey(pub(crate) [u8; NOISE_PRIVATE_KEY_SIZE]);
 
 impl NoisePrivateKey {
     /// The all-zero private key.
@@ -197,7 +197,7 @@ impl Drop for NoisePrivateKey {
 
 /// A preshared key (optional second factor mixed into the Noise transcript).
 #[derive(Clone)]
-pub struct NoisePresharedKey(pub [u8; NOISE_PRESHARED_KEY_SIZE]);
+pub struct NoisePresharedKey(pub(crate) [u8; NOISE_PRESHARED_KEY_SIZE]);
 
 impl NoisePresharedKey {
     /// The all-zero preshared key.

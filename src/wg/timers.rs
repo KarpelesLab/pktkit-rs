@@ -16,21 +16,21 @@ use crate::wg::NoisePublicKey;
 
 /// How long to wait for a handshake response before sending the initiation
 /// again.
-pub const REKEY_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const REKEY_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long to keep retrying a handshake before giving up. As in the
 /// reference, this sets the number of retries, [`MAX_TIMER_HANDSHAKES`],
 /// rather than a deadline: with the jitter each retry adds, the last one
 /// goes out a little past it.
-pub const REKEY_ATTEMPT_TIME: Duration = Duration::from_secs(90);
+pub(crate) const REKEY_ATTEMPT_TIME: Duration = Duration::from_secs(90);
 /// An unanswered initiation is sent again `MAX_TIMER_HANDSHAKES + 1` times,
 /// `MAX_TIMER_HANDSHAKES + 2` initiations in all, before the attempt is
 /// abandoned. The value and the count are the reference's
 /// (`REKEY_ATTEMPT_TIME / REKEY_TIMEOUT`, compared with `>`).
-pub const MAX_TIMER_HANDSHAKES: u32 =
+pub(crate) const MAX_TIMER_HANDSHAKES: u32 =
     (REKEY_ATTEMPT_TIME.as_secs() / REKEY_TIMEOUT.as_secs()) as u32;
 /// How long after receiving data to wait for something to send back before
 /// sending a keepalive instead.
-pub const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Up to this much random delay is added to each retransmission, so peers
 /// that lost a handshake together do not retry in lockstep.
 const REKEY_TIMEOUT_JITTER_MAX_MS: u32 = 334;

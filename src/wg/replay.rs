@@ -22,7 +22,7 @@ const WINDOW: u64 = (WINDOW_SIZE - 64) as u64;
 
 /// Bitmap-based sliding window.
 #[derive(Debug)]
-pub struct SlidingWindow {
+pub(crate) struct SlidingWindow {
     inner: Mutex<Inner>,
 }
 
@@ -48,7 +48,7 @@ impl Inner {
 
 impl SlidingWindow {
     /// A window that has accepted no counter yet.
-    pub const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             inner: Mutex::new(Inner {
                 bitmap: [0; BITMAP_WORDS],
@@ -61,7 +61,7 @@ impl SlidingWindow {
     /// Lets a receiver drop obvious replays before paying to decrypt them;
     /// a `false` here must still be confirmed by
     /// [`check_replay`](Self::check_replay) after decryption.
-    pub fn is_replay(&self, counter: u64) -> bool {
+    pub(crate) fn is_replay(&self, counter: u64) -> bool {
         let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if g.too_old_or_invalid(counter) {
             return true;
@@ -74,7 +74,7 @@ impl SlidingWindow {
     /// replay (already seen, too old, or past `REJECT_AFTER_MESSAGES`).
     /// Otherwise records it and returns `false`. Call only for packets that
     /// have authenticated.
-    pub fn check_replay(&self, counter: u64) -> bool {
+    pub(crate) fn check_replay(&self, counter: u64) -> bool {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if g.too_old_or_invalid(counter) {
             return true;
@@ -102,13 +102,6 @@ impl SlidingWindow {
             ((counter / 64) % BITMAP_WORDS as u64) as usize,
             1u64 << (counter % 64),
         )
-    }
-
-    /// Reset the window to its initial state.
-    pub fn reset(&self) {
-        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        g.bitmap = [0; BITMAP_WORDS];
-        g.next = 0;
     }
 }
 
@@ -264,14 +257,5 @@ mod tests {
         assert!(!w.check_replay(5));
         assert!(w.is_replay(5));
         assert!(w.is_replay(u64::MAX));
-    }
-
-    #[test]
-    fn reset_allows_replay() {
-        let w = SlidingWindow::new();
-        assert!(!w.check_replay(7));
-        assert!(w.check_replay(7));
-        w.reset();
-        assert!(!w.check_replay(7));
     }
 }

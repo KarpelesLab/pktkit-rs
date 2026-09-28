@@ -31,11 +31,20 @@ pub type OnPeerConnectedFn = Arc<dyn Fn(NoisePublicKey, &Arc<Handler>) + Send + 
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct ServerConfig {
+    /// The single identity to serve. Exactly one of `handler` and
+    /// `multi_handler` must be set.
     pub handler: Option<Arc<Handler>>,
+    /// Several identities sharing the socket, instead of `handler`.
     pub multi_handler: Option<Arc<MultiHandler>>,
+    /// Called with each decrypted transport packet. Default: drop it.
     pub on_packet: OnPacketFn,
+    /// Called when a handshake with a peer completes.
     pub on_peer_connected: Option<OnPeerConnectedFn>,
+    /// How often the handler's
+    /// [`maintenance`](Handler::maintenance) runs. Default: 10 seconds.
     pub maintenance_interval: Option<Duration>,
+    /// Size of the receive buffer, the largest datagram read whole.
+    /// Default (and when 0): 65535.
     pub read_buffer_size: usize,
 }
 
@@ -787,7 +796,7 @@ mod tests {
                 remote_index: kp.remote_index,
                 peer_key: kp.peer_key,
                 is_initiator: kp.is_initiator,
-                replay_filter: crate::wg::SlidingWindow::new(),
+                replay_filter: crate::wg::replay::SlidingWindow::new(),
             }));
         }
         s.send(b"staged", &b.public_key()).unwrap();
