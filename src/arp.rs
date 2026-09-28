@@ -498,7 +498,9 @@ impl<K: Eq + Hash + Copy> Pending<K> {
     /// hold a queue, and broadcast a request, for every address in it
     /// (RFC 6583 §4). Likewise once the queues hold [`PENDING_MAX_BYTES`]
     /// together: a queue then makes room by dropping its own oldest packets,
-    /// and a new destination is refused. The [pinned](Self::pin) router is
+    /// and a new destination is refused. A packet that would not fit even
+    /// with its queue emptied is refused outright, and nothing is dropped
+    /// for it. The [pinned](Self::pin) router is
     /// the exception to both, and takes its room from the others.
     pub fn enqueue(&self, ip: K, pkt: &[u8]) -> bool {
         self.enqueue_at(ip, pkt, Instant::now())
@@ -510,6 +512,22 @@ impl<K: Eq + Hash + Copy> Pending<K> {
             return false;
         }
         let pinned = q.pinned == Some(ip);
+        // Whether the packet can be admitted at all, before anything is
+        // shed for it: room is made from this target's own packets (all
+        // of them, at most), or for the pinned router from anyone's. A
+        // packet that will not fit even so is refused with the queues as
+        // they were, rather than after throwing away the packets it was
+        // to join -- which left an empty queue behind, soliciting for
+        // nothing and failing with nothing to report.
+        let own = q.map.get(&ip).map_or(0, PendingEntry::size);
+        let room = if pinned {
+            PENDING_MAX_BYTES
+        } else {
+            PENDING_MAX_BYTES - (q.bytes - own)
+        };
+        if pkt.len() > room {
+            return false;
+        }
         // A resolution that failed but was never polled: with nobody
         // driving the timers, start over rather than hold the target, and
         // its full queue, forever. Its old packets go unreported.
@@ -565,9 +583,9 @@ impl<K: Eq + Hash + Copy> Pending<K> {
             }
             let e = q.map.get_mut(&ip).unwrap();
             if e.packets.is_empty() {
-                if fresh {
-                    q.map.remove(&ip);
-                }
+                // Cannot happen after the check above; were it to, a queue
+                // left with nothing in it goes too.
+                q.map.remove(&ip);
                 return false;
             }
             q.bytes -= e.packets.remove(0).len();
@@ -990,6 +1008,36 @@ mod tests {
         }
         assert_eq!(p.drain(gw).len(), PENDING_MAX_PKTS, "router starved");
         assert!(p.inner.lock().unwrap().bytes <= PENDING_MAX_BYTES);
+    }
+
+    /// A packet too big for the room left, even with this target's own
+    /// packets dropped, is refused without dropping them: they were
+    /// deliverable, and an emptied queue would solicit for nothing.
+    #[test]
+    fn a_packet_that_cannot_fit_does_not_shed_its_queue() {
+        let p = Pending::new();
+        let (a, b) = (Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 2));
+        let big = vec![0u8; 65535];
+        for _ in 0..15 {
+            p.enqueue(b, &big);
+        }
+        p.enqueue(b, &[0u8; 1000]);
+        for i in 0..3u8 {
+            p.enqueue(a, &[i; 100]);
+        }
+        // B holds 984025 bytes; 64551 are left for A, own packets and all.
+        assert!(!p.enqueue(a, &big), "admitted over the cap");
+        assert!(p.contains(a));
+        assert_eq!(p.drain(a), vec![vec![0u8; 100], vec![1; 100], vec![2; 100]]);
+        let q = p.inner.lock().unwrap();
+        assert_eq!(
+            q.bytes,
+            q.map.values().map(PendingEntry::size).sum::<usize>()
+        );
+        assert!(
+            q.map.values().all(|e| !e.packets.is_empty()),
+            "empty queue left"
+        );
     }
 
     #[test]
