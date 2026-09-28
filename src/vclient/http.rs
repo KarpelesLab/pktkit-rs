@@ -988,7 +988,6 @@ mod tests {
         }
     }
 
-    /// Feed `raw` in pieces of `step` bytes, then close.
     /// The body limit bounds the memory the body takes, not just its length:
     /// `Vec` doubling would otherwise take a body just past half the limit
     /// to twice the limit in capacity.
@@ -1012,6 +1011,7 @@ mod tests {
         }
     }
 
+    /// Feed `raw` in pieces of `step` bytes, then close.
     fn read_response(raw: &[u8], step: usize) -> io::Result<Response> {
         let mut r = ResponseReader::new(false, DEFAULT_MAX_RESPONSE_BODY);
         for piece in raw.chunks(step) {
