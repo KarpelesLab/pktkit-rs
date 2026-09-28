@@ -2465,8 +2465,10 @@ mod tests {
         );
         let start = Instant::now();
         L3Device::send(&*stack, Packet::from_slice(&syn)).unwrap();
+        // A blocked dial takes the OS's connect timeout, over a minute:
+        // the bound only has to stay clear of a loaded machine's delays.
         assert!(
-            start.elapsed() < Duration::from_millis(500),
+            start.elapsed() < Duration::from_secs(5),
             "send blocked for {:?} dialing the destination",
             start.elapsed()
         );
@@ -3593,6 +3595,10 @@ mod tests {
         s.set_dest_filter(None);
         L3Device::send(&*s, Packet::from_slice(&dgram)).unwrap();
         let mut buf = [0u8; 16];
+        // Short only while nothing is meant to arrive.
+        real_udp
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
         let (n, _) = real_udp.recv_from(&mut buf).expect("datagram relayed");
         assert_eq!(&buf[..n], b"hello");
     }
@@ -3648,6 +3654,9 @@ mod tests {
         captured.lock().unwrap().clear();
         L3Device::send(&*s, Packet::from_slice(&dgram)).unwrap();
         let mut buf = [0u8; 16];
+        real_udp
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
         let (n, from) = real_udp.recv_from(&mut buf).expect("datagram relayed");
         assert_eq!(&buf[..n], b"hi");
         real_udp.send_to(b"yo", from).unwrap();
