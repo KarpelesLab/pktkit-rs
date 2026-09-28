@@ -33,6 +33,10 @@
 //!   retransmissions alike, and rides out reordering. A tail loss probe
 //!   two round trips after the last ACK draws the feedback that shows a
 //!   loss at the end of a flight, which otherwise only the RTO would.
+//! - RFC 6937: Proportional Rate Reduction (PRR-SSRB). During fast
+//!   recovery the window comes down to ssthresh in step with what the
+//!   ACKs report delivered, a segment for about every other ACK, rather
+//!   than inflating with every duplicate ACK or going quiet and bursting.
 //! - RFC 2883: D-SACK, reporting data received twice.
 //! - RFC 5961: challenge ACKs against blind RST, SYN and data injection,
 //!   rate-limited.

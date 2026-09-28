@@ -428,6 +428,11 @@ pub struct Conn {
     /// The segments those duplicates say left the network, in bytes
     /// (Linux's Reno `sacked_out`).
     reno_sacked: u32,
+    /// PRR (RFC 6937): bytes delivered and sent since fast recovery began,
+    /// and the flight it began with.
+    prr_delivered: u64,
+    prr_out: u64,
+    recover_fs: u32,
     /// RACK's reordering timer (RFC 8985 §5.4): when what was sent before
     /// the last delivered segment, and is not yet deemed lost, will be.
     reo_deadline: std::option::Option<Instant>,
@@ -611,6 +616,9 @@ impl Conn {
             last_oow_ack: None,
             dup_acks: 0,
             reno_sacked: 0,
+            prr_delivered: 0,
+            prr_out: 0,
+            recover_fs: 1,
             reo_deadline: None,
             pto_deadline: None,
             tlp_end: None,
@@ -1305,6 +1313,7 @@ impl Conn {
         }
         let tsval = self.ts_now();
         self.score.on_send(snd_nxt, 1, true, self.now, tsval);
+        self.note_sent(1);
         self.fin_queued = false;
         self.fin_sent = true;
         if self.rto_deadline.is_none() {
@@ -2276,11 +2285,18 @@ impl Conn {
         flight: u32,
     ) {
         let mss = self.mss as u32;
+        // RFC 6937's DeliveredData.
+        let mut delivered = d.delivered;
         // Without SACK, each duplicate stands for a segment that left the
         // network, as Linux's Reno emulation counts it: the pipe shrinks by
-        // a segment, which is Limited Transmit (RFC 3042) before recovery
-        // and RFC 5681's window inflation during it.
+        // a segment, which is Limited Transmit (RFC 3042) before recovery,
+        // and what PRR counts as delivered during it.
         if !self.sack_ok {
+            delivered = if dup {
+                mss
+            } else {
+                acked.saturating_sub(self.reno_sacked).max(acked.min(mss))
+            };
             if dup {
                 self.dup_acks += 1;
                 if self.ca != CaState::Loss {
@@ -2328,6 +2344,43 @@ impl Conn {
         if self.ca == CaState::Open && self.score.lost_bytes() > 0 {
             self.enter_recovery();
         }
+        if self.ca == CaState::Recovery {
+            self.prr_update(delivered);
+        }
+    }
+
+    /// PRR (RFC 6937): after an ACK in fast recovery reporting `delivered`
+    /// bytes, set cwnd so that what may be sent now keeps the flight on
+    /// its way down to ssthresh in proportion to what is delivered, rather
+    /// than falling silent for half a round trip and then bursting, as
+    /// cwnd = ssthresh would; and once losses have taken the flight below
+    /// ssthresh, lets it grow back no faster than slow start (PRR-SSRB).
+    fn prr_update(&mut self, delivered: u32) {
+        self.prr_delivered += u64::from(delivered);
+        let pipe = self.in_flight();
+        let mut sndcnt = prr_sndcnt(
+            self.prr_delivered,
+            self.prr_out,
+            self.recover_fs,
+            self.cc.ssthresh(),
+            pipe,
+            delivered,
+            self.mss as u32,
+        );
+        // The fast retransmit goes at once, whatever the pipe (RFC 5681
+        // §3.2 step 2, and Linux's PRR).
+        if self.prr_out == 0 {
+            sndcnt = sndcnt.max(self.mss as u32);
+        }
+        self.cc.set_cwnd(pipe.saturating_add(sndcnt));
+    }
+
+    /// Count `len` bytes sent, for PRR.
+    #[inline]
+    fn note_sent(&mut self, len: u32) {
+        if self.ca == CaState::Recovery {
+            self.prr_out += u64::from(len);
+        }
     }
 
     /// Whether an ACK up to `ack` ends the current recovery episode.
@@ -2356,21 +2409,16 @@ impl Conn {
         let sb = self.send_buf.as_ref().unwrap();
         let (flight, nxt) = (sb.unacked() as u32, sb.nxt());
         self.cc.on_loss(flight);
-        self.cc.set_cwnd(self.cc.ssthresh());
         self.recover = nxt;
         self.ca = CaState::Recovery;
+        // RFC 6937 §3's RecoverFS: the flight the reduction is spread over.
+        self.recover_fs = flight.max(1);
+        self.prr_delivered = 0;
+        self.prr_out = 0;
         // RFC 8985 §7.1: a probe of the flight this recovery repairs is
         // moot.
         self.tlp_end = None;
         self.pto_deadline = None;
-        // Fast retransmit (RFC 5681 §3.2 step 2, RFC 6675 §5 step 4.3):
-        // the first lost segment goes now, whatever the pipe.
-        let room = self.send_mss() as u32;
-        if self.snd_wnd > 0
-            && let Some((seq, len, fin)) = self.score.next_lost(room)
-        {
-            self.resend(seq, len, fin);
-        }
     }
 
     /// In fast recovery.
@@ -2537,6 +2585,9 @@ impl Conn {
         if self.ca == CaState::Open && self.score.lost_bytes() > 0 {
             self.enter_recovery();
         }
+        if self.ca == CaState::Recovery {
+            self.prr_update(0);
+        }
         self.flush_send_queue();
     }
 
@@ -2572,6 +2623,7 @@ impl Conn {
         self.queue_seg(seg);
         let tsval = self.ts_now();
         self.score.on_retransmit(seq, len, self.now, tsval);
+        self.note_sent(len);
         // Karn's algorithm: no timing of a segment that went twice.
         self.rto.invalidate_timing();
         // Linux re-arms the RTO for the first segment only: re-arming it
@@ -2630,6 +2682,7 @@ impl Conn {
         let tsval = self.ts_now();
         self.score
             .on_send(snd_nxt, len as u32, false, self.now, tsval);
+        self.note_sent(len as u32);
         // Answering the peer's data within a delayed ACK's time (Linux's
         // tcp_event_data_sent).
         if self
@@ -3403,6 +3456,33 @@ impl Conn {
     fn signal_fin_recvd(&mut self) {
         self.fin_recvd_signaled = true;
     }
+}
+
+/// RFC 6937 §3's sndcnt, PRR-SSRB: how much fast recovery may send on an
+/// ACK that reported `delivered` bytes, `prr_delivered` and `prr_out`
+/// having been delivered and sent since it began with a flight of
+/// `recover_fs`, now that `pipe` bytes are in flight and the target is
+/// `ssthresh`.
+fn prr_sndcnt(
+    prr_delivered: u64,
+    prr_out: u64,
+    recover_fs: u32,
+    ssthresh: u32,
+    pipe: u32,
+    delivered: u32,
+    mss: u32,
+) -> u32 {
+    let sndcnt = if pipe > ssthresh {
+        // Proportional Rate Reduction.
+        let target = (prr_delivered * u64::from(ssthresh)).div_ceil(u64::from(recover_fs.max(1)));
+        target.saturating_sub(prr_out)
+    } else {
+        // Slow Start Reduction Bound.
+        let banked = prr_delivered.saturating_sub(prr_out);
+        let limit = banked.max(u64::from(delivered)) + u64::from(mss);
+        u64::from(ssthresh - pipe).min(limit)
+    };
+    sndcnt.min(u64::from(u32::MAX)) as u32
 }
 
 /// The time now. Tests move it on at will: RACK and TLP go by the time
@@ -5047,6 +5127,82 @@ mod tests {
         // No second probe while the first is out.
         client.pto_deadline = Some(test_now());
         assert!(tick_due(&mut client).is_empty());
+    }
+
+    // --- PRR (RFC 6937) ---------------------------------------------------
+
+    /// RFC 6937 §3.1's examples, a segment a unit: 20 in flight, ssthresh
+    /// 10. One loss: the reduction is spread over the round trip, a
+    /// segment every other ACK, and the flight ends at ssthresh. Fifteen
+    /// losses, which take the pipe below ssthresh: PRR-SSRB sends two
+    /// segments per ACK, slow start's pace, rather than all at once.
+    #[test]
+    fn prr_send_quantities_follow_rfc_6937() {
+        let (fs, ssthresh) = (20, 10);
+        let (mut delivered, mut out) = (0u64, 0u64);
+        let mut sent = Vec::new();
+        let mut pipe = 19u32;
+        for _ in 3..=19 {
+            delivered += 1;
+            pipe -= 1;
+            let n = prr_sndcnt(delivered, out, fs, ssthresh, pipe, 1, 1).max(u32::from(out == 0));
+            out += u64::from(n);
+            pipe += n;
+            sent.push(n);
+        }
+        assert_eq!(sent[..15], [1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1]);
+        assert_eq!(pipe, ssthresh, "ends at ssthresh");
+
+        // The burst: ACKs 17, 18 and 19 each find the pipe below ssthresh.
+        let (mut delivered, mut out) = (0u64, 0u64);
+        let mut pipe = 5u32;
+        let mut sent = Vec::new();
+        for _ in 17..=19 {
+            delivered += 1;
+            pipe -= 1;
+            let n = prr_sndcnt(delivered, out, fs, ssthresh, pipe, 1, 1);
+            out += u64::from(n);
+            pipe += n;
+            sent.push(n);
+        }
+        assert_eq!(sent, [2, 2, 2]);
+    }
+
+    /// A loss in a window of twenty segments: fast recovery sends a
+    /// segment for about every other ACK, never a burst, and leaves the
+    /// window at ssthresh, where cwnd = ssthresh would have gone quiet for
+    /// half the round trip and then sent the rest at once, and RFC 5681's
+    /// inflation would have gone on past it.
+    #[test]
+    fn prr_spreads_the_reduction_over_the_round_trip() {
+        let rtt = Duration::from_millis(100);
+        let conf = |l, r| big(l, r).send_buf_size(1 << 20).recv_buf_size(1 << 20);
+        let (mut client, mut server) = rtt_pair(conf, 40710, rtt);
+        client.cc.set_cwnd(20_000);
+        let (_, segs) = client.write(&[3; 100_000]);
+        assert_eq!(segs.len(), 20);
+        advance(rtt / 2);
+        let acks = deliver(&mut server, &segs[1..]);
+        advance(rtt / 2);
+        let mut per_ack = Vec::new();
+        let mut started = false;
+        for a in &acks {
+            let out = client.handle_segment(&parse(a));
+            started |= client.in_recovery();
+            if started {
+                per_ack.push(out.len());
+            }
+        }
+        assert!(client.in_recovery());
+        assert!(per_ack.iter().all(|&n| n <= 2), "{per_ack:?}");
+        let half = per_ack.len() / 2;
+        assert!(per_ack[1..half].iter().sum::<usize>() >= 3, "{per_ack:?}");
+        let ssthresh = client.cc.ssthresh();
+        assert!(
+            client.in_flight().abs_diff(ssthresh) <= 1000,
+            "pipe {} vs ssthresh {ssthresh}",
+            client.in_flight()
+        );
     }
 
     /// The MSS counts payload only; options come out of it (RFC 6691 §2,
