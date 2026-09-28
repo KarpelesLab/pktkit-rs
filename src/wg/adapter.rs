@@ -294,7 +294,10 @@ impl Adapter {
     ///
     /// This is [`Handler::add_peer`] on each: a peer already known keeps
     /// its preshared key, and any [expiry](Handler::set_peer_expiry) is
-    /// cleared, so a lapsed peer is authorized again.
+    /// cleared, so a lapsed peer is authorized again. The peer stays until
+    /// [`remove_peer`](Self::remove_peer), however long expired: only peers
+    /// taken with [`accept_unknown_peer`](Self::accept_unknown_peer) are
+    /// dropped by the handler itself.
     pub fn add_peer(&self, key: NoisePublicKey) {
         if let Some(mh) = self.multi_handler.as_ref() {
             for h in mh.handlers() {
@@ -329,8 +332,9 @@ impl Adapter {
     ///
     /// A new peer is refused once the handler has
     /// [`unknown_peer_limit`](AdapterConfig::unknown_peer_limit) peers,
-    /// none of them past its expiry: the one expired longest is otherwise
-    /// removed to make room.
+    /// none of those taken this way past its expiry: the one expired
+    /// longest is otherwise removed to make room. Peers added with
+    /// [`add_peer`](Self::add_peer) are never removed to make room.
     pub fn accept_unknown_peer(
         &self,
         key: NoisePublicKey,

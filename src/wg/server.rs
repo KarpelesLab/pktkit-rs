@@ -1049,8 +1049,8 @@ mod tests {
         h.remove_peer(&key(1));
         assert_eq!(s.peer_addr(&key(1)), None, "removed");
 
-        // Expired, then pruned by maintenance.
-        h.add_peer(key(2));
+        // Taken as unknown, expired, then pruned by maintenance.
+        h.add_unknown_peer(key(2)).unwrap();
         known(key(2));
         h.set_peer_expiry(&key(2), long_expired);
         h.maintenance();

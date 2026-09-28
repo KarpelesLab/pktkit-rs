@@ -23,7 +23,7 @@ use crate::wg::replay::SlidingWindow;
 use crate::wg::timers::{PeerTimers, TimerAction};
 use crate::wg::transport::EncryptError;
 
-/// How long a peer stays in the table past its
+/// How long a peer taken from `on_unknown_peer` stays in the table past its
 /// [expiry](Handler::set_peer_expiry) before [`Handler::maintenance`] drops
 /// it. Its sessions stop at expiry; until then it is still reported
 /// ([`Handler::get_peer_info`]) and a refresh keeps its replay state.
@@ -178,6 +178,11 @@ struct PeerEntry {
     has_timestamp: bool,
     /// When an initiation from the peer was last accepted.
     last_initiation_consumed: Option<Instant>,
+    /// Authorized through [`Handler::accept_unknown_peer`] and never by the
+    /// operator since. Only such a peer may the handler drop by itself:
+    /// the operator's own go only when the operator says, and with their
+    /// preshared key, which a later refresh cannot restore.
+    accepted_unknown: bool,
     /// Initiator-side cookie state: writes MAC1/MAC2 on outgoing handshakes.
     cookie_gen: Mutex<crate::wg::cookie::CookieGenerator>,
     timers: Mutex<PeerTimers>,
@@ -195,6 +200,7 @@ impl PeerEntry {
             last_timestamp: [0u8; TAI64N_TIMESTAMP_SIZE],
             has_timestamp: false,
             last_initiation_consumed: None,
+            accepted_unknown: false,
             cookie_gen: Mutex::new(crate::wg::cookie::CookieGenerator::new(&key)),
             timers: Mutex::new(PeerTimers::default()),
         }
@@ -342,20 +348,36 @@ impl Handler {
     /// handshake, and [`Adapter::add_peer`](crate::wg::Adapter::add_peer)
     /// calls this on every identity. Use [`remove_peer`](Self::remove_peer)
     /// first to take the key away.
+    ///
+    /// A peer added (or refreshed) here stays in the table until
+    /// [`remove_peer`](Self::remove_peer), expired or not: only peers taken
+    /// with [`accept_unknown_peer`](Self::accept_unknown_peer) are dropped
+    /// by the handler itself.
     pub fn add_peer(&self, peer_key: NoisePublicKey) {
-        Self::add_peer_locked(&mut self.peers.write().expect("peers lock"), peer_key);
+        Self::add_peer_locked(
+            &mut self.peers.write().expect("peers lock"),
+            peer_key,
+            false,
+        );
     }
 
-    fn add_peer_locked(peers: &mut HashMap<NoisePublicKey, PeerEntry>, peer_key: NoisePublicKey) {
+    fn add_peer_locked(
+        peers: &mut HashMap<NoisePublicKey, PeerEntry>,
+        peer_key: NoisePublicKey,
+        accepted_unknown: bool,
+    ) {
         match peers.get_mut(&peer_key) {
             // Update in place, as add_peer_with_psk does, to keep the replay
-            // state.
-            Some(p) => p.expires_at = None,
+            // state. Accepting a peer the operator added does not hand it
+            // over to the handler's own pruning.
+            Some(p) => {
+                p.expires_at = None;
+                p.accepted_unknown &= accepted_unknown;
+            }
             None => {
-                peers.insert(
-                    peer_key,
-                    PeerEntry::new(peer_key, NoisePresharedKey::zero(), false),
-                );
+                let mut p = PeerEntry::new(peer_key, NoisePresharedKey::zero(), false);
+                p.accepted_unknown = accepted_unknown;
+                peers.insert(peer_key, p);
             }
         }
     }
@@ -369,7 +391,8 @@ impl Handler {
     }
 
     /// Add (or refresh) an authorized peer with a preshared key. Refreshing
-    /// a known peer replaces its key and clears any expiry.
+    /// a known peer replaces its key and clears any expiry. Like
+    /// [`add_peer`](Self::add_peer), the peer stays until removed.
     pub fn add_peer_with_psk(&self, peer_key: NoisePublicKey, psk: NoisePresharedKey) {
         let mut peers = self.peers.write().expect("peers lock");
         match peers.get_mut(&peer_key) {
@@ -380,6 +403,7 @@ impl Handler {
                 p.preshared_key = psk;
                 p.has_psk = true;
                 p.expires_at = None;
+                p.accepted_unknown = false;
             }
             None => {
                 peers.insert(peer_key, PeerEntry::new(peer_key, psk, true));
@@ -479,11 +503,15 @@ impl Handler {
     /// running on until they expire by themselves. Until
     /// [`add_peer`](Self::add_peer) or
     /// [`add_peer_with_psk`](Self::add_peer_with_psk) clears the expiry and
-    /// authorizes it again, it stays in the table for a grace period (three
-    /// minutes), after which [`maintenance`](Self::maintenance) removes it
-    /// as [`remove_peer`](Self::remove_peer) would. An expired peer may also
-    /// be removed sooner to make room for one
-    /// [`accept_unknown_peer`](Self::accept_unknown_peer) takes.
+    /// authorizes it again, it stays in the table. A peer taken with
+    /// [`accept_unknown_peer`](Self::accept_unknown_peer) (and not added by
+    /// the operator since) stays only for a grace period (three minutes),
+    /// after which [`maintenance`](Self::maintenance) removes it as
+    /// [`remove_peer`](Self::remove_peer) would; it may also be removed
+    /// sooner to make room for another such peer. One added with
+    /// [`add_peer`](Self::add_peer) or
+    /// [`add_peer_with_psk`](Self::add_peer_with_psk) is only removed by
+    /// [`remove_peer`](Self::remove_peer).
     pub fn set_peer_expiry(&self, peer_key: &NoisePublicKey, at: Instant) {
         let mut peers = self.peers.write().expect("peers lock");
         if let Some(p) = peers.get_mut(peer_key) {
@@ -758,7 +786,8 @@ impl Handler {
         Some(f(&mut t))
     }
 
-    /// Run periodic cleanup: drop peers long past their
+    /// Run periodic cleanup: drop peers taken with
+    /// [`accept_unknown_peer`](Self::accept_unknown_peer) long past their
     /// [expiry](Self::set_peer_expiry), stale handshakes and inactive
     /// sessions.
     pub fn maintenance(&self) {
@@ -767,17 +796,20 @@ impl Handler {
         self.cleanup_sessions();
     }
 
-    /// Remove the peers expired more than [`EXPIRED_PEER_GRACE`] ago, with
-    /// their state. Kept for ever, they would count against
-    /// [`unknown_peer_limit`](Config::unknown_peer_limit) for good.
+    /// Remove the peers taken from `on_unknown_peer` that expired more than
+    /// [`EXPIRED_PEER_GRACE`] ago, with their state. Kept for ever, they
+    /// would count against [`unknown_peer_limit`](Config::unknown_peer_limit)
+    /// for good. The operator's own peers are left alone.
     fn prune_expired_peers(&self, now: Instant) {
         let gone: Vec<NoisePublicKey> = {
             let mut peers = self.peers.write().expect("peers lock");
             let gone: Vec<NoisePublicKey> = peers
                 .values()
                 .filter(|p| {
-                    p.expires_at
-                        .is_some_and(|exp| now.saturating_duration_since(exp) > EXPIRED_PEER_GRACE)
+                    p.accepted_unknown
+                        && p.expires_at.is_some_and(|exp| {
+                            now.saturating_duration_since(exp) > EXPIRED_PEER_GRACE
+                        })
                 })
                 .map(|p| p.public_key)
                 .collect();
@@ -1257,8 +1289,9 @@ impl Handler {
 
     /// [`add_peer`](Self::add_peer) for a peer accepted from
     /// `on_unknown_peer`: if it is new and the table already holds
-    /// [`unknown_peer_limit`](Config::unknown_peer_limit) peers, the one
-    /// expired longest makes room for it, and without one it is refused.
+    /// [`unknown_peer_limit`](Config::unknown_peer_limit) peers, the
+    /// accepted-unknown peer expired longest makes room for it, and without
+    /// one it is refused.
     pub(crate) fn add_unknown_peer(&self, peer_key: NoisePublicKey) -> Result<()> {
         let evicted = {
             let mut peers = self.peers.write().expect("peers lock");
@@ -1270,6 +1303,7 @@ impl Handler {
                 let now = Instant::now();
                 let victim = peers
                     .values()
+                    .filter(|p| p.accepted_unknown)
                     .filter_map(|p| p.expires_at.filter(|&exp| now > exp).map(|exp| (exp, p)))
                     .min_by_key(|(exp, _)| *exp)
                     .map(|(_, p)| p.public_key)
@@ -1277,7 +1311,7 @@ impl Handler {
                 peers.remove(&victim);
                 evicted = Some(victim);
             }
-            Self::add_peer_locked(&mut peers, peer_key);
+            Self::add_peer_locked(&mut peers, peer_key, true);
             evicted
         };
         if let Some(victim) = evicted {
@@ -1292,8 +1326,10 @@ impl Handler {
     ///
     /// A new peer is refused once the handler has
     /// [`unknown_peer_limit`](Config::unknown_peer_limit) peers, none of
-    /// them past its [expiry](Self::set_peer_expiry): the one expired
-    /// longest is otherwise removed to make room.
+    /// those taken this way past its [expiry](Self::set_peer_expiry): the
+    /// one expired longest is otherwise removed to make room. A peer taken
+    /// this way is dropped by the handler once long expired; one the
+    /// operator has also added keeps its place.
     pub fn accept_unknown_peer(
         &self,
         peer_key: NoisePublicKey,
@@ -2229,6 +2265,39 @@ mod tests {
         assert!(b.get_peer_info(&recent.public_key()).is_some());
         assert!(b.get_peer_info(&never.public_key()).is_some());
         assert!(holds_state_for(&b, &never.public_key()));
+    }
+
+    /// Only peers taken from on_unknown_peer are dropped by the handler
+    /// itself. One the operator added keeps its place, and its preshared
+    /// key, however long it has been expired: pruned and then renewed with
+    /// add_peer, as Adapter::add_peer documents, it came back without its
+    /// PSK, and evicted for a newcomer it lost it the same way.
+    #[test]
+    fn operator_added_peers_are_never_pruned_or_evicted() {
+        let b = Handler::new(Config::default().unknown_peer_limit(1)).unwrap();
+        let k = x25519_public(&NoisePrivateKey([7; 32]));
+        b.add_peer_with_psk(k, NoisePresharedKey([9; 32]));
+        let long_ago = Instant::now() - EXPIRED_PEER_GRACE - Duration::from_secs(1);
+        b.set_peer_expiry(&k, long_ago);
+        b.maintenance();
+        assert!(b.has_peer(&k), "pruned");
+        assert!(b.add_unknown_peer(NoisePublicKey([3; 32])).is_err());
+        assert!(b.has_peer(&k), "evicted");
+        b.add_peer(k);
+        assert!(b.get_peer_info(&k).unwrap().has_psk, "PSK silently dropped");
+        assert!(b.is_authorized_peer(&k));
+
+        // A plain operator peer is kept the same way, and so is one taken
+        // as unknown that the operator has added since.
+        let b = Handler::new(Config::default().unknown_peer_limit(2)).unwrap();
+        let (op, taken) = (NoisePublicKey([4; 32]), NoisePublicKey([5; 32]));
+        b.add_peer(op);
+        b.add_unknown_peer(taken).unwrap();
+        b.add_peer(taken);
+        b.set_peer_expiry(&op, long_ago);
+        b.set_peer_expiry(&taken, long_ago);
+        b.maintenance();
+        assert!(b.has_peer(&op) && b.has_peer(&taken));
     }
 
     /// An unknown peer's initiation is charged to its source's under-load
