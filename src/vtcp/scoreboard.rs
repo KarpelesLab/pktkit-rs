@@ -752,7 +752,6 @@ impl Scoreboard {
     }
 
     /// Nothing is lost after all: a loss response turned out spurious.
-    #[cfg(test)]
     pub fn unmark_lost(&mut self) {
         for s in self.segs.iter_mut() {
             s.flags &= !LOST;

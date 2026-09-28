@@ -113,6 +113,29 @@ impl RtoState {
         self.srtt
     }
 
+    /// The RTTVAR estimate.
+    #[inline]
+    pub fn rttvar(&self) -> Duration {
+        self.rttvar
+    }
+
+    /// A timeout turned out spurious, and a round trip taken since from
+    /// data sent after it was `sample`: RFC 4015 step (11) makes the timer
+    /// no less conservative than it was before, `srtt_prev` and
+    /// `rttvar_prev` being SRTT (plus two clock ticks) and RTTVAR then.
+    pub fn after_spurious_timeout(
+        &mut self,
+        srtt_prev: Duration,
+        rttvar_prev: Duration,
+        sample: Duration,
+    ) {
+        self.srtt = srtt_prev.max(sample);
+        self.rttvar = rttvar_prev.max(sample / 2);
+        self.measured = true;
+        self.rto = self.srtt + (self.rttvar * 4).max(MIN_RTO);
+        self.clamp();
+    }
+
     /// Mark a segment sent at `now` as in-flight for RTT measurement.
     pub fn start_timing(&mut self, seq: u32, now: Instant) {
         if self.timing {

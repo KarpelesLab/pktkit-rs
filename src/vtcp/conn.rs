@@ -18,7 +18,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use super::autotune::{self, Budget, RcvSpace};
-use super::congestion::{CongestionController, HighSpeed, NewReno};
+use super::congestion::{CongestionController, HighSpeed, NewReno, initial_window};
 use super::options::{
     self, SackBlock, TcpOption, get_sack_blocks, get_timestamp, get_wscale, has_sack_perm,
     mss_option, sack_option, sack_perm_option, timestamp_option, wscale_option,
@@ -171,6 +171,71 @@ enum CaState {
     Recovery,
     /// Recovery after a retransmission timeout (RFC 5681 §3.1).
     Loss,
+}
+
+/// F-RTO (RFC 5682): after a timeout, whether the next ACKs show it was
+/// spurious, before resending everything the timeout marked lost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Frto {
+    Off,
+    /// Step 2: waiting for the ACK of the segment the timeout resent,
+    /// which ended at `head_end`.
+    First {
+        head_end: u32,
+    },
+    /// Step 3: new data went out instead of retransmissions; waiting for
+    /// the next ACK. `rp` is RecoveryPoint, SND.NXT at step 2.
+    Second {
+        rp: u32,
+    },
+}
+
+/// A loss response, kept so it can be undone if it turns out spurious
+/// (Linux's `undo_marker` and what goes with it).
+#[derive(Debug, Default)]
+struct Undo {
+    /// SND.UNA when the episode began; `None` when nothing is to undo.
+    marker: Option<u32>,
+    /// RFC 4015 step (0): pipe_prev = max(FlightSize, ssthresh), what
+    /// ssthresh goes back to.
+    pipe_prev: u32,
+    /// Whether the episode includes a timeout, and SRTT (plus two ticks of
+    /// the clock) and RTTVAR before it, for RFC 4015 step (11).
+    timeout: bool,
+    srtt_prev: Duration,
+    rttvar_prev: Duration,
+    /// TSval of the episode's first retransmission: RFC 3522's
+    /// RetransmitTS.
+    retrans_ts: Option<u32>,
+    /// The first ACK after it has not come yet: the one Eifel looks at.
+    eifel_pending: bool,
+    /// What the episode retransmitted and no D-SACK has reported yet (RFC
+    /// 3708); `None` once there is too much to follow.
+    retrans: Option<Vec<(u32, u32)>>,
+}
+
+/// Retransmitted ranges followed per episode for D-SACK undo.
+const MAX_UNDO_RANGES: usize = 256;
+/// The clock granularity RFC 4015 step (0) pads SRTT_prev with: the
+/// timestamp clock's millisecond.
+const CLOCK_TICK: Duration = Duration::from_millis(1);
+
+/// What an ACK said, for loss recovery.
+#[derive(Debug, Clone, Copy)]
+struct AckEvent {
+    ack: u32,
+    /// It advanced SND.UNA, by `acked` bytes.
+    advanced: bool,
+    acked: u32,
+    /// What the scoreboard counted newly delivered.
+    d: Delivery,
+    dsack: Option<SackBlock>,
+    /// A duplicate ACK (RFC 5681 §2).
+    dup: bool,
+    /// Bytes outstanding before it.
+    flight: u32,
+    /// Its TSecr, if any.
+    ecr: Option<u32>,
 }
 
 /// Choice of congestion controller.
@@ -431,6 +496,14 @@ pub struct Conn {
     /// The segments those duplicates say left the network, in bytes
     /// (Linux's Reno `sacked_out`).
     reno_sacked: u32,
+    /// What the current, or last, loss response would take undoing.
+    undo: Undo,
+    /// Where F-RTO stands.
+    frto: Frto,
+    /// RFC 4015 step (11) is due on the first RTT sample from data sent
+    /// after a spurious timeout: SRTT_prev, RTTVAR_prev, and SND.NXT when
+    /// the timeout fired.
+    rto_adapt: Option<(Duration, Duration, u32)>,
     /// PRR (RFC 6937): bytes delivered and sent since fast recovery began,
     /// and the flight it began with.
     prr_delivered: u64,
@@ -619,6 +692,9 @@ impl Conn {
             last_oow_ack: None,
             dup_acks: 0,
             reno_sacked: 0,
+            undo: Undo::default(),
+            frto: Frto::Off,
+            rto_adapt: None,
             prr_delivered: 0,
             prr_out: 0,
             recover_fs: 1,
@@ -840,6 +916,9 @@ impl Conn {
         self.score.mark_all_lost();
         self.ca = CaState::Loss;
         self.recover = nxt;
+        // Nothing to undo, nor a timeout for F-RTO to judge.
+        self.undo.marker = None;
+        self.frto = Frto::Off;
         self.reno_sacked = 0;
         self.dup_acks = 0;
         self.tlp_end = None;
@@ -2239,7 +2318,16 @@ impl Conn {
         // arrived (RFC 8985 §7.4.2, case 2).
         let probe_dup = !advanced && !sack_seen && !wnd_changed && bare;
         self.tlp_on_ack(ack, dsack, probe_dup);
-        self.recover_on_ack(ack, advanced, acked, d, dsack.is_some(), dup, flight);
+        self.recover_on_ack(AckEvent {
+            ack,
+            advanced,
+            acked,
+            d,
+            dsack,
+            dup,
+            flight,
+            ecr,
+        });
 
         if self.snd_wnd > 0 && self.persist_deadline.is_some() && (advanced || wnd_changed) {
             self.stop_persist();
@@ -2282,20 +2370,19 @@ impl Conn {
             .filter(|&e| e != 0)
     }
 
-    /// Loss detection and the recovery state machine, for an ACK that
-    /// `advanced` SND.UNA to `ack` by `acked` bytes (the scoreboard counted
-    /// `d` newly delivered), with `flight` bytes outstanding before it.
-    #[allow(clippy::too_many_arguments)]
-    fn recover_on_ack(
-        &mut self,
-        ack: u32,
-        advanced: bool,
-        acked: u32,
-        d: Delivery,
-        dsack: bool,
-        dup: bool,
-        flight: u32,
-    ) {
+    /// Loss detection, spurious-retransmission detection and the recovery
+    /// state machine, for an ACK.
+    fn recover_on_ack(&mut self, ev: AckEvent) {
+        let AckEvent {
+            ack,
+            advanced,
+            acked,
+            d,
+            dsack,
+            dup,
+            flight,
+            ecr,
+        } = ev;
         let mss = self.mss as u32;
         // RFC 6937's DeliveredData.
         let mut delivered = d.delivered;
@@ -2311,7 +2398,11 @@ impl Conn {
             };
             if dup {
                 self.dup_acks += 1;
-                if self.ca != CaState::Loss {
+                // After a timeout, duplicates count only once new data has
+                // gone out past what it marked lost (F-RTO's, Linux's
+                // tcp_process_loss): they report that new data arriving.
+                let nxt = self.send_buf.as_ref().unwrap().nxt();
+                if self.ca != CaState::Loss || seq_after(nxt, self.recover) {
                     let unacked = self.send_buf.as_ref().unwrap().unacked() as u32;
                     let holes = self.score.lost_bytes().max(mss);
                     self.reno_sacked = (self.reno_sacked + mss).min(unacked.saturating_sub(holes));
@@ -2324,7 +2415,34 @@ impl Conn {
             }
         }
 
-        let mut exiting = false;
+        // Was the response to a loss needless? A D-SACK for everything the
+        // episode resent (RFC 3708), or the echo of a timestamp older than
+        // its first retransmission (RFC 3522) says so; F-RTO (RFC 5682)
+        // looks at the ACKs after a timeout.
+        let was = self.ca;
+        let mut undone = false;
+        if self.undo.marker.is_some() {
+            if let Some(b) = dsack
+                && self.dsack_covers_retransmissions(b)
+            {
+                undone = self.undo_recovery(acked);
+            }
+            if !undone && advanced && self.undo.eifel_pending {
+                self.undo.eifel_pending = false;
+                if self.ca != CaState::Open
+                    && let (Some(e), Some(ts)) = (ecr, self.undo.retrans_ts)
+                    && (e.wrapping_sub(ts) as i32) < 0
+                {
+                    undone = self.undo_recovery(acked);
+                }
+            }
+        }
+        let frto_was = self.frto;
+        if !undone && self.ca == CaState::Loss && self.frto != Frto::Off {
+            undone = self.frto_on_ack(ev);
+        }
+
+        let mut exiting = undone && was != CaState::Open;
         if advanced && self.ca != CaState::Open && self.recovered(ack) {
             // RFC 6675 §5: done once RecoveryPoint is acknowledged; without
             // SACK, only past it (RFC 6582 §3.2 step 1 and §4.1: segments
@@ -2342,13 +2460,20 @@ impl Conn {
         }
 
         // Growth, outside fast recovery: in slow start after a timeout too.
-        if advanced && self.ca != CaState::Recovery {
+        // Not on the ACK that undid a response: RFC 4015 step (9) has just
+        // set cwnd for it.
+        if advanced && self.ca != CaState::Recovery && !undone {
             let bytes = if self.sack_ok { d.delivered } else { acked };
             self.cc.on_ack(bytes, flight);
         }
+        // F-RTO step 2b sends up to two new segments (RFC 5682 §2.1).
+        if frto_was != self.frto && matches!(self.frto, Frto::Second { .. }) {
+            let cap = self.in_flight().saturating_add(2 * mss);
+            self.cc.set_cwnd(self.cc.cwnd().min(cap));
+        }
 
         if self.sack_ok {
-            self.rack_detect(dsack, exiting);
+            self.rack_detect(dsack.is_some(), exiting);
         } else if dup && self.dup_acks == DUP_THRESH && self.ca == CaState::Open {
             // RFC 5681 §3.2: the third duplicate ACK.
             self.score.mark_head_lost();
@@ -2358,6 +2483,172 @@ impl Conn {
         }
         if self.ca == CaState::Recovery {
             self.prr_update(delivered);
+        }
+    }
+
+    /// A loss response begins: keep what undoing it would restore (RFC
+    /// 4015 step (0)). `timeout` if a retransmission timeout, not fast
+    /// recovery.
+    fn begin_undo(&mut self, timeout: bool) {
+        let sb = self.send_buf.as_ref().unwrap();
+        self.undo = Undo {
+            marker: Some(sb.una()),
+            pipe_prev: (sb.unacked() as u32).max(self.cc.ssthresh()),
+            timeout,
+            srtt_prev: self.rto.srtt() + 2 * CLOCK_TICK,
+            rttvar_prev: self.rto.rttvar(),
+            retrans_ts: None,
+            eifel_pending: false,
+            retrans: Some(Vec::new()),
+        };
+    }
+
+    /// Note a retransmission of `[seq, seq+len)` carrying `tsval`, for the
+    /// episode's undo.
+    fn note_retransmission(&mut self, seq: u32, len: u32, tsval: u32) {
+        if self.ca == CaState::Open || self.undo.marker.is_none() {
+            return;
+        }
+        if self.undo.retrans_ts.is_none() {
+            self.undo.retrans_ts = Some(tsval);
+            self.undo.eifel_pending = true;
+        }
+        let end = seq.wrapping_add(len);
+        let Some(r) = self.undo.retrans.as_mut() else {
+            return;
+        };
+        if let Some(last) = r.last_mut()
+            && last.1 == seq
+        {
+            last.1 = end;
+        } else if r.len() < MAX_UNDO_RANGES {
+            r.push((seq, end));
+        } else {
+            self.undo.retrans = None;
+        }
+    }
+
+    /// Take a D-SACK against what the episode retransmitted: true once
+    /// every retransmission has been reported received twice, so none was
+    /// needed (RFC 3708 §3). A D-SACK of data not retransmitted in the
+    /// episode, which the network duplicated, counts for nothing.
+    fn dsack_covers_retransmissions(&mut self, b: SackBlock) -> bool {
+        let Some(marker) = self.undo.marker else {
+            return false;
+        };
+        let Some(r) = self.undo.retrans.as_mut() else {
+            return false;
+        };
+        if r.is_empty() || !seq_after(b.right, marker) {
+            return false;
+        }
+        let before = r.len();
+        let mut changed = false;
+        let mut out = Vec::with_capacity(before + 1);
+        for &(l, e) in r.iter() {
+            if !seq_before(b.left, e) || !seq_after(b.right, l) {
+                out.push((l, e));
+                continue;
+            }
+            changed = true;
+            if seq_before(l, b.left) {
+                out.push((l, b.left));
+            }
+            if seq_after(e, b.right) {
+                out.push((b.right, e));
+            }
+        }
+        *r = out;
+        changed && r.is_empty()
+    }
+
+    /// The loss response was spurious: put the window back, per RFC 4015
+    /// steps (8) and (9), and return to the open state. What is still
+    /// marked lost is unmarked, so new data goes out rather than needless
+    /// retransmissions; RACK marks anything really lost again. `acked` is
+    /// what the ACK acknowledged. Returns true.
+    fn undo_recovery(&mut self, acked: u32) -> bool {
+        self.score.unmark_lost();
+        let mss = self.mss as u32;
+        // cwnd = FlightSize + min(bytes_acked, IW): no burst, and slow
+        // start back to where ssthresh was.
+        let cwnd = self.cc.cwnd().max(
+            self.in_flight()
+                .saturating_add(acked.min(initial_window(mss))),
+        );
+        let ssthresh = self.cc.ssthresh().max(self.undo.pipe_prev);
+        self.cc.undo(cwnd, ssthresh);
+        if self.undo.timeout {
+            self.rto_adapt = Some((self.undo.srtt_prev, self.undo.rttvar_prev, self.recover));
+        }
+        self.undo.marker = None;
+        self.ca = CaState::Open;
+        self.frto = Frto::Off;
+        self.reno_sacked = 0;
+        self.retries = 0;
+        true
+    }
+
+    /// F-RTO's steps 2 and 3 (RFC 5682 §2.1, and §3.1 with SACK) for an
+    /// ACK after a timeout. Returns true if it found the timeout spurious
+    /// and undid it.
+    fn frto_on_ack(&mut self, ev: AckEvent) -> bool {
+        let mss = self.mss as u32;
+        match self.frto {
+            Frto::Off => false,
+            Frto::First { head_end } => {
+                if ev.advanced {
+                    let sb = self.send_buf.as_ref().unwrap();
+                    let rp = sb.nxt();
+                    let room = self.snd_wnd > sb.unacked() as u32;
+                    // 2a: the ACK covers RecoveryPoint, so it says nothing
+                    // of data sent before the timeout; or it does not cover
+                    // all of what the timeout resent. 2b needs new data to
+                    // send, and room for it.
+                    self.frto = if seq_after_eq(ev.ack, rp)
+                        || seq_before(ev.ack, head_end)
+                        || sb.pending() == 0
+                        || !room
+                    {
+                        Frto::Off
+                    } else {
+                        Frto::Second { rp }
+                    };
+                } else if ev.dup && !self.sack_ok {
+                    // 2a, without SACK: a duplicate.
+                    self.frto = Frto::Off;
+                }
+                false
+            }
+            Frto::Second { rp } => {
+                if !ev.advanced && !ev.dup {
+                    return false;
+                }
+                // 3b: data sent before the timeout, and not resent, got
+                // through after all. With SACK that has to lie below
+                // RecoveryPoint, and nothing past it be acknowledged (3a).
+                let spurious = if self.sack_ok {
+                    let beyond =
+                        seq_after(ev.ack, rp) || ev.d.max_end.is_some_and(|e| seq_after(e, rp));
+                    !beyond && ev.d.orig_min_end.is_some_and(|e| seq_before_eq(e, rp))
+                } else {
+                    ev.advanced
+                };
+                if spurious {
+                    return self.undo_recovery(ev.acked);
+                }
+                // 3a: the loss was real. Two round trips have passed since
+                // the timeout, which a conventional sender would have
+                // spent growing cwnd to three segments. The go-back-N
+                // repair starts now, so `recover` covers the new data too:
+                // duplicates its needless resends draw must not start fast
+                // recovery once that new data is acknowledged (RFC 6582
+                // §3.2 step 1).
+                self.frto = Frto::Off;
+                self.cc.set_cwnd(self.cc.cwnd().min(3 * mss));
+                self.recover = self.send_buf.as_ref().unwrap().nxt();
+                false
+            }
         }
     }
 
@@ -2420,6 +2711,7 @@ impl Conn {
     fn enter_recovery(&mut self) {
         let sb = self.send_buf.as_ref().unwrap();
         let (flight, nxt) = (sb.unacked() as u32, sb.nxt());
+        self.begin_undo(false);
         self.cc.on_loss(flight);
         self.recover = nxt;
         self.ca = CaState::Recovery;
@@ -2457,7 +2749,16 @@ impl Conn {
         } else {
             1
         };
-        self.rto.sample_of(rtt, per_window);
+        match self.rto_adapt {
+            // RFC 4015 step (11): the first sample of data sent after a
+            // spurious timeout makes the timer no less conservative than
+            // it was before it.
+            Some((srtt, rttvar, recover)) if seq_after(seg.ack, recover) => {
+                self.rto.after_spurious_timeout(srtt, rttvar, rtt);
+                self.rto_adapt = None;
+            }
+            _ => self.rto.sample_of(rtt, per_window),
+        }
         self.score.rtt_sample(rtt, self.now);
         self.rtt_sampled = true;
     }
@@ -2579,6 +2880,7 @@ impl Conn {
                 let flight = self.send_buf.as_ref().unwrap().unacked() as u32;
                 self.cc.on_loss(flight);
                 self.cc.set_cwnd(self.cc.ssthresh());
+                self.undo.marker = None;
             }
         } else if probe_dup {
             // Case 2, from a receiver without D-SACK.
@@ -2636,6 +2938,7 @@ impl Conn {
         let tsval = self.ts_now();
         self.score.on_retransmit(seq, len, self.now, tsval);
         self.note_sent(len);
+        self.note_retransmission(seq, len, tsval);
         // Karn's algorithm: no timing of a segment that went twice.
         self.rto.invalidate_timing();
         // Linux re-arms the RTO for the first segment only: re-arming it
@@ -2650,7 +2953,9 @@ impl Conn {
     /// has room (RFC 6675 §5 NextSeg rule 1, RFC 8985's retransmissions).
     fn retransmit_lost(&mut self) {
         // A zero window is the persist timer's and the RTO's to probe.
-        if self.snd_wnd == 0 || !self.state.is_synchronized() {
+        // F-RTO holds retransmissions back until it knows the timeout was
+        // not spurious (RFC 5682 §2.1 step 2b).
+        if self.snd_wnd == 0 || !self.state.is_synchronized() || self.frto != Frto::Off {
             return;
         }
         while self.in_flight() < self.cc.cwnd() {
@@ -3020,6 +3325,7 @@ impl Conn {
         self.rto.backoff();
         self.rto.invalidate_timing();
         let synchronized = self.state.is_synchronized();
+        let mut frto = false;
         self.reo_deadline = None;
         self.pto_deadline = None;
         self.tlp_end = None;
@@ -3031,6 +3337,19 @@ impl Conn {
             let repeated = self.retries > 1 || (zero_window && self.ca == CaState::Loss);
             let sb = self.send_buf.as_ref().unwrap();
             let (flight, nxt) = (sb.unacked() as u32, sb.nxt());
+            // A new episode keeps what undoing it would take; a timeout in
+            // fast recovery, or a repeated one, keeps the episode's.
+            let fresh = self.ca == CaState::Open;
+            if fresh && !self.score.is_empty() {
+                self.begin_undo(true);
+            } else {
+                self.undo.timeout = true;
+            }
+            // F-RTO (RFC 5682): not after other recovery is underway (it
+            // would read ACKs for that recovery's retransmissions as
+            // progress), but again on a timeout repeated while it runs.
+            frto = !zero_window && (fresh || self.frto != Frto::Off);
+            self.frto = Frto::Off;
             self.cc.on_retransmit_timeout(flight, repeated);
             // A SYN or SYN-ACK alone is not a loss the data's repair has to
             // track.
@@ -3089,6 +3408,11 @@ impl Conn {
                 let room = self.send_mss() as u32;
                 if let Some((seq, len, fin)) = self.score.head(room) {
                     self.resend(seq, len, fin);
+                    if frto && self.ca == CaState::Loss {
+                        self.frto = Frto::First {
+                            head_end: seq.wrapping_add(len),
+                        };
+                    }
                 }
             }
             _ => {}
@@ -5171,6 +5495,144 @@ mod tests {
         let out = client.tick();
         assert_eq!(seqs(&out), vec![seq(1)]);
         assert_eq!(client.score.sacked_segs(), 0, "SACKs forgotten");
+    }
+
+    // --- Spurious retransmissions (RFC 3708, 3522, 5682, 4015) ------------
+
+    /// Segment 0 is only delayed, past three later ones: RACK has fast
+    /// recovery resend it and halve ssthresh. `ts` turns timestamps on.
+    /// Returns the pair, the flight, and what the server sent back for the
+    /// late original.
+    fn spurious_fast_retransmit(ts: bool, port: u16) -> (Conn, Conn, Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let rtt = Duration::from_millis(100);
+        let (mut client, mut server) = rtt_pair(|l, r| big(l, r).enable_timestamps(ts), port, rtt);
+        let (_, segs) = client.write(&[6; 10_000]);
+        advance(rtt / 2);
+        let dups = deliver(&mut server, &segs[1..4]);
+        advance(rtt / 2);
+        let rexmit = deliver(&mut client, &dups);
+        assert!(client.in_recovery());
+        assert_eq!(seqs(&rexmit)[0], parse(&segs[0]).seq);
+        assert!(client.cc.ssthresh() < u32::MAX);
+        advance(Duration::from_millis(5));
+        let late = deliver(&mut server, &segs[..1]);
+        (client, server, segs, [late, rexmit].concat())
+    }
+
+    /// Without timestamps, the D-SACK the needless retransmission draws
+    /// shows every retransmission of the episode arrived twice (RFC 3708),
+    /// and the window is put back (RFC 4015).
+    #[test]
+    fn dsack_undoes_a_spurious_fast_retransmit() {
+        let (mut client, mut server, _, late_and_rexmit) = spurious_fast_retransmit(false, 40730);
+        let (late, rexmit) = late_and_rexmit.split_at(1);
+        advance(Duration::from_millis(50));
+        deliver(&mut client, late);
+        assert!(client.cc.ssthresh() < u32::MAX, "no undo without evidence");
+        let dsack = deliver(&mut server, &rexmit[..1]);
+        let blocks = get_sack_blocks(&parse(&dsack[0]).options);
+        assert!(!blocks.is_empty(), "a D-SACK");
+        advance(Duration::from_millis(50));
+        deliver(&mut client, &dsack);
+        assert_eq!(client.ca, CaState::Open);
+        assert_eq!(client.cc.ssthresh(), u32::MAX, "ssthresh put back");
+        assert!(client.score.reo_wnd_mult() > 1, "RACK's window widened");
+    }
+
+    /// With timestamps, the ACK of the late original echoes its TSval,
+    /// older than the retransmission's: Eifel (RFC 3522) knows at once.
+    #[test]
+    fn eifel_undoes_a_spurious_fast_retransmit() {
+        let (mut client, _server, _, late_and_rexmit) = spurious_fast_retransmit(true, 40731);
+        advance(Duration::from_millis(50));
+        deliver(&mut client, &late_and_rexmit[..1]);
+        assert_eq!(client.ca, CaState::Open);
+        assert_eq!(client.cc.ssthresh(), u32::MAX);
+    }
+
+    /// A delay spike longer than the RTO: the timeout resends segment 0,
+    /// but the originals all arrive after all. F-RTO (RFC 5682) sends new
+    /// data instead of resending the rest, the next ACK acknowledges an
+    /// original it never resent, and the timeout is undone: ssthresh is
+    /// back, and none of the flight goes twice.
+    #[test]
+    fn frto_undoes_a_spurious_timeout() {
+        let rtt = Duration::from_millis(100);
+        let (mut client, mut server) = rtt_pair(big, 40732, rtt);
+        let (_, segs) = client.write(&[7; 30_000]);
+        assert_eq!(segs.len(), 10);
+        let last = parse(&segs[9]).seq;
+        let rexmit = fire_rto(&mut client);
+        assert_eq!(seqs(&rexmit), vec![parse(&segs[0]).seq]);
+        assert_eq!(
+            client.frto,
+            Frto::First {
+                head_end: parse(&segs[1]).seq
+            }
+        );
+        let mut acks = deliver(&mut server, &segs);
+        acks.extend(delack_expired(&mut server));
+        let mut sent = Vec::new();
+        for a in &acks {
+            advance(Duration::from_millis(1));
+            sent.extend(client.handle_segment(&parse(a)));
+        }
+        assert_eq!(client.ca, CaState::Open, "timeout undone");
+        assert_eq!(client.frto, Frto::Off);
+        assert_eq!(client.cc.ssthresh(), u32::MAX);
+        let resent: Vec<u32> = seqs(&sent)
+            .into_iter()
+            .filter(|&s| seq_before_eq(s, last))
+            .collect();
+        assert!(resent.is_empty(), "resent {resent:?}");
+        assert!(!sent.is_empty(), "new data flows");
+        assert!(client.rto_adapt.is_some() || client.rto.srtt() >= rtt);
+    }
+
+    /// Without SACK and timestamps, F-RTO still tells a spurious timeout
+    /// (§2.1): the second ACK after it advances the window.
+    #[test]
+    fn frto_without_sack() {
+        let rtt = Duration::from_millis(100);
+        let (mut client, mut server) = rtt_pair(|l, r| big(l, r).enable_sack(false), 40733, rtt);
+        let (_, segs) = client.write(&[7; 30_000]);
+        fire_rto(&mut client);
+        let mut acks = deliver(&mut server, &segs);
+        acks.extend(delack_expired(&mut server));
+        for a in &acks {
+            client.handle_segment(&parse(a));
+        }
+        assert_eq!(client.ca, CaState::Open);
+        assert_eq!(client.cc.ssthresh(), u32::MAX);
+    }
+
+    /// A tail loss probe that was not needed: the original last segment
+    /// arrived, and so does the probe, drawing a D-SACK. That ends the
+    /// probe's episode without the congestion response a repaired loss
+    /// gets (RFC 8985 §7.4.2).
+    #[test]
+    fn dsack_of_a_needless_probe_keeps_the_window() {
+        let rtt = Duration::from_millis(100);
+        let (mut client, mut server) = rtt_pair(big, 40734, rtt);
+        let (_, segs) = client.write(&[1; 10_000]);
+        let mut acks = deliver(&mut server, &segs);
+        acks.extend(delack_expired(&mut server));
+        // The ACKs are slow: the probe fires first.
+        advance(
+            client
+                .pto_deadline
+                .unwrap()
+                .saturating_duration_since(test_now()),
+        );
+        let probe = client.tick();
+        assert_eq!(seqs(&probe), vec![parse(&segs[9]).seq]);
+        let dsack = deliver(&mut server, &probe);
+        let cwnd = client.cc.cwnd();
+        deliver(&mut client, &acks);
+        deliver(&mut client, &dsack);
+        assert_eq!(client.tlp_end, None);
+        assert_eq!(client.cc.ssthresh(), u32::MAX, "no loss response");
+        assert!(client.cc.cwnd() >= cwnd);
     }
 
     // --- PRR (RFC 6937) ---------------------------------------------------

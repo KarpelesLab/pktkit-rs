@@ -46,6 +46,9 @@ pub trait CongestionController: Send {
     /// Set cwnd: fast recovery reduces it an ACK at a time, and sets it to
     /// ssthresh when done.
     fn set_cwnd(&mut self, cwnd: u32);
+    /// A loss response turned out spurious: go back to `cwnd` and
+    /// `ssthresh`, forgetting any growth state tied to the cut.
+    fn undo(&mut self, cwnd: u32, ssthresh: u32);
     /// The congestion window, in bytes.
     fn cwnd(&self) -> u32;
     /// The slow-start threshold, in bytes; `u32::MAX` until the first loss.
@@ -127,6 +130,12 @@ impl CongestionController for NewReno {
 
     fn set_cwnd(&mut self, cwnd: u32) {
         self.cwnd = cwnd.max(self.mss);
+    }
+
+    fn undo(&mut self, cwnd: u32, ssthresh: u32) {
+        self.cwnd = cwnd.max(self.mss);
+        self.ssthresh = ssthresh;
+        self.ca_acked = 0;
     }
 
     fn cwnd(&self) -> u32 {
@@ -259,6 +268,12 @@ impl CongestionController for HighSpeed {
         self.cwnd = cwnd.max(self.mss);
     }
 
+    fn undo(&mut self, cwnd: u32, ssthresh: u32) {
+        self.cwnd = cwnd.max(self.mss);
+        self.ssthresh = ssthresh;
+        self.ca_credit = 0.0;
+    }
+
     fn cwnd(&self) -> u32 {
         self.cwnd
     }
@@ -294,12 +309,15 @@ mod tests {
     }
 
     #[test]
-    fn loss_sets_ssthresh() {
+    fn loss_sets_ssthresh_and_undo_restores() {
         for mut cc in both(1000) {
             cc.set_cwnd(30_000);
             cc.on_loss(30_000);
             assert_eq!(cc.ssthresh(), 15_000);
             assert_eq!(cc.cwnd(), 30_000, "cwnd is the connection's to bring down");
+            cc.set_cwnd(cc.ssthresh());
+            cc.undo(25_000, u32::MAX);
+            assert_eq!((cc.cwnd(), cc.ssthresh()), (25_000, u32::MAX));
         }
     }
 

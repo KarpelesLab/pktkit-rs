@@ -38,6 +38,11 @@
 //!   ACKs report delivered, a segment for about every other ACK, rather
 //!   than inflating with every duplicate ACK or going quiet and bursting.
 //! - RFC 2883: D-SACK, reporting data received twice.
+//! - Undoing a needless loss response: D-SACKs for everything an episode
+//!   retransmitted (RFC 3708), the Eifel detection's timestamp echo (RFC
+//!   3522) and F-RTO after a timeout (RFC 5682) tell a spurious
+//!   retransmission, and RFC 4015's response puts cwnd and ssthresh back.
+//!   D-SACKs also widen RACK's reordering window.
 //! - RFC 5961: challenge ACKs against blind RST, SYN and data injection,
 //!   rate-limited.
 //! - RFC 6191: a new SYN may reuse a 4-tuple in TIME-WAIT when its
