@@ -1022,7 +1022,14 @@ mod tests {
         while s.threads.lock().unwrap().is_empty() {
             thread::sleep(Duration::from_millis(1));
         }
-        // Ours and the one serve runs on; not a third for the thread.
+        // Ours and the one serve runs on; not a third for the thread. It
+        // upgrades its weak handle for each tick, so a third may show up for
+        // a moment: wait for it to go, as a strong one never would.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while Arc::strong_count(&s) > 2 {
+            assert!(std::time::Instant::now() < deadline, "the thread holds the server");
+            thread::sleep(Duration::from_millis(5));
+        }
         assert_eq!(Arc::strong_count(&s), 2);
         s.close().unwrap();
         serve.join().unwrap().unwrap();

@@ -4393,13 +4393,14 @@ mod tests {
         let mut held = held_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         let bridge = stack.inner.tcp.lock().unwrap().values().next().cloned();
         let bridge = bridge.expect("bridge registered");
-        thread::sleep(Duration::from_millis(100));
-        // The table's handle and ours: no pump holds one.
-        assert_eq!(
-            Arc::strong_count(&bridge),
-            2,
-            "pumps started before the ACK"
-        );
+        // The table's handle and ours: no pump holds one. The dial thread
+        // and the tick thread each hold one for a moment, so wait for them
+        // to let go; a pump would hold its handle for good.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Arc::strong_count(&bridge) > 2 {
+            assert!(Instant::now() < deadline, "pumps started before the ACK");
+            thread::sleep(Duration::from_millis(10));
+        }
 
         tick_outbound(
             &stack.inner.tcp,
