@@ -68,8 +68,9 @@ pub struct AdapterConfig {
     /// Most of those from one source; see
     /// [`ServerConfig::max_unauthenticated_peers_per_source`].
     pub max_unauthenticated_peers_per_source: usize,
-    /// New peers per period; see [`ServerConfig::connect_freq`].
-    pub connect_freq: (u32, Duration),
+    /// New peers per period from one source, or `None` (the default) for
+    /// no limit; see [`ServerConfig::connect_freq`].
+    pub connect_freq: Option<(u32, Duration)>,
     /// Most TCP connections served at once; see
     /// [`ServerConfig::max_tcp_connections`].
     pub max_tcp_connections: usize,
@@ -91,7 +92,7 @@ setters! {
         set max_peers: usize;
         some max_unauthenticated_peers: usize;
         set max_unauthenticated_peers_per_source: usize;
-        set connect_freq: (u32, Duration);
+        some connect_freq: (u32, Duration);
         set max_tcp_connections: usize;
         set max_tcp_connections_per_source: usize;
         set timers: PeerTimers;
@@ -118,7 +119,7 @@ impl AdapterConfig {
             max_unauthenticated_peers: None,
             max_unauthenticated_peers_per_source:
                 super::server::DEFAULT_MAX_UNAUTHENTICATED_PER_SOURCE,
-            connect_freq: super::server::DEFAULT_CONNECT_FREQ,
+            connect_freq: None,
             max_tcp_connections: super::server::DEFAULT_MAX_TCP_CONNECTIONS,
             max_tcp_connections_per_source: super::server::DEFAULT_MAX_TCP_CONNECTIONS_PER_SOURCE,
             timers: PeerTimers::default(),
@@ -211,7 +212,6 @@ impl Adapter {
             ServerConfig::new(cfg.tls_config, cfg.listen_addr, cfg.on_auth, on_data)
                 .max_peers(cfg.max_peers)
                 .max_unauthenticated_peers_per_source(cfg.max_unauthenticated_peers_per_source)
-                .connect_freq(cfg.connect_freq)
                 .max_tcp_connections(cfg.max_tcp_connections)
                 .max_tcp_connections_per_source(cfg.max_tcp_connections_per_source)
                 .timers(cfg.timers)
@@ -234,6 +234,7 @@ impl Adapter {
                     })
                 });
         server_cfg.max_unauthenticated_peers = cfg.max_unauthenticated_peers;
+        server_cfg.connect_freq = cfg.connect_freq;
 
         let server = Server::new(server_cfg)?;
         *adapter.server.lock().unwrap() = Some(server);

@@ -27,7 +27,7 @@ use std::thread::{self, ThreadId};
 use std::time::Duration;
 
 use super::addr::{PeerKey, Transport};
-use super::cookie::{Cookies, RateLimit};
+use super::cookie::{Cookies, RateLimit, SourceRateLimit};
 use super::packet_ctrl::ControlPacket;
 use super::peer::{AuthRequest, OnAuth, Peer, PeerConfig, PeerOutput, PeerTimers};
 
@@ -110,11 +110,20 @@ pub struct ServerConfig {
     /// (what one host is typically given). Keeps one source from taking
     /// every place the whole server has for clients handshaking. Default 16.
     pub max_unauthenticated_peers_per_source: usize,
-    /// At most this many new peers per period, UDP and TCP together
-    /// (OpenVPN's `connect-freq`). Default 100 per 10 s. Unlike
+    /// At most this many new peers per period from one source (an IPv4
+    /// address or an IPv6 /64, as for
+    /// [`max_unauthenticated_peers_per_source`](Self::max_unauthenticated_peers_per_source)),
+    /// UDP and TCP together. Unlike
     /// [`connect_freq_initial`](Self::connect_freq_initial), it counts the
-    /// clients that complete the three-way handshake: each gets a peer.
-    pub connect_freq: (u32, Duration),
+    /// clients that complete the three-way handshake and get a peer.
+    ///
+    /// `None`, the default: no limit, as with OpenVPN's `connect-freq`
+    /// unless configured. Unlike OpenVPN's, it is kept per source, so that
+    /// one host opening peers as fast as it can uses up its own budget,
+    /// not every other client's; it bounds how fast one source makes the
+    /// server run handshakes, where the caps on unauthenticated peers bound
+    /// how many it runs at once.
+    pub connect_freq: Option<(u32, Duration)>,
     /// Most TCP connections served at once; each has two threads, a reader
     /// and a writer. Default 256.
     pub max_tcp_connections: usize,
@@ -147,8 +156,6 @@ pub struct ServerConfig {
 pub(super) const DEFAULT_MAX_PEERS: usize = 1024;
 /// Default [`ServerConfig::max_unauthenticated_peers_per_source`].
 pub(super) const DEFAULT_MAX_UNAUTHENTICATED_PER_SOURCE: usize = 16;
-/// Default [`ServerConfig::connect_freq`].
-pub(super) const DEFAULT_CONNECT_FREQ: (u32, Duration) = (100, Duration::from_secs(10));
 /// Default [`ServerConfig::max_tcp_connections`].
 pub(super) const DEFAULT_MAX_TCP_CONNECTIONS: usize = 256;
 /// Default [`ServerConfig::max_tcp_connections_per_source`].
@@ -165,7 +172,7 @@ setters! {
         set max_peers: usize;
         some max_unauthenticated_peers: usize;
         set max_unauthenticated_peers_per_source: usize;
-        set connect_freq: (u32, Duration);
+        some connect_freq: (u32, Duration);
         set max_tcp_connections: usize;
         set max_tcp_connections_per_source: usize;
         set timers: PeerTimers;
@@ -192,7 +199,7 @@ impl ServerConfig {
             max_peers: DEFAULT_MAX_PEERS,
             max_unauthenticated_peers: None,
             max_unauthenticated_peers_per_source: DEFAULT_MAX_UNAUTHENTICATED_PER_SOURCE,
-            connect_freq: DEFAULT_CONNECT_FREQ,
+            connect_freq: None,
             max_tcp_connections: DEFAULT_MAX_TCP_CONNECTIONS,
             max_tcp_connections_per_source: DEFAULT_MAX_TCP_CONNECTIONS_PER_SOURCE,
             timers: PeerTimers::default(),
@@ -435,8 +442,8 @@ pub struct Server {
     cookies: Cookies,
     /// Bounds those answers (`connect_freq_initial`).
     initial_limit: Mutex<RateLimit>,
-    /// Bounds new peers (`connect_freq`).
-    connect_limit: Mutex<RateLimit>,
+    /// Bounds new peers per source (`connect_freq`), if configured.
+    connect_limit: Option<Mutex<SourceRateLimit>>,
     /// Peers with authentications to run, and the workers running them.
     auth: Mutex<AuthPool>,
     /// on_connect / on_disconnect calls owed, by key. A key is here only
@@ -458,6 +465,12 @@ struct AuthPool {
     ready: VecDeque<Weak<PeerEntry>>,
     workers: usize,
 }
+
+/// Most sources `connect_freq` keeps a count for. Past it, the stalest
+/// count is forgotten -- that source's limit starts over -- rather than
+/// anyone refused: many sources each proving its address is what the caps
+/// on peers are for.
+const CONNECT_FREQ_SOURCES: usize = 4096;
 
 /// A thread serving a listening socket.
 struct SocketLoop {
@@ -533,8 +546,9 @@ impl Server {
         let cookies = Cookies::new(cfg.timers.handshake_window);
         let (max, period) = cfg.connect_freq_initial;
         let initial_limit = Mutex::new(RateLimit::new(max, period));
-        let (max, period) = cfg.connect_freq;
-        let connect_limit = Mutex::new(RateLimit::new(max, period));
+        let connect_limit = cfg.connect_freq.map(|(max, period)| {
+            Mutex::new(SourceRateLimit::new(max, period, CONNECT_FREQ_SOURCES))
+        });
         let server = Arc::new_cyclic(|me| Server {
             me: me.clone(),
             cookies,
@@ -805,7 +819,7 @@ impl Server {
     /// Add a peer for `key`, or return the one already there. `None` when
     /// the peer table is full -- or has no room for another peer that has
     /// not authenticated, from this source or at all -- or when new peers
-    /// are coming faster than `connect_freq` allows.
+    /// are coming from its source faster than `connect_freq` allows.
     ///
     /// `stateless` is for a UDP client whose hard reset was answered
     /// statelessly: our session id from that answer and the client's.
@@ -847,14 +861,6 @@ impl Server {
         if let Err(found) = admit(&self.peers.read().unwrap()) {
             return found;
         }
-        if !self
-            .connect_limit
-            .lock()
-            .unwrap()
-            .allow(crate::time::Instant::now())
-        {
-            return None;
-        }
         // Built with no lock held: a panic under the table's write lock
         // would poison it for every client. A panic costs this client only.
         let peer =
@@ -865,6 +871,17 @@ impl Server {
         let mut peers = self.peers.write().unwrap();
         if let Err(found) = admit(&peers) {
             return found;
+        }
+        // Charged only for a peer about to be added: a client turned away
+        // for want of room, or finding its peer there already, has not
+        // cost a handshake.
+        if let Some(limit) = &self.connect_limit
+            && !limit
+                .lock()
+                .unwrap()
+                .allow(source, crate::time::Instant::now())
+        {
+            return None;
         }
         let entry = Arc::new(PeerEntry::new(peer, transport, addr, tcp));
         peers.insert(key, entry.clone());
@@ -3108,6 +3125,80 @@ mod tests {
             })
             .count();
         assert_eq!(served, 16);
+        server.close();
+    }
+
+    /// Create a peer for `addr` over UDP, marked authenticated so that the
+    /// caps on unauthenticated peers stay out of the way.
+    fn create_authenticated(server: &Server, addr: &str) -> bool {
+        let addr: SocketAddr = addr.parse().unwrap();
+        let key = PeerKey::new(addr, Transport::Udp);
+        let entry = server.create_peer(key, Transport::Udp, addr, None, None);
+        if let Some(e) = &entry {
+            e.authenticated.store(true, Ordering::Relaxed);
+        }
+        entry.is_some()
+    }
+
+    /// connect-freq is off unless configured, as in OpenVPN: one host
+    /// opening peers as fast as it can -- all unspoofed, each proving its
+    /// address -- must not use up a server-wide budget and so lock out
+    /// every other new client.
+    #[test]
+    fn new_peers_are_not_rate_limited_by_default() {
+        let server = test_server();
+        for port in 1..=150u16 {
+            assert!(
+                create_authenticated(&server, &format!("192.0.2.1:{port}")),
+                "peer {port} refused"
+            );
+        }
+        assert!(create_authenticated(&server, "192.0.2.2:1"));
+        server.close();
+    }
+
+    /// Configured, connect-freq limits each source on its own: one using up
+    /// its budget does not use up another's.
+    #[test]
+    fn connect_freq_is_per_source() {
+        let server =
+            server_configured(auth_ok(), |c| c.connect_freq((2, Duration::from_secs(600))));
+        assert!(create_authenticated(&server, "192.0.2.1:1"));
+        assert!(create_authenticated(&server, "192.0.2.1:2"));
+        assert!(
+            !create_authenticated(&server, "192.0.2.1:3"),
+            "over the limit"
+        );
+        // The same /64 is the same source.
+        assert!(create_authenticated(&server, "[2001:db8::1]:1"));
+        assert!(create_authenticated(&server, "[2001:db8::2]:1"));
+        assert!(!create_authenticated(&server, "[2001:db8::3]:1"));
+        assert!(
+            create_authenticated(&server, "192.0.2.2:1"),
+            "another source"
+        );
+        assert!(create_authenticated(&server, "[2001:db8:0:1::1]:1"));
+        server.close();
+    }
+
+    /// A client refused for want of room is not charged: connect-freq
+    /// counts the peers made.
+    #[test]
+    fn a_client_refused_a_peer_is_not_charged_connect_freq() {
+        let server = server_configured(auth_ok(), |c| {
+            c.connect_freq((2, Duration::from_secs(600))).max_peers(1)
+        });
+        assert!(create_authenticated(&server, "192.0.2.1:1"));
+        assert!(!create_authenticated(&server, "192.0.2.1:2"), "table full");
+        assert!(!create_authenticated(&server, "192.0.2.1:3"), "table full");
+        let first = server
+            .get_peer(&PeerKey::new(
+                "192.0.2.1:1".parse().unwrap(),
+                Transport::Udp,
+            ))
+            .unwrap();
+        server.remove_entry(&first);
+        assert!(create_authenticated(&server, "192.0.2.1:4"));
         server.close();
     }
 

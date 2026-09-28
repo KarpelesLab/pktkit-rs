@@ -12,7 +12,8 @@
 //! it knows about any of this -- gets a session. OpenVPN clients from before
 //! 2.6 need nothing new: to them it is just the server's session id.
 
-use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use purecrypto::hash::{Hmac, Mac, Sha256};
@@ -147,6 +148,57 @@ impl RateLimit {
     }
 }
 
+/// A [`RateLimit`] for each source (the server's `connect_freq`), keeping
+/// at most `sources` of them. A source's count is kept for a period after it
+/// last started one; to make room for a new source, those whose period has
+/// run out are forgotten, or failing that the one whose period started
+/// first. Forgetting a count lets that source start over: under a flood of
+/// sources the limit weakens, but nobody is ever refused for want of room.
+pub(super) struct SourceRateLimit {
+    max: u32,
+    period: Duration,
+    sources: usize,
+    limits: HashMap<IpAddr, RateLimit>,
+}
+
+impl SourceRateLimit {
+    pub(super) fn new(max: u32, period: Duration, sources: usize) -> SourceRateLimit {
+        SourceRateLimit {
+            max,
+            period,
+            sources: sources.max(1),
+            limits: HashMap::new(),
+        }
+    }
+
+    /// Count one new peer from `source`; whether it may be made.
+    pub(super) fn allow(&mut self, source: IpAddr, now: Instant) -> bool {
+        if !self.limits.contains_key(&source) && self.limits.len() >= self.sources {
+            let period = self.period;
+            self.limits
+                .retain(|_, l| now.saturating_duration_since(l.start) <= period);
+            if self.limits.len() >= self.sources
+                && let Some(stalest) = self
+                    .limits
+                    .iter()
+                    .min_by_key(|(_, l)| l.start)
+                    .map(|(ip, _)| *ip)
+            {
+                self.limits.remove(&stalest);
+            }
+        }
+        self.limits
+            .entry(source)
+            .or_insert_with(|| RateLimit {
+                max: self.max,
+                period: self.period,
+                start: now,
+                count: 0,
+            })
+            .allow(now)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,6 +260,28 @@ mod tests {
         late.set_pid(2);
         let late = ControlPacket::parse(&late.to_bytes(&[0])).unwrap();
         assert!(!c.check(&late, from, t0));
+    }
+
+    #[test]
+    fn source_rate_limit_is_per_source_and_bounded() {
+        let t0 = Instant::now();
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let mut r = SourceRateLimit::new(1, Duration::from_secs(10), 2);
+        assert!(r.allow(ip("192.0.2.1"), t0));
+        assert!(!r.allow(ip("192.0.2.1"), t0));
+        let t1 = t0 + Duration::from_secs(1);
+        assert!(r.allow(ip("192.0.2.2"), t1));
+        assert!(!r.allow(ip("192.0.2.2"), t1));
+        // A third source is never refused for want of room: the stalest
+        // count goes, the others stay.
+        assert!(r.allow(ip("192.0.2.3"), t1));
+        assert_eq!(r.limits.len(), 2);
+        assert!(!r.allow(ip("192.0.2.2"), t1));
+        assert!(!r.allow(ip("192.0.2.3"), t1));
+        // Counts whose period ran out go first.
+        let t2 = t1 + Duration::from_secs(11);
+        assert!(r.allow(ip("192.0.2.4"), t2));
+        assert_eq!(r.limits.len(), 1);
     }
 
     #[test]
