@@ -60,6 +60,9 @@ pub struct RecvBuf {
     /// than pull the edge back (RFC 7323 §2.4), and what the peer was told
     /// it may send must still be taken.
     adv_edge: Option<u32>,
+    /// The first range of the last segment that was already here: what the
+    /// next ACK reports as a D-SACK (RFC 2883).
+    dup: Option<SackBlock>,
 }
 
 impl RecvBuf {
@@ -72,6 +75,7 @@ impl RecvBuf {
             recent: Vec::new(),
             window_size,
             adv_edge: None,
+            dup: None,
         }
     }
 
@@ -110,6 +114,7 @@ impl RecvBuf {
     /// Insert `data` at sequence `seq`. Returns the number of new
     /// in-order bytes added (now available via `read`).
     pub fn insert(&mut self, mut seq: u32, data: &[u8]) -> usize {
+        self.dup = None;
         if data.is_empty() {
             return 0;
         }
@@ -122,6 +127,12 @@ impl RecvBuf {
         // Trim already-received prefix.
         if seq_before(seq, self.nxt) {
             let overlap = self.nxt.wrapping_sub(seq) as usize;
+            let dup_end = if seq_before(end_seq, self.nxt) {
+                end_seq
+            } else {
+                self.nxt
+            };
+            self.note_dup(seq, dup_end);
             if overlap >= (end - start) {
                 return 0;
             }
@@ -154,6 +165,17 @@ impl RecvBuf {
         let slice = &data[start..end];
 
         if seq == self.nxt {
+            // Out-of-order data this fills in again was here already.
+            if let Some(e) = self.ooo.first()
+                && seq_before(e.seq, end_seq)
+            {
+                let r = if seq_before(e.end(), end_seq) {
+                    e.end()
+                } else {
+                    end_seq
+                };
+                self.note_dup(e.seq, r);
+            }
             self.buf.extend(slice);
             self.nxt = end_seq;
             self.merge_ooo();
@@ -171,6 +193,29 @@ impl RecvBuf {
         }
         self.note_recent(seq);
         0
+    }
+
+    /// Record `[left, right)` as received twice, unless a range already
+    /// is: RFC 2883 §4 reports the first duplicate a segment brought.
+    fn note_dup(&mut self, left: u32, right: u32) {
+        if self.dup.is_none() && seq_before(left, right) {
+            self.dup = Some(SackBlock { left, right });
+        }
+    }
+
+    /// The range of the last segment taken in that was here already, for
+    /// a D-SACK (RFC 2883), if it had one; forgotten once taken.
+    pub fn take_dup(&mut self) -> Option<SackBlock> {
+        self.dup.take()
+    }
+
+    /// The out-of-order range holding `left..right`, as a SACK block.
+    pub fn sack_block_around(&self, left: u32, right: u32) -> Option<SackBlock> {
+        let e = self.range_of(left)?;
+        seq_before_eq(right, e.end()).then(|| SackBlock {
+            left: e.seq,
+            right: e.end(),
+        })
     }
 
     /// The out-of-order range holding `seq`, if any.
@@ -219,6 +264,18 @@ impl RecvBuf {
                 },
             );
             return;
+        }
+        for e in &self.ooo[i..j] {
+            let l = if seq_after(e.seq, seq) { e.seq } else { seq };
+            let r = if seq_before(e.end(), end) {
+                e.end()
+            } else {
+                end
+            };
+            if seq_before(l, r) {
+                self.note_dup(l, r);
+                break;
+            }
         }
         let k = (i..j).max_by_key(|&k| self.ooo[k].data.len()).unwrap();
         let mut others: Vec<OooEntry> = self.ooo.drain(i..j).collect();
@@ -641,6 +698,30 @@ mod tests {
             }
         }
         assert!(out.iter().enumerate().all(|(i, &b)| b == i as u8));
+    }
+
+    /// Whatever part of a segment was here already is reported for a
+    /// D-SACK: below RCV.NXT, inside an out-of-order range, or both.
+    #[test]
+    fn duplicates_are_reported_for_dsack() {
+        let b = |left, right| Some(SackBlock { left, right });
+        let mut r = RecvBuf::new(1000, 0);
+        r.insert(1000, &[1; 100]);
+        assert_eq!(r.take_dup(), None);
+        r.insert(950, &[1; 100]);
+        assert_eq!(r.take_dup(), b(950, 1050), "an old segment");
+        assert_eq!(r.take_dup(), None, "taken once");
+        r.insert(1050, &[1; 100]);
+        assert_eq!(r.take_dup(), b(1050, 1100), "partly old");
+        r.insert(1300, &[1; 100]);
+        r.insert(1350, &[1; 100]);
+        assert_eq!(r.take_dup(), b(1350, 1400), "partly held out of order");
+        assert_eq!(r.sack_block_around(1350, 1400), b(1300, 1450));
+        r.insert(1310, &[1; 20]);
+        assert_eq!(r.take_dup(), b(1310, 1330));
+        r.insert(1150, &[1; 200]);
+        assert_eq!(r.take_dup(), b(1300, 1350), "filling the hole, and past it");
+        assert_eq!(r.nxt(), 1450);
     }
 
     #[test]

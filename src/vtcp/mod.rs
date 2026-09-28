@@ -25,6 +25,7 @@
 //! - RFC 7323: window scaling, timestamps (PAWS, and an RTT sample from
 //!   every ACK, weighed as its Appendix G suggests).
 //! - RFC 2018: SACK, and RFC 6675 SACK-based loss recovery.
+//! - RFC 2883: D-SACK, reporting data received twice.
 //! - RFC 5827: Early Retransmit, for a flight too small to draw three
 //!   duplicate ACKs.
 //! - RFC 5961: challenge ACKs against blind RST, SYN and data injection,

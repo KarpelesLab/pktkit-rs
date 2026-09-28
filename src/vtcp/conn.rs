@@ -20,8 +20,8 @@ use std::time::Duration;
 use super::autotune::{self, Budget, RcvSpace};
 use super::congestion::{CongestionController, HighSpeed, NewReno};
 use super::options::{
-    self, TcpOption, get_sack_blocks, get_timestamp, get_wscale, has_sack_perm, mss_option,
-    sack_option, sack_perm_option, timestamp_option, wscale_option,
+    self, SackBlock, TcpOption, get_sack_blocks, get_timestamp, get_wscale, has_sack_perm,
+    mss_option, sack_option, sack_perm_option, timestamp_option, wscale_option,
 };
 use super::recvbuf::RecvBuf;
 use super::rto::{MAX_RTO, RtoState};
@@ -476,6 +476,10 @@ pub struct Conn {
     // SACK.
     sack_enabled: bool,
     sack_ok: bool,
+    /// Data received twice, for the first SACK block of the next ACK: a
+    /// D-SACK (RFC 2883), which tells the sender its retransmission was
+    /// not needed, or that the network duplicated a segment.
+    dsack_out: Option<SackBlock>,
 
     // SND.WL1 / SND.WL2: SEQ and ACK of the segment that last set snd_wnd.
     snd_wl: Option<(u32, u32)>,
@@ -608,6 +612,7 @@ impl Conn {
             last_ack_sent: None,
             sack_enabled: cfg.enable_sack,
             sack_ok: false,
+            dsack_out: None,
             snd_wl: None,
             rcv_adv: None,
             syn_data: Vec::new(),
@@ -1037,11 +1042,28 @@ impl Conn {
         }
         if self.sack_ok
             && let Some(rb) = self.recv_buf.as_ref()
-            && rb.has_ooo()
+            && (rb.has_ooo() || self.dsack_out.is_some())
         {
             // Four blocks fit in the option space alone, three beside a
             // timestamp (RFC 2018 §3).
-            let blocks = rb.sack_blocks_up_to(if self.ts_ok { 3 } else { 4 });
+            let max = if self.ts_ok { 3 } else { 4 };
+            let mut blocks = Vec::with_capacity(max);
+            // A D-SACK goes first, followed by the range holding it, if
+            // any (RFC 2883 §4).
+            if let Some(d) = self.dsack_out {
+                blocks.push(d);
+                if let Some(around) = rb.sack_block_around(d.left, d.right) {
+                    blocks.push(around);
+                }
+            }
+            for b in rb.sack_blocks_up_to(max) {
+                if blocks.len() == max {
+                    break;
+                }
+                if !blocks[self.dsack_out.is_some() as usize..].contains(&b) {
+                    blocks.push(b);
+                }
+            }
             if !blocks.is_empty() {
                 opts.push(sack_option(&blocks));
             }
@@ -1164,6 +1186,8 @@ impl Conn {
             self.delack_deadline = None;
             self.ack_pushed = false;
             self.last_ack_sent = Some(seg.ack);
+            // Reported once (RFC 2883 §4).
+            self.dsack_out = None;
             let shift = if seg.has_flag(flags::SYN) || !self.wscale_ok {
                 0
             } else {
@@ -1492,6 +1516,23 @@ impl Conn {
                 return self.handle_ack_past_closed_window(seg);
             }
             if !seg.has_flag(flags::RST) {
+                // Data that was all here already: the sender resent it
+                // needlessly, or the network duplicated it. Say so with a
+                // D-SACK (RFC 2883), and ACK at once, as Linux's
+                // tcp_send_dupack does.
+                if self.sack_ok
+                    && !seg.payload.is_empty()
+                    && let Some(rb) = self.recv_buf.as_ref()
+                {
+                    let end = seg.seq.wrapping_add(seg.payload.len() as u32);
+                    if seq_before_eq(end, rb.nxt()) {
+                        self.dsack_out = Some(SackBlock {
+                            left: seg.seq,
+                            right: end,
+                        });
+                        self.enter_quickack();
+                    }
+                }
                 if self.state == State::TimeWait && seg.has_flag(flags::FIN) {
                     // The peer lost our last ACK: always answer.
                     self.restart_time_wait();
@@ -1745,6 +1786,10 @@ impl Conn {
             let rb = self.recv_buf.as_ref().unwrap();
             let (nxt, had_holes) = (rb.nxt(), rb.has_ooo());
             self.process_data(seg);
+            let dup = self.recv_buf.as_mut().unwrap().take_dup();
+            if self.sack_ok && dup.is_some() {
+                self.dsack_out = dup;
+            }
             let rb = self.recv_buf.as_ref().unwrap();
             // RFC 5681 §4.2: at once for a segment out of order, or one
             // that fills all or part of a hole, so the sender learns of
@@ -4838,6 +4883,42 @@ mod tests {
         let blocks = get_sack_blocks(&last.options);
         assert_eq!(blocks.len(), 4, "{blocks:?}");
         assert_eq!(blocks[0].left, parse(&segs[7]).seq, "newest first");
+    }
+
+    /// A segment received twice draws a D-SACK (RFC 2883): an old one
+    /// alone, one held out of order followed by its range; reported once.
+    #[test]
+    fn duplicates_are_reported_with_dsack() {
+        let mut client = Conn::new(big(40245, 80));
+        let mut server = Conn::new(big(80, 40245));
+        drive_handshake(&mut client, &mut server);
+        let (_, segs) = client.write(&[1; 5000]);
+        let seq = |i: usize| parse(&segs[i]).seq;
+        let blocks = |pkts: &[Vec<u8>]| get_sack_blocks(&parse(pkts.last().unwrap()).options);
+        let sb = |l, r| SackBlock { left: l, right: r };
+
+        deliver(&mut server, &segs[..1]);
+        let acks = deliver(&mut server, &segs[..1]);
+        assert_eq!(blocks(&acks), vec![sb(seq(0), seq(1))], "below RCV.NXT");
+
+        deliver(&mut server, &segs[2..4]);
+        let acks = deliver(&mut server, &segs[3..4]);
+        assert_eq!(
+            blocks(&acks),
+            vec![sb(seq(3), seq(4)), sb(seq(2), seq(4))],
+            "inside an out-of-order range"
+        );
+        let acks = deliver(&mut server, &segs[4..5]);
+        assert_eq!(blocks(&acks), vec![sb(seq(2), seq(4) + 1000)], "once");
+
+        // Without SACK, no D-SACK either.
+        let mut client = Conn::new(big(40246, 80).enable_sack(false));
+        let mut server = Conn::new(big(80, 40246).enable_sack(false));
+        drive_handshake(&mut client, &mut server);
+        let (_, segs) = client.write(&[1; 100]);
+        deliver(&mut server, &segs);
+        let acks = deliver(&mut server, &segs);
+        assert!(get_sack_blocks(&parse(&acks[0]).options).is_empty());
     }
 
     /// A data segment from `server` to `client` carrying `ack`.
