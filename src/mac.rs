@@ -138,7 +138,8 @@ impl core::str::FromStr for MacAddr {
     }
 }
 
-/// Returned by [`MacAddr::from_str`] on a malformed input.
+/// Returned by [`MacAddr::from_str`](std::str::FromStr::from_str) on a
+/// malformed input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ParseMacError(());
 

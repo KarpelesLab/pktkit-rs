@@ -130,6 +130,8 @@ impl core::str::FromStr for IpPrefix {
     }
 }
 
+/// Returned by [`IpPrefix::from_str`](std::str::FromStr::from_str) on a
+/// malformed input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ParsePrefixError(());
 
