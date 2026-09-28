@@ -8,10 +8,10 @@
 
 use crate::Result;
 use crate::slirp::tcp_stream::{ConnState, Offer, TcpStream};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 
 /// Bounded accept-queue depth; mirrors the Go `acceptCh` buffer of 10.
@@ -21,23 +21,59 @@ pub(crate) const ACCEPT_QUEUE_CAP: usize = 10;
 /// bounds them. Each SYN would otherwise mint a connection that lives until
 /// its handshake times out, and a flood at one listener could fill the
 /// stack-wide table of virtual connections that every listener shares.
+///
+/// Like the stack's other caps, it is shared out between namespaces (see
+/// `usernat::NS_SHARE`): one guest sending SYNs it never completes would
+/// otherwise keep the backlog full for every guest.
 pub(crate) const HALF_OPEN_CAP: usize = 128;
+
+/// A listener's half-open connections, in all and per namespace.
+#[derive(Debug, Default)]
+pub(crate) struct HalfOpen {
+    all: usize,
+    per_ns: HashMap<u64, usize>,
+}
 
 /// One of a listener's [`HALF_OPEN_CAP`] half-open slots, held by a
 /// connection until its handshake completes or it is dropped.
 #[derive(Debug)]
-pub(crate) struct HalfOpenSlot(Arc<AtomicUsize>);
+pub(crate) struct HalfOpenSlot {
+    table: Arc<Mutex<HalfOpen>>,
+    ns: u64,
+}
 
 impl HalfOpenSlot {
-    /// Take a slot from `count`, unless all are in use.
-    pub(crate) fn take(count: &Arc<AtomicUsize>) -> Option<HalfOpenSlot> {
-        crate::stats::add_within(count, 1, HALF_OPEN_CAP).then(|| HalfOpenSlot(count.clone()))
+    /// Take a slot for namespace `ns` from `table`, unless the listener has
+    /// all [`HALF_OPEN_CAP`] in use or `ns` already holds `ns_cap`.
+    pub(crate) fn take(
+        table: &Arc<Mutex<HalfOpen>>,
+        ns: u64,
+        ns_cap: usize,
+    ) -> Option<HalfOpenSlot> {
+        let mut t = table.lock().expect("poisoned");
+        let mine = t.per_ns.get(&ns).copied().unwrap_or(0);
+        if t.all >= HALF_OPEN_CAP || mine >= ns_cap {
+            return None;
+        }
+        t.all += 1;
+        t.per_ns.insert(ns, mine + 1);
+        Some(HalfOpenSlot {
+            table: table.clone(),
+            ns,
+        })
     }
 }
 
 impl Drop for HalfOpenSlot {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
+        let mut t = self.table.lock().expect("poisoned");
+        t.all -= 1;
+        if let Some(n) = t.per_ns.get_mut(&self.ns) {
+            *n -= 1;
+            if *n == 0 {
+                t.per_ns.remove(&self.ns);
+            }
+        }
     }
 }
 
@@ -144,7 +180,7 @@ pub struct Listener {
     /// Removes this listener from the stack's table; taken by the first close.
     unregister: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Connections still in their handshake; see [`HalfOpenSlot`].
-    half_open: Arc<AtomicUsize>,
+    half_open: Arc<Mutex<HalfOpen>>,
 }
 
 impl core::fmt::Debug for Listener {
@@ -165,7 +201,7 @@ impl Listener {
             signal: Condvar::new(),
             waiting: Mutex::new(Waiting::default()),
             unregister: Mutex::new(None),
-            half_open: Arc::new(AtomicUsize::new(0)),
+            half_open: Arc::default(),
         }
     }
 
@@ -215,10 +251,11 @@ impl Listener {
         true
     }
 
-    /// A half-open slot for a new connection, or `None` when the listener
-    /// already has [`HALF_OPEN_CAP`] handshakes under way.
-    pub(crate) fn half_open_slot(&self) -> Option<HalfOpenSlot> {
-        HalfOpenSlot::take(&self.half_open)
+    /// A half-open slot for a new connection from namespace `ns`, or `None`
+    /// when the listener already has [`HALF_OPEN_CAP`] handshakes under way,
+    /// or `ns` has `ns_cap` of them.
+    pub(crate) fn half_open_slot(&self, ns: u64, ns_cap: usize) -> Option<HalfOpenSlot> {
+        HalfOpenSlot::take(&self.half_open, ns, ns_cap)
     }
 
     /// Block until a connection is available, returning the accepted stream.

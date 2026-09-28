@@ -26,7 +26,7 @@ use crate::slirp::checksum::{tcp_ok, udp_ok};
 use crate::slirp::icmpv4::build_icmpv4_echo_reply;
 use crate::slirp::icmpv6::build_icmpv6_echo_reply;
 use crate::slirp::ipv6::skip_extension_headers;
-use crate::slirp::listener::{Listener, ListenerKey, resolve_v4};
+use crate::slirp::listener::{HALF_OPEN_CAP, Listener, ListenerKey, resolve_v4};
 use crate::slirp::listener6::{Listener6, ListenerKey6, resolve_v6};
 use crate::slirp::ns_table::{NsKey, NsTable};
 use crate::slirp::packet::{DEFAULT_MTU, MIN_MTU, fit_link, mss_for_mtu};
@@ -960,7 +960,8 @@ impl Stack {
         if full(&inner.virt_tcp.lock().expect("poisoned")) {
             return Ok(()); // silently drop; client will retransmit
         }
-        // A full backlog drops the SYN, as Linux does: the peer retransmits,
+        // A full backlog, or the namespace's share of it (see [`NS_SHARE`]),
+        // drops the SYN, as Linux does: the peer retransmits,
         // and by then a slot may have freed up. The accept queue being full
         // is no reason to here, unlike on Linux: the handshake waits in
         // SYN-RECEIVED, holding its half-open slot, for `accept` to make
@@ -970,7 +971,8 @@ impl Stack {
         // of retransmitted SYNs from a burst of clients.
         // TODO(slirp): past the backlog, answer with a stateless SYN-cookie
         // (vtcp::SynCookies) SYN-ACK instead of dropping.
-        let Some(slot) = listener.half_open_slot() else {
+        let backlog = ns_cap(inner, ns, HALF_OPEN_CAP);
+        let Some(slot) = listener.half_open_slot(ns, backlog) else {
             return Ok(());
         };
         let seg = match Segment::parse(tcp) {
@@ -1318,7 +1320,8 @@ impl Stack {
         if full(&inner.virt_tcp6.lock().expect("poisoned")) {
             return Ok(()); // silently drop; client will retransmit
         }
-        // A full backlog drops the SYN, as Linux does: the peer retransmits,
+        // A full backlog, or the namespace's share of it (see [`NS_SHARE`]),
+        // drops the SYN, as Linux does: the peer retransmits,
         // and by then a slot may have freed up. The accept queue being full
         // is no reason to here, unlike on Linux: the handshake waits in
         // SYN-RECEIVED, holding its half-open slot, for `accept` to make
@@ -1328,7 +1331,8 @@ impl Stack {
         // of retransmitted SYNs from a burst of clients.
         // TODO(slirp): past the backlog, answer with a stateless SYN-cookie
         // (vtcp::SynCookies) SYN-ACK instead of dropping.
-        let Some(slot) = listener.half_open_slot() else {
+        let backlog = ns_cap(inner, ns, HALF_OPEN_CAP);
+        let Some(slot) = listener.half_open_slot(ns, backlog) else {
             return Ok(());
         };
         let seg = match Segment::parse(tcp) {
@@ -3510,7 +3514,6 @@ mod tests {
 
     #[test]
     fn half_open_connections_per_listener_are_capped() {
-        use crate::slirp::listener::HALF_OPEN_CAP;
         let s = Stack::new();
         let _l = s.listen("tcp", "10.0.0.1:80").unwrap();
         let _l6 = s.listen6("[fd00::1]:80").unwrap();
@@ -3548,6 +3551,50 @@ mod tests {
         let syn = seg(20000, tcp_flags::SYN).marshal();
         inject(crate::slirp::packet::build_packet4(client, us, &syn));
         assert_eq!(s.inner.virt_tcp.lock().unwrap().len(), HALF_OPEN_CAP);
+    }
+
+    /// A listener's backlog is shared out between namespaces like the
+    /// stack's other caps: guests sending SYNs they never complete fill
+    /// their own share of it, not the whole, and another guest's SYN is
+    /// still answered.
+    #[test]
+    fn half_open_slots_are_shared_between_namespaces() {
+        let s = Stack::new();
+        let _l = s.listen("tcp", "10.0.0.1:80").unwrap();
+        let attach = || {
+            let r = Arc::new(Recorder::default());
+            let c = L3Connector::connect_l3(&*s, r.clone()).unwrap();
+            let inject = r.handler.lock().unwrap().clone().unwrap();
+            (r, c, inject)
+        };
+        let us = Ipv4Addr::new(10, 0, 0, 1);
+        let syn = |port: u16| {
+            let syn = Segment {
+                src_port: port,
+                dst_port: 80,
+                seq: 1,
+                flags: tcp_flags::SYN,
+                window: 65535,
+                ..Default::default()
+            };
+            crate::slirp::packet::build_packet4(Ipv4Addr::new(10, 0, 0, 5), us, &syn.marshal())
+        };
+        // Enough flooding namespaces to fill the whole backlog were it not
+        // shared; each sends as many SYNs as the backlog holds.
+        let floods: Vec<_> = (0..NS_SHARE / 2 + 1).map(|_| attach()).collect();
+        for (r, _, inject) in &floods {
+            for port in 0..HALF_OPEN_CAP as u16 {
+                inject(Packet::from_slice(&syn(10000 + port))).unwrap();
+            }
+            let answered = r.got.lock().unwrap().len();
+            assert_eq!(answered, HALF_OPEN_CAP / NS_SHARE);
+        }
+        let (good, _c, inject) = attach();
+        inject(Packet::from_slice(&syn(5555))).unwrap();
+        let got = good.got.lock().unwrap();
+        assert_eq!(got.len(), 1, "another namespace's SYN went unanswered");
+        let synack = Segment::parse(&got[0][20..]).unwrap();
+        assert_eq!(synack.flags, tcp_flags::SYN | tcp_flags::ACK);
     }
 
     #[test]
@@ -4224,9 +4271,10 @@ mod tests {
                 &[],
             )
         };
-        // Within one listener's backlog, but past the namespace's share.
+        // Within the namespace's share of two listeners' backlogs, but past
+        // its share of the table.
         for i in 0..100 {
-            Stack::handle_packet(&stack.inner, 1, &syn(44000 + i, 80)).unwrap();
+            Stack::handle_packet(&stack.inner, 1, &syn(44000 + i, 80 + i % 2)).unwrap();
         }
         assert_eq!(
             in_ns(&stack.inner.virt_tcp, 1),
