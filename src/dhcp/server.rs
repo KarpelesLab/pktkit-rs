@@ -23,6 +23,10 @@ const PROVISIONAL_LEASE: Duration = OFFER_HOLD;
 /// Anything sooner is a client asking again, not renewing, and stays
 /// provisional.
 const PROVISIONAL_MIN_AGE: Duration = Duration::from_secs(PROVISIONAL_LEASE.as_secs() / 2);
+/// Default for [`ServerConfig::max_leases_per_mac`]: room for a machine
+/// with a few clients told apart by client identifier, not for one
+/// inventing identifiers to take the pool.
+const DEFAULT_MAX_LEASES_PER_MAC: usize = 4;
 
 /// Configure a [`Server`].
 #[derive(Clone)]
@@ -48,6 +52,26 @@ pub struct ServerConfig {
     /// Reserved IPs handed out to specific clients, never recycled to anyone
     /// else.
     pub static_leases: HashMap<MacAddr, Ipv4Addr>,
+    /// Ignore a request whose client hardware address (`chaddr`) is not the
+    /// Ethernet source of the frame it came in. Default on.
+    ///
+    /// `chaddr` is whatever the sender wrote, so without this one station
+    /// can ask for a lease under as many made-up addresses as the pool
+    /// has room for. Only a request from the local segment is checked
+    /// (`giaddr` zero, and an Ethernet `chaddr`): a relayed one comes from
+    /// the relay. Neither is a message handed to
+    /// [`Server::handle_dhcp`], which has no frame to check against.
+    pub verify_chaddr: bool,
+    /// Most leases and outstanding offers held for clients on the local
+    /// segment sending from one Ethernet address; `None` for no limit.
+    /// Default 4.
+    ///
+    /// With [`verify_chaddr`](Self::verify_chaddr), one station still gets
+    /// a lease per client identifier (option 61) it sends, since leases
+    /// are keyed by that when given (RFC 2131 §4.2). This bounds what it
+    /// can take that way. Relayed requests, all from the relay, and
+    /// messages handed to [`Server::handle_dhcp`] are not counted.
+    pub max_leases_per_mac: Option<usize>,
 }
 
 setters! {
@@ -61,6 +85,8 @@ setters! {
         set lease_time: Duration;
         set mac: MacAddr;
         set static_leases: HashMap<MacAddr, Ipv4Addr>;
+        set verify_chaddr: bool;
+        set max_leases_per_mac: Option<usize>;
     }
 }
 
@@ -76,6 +102,8 @@ impl core::fmt::Debug for ServerConfig {
             .field("lease_time", &self.lease_time)
             .field("mac", &self.mac)
             .field("static_leases", &self.static_leases.len())
+            .field("verify_chaddr", &self.verify_chaddr)
+            .field("max_leases_per_mac", &self.max_leases_per_mac)
             .finish()
     }
 }
@@ -93,6 +121,8 @@ impl ServerConfig {
             lease_time: DEFAULT_LEASE,
             mac: MacAddr([0x02, 0xDD, 0xCC, 0x00, 0x00, 0x01]),
             static_leases: HashMap::new(),
+            verify_chaddr: true,
+            max_leases_per_mac: Some(DEFAULT_MAX_LEASES_PER_MAC),
         }
     }
 }
@@ -142,6 +172,9 @@ struct Lease {
     /// [`PROVISIONAL_LEASE`]), when it was first granted. `None` for a
     /// full lease, or an offer.
     provisional: Option<Instant>,
+    /// The Ethernet source the client asked from, for one on the local
+    /// segment, counted against [`ServerConfig::max_leases_per_mac`].
+    src: Option<MacAddr>,
 }
 
 /// The lease table, indexed by address too, so that whether an address is
@@ -153,6 +186,8 @@ struct Leases {
     /// seen under two keys (with and without a client identifier), each
     /// given the address reserved for its MAC.
     by_ip: HashMap<Ipv4Addr, u32>,
+    /// How many leases each Ethernet source holds ([`Lease::src`]).
+    by_src: HashMap<MacAddr, u32>,
 }
 
 /// Reads go straight to the table; writes go through [`Leases`]'s own
@@ -164,42 +199,55 @@ impl core::ops::Deref for Leases {
     }
 }
 
+/// Take `old` out of the indexes. A free function so that
+/// [`Leases::expire`] can call it while it walks the table.
+fn unindex(by_ip: &mut HashMap<Ipv4Addr, u32>, by_src: &mut HashMap<MacAddr, u32>, old: &Lease) {
+    fn dec<K: Eq + std::hash::Hash>(m: &mut HashMap<K, u32>, k: K) {
+        if let Some(n) = m.get_mut(&k) {
+            *n -= 1;
+            if *n == 0 {
+                m.remove(&k);
+            }
+        }
+    }
+    dec(by_ip, old.ip);
+    if let Some(src) = old.src {
+        dec(by_src, src);
+    }
+}
+
 impl Leases {
     fn insert(&mut self, key: ClientKey, lease: Lease) {
         if let Some(old) = self.by_key.insert(key, lease) {
-            self.unindex(old.ip);
+            unindex(&mut self.by_ip, &mut self.by_src, &old);
         }
         *self.by_ip.entry(lease.ip).or_default() += 1;
+        if let Some(src) = lease.src {
+            *self.by_src.entry(src).or_default() += 1;
+        }
     }
 
     fn remove(&mut self, key: &ClientKey) -> Option<Lease> {
         let old = self.by_key.remove(key)?;
-        self.unindex(old.ip);
+        unindex(&mut self.by_ip, &mut self.by_src, &old);
         Some(old)
-    }
-
-    fn unindex(&mut self, ip: Ipv4Addr) {
-        if let Some(n) = self.by_ip.get_mut(&ip) {
-            *n -= 1;
-            if *n == 0 {
-                self.by_ip.remove(&ip);
-            }
-        }
     }
 
     /// Drop the leases and offers run out by `now`.
     fn expire(&mut self, now: Instant) {
-        let by_ip = &mut self.by_ip;
+        let (by_ip, by_src) = (&mut self.by_ip, &mut self.by_src);
         self.by_key.retain(|_, l| {
             let live = l.expiry > now;
-            if !live && let Some(n) = by_ip.get_mut(&l.ip) {
-                *n -= 1;
-                if *n == 0 {
-                    by_ip.remove(&l.ip);
-                }
+            if !live {
+                unindex(by_ip, by_src, l);
             }
             live
         });
+    }
+
+    /// How many leases clients sending from `src` hold.
+    fn held_from(&self, src: MacAddr) -> usize {
+        self.by_src.get(&src).copied().unwrap_or(0) as usize
     }
 
     /// Whether a lease other than `key`'s holds `ip`.
@@ -256,8 +304,12 @@ impl Server {
     ///
     /// Without the Ethernet frame the server does not know a relay agent's
     /// MAC, so replies to a relay go to the broadcast MAC (still addressed
-    /// to the relay's IP). Frames given to [`send`](L2Device::send) do not
-    /// have that problem.
+    /// to the relay's IP). Nor can it check that `chaddr` is the sender's
+    /// own ([`ServerConfig::verify_chaddr`]) or count one station's leases
+    /// ([`ServerConfig::max_leases_per_mac`]), so here neither is applied,
+    /// and anyone able to reach the caller can lease the pool away under
+    /// made-up hardware addresses. Frames given to
+    /// [`send`](L2Device::send) do not have these problems.
     pub fn handle_dhcp(&self, msg: &[u8]) {
         self.handle(msg, None);
     }
@@ -282,14 +334,25 @@ impl Server {
         if !p.giaddr.is_unspecified() && !self.on_our_subnet(p.giaddr) {
             return;
         }
+        // The station that sent a request from the local segment. A relayed
+        // one was sent by the relay, on behalf of every client behind it.
+        let src = from.filter(|_| p.giaddr.is_unspecified());
+        if self.cfg.verify_chaddr
+            && let Some(src) = src
+            && p.htype == 1
+            && p.hlen == 6
+            && p.chaddr != src
+        {
+            return;
+        }
         match p.msg_type {
             wire::MSG_DISCOVER => {
-                if let Some(ip) = self.allocate(&key, self.reservation(&p)) {
+                if let Some(ip) = self.allocate(&key, self.reservation(&p), src) {
                     let lease = (ip, self.lease_secs());
                     self.send_reply(&p, from, wire::MSG_OFFER, Some(lease));
                 }
             }
-            wire::MSG_REQUEST => match self.request(&p, &key) {
+            wire::MSG_REQUEST => match self.request(&p, &key, src) {
                 Answer::Ack(ip, secs) => self.send_reply(&p, from, wire::MSG_ACK, Some((ip, secs))),
                 Answer::Nak => self.send_nak(&p, from),
                 Answer::Silent => {}
@@ -392,7 +455,12 @@ impl Server {
     /// [`OFFER_HOLD`]: a DISCOVER is unauthenticated and cheap to forge, and
     /// holding the address for a whole lease would let a flood of made-up
     /// client addresses drain the pool.
-    fn allocate(&self, key: &ClientKey, res: Reservation) -> Option<Ipv4Addr> {
+    fn allocate(
+        &self,
+        key: &ClientKey,
+        res: Reservation,
+        src: Option<MacAddr>,
+    ) -> Option<Ipv4Addr> {
         let now = Instant::now();
         if let Some(ip) = res.ip {
             // A reservation off our subnet could never be ACKed (see
@@ -412,7 +480,7 @@ impl Server {
             leases.remove(key);
         }
 
-        if leases.len() >= MAX_LEASES {
+        if leases.len() >= MAX_LEASES || self.over_src_cap(&leases, src) {
             return None;
         }
 
@@ -431,15 +499,25 @@ impl Server {
                 expiry: now + OFFER_HOLD,
                 bound: false,
                 provisional: None,
+                src,
             },
         );
         Some(ip)
     }
 
+    /// Whether clients sending from `src` already hold as many leases as
+    /// [`ServerConfig::max_leases_per_mac`] allows.
+    fn over_src_cap(&self, leases: &Leases, src: Option<MacAddr>) -> bool {
+        match (self.cfg.max_leases_per_mac, src) {
+            (Some(cap), Some(src)) => leases.held_from(src) >= cap,
+            _ => false,
+        }
+    }
+
     /// Answer a DHCPREQUEST, telling apart the client states of RFC 2131
     /// §4.3.2 by which of server identifier, requested address and ciaddr
     /// it carries.
-    fn request(&self, p: &wire::Parsed, key: &ClientKey) -> Answer {
+    fn request(&self, p: &wire::Parsed, key: &ClientKey, src: Option<MacAddr>) -> Answer {
         let now = Instant::now();
         let mut leases = self.live_leases(now);
         let mut renewing = false;
@@ -469,16 +547,18 @@ impl Server {
             }
             _ => return Answer::Silent,
         };
-        self.commit(&mut leases, (key, self.reservation(p)), ip, renewing, now)
+        let res = self.reservation(p);
+        self.commit(&mut leases, (key, res, src), ip, renewing, now)
     }
 
-    /// Bind `ip` to client `key` (with reservation `res`) if the server
-    /// agrees that is the client's address. `renewing` is set for a client
-    /// RENEWING or REBINDING, which is already using `ip`.
+    /// Bind `ip` to client `key` (with reservation `res`, asking from
+    /// Ethernet source `src`) if the server agrees that is the client's
+    /// address. `renewing` is set for a client RENEWING or REBINDING, which
+    /// is already using `ip`.
     fn commit(
         &self,
         leases: &mut Leases,
-        (key, res): (&ClientKey, Reservation),
+        (key, res, src): (&ClientKey, Reservation, Option<MacAddr>),
         ip: Ipv4Addr,
         renewing: bool,
         now: Instant,
@@ -488,6 +568,7 @@ impl Server {
             expiry: self.lease_end(now),
             bound: true,
             provisional: None,
+            src,
         };
         if !self.on_our_subnet(ip) {
             return Answer::Nak; // the client moved here from another network
@@ -571,7 +652,7 @@ impl Server {
         // lease is only as long as that hold, and past three quarters full
         // we keep to the RFC's silence: the client falls back to DISCOVER,
         // and the offer path.
-        if leases.len() * 4 >= self.capacity * 3 {
+        if leases.len() * 4 >= self.capacity * 3 || self.over_src_cap(leases, src) {
             return Answer::Silent;
         }
         let provisional = self.cfg.lease_time.min(PROVISIONAL_LEASE);
@@ -1047,6 +1128,7 @@ mod tests {
                         expiry: gone,
                         bound: true,
                         provisional: None,
+                        src: None,
                     },
                 );
             }
@@ -1672,5 +1754,92 @@ mod tests {
         s.handle_dhcp(&msg);
         assert!(replies(&r).is_empty());
         assert!(s.leases.lock().unwrap().is_empty());
+    }
+
+    /// Hand `dhcp` to the server as a station at `src` broadcasts it.
+    fn from_station(s: &Server, src: MacAddr, dhcp: &[u8]) {
+        let any = Ipv4Addr::UNSPECIFIED;
+        let udp = crate::build::build_udp(any.into(), Ipv4Addr::BROADCAST.into(), 68, 67, dhcp);
+        let ip = crate::build::build_ipv4(any, Ipv4Addr::BROADCAST, Protocol::UDP, 64, &udp);
+        let f = build_frame(MacAddr::broadcast(), src, EtherType::IPV4, &ip);
+        s.send(Frame::from_slice(&f)).unwrap();
+    }
+
+    fn fifty_address_pool() -> ServerConfig {
+        ServerConfig::new(
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(10, 0, 0, 10),
+            Ipv4Addr::new(10, 0, 0, 59),
+        )
+    }
+
+    /// DISCOVER then REQUEST from the station at `src`, as client `chaddr`
+    /// with identifier `id`; whether it was ACKed.
+    fn lease_from(s: &Server, r: &Sent, src: MacAddr, chaddr: MacAddr, id: Option<&[u8]>) -> bool {
+        let mut b = wire::Builder::new(1, 1, chaddr);
+        b.message_type(wire::MSG_DISCOVER);
+        if let Some(id) = id {
+            b.option(wire::OPT_CLIENT_ID, id);
+        }
+        from_station(s, src, &b.finish());
+        let Some(offer) = replies(r).into_iter().next() else {
+            return false;
+        };
+        let mut b = wire::Builder::new(1, 2, chaddr);
+        b.message_type(wire::MSG_REQUEST)
+            .ipv4_option(wire::OPT_REQUESTED_IP, offer.yiaddr)
+            .ipv4_option(wire::OPT_SERVER_ID, Ipv4Addr::new(10, 0, 0, 1));
+        if let Some(id) = id {
+            b.option(wire::OPT_CLIENT_ID, id);
+        }
+        from_station(s, src, &b.finish());
+        replies(r)
+            .first()
+            .is_some_and(|a| a.msg_type == wire::MSG_ACK)
+    }
+
+    #[test]
+    fn one_station_cannot_take_the_pool_under_made_up_hardware_addresses() {
+        let (s, r) = recording(fifty_address_pool());
+        let attacker = MacAddr([2, 0, 0, 0, 0, 0xee]);
+        let taken = (0..100u8)
+            .filter(|&i| lease_from(&s, &r, attacker, MacAddr([2, 0xde, 0xad, 0, 0, i]), None))
+            .count();
+        assert_eq!(
+            taken, 0,
+            "leases for hardware addresses the sender does not have"
+        );
+        let client = MacAddr([2, 1, 1, 1, 1, 1]);
+        assert!(lease_from(&s, &r, client, client, None), "pool drained");
+    }
+
+    #[test]
+    fn one_station_gets_only_a_few_leases_however_many_identifiers_it_sends() {
+        let (s, r) = recording(fifty_address_pool());
+        let attacker = MacAddr([2, 0, 0, 0, 0, 0xee]);
+        let taken = (0..100u8)
+            .filter(|&i| lease_from(&s, &r, attacker, attacker, Some(&[0, i])))
+            .count();
+        assert_eq!(taken, DEFAULT_MAX_LEASES_PER_MAC);
+        let client = MacAddr([2, 1, 1, 1, 1, 1]);
+        assert!(lease_from(&s, &r, client, client, None));
+
+        // A client that already holds a lease keeps renewing it.
+        assert!(lease_from(&s, &r, attacker, attacker, Some(&[0, 0])));
+
+        // Without a limit, as before.
+        let (s, r) = recording(fifty_address_pool().max_leases_per_mac(None));
+        let taken = (0..10u8)
+            .filter(|&i| lease_from(&s, &r, attacker, attacker, Some(&[0, i])))
+            .count();
+        assert_eq!(taken, 10);
+    }
+
+    #[test]
+    fn the_hardware_address_check_can_be_turned_off() {
+        let (s, r) = recording(fifty_address_pool().verify_chaddr(false));
+        let bridge = MacAddr([2, 0, 0, 0, 0, 0xee]);
+        let client = MacAddr([2, 1, 1, 1, 1, 1]);
+        assert!(lease_from(&s, &r, bridge, client, None));
     }
 }
