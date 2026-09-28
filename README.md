@@ -93,8 +93,9 @@ sockets there, so the crate works as a sans-I/O stack that the embedder drives:
   `ErrorKind::WouldBlock` where they would have waited. Open connections with
   `Client::dial_tcp_nonblocking` and check `TcpConn::poll_connect`.
 - **You run the timers.** Work that a background thread does elsewhere is a
-  method you call on a timer: `vclient::Client::tick` (TCP retransmits and
-  keepalives, about every 100 ms), `ImpairL2::poll` / `ImpairL3::poll`
+  method you call on a timer: `vclient::Client::tick` (TCP retransmits,
+  delayed ACKs and keepalives, when `Client::next_timer` says),
+  `ImpairL2::poll` / `ImpairL3::poll`
   (each returns when the next message is due), `dhcp::Client::tick` or
   `L2Adapter::tick` (DHCP retransmission, renewal and expiry),
   `wg::Handler::poll_timers` (handshake retries, rekeys and keepalives) and
