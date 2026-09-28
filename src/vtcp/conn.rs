@@ -2,7 +2,8 @@
 //!
 //! This is a synchronous, callback-style port of the Go upstream's `Conn`.
 //! Rather than asynchronous timers and condvars, the connection exposes a
-//! [`tick`](Conn::tick) method that the caller invokes periodically to drive
+//! [`tick`](Conn::tick) method that the caller invokes when
+//! [`next_deadline`](Conn::next_deadline) comes due, to drive
 //! retransmission, persist, keepalive, and TIME-WAIT timeouts. All outgoing
 //! segments are returned from methods as `Vec<Vec<u8>>` — the caller is
 //! responsible for wrapping each in IP+L2 and pushing it on the wire.
@@ -2117,8 +2118,7 @@ impl Conn {
             // With so few duplicates, a segment merely reordered looks lost.
             // Wait a quarter of an RTT for it (RFC 5827 §6, and Linux's
             // delayed ER); a new ACK in the meantime cancels. tick() sends
-            // it, so the delay is at least the caller's tick interval --
-            // still well short of the RTO this saves.
+            // it.
             if self.er_deadline.is_none() {
                 let delay = (self.rto.srtt() / 4).max(ER_MIN_DELAY);
                 self.er_deadline = Some(Instant::now() + delay);
@@ -2478,8 +2478,53 @@ impl Conn {
         self.keepalive_deadline = None;
     }
 
-    /// Drive any expired timers. Call this periodically (e.g. every 100ms).
-    /// Returns any segments produced by timer-driven actions.
+    /// When the earliest pending timer comes due: the next time
+    /// [`tick`](Self::tick) has something to do. `None` if no timer is
+    /// running. It moves with every call that sends or takes in a segment
+    /// (sending data arms the retransmission timer, taking in data may arm
+    /// the delayed ACK), so a driver reads it again after each.
+    ///
+    /// A deadline already past is due now.
+    pub fn next_deadline(&self) -> Option<Instant> {
+        // Exactly the timers tick() acts on, under the same conditions: a
+        // deadline it would leave in place would have its driver spin.
+        let live = !self.closed && self.state != State::Closed;
+        let mut next = self.time_wait_deadline;
+        let mut consider = |d: Option<Instant>| {
+            if let Some(d) = d {
+                next = Some(next.map_or(d, |n| n.min(d)));
+            }
+        };
+        if !self.closed {
+            consider(self.er_deadline);
+        }
+        if live {
+            consider(self.rto_deadline);
+            consider(self.persist_deadline);
+            consider(self.keepalive_deadline);
+        }
+        consider(self.fin_wait2_deadline());
+        next
+    }
+
+    /// When a released connection in FIN-WAIT-2 is reset for the peer's
+    /// silence (see [`ConnConfig::fin_wait2_timeout`]).
+    fn fin_wait2_deadline(&self) -> Option<Instant> {
+        if self.state != State::FinWait2 {
+            return None;
+        }
+        let released = self.released?;
+        let t = self.cfg.fin_wait2_timeout?;
+        released.max(self.last_recv).checked_add(t)
+    }
+
+    /// Drive any expired timers, and return the segments they produce.
+    ///
+    /// Call it once [`next_deadline`](Self::next_deadline) has passed. It
+    /// is harmless to call it early or more often: a timer runs only once
+    /// due. Each fires late by however late it is called, which is what a
+    /// fixed polling interval costs: a retransmission or a delayed ACK
+    /// waits for the next poll.
     pub fn tick(&mut self) -> Vec<Vec<u8>> {
         let now = Instant::now();
 
@@ -2520,11 +2565,7 @@ impl Conn {
         // on our side is waiting for what it might still send. Quiet since
         // the release, that is: before it, a half-closed application was
         // still reading, and the peer was free to take its time.
-        if self.state == State::FinWait2
-            && let Some(released) = self.released
-            && let Some(t) = self.cfg.fin_wait2_timeout
-            && now.duration_since(released.max(self.last_recv)) >= t
-        {
+        if self.fin_wait2_deadline().is_some_and(|d| now >= d) {
             let rst = self.abort();
             self.outgoing.extend(rst);
         }
@@ -6291,5 +6332,30 @@ mod tests {
         assert!(server.grown > 0);
         drop(server);
         assert_eq!(budget.used(), client.grown);
+    }
+
+    /// next_deadline is the earliest timer tick() would act on, and
+    /// nothing once none is running.
+    #[test]
+    fn next_deadline_is_the_earliest_timer() {
+        let (mut client, mut server) = established(40600);
+        assert_eq!(client.next_deadline(), None);
+        let (_, data) = client.write(&[7; 100]);
+        let rto = client.rto_deadline.expect("RTO armed");
+        assert_eq!(client.next_deadline(), Some(rto));
+        client.keepalive_deadline = Some(rto + Duration::from_secs(1));
+        assert_eq!(client.next_deadline(), Some(rto));
+        client.er_deadline = Some(rto - Duration::from_millis(1));
+        assert_eq!(client.next_deadline(), client.er_deadline);
+        client.er_deadline = None;
+        let acks = deliver(&mut server, &data);
+        deliver(&mut client, &acks);
+        assert_eq!(client.next_deadline(), client.keepalive_deadline);
+        client.keepalive_deadline = None;
+        assert_eq!(client.next_deadline(), None);
+        // A closed connection's leftovers are not due: tick() ignores them.
+        client.rto_deadline = Some(Instant::now());
+        client.closed = true;
+        assert_eq!(client.next_deadline(), None);
     }
 }

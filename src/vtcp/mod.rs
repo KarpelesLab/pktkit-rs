@@ -3,10 +3,11 @@
 //! A synchronous TCP state machine operating on raw TCP segments, in pure
 //! Rust (it began as a port of the Go `vtcp` subpackage). It is IP-agnostic
 //! and Ethernet-agnostic — callers feed inbound segments via
-//! [`Conn::handle_segment`] and transmit whatever the connection returns. A
-//! periodic [`Conn::tick`] drives the RTO, Early Retransmit, persist,
-//! keepalive, FIN-WAIT-2 and TIME-WAIT timers; there is no background
-//! thread.
+//! [`Conn::handle_segment`] and transmit whatever the connection returns.
+//! [`Conn::tick`] drives the RTO, Early Retransmit, persist, keepalive,
+//! FIN-WAIT-2 and TIME-WAIT timers; there is no background thread. Call it
+//! when [`Conn::next_deadline`] comes due: a timer fires only as precisely
+//! as it is driven.
 //!
 //! Supported RFCs:
 //! - RFC 9293 (TCP, rolled-up): state machine and segment processing.
