@@ -101,19 +101,32 @@ pub struct ServerConfig {
     pub max_peers: usize,
     /// Most peers held at once that have no authenticated session: clients
     /// still in their handshake, or anyone at all who got as far as a
-    /// session id. Past it, a new client is not served until one of those
-    /// authenticates or gives up, but clients that have authenticated keep
-    /// their places. `None`, the default: half of
-    /// [`max_peers`](Self::max_peers), rounded up.
+    /// session id. Clients that have authenticated keep their places. Past
+    /// it -- or once [`max_peers`](Self::max_peers) is reached -- a new
+    /// client takes the place of the oldest unauthenticated peer of the
+    /// source holding the most of them, provided that source holds more
+    /// than the new client's does; otherwise it is not served. So sources
+    /// filling the table push out their own peers first, and a source with
+    /// few peers handshaking always gets its turn. `None`, the default:
+    /// half of [`max_peers`](Self::max_peers), rounded up.
     pub max_unauthenticated_peers: Option<usize>,
-    /// Most such peers from one source: an IPv4 address, or an IPv6 /64
-    /// (what one host is typically given). Keeps one source from taking
-    /// every place the whole server has for clients handshaking. Default 16.
+    /// Most such peers from one source (see
+    /// [`source_prefix_v6`](Self::source_prefix_v6)). Keeps one source from
+    /// taking every place the whole server has for clients handshaking.
+    /// Default 16.
     pub max_unauthenticated_peers_per_source: usize,
-    /// At most this many new peers per period from one source (an IPv4
-    /// address or an IPv6 /64, as for
-    /// [`max_unauthenticated_peers_per_source`](Self::max_unauthenticated_peers_per_source)),
-    /// UDP and TCP together. Unlike
+    /// How much of an IPv6 address names its source, for every per-source
+    /// limit: the caps on unauthenticated peers and TCP connections,
+    /// [`connect_freq`](Self::connect_freq) and
+    /// [`connect_freq_initial`](Self::connect_freq_initial). An IPv4
+    /// client's source is its address. Default 56: a site is commonly
+    /// given a /56 (or a /48), so one subscriber cannot pose as 256
+    /// sources the way it could with /64s; clients from one /56 share its
+    /// limits, as clients behind one IPv4 NAT address do. At most 128.
+    pub source_prefix_v6: u8,
+    /// At most this many new peers per period from one source (see
+    /// [`source_prefix_v6`](Self::source_prefix_v6)), UDP and TCP
+    /// together. Unlike
     /// [`connect_freq_initial`](Self::connect_freq_initial), it counts the
     /// clients that complete the three-way handshake and get a peer.
     ///
@@ -125,13 +138,17 @@ pub struct ServerConfig {
     /// how many it runs at once.
     pub connect_freq: Option<(u32, Duration)>,
     /// Most TCP connections served at once; each has two threads, a reader
-    /// and a writer. Default 256.
+    /// and a writer. Default 256. Once reached, a new connection takes the
+    /// place of the oldest one whose client has not authenticated, from
+    /// the source holding the most of those -- provided it holds more than
+    /// the new connection's source does -- as for
+    /// [`max_unauthenticated_peers`](Self::max_unauthenticated_peers);
+    /// otherwise it is closed. The connection pushed out is shut down, and
+    /// its two threads end within moments.
     pub max_tcp_connections: usize,
-    /// Most TCP connections served at once from one source (an IPv4
-    /// address or an IPv6 /64, as for
-    /// [`max_unauthenticated_peers_per_source`](Self::max_unauthenticated_peers_per_source))
-    /// whose client has not authenticated, so that one source cannot take
-    /// them all. A connection whose client authenticates gives its place
+    /// Most TCP connections served at once from one source (see
+    /// [`source_prefix_v6`](Self::source_prefix_v6)) whose client has not
+    /// authenticated, so that one source cannot take them all. A connection whose client authenticates gives its place
     /// back: clients behind one NAT address are not limited to this many,
     /// only [`max_tcp_connections`](Self::max_tcp_connections) bounds
     /// them. Default 16.
@@ -140,7 +157,8 @@ pub struct ServerConfig {
     /// Defaults to OpenVPN's (see [`PeerTimers`]).
     pub timers: PeerTimers,
     /// At most this many answers to UDP clients' first packets per period
-    /// and per source (an IPv4 address or an IPv6 /64); default 100 per
+    /// and per source (see [`source_prefix_v6`](Self::source_prefix_v6));
+    /// default 100 per
     /// 10 s. The first answer goes to an address nobody has vouched for
     /// yet, so this bounds how much the server can be made to reflect at a
     /// spoofed victim. Clients that complete the handshake are not counted.
@@ -176,6 +194,8 @@ pub(super) const DEFAULT_MAX_TCP_CONNECTIONS_PER_SOURCE: usize = 16;
 pub(super) const DEFAULT_CONNECT_FREQ_INITIAL: (u32, Duration) = (100, Duration::from_secs(10));
 /// Default [`ServerConfig::max_auth_threads`].
 pub(super) const DEFAULT_MAX_AUTH_THREADS: usize = 16;
+/// Default [`ServerConfig::source_prefix_v6`].
+pub(super) const DEFAULT_SOURCE_PREFIX_V6: u8 = 56;
 
 setters! {
     ServerConfig {
@@ -184,6 +204,7 @@ setters! {
         set max_peers: usize;
         some max_unauthenticated_peers: usize;
         set max_unauthenticated_peers_per_source: usize;
+        set source_prefix_v6: u8;
         some connect_freq: (u32, Duration);
         set max_tcp_connections: usize;
         set max_tcp_connections_per_source: usize;
@@ -211,6 +232,7 @@ impl ServerConfig {
             max_peers: DEFAULT_MAX_PEERS,
             max_unauthenticated_peers: None,
             max_unauthenticated_peers_per_source: DEFAULT_MAX_UNAUTHENTICATED_PER_SOURCE,
+            source_prefix_v6: DEFAULT_SOURCE_PREFIX_V6,
             connect_freq: None,
             max_tcp_connections: DEFAULT_MAX_TCP_CONNECTIONS,
             max_tcp_connections_per_source: DEFAULT_MAX_TCP_CONNECTIONS_PER_SOURCE,
@@ -247,6 +269,9 @@ struct PeerEntry {
     /// The peer's last output said it has an authenticated session: it
     /// does not count against the limits on unauthenticated peers.
     authenticated: AtomicBool,
+    /// When it was added: of a source's unauthenticated peers, the oldest
+    /// is the first pushed out for a newcomer.
+    created: crate::time::Instant,
 }
 
 /// A peer's authentications. They run one at a time -- a client restarting
@@ -278,6 +303,7 @@ impl PeerEntry {
             link: Mutex::default(),
             auth: Mutex::default(),
             authenticated: AtomicBool::new(false),
+            created: crate::time::Instant::now(),
         }
     }
 
@@ -715,8 +741,13 @@ impl Server {
         self.initial_limit
             .lock()
             .unwrap()
-            .refund(source_of(src.ip()));
+            .refund(self.source_of(src.ip()));
         Some(entry)
+    }
+
+    /// The source `ip` counts against for the per-source limits.
+    fn source_of(&self, ip: std::net::IpAddr) -> std::net::IpAddr {
+        source_of(ip, self.cfg.source_prefix_v6)
     }
 
     /// The stateless answer to a client's hard reset from `src`, unless
@@ -727,7 +758,7 @@ impl Server {
         src: SocketAddr,
         now: crate::time::Instant,
     ) -> Option<Vec<u8>> {
-        let source = source_of(src.ip());
+        let source = self.source_of(src.ip());
         if !self.initial_limit.lock().unwrap().allow(source, now) {
             return None;
         }
@@ -754,15 +785,28 @@ impl Server {
             if self.closed.load(Ordering::SeqCst) {
                 return;
             }
-            let source = source_of(addr.ip());
+            let source = self.source_of(addr.ip());
             let here = streams
                 .values()
                 .filter(|c| c.source == source && !c.authenticated)
                 .count();
-            if streams.len() >= self.cfg.max_tcp_connections
-                || here >= self.cfg.max_tcp_connections_per_source
-            {
+            if here >= self.cfg.max_tcp_connections_per_source {
                 return;
+            }
+            if streams.len() >= self.cfg.max_tcp_connections {
+                // Ids are handed out in order, so the lowest is the oldest.
+                let pending = streams
+                    .iter()
+                    .filter(|(_, c)| !c.authenticated)
+                    .map(|(id, c)| (c.source, *id, *id));
+                let Some(victim) = pick_victim(pending, source) else {
+                    return;
+                };
+                // Its reader wakes up to the shutdown and ends the peer;
+                // its slot is given back here, so the count stays bounded.
+                if let Some(c) = streams.remove(&victim) {
+                    let _ = c.stream.shutdown(std::net::Shutdown::Both);
+                }
             }
             let id = self.next_tcp_id.fetch_add(1, Ordering::Relaxed);
             let conn = TcpConn {
@@ -851,8 +895,9 @@ impl Server {
     }
 
     /// Add a peer for `key`, or return the one already there. `None` when
-    /// the peer table is full -- or has no room for another peer that has
-    /// not authenticated, from this source or at all -- or when new peers
+    /// its source has as many unauthenticated peers as it may, when the
+    /// table is full and no unauthenticated peer can be pushed out for it
+    /// (see [`ServerConfig::max_unauthenticated_peers`]), or when new peers
     /// are coming from its source faster than `connect_freq` allows.
     ///
     /// `stateless` is for a UDP client whose hard reset was answered
@@ -869,28 +914,39 @@ impl Server {
             .cfg
             .max_unauthenticated_peers
             .unwrap_or(self.cfg.max_peers.div_ceil(2));
-        let source = source_of(addr.ip());
+        let source = self.source_of(addr.ip());
+        // Ok with the peer to push out to make room, if any.
         let admit = |peers: &HashMap<PeerKey, Arc<PeerEntry>>| {
             if let Some(e) = peers.get(&key) {
                 return Err(Some(e.clone()));
             }
-            if peers.len() >= self.cfg.max_peers {
-                return Err(None);
-            }
             // A walk of the table, at most max_peers long, only for a
             // client that proved its address to get this far: a few
             // microseconds, about what checking the proof took.
+            let pending = || {
+                peers
+                    .values()
+                    .filter(|e| !e.authenticated.load(Ordering::Relaxed))
+            };
             let (mut all, mut here) = (0, 0);
-            for e in peers.values() {
-                if !e.authenticated.load(Ordering::Relaxed) {
-                    all += 1;
-                    here += usize::from(source_of(e.addr.ip()) == source);
-                }
+            for e in pending() {
+                all += 1;
+                here += usize::from(self.source_of(e.addr.ip()) == source);
             }
-            if all >= max_unauthenticated || here >= self.cfg.max_unauthenticated_peers_per_source {
+            if here >= self.cfg.max_unauthenticated_peers_per_source {
                 return Err(None);
             }
-            Ok(())
+            if peers.len() < self.cfg.max_peers && all < max_unauthenticated {
+                return Ok(None);
+            }
+            // Full: rather than turn away every newcomer until someone
+            // gives up -- which a few sources re-arming their peers could
+            // make never -- push out a peer of the source holding most.
+            let by_source = pending().map(|e| (self.source_of(e.addr.ip()), e.created, e));
+            match pick_victim(by_source, source) {
+                Some(victim) => Ok(Some(victim.clone())),
+                None => Err(None),
+            }
         };
         if let Err(found) = admit(&self.peers.read().unwrap()) {
             return found;
@@ -903,9 +959,10 @@ impl Server {
         // Another thread may have added this peer, or filled the table,
         // meanwhile; the peer just built is then dropped.
         let mut peers = self.peers.write().unwrap();
-        if let Err(found) = admit(&peers) {
-            return found;
-        }
+        let victim = match admit(&peers) {
+            Ok(victim) => victim,
+            Err(found) => return found,
+        };
         // Charged only for a peer about to be added: a client turned away
         // for want of room, or finding its peer there already, has not
         // cost a handshake.
@@ -917,8 +974,15 @@ impl Server {
         {
             return None;
         }
+        // Under the same lock as the insertion, so the table never holds
+        // more than its caps.
+        let evicted = victim.filter(|v| self.unlink(&mut peers, v));
         let entry = Arc::new(PeerEntry::new(peer, transport, addr, tcp));
         peers.insert(key, entry.clone());
+        drop(peers);
+        if let Some(v) = evicted {
+            self.after_unlink(&v);
+        }
         Some(entry)
     }
 
@@ -955,19 +1019,33 @@ impl Server {
     /// for its key, as a caller may hold a stale one -- and close its TCP
     /// connection, which ends the thread serving it.
     fn remove_entry(&self, entry: &Arc<PeerEntry>) {
-        let key = entry.key();
-        {
-            let mut peers = self.peers.write().unwrap();
-            let current = peers.get(&key).is_some_and(|e| Arc::ptr_eq(e, entry));
-            if !current || peers.remove(&key).is_none() {
-                return;
-            }
-            // Under the table's lock, as close() does: once the lock is
-            // released, a new session for the key can be created and
-            // authenticate on another thread, and its on_connect must be
-            // queued behind this one's on_disconnect, not ahead of it.
-            self.mark_removed(entry);
+        if self.unlink(&mut self.peers.write().unwrap(), entry) {
+            self.after_unlink(entry);
         }
+    }
+
+    /// The part of [`remove_entry`](Self::remove_entry) done under the
+    /// table's write lock, `peers`: whether the entry was there to remove.
+    /// The caller then calls [`after_unlink`](Self::after_unlink), with
+    /// the lock released.
+    fn unlink(&self, peers: &mut HashMap<PeerKey, Arc<PeerEntry>>, entry: &Arc<PeerEntry>) -> bool {
+        let key = entry.key();
+        let current = peers.get(&key).is_some_and(|e| Arc::ptr_eq(e, entry));
+        if !current || peers.remove(&key).is_none() {
+            return false;
+        }
+        // Under the table's lock, as close() does: once the lock is
+        // released, a new session for the key can be created and
+        // authenticate on another thread, and its on_connect must be
+        // queued behind this one's on_disconnect, not ahead of it.
+        self.mark_removed(entry);
+        true
+    }
+
+    /// The rest of [`remove_entry`](Self::remove_entry), with no lock held:
+    /// on_disconnect may call back into the server.
+    fn after_unlink(&self, entry: &Arc<PeerEntry>) {
+        let key = entry.key();
         #[cfg(test)]
         if let Some(hook) = tests::AFTER_UNLINK.with(std::cell::Cell::get) {
             hook(self, key);
@@ -1236,17 +1314,54 @@ impl Server {
     }
 }
 
-/// The source a client counts against for
-/// [`max_unauthenticated_peers_per_source`](ServerConfig::max_unauthenticated_peers_per_source):
-/// its IPv4 address, or its IPv6 /64, which one host typically has all of.
-fn source_of(ip: std::net::IpAddr) -> std::net::IpAddr {
+/// The source a client counts against for the per-source limits: its IPv4
+/// address, or the first `v6_prefix` bits of its IPv6 address (see
+/// [`ServerConfig::source_prefix_v6`]).
+fn source_of(ip: std::net::IpAddr, v6_prefix: u8) -> std::net::IpAddr {
     match ip.to_canonical() {
         std::net::IpAddr::V6(v6) => {
-            let bits = u128::from(v6) & !(u128::from(u64::MAX));
-            std::net::IpAddr::V6(bits.into())
+            let mask = u128::MAX
+                .checked_shl(128 - u32::from(v6_prefix.min(128)))
+                .unwrap_or(0);
+            std::net::IpAddr::V6((u128::from(v6) & mask).into())
         }
         v4 => v4,
     }
+}
+
+/// The one to push out of a full table to make room for a newcomer from
+/// `newcomer`, of `candidates` -- each its source, its age (smaller is
+/// older) and itself: the oldest of the source holding the most, provided
+/// it holds more than the newcomer's own source does. Otherwise `None`:
+/// no source may grow past another by pushing it out, so sources filling
+/// the table only push out their own, and the newcomer is turned away once
+/// its source holds as many as any.
+fn pick_victim<A: Ord + Copy, T>(
+    candidates: impl IntoIterator<Item = (std::net::IpAddr, A, T)>,
+    newcomer: std::net::IpAddr,
+) -> Option<T> {
+    let mut sources: HashMap<std::net::IpAddr, (usize, A, T)> = HashMap::new();
+    for (source, age, item) in candidates {
+        match sources.entry(source) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert((1, age, item));
+            }
+            std::collections::hash_map::Entry::Occupied(mut o) => {
+                let (count, oldest, it) = o.get_mut();
+                *count += 1;
+                if age < *oldest {
+                    *oldest = age;
+                    *it = item;
+                }
+            }
+        }
+    }
+    let here = sources.get(&newcomer).map_or(0, |(count, ..)| *count);
+    // The most held; of sources holding as many, the one with the oldest.
+    let (count, _, victim) = sources
+        .into_values()
+        .max_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)))?;
+    (count > here).then_some(victim)
 }
 
 fn closed_error() -> io::Error {
@@ -1751,7 +1866,7 @@ mod tests {
             server.answer_reset(&reset, legit, now).is_some(),
             "v4 client starved"
         );
-        let legit6: SocketAddr = "[2001:db8:0:2::1]:5000".parse().unwrap();
+        let legit6: SocketAddr = "[2001:db8:1::1]:5000".parse().unwrap();
         assert!(
             server.answer_reset(&reset, legit6, now).is_some(),
             "v6 client starved"
@@ -2187,6 +2302,42 @@ mod tests {
                 ) => {}
             other => panic!("third connection must be refused, got {other:?}"),
         }
+        server.close();
+    }
+
+    /// Every TCP place taken by clients of another source that are still
+    /// handshaking, a new client gets the place of the oldest of them:
+    /// its connection is shut down. Before, 16 sources could hold all 256
+    /// places, and every other TCP client was turned away.
+    #[test]
+    fn a_full_tcp_table_makes_room_for_a_newcomer() {
+        let server = server_configured(auth_ok(), |c| c.max_tcp_connections(2));
+        // Connections held by another source, as the table sees them.
+        let sink = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut held = Vec::new();
+        for id in [1000, 1001] {
+            let theirs = TcpStream::connect(sink.local_addr().unwrap()).unwrap();
+            let (ours, _) = sink.accept().unwrap();
+            let conn = TcpConn {
+                source: "192.0.2.1".parse().unwrap(),
+                authenticated: false,
+                stream: ours,
+            };
+            server.tcp_streams.lock().unwrap().insert(id, conn);
+            theirs
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            held.push(theirs);
+        }
+        let mut c = tcp_client(&server);
+        tcp_send(&mut c, &client_reset(*b"NEWCOMER"));
+        tcp_recv(&mut c).expect("newcomer is served");
+        // The oldest was shut down; the other kept.
+        let mut b = [0u8; 1];
+        assert!(matches!(held[0].read(&mut b), Ok(0)));
+        let streams = server.tcp_streams.lock().unwrap();
+        assert!(!streams.contains_key(&1000) && streams.contains_key(&1001));
+        drop(streams);
         server.close();
     }
 
@@ -3242,15 +3393,15 @@ mod tests {
             !create_authenticated(&server, "192.0.2.1:3"),
             "over the limit"
         );
-        // The same /64 is the same source.
+        // The same /56 is the same source.
         assert!(create_authenticated(&server, "[2001:db8::1]:1"));
-        assert!(create_authenticated(&server, "[2001:db8::2]:1"));
+        assert!(create_authenticated(&server, "[2001:db8:0:1::2]:1"));
         assert!(!create_authenticated(&server, "[2001:db8::3]:1"));
         assert!(
             create_authenticated(&server, "192.0.2.2:1"),
             "another source"
         );
-        assert!(create_authenticated(&server, "[2001:db8:0:1::1]:1"));
+        assert!(create_authenticated(&server, "[2001:db8:0:100::1]:1"));
         server.close();
     }
 
@@ -3290,11 +3441,120 @@ mod tests {
     }
 
     #[test]
-    fn sources_are_addresses_or_ipv6_64s() {
+    fn sources_are_addresses_or_ipv6_prefixes() {
         let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
-        assert_eq!(source_of(ip("192.0.2.7")), ip("192.0.2.7"));
-        assert_eq!(source_of(ip("::ffff:192.0.2.7")), ip("192.0.2.7"));
-        assert_eq!(source_of(ip("2001:db8:1:2:3:4:5:6")), ip("2001:db8:1:2::"));
+        let v6 = DEFAULT_SOURCE_PREFIX_V6;
+        assert_eq!(source_of(ip("192.0.2.7"), v6), ip("192.0.2.7"));
+        assert_eq!(source_of(ip("::ffff:192.0.2.7"), v6), ip("192.0.2.7"));
+        assert_eq!(
+            source_of(ip("2001:db8:1:2ff:3:4:5:6"), v6),
+            ip("2001:db8:1:200::")
+        );
+        assert_eq!(
+            source_of(ip("2001:db8:1:2:3:4:5:6"), 64),
+            ip("2001:db8:1:2::")
+        );
+        assert_eq!(source_of(ip("2001:db8::1"), 128), ip("2001:db8::1"));
+        assert_eq!(source_of(ip("2001:db8::1"), 200), ip("2001:db8::1"));
+        assert_eq!(source_of(ip("2001:db8::1"), 0), ip("::"));
+    }
+
+    /// The table full of peers handshaking, a newcomer pushes out the
+    /// oldest of the source holding the most -- never one of a source
+    /// holding no more than its own, so no source grows past another that
+    /// way. Before, 32 IPv6 /64s (16 peers each) filled the table, and
+    /// every other client was turned away until they gave up -- which,
+    /// re-arming their peers every minute, they need never do.
+    #[test]
+    fn a_full_table_makes_room_for_a_newcomer() {
+        let server = test_server(); // 1024 peers: 512 unauthenticated, 16 per source
+        let add = |addr: &str| {
+            let addr: SocketAddr = addr.parse().unwrap();
+            let key = PeerKey::new(addr, Transport::Udp);
+            server.create_peer(key, Transport::Udp, addr, None, None)
+        };
+        let mut made = Vec::new();
+        for net in 0..32u32 {
+            for port in 1..=16u16 {
+                // Distinct /56s: 2001:db8:NN00::/56.
+                made.push(add(&format!("[2001:db8:0:{:x}00::1]:{port}", net + 1)).unwrap());
+            }
+        }
+        let first = made[0].key();
+        assert_eq!(server.peers.read().unwrap().len(), 512);
+        assert!(add("198.51.100.7:5000").is_some(), "newcomer refused");
+        assert_eq!(server.peers.read().unwrap().len(), 512);
+        // The oldest peer of a source holding the most went.
+        assert!(server.get_peer(&first).is_none());
+        assert!(made[0].link.lock().unwrap().removed);
+        // A second newcomer from the same source still gets in: it holds
+        // one, the others 15 or 16.
+        assert!(add("198.51.100.7:5001").is_some());
+        assert!(server.get_peer(&made[16].key()).is_none());
+        server.close();
+    }
+
+    /// A source that holds as many peers handshaking as any other does not
+    /// push out anyone's: with two sources at two each in a table of four,
+    /// a fifth from either is turned away.
+    #[test]
+    fn a_newcomer_does_not_push_out_a_smaller_source() {
+        let server = server_configured(auth_ok(), |c| c.max_peers(8).max_unauthenticated_peers(4));
+        let add = |addr: &str| {
+            let addr: SocketAddr = addr.parse().unwrap();
+            let key = PeerKey::new(addr, Transport::Udp);
+            server.create_peer(key, Transport::Udp, addr, None, None)
+        };
+        for a in ["192.0.2.1:1", "192.0.2.1:2", "192.0.2.2:1", "192.0.2.2:2"] {
+            assert!(add(a).is_some());
+        }
+        assert!(add("192.0.2.1:3").is_none());
+        assert!(add("192.0.2.2:3").is_none());
+        // A third source holds none: it gets a place.
+        assert!(add("192.0.2.3:1").is_some());
+        assert_eq!(server.peers.read().unwrap().len(), 4);
+        server.close();
+    }
+
+    /// IPv6 clients of one /56 (by default) are one source: 16 /64s of it
+    /// cannot take 16 places each.
+    #[test]
+    fn ipv6_sources_are_grouped_by_prefix() {
+        let add = |server: &Server, addr: &str| {
+            let addr: SocketAddr = addr.parse().unwrap();
+            let key = PeerKey::new(addr, Transport::Udp);
+            server
+                .create_peer(key, Transport::Udp, addr, None, None)
+                .is_some()
+        };
+        let server = test_server();
+        let made = (0..32u32)
+            .filter(|n| add(&server, &format!("[2001:db8:0:{n:x}::1]:1194")))
+            .count();
+        assert_eq!(made, DEFAULT_MAX_UNAUTHENTICATED_PER_SOURCE);
+        server.close();
+        let server = server_configured(auth_ok(), |c| c.source_prefix_v6(64));
+        let made = (0..32u32)
+            .filter(|n| add(&server, &format!("[2001:db8:0:{n:x}::1]:1194")))
+            .count();
+        assert_eq!(made, 32);
+        server.close();
+    }
+
+    #[test]
+    fn the_victim_is_the_oldest_of_the_largest_source() {
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        let (a, b, c) = (ip("192.0.2.1"), ip("192.0.2.2"), ip("192.0.2.3"));
+        let pick = |items: &[(std::net::IpAddr, u32)], newcomer| {
+            pick_victim(items.iter().map(|&(s, age)| (s, age, age)), newcomer)
+        };
+        assert_eq!(pick(&[(a, 5), (a, 3), (b, 1)], c), Some(3));
+        // Ties between sources: the one with the oldest goes.
+        assert_eq!(pick(&[(a, 5), (a, 3), (b, 4), (b, 2)], c), Some(2));
+        // Never a source holding no more than the newcomer's.
+        assert_eq!(pick(&[(a, 5), (a, 3), (b, 4), (b, 2)], a), None);
+        assert_eq!(pick(&[(a, 5), (b, 4), (b, 2)], a), Some(2));
+        assert_eq!(pick(&[], a), None);
     }
 
     /// While every auth worker is busy -- a slow on_auth -- peers that come

@@ -68,6 +68,9 @@ pub struct AdapterConfig {
     /// Most of those from one source; see
     /// [`ServerConfig::max_unauthenticated_peers_per_source`].
     pub max_unauthenticated_peers_per_source: usize,
+    /// How much of an IPv6 address names its source for the per-source
+    /// limits; see [`ServerConfig::source_prefix_v6`].
+    pub source_prefix_v6: u8,
     /// New peers per period from one source, or `None` (the default) for
     /// no limit; see [`ServerConfig::connect_freq`].
     pub connect_freq: Option<(u32, Duration)>,
@@ -92,6 +95,7 @@ setters! {
         set max_peers: usize;
         some max_unauthenticated_peers: usize;
         set max_unauthenticated_peers_per_source: usize;
+        set source_prefix_v6: u8;
         some connect_freq: (u32, Duration);
         set max_tcp_connections: usize;
         set max_tcp_connections_per_source: usize;
@@ -119,6 +123,7 @@ impl AdapterConfig {
             max_unauthenticated_peers: None,
             max_unauthenticated_peers_per_source:
                 super::server::DEFAULT_MAX_UNAUTHENTICATED_PER_SOURCE,
+            source_prefix_v6: super::server::DEFAULT_SOURCE_PREFIX_V6,
             connect_freq: None,
             max_tcp_connections: super::server::DEFAULT_MAX_TCP_CONNECTIONS,
             max_tcp_connections_per_source: super::server::DEFAULT_MAX_TCP_CONNECTIONS_PER_SOURCE,
@@ -140,6 +145,7 @@ impl std::fmt::Debug for AdapterConfig {
                 "max_unauthenticated_peers_per_source",
                 &self.max_unauthenticated_peers_per_source,
             )
+            .field("source_prefix_v6", &self.source_prefix_v6)
             .field("connect_freq", &self.connect_freq)
             .field("max_tcp_connections", &self.max_tcp_connections)
             .field(
@@ -212,6 +218,7 @@ impl Adapter {
             ServerConfig::new(cfg.tls_config, cfg.listen_addr, cfg.on_auth, on_data)
                 .max_peers(cfg.max_peers)
                 .max_unauthenticated_peers_per_source(cfg.max_unauthenticated_peers_per_source)
+                .source_prefix_v6(cfg.source_prefix_v6)
                 .max_tcp_connections(cfg.max_tcp_connections)
                 .max_tcp_connections_per_source(cfg.max_tcp_connections_per_source)
                 .timers(cfg.timers)
