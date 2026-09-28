@@ -384,7 +384,16 @@ pub(crate) fn process_handshake_initiation(
     if !h.cookie_check_mac1(data) {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid MAC1"));
     }
-    let under_load = h.note_initiation_under_load();
+    // An initiation accepted from on_unknown_peer and re-run was counted,
+    // and charged, when it arrived: charging again would refuse the peer
+    // the caller just accepted, once its source had spent the rest of its
+    // allowance meanwhile.
+    let replay = crate::wg::handler::replaying_accepted();
+    let under_load = if replay {
+        h.is_under_load()
+    } else {
+        h.note_initiation_under_load()
+    };
 
     // Under load: require a valid MAC2. The sender index lives at
     // data[4..8]; MAC1 occupies data[116..132] on a 148-byte initiation.
@@ -412,7 +421,7 @@ pub(crate) fn process_handshake_initiation(
         // us doing DH work flat out. As the reference's
         // wg_cookie_validate_packet does, hold each source to its share
         // while under load, dropping the excess without a reply.
-        if !h.ratelimit_allow(remote_addr.ip()) {
+        if !replay && !h.ratelimit_allow(remote_addr.ip()) {
             return Err(io::Error::other("handshake rate limited"));
         }
     }

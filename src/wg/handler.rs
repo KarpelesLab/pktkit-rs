@@ -29,6 +29,34 @@ use crate::wg::transport::EncryptError;
 /// ([`Handler::get_peer_info`]) and a refresh keeps its replay state.
 pub(crate) const EXPIRED_PEER_GRACE: Duration = REJECT_AFTER_TIME;
 
+thread_local! {
+    /// Set while [`Handler::accept_unknown_peer`] (or the adapter's) re-runs
+    /// an initiation that already went through the under-load checks when
+    /// it arrived, and was charged for there.
+    static REPLAYING_ACCEPTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` as the re-run of an accepted unknown peer's initiation: see
+/// [`replaying_accepted`].
+pub(crate) fn replay_accepted<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            REPLAYING_ACCEPTED.with(|r| r.set(self.0));
+        }
+    }
+    let _restore = Restore(REPLAYING_ACCEPTED.with(|r| r.replace(true)));
+    f()
+}
+
+/// Whether this thread is re-running an accepted unknown peer's
+/// initiation. It was counted towards the load, and charged to its source's
+/// rate limit, when it arrived; the re-run is the caller's decision, not
+/// more traffic, and is charged nothing.
+pub(crate) fn replaying_accepted() -> bool {
+    REPLAYING_ACCEPTED.with(std::cell::Cell::get)
+}
+
 /// Callback invoked when a handshake arrives from a peer not in the authorized
 /// list. The packet slice is only valid for the call; the callback must copy
 /// it if it needs to keep the data (e.g. for later `accept_unknown_peer`).
@@ -1056,6 +1084,15 @@ impl Handler {
     /// load lasts a second past the last time the threshold was exceeded,
     /// so a flood does not flicker between the two paths.
     pub(crate) fn note_initiation_under_load(&self) -> bool {
+        self.under_load(true)
+    }
+
+    /// Whether we are under load, without counting an initiation.
+    pub(crate) fn is_under_load(&self) -> bool {
+        self.under_load(false)
+    }
+
+    fn under_load(&self, count: bool) -> bool {
         let now = Instant::now();
         let mut m = self.load.lock().expect("load lock");
         if m.window_start
@@ -1064,9 +1101,11 @@ impl Handler {
             m.window_start = Some(now);
             m.count = 0;
         }
-        m.count = m.count.saturating_add(1);
-        if m.count > self.load_threshold {
-            m.until = Some(now + Duration::from_secs(1));
+        if count {
+            m.count = m.count.saturating_add(1);
+            if m.count > self.load_threshold {
+                m.until = Some(now + Duration::from_secs(1));
+            }
         }
         m.until.is_some_and(|u| now < u)
     }
@@ -1223,7 +1262,7 @@ impl Handler {
                 "peer not authorized after adding it",
             ));
         }
-        let res = self.process_packet(initiation_packet, remote_addr)?;
+        let res = replay_accepted(|| self.process_packet(initiation_packet, remote_addr))?;
         Ok(res.response)
     }
 }
@@ -2135,6 +2174,45 @@ mod tests {
         assert!(b.get_peer_info(&recent.public_key()).is_some());
         assert!(b.get_peer_info(&never.public_key()).is_some());
         assert!(holds_state_for(&b, &never.public_key()));
+    }
+
+    /// An unknown peer's initiation is charged to its source's under-load
+    /// allowance when it arrives. Accepting the peer later -- the callback
+    /// kept the packet and a decision came afterwards -- re-runs it, which
+    /// must not charge the source a second time: with its allowance spent
+    /// meanwhile, the peer the caller accepted was refused.
+    #[test]
+    fn accepting_an_unknown_peer_charges_its_source_once() {
+        let stash: Arc<Mutex<Option<Vec<u8>>>> = Arc::default();
+        let st = stash.clone();
+        let b = Handler::new(
+            Config::default()
+                .load_threshold(0)
+                .on_unknown_peer(Arc::new(move |_, _, pkt: &[u8]| {
+                    *st.lock().unwrap() = Some(pkt.to_vec());
+                })),
+        )
+        .unwrap();
+        let a = Handler::new(Config::default()).unwrap();
+        a.add_peer(b.public_key());
+        let here = loopback();
+        // Under load: a cookie first, for the initiation to pass MAC2.
+        let init = a.initiate_handshake(&b.public_key()).unwrap();
+        let reply = b.process_packet(&init, &here).unwrap();
+        assert_eq!(reply.ty, PacketType::CookieReply);
+        a.process_packet(&reply.response, &here).unwrap();
+        let init = a.initiate_handshake(&b.public_key()).unwrap();
+        assert!(b.process_packet(&init, &here).is_err(), "unknown peer");
+        let pkt = stash.lock().unwrap().take().expect("callback not invoked");
+        // The source spends the rest of its allowance.
+        while b.ratelimit_allow(here.ip()) {}
+        let resp = b
+            .accept_unknown_peer(a.public_key(), &pkt, &here)
+            .expect("the accepted initiation was charged again");
+        assert_eq!(
+            a.process_packet(&resp, &here).unwrap().ty,
+            PacketType::HandshakeResponse
+        );
     }
 
     #[test]

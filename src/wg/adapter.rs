@@ -344,7 +344,7 @@ impl Adapter {
                 "peer not authorized after adding it",
             ));
         }
-        self.server.handle_packet(packet, addr)
+        crate::wg::handler::replay_accepted(|| self.server.handle_packet(packet, addr))
     }
 
     /// Remove a peer and tear down its plumbing.
