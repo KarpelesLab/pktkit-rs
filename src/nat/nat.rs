@@ -639,10 +639,11 @@ impl Nat {
     /// Fails with `AlreadyExists` if the port is forwarded to another host,
     /// and with `AddrInUse` if a live dynamic mapping or a pending expectation
     /// holds it: taking the port over would hand that session's traffic to
-    /// the forward's host. Also fails with `AddrInUse` if another port is
-    /// already forwarded to the same inside endpoint: the NAT gives each
-    /// inside endpoint a single public port, from which all its traffic
-    /// leaves.
+    /// the forward's host. A dynamic mapping of the forward's own inside
+    /// endpoint is no conflict, and becomes the forward's, sessions and
+    /// all. Also fails with `AddrInUse` if another port is already
+    /// forwarded to the same inside endpoint: the NAT gives each inside
+    /// endpoint a single public port, from which all its traffic leaves.
     pub fn add_port_forward(&self, pf: PortForward) -> Result<()> {
         self.add_port_forward_id(pf).map(|_| ())
     }
@@ -678,7 +679,13 @@ impl Nat {
             .expectations
             .iter()
             .any(|e| e.proto == pf.proto && e.outside_port == pf.outside_port && now <= e.expires);
-        let dynamic = inner.reverse.contains_key(&rk) && !inner.forwards.contains_key(&rk);
+        // A dynamic mapping of the forward's own inside endpoint is no
+        // conflict: a host that sends from its listening port, which the
+        // NAT preserved, then asks UPnP to forward that port to itself
+        // wants exactly what it has. The forward takes the mapping over.
+        let endpoint = Forwards::endpoint(&pf);
+        let own = inner.reverse.get(&rk) == Some(&endpoint);
+        let dynamic = inner.reverse.contains_key(&rk) && !inner.forwards.contains_key(&rk) && !own;
         // An inside endpoint has one mapping, so one public port (RFC 5382
         // REQ-1: endpoint-independent mapping). A second forward to it
         // would move that mapping to whichever port saw traffic last,
@@ -703,7 +710,12 @@ impl Nat {
                 && old.inside_ip == pf.inside_ip
                 && old.inside_port == pf.inside_port
         });
-        if !same {
+        if own {
+            // Opened as a forward's is, sessions and port kept.
+            if let Some(m) = inner.mappings.get_mut(&endpoint) {
+                m.open = true;
+            }
+        } else if !same {
             Self::remove_mapping_at_locked(inner, rk);
         }
         inner.forward_id += 1;
@@ -3192,6 +3204,35 @@ mod tests {
                 Ipv4Addr::new(10, 0, 0, 9),
                 22,
             ))
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+    }
+
+    #[test]
+    fn host_may_forward_the_port_its_own_mapping_holds() {
+        let (nat, i, o) = setup();
+        let other = Ipv4Addr::new(10, 0, 0, 9);
+        // A BitTorrent client sends from its listening port, which the NAT
+        // preserves, then asks (UPnP) for that same port to be forwarded
+        // to itself.
+        let p = build_udp(INSIDE, 40000, REMOTE, 6881, b"dht");
+        nat.inside().send(Packet::from_slice(&p)).unwrap();
+        assert_eq!(src_port(&o.lock().unwrap()[0]), 40000);
+        nat.add_port_forward(PortForward::new(PROTO_UDP, 40000, INSIDE, 40000))
+            .unwrap();
+        // The mapping is the forward's now: open to anyone, and its
+        // session with REMOTE kept.
+        let p = build_udp(Ipv4Addr::new(192, 0, 2, 77), 1234, PUBLIC, 40000, b"hi");
+        nat.outside().send(Packet::from_slice(&p)).unwrap();
+        let p = build_udp(REMOTE, 6881, PUBLIC, 40000, b"re");
+        nat.outside().send(Packet::from_slice(&p)).unwrap();
+        assert_eq!(i.lock().unwrap().len(), 2);
+        assert_eq!(mapped(&nat), 1);
+        // Another host's mapping still keeps its port.
+        let p = build_udp(other, 40002, REMOTE, 6881, b"dht");
+        nat.inside().send(Packet::from_slice(&p)).unwrap();
+        let err = nat
+            .add_port_forward(PortForward::new(PROTO_UDP, 40002, INSIDE, 40002))
             .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
     }
