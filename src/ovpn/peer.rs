@@ -74,7 +74,7 @@ fn invalid(msg: impl Into<String>) -> io::Error {
 /// but only for the identity the session first authenticated as: a client
 /// presenting another username, or another certificate, is refused without
 /// a call, as OpenVPN refuses it.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct AuthInfo {
     /// The `auth-user-pass` username; empty if the client sent none.
@@ -95,6 +95,42 @@ pub struct AuthInfo {
     /// The subject common name (CN) of the leaf certificate, if there is a
     /// leaf and it names one: what OpenVPN calls the client's common name.
     pub common_name: Option<String>,
+}
+
+impl std::fmt::Debug for AuthInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never the password: debug output ends up in logs.
+        f.debug_struct("AuthInfo")
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .field("peer_info", &self.peer_info)
+            .field("dev_type", &self.dev_type)
+            .field("peer_certificates", &self.peer_certificates.len())
+            .field("common_name", &self.common_name)
+            .finish()
+    }
+}
+
+impl AuthInfo {
+    /// Wipe the password.
+    fn wipe(&mut self) {
+        wipe_string(&mut self.password);
+    }
+}
+
+impl Drop for AuthInfo {
+    /// The password is wiped from memory when the info is dropped, so it
+    /// does not linger in freed memory; clones the callback makes are its
+    /// own to wipe.
+    fn drop(&mut self) {
+        self.wipe();
+    }
+}
+
+/// Overwrite a string's bytes with zeros (NULs, still valid UTF-8).
+fn wipe_string(s: &mut str) {
+    // SAFETY: zero bytes are valid UTF-8.
+    crate::zeroize::zeroize(unsafe { s.as_bytes_mut() });
 }
 
 /// IP configuration the server pushes back to an authenticated client.
@@ -1127,6 +1163,16 @@ struct KeyState {
     data: Option<DataKeys>,
 }
 
+impl Drop for KeyState {
+    /// The server random is secret until the key is derived from it
+    /// (derive_keys wipes it then); a key that never gets that far is
+    /// wiped here.
+    fn drop(&mut self) {
+        crate::zeroize::zeroize(&mut self.server_random);
+        crate::zeroize::zeroize(&mut self.ctrl_buf);
+    }
+}
+
 /// Data-channel keys and packet-id state for one key.
 struct DataKeys {
     keys: PeerKeys,
@@ -1459,13 +1505,19 @@ impl Session {
             .map_err(|e| invalid(format!("tls feed: {e:?}")))?;
         // Drain decrypted plaintext into the control buffer. `recv` hands
         // back everything buffered in one call.
-        let plain = tls
+        let mut plain = tls
             .recv()
             .map_err(|e| invalid(format!("tls recv: {e:?}")))?;
         // A rejected session is only kept to deliver AUTH_FAILED; nothing
         // the client says on it is acted on any more.
-        if self.auth_failed.is_none() {
+        let rejected = self.auth_failed.is_some();
+        if !rejected {
             self.primary.ctrl_buf.extend_from_slice(&plain);
+        }
+        // It may hold the key exchange: the pre-master secret and the
+        // password.
+        crate::zeroize::zeroize(&mut plain);
+        if !rejected {
             self.advance_control(auth, request)?;
             // Whatever is left is an incomplete message; bound how much of
             // one we are willing to hold.
@@ -1505,6 +1557,9 @@ impl Session {
             None => return Ok(()), // not enough bytes yet
         };
         // What follows the key exchange is NUL-terminated control messages.
+        // The key exchange itself -- pre-master secret, password -- is
+        // wiped first: draining only moves what follows over part of it.
+        crate::zeroize::zeroize(&mut self.primary.ctrl_buf[..used]);
         self.primary.ctrl_buf.drain(..used);
 
         // Generate the server random once; it's used both in the reply and in
@@ -1580,7 +1635,7 @@ impl Session {
     /// the client, or generate the key and start the data channel.
     fn apply_auth(
         &mut self,
-        kx: KeyExchange,
+        mut kx: KeyExchange,
         verdict: Result<PeerConfig, String>,
     ) -> io::Result<()> {
         let cfg = match verdict {
@@ -1612,8 +1667,8 @@ impl Session {
                 "tap" => 2,
                 _ => 3,
             };
-            self.peer_info = kx.peer_info;
-            self.opts = Some(kx.opts);
+            self.peer_info = std::mem::take(&mut kx.peer_info);
+            self.opts = Some(std::mem::take(&mut kx.opts));
             self.pushed_cipher = kx.ncp_cipher;
         }
         // Control messages that arrived with the key exchange, or while it
@@ -1712,6 +1767,13 @@ impl Session {
         prf10(&mut expansion, &master, label2.as_bytes(), &seed2);
 
         self.primary.data = Some(DataKeys::new(PeerKeys::from_expansion(&expansion)));
+        // Everything but the keys themselves, which PeerKeys wipes when
+        // dropped: the secrets they were derived from, and the random
+        // material of both sides.
+        for buf in [&mut master[..], &mut expansion, &mut seed, &mut seed2] {
+            crate::zeroize::zeroize(buf);
+        }
+        crate::zeroize::zeroize(&mut self.primary.server_random);
     }
 }
 
@@ -1918,6 +1980,22 @@ struct KeyExchange {
     leaf: Option<Vec<u8>>,
 }
 
+impl KeyExchange {
+    /// Wipe the client's secrets.
+    fn wipe(&mut self) {
+        crate::zeroize::zeroize(&mut self.pre_master);
+        crate::zeroize::zeroize(&mut self.random1);
+        crate::zeroize::zeroize(&mut self.random2);
+        wipe_string(&mut self.password);
+    }
+}
+
+impl Drop for KeyExchange {
+    fn drop(&mut self) {
+        self.wipe();
+    }
+}
+
 /// Read a control string at `pos`: a big-endian u16 length followed by that
 /// many bytes, NUL-terminated. Returns the string (without the NUL) and the
 /// new position, or `None` if the buffer doesn't yet hold the whole string.
@@ -2012,6 +2090,49 @@ mod tests {
         s.primary.established = Some(Instant::now());
         p.active = Some(s);
         p
+    }
+
+    /// The secrets of a key exchange -- the pre-master secret, the random
+    /// material of both sides, the password -- are wiped once used or
+    /// dropped, not left in freed memory.
+    #[test]
+    fn key_exchange_secrets_are_wiped() {
+        let mut buf = vec![0, 0, 0, 0, 2];
+        buf.extend_from_slice(&[0x11; 48]);
+        buf.extend_from_slice(&[0x22; 32]);
+        buf.extend_from_slice(&[0x33; 32]);
+        write_control_string(&mut buf, &crate::ovpn::tests::gcm_opts().to_string());
+        write_control_string(&mut buf, "alice");
+        write_control_string(&mut buf, "hunter2");
+        write_control_string(&mut buf, "IV_VER=2.6\n");
+        let (mut kx, used) = try_parse_key_exchange(&buf).unwrap().unwrap();
+        assert_eq!(used, buf.len());
+
+        let (mut s, _) = Session::new(*b"SERVERID", *b"CLIENTID", PeerTimers::default());
+        s.primary.server_random = [0x44; 64];
+        s.derive_keys(&kx);
+        assert!(s.primary.data.is_some());
+        assert_eq!(s.primary.server_random, [0; 64], "server random kept");
+
+        assert_eq!(kx.password, "hunter2");
+        kx.wipe();
+        assert_eq!(kx.pre_master, [0; 48]);
+        assert_eq!(kx.random1, [0; 32]);
+        assert_eq!(kx.random2, [0; 32]);
+        assert!(kx.password.bytes().all(|b| b == 0));
+
+        let mut info = AuthInfo {
+            username: "alice".into(),
+            password: "hunter2".into(),
+            peer_info: HashMap::new(),
+            dev_type: "tun".into(),
+            peer_certificates: Vec::new(),
+            common_name: None,
+        };
+        info.wipe();
+        assert!(info.password.bytes().all(|b| b == 0));
+        assert_eq!(info.username, "alice");
+        assert!(!format!("{info:?}").contains("hunter2"));
     }
 
     #[test]

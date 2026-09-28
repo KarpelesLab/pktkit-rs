@@ -49,18 +49,13 @@ impl PeerKeys {
 
 impl Drop for PeerKeys {
     fn drop(&mut self) {
-        // Best-effort wipe of key material. `write_volatile` prevents the
-        // compiler from eliding the stores. (The `zeroize` crate is only a
-        // dependency of the `wg` feature, so we do this by hand here.)
         for buf in [
             &mut self.cipher_encrypt,
             &mut self.hmac_encrypt,
             &mut self.cipher_decrypt,
             &mut self.hmac_decrypt,
         ] {
-            for b in buf.iter_mut() {
-                unsafe { std::ptr::write_volatile(b, 0) };
-            }
+            crate::zeroize::zeroize(buf);
         }
     }
 }

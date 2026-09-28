@@ -43,6 +43,12 @@ impl Cookies {
         }
     }
 
+    /// Wipe the key: whoever reads it can hand out session ids that pass
+    /// [`check`](Self::check).
+    fn wipe(&mut self) {
+        crate::zeroize::zeroize(&mut self.key);
+    }
+
     fn slot_at(&self, now: Instant) -> u64 {
         let elapsed = now.saturating_duration_since(self.epoch);
         (elapsed.as_millis() / self.slot.as_millis()) as u64
@@ -107,6 +113,12 @@ impl Cookies {
                 .fold(0u8, |acc, (a, b)| acc | (a ^ b))
                 == 0
         })
+    }
+}
+
+impl Drop for Cookies {
+    fn drop(&mut self) {
+        self.wipe();
     }
 }
 
@@ -269,6 +281,14 @@ mod tests {
         late.set_pid(2);
         let late = ControlPacket::parse(&late.to_bytes(&[0])).unwrap();
         assert!(!c.check(&late, from, t0));
+    }
+
+    #[test]
+    fn the_cookie_key_is_wiped() {
+        let mut c = Cookies::new(Duration::from_secs(60));
+        assert_ne!(c.key, [0; 32]);
+        c.wipe();
+        assert_eq!(c.key, [0; 32]);
     }
 
     #[test]

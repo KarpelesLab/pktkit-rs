@@ -49,6 +49,9 @@ fn p_hash<H: Digest>(result: &mut [u8], secret: &[u8], seed: &[u8]) {
         let n = (result.len() - written).min(out_len);
         result[written..written + n].copy_from_slice(&block[..n]);
         written += n;
+        // Each block is part of the output, and A(i) derives all the
+        // blocks after it: key material, left on the stack otherwise.
+        crate::zeroize::zeroize(block);
 
         // A(i+1) = HMAC(secret, A(i))
         let mut next = H::zeroed_output();
@@ -57,7 +60,9 @@ fn p_hash<H: Digest>(result: &mut [u8], secret: &[u8], seed: &[u8]) {
         mac.update(a);
         mac.finalize_into(next);
         a.copy_from_slice(next);
+        crate::zeroize::zeroize(next);
     }
+    crate::zeroize::zeroize(a);
 }
 
 /// TLS 1.0 PRF (RFC 2246 §5): MD5 over the first half XOR SHA-1 over the second.
@@ -73,6 +78,8 @@ pub fn prf10(result: &mut [u8], secret: &[u8], label: &[u8], seed: &[u8]) {
     for (r, b) in result.iter_mut().zip(result2.iter()) {
         *r ^= *b;
     }
+    // Half of the output: with the other half, the output itself.
+    crate::zeroize::zeroize(&mut result2);
 }
 
 /// TLS 1.2 PRF (RFC 5246 §5) using SHA-256. OpenVPN key-method 2 derives its

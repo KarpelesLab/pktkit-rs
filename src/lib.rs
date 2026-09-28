@@ -76,7 +76,7 @@ mod protocol;
 mod rand;
 mod stats;
 pub mod time;
-#[cfg(feature = "wg")]
+#[cfg(any(feature = "wg", feature = "ovpn"))]
 mod zeroize;
 
 #[cfg(not(target_family = "wasm"))]
