@@ -1,4 +1,15 @@
-//! RTO calculation (RFC 6298) with Karn's algorithm.
+//! RTO calculation (RFC 6298) with Karn's algorithm, and RFC 7323's
+//! per-ACK samples when timestamps are on.
+//!
+//! The constants are Linux's: RFC 6298 asks for a 1 s floor (a SHOULD),
+//! which every major stack lowers to 200 ms. Linux also floors the
+//! variance term rather than the sum, RTO = SRTT + max(4*RTTVAR, 200 ms),
+//! which is RFC 6298's `max(G, K*RTTVAR)` with a coarse G: on a path of
+//! steady delay RTTVAR decays towards zero, and an RTO that close to the
+//! round trip fires on any jitter (a delayed ACK alone adds 40 ms). The cap
+//! stays at 60 s, the least RFC 6298 §2.5 allows (Linux uses 120 s): with
+//! [`MAX_RETRIES`](super::conn::MAX_RETRIES) backoffs it bounds how long a
+//! connection keeps trying.
 
 use crate::time::Instant;
 use std::time::Duration;
@@ -7,11 +18,11 @@ use super::seqspace::seq_after;
 
 /// Default initial retransmission timeout (RFC 6298 §2.1).
 pub const DEFAULT_RTO: Duration = Duration::from_secs(1);
-/// Floor for the RTO (RFC 6298 §2.4 — most implementations).
+/// Floor for the RTO, and for its variance term (Linux's `TCP_RTO_MIN`).
 pub const MIN_RTO: Duration = Duration::from_millis(200);
 /// RTO once data transfer begins after a lost SYN (RFC 6298 §5.7).
 const SYN_LOSS_RTO: Duration = Duration::from_secs(3);
-/// Hard upper bound (RFC 6298 allows up to 60s).
+/// Cap on the RTO, backoff included: the least RFC 6298 §2.5 allows.
 pub const MAX_RTO: Duration = Duration::from_secs(60);
 
 /// Computes the retransmission timeout per RFC 6298.
@@ -52,17 +63,32 @@ impl RtoState {
 
     /// Feed a fresh RTT sample and recompute SRTT / RTTVAR / RTO.
     pub fn sample(&mut self, rtt: Duration) {
+        self.sample_of(rtt, 1);
+    }
+
+    /// Feed one of about `per_window` samples taken this round trip.
+    ///
+    /// With timestamps every ACK that advances SND.UNA gives a sample (RFC
+    /// 7323 §4.2), and weighing each as RFC 6298 weighs one per round trip
+    /// would have SRTT and RTTVAR forget a round trip's history in a
+    /// fraction of it. RFC 7323 Appendix G divides the gains by the
+    /// samples expected per window instead, alpha' = alpha / n and
+    /// beta' = beta / n, which keeps their memory a few round trips long.
+    pub fn sample_of(&mut self, rtt: Duration, per_window: u32) {
+        let n = per_window.max(1);
         if !self.measured {
             self.srtt = rtt;
             self.rttvar = rtt / 2;
             self.measured = true;
         } else {
-            // RTTVAR must be updated before SRTT (RFC 6298 §2.3).
+            // RTTVAR must be updated before SRTT (RFC 6298 §2.3):
+            // RTTVAR += beta' * (|SRTT - R| - RTTVAR), beta' = 1/(4n), and
+            // SRTT += alpha' * (R - SRTT), alpha' = 1/(8n).
             let diff = self.srtt.abs_diff(rtt);
-            self.rttvar = (self.rttvar * 3 + diff) / 4;
-            self.srtt = (self.srtt * 7 + rtt) / 8;
+            self.rttvar = (self.rttvar * (4 * n - 1) + diff) / (4 * n);
+            self.srtt = (self.srtt * (8 * n - 1) + rtt) / (8 * n);
         }
-        self.rto = self.srtt + self.rttvar * 4;
+        self.rto = self.srtt + (self.rttvar * 4).max(MIN_RTO);
         self.clamp();
     }
 
@@ -106,16 +132,23 @@ impl RtoState {
     /// If the ACK covers the timed segment, record the sample. Returns true
     /// when a sample was taken.
     pub fn ack_received(&mut self, ack: u32) -> bool {
-        if !self.timing {
-            return false;
+        match self.timed_rtt(ack) {
+            Some(rtt) => {
+                self.sample(rtt);
+                true
+            }
+            None => false,
         }
-        if seq_after(ack, self.time_seq) {
-            let elapsed = self.time_sent.elapsed();
-            self.sample(elapsed);
-            self.timing = false;
-            return true;
+    }
+
+    /// If the ACK covers the timed segment, the round trip it took, for
+    /// the caller to [sample](Self::sample_of); timing stops either way.
+    pub fn timed_rtt(&mut self, ack: u32) -> Option<Duration> {
+        if !self.timing || !seq_after(ack, self.time_seq) {
+            return None;
         }
-        false
+        self.timing = false;
+        Some(self.time_sent.elapsed())
     }
 
     /// Karn's algorithm: drop the current sample on retransmit.
@@ -160,6 +193,45 @@ mod tests {
         let mut r = RtoState::new();
         r.sample(Duration::from_micros(1));
         assert!(r.rto() >= MIN_RTO);
+    }
+
+    /// The variance term has a floor of its own, as Linux's: a steady
+    /// round trip must not bring the RTO down to it.
+    #[test]
+    fn rto_stays_clear_of_a_steady_rtt() {
+        let mut r = RtoState::new();
+        for _ in 0..100 {
+            r.sample(Duration::from_millis(300));
+        }
+        assert_eq!(r.srtt(), Duration::from_millis(300));
+        assert!(r.rto() >= Duration::from_millis(500), "{:?}", r.rto());
+    }
+
+    /// Before any sample the RTO is RFC 6298's 1 s; a backoff doubles it,
+    /// up to the cap.
+    #[test]
+    fn initial_rto_and_cap() {
+        let mut r = RtoState::new();
+        assert_eq!(r.rto(), Duration::from_secs(1));
+        for _ in 0..10 {
+            r.backoff();
+        }
+        assert_eq!(r.rto(), MAX_RTO);
+    }
+
+    /// Many samples a window move SRTT about as far in a round trip as one
+    /// sample a window does (RFC 7323 Appendix G).
+    #[test]
+    fn per_ack_samples_are_weighed_by_the_window() {
+        let (mut once, mut each) = (RtoState::new(), RtoState::new());
+        once.sample(Duration::from_millis(100));
+        each.sample(Duration::from_millis(100));
+        once.sample(Duration::from_millis(200));
+        for _ in 0..10 {
+            each.sample_of(Duration::from_millis(200), 10);
+        }
+        let diff = once.srtt().abs_diff(each.srtt());
+        assert!(diff < Duration::from_millis(2), "{once:?} / {each:?}");
     }
 
     #[test]

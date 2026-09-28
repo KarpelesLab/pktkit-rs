@@ -11,13 +11,15 @@
 //!
 //! Supported RFCs:
 //! - RFC 9293 (TCP, rolled-up): state machine and segment processing.
-//! - RFC 6298: RTO smoothing + Karn's algorithm.
+//! - RFC 6298: RTO smoothing + Karn's algorithm, with Linux's constants
+//!   (200 ms floor under the variance term, 1 s initial RTO).
 //! - RFC 5681: congestion control (slow start, congestion avoidance, fast
 //!   retransmit/recovery), with RFC 6582's NewReno partial-ACK handling,
 //!   RFC 3042 Limited Transmit and RFC 6928's initial window.
 //! - RFC 3649: HighSpeed TCP (default controller); NewReno is the other.
 //! - RFC 7661 §4.3: no cwnd growth while the sender is application-limited.
-//! - RFC 7323: window scaling, timestamps (PAWS).
+//! - RFC 7323: window scaling, timestamps (PAWS, and an RTT sample from
+//!   every ACK, weighed as its Appendix G suggests).
 //! - RFC 2018: SACK, and RFC 6675 SACK-based loss recovery.
 //! - RFC 5827: Early Retransmit, for a flight too small to draw three
 //!   duplicate ACKs.

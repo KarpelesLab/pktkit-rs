@@ -851,6 +851,7 @@ impl Conn {
         };
         self.queue_seg(synack);
         self.send_buf.as_mut().unwrap().advance_sent(1);
+        self.rto.start_timing(iss);
 
         self.syn_data = syn.payload.clone();
 
@@ -1612,6 +1613,8 @@ impl Conn {
             return self.take_outgoing();
         }
         self.send_buf.as_mut().unwrap().acknowledge(seg.ack);
+        // The SYN-ACK's round trip, unless it was resent (Karn).
+        self.rto.ack_received(seg.ack);
         self.retries = 0;
         self.stop_rto();
         self.set_snd_wnd((seg.window as u32) << self.snd_wnd_shift);
@@ -2049,7 +2052,7 @@ impl Conn {
             self.stop_persist();
         }
 
-        self.rto.ack_received(ack);
+        self.sample_rtt(seg, flight);
 
         if self.cc.in_recovery() && seq_after_eq(ack, self.cc.recovery_seq()) {
             self.cc.exit_recovery();
@@ -2066,6 +2069,47 @@ impl Conn {
         // buffer held has gone out does it show whether it ran dry.
         self.sndbuf_expand();
         true
+    }
+
+    /// Take the RTT samples an ACK that advanced SND.UNA offers: the timed
+    /// segment's (RFC 6298, Karn's algorithm), measured to the nanosecond,
+    /// and failing that the timestamp echo, which with timestamps every
+    /// such ACK carries (RFC 7323 §4.2) and which a retransmission cannot
+    /// make ambiguous, since it carries a TSval of its own. `flight` is
+    /// what was outstanding before the ACK.
+    fn sample_rtt(&mut self, seg: &Segment, flight: u32) {
+        let timed = self.rto.timed_rtt(seg.ack);
+        let Some(rtt) = timed.or_else(|| self.ts_echo_rtt(seg)) else {
+            return;
+        };
+        // RFC 7323 Appendix G: a window of timestamps gives about one
+        // sample per two segments, the ACKs of a delayed-ACK receiver.
+        let per_window = if self.ts_ok {
+            flight.div_ceil(2 * self.mss as u32).max(1)
+        } else {
+            1
+        };
+        self.rto.sample_of(rtt, per_window);
+    }
+
+    /// The round trip the timestamp echoed in `seg` has made, if it has
+    /// one: at least its age in whole milliseconds, and less than one more.
+    /// Rounded up, not down: a sample never reads shorter than the path.
+    fn ts_echo_rtt(&self, seg: &Segment) -> Option<Duration> {
+        if !self.ts_ok {
+            return None;
+        }
+        let (_, ecr) = get_timestamp(&seg.options)?;
+        // Zero is what a peer that has no TSval to echo sends (Linux reads
+        // it so too), and a wild echo reads as a huge (or negative) age.
+        let age = self.ts_now().wrapping_sub(ecr);
+        if ecr == 0 || age >= 1 << 20 {
+            return None;
+        }
+        // The TSval was taken in the millisecond `age` before this one:
+        // what has passed of this one belongs to the round trip too.
+        let into_ms = (self.ts_base.elapsed().as_nanos() % 1_000_000) as u64;
+        Some(Duration::from_millis(u64::from(age)) + Duration::from_nanos(into_ms))
     }
 
     fn on_dup_ack(&mut self, snd_nxt: u32) {
@@ -3055,6 +3099,7 @@ fn _options_export_is_used(_o: &TcpOption) {
 mod tests {
     use super::*;
     use crate::vtcp::options::get_mss;
+    use crate::vtcp::rto::DEFAULT_RTO;
 
     fn cfg(local: u16, remote: u16) -> ConnConfig {
         ConnConfig {
@@ -6178,6 +6223,10 @@ mod tests {
         client.budget = budget;
         server.budget = budget;
         drive_handshake(&mut client, &mut server);
+        // The handshake timed a round trip of next to nothing, which would
+        // pace the receiver's measurements; these tests stand for their
+        // round trips with RcvSpace::backdate instead.
+        server.rto = RtoState::new();
         (client, server)
     }
 
@@ -6357,5 +6406,41 @@ mod tests {
         client.rto_deadline = Some(Instant::now());
         client.closed = true;
         assert_eq!(client.next_deadline(), None);
+    }
+
+    /// With timestamps, an ACK advancing SND.UNA is an RTT sample even
+    /// when no segment is being timed (RFC 7323 §4.2); without, only the
+    /// timed segment's ACK is (RFC 6298).
+    #[test]
+    fn timestamps_give_a_sample_per_ack() {
+        for ts in [true, false] {
+            let (mut client, mut server) = if ts {
+                ts_pair(40610)
+            } else {
+                established(40611)
+            };
+            let (_, data) = client.write(&[1; 100]);
+            client.rto = RtoState::new();
+            let acks = deliver(&mut server, &data);
+            deliver(&mut client, &acks);
+            assert_eq!(client.rto.rto() < DEFAULT_RTO, ts, "timestamps {ts}");
+        }
+    }
+
+    /// The echo's round trip counts what has passed of the current
+    /// millisecond, so it is never shorter than the path, nor zero.
+    #[test]
+    fn timestamp_echo_rtt_rounds_up() {
+        let (client, _) = ts_pair(40612);
+        let seg = |ecr| Segment {
+            options: vec![timestamp_option(1, ecr)],
+            ..Default::default()
+        };
+        let now = client.ts_now();
+        let rtt = client.ts_echo_rtt(&seg(now.wrapping_sub(30))).unwrap();
+        assert!(rtt >= Duration::from_millis(30) && rtt < Duration::from_millis(32));
+        assert_eq!(client.ts_echo_rtt(&seg(0)), None);
+        // From the future, or older than the connection could be.
+        assert_eq!(client.ts_echo_rtt(&seg(now.wrapping_add(5))), None);
     }
 }
