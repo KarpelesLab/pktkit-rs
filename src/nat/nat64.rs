@@ -110,7 +110,8 @@ struct Nat64Inner {
     /// When a full pool may next reclaim idle mappings (see
     /// [`RECLAIM_INTERVAL`]).
     next_reclaim: Instant,
-    /// What each inside host holds; an entry goes once nothing refers to
+    /// What each inside host holds, by its prefix (see
+    /// [`NatLimits::host_prefix_v6`]); an entry goes once nothing refers to
     /// it.
     hosts: HashMap<Ipv6Addr, Arc<HostQuota>>,
     /// Remotes tracked over all mappings.
@@ -1183,7 +1184,7 @@ impl Nat64 {
         let limits = &inner.limits;
         let host = inner
             .hosts
-            .entry(k.ip)
+            .entry(host_of(k.ip, limits.host_prefix_v6))
             .or_insert_with(|| Arc::new(HostQuota::new(limits)))
             .clone();
         let hold = MappingHold::take(&host, false)?;
@@ -1335,6 +1336,14 @@ fn unexpired_source_route(opts: &[u8]) -> bool {
         }
     }
     false
+}
+
+/// The inside host `ip` counts as for the per-host caps: its first `len`
+/// bits.
+fn host_of(ip: Ipv6Addr, len: u8) -> Ipv6Addr {
+    let len = u32::from(len.min(128));
+    let mask = u128::MAX.checked_shl(128 - len).unwrap_or(0);
+    Ipv6Addr::from(u128::from(ip) & mask)
 }
 
 fn read_v6(b: &[u8]) -> Ipv6Addr {
@@ -2196,10 +2205,55 @@ mod tests {
         assert_eq!(inner.peer_quota.used(), 3);
         drop(inner);
 
-        let other: Ipv6Addr = "2001:db8::6".parse().unwrap();
+        // Another address in the host's /64 is the same host...
+        let same: Ipv6Addr = "2001:db8::6".parse().unwrap();
+        let pkt = build_v6_udp(same, 1, wkp(SERVER), 53, b"q");
+        nat.inside().send(Packet::from_slice(&pkt)).unwrap();
+        assert_eq!(outside.lock().unwrap().len(), 4);
+        // ...one in another /64 is another host.
+        let other: Ipv6Addr = "2001:db8:0:1::6".parse().unwrap();
         let pkt = build_v6_udp(other, 1, wkp(SERVER), 53, b"q");
         nat.inside().send(Packet::from_slice(&pkt)).unwrap();
         assert_eq!(outside.lock().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn a_host_cannot_dodge_its_cap_by_changing_address() {
+        let (nat, _inside, outside) = wired();
+        nat.set_limits(NatLimits::default().max_mappings_per_host(4));
+        let base = u128::from(CLIENT.parse::<Ipv6Addr>().unwrap());
+        for i in 0..50u16 {
+            let src = Ipv6Addr::from(base + u128::from(i) * 0x1_0000);
+            let pkt = build_v6_udp(src, 20000 + i, wkp(SERVER), 53, b"q");
+            nat.inside().send(Packet::from_slice(&pkt)).unwrap();
+        }
+        assert_eq!(outside.lock().unwrap().len(), 4);
+
+        // Where each host has its own /128, that can be said.
+        let (nat, _inside, outside) = wired();
+        nat.set_limits(
+            NatLimits::default()
+                .max_mappings_per_host(4)
+                .host_prefix_v6(128),
+        );
+        for i in 0..50u16 {
+            let src = Ipv6Addr::from(base + u128::from(i));
+            let pkt = build_v6_udp(src, 20000 + i, wkp(SERVER), 53, b"q");
+            nat.inside().send(Packet::from_slice(&pkt)).unwrap();
+        }
+        assert_eq!(outside.lock().unwrap().len(), 50);
+    }
+
+    #[test]
+    fn host_prefixes() {
+        let a: Ipv6Addr = "2001:db8:1:2:3:4:5:6".parse().unwrap();
+        assert_eq!(
+            host_of(a, 64),
+            "2001:db8:1:2::".parse::<Ipv6Addr>().unwrap()
+        );
+        assert_eq!(host_of(a, 128), a);
+        assert_eq!(host_of(a, 200), a);
+        assert_eq!(host_of(a, 0), Ipv6Addr::UNSPECIFIED);
     }
 
     #[test]

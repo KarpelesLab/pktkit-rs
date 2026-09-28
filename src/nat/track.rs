@@ -37,6 +37,9 @@ const DEFAULT_MAX_PEERS_PER_HOST: usize = 65536;
 const DEFAULT_MAX_PEERS: usize = 262_144;
 /// Default for [`NatLimits::max_expectations_per_host`].
 const DEFAULT_MAX_EXPECTATIONS_PER_HOST: usize = 128;
+/// Default for [`NatLimits::host_prefix_v6`]: a /64, the subnet size
+/// SLAAC hosts pick their addresses in (RFC 4291 §2.5.1).
+const DEFAULT_HOST_PREFIX_V6: u8 = 64;
 
 /// Caps on the state a [`Nat`](super::Nat) or [`Nat64`](super::Nat64)
 /// keeps, so that no inside host, nor the remotes it talks to, can grow it
@@ -66,6 +69,15 @@ pub struct NatLimits {
     /// only); past it, a new one replaces that host's closest to lapsing.
     /// The table holds 1024 in all. Default: 128.
     pub max_expectations_per_host: usize,
+    /// Length of the IPv6 prefix that counts as one inside host for the
+    /// per-host caps (NAT64 only). An IPv6 host picks addresses from its
+    /// whole /64 at will (temporary addresses, RFC 8981), so capping each
+    /// address alone caps nothing: one host could hold the whole pool by
+    /// sending from a new one per flow. Lengthen it only where each host
+    /// really has a longer prefix (DHCPv6 /128s on a shared link, say).
+    /// Past 128 counts as 128; a change applies to mappings made after it.
+    /// Default: 64.
+    pub host_prefix_v6: u8,
 }
 
 setters! {
@@ -74,6 +86,7 @@ setters! {
         set max_peers_per_host: usize;
         set max_peers: usize;
         set max_expectations_per_host: usize;
+        set host_prefix_v6: u8;
     }
 }
 
@@ -84,6 +97,7 @@ impl Default for NatLimits {
             max_peers_per_host: DEFAULT_MAX_PEERS_PER_HOST,
             max_peers: DEFAULT_MAX_PEERS,
             max_expectations_per_host: DEFAULT_MAX_EXPECTATIONS_PER_HOST,
+            host_prefix_v6: DEFAULT_HOST_PREFIX_V6,
         }
     }
 }
