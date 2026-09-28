@@ -150,24 +150,13 @@ impl SipHelper {
                 let new_sdp = if outbound {
                     // Past either cap a media line is left as it is, as
                     // when the port pool is exhausted.
-                    let now = Instant::now();
-                    let mut in_message: Vec<u16> = Vec::new();
-                    let mut admit = |ports: &[u16]| {
-                        let new = ports.iter().filter(|p| !in_message.contains(p));
-                        if in_message.len() + new.clone().count() > MAX_PORTS_PER_MESSAGE
-                            || !self.opened.admit((m.namespace, inside_ip), ports, now)
-                        {
-                            return false;
-                        }
-                        let new: Vec<u16> = new.copied().collect();
-                        in_message.extend(new);
-                        true
-                    };
                     let media = Media {
                         nat,
                         ns: m.namespace,
                         inside_ip,
-                        admit: &mut admit,
+                        opened: &self.opened,
+                        in_message: Vec::new(),
+                        now: Instant::now(),
                     };
                     rewrite_sdp_outbound(media, &sdp_body, &outside_addr)
                 } else {
@@ -300,13 +289,42 @@ fn sip_rewrite_sdp_addr(sdp: &[u8], old_addr: &str, new_addr: &str) -> Vec<u8> {
 }
 
 /// What mapping an outbound SDP's media streams takes: the NAT, the inside
-/// host (namespace and address) that sent it, and whether the ports a
-/// stream needs may be opened (see [`MAX_PORTS_PER_MESSAGE`]).
+/// host (namespace and address) that sent it, and the ports it has opened,
+/// in this message and lately (see [`MAX_PORTS_PER_MESSAGE`] and
+/// [`MAX_PORTS_PER_HOST`]).
 struct Media<'a> {
     nat: &'a Nat,
     ns: u64,
     inside_ip: Ipv4Addr,
-    admit: &'a mut dyn FnMut(&[u16]) -> bool,
+    opened: &'a OpenedPorts,
+    in_message: Vec<u16>,
+    now: Instant,
+}
+
+impl Media<'_> {
+    /// Count `ports` as opened, if both caps allow; returns those newly
+    /// counted for the host, for [`refund`](Self::refund).
+    fn admit(&mut self, ports: &[u16]) -> Option<Vec<u16>> {
+        let new: Vec<u16> = ports
+            .iter()
+            .copied()
+            .filter(|p| !self.in_message.contains(p))
+            .collect();
+        if self.in_message.len() + new.len() > MAX_PORTS_PER_MESSAGE {
+            return None;
+        }
+        let counted = self
+            .opened
+            .admit((self.ns, self.inside_ip), ports, self.now)?;
+        self.in_message.extend(new);
+        Some(counted)
+    }
+
+    /// Uncount `ports`, admitted but not opened after all.
+    fn refund(&mut self, ports: &[u16]) {
+        self.in_message.retain(|p| !ports.contains(p));
+        self.opened.refund((self.ns, self.inside_ip), ports);
+    }
 }
 
 /// Parse an SDP `m=` media line, map its RTP port and the RTCP port that
@@ -335,32 +353,31 @@ fn sip_parse_media_line(
     }
     let rtcp_inside = explicit.or(inside_port.checked_add(1));
     let ports: Vec<u16> = std::iter::once(inside_port).chain(rtcp_inside).collect();
-    if !(media.admit)(&ports) {
-        return None;
-    }
+    let counted = media.admit(&ports)?;
 
     // RTP on an even port and RTCP on the next (RFC 3550 §11), allocated
     // together so the peer's default of RTP + 1 lands on the RTCP mapping.
     // RTCP multiplexed onto the RTP port (RFC 5761) needs just the one.
-    let (rtp_out, rtcp_out) = match rtcp_inside {
+    let map = |port| nat.create_mapping_in(ns, PROTO_UDP, inside_ip, port);
+    let mapped = match rtcp_inside {
         Some(rtcp) if rtcp != inside_port => {
             match nat.create_mapping_pair_in(ns, PROTO_UDP, inside_ip, (inside_port, rtcp)) {
-                Some(p) => (p, Some(p + 1)),
-                None => (
-                    nat.create_mapping_in(ns, PROTO_UDP, inside_ip, inside_port)?,
-                    nat.create_mapping_in(ns, PROTO_UDP, inside_ip, rtcp),
-                ),
+                Some(p) => Some((p, Some(p + 1))),
+                None => map(inside_port).map(|p| (p, map(rtcp))),
             }
         }
-        Some(_) => {
-            let p = nat.create_mapping_in(ns, PROTO_UDP, inside_ip, inside_port)?;
-            (p, Some(p))
-        }
-        None => (
-            nat.create_mapping_in(ns, PROTO_UDP, inside_ip, inside_port)?,
-            None,
-        ),
+        Some(_) => map(inside_port).map(|p| (p, Some(p))),
+        None => map(inside_port).map(|p| (p, None)),
     };
+    // What could not be mapped was not opened, and must not count as if
+    // it were.
+    let unopened: Vec<u16> = match mapped {
+        None => counted,
+        Some((_, None)) => counted.into_iter().filter(|&p| p != inside_port).collect(),
+        Some(_) => Vec::new(),
+    };
+    media.refund(&unopened);
+    let (rtp_out, rtcp_out) = mapped?;
 
     // Neither the remote's media address nor its ports are known yet: the
     // offer carries only this side's.
@@ -769,6 +786,38 @@ Content-Length: {}\r\n\r\n{}",
         }
         // 32 ports: 16 streams.
         assert_eq!(opened, 16);
+    }
+
+    #[test]
+    fn ports_that_fail_to_map_are_not_charged() {
+        let (nat, _, _) = invite_with_sdp("v=0\r\n", |_| {});
+        let invite = |first: u16| {
+            let sdp = many_streams(first, 4);
+            let body = format!(
+                "INVITE sip:bob@example.com SIP/2.0\r\n\
+Content-Type: application/sdp\r\n\
+Content-Length: {}\r\n\r\n{}",
+                sdp.len(),
+                sdp
+            );
+            let pkt = build_sip_udp(
+                Ipv4Addr::new(10, 0, 0, 5),
+                5060,
+                Ipv4Addr::new(198, 51, 100, 9),
+                5060,
+                body.as_bytes(),
+            );
+            nat.inside().send(Packet::from_slice(&pkt)).unwrap();
+            opened_streams(&nat, first, 4).len()
+        };
+        // The host is at its mapping cap (its signalling mapping): no
+        // media port can be mapped, and none may count as opened.
+        nat.set_limits(crate::nat::NatLimits::default().max_mappings_per_host(1));
+        for i in 0..8 {
+            assert_eq!(invite(20000 + 8 * i), 0);
+        }
+        nat.set_limits(crate::nat::NatLimits::default());
+        assert_eq!(invite(30000), 4);
     }
 
     /// Send an INVITE carrying `sdp` from 10.0.0.5; returns the SDP that

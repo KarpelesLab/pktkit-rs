@@ -92,22 +92,27 @@ impl PacketHelper for H323Helper {
                 if port >= H245_PORT_MIN {
                     // Past either cap the address is rewritten but no port
                     // opened, as when the pool is exhausted.
+                    let host = (m.namespace, inside_ip);
                     let admitted = if opened.contains(&port) {
-                        true
-                    } else if opened.len() < MAX_PORTS_PER_MESSAGE
-                        && self.opened.admit((m.namespace, inside_ip), &[port], now)
-                    {
-                        opened.push(port);
-                        true
+                        Some(Vec::new())
+                    } else if opened.len() < MAX_PORTS_PER_MESSAGE {
+                        self.opened.admit(host, &[port], now)
                     } else {
-                        false
+                        None
                     };
                     // Transport address: H.245 runs over TCP and media over UDP,
                     // and the heuristic cannot tell which this is, so both are
                     // expected on the one outside port written into the message.
-                    let outside_port = admitted
-                        .then(|| nat.create_mapping_in(m.namespace, PROTO_TCP, inside_ip, port))
-                        .flatten();
+                    let outside_port = admitted.as_ref().and_then(|_| {
+                        nat.create_mapping_in(m.namespace, PROTO_TCP, inside_ip, port)
+                    });
+                    match (admitted, outside_port) {
+                        (Some(_), Some(_)) if !opened.contains(&port) => opened.push(port),
+                        // Not opened after all: it must not count as if it
+                        // were.
+                        (Some(counted), None) => self.opened.refund(host, &counted),
+                        _ => {}
+                    }
                     if let Some(op) = outside_port {
                         let expires = now + H323_RTP_TIMEOUT;
                         let expect = |proto, inside_port, outside_port| {
@@ -376,15 +381,12 @@ mod tests {
     }
 
     /// Sends one H.225 segment from 10.0.0.5 announcing `ports`, and returns
-    /// how many of them came out mapped to another port.
+    /// how many of them came out mapped to another port. Ports below the
+    /// NAT's pool never keep their number, so a mapped one shows as
+    /// rewritten.
     fn announce(nat: &Nat, h: &H323Helper, ports: std::ops::Range<u16>) -> usize {
+        assert!(ports.end <= 10000);
         let inside = Ipv4Addr::new(10, 0, 0, 5);
-        // Another host holds the same outside ports, so that a mapped port
-        // cannot keep its number and shows as rewritten.
-        for p in ports.clone() {
-            nat.create_mapping(PROTO_TCP, Ipv4Addr::new(10, 0, 0, 99), p)
-                .unwrap();
-        }
         let mut body = Vec::new();
         for p in ports.clone() {
             body.push(0x00);
@@ -430,5 +432,22 @@ mod tests {
         assert_eq!(total, MAX_PORTS_PER_HOST);
         // Announcing a port already open still maps it.
         assert_eq!(announce(&nat, &h, 5000..5001), 1);
+    }
+
+    #[test]
+    fn ports_that_fail_to_map_are_not_charged() {
+        let nat = Nat::new(pfx("10.0.0.1/24"), pfx("203.0.113.1/24"));
+        let h = H323Helper::new();
+        // The host is at its mapping cap: nothing announced can be mapped,
+        // and none of it may count as opened.
+        nat.set_limits(crate::nat::NatLimits::default().max_mappings_per_host(1));
+        nat.create_mapping(PROTO_TCP, Ipv4Addr::new(10, 0, 0, 5), 40000)
+            .unwrap();
+        for i in 0..8u16 {
+            let first = 5000 + i * 8;
+            assert_eq!(announce(&nat, &h, first..first + 8), 0);
+        }
+        nat.set_limits(crate::nat::NatLimits::default());
+        assert_eq!(announce(&nat, &h, 6000..6008), 8);
     }
 }

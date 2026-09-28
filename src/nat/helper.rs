@@ -42,9 +42,16 @@ impl OpenedPorts {
     }
 
     /// Whether `host` may open all of inside `ports` now; if so, they are
-    /// counted, or refreshed where already open. All or none, so a media
-    /// stream is never left with only part of its ports.
-    pub(crate) fn admit(&self, host: (u64, Ipv4Addr), ports: &[u16], now: Instant) -> bool {
+    /// counted, or refreshed where already open, and those newly counted
+    /// are returned, to be [`refund`](Self::refund)ed if they cannot be
+    /// opened after all. All or none, so a media stream is never left with
+    /// only part of its ports.
+    pub(crate) fn admit(
+        &self,
+        host: (u64, Ipv4Addr),
+        ports: &[u16],
+        now: Instant,
+    ) -> Option<Vec<u16>> {
         let window = self.window;
         let live = |t: &Instant| now.saturating_duration_since(*t) < window;
         let mut by_host = self.by_host.lock().unwrap();
@@ -58,14 +65,14 @@ impl OpenedPorts {
         new.sort_unstable();
         new.dedup();
         if open.len() + new.len() > self.max_per_host {
-            return false;
+            return None;
         }
         for (p, t) in open.iter_mut() {
             if ports.contains(p) {
                 *t = now;
             }
         }
-        open.extend(new.into_iter().map(|p| (p, now)));
+        open.extend(new.iter().map(|&p| (p, now)));
         // Hosts that went quiet leave no record behind.
         if by_host.len() > 64 {
             by_host.retain(|_, open| {
@@ -73,7 +80,23 @@ impl OpenedPorts {
                 !open.is_empty()
             });
         }
-        true
+        Some(new)
+    }
+
+    /// Uncount `ports`, newly admitted for `host` but never opened (the
+    /// mapping failed): a host at its mapping cap, or a full pool, must not
+    /// use up its allowance of open ports for nothing.
+    pub(crate) fn refund(&self, host: (u64, Ipv4Addr), ports: &[u16]) {
+        if ports.is_empty() {
+            return;
+        }
+        let mut by_host = self.by_host.lock().unwrap();
+        if let Some(open) = by_host.get_mut(&host) {
+            open.retain(|(p, _)| !ports.contains(p));
+            if open.is_empty() {
+                by_host.remove(&host);
+            }
+        }
     }
 }
 
