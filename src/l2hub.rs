@@ -186,10 +186,15 @@ impl core::fmt::Debug for VlanSet {
 pub enum PortMode {
     /// An edge port belonging to a single VLAN.
     ///
-    /// Frames arriving untagged are treated as belonging to `vlan`; a frame
-    /// tagged with `vlan` is also accepted, and any other tag is dropped as
-    /// misconfiguration. Frames leaving are always untagged, so the station
-    /// behind the port never sees 802.1Q at all.
+    /// Frames arriving untagged, or priority-tagged (VID 0), belong to
+    /// `vlan`. A frame carrying a VLAN tag is dropped, even one naming `vlan`
+    /// itself: this is 802.1Q's "admit only untagged and priority-tagged
+    /// frames". A station behind an access port has no business tagging, and
+    /// a frame tagged with its port's own VLAN is the first step of double
+    /// tagging, where a second tag behind it would be exposed wherever the
+    /// outer one is popped and carry the frame into another VLAN. Frames
+    /// leaving are always untagged, so the station behind the port never
+    /// sees 802.1Q at all.
     Access {
         /// The port's VLAN ID.
         vlan: u16,
@@ -200,6 +205,12 @@ pub enum PortMode {
     /// A frame arriving untagged belongs to `native`, if set, and is dropped
     /// otherwise. On the way out, frames are tagged, except those on the
     /// native VLAN which leave untagged.
+    ///
+    /// A frame that would leave untagged but still carries a VLAN tag once
+    /// its own is removed -- one tagged twice, arriving on the native VLAN
+    /// -- is dropped rather than sent: the next switch would read the inner
+    /// tag as the frame's VLAN, which is how double tagging hops VLANs. The
+    /// same holds for access ports, which send everything untagged.
     Trunk {
         /// The VLANs the port carries tagged.
         allowed: VlanSet,
@@ -228,8 +239,7 @@ impl PortMode {
         let tagged = tagged.filter(|&t| t != 0);
         match (self, tagged) {
             (PortMode::Access { vlan }, None) => Some(*vlan),
-            // A tag matching the port's own VLAN is redundant but harmless.
-            (PortMode::Access { vlan }, Some(t)) if t == *vlan => Some(*vlan),
+            // Even a tag naming the port's own VLAN: see `Access`.
             (PortMode::Access { .. }, Some(_)) => None,
             (PortMode::Trunk { allowed, .. }, Some(t)) if allowed.contains(t) => Some(t),
             (PortMode::Trunk { .. }, Some(_)) => None,
@@ -291,20 +301,24 @@ impl<'a> Egress<'a> {
         }
     }
 
-    fn apply(&mut self, action: TagAction) -> &Frame {
+    /// The frame to send for `action`, or `None` if it must not leave.
+    fn apply(&mut self, action: TagAction) -> Option<&Frame> {
         match action {
             TagAction::Untagged => {
                 if !self.original.has_vlan() {
-                    return self.original;
+                    return Some(self.original);
                 }
                 let buf = self
                     .untagged
                     .get_or_insert_with(|| crate::build::pop_vlan(self.original));
-                Frame::from_slice(buf)
+                let out = Frame::from_slice(buf);
+                // Tagged twice: sent untagged, the inner tag would become
+                // the frame's VLAN at the next switch (see PortMode::Trunk).
+                (!out.has_vlan()).then_some(out)
             }
             TagAction::Tagged(vlan) => {
                 if self.original.has_vlan() && self.original.vlan_id() == vlan {
-                    return self.original;
+                    return Some(self.original);
                 }
                 if !matches!(&self.tagged, Some((v, _)) if *v == vlan) {
                     // Build from the untagged form so a re-tag replaces rather
@@ -314,11 +328,17 @@ impl<'a> Egress<'a> {
                     } else {
                         self.original.to_vec()
                     };
+                    // Still tagged underneath (a priority tag over a VLAN
+                    // tag): push_vlan would leave the inner tag outermost,
+                    // making it the frame's VLAN.
+                    if Frame::from_slice(&base).has_vlan() {
+                        return None;
+                    }
                     let out = crate::build::push_vlan(Frame::from_slice(&base), vlan, self.pcp);
                     self.tagged = Some((vlan, out));
                 }
                 let (_, buf) = self.tagged.as_ref().expect("just built");
-                Frame::from_slice(buf)
+                Some(Frame::from_slice(buf))
             }
         }
     }
@@ -765,8 +785,10 @@ impl L2Hub {
                 // The destination is known, but it still has to be reachable
                 // on this VLAN — a learned address on another VLAN is not a
                 // hit.
-                if let Some(action) = dst.mode.egress(vlan) {
-                    let _ = dst.dev.send(egress.apply(action));
+                if let Some(action) = dst.mode.egress(vlan)
+                    && let Some(out) = egress.apply(action)
+                {
+                    let _ = dst.dev.send(out);
                     self.stats.record_forwarded(1);
                 } else {
                     self.stats.record_dropped();
@@ -864,8 +886,10 @@ impl L2Hub {
             if p.id == source_id {
                 continue;
             }
-            if let Some(action) = p.mode.egress(vlan) {
-                let _ = p.dev.send(egress.apply(action));
+            if let Some(action) = p.mode.egress(vlan)
+                && let Some(out) = egress.apply(action)
+            {
+                let _ = p.dev.send(out);
                 sent += 1;
             }
         }
@@ -1656,10 +1680,99 @@ mod tests {
             "an access port claiming VLAN 10 cannot inject VLAN 20"
         );
 
-        // Its own VLAN, redundantly tagged, is accepted.
+        // Nor is its own VLAN tagged: an access port admits only untagged
+        // and priority-tagged frames (802.1Q).
         let tagged_10 = crate::build::push_vlan(Frame::from_slice(&base), 10, 0);
         hub.forward_from(Frame::from_slice(&tagged_10), ports[0].1.id);
+        assert_eq!(ports[1].0.inner.lock().unwrap().len(), 0);
+        hub.forward_from(Frame::from_slice(&base), ports[0].1.id);
         assert_eq!(ports[1].0.inner.lock().unwrap().len(), 1);
+    }
+
+    /// A frame tagged twice, `outer` first. `push_vlan` does not stack.
+    fn double_tagged(src: MacAddr, outer: u16, inner: u16) -> Vec<u8> {
+        let mut f = MacAddr::broadcast().octets().to_vec();
+        f.extend_from_slice(&src.octets());
+        for vid in [outer, inner] {
+            f.extend_from_slice(&[0x81, 0x00]);
+            f.extend_from_slice(&vid.to_be_bytes());
+        }
+        f.extend_from_slice(&[0x08, 0x00]);
+        f.extend_from_slice(&[0; 40]);
+        f
+    }
+
+    #[test]
+    fn double_tagging_cannot_hop_vlans() {
+        // The classic attack: a station in VLAN 10, which is also the
+        // trunk's native VLAN, sends [10][20]. Popping the outer tag for
+        // the native VLAN would put the frame on the trunk tagged 20, and
+        // the switch at the far end would deliver it into VLAN 20.
+        let hub = Arc::new(L2Hub::new());
+        let ports = sinks(&hub, 3);
+        hub.set_port_mode(&ports[0].1, access(10));
+        hub.set_port_mode(&ports[1].1, trunk(&[10, 20], Some(10)));
+        hub.set_port_mode(&ports[2].1, access(10));
+        let f = double_tagged(ports[0].0.mac, 10, 20);
+        hub.forward_from(Frame::from_slice(&f), ports[0].1.id);
+        assert!(
+            ports[1].0.inner.lock().unwrap().is_empty(),
+            "the inner tag reached the trunk"
+        );
+        assert!(ports[2].0.inner.lock().unwrap().is_empty());
+
+        // Priority-tagged outside (VID 0, which an access port admits):
+        // retagging for the trunk must not leave the inner tag outermost.
+        hub.set_port_mode(&ports[1].1, trunk(&[10, 20], None));
+        let f = double_tagged(ports[0].0.mac, 0, 20);
+        hub.forward_from(Frame::from_slice(&f), ports[0].1.id);
+        let out = ports[1].0.inner.lock().unwrap();
+        assert!(
+            out.iter().all(|f| Frame::from_slice(f).vlan_id() != 20),
+            "the inner tag became the frame's VLAN on the trunk"
+        );
+        drop(out);
+        assert!(ports[2].0.inner.lock().unwrap().is_empty());
+
+        // The same frame arriving on a trunk, tagged with the native VLAN
+        // of another trunk (or an access port's VLAN), must not leave
+        // there with the inner tag exposed either.
+        let hub = Arc::new(L2Hub::new());
+        let ports = sinks(&hub, 3);
+        hub.set_port_mode(&ports[0].1, trunk(&[10, 20], None));
+        hub.set_port_mode(&ports[1].1, trunk(&[10, 20], Some(10)));
+        hub.set_port_mode(&ports[2].1, access(10));
+        let f = double_tagged(ports[0].0.mac, 10, 20);
+        hub.forward_from(Frame::from_slice(&f), ports[0].1.id);
+        for (s, _) in &ports[1..] {
+            let out = s.inner.lock().unwrap();
+            assert!(
+                out.iter().all(|f| !Frame::from_slice(f).has_vlan()),
+                "an untagged egress exposed the inner tag"
+            );
+            assert!(out.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_single_tag_still_crosses_to_the_native_vlan() {
+        // What the double-tag check must not break: a frame tagged once
+        // with the native VLAN leaves the native trunk untagged.
+        let hub = Arc::new(L2Hub::new());
+        let ports = sinks(&hub, 2);
+        hub.set_port_mode(&ports[0].1, trunk(&[10], None));
+        hub.set_port_mode(&ports[1].1, trunk(&[10], Some(10)));
+        let base = build_frame(
+            MacAddr::broadcast(),
+            ports[0].0.mac,
+            EtherType::IPV4,
+            &[0; 40],
+        );
+        let tagged = crate::build::push_vlan(Frame::from_slice(&base), 10, 0);
+        hub.forward_from(Frame::from_slice(&tagged), ports[0].1.id);
+        let out = ports[1].0.inner.lock().unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0], base);
     }
 
     #[test]
