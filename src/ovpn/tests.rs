@@ -130,6 +130,8 @@ pub(super) struct TestClient {
     ctrl_buf: Vec<u8>,
     /// What the client puts in its key-method-2 message.
     kx: ClientKx,
+    /// The TLS config each new key's handshake uses.
+    config: Arc<TlsConfig>,
 }
 
 /// The strings of a client's key-method-2 message. `None` is sent the way
@@ -173,6 +175,7 @@ impl TestClient {
             reliable: Reliable::new(local_id),
             ctrl_buf: Vec::new(),
             kx: ClientKx::default(),
+            config,
         }
     }
 
@@ -257,7 +260,7 @@ impl TestClient {
     /// (key_state_soft_reset): a fresh TLS session over a fresh reliable
     /// stream, opened by a P_CONTROL_SOFT_RESET_V1, which is returned.
     fn renegotiate(&mut self, key_id: u8) -> Vec<u8> {
-        self.tls = TlsConnection::client(&client_config()).unwrap();
+        self.tls = TlsConnection::client(&self.config).unwrap();
         let mut r = Reliable::new(self.reliable.local_id);
         r.peer_id = self.reliable.peer_id;
         r.key_id = key_id;
@@ -1199,7 +1202,7 @@ fn on_auth_sees_the_client_certificate() {
         auth_hook()(info)
     });
     let mut server = Peer::new(server_tls, *b"SERVERID", hook).unwrap();
-    let mut client = TestClient::with_config(*b"CLIENTID", client_tls);
+    let mut client = TestClient::with_config(*b"CLIENTID", client_tls.clone());
     connect(&mut server, &mut client);
     let info = seen.lock().unwrap().take().expect("on_auth called");
     assert_eq!(info.peer_certificates, vec![cert]);
@@ -1895,6 +1898,113 @@ fn huge_timers_do_not_panic() {
     assert_eq!(
         deliver_on(&mut server, &k0, 0, 1, b"k0"),
         Some(b"k0".to_vec())
+    );
+}
+
+/// A renegotiation must present the identity the session authenticated
+/// as: the client's config -- its tunnel address -- was pushed for that
+/// one. A different username is refused, as OpenVPN refuses it
+/// ("username attempted to change"), without asking on_auth, and the
+/// session ends; before, the client went on as someone else, keeping the
+/// first identity's address.
+#[test]
+fn renegotiation_cannot_change_the_username() {
+    use std::sync::Mutex;
+    let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+    let s = seen.clone();
+    let hook: OnAuth = Arc::new(move |info: &AuthInfo| {
+        s.lock().unwrap().push(info.username.clone());
+        auth_hook()(info)
+    });
+    let mut server = Peer::new(server_config(), *b"SERVERID", hook)
+        .unwrap()
+        .with_timers(quiet_timers());
+    let mut client = TestClient::new(*b"CLIENTID");
+    client.kx.username = Some("alice".into());
+    let k0 = connect(&mut server, &mut client);
+
+    // The same username renegotiates fine.
+    let first = vec![client.renegotiate(1)];
+    let k1 = connect_from(&mut server, &mut client, first);
+    assert_eq!(
+        deliver_on(&mut server, &k1, 1, 1, b"x"),
+        Some(b"x".to_vec())
+    );
+
+    client.kx.username = Some("bob".into());
+    let first = vec![client.renegotiate(2)];
+    let k2 = connect_from(&mut server, &mut client, first);
+    assert_eq!(
+        deliver_on(&mut server, &k2, 2, 1, b"y"),
+        None,
+        "bob's key works"
+    );
+    assert!(
+        client
+            .control_text()
+            .windows(11)
+            .any(|w| w == b"AUTH_FAILED"),
+        "no AUTH_FAILED"
+    );
+    assert_eq!(*seen.lock().unwrap(), ["alice", "alice"]);
+    let out = server
+        .tick(Instant::now() + Duration::from_secs(10))
+        .unwrap();
+    assert!(out.close, "the session goes on");
+    drop(k0);
+}
+
+/// The client certificate is pinned the same way: a renegotiation
+/// presenting another -- or none, where the TLS config allows clients
+/// without one -- is refused.
+#[test]
+fn renegotiation_cannot_change_the_client_certificate() {
+    let cert = der(TEST_CERT, "CERTIFICATE");
+    let mut roots = purecrypto::tls::RootCertStore::new();
+    roots.add_der(cert.clone()).unwrap();
+    let key =
+        purecrypto::rsa::BoxedRsaPrivateKey::from_pkcs8_der(&der(TEST_KEY, "PRIVATE KEY")).unwrap();
+    let server_tls = Arc::new(
+        TlsConfig::builder()
+            .versions(ProtocolVersion::TLSv1_2, ProtocolVersion::TLSv1_2)
+            .rng(Arc::new(purecrypto::rng::OsRng))
+            .identity(
+                vec![cert.clone()],
+                purecrypto::tls::SigningKey::Rsa(key.clone()),
+            )
+            .client_auth(purecrypto::tls::ClientAuth::new(roots, false))
+            .build(),
+    );
+    let with_cert = Arc::new(
+        TlsConfig::builder()
+            .versions(ProtocolVersion::TLSv1_2, ProtocolVersion::TLSv1_2)
+            .rng(Arc::new(purecrypto::rng::OsRng))
+            .server_name("ovpn-test")
+            .verify_certificates(false)
+            .identity(vec![cert], purecrypto::tls::SigningKey::Rsa(key))
+            .build(),
+    );
+    let mut server = Peer::new(server_tls, *b"SERVERID", auth_hook())
+        .unwrap()
+        .with_timers(quiet_timers());
+    let mut client = TestClient::with_config(*b"CLIENTID", with_cert);
+    connect(&mut server, &mut client);
+    let first = vec![client.renegotiate(1)];
+    let k1 = connect_from(&mut server, &mut client, first);
+    assert_eq!(
+        deliver_on(&mut server, &k1, 1, 1, b"x"),
+        Some(b"x".to_vec())
+    );
+
+    client.config = client_config();
+    let first = vec![client.renegotiate(2)];
+    let k2 = connect_from(&mut server, &mut client, first);
+    assert_eq!(deliver_on(&mut server, &k2, 2, 1, b"y"), None);
+    assert!(
+        client
+            .control_text()
+            .windows(11)
+            .any(|w| w == b"AUTH_FAILED")
     );
 }
 

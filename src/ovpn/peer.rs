@@ -69,6 +69,11 @@ fn invalid(msg: impl Into<String>) -> io::Error {
 /// [`common_name`](Self::common_name), as OpenVPN's
 /// `username-as-common-name` arranges -- and base its decision on the
 /// certificate, not on the username alone.
+///
+/// A renegotiation calls on_auth again (OpenVPN re-checks credentials too),
+/// but only for the identity the session first authenticated as: a client
+/// presenting another username, or another certificate, is refused without
+/// a call, as OpenVPN refuses it.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct AuthInfo {
@@ -1056,6 +1061,17 @@ struct Session {
     /// Until then, a PUSH_REQUEST gets no new PUSH_REPLY: one was just
     /// sent.
     push_reply_until: Option<Instant>,
+    /// Who the session first authenticated as; every renegotiation must
+    /// present the same.
+    identity: Option<Identity>,
+}
+
+/// What a session's client authenticated as: pinned by its first
+/// authentication, and checked on each renegotiation.
+struct Identity {
+    username: String,
+    /// The leaf of the client's certificate chain (DER), if it sent one.
+    leaf: Option<Vec<u8>>,
 }
 
 /// One TLS handshake and what it produced (OpenVPN's `key_state`): its own
@@ -1275,6 +1291,7 @@ impl Session {
             auth_failed: None,
             pushed_cipher: None,
             push_reply_until: None,
+            identity: None,
         }
     }
 
@@ -1478,6 +1495,27 @@ impl Session {
         // arrived over it.
         let peer_certificates = self.primary.tls()?.peer_certificates().to_vec();
         let common_name = peer_certificates.first().and_then(|leaf| common_name(leaf));
+        let mut parsed = parsed;
+        parsed.leaf = peer_certificates.first().cloned();
+        // A renegotiation is the same client going on under the identity
+        // it authenticated as: its config -- its tunnel address -- was
+        // pushed for that one. OpenVPN refuses a change of username or
+        // certificate the same way (ssl_verify.c: "username attempted to
+        // change", "TLS object CN attempted to change", and the cert hash
+        // check), disabling the tunnel, whatever the credentials' merits.
+        if let Some(id) = &self.identity {
+            let what = if id.username != parsed.username {
+                Some("username")
+            } else if id.leaf != parsed.leaf {
+                Some("client certificate")
+            } else {
+                None
+            };
+            if let Some(what) = what {
+                let why = format!("{what} attempted to change on renegotiation");
+                return self.apply_auth(parsed, Err(why));
+            }
+        }
         let info = AuthInfo {
             username: parsed.username.clone(),
             password: parsed.password.clone(),
@@ -1529,6 +1567,12 @@ impl Session {
         self.derive_keys(&kx);
         self.primary.kx_done = true;
         self.primary.established = Some(Instant::now());
+        if self.identity.is_none() {
+            self.identity = Some(Identity {
+                username: kx.username.clone(),
+                leaf: kx.leaf.clone(),
+            });
+        }
         if self.opts.is_none() {
             self.peer_cfg = Some(cfg);
             self.layer = match kx.opts.dev_type.as_str() {
@@ -1722,6 +1766,7 @@ fn try_parse_key_exchange(buf: &[u8]) -> io::Result<Option<(KeyExchange, usize)>
         username,
         password,
         peer_info,
+        leaf: None,
     };
     Ok(Some((kx, used)))
 }
@@ -1835,6 +1880,9 @@ struct KeyExchange {
     username: String,
     password: String,
     peer_info: std::collections::HashMap<String, String>,
+    /// The leaf of the client's certificate chain, once the key exchange
+    /// is matched with the TLS session that carried it.
+    leaf: Option<Vec<u8>>,
 }
 
 /// Read a control string at `pos`: a big-endian u16 length followed by that
