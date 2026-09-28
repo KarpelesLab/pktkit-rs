@@ -153,6 +153,8 @@ impl Tap {
             "TAP mode is not supported on macOS",
         ))
     }
+
+    /// OS interface name. Never reached: [`open`](Self::open) always fails.
     pub fn name(&self) -> &str {
         ""
     }

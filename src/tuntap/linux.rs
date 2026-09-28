@@ -113,6 +113,7 @@ impl Tap {
         })
     }
 
+    /// OS interface name (e.g. `tap0`).
     pub fn name(&self) -> &str {
         &self.name
     }

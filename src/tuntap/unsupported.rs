@@ -31,6 +31,7 @@ impl Tun {
         unsupported()
     }
 
+    /// OS interface name. Never reached: `open` always fails here.
     pub fn name(&self) -> &str {
         ""
     }
@@ -46,6 +47,7 @@ impl Tap {
         unsupported()
     }
 
+    /// OS interface name. Never reached: `open` always fails here.
     pub fn name(&self) -> &str {
         ""
     }
