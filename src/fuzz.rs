@@ -486,12 +486,26 @@ pub fn dhcp_exchange(data: &[u8]) {
     }
 }
 
-/// Frames into an L2Adapter: the ARP and NDP handling, the NDP queue, and
-/// its cache, fed one frame after another.
+/// Frames into an L2Adapter: the ARP and NDP handling, the resolution
+/// queues, and the neighbour cache, fed one message after another. The low
+/// two bits of each message's first byte say what it is:
+///
+/// - `x0`: a frame from the network, the rest of the message;
+/// - `01`: a packet from the L3 side, to be resolved and framed;
+/// - `11`: time passing, 1 to 8 retransmission intervals by the second
+///   byte, and the timers run: solicitations resent, NUD probes, failed
+///   resolutions reported as unreachable, the deferred ICMPv6 errors sent.
 #[cfg(feature = "l2adapter")]
 pub fn l2adapter_frames(data: &[u8]) {
+    l2adapter_run(data);
+}
+
+/// [`l2adapter_frames`], returning how many frames the adapter sent.
+#[cfg(feature = "l2adapter")]
+fn l2adapter_run(data: &[u8]) -> usize {
     use crate::{IpPrefix, L2Adapter, L2AdapterConfig, L2Device, L3Device, MacAddr, PipeL3};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     // A fresh adapter for each input, and without the timer thread: one
     // running in the background, and state carried over from the inputs
@@ -505,15 +519,33 @@ pub fn l2adapter_frames(data: &[u8]) {
             .gateway_v4("10.0.0.1".parse().unwrap()),
         false,
     );
+    let sent = Arc::new(AtomicUsize::new(0));
+    let counter = sent.clone();
+    adapter.set_handler(Arc::new(move |_: &Frame| {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }));
+    // Time is the input's, not the clock's: a crash then depends on the
+    // input alone, and a few messages cover minutes of timers. It only
+    // moves forward, from where the adapter was built.
+    let start = crate::time::Instant::now();
+    let mut intervals = 0u32;
     for msg in messages(data) {
-        if msg.first().is_some_and(|b| b & 1 == 0) {
-            // From the network.
-            let _ = adapter.send(Frame::from_slice(&msg[1..]));
-        } else if msg.len() > 1 {
-            // From the L3 side, to be resolved and framed.
-            let _ = inner.send(Packet::from_slice(&msg[1..]));
+        match msg.first().map(|b| b & 3) {
+            Some(0 | 2) => {
+                let _ = adapter.send(Frame::from_slice(&msg[1..]));
+            }
+            Some(1) if msg.len() > 1 => {
+                let _ = inner.send(Packet::from_slice(&msg[1..]));
+            }
+            Some(3) => {
+                intervals += 1 + u32::from(msg.get(1).copied().unwrap_or(0) % 8);
+                adapter.run_timers(start + crate::arp::RETRANS_TIMER * intervals);
+            }
+            _ => {}
         }
     }
+    sent.load(Ordering::Relaxed)
 }
 
 /// slirp's IP reassembler, fed one fragment after another, as slirp's input
@@ -655,4 +687,39 @@ pub fn wg_process(data: &[u8]) {
     });
     let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 9), 51820));
     let _ = h.process_packet(data, &addr);
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(feature = "l2adapter")]
+    #[test]
+    fn l2adapter_messages_can_run_the_timers() {
+        fn msg(input: &mut Vec<u8>, body: &[u8]) {
+            input.extend_from_slice(&(body.len() as u16).to_be_bytes());
+            input.extend_from_slice(body);
+        }
+        // A packet for an on-link host nobody answers for...
+        let mut pkt = vec![0u8; 20];
+        pkt[0] = 0x45;
+        pkt[2..4].copy_from_slice(&20u16.to_be_bytes());
+        pkt[8] = 64;
+        pkt[9] = 17;
+        pkt[12..16].copy_from_slice(&[10, 0, 0, 2]);
+        pkt[16..20].copy_from_slice(&[10, 0, 0, 9]);
+        let cs = crate::checksum(&pkt);
+        pkt[10..12].copy_from_slice(&cs.to_be_bytes());
+        let mut input = Vec::new();
+        let mut body = vec![1];
+        body.extend_from_slice(&pkt);
+        msg(&mut input, &body);
+        let asked = super::l2adapter_run(&input);
+        assert_eq!(asked, 1, "the first ARP request");
+
+        // ...then time passing: the request is sent again, as RFC 1122
+        // §2.3.2.1 paces it, which only the timers do.
+        msg(&mut input, &[3, 0]);
+        msg(&mut input, &[3, 0]);
+        let resent = super::l2adapter_run(&input);
+        assert!(resent > asked, "the timers never ran: {resent} frames");
+    }
 }

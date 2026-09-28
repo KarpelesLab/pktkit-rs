@@ -289,8 +289,9 @@ impl L2Adapter {
         }
     }
 
-    /// The neighbour timers, as of `now`.
-    fn run_timers(&self, now: Instant) {
+    /// The neighbour timers, as of `now`. Crate-visible for the fuzz
+    /// harness, which drives time itself.
+    pub(crate) fn run_timers(&self, now: Instant) {
         if self.closed.load(Ordering::Acquire) {
             return;
         }
