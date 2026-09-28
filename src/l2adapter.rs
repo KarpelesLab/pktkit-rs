@@ -641,12 +641,25 @@ impl L2Adapter {
             // replies are overheard: they keep the MAC current, but leave
             // it to be checked when next used.
             let confirmed = op == arp::OP_REPLY && for_us && f.dst_mac() == Some(self.mac);
-            self.arp.update(sender_ip, sender_mac, confirmed, true);
+            // ARP has no Override flag, so any of it could move an entry to
+            // a new MAC -- and anyone on the link can send it. For the
+            // gateway, which every off-link packet follows, that is the
+            // whole of ARP spoofing, so its entry is held as NDP holds one
+            // for an advertisement without the flag: a different MAC only
+            // makes it STALE, and NUD then probes the MAC we have. If the
+            // gateway answers there, nothing changed; if it has really
+            // moved, the probes go unanswered, the entry is dropped, and
+            // the next packet resolves it afresh, taking the reply to our
+            // own broadcast request.
+            let override_ = !self.arp.is_pinned(sender_ip);
+            self.arp.update(sender_ip, sender_mac, confirmed, override_);
+            // An ARP that may not override leaves the cached MAC.
+            let mac = self.arp.lookup(sender_ip).unwrap_or(sender_mac);
             // Straight to the MAC just learnt rather than back through
             // handle_outgoing: the queue was only waiting for this answer,
             // and a second lookup that missed would queue and solicit again.
             for buf in self.arp_pending.drain(sender_ip) {
-                let frame = build_frame(sender_mac, self.mac, EtherType::IPV4, &buf);
+                let frame = build_frame(mac, self.mac, EtherType::IPV4, &buf);
                 self.send_l2(Frame::from_slice(&frame));
             }
         }
@@ -2389,5 +2402,82 @@ mod tests {
         adapter.send(Frame::from_slice(&f)).unwrap();
         assert_eq!(adapter.ndp.lookup(stranger), None);
         assert!(take(&out).is_empty());
+    }
+
+    /// A unicast ARP reply from `mac`/`ip`, to us: what a real answer to our
+    /// own request looks like, and what a spoofer can send just as well.
+    fn arp_reply_to_us(adapter: &L2Adapter, mac: MacAddr, ip: Ipv4Addr) {
+        let payload = arp::build_packet(arp::OP_REPLY, mac, ip, adapter.mac, [10, 0, 0, 5].into());
+        let f = build_frame(adapter.mac, mac, EtherType::ARP, &payload);
+        adapter.send(Frame::from_slice(&f)).unwrap();
+    }
+
+    #[test]
+    fn unsolicited_arp_cannot_move_the_gateway() {
+        let (pipe, adapter, out) = rig("10.0.0.5/24");
+        let gw = Ipv4Addr::new(10, 0, 0, 1);
+        adapter.set_gateway_v4(gw);
+        let gw_mac = MacAddr([2, 0, 0, 0, 0, 1]);
+        let evil = MacAddr([2, 0xba, 0xd, 0, 0, 1]);
+
+        // Resolve the gateway the ordinary way.
+        let off_link = v4_packet([10, 0, 0, 5], [8, 8, 8, 8]);
+        pipe.inject(Packet::from_slice(&off_link)).unwrap();
+        arp_reply_to_us(&adapter, gw_mac, gw);
+        take(&out);
+
+        // Gratuitous ARP from the attacker, and a reply it sends us
+        // unasked.
+        arp_in(&adapter, arp::OP_REQUEST, evil, gw.octets(), gw.octets());
+        arp_reply_to_us(&adapter, evil, gw);
+        let t0 = Instant::now();
+        adapter.handle_outgoing_at(Packet::from_slice(&off_link), t0);
+        let sent = take(&out);
+        assert_eq!(
+            Frame::from_slice(&sent[0]).dst_mac(),
+            Some(gw_mac),
+            "the gateway's traffic went to the spoofer"
+        );
+
+        // It does leave the entry to be checked: NUD probes the MAC we
+        // have, and the gateway answering there keeps it.
+        adapter.run_timers(t0 + arp::DELAY_FIRST_PROBE_TIME);
+        let probes = take(&out);
+        assert_eq!(probes.len(), 1, "no unicast probe");
+        assert_eq!(Frame::from_slice(&probes[0]).dst_mac(), Some(gw_mac));
+    }
+
+    #[test]
+    fn a_gateway_that_really_moves_is_found_again() {
+        let (pipe, adapter, out) = rig("10.0.0.5/24");
+        let gw = Ipv4Addr::new(10, 0, 0, 1);
+        adapter.set_gateway_v4(gw);
+        let (old, new) = (MacAddr([2, 0, 0, 0, 0, 1]), MacAddr([2, 0, 0, 0, 0, 2]));
+        let off_link = v4_packet([10, 0, 0, 5], [8, 8, 8, 8]);
+        pipe.inject(Packet::from_slice(&off_link)).unwrap();
+        arp_reply_to_us(&adapter, old, gw);
+
+        // The new gateway announces itself; the old MAC stops answering.
+        arp_in(&adapter, arp::OP_REQUEST, new, gw.octets(), gw.octets());
+        let t0 = Instant::now();
+        adapter.handle_outgoing_at(Packet::from_slice(&off_link), t0);
+        let mut t = t0 + arp::DELAY_FIRST_PROBE_TIME;
+        for _ in 0..=arp::MAX_UNICAST_SOLICIT {
+            adapter.run_timers(t);
+            t += arp::RETRANS_TIMER;
+        }
+        take(&out);
+
+        // Forgotten, so the next packet asks by broadcast, and the answer
+        // to that is taken.
+        adapter.handle_outgoing_at(Packet::from_slice(&off_link), t);
+        let sent = take(&out);
+        assert_eq!(
+            Frame::from_slice(&sent[0]).dst_mac(),
+            Some(MacAddr::broadcast())
+        );
+        arp_reply_to_us(&adapter, new, gw);
+        let sent = take(&out);
+        assert_eq!(Frame::from_slice(&sent[0]).dst_mac(), Some(new));
     }
 }

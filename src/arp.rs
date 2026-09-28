@@ -172,6 +172,11 @@ impl<K: Eq + Hash + Copy> Table<K> {
         self.inner.lock().unwrap().pinned = ip;
     }
 
+    /// Whether `ip` is the [pinned](Self::pin) router.
+    pub fn is_pinned(&self, ip: K) -> bool {
+        self.inner.lock().unwrap().pinned == Some(ip)
+    }
+
     /// Look up `ip`, returning its MAC if an entry exists. This only looks:
     /// it neither counts as using the entry nor moves its state on.
     pub fn lookup(&self, ip: K) -> Option<MacAddr> {
