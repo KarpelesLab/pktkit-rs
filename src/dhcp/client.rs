@@ -500,6 +500,14 @@ impl Client {
                 return None;
             }
             let (event, out) = match (i.state, p.msg_type) {
+                // RENEWING asks the server that granted the lease, and only
+                // it (RFC 2131 §4.4.5); an answer naming another server is
+                // not an answer to that. REBINDING asks anyone.
+                (State::Renewing, wire::MSG_ACK | wire::MSG_NAK)
+                    if i.server_ip.is_some() && p.server_id != i.server_ip =>
+                {
+                    (None, None)
+                }
                 // RFC 2131 Table 3: an OFFER and an ACK carry the address
                 // in yiaddr and a lease time. One without either grants
                 // nothing usable, and binding it would configure 0.0.0.0 or
@@ -1403,6 +1411,41 @@ mod tests {
         sent(&r);
         tick_after(&c, Duration::from_secs(1700));
         assert!(sent(&r).is_empty(), "a fresh lease, T1 half an hour out");
+    }
+
+    /// `msg_type` for `xid` as the server at `server` would send it.
+    fn reply_from(msg_type: u8, xid: u32, mac: MacAddr, server: Ipv4Addr) -> Vec<u8> {
+        let mut b = wire::Builder::new(2, xid, mac);
+        b.yiaddr(Ipv4Addr::new(192, 168, 1, 100))
+            .message_type(msg_type)
+            .ipv4_option(wire::OPT_SUBNET_MASK, Ipv4Addr::new(255, 255, 255, 0))
+            .ipv4_option(wire::OPT_ROUTER, server)
+            .u32_option(wire::OPT_LEASE_TIME, 3600)
+            .ipv4_option(wire::OPT_SERVER_ID, server);
+        b.finish()
+    }
+
+    #[test]
+    fn while_renewing_only_our_server_is_heard() {
+        let other = Ipv4Addr::new(192, 168, 1, 66);
+        let (r, c) = bound();
+        tick_after(&c, Duration::from_secs(1801));
+        assert_eq!(state(&c), State::Renewing);
+        sent(&r);
+        c.handle_packet(&reply_from(wire::MSG_NAK, xid(&c), r.mac, other));
+        assert_eq!(*r.lost.lock().unwrap(), 0, "another server took the lease");
+        c.handle_packet(&reply_from(wire::MSG_ACK, xid(&c), r.mac, other));
+        assert_eq!(state(&c), State::Renewing, "another server's ACK taken");
+        assert_eq!(
+            r.bound.lock().unwrap().unwrap().1,
+            Some(Ipv4Addr::new(192, 168, 1, 1))
+        );
+
+        // Rebinding, any server may answer.
+        tick_after(&c, Duration::from_secs(3151));
+        assert_eq!(state(&c), State::Rebinding);
+        c.handle_packet(&reply_from(wire::MSG_ACK, xid(&c), r.mac, other));
+        assert_eq!(state(&c), State::Bound);
     }
 
     #[test]
