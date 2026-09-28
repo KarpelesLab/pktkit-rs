@@ -693,6 +693,7 @@ mod tests {
                     rtt: Some(rtt(r)),
                     ack: seq,
                     snd_nxt: end + (i + 1) * 2 * MSS,
+                    ..Ack::of(now, 2 * MSS, c.cwnd())
                 };
                 c.on_ack(&a);
                 if c.hystart.in_css() {

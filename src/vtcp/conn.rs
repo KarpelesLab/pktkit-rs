@@ -18,13 +18,15 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use super::autotune::{self, Budget, RcvSpace};
-use super::congestion::{Ack, CongestionController, HighSpeed, NewReno, initial_window};
+use super::bbr::Bbr;
+use super::congestion::{Ack, CongestionController, HighSpeed, Lost, NewReno, initial_window};
 use super::cubic::Cubic;
 use super::cwv::{self, PipeAck};
 use super::options::{
     self, SackBlock, TcpOption, get_sack_blocks, get_timestamp, get_wscale, has_sack_perm,
     mss_option, sack_option, sack_perm_option, timestamp_option, wscale_option,
 };
+use super::rate::RateSample;
 use super::recvbuf::RecvBuf;
 use super::rto::{DEFAULT_RTO, MAX_RTO, RtoState};
 use super::scoreboard::{DUP_THRESH, Delivery, Scoreboard, dsack_block};
@@ -241,6 +243,8 @@ struct AckEvent {
     ecr: Option<u32>,
     /// The round trip it measured, if any.
     rtt: Option<Duration>,
+    /// Its delivery rate sample, if it delivered anything.
+    rs: Option<RateSample>,
 }
 
 /// Choice of congestion controller.
@@ -258,17 +262,34 @@ pub enum CongestionKind {
     NewReno,
     /// HighSpeed TCP (RFC 3649).
     HighSpeed,
+    /// BBR (draft-ietf-ccwg-bbr, "BBRv3"): paces at a model of the path's
+    /// bottleneck bandwidth, with about a bandwidth-delay product in flight,
+    /// instead of growing the window until a queue overflows. It keeps the
+    /// bottleneck's queue short, and holds its rate through random loss
+    /// below 2% that would cut a loss-based controller's to a fraction:
+    /// the choice for long, lossy paths. It always paces, whatever
+    /// [`ConnConfig::pacing`] says. Not the default, as it is not on
+    /// Linux: at a shallow bottleneck queue it can take more than its share
+    /// from CUBIC flows, which read its losses as congestion where it does
+    /// not.
+    Bbr,
 }
 
 /// A controller of `kind` for segments of `mss` bytes, told whether
 /// sending is paced.
-fn make_cc(kind: CongestionKind, mss: u32, paced: bool) -> Box<dyn CongestionController> {
+fn make_cc(
+    kind: CongestionKind,
+    mss: u32,
+    paced: bool,
+    now: Instant,
+) -> Box<dyn CongestionController> {
     let mut cc: Box<dyn CongestionController> = match kind {
         CongestionKind::Cubic => Box::new(Cubic::new(mss)),
         CongestionKind::NewReno => Box::new(NewReno::new(mss)),
         CongestionKind::HighSpeed => Box::new(HighSpeed::new(mss)),
+        CongestionKind::Bbr => Box::new(Bbr::new(mss, now)),
     };
-    cc.set_paced(paced);
+    cc.set_paced(paced || cc.model_based());
     cc
 }
 
@@ -313,7 +334,8 @@ pub struct ConnConfig {
     /// millisecond's worth at a time, rather than send what each ACK lets
     /// go at once. Bursts that overflow a shallow bottleneck queue go away,
     /// slow start's included. The timer it runs on is part of
-    /// [`Conn::next_deadline`]. On by default.
+    /// [`Conn::next_deadline`]. BBR paces whatever this says. On by
+    /// default.
     pub pacing: bool,
     /// Start again from the initial window after sending nothing for an
     /// RTO (RFC 5681 §4.1): the window halves for every RTO of the spell,
@@ -567,6 +589,9 @@ pub struct Conn {
     /// An RTT sample came in since the last probe (RFC 8985 §7.3), so
     /// probes cannot keep SRTT from following a longer path.
     rtt_sampled: bool,
+    /// cwnd held back data that was ready to go since the last ACK (for
+    /// BBR's C.is_cwnd_limited).
+    cwnd_blocked: bool,
 
     // Pacing: a token bucket filled at the pacing rate, holding up to two
     // send quanta (see `pace_quantum`).
@@ -720,7 +745,7 @@ impl Conn {
         let now = wall_clock();
         let rcv_shift = cfg.rcv_wscale();
         let mss = cfg.mss.max(1);
-        let cc = make_cc(cfg.congestion, mss as u32, cfg.pacing);
+        let cc = make_cc(cfg.congestion, mss as u32, cfg.pacing, now);
         let ts_offset = super::secret::keyed_hash((
             "tsval",
             cfg.local_addr.map(|a| a.ip()),
@@ -762,6 +787,7 @@ impl Conn {
             nvp_since: None,
             last_data_sent: None,
             rtt_sampled: false,
+            cwnd_blocked: false,
             pace_credit: 0.0,
             pace_stamp: now,
             pace_deadline: None,
@@ -1183,7 +1209,12 @@ impl Conn {
     /// made one.
     fn set_mss(&mut self, mss: u16) {
         self.mss = mss.min(self.cfg.mss.max(1)).min(self.path_mss);
-        self.cc = make_cc(self.cfg.congestion, self.mss as u32, self.cfg.pacing);
+        self.cc = make_cc(
+            self.cfg.congestion,
+            self.mss as u32,
+            self.cfg.pacing,
+            self.now,
+        );
     }
 
     fn is_ipv6(&self) -> bool {
@@ -1520,6 +1551,7 @@ impl Conn {
         if let Some(sb) = self.send_buf.as_ref() {
             self.score = Scoreboard::new(sb.una(), self.now);
             self.score.set_rack(self.sack_ok);
+            self.score.set_track_losses(self.cc.model_based());
         }
     }
 
@@ -2328,6 +2360,8 @@ impl Conn {
             self.queue_challenge_ack();
             return false;
         }
+        // Before anything this ACK lets go (draft-ietf-ccwg-bbr §4.1.2.4).
+        self.check_app_limited();
         // The window comes first: the flush below must see this segment's.
         let wnd_changed = self.update_send_window(seg);
         let now = self.now;
@@ -2354,6 +2388,7 @@ impl Conn {
                 d.merge(self.score.sack(rest, now, ecr));
             }
         }
+        let rs = self.score.rate_sample();
 
         // RFC 5681 §2: only an ACK of SND.UNA with data outstanding, no
         // payload or FIN, and the same window is a duplicate. A window
@@ -2391,6 +2426,7 @@ impl Conn {
             flight,
             ecr,
             rtt,
+            rs,
         });
 
         if self.snd_wnd > 0 && self.persist_deadline.is_some() && (advanced || wnd_changed) {
@@ -2447,8 +2483,11 @@ impl Conn {
             flight,
             ecr,
             rtt,
+            rs,
         } = ev;
         let mss = self.mss as u32;
+        let model = self.cc.model_based();
+        let lost_before = self.score.rate().lost();
         // RFC 6937's DeliveredData.
         let mut delivered = d.delivered;
         // Without SACK, each duplicate stands for a segment that left the
@@ -2519,7 +2558,9 @@ impl Conn {
             // RFC 6675 §5: done once RecoveryPoint is acknowledged; without
             // SACK, only past it (RFC 6582 §3.2 step 1 and §4.1: segments
             // resent needlessly draw duplicates right at it).
-            if self.ca == CaState::Recovery {
+            if model {
+                self.cc.on_recovery_exit();
+            } else if self.ca == CaState::Recovery {
                 self.cc.set_cwnd(self.cc.ssthresh());
             }
             self.ca = CaState::Open;
@@ -2534,16 +2575,10 @@ impl Conn {
         // Growth, outside fast recovery: in slow start after a timeout too.
         // Not on the ACK that undid a response: RFC 4015 step (9) has just
         // set cwnd for it.
-        if advanced && self.ca != CaState::Recovery && !undone {
+        if advanced && self.ca != CaState::Recovery && !undone && !model {
             let bytes = if self.sack_ok { d.delivered } else { acked };
-            self.cc.on_ack(&Ack {
-                now: self.now,
-                bytes_acked: bytes,
-                flight,
-                rtt,
-                ack,
-                snd_nxt: self.send_buf.as_ref().unwrap().nxt(),
-            });
+            let a = self.ack_info(bytes, flight, rtt, ack, rs, delivered, 0);
+            self.cc.on_ack(&a);
         }
         // RFC 7661: what the path carried, sampled outside loss recovery
         // only, and forgotten once one is over (§4.2, §4.4.1).
@@ -2555,7 +2590,7 @@ impl Conn {
             self.validate_cwnd();
         }
         // F-RTO step 2b sends up to two new segments (RFC 5682 §2.1).
-        if frto_was != self.frto && matches!(self.frto, Frto::Second { .. }) {
+        if frto_was != self.frto && matches!(self.frto, Frto::Second { .. }) && !model {
             let cap = self.in_flight().saturating_add(2 * mss);
             self.cc.set_cwnd(self.cc.cwnd().min(cap));
         }
@@ -2571,6 +2606,91 @@ impl Conn {
         }
         if self.ca == CaState::Recovery {
             self.prr_update(delivered);
+        }
+        // A model-based controller takes every ACK, once the losses it
+        // revealed are known (as Linux runs BBR after tcp_fastretrans_alert).
+        if model {
+            self.feed_losses();
+            let newly_lost = (self.score.rate().lost() - lost_before) as u32;
+            if advanced || delivered > 0 || newly_lost > 0 {
+                let bytes = if self.sack_ok { d.delivered } else { acked };
+                let a = self.ack_info(bytes, flight, rtt, ack, rs, delivered, newly_lost);
+                self.cc.on_ack(&a);
+                if self.cc.take_app_limited() {
+                    self.score.mark_app_limited();
+                }
+            }
+        }
+    }
+
+    /// What the controller is told of an ACK that delivered `bytes`
+    /// (DeliveredData `delivered`, `newly_lost` marked lost on it).
+    #[allow(clippy::too_many_arguments)]
+    fn ack_info(
+        &mut self,
+        bytes: u32,
+        flight: u32,
+        rtt: Option<Duration>,
+        ack: u32,
+        rs: Option<RateSample>,
+        delivered: u32,
+        newly_lost: u32,
+    ) -> Ack {
+        Ack {
+            now: self.now,
+            bytes_acked: bytes,
+            flight,
+            rtt,
+            ack,
+            snd_nxt: self.send_buf.as_ref().unwrap().nxt(),
+            rs,
+            newly_acked: delivered,
+            newly_lost,
+            inflight: self.in_flight(),
+            delivered: self.score.rate().delivered(),
+            newest_rtt: self.score.ack_rtt(),
+            cwnd_limited: std::mem::take(&mut self.cwnd_blocked),
+            sack: self.sack_ok,
+        }
+    }
+
+    /// Tell a model-based controller of each segment marked lost since
+    /// last asked, with C.lost as it stood when that one was marked.
+    fn feed_losses(&mut self) {
+        let losses = self.score.take_losses();
+        if losses.is_empty() {
+            return;
+        }
+        let (total, delivered) = (self.score.rate().lost(), self.score.rate().delivered());
+        let mut after: u64 = losses.iter().map(|&(_, len)| u64::from(len)).sum();
+        for (tx, len) in losses {
+            let total_lost = total - after + u64::from(len);
+            after -= u64::from(len);
+            self.cc.on_lost(&Lost {
+                tx,
+                len,
+                total_lost,
+                delivered,
+            });
+        }
+    }
+
+    /// Mark the connection application-limited if it has run out of data
+    /// with room in the window and nothing to repair (draft-ietf-ccwg-bbr
+    /// §4.1.2.4): delivery rate samples until what is in flight is
+    /// delivered then show the application's pace, not the path's.
+    fn check_app_limited(&mut self) {
+        let Some(sb) = self.send_buf.as_ref() else {
+            return;
+        };
+        if !self.state.is_synchronized() {
+            return;
+        }
+        if sb.pending() < self.mss as usize
+            && self.in_flight() < self.cc.cwnd()
+            && self.score.lost_bytes() == 0
+        {
+            self.score.mark_app_limited();
         }
     }
 
@@ -2734,7 +2854,9 @@ impl Conn {
                 // recovery once that new data is acknowledged (RFC 6582
                 // §3.2 step 1).
                 self.frto = Frto::Off;
-                self.cc.set_cwnd(self.cc.cwnd().min(3 * mss));
+                if !self.cc.model_based() {
+                    self.cc.set_cwnd(self.cc.cwnd().min(3 * mss));
+                }
                 self.recover = self.send_buf.as_ref().unwrap().nxt();
                 false
             }
@@ -2748,6 +2870,10 @@ impl Conn {
     /// cwnd = ssthresh would; and once losses have taken the flight below
     /// ssthresh, lets it grow back no faster than slow start (PRR-SSRB).
     fn prr_update(&mut self, delivered: u32) {
+        // BBR sets cwnd in recovery from its model.
+        if self.cc.model_based() {
+            return;
+        }
         self.prr_delivered += u64::from(delivered);
         let pipe = self.in_flight();
         let mut sndcnt = prr_sndcnt(
@@ -2839,7 +2965,7 @@ impl Conn {
     /// recovery; PRR has by then brought the flight down in step with what
     /// was delivered, which already leaves the losses out.
     fn loss_flight(&mut self, flight: u32) -> u32 {
-        if self.nvp_since.is_none() {
+        if self.nvp_since.is_none() || self.cc.model_based() {
             return flight;
         }
         let used = self
@@ -2862,7 +2988,8 @@ impl Conn {
     /// after RFC 7661's non-validated period: halved once per period
     /// (§4.4.3).
     fn restart_idle_window(&mut self) {
-        if self.ca != CaState::Open {
+        // BBR restarts from idle by its own model (draft §5.4).
+        if self.ca != CaState::Open || self.cc.model_based() {
             return;
         }
         let mss = self.mss as u32;
@@ -3054,7 +3181,7 @@ impl Conn {
         } else if seq_after(ack, end) {
             // The probe repaired a loss: respond to it as to any other.
             self.tlp_end = None;
-            if self.ca == CaState::Open {
+            if self.ca == CaState::Open && !self.cc.model_based() {
                 let flight = self.send_buf.as_ref().unwrap().unacked() as u32;
                 let flight = self.loss_flight(flight);
                 self.cc.on_loss(flight);
@@ -3077,6 +3204,9 @@ impl Conn {
         self.rack_detect(false, false);
         if self.ca == CaState::Open && self.score.lost_bytes() > 0 {
             self.enter_recovery();
+        }
+        if self.cc.model_based() {
+            self.feed_losses();
         }
         if self.ca == CaState::Recovery {
             self.prr_update(0);
@@ -3142,7 +3272,11 @@ impl Conn {
         {
             return;
         }
-        while self.in_flight() < self.cc.cwnd() {
+        loop {
+            if self.in_flight() >= self.cc.cwnd() {
+                self.cwnd_blocked = true;
+                break;
+            }
             let room = self.send_mss() as u32;
             let Some((seq, len, fin)) = self.score.next_lost(room) else {
                 break;
@@ -3205,10 +3339,15 @@ impl Conn {
     fn flush_send_queue(&mut self) {
         // Anything held back by pacing is looked at again now.
         self.pace_deadline = None;
+        let pending = self.send_buf.as_ref().unwrap().pending();
+        if self.cc.model_based() && (pending > 0 || self.score.lost_bytes() > 0) {
+            let idle = self.in_flight() == 0 && self.score.rate().is_app_limited();
+            self.cc.on_transmit(self.now, idle);
+        }
         // Lost data before new data: the receiver can deliver nothing past
         // the first hole until it is filled.
         self.retransmit_lost();
-        if self.send_buf.as_ref().unwrap().pending() > 0 {
+        if pending > 0 {
             self.restart_idle_window();
         }
         let mut sent_new = false;
@@ -3220,12 +3359,15 @@ impl Conn {
             let cc_room = self.cc.cwnd().saturating_sub(self.in_flight());
             let unacked = self.send_buf.as_ref().unwrap().unacked() as u32;
             let rcv_room = self.snd_wnd.saturating_sub(unacked);
+            let opts = self.segment_options();
+            let room = self.payload_room(&opts);
+            if (cc_room as usize) < pending.min(room) {
+                self.cwnd_blocked = true;
+            }
             if cc_room == 0 || rcv_room == 0 {
                 break;
             }
             let avail = cc_room.min(rcv_room) as usize;
-            let opts = self.segment_options();
-            let room = self.payload_room(&opts);
             let n = avail.min(room).min(pending);
 
             // Sender SWS avoidance (RFC 9293 §3.8.6.2.1): avoid tiny
@@ -3294,13 +3436,14 @@ impl Conn {
 
     // --- Pacing ---------------------------------------------------------------
 
-    /// Whether sending is paced.
+    /// Whether sending is paced: as configured, and always for a
+    /// controller that sets a pacing rate of its own (BBR).
     fn pacing_on(&self) -> bool {
-        self.cfg.pacing
+        self.cfg.pacing || self.cc.model_based()
     }
 
-    /// The pacing rate in bytes per second, if pacing: Linux's
-    /// (`tcp_update_pacing_rate`): cwnd (or what is
+    /// The pacing rate in bytes per second, if pacing: the controller's,
+    /// or else Linux's (`tcp_update_pacing_rate`): cwnd (or what is
     /// outstanding, if more) per SRTT, doubled while cwnd is under half
     /// of ssthresh so slow start can still double it each round trip, and
     /// 1.2 times after, a little ahead of the ACK clock. None before a
@@ -3308,6 +3451,9 @@ impl Conn {
     fn pace_rate(&self) -> Option<u64> {
         if !self.pacing_on() {
             return None;
+        }
+        if let Some(r) = self.cc.pacing_rate() {
+            return Some(r.max(1));
         }
         let srtt = self.rto.srtt();
         if srtt.is_zero() {
@@ -3490,6 +3636,19 @@ impl Conn {
         let now = self.clock();
 
         let live = !self.closed && self.state != State::Closed;
+        // Before timers that may send (draft-ietf-ccwg-bbr §4.1.2.4).
+        if live
+            && [
+                self.reo_deadline,
+                self.pto_deadline,
+                self.rto_deadline,
+                self.pace_deadline,
+            ]
+            .iter()
+            .any(|d| d.is_some_and(|d| now >= d))
+        {
+            self.check_app_limited();
+        }
         // RACK's reordering timer and the loss probe, ahead of the RTO:
         // what they send restarts it, and then it has nothing to do.
         if let Some(d) = self.reo_deadline
@@ -3646,6 +3805,12 @@ impl Conn {
                 }
                 self.ca = CaState::Loss;
                 self.recover = nxt;
+            }
+            // BBR: what is in flight and one segment (draft §5.6.4.4).
+            if self.cc.model_based() {
+                self.feed_losses();
+                let cwnd = self.in_flight().saturating_add(self.mss as u32);
+                self.cc.set_cwnd(cwnd);
             }
         } else {
             // With only the SYN or SYN-ACK out there is no flight to halve:
@@ -3899,6 +4064,8 @@ impl Conn {
         if self.state != State::Established && self.state != State::CloseWait {
             return (0, Vec::new());
         }
+        // Before the new data is queued (draft-ietf-ccwg-bbr §4.1.2.4).
+        self.check_app_limited();
         let n = self.send_buf.as_mut().unwrap().write(buf);
         self.snd_nospace = n < buf.len();
         if n > 0 {
@@ -4127,6 +4294,7 @@ fn _options_export_is_used(_o: &TcpOption) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vtcp::bbr;
     use crate::vtcp::options::get_mss;
     use crate::vtcp::rto::DEFAULT_RTO;
 
@@ -4966,7 +5134,7 @@ mod tests {
         let mut cc_rng = Rng(splitmix(seed ^ 0xCC) | 1);
         let mut small = |port| {
             let mut c = cfg(port, 80);
-            c.congestion = CONTROLLERS[cc_rng.below(3) as usize];
+            c.congestion = CONTROLLERS[cc_rng.below(4) as usize];
             c.pacing = cc_rng.below(2) == 0;
             c.enable_timestamps = ts;
             c.enable_sack = sack;
@@ -5272,7 +5440,12 @@ mod tests {
         // After the lost SYN data starts from one segment. Stand in for the
         // round trips of slow start that would grow it, without the new
         // ACKs that would also clear any stale loss state.
-        client.cc = make_cc(client.cfg.congestion, client.mss as u32, client.cfg.pacing);
+        client.cc = make_cc(
+            client.cfg.congestion,
+            client.mss as u32,
+            client.cfg.pacing,
+            client.now,
+        );
 
         let (_, segs) = client.write(&[4; 10_000]);
         assert_eq!(segs.len(), 10);
@@ -7521,10 +7694,11 @@ mod tests {
         }
     }
 
-    const CONTROLLERS: [CongestionKind; 3] = [
+    const CONTROLLERS: [CongestionKind; 4] = [
         CongestionKind::Cubic,
         CongestionKind::NewReno,
         CongestionKind::HighSpeed,
+        CongestionKind::Bbr,
     ];
 
     /// What a [`stress_run`] varies per seed.
@@ -7564,8 +7738,8 @@ mod tests {
                 blackout,
                 autotune: pair(&mut r),
                 congestion: [
-                    CONTROLLERS[r.below(3) as usize],
-                    CONTROLLERS[r.below(3) as usize],
+                    CONTROLLERS[r.below(4) as usize],
+                    CONTROLLERS[r.below(4) as usize],
                 ],
                 ss_after_idle: pair(&mut r),
                 pacing: pair(&mut r),
@@ -8522,6 +8696,69 @@ mod tests {
         Path::new(conf, rate, queue.max(3000.0), rtt / 2, port)
     }
 
+    /// BBR finds the bottleneck's rate and round trip and fills the link
+    /// with little queue: its estimate within 10% of the rate, the link
+    /// nearly full, and packets queueing for a fraction of the round trip.
+    #[test]
+    fn bbr_converges_on_the_bottleneck_rate() {
+        let conf = ConnConfig::default().congestion(CongestionKind::Bbr);
+        let mut p = bulk(conf, 2.0, 40710);
+        p.run_for(Duration::from_secs(3));
+        p.queue_delays.clear();
+        let goodput = p.goodput(Duration::from_secs(10));
+        let bbr = p.a.cc.as_bbr().unwrap();
+        let bw = bbr.max_bw() as f64;
+        assert!((bw / p.rate - 1.0).abs() < 0.1, "bw estimate {bw}");
+        let min_rtt = bbr.min_rtt().unwrap();
+        assert!(
+            min_rtt >= Duration::from_millis(40) && min_rtt < Duration::from_millis(45),
+            "{min_rtt:?}"
+        );
+        assert!(goodput > 0.9 * p.rate, "goodput {goodput}");
+        let mut q = p.queue_delays.clone();
+        q.sort();
+        let median = q[q.len() / 2];
+        assert!(
+            median < Duration::from_millis(20),
+            "median queueing {median:?}"
+        );
+        assert_eq!(p.drops, 0, "a queue of two BDPs never overflows");
+        assert!(
+            matches!(
+                bbr.state(),
+                bbr::State::ProbeBwDown
+                    | bbr::State::ProbeBwCruise
+                    | bbr::State::ProbeBwRefill
+                    | bbr::State::ProbeBwUp
+                    | bbr::State::ProbeRtt
+            ),
+            "{:?}",
+            bbr.state()
+        );
+    }
+
+    /// Random loss well below BBR's 2% threshold per round trip leaves
+    /// its model alone: at 0.5% over 50 Mbit/s and 40 ms (170 segments in
+    /// flight, fewer than one lost per round on average) it still nearly
+    /// fills the link, where a loss-based controller cuts its window on
+    /// every loss.
+    #[test]
+    fn bbr_holds_its_rate_through_random_loss() {
+        let run = |conf: ConnConfig, port| {
+            let mut p = bulk(conf, 1.0, port);
+            p.rate *= 5.0;
+            p.queue *= 5.0;
+            p.loss_ppm = 5_000;
+            p.run_for(Duration::from_secs(3));
+            let goodput = p.goodput(Duration::from_secs(10));
+            (goodput, p.rate)
+        };
+        let (bbr, rate) = run(ConnConfig::default().congestion(CongestionKind::Bbr), 40711);
+        assert!(bbr > 0.8 * rate, "BBR goodput {bbr}");
+        let (cubic, _) = run(ConnConfig::default(), 40712);
+        assert!(cubic < 0.5 * bbr, "CUBIC {cubic}, BBR {bbr}");
+    }
+
     /// Into a queue of a tenth of the BDP, CUBIC's slow start overflows it
     /// with every burst unless paced. Paced, it loses fewer packets and
     /// moves at least as much.
@@ -8542,5 +8779,39 @@ mod tests {
             paced_goodput >= 0.95 * bursty_goodput,
             "goodput paced {paced_goodput}, not {bursty_goodput}"
         );
+    }
+
+    /// A sender that runs out of data with room in the window marks its
+    /// delivery rate samples application-limited, until what it sent then
+    /// is delivered; a bulk sender does not.
+    #[test]
+    fn running_dry_marks_samples_application_limited() {
+        let mut c = Conn::new(big(40716, 80));
+        let mut s = Conn::new(big(80, 40716));
+        drive_handshake(&mut c, &mut s);
+        let (_, data) = c.write(&[1; 1000]);
+        assert!(c.score.rate().is_app_limited(), "ran dry with room");
+        advance(Duration::from_millis(10));
+        let acks = deliver(&mut s, &data);
+        c.score.begin_ack();
+        let ack = parse(&acks[0]).ack;
+        c.send_buf.as_mut().unwrap().acknowledge(ack);
+        c.score.ack(ack, test_now(), None);
+        let rs = c.score.rate_sample().unwrap();
+        assert!(rs.is_app_limited);
+        assert_eq!(rs.delivered, 1000);
+        assert!(!c.score.rate().is_app_limited(), "the bubble is delivered");
+
+        // More than the window can take: the first flight still went out
+        // of an application-limited connection, but once it is delivered
+        // the window, not the application, holds the sender back.
+        let (_, data) = c.write(&vec![1; 200_000]);
+        assert!(!data.is_empty());
+        assert!(c.score.rate().is_app_limited());
+        advance(Duration::from_millis(10));
+        let acks = deliver(&mut s, &data);
+        read_all(&mut s);
+        deliver(&mut c, &acks);
+        assert!(!c.score.rate().is_app_limited());
     }
 }

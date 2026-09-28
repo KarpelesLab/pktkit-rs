@@ -28,7 +28,12 @@
 //!   state put back when the loss turns out spurious. Its first slow start
 //!   runs RFC 9406 HyStart++, which leaves slow start when the round trip
 //!   rises rather than when the bottleneck's queue overflows. NewReno and
-//!   RFC 3649 HighSpeed TCP are the others.
+//!   RFC 3649 HighSpeed TCP are the others, and BBR below.
+//! - draft-ietf-ccwg-bbr ("BBRv3"), opt in: a model of the path's
+//!   bottleneck bandwidth and round trip, from delivery rate samples
+//!   (draft-cheng-iccrg-delivery-rate-estimation), sets the pacing rate
+//!   and cwnd, rather than a queue overflowing. It keeps queues short, and
+//!   its rate through random loss under 2%.
 //! - Pacing, as Linux's: each round trip's data goes out spread over it, a
 //!   millisecond's worth at a time, not in bursts as ACKs let it go.
 //! - RFC 7661: congestion window validation. No cwnd growth while the
@@ -92,11 +97,13 @@
 ))]
 pub(crate) mod alarm;
 pub(crate) mod autotune;
+pub(crate) mod bbr;
 pub(crate) mod congestion;
 pub(crate) mod conn;
 pub(crate) mod cubic;
 pub(crate) mod cwv;
 pub(crate) mod options;
+pub(crate) mod rate;
 pub(crate) mod recvbuf;
 pub(crate) mod rto;
 pub(crate) mod scoreboard;

@@ -1,5 +1,6 @@
 //! Congestion control: CUBIC (RFC 9438, in [`super::cubic`]), NewReno (RFC
-//! 5681) and HighSpeed TCP (RFC 3649).
+//! 5681), HighSpeed TCP (RFC 3649) and BBR (draft-ietf-ccwg-bbr, in
+//! [`super::bbr`]).
 //!
 //! All count bytes, not ACKs (RFC 3465): a receiver that delays its ACKs
 //! acknowledges two segments with each, and counting ACKs would halve the
@@ -9,6 +10,7 @@
 //! letting one stretch ACK burst the window open; CUBIC's HyStart++ takes
 //! RFC 9406's L = 8, or no limit when paced.
 
+use super::rate::{RateSample, TxState};
 use crate::time::Instant;
 use std::time::Duration;
 
@@ -31,6 +33,35 @@ pub struct Ack {
     /// acknowledged.
     pub ack: u32,
     pub snd_nxt: u32,
+    /// Its delivery rate sample, if it delivered anything.
+    pub rs: Option<RateSample>,
+    /// Bytes it delivered, cumulatively or selectively (RFC 6937's
+    /// DeliveredData, the BBR draft's RS.newly_acked).
+    pub newly_acked: u32,
+    /// Bytes marked lost while processing it.
+    pub newly_lost: u32,
+    /// Bytes in flight once it was processed.
+    pub inflight: u32,
+    /// Bytes delivered over the connection's life (C.delivered).
+    pub delivered: u64,
+    /// The round trip of the most recently sent segment it delivered.
+    pub newest_rtt: Option<Duration>,
+    /// Since the last ACK, cwnd held back data that was ready to go.
+    pub cwnd_limited: bool,
+    /// The peer SACKs: losses show up several per round trip.
+    pub sack: bool,
+}
+
+/// A segment just marked lost: what it was sent with, its size, and the
+/// connection's totals at the time (for BBR's HandleLostPacket).
+#[derive(Debug, Clone, Copy)]
+pub struct Lost {
+    pub tx: TxState,
+    pub len: u32,
+    /// Bytes marked lost over the connection's life, this one included.
+    pub total_lost: u64,
+    /// Bytes delivered over the connection's life.
+    pub delivered: u64,
 }
 
 impl Ack {
@@ -45,6 +76,14 @@ impl Ack {
             rtt: None,
             ack: 0,
             snd_nxt: 0,
+            rs: None,
+            newly_acked: bytes_acked,
+            newly_lost: 0,
+            inflight: flight.saturating_sub(bytes_acked),
+            delivered: 0,
+            newest_rtt: None,
+            cwnd_limited: false,
+            sack: true,
         }
     }
 }
@@ -56,13 +95,51 @@ impl Ack {
 /// and ends, paces the window down to ssthresh during it (RFC 6937), and
 /// undoes a response found spurious. The controller only says how much to
 /// cut and how fast to grow back.
+///
+/// A [model-based](Self::model_based) controller (BBR) instead sets cwnd
+/// and the pacing rate itself on every ACK, recovery included, from its
+/// model of the path: the connection then leaves PRR and ssthresh out.
 pub trait CongestionController: Send {
-    /// A cumulative ACK outside fast recovery.
+    /// A cumulative ACK outside fast recovery; for a model-based
+    /// controller, every ACK.
     fn on_ack(&mut self, ack: &Ack);
+    /// Whether the controller runs on every ACK and sets cwnd itself in
+    /// and out of recovery, and paces at a rate of its own (BBR).
+    fn model_based(&self) -> bool {
+        false
+    }
+    /// A segment was marked lost. Only a model-based controller is told.
+    fn on_lost(&mut self, lost: &Lost) {
+        let _ = lost;
+    }
+    /// A recovery episode (fast recovery or after a timeout) is over, all
+    /// its losses repaired. Only a model-based controller is told; for the
+    /// others the connection sets cwnd to ssthresh.
+    fn on_recovery_exit(&mut self) {}
+    /// About to send with nothing in flight after the application ran dry
+    /// (`idle`), or otherwise. Only a model-based controller is told.
+    fn on_transmit(&mut self, now: Instant, idle: bool) {
+        let _ = (now, idle);
+    }
+    /// The controller wants the samples until what is in flight is
+    /// delivered marked application-limited (BBR's ProbeRTT). Taken once.
+    fn take_app_limited(&mut self) -> bool {
+        false
+    }
+    /// The rate to pace at, in bytes per second, if the controller sets
+    /// one; otherwise the connection derives it from cwnd and SRTT.
+    fn pacing_rate(&self) -> Option<u64> {
+        None
+    }
     /// Sending is paced: slow start need not limit the growth per ACK
     /// against bursts (RFC 9406 §4.3's L).
     fn set_paced(&mut self, paced: bool) {
         let _ = paced;
+    }
+    /// The controller as BBR, for tests to look inside.
+    #[cfg(test)]
+    fn as_bbr(&self) -> Option<&super::bbr::Bbr> {
+        None
     }
     /// A loss was detected with `flight_size` bytes outstanding: set
     /// ssthresh. The connection then brings cwnd down to it.

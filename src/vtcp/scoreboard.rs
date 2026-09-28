@@ -13,6 +13,7 @@ use std::time::Duration;
 use crate::time::Instant;
 
 use super::options::SackBlock;
+use super::rate::{Rate, RateSample, TxState};
 use super::seqspace::{seq_after, seq_before, seq_before_eq};
 
 const SACKED: u8 = 1;
@@ -45,6 +46,8 @@ struct Seg {
     /// Which transmission that was.
     tx: u64,
     flags: u8,
+    /// The delivery state it went out with, for rate samples.
+    rate: TxState,
 }
 
 impl Seg {
@@ -200,6 +203,11 @@ pub(crate) struct Scoreboard {
     /// what is new in it, not a walk over the whole range again (Linux's
     /// `recv_sack_cache`).
     sack_cache: Vec<(u64, u64)>,
+    /// Delivery rate estimation.
+    rate: Rate,
+    /// Segments marked lost since last taken, with their size, for a
+    /// controller that reacts to each loss (BBR); `None` when none does.
+    lost_log: Option<Vec<(TxState, u32)>>,
 }
 
 impl Scoreboard {
@@ -231,6 +239,8 @@ impl Scoreboard {
                 min_rtt: WindowedMin::default(),
             },
             sack_cache: Vec::new(),
+            rate: Rate::default(),
+            lost_log: None,
         }
     }
 
@@ -340,6 +350,7 @@ impl Scoreboard {
         let xmit = self.ns(now);
         let tx = self.next_tx;
         self.next_tx += 1;
+        let rate = self.rate.on_send(xmit, self.pipe(), len);
         self.segs.push_back(Seg {
             start,
             end: start + u64::from(len),
@@ -347,6 +358,7 @@ impl Scoreboard {
             tsval,
             tx,
             flags: if fin { FIN } else { 0 },
+            rate,
         });
         self.push_tx(start, start + u64::from(len), xmit, tx);
     }
@@ -377,11 +389,17 @@ impl Scoreboard {
             self.lost -= s_end - s_start;
             self.lost_set.remove(&s_start);
         }
+        // In flight again, itself included (unless SACKed meanwhile).
+        let len = (s_end - s_start) as u32;
+        let rate = self
+            .rate
+            .on_send(xmit, self.pipe().saturating_sub(len), len);
         let s = &mut self.segs[i];
         s.flags |= RETRANS;
         s.xmit = xmit;
         s.tsval = tsval;
         s.tx = tx;
+        s.rate = rate;
         self.push_tx(s_start, s_end, xmit, tx);
     }
 
@@ -446,6 +464,8 @@ impl Scoreboard {
                 } else {
                     let end = self.seq_of(front.end);
                     d.note(front.len(), end, !front.has(RETRANS));
+                    self.rate
+                        .on_delivered(&front.rate, front.xmit, front.end, front.len(), now);
                     self.rack_delivered(&front, now, ecr);
                 }
             } else {
@@ -459,6 +479,7 @@ impl Scoreboard {
                         self.sacked -= cut;
                     } else {
                         d.delivered = d.delivered.saturating_add(cut as u32);
+                        self.rate.on_partial(cut);
                     }
                     if f.has(LOST) {
                         self.lost -= cut;
@@ -563,6 +584,7 @@ impl Scoreboard {
             self.sacked_segs += 1;
             let end = self.seq_of(s.end);
             d.note(s.len(), end, !s.has(RETRANS));
+            self.rate.on_delivered(&s.rate, s.xmit, s.end, s.len(), now);
             self.rack_delivered(&s, now, ecr);
             i += 1;
         }
@@ -574,6 +596,48 @@ impl Scoreboard {
         self.rack
             .min_rtt
             .update(MIN_RTT_WINDOW, t, rtt.as_nanos() as u64);
+    }
+
+    /// The delivery rate sample of the ACK just processed, if it delivered
+    /// anything; see [`Rate::sample`].
+    pub fn rate_sample(&mut self) -> Option<RateSample> {
+        let min_rtt = self.rack.min_rtt.get();
+        self.rate.sample(min_rtt)
+    }
+
+    /// The connection's delivery state.
+    #[inline]
+    pub fn rate(&self) -> &Rate {
+        &self.rate
+    }
+
+    /// The sender has run out of data while the window had room: samples
+    /// until what is in flight is delivered are application-limited.
+    pub fn mark_app_limited(&mut self) {
+        let pipe = self.pipe();
+        self.rate.mark_app_limited(pipe);
+    }
+
+    /// Keep a log of the segments marked lost, for [`take_losses`](Self::take_losses).
+    pub fn set_track_losses(&mut self, on: bool) {
+        self.lost_log = on.then(Vec::new);
+    }
+
+    /// The segments marked lost since last asked, with their sizes.
+    pub fn take_losses(&mut self) -> Vec<(TxState, u32)> {
+        match self.lost_log.as_mut() {
+            Some(log) => std::mem::take(log),
+            None => Vec::new(),
+        }
+    }
+
+    /// The round trip of the most recently sent segment the ACK in
+    /// progress delivered, as RACK took it: what BBR's minimum RTT wants
+    /// (draft-ietf-ccwg-bbr §5.5.7.1), where the RTO takes the oldest.
+    pub fn ack_rtt(&self) -> Option<Duration> {
+        self.rack
+            .rtt_from
+            .map(|_| Duration::from_nanos(self.rack.rtt))
     }
 
     /// RACK step 4 (RFC 8985 §6.2): the reordering window for this ACK.
@@ -625,8 +689,12 @@ impl Scoreboard {
             return false;
         }
         s.flags |= LOST;
-        let (start, len) = (s.start, s.len());
+        let (start, len, rate) = (s.start, s.len(), s.rate);
         self.lost += len;
+        self.rate.on_lost(len);
+        if let Some(log) = self.lost_log.as_mut() {
+            log.push((rate, len as u32));
+        }
         self.lost_set.insert(start);
         true
     }
@@ -872,6 +940,63 @@ mod tests {
             left: seq(from),
             right: seq(to),
         }
+    }
+
+    /// Rate samples from SACKs and cumulative ACKs alike, taken from the
+    /// newest segment each ACK delivers; a segment SACKed before is not
+    /// counted again when cumulatively acknowledged.
+    #[test]
+    fn deliveries_give_rate_samples() {
+        let t0 = Instant::now();
+        // Ten segments sent 1 ms apart into an idle path.
+        let mut b = board(10, t0);
+        let rtt = Duration::from_millis(100);
+        b.rtt_sample(rtt, t0 + rtt);
+        // Segments 2..4 SACKed 100 ms after segment 3 went out.
+        let now = t0 + Duration::from_millis(103);
+        b.begin_ack();
+        b.sack(&[blk(2, 4)], now, None);
+        let rs = b.rate_sample().unwrap();
+        assert_eq!(rs.delivered, 2 * u64::from(MSS));
+        assert_eq!(rs.prior_delivered, 0);
+        assert_eq!(rs.tx_in_flight, 4 * MSS, "segment 3 went out fourth");
+        // Over max(send 3 ms, ACK 103 ms).
+        assert_eq!(rs.interval, Duration::from_millis(103));
+        assert_eq!(rs.delivery_rate, 2 * u64::from(MSS) * 1000 / 103);
+        assert!(b.rate_sample().is_none(), "one per ACK");
+        // The cumulative ACK of 0..5: 0, 1 and 4 are new; 2 and 3 were in.
+        let now = t0 + Duration::from_millis(106);
+        b.begin_ack();
+        b.ack(seq(5), now, None);
+        let rs = b.rate_sample().unwrap();
+        assert_eq!(b.rate().delivered(), 5 * u64::from(MSS));
+        assert_eq!(rs.delivered, 5 * u64::from(MSS));
+        // An ACK of nothing new has no sample; losses show in the next.
+        b.begin_ack();
+        b.ack(seq(5), now, None);
+        assert!(b.rate_sample().is_none());
+        b.mark_head_lost();
+        assert_eq!(b.rate().lost(), u64::from(MSS));
+        b.begin_ack();
+        b.sack(&[blk(6, 7)], now + Duration::from_millis(1), None);
+        let rs = b.rate_sample().unwrap();
+        assert_eq!(rs.lost, u64::from(MSS));
+    }
+
+    /// With the log on, each segment marked lost is reported once, with the
+    /// state it went out with.
+    #[test]
+    fn losses_are_logged_for_the_controller() {
+        let t0 = Instant::now();
+        let mut b = board(4, t0);
+        assert!(b.take_losses().is_empty(), "no log unless asked");
+        b.set_track_losses(true);
+        b.mark_all_lost();
+        let lost = b.take_losses();
+        assert_eq!(lost.len(), 4);
+        assert_eq!(lost[3].0.tx_in_flight, 4 * MSS);
+        assert_eq!(lost[3].1, MSS);
+        assert!(b.take_losses().is_empty());
     }
 
     #[test]
