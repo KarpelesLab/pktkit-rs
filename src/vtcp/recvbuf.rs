@@ -1,19 +1,17 @@
 //! Receiver-side reassembly buffer with SACK reporting.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use super::options::SackBlock;
 use super::sendbuf::KEEP_IDLE_CAPACITY;
 use super::seqspace::{seq_after, seq_after_eq, seq_before, seq_before_eq};
 
-/// Cap on the number of out-of-order ranges. Adjacent and overlapping
-/// segments merge into one range, so this counts holes in the stream, not
-/// segments; the bytes they hold are bounded by the window. Past it the
-/// range furthest out is dropped, reneging on its SACK, which costs the
-/// sender a timeout to notice; a drop-tail queue overflowing in slow start
-/// loses every other segment of a burst, so a window of megabytes can hold
-/// a thousand holes.
-const MAX_OOO_ENTRIES: usize = 1024;
+/// What an out-of-order range costs beyond the bytes it holds: its entry in
+/// the map and its buffer's allocation. Charged against the memory bound,
+/// so that a peer sending a byte here and a byte there cannot make the
+/// ranges cost many times the window they fit in (Linux charges each
+/// segment its skb's truesize for the same reason).
+const RANGE_OVERHEAD: usize = 128;
 
 /// SACK blocks that fit in the 40 option bytes: four alone (34 bytes), three
 /// beside a timestamp option (RFC 2018 §3).
@@ -32,6 +30,12 @@ impl OooEntry {
     #[inline]
     fn end(&self) -> u32 {
         self.seq.wrapping_add(self.data.len() as u32)
+    }
+
+    /// What it counts against the memory bound.
+    #[inline]
+    fn cost(&self) -> usize {
+        self.data.len() + RANGE_OVERHEAD
     }
 }
 
@@ -54,7 +58,15 @@ pub struct RecvBuf {
     /// only the bytes they move.
     buf: VecDeque<u8>,
     nxt: u32,
-    ooo: Vec<OooEntry>,
+    /// RCV.NXT as an offset into the stream, which unlike a sequence
+    /// number does not wrap: what the out-of-order ranges are ordered by.
+    nxt_off: u64,
+    /// Out-of-order ranges by stream offset: sorted, disjoint and apart
+    /// (touching ranges are merged), so a segment finds its neighbours in
+    /// O(log n) however many holes there are.
+    ooo: BTreeMap<u64, OooEntry>,
+    /// What the ranges cost together (see [`OooEntry::cost`]).
+    ooo_mem: usize,
     /// A sequence number inside each of the most recently extended
     /// out-of-order ranges, newest first. RFC 2018 orders SACK blocks by it.
     recent: Vec<u32>,
@@ -75,7 +87,9 @@ impl RecvBuf {
         Self {
             buf: VecDeque::new(),
             nxt: initial_nxt,
-            ooo: Vec::new(),
+            nxt_off: 0,
+            ooo: BTreeMap::new(),
+            ooo_mem: 0,
             recent: Vec::new(),
             window_size,
             adv_edge: None,
@@ -113,6 +127,26 @@ impl RecvBuf {
             return 65535;
         }
         self.window_size.saturating_sub(self.buf.len()) as u32
+    }
+
+    /// The most the out-of-order ranges may cost before the furthest are
+    /// given up. The bytes they hold lie inside the window, so they never
+    /// come to more than the buffer (a unit more, when a scaled window was
+    /// rounded up); the other half is for the ranges' overhead, which only
+    /// many tiny segments scattered over the window run through. Data sent
+    /// as the window allows is therefore never dropped once taken, however
+    /// many holes a reordering path leaves in it, as Linux prunes its
+    /// out-of-order queue only once past the receive buffer.
+    fn ooo_budget(&self) -> usize {
+        let w = self.window_size.max(65535);
+        w + w / 2
+    }
+
+    /// The stream offset of `seq`, which lies within a window of RCV.NXT.
+    #[inline]
+    fn off(&self, seq: u32) -> u64 {
+        self.nxt_off
+            .wrapping_add(seq.wrapping_sub(self.nxt) as i32 as i64 as u64)
     }
 
     /// Insert `data` at sequence `seq`. Returns the number of new
@@ -170,30 +204,30 @@ impl RecvBuf {
 
         if seq == self.nxt {
             // Out-of-order data this fills in again was here already.
-            if let Some(e) = self.ooo.first()
+            if let Some((_, e)) = self.ooo.first_key_value()
                 && seq_before(e.seq, end_seq)
             {
-                let r = if seq_before(e.end(), end_seq) {
-                    e.end()
-                } else {
-                    end_seq
-                };
-                self.note_dup(e.seq, r);
+                let (l, r) = (e.seq, e.end());
+                self.note_dup(l, if seq_before(r, end_seq) { r } else { end_seq });
             }
             self.buf.extend(slice);
             self.nxt = end_seq;
+            self.nxt_off += slice.len() as u64;
             self.merge_ooo();
             return slice.len();
         }
 
         self.insert_ooo(seq, slice);
-        if self.ooo.len() > MAX_OOO_ENTRIES {
-            // Too many holes. Give up the range furthest from RCV.NXT, as
-            // Linux's tcp_prune_ofo_queue does: it is the last one the
-            // stream will need. Dropping it reneges on anything SACKed
-            // there, which RFC 2018 allows; the sender keeps it until it is
-            // cumulatively acknowledged.
-            self.ooo.pop();
+        // Over the memory bound: give up the ranges furthest from RCV.NXT,
+        // as Linux's tcp_prune_ofo_queue does: the stream needs them last.
+        // Dropping them reneges on what was SACKed there, which RFC 2018
+        // allows; the sender keeps it until it is cumulatively acknowledged.
+        let budget = self.ooo_budget();
+        while self.ooo_mem > budget {
+            let Some((_, e)) = self.ooo.pop_last() else {
+                break;
+            };
+            self.ooo_mem -= e.cost();
         }
         self.note_recent(seq);
         0
@@ -224,10 +258,13 @@ impl RecvBuf {
 
     /// The out-of-order range holding `seq`, if any.
     fn range_of(&self, seq: u32) -> Option<&OooEntry> {
-        // Sorted and disjoint: the first range ending past `seq` is the
-        // only one that can hold it.
-        let i = self.ooo.partition_point(|e| seq_before_eq(e.end(), seq));
-        self.ooo.get(i).filter(|e| seq_before_eq(e.seq, seq))
+        if !seq_after(seq, self.nxt) {
+            return None;
+        }
+        // Sorted and disjoint: the last range starting at or before `seq`
+        // is the only one that can hold it.
+        let (_, e) = self.ooo.range(..=self.off(seq)).next_back()?;
+        seq_before(seq, e.end()).then_some(e)
     }
 
     /// Record that the range holding `seq` was just extended, displacing any
@@ -253,24 +290,32 @@ impl RecvBuf {
     /// extending a range costs its own size, not the range's.
     fn insert_ooo(&mut self, seq: u32, data: &[u8]) {
         let end = seq.wrapping_add(data.len() as u32);
-        // Ranges i..j touch [seq, end): sorted and disjoint, so they are
-        // consecutive, and the gaps between them lie inside [seq, end).
-        let i = self.ooo.partition_point(|e| seq_before(e.end(), seq));
-        let mut j = i;
-        while j < self.ooo.len() && seq_before_eq(self.ooo[j].seq, end) {
-            j += 1;
+        let (lo, hi) = (self.off(seq), self.off(end));
+        // The ranges touching [seq, end): the one starting at or before it,
+        // if it reaches that far, and any starting inside it or at its end.
+        let mut keys: Vec<u64> = Vec::new();
+        if let Some((&k, e)) = self.ooo.range(..=lo).next_back()
+            && k + e.data.len() as u64 >= lo
+        {
+            keys.push(k);
         }
-        if i == j {
-            self.ooo.insert(
-                i,
-                OooEntry {
-                    seq,
-                    data: data.iter().copied().collect(),
-                },
-            );
+        keys.extend(self.ooo.range(lo + 1..=hi).map(|(&k, _)| k));
+        if keys.is_empty() {
+            let e = OooEntry {
+                seq,
+                data: data.iter().copied().collect(),
+            };
+            self.ooo_mem += e.cost();
+            self.ooo.insert(lo, e);
             return;
         }
-        for e in &self.ooo[i..j] {
+        let mut touching: Vec<OooEntry> = Vec::with_capacity(keys.len());
+        for k in keys {
+            let e = self.ooo.remove(&k).expect("key just found");
+            self.ooo_mem -= e.cost();
+            touching.push(e);
+        }
+        for e in &touching {
             let l = if seq_after(e.seq, seq) { e.seq } else { seq };
             let r = if seq_before(e.end(), end) {
                 e.end()
@@ -282,16 +327,17 @@ impl RecvBuf {
                 break;
             }
         }
-        let k = (i..j).max_by_key(|&k| self.ooo[k].data.len()).unwrap();
-        let mut others: Vec<OooEntry> = self.ooo.drain(i..j).collect();
-        let mut base = others.remove(k - i);
+        let k = (0..touching.len())
+            .max_by_key(|&k| touching[k].data.len())
+            .unwrap();
+        let mut base = touching.remove(k);
         let new_part = |from: u32, to: u32| {
             &data[from.wrapping_sub(seq) as usize..to.wrapping_sub(seq) as usize]
         };
 
         // Everything left of the base range, gathered in order and then
         // pushed onto its front.
-        let (left, right): (Vec<OooEntry>, Vec<OooEntry>) = others
+        let (left, right): (Vec<OooEntry>, Vec<OooEntry>) = touching
             .into_iter()
             .partition(|e| seq_before(e.seq, base.seq));
         let mut front: VecDeque<u8> = VecDeque::new();
@@ -329,26 +375,27 @@ impl RecvBuf {
         if seq_before(cursor, end) {
             base.data.extend(new_part(cursor, end));
         }
-        self.ooo.insert(i, base);
+        self.ooo_mem += base.cost();
+        self.ooo.insert(self.off(base.seq), base);
     }
 
     /// Move whatever out-of-order data now continues the stream into it.
     fn merge_ooo(&mut self) {
         // Sorted, so only the leading ranges can join.
-        let mut done = 0;
-        while let Some(e) = self.ooo.get(done) {
-            if seq_after(e.seq, self.nxt) {
+        while let Some(entry) = self.ooo.first_entry() {
+            if *entry.key() > self.nxt_off {
                 break;
             }
+            let e = entry.remove();
+            self.ooo_mem -= e.cost();
             if seq_after(e.end(), self.nxt) {
                 let offset = self.nxt.wrapping_sub(e.seq) as usize;
                 extend_from_deque(&mut self.buf, &e.data, offset);
+                self.nxt_off += u64::from(e.end().wrapping_sub(self.nxt));
                 self.nxt = e.end();
             }
             // else: entirely before nxt, discard
-            done += 1;
         }
-        self.ooo.drain(..done);
         let nxt = self.nxt;
         self.recent.retain(|&s| seq_after_eq(s, nxt));
     }
@@ -370,7 +417,8 @@ impl RecvBuf {
     /// arrive (TIME-WAIT, CLOSED): the out-of-order ranges, and the
     /// in-order data too unless it is still to be read (`keep_unread`).
     pub fn release_memory(&mut self, keep_unread: bool) {
-        self.ooo = Vec::new();
+        self.ooo = BTreeMap::new();
+        self.ooo_mem = 0;
         self.recent = Vec::new();
         if !keep_unread || self.buf.is_empty() {
             self.buf = VecDeque::new();
@@ -380,7 +428,7 @@ impl RecvBuf {
     /// Bytes allocated for data, in order and out of order.
     #[cfg(test)]
     pub fn allocated(&self) -> usize {
-        self.buf.capacity() + self.ooo.iter().map(|e| e.data.capacity()).sum::<usize>()
+        self.buf.capacity() + self.ooo.values().map(|e| e.data.capacity()).sum::<usize>()
     }
 
     /// In-order bytes waiting to be read.
@@ -398,6 +446,7 @@ impl RecvBuf {
     /// Bump RCV.NXT by `n`. Used to consume the FIN sequence space.
     pub(crate) fn bump_nxt(&mut self, n: u32) {
         self.nxt = self.nxt.wrapping_add(n);
+        self.nxt_off += u64::from(n);
     }
 
     /// Up to 3 SACK blocks describing out-of-order data: as many as fit
@@ -420,7 +469,7 @@ impl RecvBuf {
         };
         let mut out: Vec<SackBlock> = Vec::with_capacity(max);
         let recent = self.recent.iter().filter_map(|&s| self.range_of(s));
-        for e in recent.chain(self.ooo.iter()) {
+        for e in recent.chain(self.ooo.values()) {
             if out.len() == max {
                 break;
             }
@@ -528,7 +577,7 @@ mod tests {
     #[test]
     fn contiguous_segments_behind_a_hole_are_all_kept() {
         // One lost segment followed by a full default window of contiguous
-        // ones: far more segments than MAX_OOO_ENTRIES, but a single range.
+        // ones: hundreds of segments, but a single range.
         const MSS: usize = 1460;
         const SEGS: usize = 700;
         let mut r = RecvBuf::new(0, 1 << 20);
@@ -562,28 +611,67 @@ mod tests {
         assert_eq!(&buf[..n], b"0123456789aaaaabbbbbcccc");
     }
 
+    /// A reordering path at a large window leaves thousands of holes:
+    /// everything the window let in is kept, SACKed and later delivered,
+    /// however many there are.
     #[test]
-    fn too_many_holes_drops_the_furthest_range() {
-        let mut r = RecvBuf::new(0, 1 << 20);
-        // Every other segment: each one is its own hole.
-        for i in 0..=MAX_OOO_ENTRIES {
-            r.insert((i * 20 + 10) as u32, &[1; 10]);
+    fn thousands_of_holes_within_the_window_are_kept() {
+        const MSS: usize = 1460;
+        const WINDOW: usize = 16 << 20;
+        let mut r = RecvBuf::new(u32::MAX - 5000, WINDOW);
+        let base = r.nxt();
+        let segs = WINDOW / MSS;
+        // Every other segment first, back to front for good measure: each
+        // is a hole of its own, about 5700 of them.
+        for i in (1..segs).step_by(2).rev() {
+            let seq = base.wrapping_add((i * MSS) as u32);
+            r.insert(seq, &[i as u8; MSS]);
         }
-        assert_eq!(r.ooo.len(), MAX_OOO_ENTRIES);
-        assert_eq!(
-            r.ooo.last().unwrap().seq,
-            ((MAX_OOO_ENTRIES - 1) * 20 + 10) as u32
-        );
-        // A segment adjacent to an existing range still gets in.
-        r.insert(20, &[1; 10]);
-        assert_eq!(r.ooo.len(), MAX_OOO_ENTRIES - 1);
+        assert_eq!(r.ooo.len(), segs / 2);
+        let first = r.sack_blocks_up_to(4)[0];
+        assert_eq!(first.left, base.wrapping_add(MSS as u32), "newest first");
+        // Then the rest: all of it comes out in order.
+        for i in (0..segs).step_by(2) {
+            let seq = base.wrapping_add((i * MSS) as u32);
+            r.insert(seq, &[i as u8; MSS]);
+        }
+        assert!(!r.has_ooo());
+        assert_eq!(r.ooo_mem, 0);
+        assert_eq!(r.readable(), segs * MSS);
+        let mut out = vec![0; segs * MSS];
+        assert_eq!(r.read(&mut out), segs * MSS);
+        assert!(out.chunks(MSS).enumerate().all(|(i, c)| c[0] == i as u8));
+    }
+
+    /// Past the memory bound, which only ranges far smaller than a segment
+    /// reach, the ranges furthest out are given up, and the rest stays.
+    #[test]
+    fn scattered_tiny_segments_are_pruned_from_the_far_end() {
+        let window = 1 << 16;
+        let mut r = RecvBuf::new(0, window);
+        // A byte in every 20: the ranges' overhead far outweighs the data.
+        for i in 0..window / 20 {
+            r.insert((i * 20 + 10) as u32, &[1]);
+            assert!(r.ooo_mem <= r.ooo_budget());
+        }
+        let kept = r.ooo.len();
+        assert!(kept < window / 20, "nothing pruned");
+        assert!(kept > 100, "pruned too much: {kept}");
+        // The nearest ranges are the ones kept.
+        let (_, last) = r.ooo.last_key_value().unwrap();
+        assert_eq!(last.seq, ((kept - 1) * 20 + 10) as u32);
+        // A segment joining two kept ranges still gets in, and costs less.
+        let before = r.ooo_mem;
+        r.insert(11, &[1; 19]);
+        assert_eq!(r.ooo.len(), kept - 1);
+        assert!(r.ooo_mem < before);
     }
 
     #[test]
     fn unbounded_mode_holds_ooo_to_the_advertised_window() {
         let mut r = RecvBuf::new(0, 0);
         assert_eq!(r.insert(100, &[1; 70_000]), 0);
-        let held: usize = r.ooo.iter().map(|e| e.data.len()).sum();
+        let held: usize = r.ooo.values().map(|e| e.data.len()).sum();
         assert_eq!(held, 65535 - 100);
         // In-order data is still taken whole.
         assert_eq!(r.insert(0, &[1; 100]), 100);
@@ -640,7 +728,7 @@ mod tests {
                     out.extend_from_slice(&buf[..n]);
                 }
                 let mut prev_end: Option<u32> = None;
-                for e in &r.ooo {
+                for e in r.ooo.values() {
                     assert!(seq_after(e.seq, r.nxt()));
                     assert!(prev_end.is_none_or(|p| seq_after(e.seq, p)), "{round}");
                     for (i, &b) in e.data.iter().enumerate() {
@@ -648,6 +736,11 @@ mod tests {
                     }
                     prev_end = Some(e.end());
                 }
+                for (&k, e) in &r.ooo {
+                    assert_eq!(k, r.off(e.seq), "{round}: keyed by offset");
+                }
+                let cost: usize = r.ooo.values().map(OooEntry::cost).sum();
+                assert_eq!(cost, r.ooo_mem, "{round}: memory accounted");
             }
             let mut buf = vec![0; 1 << 16];
             let n = r.read(&mut buf);

@@ -36,7 +36,9 @@
 //!   does by default.
 //! - RFC 7323: window scaling, timestamps (PAWS, and an RTT sample from
 //!   every ACK, weighed as its Appendix G suggests).
-//! - RFC 2018: SACK, with RFC 6675's scoreboard and pipe.
+//! - RFC 2018: SACK, with RFC 6675's scoreboard and pipe. Out-of-order
+//!   data is kept however many holes it leaves; only ranges costing more
+//!   memory than the receive buffer allows are given up.
 //! - RFC 8985: RACK-TLP. With SACK, losses are found by time rather than
 //!   by counting duplicates: a segment is lost once one sent after it has
 //!   been delivered and a reordering window (a quarter of the minimum RTT)
