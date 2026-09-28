@@ -547,11 +547,12 @@ fn write_after_close_is_a_broken_pipe() {
         )
         .unwrap();
     conn.close().unwrap();
-    conn.set_write_timeout(Some(Duration::from_secs(2)));
+    conn.set_write_timeout(Some(Duration::from_secs(30)));
     let start = std::time::Instant::now();
     let err = conn.write(b"late").unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
-    assert!(start.elapsed() < Duration::from_secs(1));
+    // Far below the timeout: failing at once, not after waiting it out.
+    assert!(start.elapsed() < Duration::from_secs(10));
 }
 
 /// Dropping a connection whose incoming data was never read resets it

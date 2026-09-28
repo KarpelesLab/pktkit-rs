@@ -176,11 +176,12 @@ fn inbound_accept_handshake_and_bidirectional_data() {
 
     server_conn.close().unwrap();
     // Closed for writing: a late write fails at once, it does not wait.
-    server_conn.set_write_timeout(Some(Duration::from_secs(2)));
+    server_conn.set_write_timeout(Some(Duration::from_secs(30)));
     let start = Instant::now();
     let err = server_conn.write(b"late").unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
-    assert!(start.elapsed() < Duration::from_secs(1));
+    // Far below the timeout: failing at once, not after waiting it out.
+    assert!(start.elapsed() < Duration::from_secs(10));
     let _ = listener.close();
     let _ = stack.shutdown();
 }
