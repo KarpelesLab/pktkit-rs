@@ -592,18 +592,20 @@ mod tests {
         // fragments covering all but a gap before it, which never complete
         // it. Each used to rescan every fragment and the whole datagram;
         // now a count answers, and a fragment is checked against its two
-        // neighbours. The bound is loose enough for a slow debug build.
+        // neighbours. The bound is loose enough for a slow debug build on
+        // a loaded machine; the work, small fragments of many datagrams,
+        // is enough that the rescans would still take it well past it.
         let d = Defragger::new();
         let start = std::time::Instant::now();
-        for id in 0..32u16 {
+        for id in 0..128u16 {
             d.process(&build_ipv4(id, false, 65480, &[0u8; 8]));
             for i in 0..(DEFRAG_MAX_FRAGS - 2) {
-                d.process(&build_ipv4(id, true, i * 256, &[0u8; 256]));
+                d.process(&build_ipv4(id, true, i * 64, &[0u8; 64]));
             }
         }
         let took = start.elapsed();
-        assert!(took < Duration::from_millis(500), "{took:?}");
+        assert!(took < Duration::from_secs(2), "{took:?}");
         // All of it still held.
-        assert_eq!(buffered(&d), 32 * (DEFRAG_MAX_FRAGS - 1));
+        assert_eq!(buffered(&d), 128 * (DEFRAG_MAX_FRAGS - 1));
     }
 }

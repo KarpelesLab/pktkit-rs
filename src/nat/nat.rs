@@ -3617,7 +3617,7 @@ mod tests {
         // used to rescan the pool and walk the whole table under the lock,
         // some 5 ms apiece; now the free count refuses it, and a reclaim
         // runs at most once a second. The bound is loose enough for a slow
-        // debug build.
+        // debug build on a loaded machine.
         let start = std::time::Instant::now();
         for sport in NAT_PORT_MIN..NAT_PORT_MIN + 2000 {
             let p = build_udp(Ipv4Addr::new(10, 0, 0, 200), sport, REMOTE, 53, b"q");
@@ -3625,7 +3625,7 @@ mod tests {
         }
         let took = start.elapsed();
         assert!(o.lock().unwrap().is_empty());
-        assert!(took < Duration::from_millis(500), "{took:?} for 2000 flows");
+        assert!(took < Duration::from_secs(2), "{took:?} for 2000 flows");
 
         // As ports come free, they are found again.
         {

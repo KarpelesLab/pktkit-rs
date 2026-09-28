@@ -443,16 +443,17 @@ mod tests {
         };
         // A table nearly full of calls, then a stream of requests: each
         // used to sweep the whole table. The bound is loose enough for a
-        // slow debug build.
+        // slow debug build on a loaded machine; the sweeps would take 5000
+        // requests well past it.
         for id in 1..=60000 {
             send(id, false);
         }
         let start = std::time::Instant::now();
-        for id in 60001..=62000 {
+        for id in 60001..=65000 {
             send(id, true);
         }
         let took = start.elapsed();
-        assert!(took < Duration::from_millis(300), "{took:?}");
+        assert!(took < Duration::from_secs(2), "{took:?}");
 
         // Stale calls still go, once the interval has passed.
         let old = Instant::now() - PPTP_GRE_TIMEOUT - Duration::from_secs(1);

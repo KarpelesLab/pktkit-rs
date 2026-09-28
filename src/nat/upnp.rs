@@ -1778,11 +1778,13 @@ Content-Length: {len}\r\n\r\n",
 
         // Just short of the request cap, a few bytes a segment, with no end
         // to the header block. Each segment used to rescan all that came
-        // before. The bound is loose enough for a slow debug build.
+        // before. The bound is loose enough for a slow debug build on a
+        // loaded machine; segments this small make the rescans take it
+        // well past it.
         let (_, segs) = conn.write(b"G");
         let first = Segment::parse(&segs[0]).unwrap();
         let mut seq = first.seq;
-        let chunk = 16;
+        let chunk = 4;
         let start = std::time::Instant::now();
         for _ in 0..(MAX_REQUEST_BYTES - 100) / chunk {
             let mut s = first.clone();
@@ -1793,7 +1795,7 @@ Content-Length: {len}\r\n\r\n",
             h.handle_local(&nat, crate::Packet::from_slice(&ip));
         }
         let took = start.elapsed();
-        assert!(took < Duration::from_millis(500), "{took:?}");
+        assert!(took < Duration::from_secs(2), "{took:?}");
         let ctrl = h.ctrl.lock().unwrap();
         let cc = ctrl.values().next().unwrap();
         assert!(cc.req.len() > MAX_REQUEST_BYTES - 200);
@@ -2057,17 +2059,18 @@ MAN: \"ssdp:discover\"\r\nST: upnp:rootdevice\r\n\r\n";
 
         // Walking the table by index copies one entry per request. Each
         // used to copy them all, descriptions included. The bound is loose
-        // enough for a slow debug build.
+        // enough for a slow debug build on a loaded machine; walking the
+        // table four times, copying it all would take it well past it.
         let start = std::time::Instant::now();
         let mut ports = HashSet::new();
-        for i in 0..1024 {
+        for i in (0..1024).cycle().take(4 * 1024) {
             let q = format!("<NewPortMappingIndex>{i}</NewPortMappingIndex>");
             let r = h.handle_soap(&nat, "GetGenericPortMappingEntry", q.as_bytes(), None);
             assert_eq!(r.status, 200);
             ports.insert(xml_field(&r.body, "NewExternalPort").unwrap());
         }
         let took = start.elapsed();
-        assert!(took < Duration::from_millis(500), "{took:?}");
+        assert!(took < Duration::from_secs(2), "{took:?}");
         assert_eq!(ports.len(), 1024, "each index names another entry");
         let q = b"<NewPortMappingIndex>1024</NewPortMappingIndex>";
         let r = h.handle_soap(&nat, "GetGenericPortMappingEntry", q, None);

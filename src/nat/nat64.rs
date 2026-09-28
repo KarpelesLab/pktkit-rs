@@ -2207,7 +2207,8 @@ mod tests {
         let client: Ipv6Addr = CLIENT.parse().unwrap();
         // All live: each new flow is refused by the free count, with a
         // reclaim at most once a second, not a rescan and a table walk
-        // apiece. The bound is loose enough for a slow debug build.
+        // apiece. The bound is loose enough for a slow debug build on a
+        // loaded machine.
         let start = std::time::Instant::now();
         for sport in NAT_PORT_MIN..NAT_PORT_MIN + 2000 {
             let pkt = build_v6_udp(client, sport, wkp(SERVER), 53, b"q");
@@ -2215,7 +2216,7 @@ mod tests {
         }
         let took = start.elapsed();
         assert!(outside.lock().unwrap().is_empty());
-        assert!(took < std::time::Duration::from_millis(500), "{took:?}");
+        assert!(took < std::time::Duration::from_secs(2), "{took:?}");
     }
 
     /// Map one host's UDP ports to every port of the pool, each keeping
