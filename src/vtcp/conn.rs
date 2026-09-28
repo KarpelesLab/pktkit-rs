@@ -188,8 +188,11 @@ pub struct ConnConfig {
     pub mss: u16,
     /// Do not offer window scaling (RFC 7323), which is offered by default.
     pub no_window_scaling: bool,
-    /// Offer timestamps (RFC 7323), for RTT measurement and PAWS. Off by
-    /// default.
+    /// Offer timestamps (RFC 7323); used only if the peer offers them too.
+    /// On by default, as on Linux: they give an RTT sample with every ACK,
+    /// which a retransmission cannot make ambiguous, and PAWS against old
+    /// duplicates once sequence numbers wrap. They cost 12 bytes of every
+    /// segment.
     pub enable_timestamps: bool,
     /// Offer SACK (RFC 2018); used only if the peer offers it too. On by
     /// default: without it a receiver can only report the first hole in the
@@ -293,7 +296,7 @@ impl Default for ConnConfig {
             remote_port: 0,
             mss: DEFAULT_MSS,
             no_window_scaling: false,
-            enable_timestamps: false,
+            enable_timestamps: true,
             enable_sack: true,
             congestion: CongestionKind::default(),
             keepalive: false,
@@ -3268,6 +3271,9 @@ mod tests {
             recv_buf_size: 4096,
             // These tests count the window in bytes, unscaled.
             autotune: false,
+            // And segments in whole MSS, which timestamps take 12 bytes
+            // of; the tests of timestamps turn them on.
+            enable_timestamps: false,
             ..Default::default()
         }
     }
@@ -6760,6 +6766,27 @@ mod tests {
         let acks = deliver(&mut server, &segs);
         assert_eq!(parse(acks.last().unwrap()).window, 0);
         assert_eq!(server.delack_deadline, None);
+    }
+
+    /// Timestamps are offered by default, and used when the peer offers
+    /// them too; one that does not gets none.
+    #[test]
+    fn timestamps_are_on_by_default() {
+        assert!(ConnConfig::default().enable_timestamps);
+        let conf = |l, r| ConnConfig::default().local_port(l).remote_port(r);
+        let mut client = Conn::new(conf(40630, 80));
+        let mut server = Conn::new(conf(80, 40630));
+        drive_handshake(&mut client, &mut server);
+        assert!(client.ts_ok && server.ts_ok);
+        let (_, data) = client.write(b"x");
+        assert!(get_timestamp(&parse(&data[0]).options).is_some());
+
+        let mut client = Conn::new(conf(40631, 80));
+        let mut server = Conn::new(conf(80, 40631).enable_timestamps(false));
+        drive_handshake(&mut client, &mut server);
+        assert!(!client.ts_ok && !server.ts_ok);
+        let (_, data) = client.write(b"x");
+        assert!(parse(&data[0]).options.is_empty());
     }
 
     /// A later connection between the same two hosts sends TSvals past an
