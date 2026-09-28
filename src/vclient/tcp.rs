@@ -1223,14 +1223,33 @@ impl TcpStack {
         ack: &Segment,
         mss: u16,
     ) {
-        let mut conn = Conn::new(passive_config(local_ip, remote, ack, self.mss_for(remote)));
-        let segs = conn.accept_cookie(ack, ack.ack.wrapping_sub(1), mss);
+        let conn = Conn::new(passive_config(local_ip, remote, ack, self.mss_for(remote)));
         let key = passive_key(remote, ack);
         let pending = PendingAccept {
             listener,
             half_open: false,
         };
         let state = ConnState::new(key, local_ip, conn, self.sink.clone(), Some(pending));
+        // Data riding on the ACK counts against the listener's budget like
+        // any other before the connection is accepted. Past it, the
+        // handshake still completes, but the data, and a FIN after it, are
+        // left for the peer to send again, as `handle_inbound` leaves them.
+        let bare;
+        let ack = if state.admit(ack) {
+            ack
+        } else {
+            bare = Segment {
+                payload: Vec::new(),
+                flags: ack.flags & !(flags::FIN | flags::PSH),
+                ..ack.clone()
+            };
+            &bare
+        };
+        let segs = state
+            .conn
+            .lock()
+            .unwrap()
+            .accept_cookie(ack, ack.ack.wrapping_sub(1), mss);
         state.connected.store(true, Ordering::Release);
         if !self.register(key, &state) {
             return;
@@ -1965,6 +1984,51 @@ mod tests {
         // Accepted, it takes data again: what was dropped comes back.
         feed(data(2 + 65_000, 1000));
         assert_eq!(conn.read(&mut buf).unwrap(), 1000);
+    }
+
+    /// Data on the ACK completing a SYN-cookie handshake counts against the
+    /// same budget: past it, the connection opens without the data (or the
+    /// FIN after it), which the peer sends again.
+    #[test]
+    fn cookie_data_counts_against_the_budget() {
+        let (stack, out) = capturing_stack();
+        let listener = stack.listen(own(US), 80).unwrap();
+        listener.set_nonblocking(true);
+        let feed = |seg: Segment| {
+            out.lock().unwrap().clear();
+            stack.handle_inbound(Packet::from_slice(&inbound(seg)), IpAddr::V4(US));
+        };
+        for port in 0..HALF_OPEN_CAP as u16 {
+            feed(syn_from(10000 + port));
+        }
+        let len = UNACCEPTED_BYTES * 3 / 4;
+        for port in [20000, 20001] {
+            feed(syn_from(port));
+            let cookie = last_sent(&out).seq;
+            feed(Segment {
+                src_port: port,
+                dst_port: 80,
+                seq: 2,
+                ack: cookie.wrapping_add(1),
+                flags: flags::ACK | flags::PSH | flags::FIN,
+                window: 65535,
+                payload: vec![7; len],
+                ..Default::default()
+            });
+            // The first fits the budget; the second's data and FIN do not,
+            // and its ACK says so.
+            let acked = if port == 20000 { 2 + len as u32 } else { 2 };
+            assert_eq!(last_sent(&out).ack, acked, "port {port}");
+        }
+        assert_eq!(listener.state.unaccepted_bytes.load(Ordering::Acquire), len);
+        let mut held = Vec::new();
+        while let Ok(c) = listener.accept() {
+            c.set_nonblocking(true);
+            let mut buf = vec![0; UNACCEPTED_BYTES];
+            let n = c.read(&mut buf).unwrap_or(0);
+            held.push((c.peer_addr().port(), n));
+        }
+        assert_eq!(held, [(20000, len), (20001, 0)]);
     }
 
     /// Past [`MAX_TIME_WAIT`], the connections longest in TIME-WAIT are
