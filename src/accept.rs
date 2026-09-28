@@ -227,69 +227,109 @@ fn transient(e: &std::io::Error) -> bool {
     ) {
         return true;
     }
-    // The rest have no ErrorKind of their own, and there is no libc to name
-    // them here, so by number, which is fixed per ABI -- but not the same on
-    // every Linux architecture.
-    //
-    // Linux: EMFILE, ENFILE, ENOBUFS, then accept(2)'s network errors:
-    // ENETDOWN, EPROTO, ENOPROTOOPT, EHOSTDOWN, ENONET, EHOSTUNREACH,
-    // EOPNOTSUPP, ENETUNREACH.
-    #[cfg(all(
-        any(target_os = "linux", target_os = "android", target_os = "fullrust"),
-        not(any(
-            target_arch = "mips",
-            target_arch = "mips32r6",
-            target_arch = "mips64",
-            target_arch = "mips64r6",
-            target_arch = "sparc",
-            target_arch = "sparc64"
-        ))
-    ))]
-    const CODES: &[i32] = &[24, 23, 105, 100, 71, 92, 112, 64, 113, 95, 101];
-    #[cfg(all(
-        any(target_os = "linux", target_os = "android"),
-        any(
-            target_arch = "mips",
-            target_arch = "mips32r6",
-            target_arch = "mips64",
-            target_arch = "mips64r6"
-        )
-    ))]
-    const CODES: &[i32] = &[24, 23, 132, 127, 71, 99, 147, 64, 148, 122, 128];
-    #[cfg(all(
-        any(target_os = "linux", target_os = "android"),
-        any(target_arch = "sparc", target_arch = "sparc64")
-    ))]
-    const CODES: &[i32] = &[24, 23, 55, 50, 86, 42, 64, 80, 65, 45, 51];
-    // WSAEMFILE, WSAENOBUFS, WSAENETDOWN, WSAEHOSTDOWN, WSAEHOSTUNREACH,
-    // WSAENETUNREACH.
-    #[cfg(windows)]
-    const CODES: &[i32] = &[10024, 10055, 10050, 10064, 10065, 10051];
-    // The BSDs and Apple: EMFILE, ENFILE, ENOBUFS, ENETDOWN, ENETUNREACH,
-    // EHOSTDOWN, EHOSTUNREACH, and EPROTO, which each numbers its own way.
-    // Not EOPNOTSUPP or ENOPROTOOPT: from a BSD accept those are about the
-    // listener, and permanent.
+    // The rest have no ErrorKind of their own; see `errno`.
+    e.raw_os_error()
+        .is_some_and(|c| errno::TRANSIENT.contains(&c))
+}
+
+/// The errno values [`transient`] retries that have no `ErrorKind` of
+/// their own. There is no libc to name them here, so by number, which is
+/// fixed per ABI -- but not the same on every Linux architecture.
+///
+/// Each ABI's block also holds the values the test checks
+/// (`NETWORK`: ENETUNREACH, EHOSTUNREACH and EPROTO, where accept can
+/// report it), so the test is built from the same cfg as the list it
+/// checks and cannot fall into another ABI's arm, or none.
+///
+/// Linux, and fullrust, which is the Linux kernel ABI without libc:
+/// EMFILE, ENFILE, ENOBUFS, then accept(2)'s network errors: ENETDOWN,
+/// EPROTO, ENOPROTOOPT, EHOSTDOWN, ENONET, EHOSTUNREACH, EOPNOTSUPP,
+/// ENETUNREACH.
+#[cfg(all(
+    any(target_os = "linux", target_os = "android", target_os = "fullrust"),
+    not(any(
+        target_arch = "mips",
+        target_arch = "mips32r6",
+        target_arch = "mips64",
+        target_arch = "mips64r6",
+        target_arch = "sparc",
+        target_arch = "sparc64"
+    ))
+))]
+mod errno {
+    pub(super) const TRANSIENT: &[i32] = &[24, 23, 105, 100, 71, 92, 112, 64, 113, 95, 101];
+    #[cfg(test)]
+    pub(super) const NETWORK: (i32, i32, Option<i32>) = (101, 113, Some(71));
+}
+/// The same errors as numbered on MIPS, r6 included.
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    any(
+        target_arch = "mips",
+        target_arch = "mips32r6",
+        target_arch = "mips64",
+        target_arch = "mips64r6"
+    )
+))]
+mod errno {
+    pub(super) const TRANSIENT: &[i32] = &[24, 23, 132, 127, 71, 99, 147, 64, 148, 122, 128];
+    #[cfg(test)]
+    pub(super) const NETWORK: (i32, i32, Option<i32>) = (128, 148, Some(71));
+}
+/// The same errors as numbered on SPARC.
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    any(target_arch = "sparc", target_arch = "sparc64")
+))]
+mod errno {
+    pub(super) const TRANSIENT: &[i32] = &[24, 23, 55, 50, 86, 42, 64, 80, 65, 45, 51];
+    #[cfg(test)]
+    pub(super) const NETWORK: (i32, i32, Option<i32>) = (51, 65, Some(86));
+}
+/// WSAEMFILE, WSAENOBUFS, WSAENETDOWN, WSAEHOSTDOWN, WSAEHOSTUNREACH,
+/// WSAENETUNREACH.
+#[cfg(windows)]
+mod errno {
+    pub(super) const TRANSIENT: &[i32] = &[10024, 10055, 10050, 10064, 10065, 10051];
+    #[cfg(test)]
+    pub(super) const NETWORK: (i32, i32, Option<i32>) = (10051, 10065, None);
+}
+/// The BSDs and Apple: EMFILE, ENFILE, ENOBUFS, ENETDOWN, ENETUNREACH,
+/// EHOSTDOWN, EHOSTUNREACH, and EPROTO, which each numbers its own way.
+/// Not EOPNOTSUPP or ENOPROTOOPT: from a BSD accept those are about the
+/// listener, and permanent. Anything else unknown is taken to number like
+/// them, without EPROTO.
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "fullrust",
+    windows
+)))]
+mod errno {
     #[cfg(target_vendor = "apple")]
-    const CODES: &[i32] = &[24, 23, 55, 50, 51, 64, 65, 100];
+    pub(super) const TRANSIENT: &[i32] = &[24, 23, 55, 50, 51, 64, 65, 100];
     #[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
-    const CODES: &[i32] = &[24, 23, 55, 50, 51, 64, 65, 92];
+    pub(super) const TRANSIENT: &[i32] = &[24, 23, 55, 50, 51, 64, 65, 92];
     #[cfg(target_os = "netbsd")]
-    const CODES: &[i32] = &[24, 23, 55, 50, 51, 64, 65, 96];
+    pub(super) const TRANSIENT: &[i32] = &[24, 23, 55, 50, 51, 64, 65, 96];
     #[cfg(target_os = "openbsd")]
-    const CODES: &[i32] = &[24, 23, 55, 50, 51, 64, 65, 95];
+    pub(super) const TRANSIENT: &[i32] = &[24, 23, 55, 50, 51, 64, 65, 95];
     #[cfg(not(any(
-        target_os = "linux",
-        target_os = "android",
-        target_os = "fullrust",
-        windows,
         target_vendor = "apple",
         target_os = "freebsd",
         target_os = "dragonfly",
         target_os = "netbsd",
         target_os = "openbsd"
     )))]
-    const CODES: &[i32] = &[24, 23, 55, 50, 51, 64, 65];
-    e.raw_os_error().is_some_and(|c| CODES.contains(&c))
+    pub(super) const TRANSIENT: &[i32] = &[24, 23, 55, 50, 51, 64, 65];
+    /// EPROTO, where there is one, is last.
+    #[cfg(test)]
+    pub(super) const NETWORK: (i32, i32, Option<i32>) = (51, 65, {
+        match TRANSIENT.len() {
+            8 => Some(TRANSIENT[7]),
+            _ => None,
+        }
+    });
 }
 
 /// Variant of [`L2Acceptor`] that yields an optional connection-closed signal
@@ -428,27 +468,9 @@ mod tests {
     /// counterparts elsewhere, are retried; a closed listener is not.
     #[test]
     fn pending_network_errors_are_transient() {
-        #[cfg(all(
-            any(target_os = "linux", target_os = "android"),
-            not(any(
-                target_arch = "mips",
-                target_arch = "mips64",
-                target_arch = "sparc",
-                target_arch = "sparc64"
-            ))
-        ))]
-        let (unreach, host_unreach, eproto) = (101, 113, Some(71));
-        #[cfg(target_vendor = "apple")]
-        let (unreach, host_unreach, eproto) = (51, 65, Some(100));
-        #[cfg(windows)]
-        let (unreach, host_unreach, eproto) = (10051, 10065, None);
-        #[cfg(not(any(
-            target_os = "linux",
-            target_os = "android",
-            target_vendor = "apple",
-            windows
-        )))]
-        let (unreach, host_unreach, eproto) = (51, 65, None);
+        // Taken from the cfg block `transient` itself uses, so this builds,
+        // and checks the right numbers, on every ABI.
+        let (unreach, host_unreach, eproto) = errno::NETWORK;
         for code in [Some(unreach), Some(host_unreach), eproto]
             .into_iter()
             .flatten()
