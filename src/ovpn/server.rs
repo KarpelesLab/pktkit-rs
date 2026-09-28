@@ -881,18 +881,25 @@ impl Server {
     /// connection, which ends the thread serving it.
     fn remove_entry(&self, entry: &Arc<PeerEntry>) {
         let key = entry.key();
-        let removed = {
+        {
             let mut peers = self.peers.write().unwrap();
             let current = peers.get(&key).is_some_and(|e| Arc::ptr_eq(e, entry));
-            current && peers.remove(&key).is_some()
-        };
-        if !removed {
-            return;
+            if !current || peers.remove(&key).is_none() {
+                return;
+            }
+            // Under the table's lock, as close() does: once the lock is
+            // released, a new session for the key can be created and
+            // authenticate on another thread, and its on_connect must be
+            // queued behind this one's on_disconnect, not ahead of it.
+            self.mark_removed(entry);
+        }
+        #[cfg(test)]
+        if let Some(hook) = tests::AFTER_UNLINK.with(std::cell::Cell::get) {
+            hook(self, key);
         }
         if let Some(w) = &entry.tcp {
             let _ = w.stream.shutdown(std::net::Shutdown::Both);
         }
-        self.mark_removed(entry);
         self.run_events(key);
     }
 
@@ -2695,6 +2702,37 @@ mod tests {
         );
     }
 
+    /// A new session for a key can authenticate the moment the old one is
+    /// out of the table. The old one's on_disconnect is queued with its
+    /// removal, so it still comes first.
+    #[test]
+    fn a_removed_session_is_reported_gone_before_its_successor_connects() {
+        let events = Events::default();
+        let server = recording_server(&events, |_| {});
+        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let key = PeerKey::new(addr, Transport::Udp);
+        let old = server
+            .create_peer(key, Transport::Udp, addr, None, None)
+            .unwrap();
+        server.apply(&old, connected_output());
+        AFTER_UNLINK.with(|h| {
+            h.set(Some(|s, key| {
+                let addr = "127.0.0.1:9".parse().unwrap();
+                let new = s
+                    .create_peer(key, Transport::Udp, addr, None, None)
+                    .unwrap();
+                s.apply(&new, connected_output());
+            }))
+        });
+        server.remove_entry(&old);
+        AFTER_UNLINK.with(|h| h.set(None));
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec!["connect", "disconnect", "connect"]
+        );
+        server.close();
+    }
+
     /// close() waits for an on_connect running on another thread, and
     /// makes that peer's on_disconnect before returning: a caller tearing
     /// down what the callbacks set up once close() returns finds nothing
@@ -2882,6 +2920,11 @@ mod tests {
         /// Makes create_peer panic while building the peer, on this thread.
         pub(super) static PANIC_BUILDING_PEER: std::cell::Cell<bool> =
             const { std::cell::Cell::new(false) };
+        /// Runs in remove_entry once the entry is out of the table and the
+        /// table's lock released, on this thread: what another thread may
+        /// do right then.
+        pub(super) static AFTER_UNLINK: std::cell::Cell<Option<fn(&Server, PeerKey)>> =
+            const { std::cell::Cell::new(None) };
     }
 
     /// Building a peer runs the TLS library on a caller-supplied config; a
