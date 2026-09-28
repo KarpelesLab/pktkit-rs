@@ -18,7 +18,8 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use super::autotune::{self, Budget, RcvSpace};
-use super::congestion::{CongestionController, HighSpeed, NewReno, initial_window};
+use super::congestion::{Ack, CongestionController, HighSpeed, NewReno, initial_window};
+use super::cubic::Cubic;
 use super::options::{
     self, SackBlock, TcpOption, get_sack_blocks, get_timestamp, get_wscale, has_sack_perm,
     mss_option, sack_option, sack_perm_option, timestamp_option, wscale_option,
@@ -237,20 +238,30 @@ struct AckEvent {
     flight: u32,
     /// Its TSecr, if any.
     ecr: Option<u32>,
+    /// The round trip it measured, if any.
+    rtt: Option<Duration>,
 }
 
 /// Choice of congestion controller.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CongestionKind {
+    /// CUBIC (RFC 9438), with HyStart++ (RFC 9406) in its first slow
+    /// start: Linux's default, and this one's. After a loss it regrows
+    /// the window along a cubic curve of the time since, which fills a
+    /// long, fast path far sooner than a segment per round trip does,
+    /// and is no slower than NewReno where NewReno does well.
+    #[default]
+    Cubic,
     /// NewReno (RFC 5681, with RFC 6582's partial-ACK handling).
     NewReno,
-    /// HighSpeed TCP (RFC 3649). Default.
-    #[default]
+    /// HighSpeed TCP (RFC 3649).
     HighSpeed,
 }
 
 fn make_cc(kind: CongestionKind, mss: u32) -> Box<dyn CongestionController> {
     match kind {
+        CongestionKind::Cubic => Box::new(Cubic::new(mss)),
         CongestionKind::NewReno => Box::new(NewReno::new(mss)),
         CongestionKind::HighSpeed => Box::new(HighSpeed::new(mss)),
     }
@@ -289,7 +300,7 @@ pub struct ConnConfig {
     /// stream, a sender repairs one hole per round trip, and neither RACK
     /// nor the tail loss probe (RFC 8985), which need it, can run.
     pub enable_sack: bool,
-    /// The congestion controller. HighSpeed by default.
+    /// The congestion controller. CUBIC by default.
     pub congestion: CongestionKind,
     /// Probe an idle connection with keepalives. Off by default.
     pub keepalive: bool,
@@ -2311,9 +2322,10 @@ impl Conn {
             && self.snd_wnd > 0
             && bare;
 
+        let mut rtt = None;
         if advanced {
             self.retries = 0;
-            self.sample_rtt(seg, flight);
+            rtt = self.sample_rtt(seg, flight);
         }
         // A duplicate of the loss probe itself, SACK-less: both copies
         // arrived (RFC 8985 §7.4.2, case 2).
@@ -2328,6 +2340,7 @@ impl Conn {
             dup,
             flight,
             ecr,
+            rtt,
         });
 
         if self.snd_wnd > 0 && self.persist_deadline.is_some() && (advanced || wnd_changed) {
@@ -2383,6 +2396,7 @@ impl Conn {
             dup,
             flight,
             ecr,
+            rtt,
         } = ev;
         let mss = self.mss as u32;
         // RFC 6937's DeliveredData.
@@ -2472,7 +2486,14 @@ impl Conn {
         // set cwnd for it.
         if advanced && self.ca != CaState::Recovery && !undone {
             let bytes = if self.sack_ok { d.delivered } else { acked };
-            self.cc.on_ack(bytes, flight);
+            self.cc.on_ack(&Ack {
+                now: self.now,
+                bytes_acked: bytes,
+                flight,
+                rtt,
+                ack,
+                snd_nxt: self.send_buf.as_ref().unwrap().nxt(),
+            });
         }
         // F-RTO step 2b sends up to two new segments (RFC 5682 §2.1).
         if frto_was != self.frto && matches!(self.frto, Frto::Second { .. }) {
@@ -2498,6 +2519,7 @@ impl Conn {
     /// 4015 step (0)). `timeout` if a retransmission timeout, not fast
     /// recovery.
     fn begin_undo(&mut self, timeout: bool) {
+        self.cc.save_undo();
         let sb = self.send_buf.as_ref().unwrap();
         self.undo = Undo {
             marker: Some(sb.una()),
@@ -2744,12 +2766,10 @@ impl Conn {
     /// and failing that the timestamp echo, which with timestamps every
     /// such ACK carries (RFC 7323 §4.2) and which a retransmission cannot
     /// make ambiguous, since it carries a TSval of its own. `flight` is
-    /// what was outstanding before the ACK.
-    fn sample_rtt(&mut self, seg: &Segment, flight: u32) {
+    /// what was outstanding before the ACK. Returns the sample, if any.
+    fn sample_rtt(&mut self, seg: &Segment, flight: u32) -> Option<Duration> {
         let timed = self.rto.timed_rtt(seg.ack, self.now);
-        let Some(rtt) = timed.or_else(|| self.ts_echo_rtt(seg)) else {
-            return;
-        };
+        let rtt = timed.or_else(|| self.ts_echo_rtt(seg))?;
         // RFC 7323 Appendix G: a window of timestamps gives about one
         // sample per two segments, the ACKs of a delayed-ACK receiver.
         let per_window = if self.ts_ok {
@@ -2769,6 +2789,7 @@ impl Conn {
         }
         self.score.rtt_sample(rtt, self.now);
         self.rtt_sampled = true;
+        Some(rtt)
     }
 
     /// The round trip the timestamp echoed in `seg` has made, if it has
@@ -4696,8 +4717,11 @@ mod tests {
     fn lossy_run(seed: u64) {
         let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
         let (ts, sack) = (rng.below(2) == 0, rng.below(2) == 0);
-        let small = |port| {
+        // Drawn apart, so each seed keeps the run it had before.
+        let mut cc_rng = Rng(splitmix(seed ^ 0xCC) | 1);
+        let mut small = |port| {
             let mut c = cfg(port, 80);
+            c.congestion = CONTROLLERS[cc_rng.below(3) as usize];
             c.enable_timestamps = ts;
             c.enable_sack = sack;
             c.mss = 536;
@@ -7155,6 +7179,12 @@ mod tests {
         }
     }
 
+    const CONTROLLERS: [CongestionKind; 3] = [
+        CongestionKind::Cubic,
+        CongestionKind::NewReno,
+        CongestionKind::HighSpeed,
+    ];
+
     /// What a [`stress_run`] varies per seed.
     #[derive(Debug)]
     struct StressCfg {
@@ -7166,6 +7196,7 @@ mod tests {
         loss_pct: u64,
         blackout: bool,
         autotune: [bool; 2],
+        congestion: [CongestionKind; 2],
     }
 
     impl StressCfg {
@@ -7188,6 +7219,10 @@ mod tests {
                 loss_pct,
                 blackout,
                 autotune: pair(&mut r),
+                congestion: [
+                    CONTROLLERS[r.below(3) as usize],
+                    CONTROLLERS[r.below(3) as usize],
+                ],
             }
         }
     }
@@ -7287,6 +7322,7 @@ mod tests {
                 .send_buf_size(sc.buf)
                 .recv_buf_size(sc.buf)
                 .autotune(sc.autotune[i])
+                .congestion(sc.congestion[i])
                 .send_buf_max(sc.buf * 4)
                 .recv_buf_max(sc.buf * 4)
         };

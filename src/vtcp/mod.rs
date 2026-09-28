@@ -21,7 +21,13 @@
 //! - RFC 1122 §4.2.3.2, RFC 5681 §4.2: delayed ACKs (40 ms, at least every
 //!   second full-sized segment, at once for anything out of order), with
 //!   Linux's quick-ACK and ping-pong modes.
-//! - RFC 3649: HighSpeed TCP (default controller); NewReno is the other.
+//! - RFC 9438: CUBIC, the default controller (as on Linux): after a loss
+//!   the window regrows along a cubic curve of the time since, cut by
+//!   β = 0.7, with fast convergence, the Reno-friendly region, and its
+//!   state put back when the loss turns out spurious. Its first slow start
+//!   runs RFC 9406 HyStart++, which leaves slow start when the round trip
+//!   rises rather than when the bottleneck's queue overflows. NewReno and
+//!   RFC 3649 HighSpeed TCP are the others.
 //! - RFC 7661 §4.3: no cwnd growth while the sender is application-limited.
 //! - RFC 7323: window scaling, timestamps (PAWS, and an RTT sample from
 //!   every ACK, weighed as its Appendix G suggests).
@@ -78,6 +84,7 @@ pub(crate) mod alarm;
 pub(crate) mod autotune;
 pub(crate) mod congestion;
 pub(crate) mod conn;
+pub(crate) mod cubic;
 pub(crate) mod options;
 pub(crate) mod recvbuf;
 pub(crate) mod rto;

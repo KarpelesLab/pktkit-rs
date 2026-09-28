@@ -1,11 +1,53 @@
-//! Congestion control. NewReno (RFC 5681) and HighSpeed TCP (RFC 3649).
+//! Congestion control: CUBIC (RFC 9438, in [`super::cubic`]), NewReno (RFC
+//! 5681) and HighSpeed TCP (RFC 3649).
 //!
-//! Both count bytes, not ACKs (RFC 3465): a receiver that delays its ACKs
+//! All count bytes, not ACKs (RFC 3465): a receiver that delays its ACKs
 //! acknowledges two segments with each, and counting ACKs would halve the
 //! window's growth, in slow start and in congestion avoidance alike. Slow
 //! start takes up to L = 2*SMSS per ACK (RFC 3465 §2.2), enough to double
 //! the window per round trip against a delayed-ACK receiver without
-//! letting one stretch ACK burst the window open.
+//! letting one stretch ACK burst the window open; CUBIC's HyStart++ takes
+//! RFC 9406's L = 8.
+
+use crate::time::Instant;
+use std::time::Duration;
+
+/// What a cumulative ACK outside fast recovery tells the controller.
+#[derive(Debug, Clone, Copy)]
+pub struct Ack {
+    /// When it arrived.
+    pub now: Instant,
+    /// Bytes newly delivered.
+    pub bytes_acked: u32,
+    /// Bytes outstanding before it. A flight well short of the window
+    /// means the sender was limited by the application or the receiver,
+    /// not by cwnd, and growing cwnd then would validate nothing (RFC 7661
+    /// §4.4, RFC 5681 §3.1).
+    pub flight: u32,
+    /// The round trip it measured, if it measured one.
+    pub rtt: Option<Duration>,
+    /// The cumulative ACK, and SND.NXT as it arrived: a round of slow
+    /// start (RFC 9406 §4.2) ends once what was sent by its start is
+    /// acknowledged.
+    pub ack: u32,
+    pub snd_nxt: u32,
+}
+
+impl Ack {
+    /// An ACK of `bytes_acked` bytes with `flight` outstanding, at `now`,
+    /// that measured no round trip.
+    #[cfg(test)]
+    pub fn of(now: Instant, bytes_acked: u32, flight: u32) -> Self {
+        Self {
+            now,
+            bytes_acked,
+            flight,
+            rtt: None,
+            ack: 0,
+            snd_nxt: 0,
+        }
+    }
+}
 
 /// Pluggable congestion control: the window, and how it grows and shrinks.
 ///
@@ -15,12 +57,8 @@
 /// undoes a response found spurious. The controller only says how much to
 /// cut and how fast to grow back.
 pub trait CongestionController: Send {
-    /// A cumulative ACK outside fast recovery: `bytes_acked` bytes were
-    /// newly delivered, with `flight_size` bytes outstanding before it. A
-    /// flight well short of the window means the sender was limited by
-    /// the application or the receiver, not by cwnd, and growing cwnd then
-    /// would validate nothing (RFC 7661 §4.3, RFC 5681 §3.1).
-    fn on_ack(&mut self, bytes_acked: u32, flight_size: u32);
+    /// A cumulative ACK outside fast recovery.
+    fn on_ack(&mut self, ack: &Ack);
     /// A loss was detected with `flight_size` bytes outstanding: set
     /// ssthresh. The connection then brings cwnd down to it.
     fn on_loss(&mut self, flight_size: u32);
@@ -46,8 +84,13 @@ pub trait CongestionController: Send {
     /// Set cwnd: fast recovery reduces it an ACK at a time, and sets it to
     /// ssthresh when done.
     fn set_cwnd(&mut self, cwnd: u32);
+    /// A loss episode begins that may later be found spurious: keep what
+    /// [`undo`](Self::undo) would put back of the growth state. The
+    /// default keeps nothing.
+    fn save_undo(&mut self) {}
     /// A loss response turned out spurious: go back to `cwnd` and
-    /// `ssthresh`, forgetting any growth state tied to the cut.
+    /// `ssthresh`, and to the growth state before the episode where the
+    /// controller keeps one.
     fn undo(&mut self, cwnd: u32, ssthresh: u32);
     /// The congestion window, in bytes.
     fn cwnd(&self) -> u32;
@@ -85,7 +128,7 @@ impl NewReno {
 }
 
 /// Slow start's growth for an ACK of `bytes_acked` (RFC 3465 §2.2, L = 2).
-fn slow_start_inc(bytes_acked: u32, mss: u32) -> u32 {
+pub(crate) fn slow_start_inc(bytes_acked: u32, mss: u32) -> u32 {
     bytes_acked.min(mss.saturating_mul(2))
 }
 
@@ -94,8 +137,9 @@ impl CongestionController for NewReno {
         self.mss = mss.max(1);
     }
 
-    fn on_ack(&mut self, bytes_acked: u32, flight_size: u32) {
-        if !cwnd_limited(self.cwnd, self.ssthresh, self.mss, flight_size) {
+    fn on_ack(&mut self, a: &Ack) {
+        let bytes_acked = a.bytes_acked;
+        if !cwnd_limited(self.cwnd, self.ssthresh, self.mss, a.flight) {
             return;
         }
         if self.cwnd < self.ssthresh {
@@ -148,11 +192,11 @@ impl CongestionController for NewReno {
 }
 
 /// Whether an ACK arriving with `flight` bytes outstanding may grow cwnd:
-/// only when the window was in use (RFC 7661 §4.3). In slow start, where
+/// only when the window was in use (RFC 7661 §4.4). In slow start, where
 /// cwnd doubles each round trip, a flight of over half of it counts, as in
 /// Linux's `tcp_is_cwnd_limited`; beyond that, less than a segment of room
 /// must have been left.
-fn cwnd_limited(cwnd: u32, ssthresh: u32, mss: u32, flight: u32) -> bool {
+pub(crate) fn cwnd_limited(cwnd: u32, ssthresh: u32, mss: u32, flight: u32) -> bool {
     if cwnd < ssthresh {
         cwnd < flight.saturating_mul(2)
     } else {
@@ -229,8 +273,9 @@ impl CongestionController for HighSpeed {
         self.mss = mss.max(1);
     }
 
-    fn on_ack(&mut self, bytes_acked: u32, flight_size: u32) {
-        if !cwnd_limited(self.cwnd, self.ssthresh, self.mss, flight_size) {
+    fn on_ack(&mut self, ack: &Ack) {
+        let bytes_acked = ack.bytes_acked;
+        if !cwnd_limited(self.cwnd, self.ssthresh, self.mss, ack.flight) {
             return;
         }
         if self.cwnd < self.ssthresh {
@@ -295,7 +340,7 @@ mod tests {
     fn slow_start_grows_per_ack() {
         let mut nr = NewReno::new(1460);
         let initial = nr.cwnd();
-        nr.on_ack(1460, u32::MAX);
+        nr.on_ack(&Ack::of(Instant::now(), 1460, u32::MAX));
         assert!(nr.cwnd() > initial);
     }
 
@@ -361,10 +406,10 @@ mod tests {
         for mut cc in both(mss) {
             let initial = cc.cwnd();
             for _ in 0..100 {
-                cc.on_ack(mss, 2 * mss);
+                cc.on_ack(&Ack::of(Instant::now(), mss, 2 * mss));
             }
             assert_eq!(cc.cwnd(), initial);
-            cc.on_ack(mss, initial);
+            cc.on_ack(&Ack::of(Instant::now(), mss, initial));
             assert_eq!(cc.cwnd(), initial + mss);
         }
     }
@@ -378,11 +423,11 @@ mod tests {
         for mut cc in both(mss) {
             let w = cc.cwnd();
             for _ in 0..w / (2 * mss) {
-                cc.on_ack(2 * mss, w);
+                cc.on_ack(&Ack::of(Instant::now(), 2 * mss, w));
             }
             assert_eq!(cc.cwnd(), 2 * w);
             // A stretch ACK counts for two segments at most.
-            cc.on_ack(10 * mss, u32::MAX);
+            cc.on_ack(&Ack::of(Instant::now(), 10 * mss, u32::MAX));
             assert_eq!(cc.cwnd(), 2 * w + 2 * mss);
         }
 
@@ -392,7 +437,7 @@ mod tests {
         let w = nr.cwnd();
         assert_eq!(w, 20 * mss);
         for _ in 0..w / (2 * mss) {
-            nr.on_ack(2 * mss, w);
+            nr.on_ack(&Ack::of(Instant::now(), 2 * mss, w));
         }
         assert_eq!(nr.cwnd(), w + mss);
     }
@@ -403,8 +448,8 @@ mod tests {
         let mut nr = NewReno::new(mss);
         let mut hs = HighSpeed::new(mss);
         for _ in 0..5 {
-            nr.on_ack(mss, u32::MAX);
-            hs.on_ack(mss, u32::MAX);
+            nr.on_ack(&Ack::of(Instant::now(), mss, u32::MAX));
+            hs.on_ack(&Ack::of(Instant::now(), mss, u32::MAX));
         }
         assert_eq!(nr.cwnd(), hs.cwnd());
     }
