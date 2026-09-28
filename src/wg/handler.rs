@@ -23,6 +23,12 @@ use crate::wg::replay::SlidingWindow;
 use crate::wg::timers::{PeerTimers, TimerAction};
 use crate::wg::transport::EncryptError;
 
+/// How long a peer stays in the table past its
+/// [expiry](Handler::set_peer_expiry) before [`Handler::maintenance`] drops
+/// it. Its sessions stop at expiry; until then it is still reported
+/// ([`Handler::get_peer_info`]) and a refresh keeps its replay state.
+pub(crate) const EXPIRED_PEER_GRACE: Duration = REJECT_AFTER_TIME;
+
 /// Callback invoked when a handshake arrives from a peer not in the authorized
 /// list. The packet slice is only valid for the call; the callback must copy
 /// it if it needs to keep the data (e.g. for later `accept_unknown_peer`).
@@ -350,19 +356,28 @@ impl Handler {
         // sessions lock, so a handshake finishing concurrently either sees
         // the peer gone or installs before the sweep below removes it.
         self.peers.write().expect("peers lock").remove(peer_key);
+        self.forget_peers(std::slice::from_ref(peer_key));
+    }
 
+    /// Tear down the session state of peers already out of the table.
+    fn forget_peers(&self, gone: &[NoisePublicKey]) {
+        if gone.is_empty() {
+            return;
+        }
         self.handshakes
             .lock()
             .expect("handshakes lock")
-            .retain(|_, hs| hs.remote_static != *peer_key);
+            .retain(|_, hs| !gone.contains(&hs.remote_static));
         let mut sess = self.sessions.write().expect("sessions lock");
-        sess.remove(peer_key);
+        for k in gone {
+            sess.remove(k);
+        }
         // Sweep the index rather than only the session's slots, so nothing
         // indexed for the peer outlives it whichever way it got there.
         self.keypairs
             .write()
             .expect("keypairs lock")
-            .retain(|_, kp| kp.peer_key != *peer_key);
+            .retain(|_, kp| !gone.contains(&kp.peer_key));
     }
 
     /// True if the peer is in the authorized table and (if `expires_at` is
@@ -382,14 +397,18 @@ impl Handler {
 
     /// Set an expiry time on an existing peer. No effect if the peer is unknown.
     ///
-    /// Past `at` the peer counts as unauthorized, though it stays in the
-    /// table: its handshakes are refused (or handed to the unknown-peer
-    /// callback), and sessions already established stop at once, both ways
-    /// -- [`encrypt`](Self::encrypt) refuses them and its transport packets
-    /// are refused -- rather than running on until they expire by
-    /// themselves. [`add_peer`](Self::add_peer) or
+    /// Past `at` the peer counts as unauthorized: its handshakes are refused
+    /// (or handed to the unknown-peer callback), and sessions already
+    /// established stop at once, both ways -- [`encrypt`](Self::encrypt)
+    /// refuses them and its transport packets are refused -- rather than
+    /// running on until they expire by themselves. Until
+    /// [`add_peer`](Self::add_peer) or
     /// [`add_peer_with_psk`](Self::add_peer_with_psk) clears the expiry and
-    /// authorizes the peer again.
+    /// authorizes it again, it stays in the table for a grace period (three
+    /// minutes), after which [`maintenance`](Self::maintenance) removes it
+    /// as [`remove_peer`](Self::remove_peer) would. An expired peer may also
+    /// be removed sooner to make room for one
+    /// [`accept_unknown_peer`](Self::accept_unknown_peer) takes.
     pub fn set_peer_expiry(&self, peer_key: &NoisePublicKey, at: Instant) {
         let mut peers = self.peers.write().expect("peers lock");
         if let Some(p) = peers.get_mut(peer_key) {
@@ -664,10 +683,35 @@ impl Handler {
         Some(f(&mut t))
     }
 
-    /// Run periodic cleanup: drop stale handshakes and inactive sessions.
+    /// Run periodic cleanup: drop peers long past their
+    /// [expiry](Self::set_peer_expiry), stale handshakes and inactive
+    /// sessions.
     pub fn maintenance(&self) {
+        self.prune_expired_peers(Instant::now());
         self.cleanup_handshakes();
         self.cleanup_sessions();
+    }
+
+    /// Remove the peers expired more than [`EXPIRED_PEER_GRACE`] ago, with
+    /// their state. Kept for ever, they would count against
+    /// [`unknown_peer_limit`](Config::unknown_peer_limit) for good.
+    fn prune_expired_peers(&self, now: Instant) {
+        let gone: Vec<NoisePublicKey> = {
+            let mut peers = self.peers.write().expect("peers lock");
+            let gone: Vec<NoisePublicKey> = peers
+                .values()
+                .filter(|p| {
+                    p.expires_at
+                        .is_some_and(|exp| now.saturating_duration_since(exp) > EXPIRED_PEER_GRACE)
+                })
+                .map(|p| p.public_key)
+                .collect();
+            for k in &gone {
+                peers.remove(k);
+            }
+            gone
+        };
+        self.forget_peers(&gone);
     }
 
     fn cleanup_handshakes(&self) {
@@ -1126,14 +1170,33 @@ impl Handler {
     }
 
     /// [`add_peer`](Self::add_peer) for a peer accepted from
-    /// `on_unknown_peer`: refused if it is new and the table already holds
-    /// [`unknown_peer_limit`](Config::unknown_peer_limit) peers.
+    /// `on_unknown_peer`: if it is new and the table already holds
+    /// [`unknown_peer_limit`](Config::unknown_peer_limit) peers, the one
+    /// expired longest makes room for it, and without one it is refused.
     pub(crate) fn add_unknown_peer(&self, peer_key: NoisePublicKey) -> Result<()> {
-        let mut peers = self.peers.write().expect("peers lock");
-        if !peers.contains_key(&peer_key) && peers.len() >= self.unknown_peer_limit {
-            return Err(io::Error::other("peer table full"));
+        let evicted = {
+            let mut peers = self.peers.write().expect("peers lock");
+            let mut evicted = None;
+            if !peers.contains_key(&peer_key) && peers.len() >= self.unknown_peer_limit {
+                // Before, expired peers kept their places until someone
+                // removed them, and once they filled the table no newcomer
+                // was ever taken again.
+                let now = Instant::now();
+                let victim = peers
+                    .values()
+                    .filter_map(|p| p.expires_at.filter(|&exp| now > exp).map(|exp| (exp, p)))
+                    .min_by_key(|(exp, _)| *exp)
+                    .map(|(_, p)| p.public_key)
+                    .ok_or_else(|| io::Error::other("peer table full"))?;
+                peers.remove(&victim);
+                evicted = Some(victim);
+            }
+            Self::add_peer_locked(&mut peers, peer_key);
+            evicted
+        };
+        if let Some(victim) = evicted {
+            self.forget_peers(&[victim]);
         }
-        Self::add_peer_locked(&mut peers, peer_key);
         Ok(())
     }
 
@@ -1142,7 +1205,9 @@ impl Handler {
     /// raw response bytes the caller should send back to `remote_addr`.
     ///
     /// A new peer is refused once the handler has
-    /// [`unknown_peer_limit`](Config::unknown_peer_limit) peers.
+    /// [`unknown_peer_limit`](Config::unknown_peer_limit) peers, none of
+    /// them past its [expiry](Self::set_peer_expiry): the one expired
+    /// longest is otherwise removed to make room.
     pub fn accept_unknown_peer(
         &self,
         peer_key: NoisePublicKey,
@@ -1986,6 +2051,90 @@ mod tests {
         assert_eq!(r1.data, b"one");
         let err = b.process_packet(&c1, &addr).unwrap_err();
         assert!(err.to_string().contains("replay"), "got: {}", err);
+    }
+
+    /// Anything the handler holds for `peer`: its session, keypairs, or a
+    /// handshake of ours waiting for its answer.
+    fn holds_state_for(h: &Handler, peer: &NoisePublicKey) -> bool {
+        h.sessions.read().unwrap().contains_key(peer)
+            || h.keypairs
+                .read()
+                .unwrap()
+                .values()
+                .any(|kp| kp.peer_key == *peer)
+            || h.handshakes
+                .lock()
+                .unwrap()
+                .values()
+                .any(|hs| hs.remote_static == *peer)
+    }
+
+    /// A peer with a session, and a handshake of `b`'s waiting for its
+    /// answer, authorized on `b` through the unknown-peer path.
+    fn accepted_unknown(b: &Handler) -> Arc<Handler> {
+        let a = Handler::new(Config::default()).unwrap();
+        a.add_peer(b.public_key());
+        let init = a.initiate_handshake(&b.public_key()).unwrap();
+        let resp = b
+            .accept_unknown_peer(a.public_key(), &init, &loopback())
+            .unwrap();
+        let ka = a.process_packet(&resp, &loopback()).unwrap();
+        b.process_packet(&ka.response, &loopback()).unwrap();
+        b.initiate_handshake(&a.public_key()).unwrap();
+        assert!(holds_state_for(b, &a.public_key()));
+        a
+    }
+
+    /// A table full of peers whose authorization has lapsed must not lock
+    /// newcomers out for good: an expired peer makes room, and goes with
+    /// all its state, as remove_peer would take it. Only a table full of
+    /// peers still authorized refuses.
+    #[test]
+    fn an_expired_peer_makes_room_for_an_unknown_one() {
+        let b = Handler::new(Config::default().unknown_peer_limit(2)).unwrap();
+        let (a1, a2) = (accepted_unknown(&b), accepted_unknown(&b));
+        b.set_peer_expiry(&a1.public_key(), Instant::now() - Duration::from_secs(1));
+        let a3 = accepted_unknown(&b);
+        let mut peers = b.peers();
+        peers.sort_by_key(|k| k.0);
+        let mut want = vec![a2.public_key(), a3.public_key()];
+        want.sort_by_key(|k| k.0);
+        assert_eq!(peers, want);
+        assert!(!holds_state_for(&b, &a1.public_key()));
+        assert!(holds_state_for(&b, &a2.public_key()));
+
+        let a4 = Handler::new(Config::default()).unwrap();
+        a4.add_peer(b.public_key());
+        let init = a4.initiate_handshake(&b.public_key()).unwrap();
+        assert!(
+            b.accept_unknown_peer(a4.public_key(), &init, &loopback())
+                .is_err(),
+            "no peer has expired: the table is full"
+        );
+    }
+
+    /// maintenance() drops peers expired past a grace period, with all
+    /// their state; one only just expired, or never, stays.
+    #[test]
+    fn maintenance_drops_peers_long_expired() {
+        let b = Handler::new(Config::default()).unwrap();
+        let (old, recent, never) = (
+            accepted_unknown(&b),
+            accepted_unknown(&b),
+            accepted_unknown(&b),
+        );
+        let now = Instant::now();
+        b.set_peer_expiry(
+            &old.public_key(),
+            now - EXPIRED_PEER_GRACE - Duration::from_secs(1),
+        );
+        b.set_peer_expiry(&recent.public_key(), now - Duration::from_secs(1));
+        b.maintenance();
+        assert!(b.get_peer_info(&old.public_key()).is_none());
+        assert!(!holds_state_for(&b, &old.public_key()));
+        assert!(b.get_peer_info(&recent.public_key()).is_some());
+        assert!(b.get_peer_info(&never.public_key()).is_some());
+        assert!(holds_state_for(&b, &never.public_key()));
     }
 
     #[test]

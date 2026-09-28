@@ -310,7 +310,9 @@ impl Adapter {
     /// recorded and `on_peer_connected` fires, as for any other handshake.
     ///
     /// A new peer is refused once the handler has
-    /// [`unknown_peer_limit`](AdapterConfig::unknown_peer_limit) peers.
+    /// [`unknown_peer_limit`](AdapterConfig::unknown_peer_limit) peers,
+    /// none of them past its expiry: the one expired longest is otherwise
+    /// removed to make room.
     pub fn accept_unknown_peer(
         &self,
         key: NoisePublicKey,
