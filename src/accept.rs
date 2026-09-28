@@ -179,13 +179,27 @@ impl Backoff {
     /// Sleep before the next attempt if `e` is transient, or hand it back.
     /// Without threads (wasm) nothing can change while we sleep, and sleep
     /// is not allowed, so every error ends the loop there.
+    ///
+    /// Only real failures back off further each time. `WouldBlock` is a
+    /// non-blocking listener with nobody waiting, not a failure: it is
+    /// polled again at the shortest interval, and leaves the backoff where
+    /// it was. An interrupted call is simply made again.
     fn wait_out(&mut self, e: std::io::Error) -> Result<()> {
         if cfg!(target_family = "wasm") || !transient(&e) {
             return Err(e);
         }
-        self.delay = (self.delay * 2).clamp(Self::FIRST, Self::MAX);
+        let wait = match e.kind() {
+            std::io::ErrorKind::Interrupted => return Ok(()),
+            std::io::ErrorKind::WouldBlock => Self::FIRST,
+            _ => {
+                self.delay = (self.delay * 2).clamp(Self::FIRST, Self::MAX);
+                self.delay
+            }
+        };
         #[cfg(not(target_family = "wasm"))]
-        std::thread::sleep(self.delay);
+        std::thread::sleep(wait);
+        #[cfg(target_family = "wasm")]
+        let _ = wait;
         Ok(())
     }
 }
@@ -194,29 +208,87 @@ impl Backoff {
 /// process or system is out of descriptors, buffers or memory (which a
 /// departing peer gives back), the connection was dropped while it waited
 /// in the backlog, or the call was interrupted. Linux's accept(2) also
-/// asks for its pending network errors to be treated as a retry. Anything
-/// else, such as a listener that was closed, ends the loop.
+/// asks for its pending network errors to be treated as a retry (they
+/// belong to the connection being accepted, not the listener), and the
+/// BSDs can report the same network conditions for a queued connection.
+/// Anything else, such as a listener that was closed, ends the loop.
 fn transient(e: &std::io::Error) -> bool {
     use std::io::ErrorKind::*;
     if matches!(
         e.kind(),
-        ConnectionAborted | ConnectionReset | Interrupted | WouldBlock | OutOfMemory
+        ConnectionAborted
+            | ConnectionReset
+            | Interrupted
+            | WouldBlock
+            | OutOfMemory
+            | NetworkDown
+            | NetworkUnreachable
+            | HostUnreachable
     ) {
         return true;
     }
-    // EMFILE, ENFILE and ENOBUFS have no ErrorKind of their own. There is
-    // no libc to name them here, so by number, which is fixed per ABI.
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "fullrust"))]
-    const CODES: &[i32] = &[24, 23, 105];
+    // The rest have no ErrorKind of their own, and there is no libc to name
+    // them here, so by number, which is fixed per ABI -- but not the same on
+    // every Linux architecture.
+    //
+    // Linux: EMFILE, ENFILE, ENOBUFS, then accept(2)'s network errors:
+    // ENETDOWN, EPROTO, ENOPROTOOPT, EHOSTDOWN, ENONET, EHOSTUNREACH,
+    // EOPNOTSUPP, ENETUNREACH.
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android", target_os = "fullrust"),
+        not(any(
+            target_arch = "mips",
+            target_arch = "mips32r6",
+            target_arch = "mips64",
+            target_arch = "mips64r6",
+            target_arch = "sparc",
+            target_arch = "sparc64"
+        ))
+    ))]
+    const CODES: &[i32] = &[24, 23, 105, 100, 71, 92, 112, 64, 113, 95, 101];
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        any(
+            target_arch = "mips",
+            target_arch = "mips32r6",
+            target_arch = "mips64",
+            target_arch = "mips64r6"
+        )
+    ))]
+    const CODES: &[i32] = &[24, 23, 132, 127, 71, 99, 147, 64, 148, 122, 128];
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        any(target_arch = "sparc", target_arch = "sparc64")
+    ))]
+    const CODES: &[i32] = &[24, 23, 55, 50, 86, 42, 64, 80, 65, 45, 51];
+    // WSAEMFILE, WSAENOBUFS, WSAENETDOWN, WSAEHOSTDOWN, WSAEHOSTUNREACH,
+    // WSAENETUNREACH.
     #[cfg(windows)]
-    const CODES: &[i32] = &[10024, 10055]; // WSAEMFILE, WSAENOBUFS
+    const CODES: &[i32] = &[10024, 10055, 10050, 10064, 10065, 10051];
+    // The BSDs and Apple: EMFILE, ENFILE, ENOBUFS, ENETDOWN, ENETUNREACH,
+    // EHOSTDOWN, EHOSTUNREACH, and EPROTO, which each numbers its own way.
+    // Not EOPNOTSUPP or ENOPROTOOPT: from a BSD accept those are about the
+    // listener, and permanent.
+    #[cfg(target_vendor = "apple")]
+    const CODES: &[i32] = &[24, 23, 55, 50, 51, 64, 65, 100];
+    #[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
+    const CODES: &[i32] = &[24, 23, 55, 50, 51, 64, 65, 92];
+    #[cfg(target_os = "netbsd")]
+    const CODES: &[i32] = &[24, 23, 55, 50, 51, 64, 65, 96];
+    #[cfg(target_os = "openbsd")]
+    const CODES: &[i32] = &[24, 23, 55, 50, 51, 64, 65, 95];
     #[cfg(not(any(
         target_os = "linux",
         target_os = "android",
         target_os = "fullrust",
-        windows
+        windows,
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "openbsd"
     )))]
-    const CODES: &[i32] = &[24, 23, 55]; // the BSDs and Apple
+    const CODES: &[i32] = &[24, 23, 55, 50, 51, 64, 65];
     e.raw_os_error().is_some_and(|c| CODES.contains(&c))
 }
 
@@ -350,6 +422,58 @@ mod tests {
             "gave up before the device"
         );
         hangup.raise();
+    }
+
+    /// The network errors Linux's accept(2) says to retry on, and their
+    /// counterparts elsewhere, are retried; a closed listener is not.
+    #[test]
+    fn pending_network_errors_are_transient() {
+        #[cfg(all(
+            any(target_os = "linux", target_os = "android"),
+            not(any(
+                target_arch = "mips",
+                target_arch = "mips64",
+                target_arch = "sparc",
+                target_arch = "sparc64"
+            ))
+        ))]
+        let (unreach, host_unreach, eproto) = (101, 113, Some(71));
+        #[cfg(target_vendor = "apple")]
+        let (unreach, host_unreach, eproto) = (51, 65, Some(100));
+        #[cfg(windows)]
+        let (unreach, host_unreach, eproto) = (10051, 10065, None);
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_vendor = "apple",
+            windows
+        )))]
+        let (unreach, host_unreach, eproto) = (51, 65, None);
+        for code in [Some(unreach), Some(host_unreach), eproto]
+            .into_iter()
+            .flatten()
+        {
+            let e = std::io::Error::from_raw_os_error(code);
+            assert!(transient(&e), "{e} ends the accept loop");
+        }
+        assert!(!transient(&std::io::ErrorKind::InvalidInput.into()));
+        assert!(!transient(&std::io::ErrorKind::BrokenPipe.into()));
+    }
+
+    /// A non-blocking listener with nothing to accept is not failing: it
+    /// is polled at the shortest interval, and the backoff does not grow.
+    #[test]
+    fn would_block_does_not_grow_the_backoff() {
+        let mut b = Backoff::default();
+        for _ in 0..4 {
+            b.wait_out(std::io::ErrorKind::WouldBlock.into()).unwrap();
+        }
+        assert_eq!(b.delay, std::time::Duration::ZERO);
+        b.wait_out(std::io::ErrorKind::ConnectionAborted.into())
+            .unwrap();
+        assert_eq!(b.delay, Backoff::FIRST);
+        b.wait_out(std::io::ErrorKind::WouldBlock.into()).unwrap();
+        assert_eq!(b.delay, Backoff::FIRST);
     }
 
     #[test]
