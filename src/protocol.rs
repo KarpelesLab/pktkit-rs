@@ -12,16 +12,25 @@ use core::fmt;
 pub struct Protocol(pub u8);
 
 impl Protocol {
+    /// Internet Control Message Protocol (RFC 792).
     pub const ICMP: Protocol = Protocol(1);
+    /// Transmission Control Protocol.
     pub const TCP: Protocol = Protocol(6);
+    /// User Datagram Protocol.
     pub const UDP: Protocol = Protocol(17);
+    /// ICMP for IPv6 (RFC 4443).
     pub const ICMPV6: Protocol = Protocol(58);
 
     // A handful of others worth naming because the L3 layer often peeks at them.
+    /// Internet Group Management Protocol.
     pub const IGMP: Protocol = Protocol(2);
-    pub const IPV4: Protocol = Protocol(4); // IP-in-IP
+    /// IPv4 encapsulated in IP (IP-in-IP, RFC 2003).
+    pub const IPV4: Protocol = Protocol(4);
+    /// Generic Routing Encapsulation.
     pub const GRE: Protocol = Protocol(47);
+    /// IPsec Encapsulating Security Payload.
     pub const ESP: Protocol = Protocol(50);
+    /// IPsec Authentication Header.
     pub const AH: Protocol = Protocol(51);
 
     /// The protocol with number `v`.

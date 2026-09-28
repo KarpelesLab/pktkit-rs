@@ -48,13 +48,21 @@ use std::net::IpAddr;
 pub struct TcpFlags(pub u8);
 
 impl TcpFlags {
+    /// No more data from the sender.
     pub const FIN: TcpFlags = TcpFlags(0x01);
+    /// Synchronize sequence numbers.
     pub const SYN: TcpFlags = TcpFlags(0x02);
+    /// Reset the connection.
     pub const RST: TcpFlags = TcpFlags(0x04);
+    /// Push.
     pub const PSH: TcpFlags = TcpFlags(0x08);
+    /// The acknowledgment field is significant.
     pub const ACK: TcpFlags = TcpFlags(0x10);
+    /// The urgent pointer is significant.
     pub const URG: TcpFlags = TcpFlags(0x20);
+    /// ECN-Echo (RFC 3168).
     pub const ECE: TcpFlags = TcpFlags(0x40);
+    /// Congestion Window Reduced (RFC 3168).
     pub const CWR: TcpFlags = TcpFlags(0x80);
 
     /// Flags from the raw byte (the low eight bits of the TCP flags field).
@@ -404,6 +412,7 @@ impl fmt::Debug for TcpSegment {
 pub struct UdpDatagram(pub [u8]);
 
 impl UdpDatagram {
+    /// Length of the UDP header.
     pub const HEADER_LEN: usize = 8;
 
     /// View `b` as a UDP datagram. No copy; nothing is checked until an
@@ -547,55 +556,92 @@ impl fmt::Debug for UdpDatagram {
 
 /// ICMPv4 message types this crate names.
 pub mod icmpv4 {
+    /// Echo Reply (ping response).
     pub const ECHO_REPLY: u8 = 0;
+    /// Destination Unreachable; see the `CODE_*` constants below it.
     pub const DEST_UNREACHABLE: u8 = 3;
+    /// Redirect.
     pub const REDIRECT: u8 = 5;
+    /// Echo Request (ping).
     pub const ECHO_REQUEST: u8 = 8;
+    /// Time Exceeded.
     pub const TIME_EXCEEDED: u8 = 11;
+    /// Parameter Problem.
     pub const PARAMETER_PROBLEM: u8 = 12;
 
-    /// Codes for [`DEST_UNREACHABLE`].
+    // Codes for DEST_UNREACHABLE.
+    /// [`DEST_UNREACHABLE`]: network unreachable.
     pub const CODE_NET_UNREACHABLE: u8 = 0;
+    /// [`DEST_UNREACHABLE`]: host unreachable.
     pub const CODE_HOST_UNREACHABLE: u8 = 1;
+    /// [`DEST_UNREACHABLE`]: protocol unreachable.
     pub const CODE_PROTOCOL_UNREACHABLE: u8 = 2;
+    /// [`DEST_UNREACHABLE`]: port unreachable.
     pub const CODE_PORT_UNREACHABLE: u8 = 3;
-    /// Fragmentation needed but DF set — carries the next-hop MTU.
+    /// [`DEST_UNREACHABLE`]: fragmentation needed but DF set — carries the
+    /// next-hop MTU.
     pub const CODE_FRAG_NEEDED: u8 = 4;
+    /// [`DEST_UNREACHABLE`]: destination network administratively
+    /// prohibited.
     pub const CODE_NET_ADMIN_PROHIBITED: u8 = 9;
+    /// [`DEST_UNREACHABLE`]: destination host administratively prohibited.
     pub const CODE_HOST_ADMIN_PROHIBITED: u8 = 10;
+    /// [`DEST_UNREACHABLE`]: communication administratively prohibited
+    /// (RFC 1812).
     pub const CODE_ADMIN_PROHIBITED: u8 = 13;
 
-    /// Codes for [`TIME_EXCEEDED`].
+    // Codes for TIME_EXCEEDED.
+    /// [`TIME_EXCEEDED`]: TTL exceeded in transit.
     pub const CODE_TTL_EXCEEDED: u8 = 0;
+    /// [`TIME_EXCEEDED`]: fragment reassembly time exceeded.
     pub const CODE_REASSEMBLY_TIMEOUT: u8 = 1;
 }
 
 /// ICMPv6 message types this crate names.
 pub mod icmpv6 {
+    /// Destination Unreachable; see the `CODE_*` constants below it.
     pub const DEST_UNREACHABLE: u8 = 1;
+    /// Packet Too Big: carries the next-hop MTU.
     pub const PACKET_TOO_BIG: u8 = 2;
+    /// Time Exceeded.
     pub const TIME_EXCEEDED: u8 = 3;
+    /// Parameter Problem.
     pub const PARAMETER_PROBLEM: u8 = 4;
+    /// Echo Request (ping).
     pub const ECHO_REQUEST: u8 = 128;
+    /// Echo Reply (ping response).
     pub const ECHO_REPLY: u8 = 129;
+    /// NDP Router Solicitation (RFC 4861).
     pub const ROUTER_SOLICITATION: u8 = 133;
+    /// NDP Router Advertisement (RFC 4861).
     pub const ROUTER_ADVERTISEMENT: u8 = 134;
+    /// NDP Neighbor Solicitation (RFC 4861).
     pub const NEIGHBOR_SOLICITATION: u8 = 135;
+    /// NDP Neighbor Advertisement (RFC 4861).
     pub const NEIGHBOR_ADVERTISEMENT: u8 = 136;
 
-    /// Codes for [`DEST_UNREACHABLE`].
+    // Codes for DEST_UNREACHABLE.
+    /// [`DEST_UNREACHABLE`]: no route to destination.
     pub const CODE_NO_ROUTE: u8 = 0;
+    /// [`DEST_UNREACHABLE`]: communication administratively prohibited.
     pub const CODE_ADMIN_PROHIBITED: u8 = 1;
+    /// [`DEST_UNREACHABLE`]: address unreachable.
     pub const CODE_ADDR_UNREACHABLE: u8 = 3;
+    /// [`DEST_UNREACHABLE`]: port unreachable.
     pub const CODE_PORT_UNREACHABLE: u8 = 4;
 
-    /// Codes for [`TIME_EXCEEDED`].
+    // Codes for TIME_EXCEEDED.
+    /// [`TIME_EXCEEDED`]: hop limit exceeded in transit.
     pub const CODE_HOP_LIMIT_EXCEEDED: u8 = 0;
+    /// [`TIME_EXCEEDED`]: fragment reassembly time exceeded.
     pub const CODE_REASSEMBLY_TIMEOUT: u8 = 1;
 
-    /// Codes for [`PARAMETER_PROBLEM`].
+    // Codes for PARAMETER_PROBLEM.
+    /// [`PARAMETER_PROBLEM`]: erroneous header field.
     pub const CODE_BAD_HEADER_FIELD: u8 = 0;
+    /// [`PARAMETER_PROBLEM`]: unrecognized Next Header type.
     pub const CODE_UNRECOGNIZED_NEXT_HEADER: u8 = 1;
+    /// [`PARAMETER_PROBLEM`]: unrecognized IPv6 option.
     pub const CODE_UNRECOGNIZED_OPTION: u8 = 2;
 }
 
@@ -608,6 +654,8 @@ pub mod icmpv6 {
 pub struct IcmpMessage(pub [u8]);
 
 impl IcmpMessage {
+    /// Length of the ICMP header: type, code, checksum and four bytes of
+    /// per-type data.
     pub const HEADER_LEN: usize = 8;
 
     /// View `b` as a ICMP or ICMPv6 message. No copy; nothing is checked until
@@ -797,10 +845,15 @@ impl fmt::Debug for IcmpMessage {
 /// ```
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
 pub struct FiveTuple {
+    /// Source address.
     pub src: IpAddr,
+    /// Destination address.
     pub dst: IpAddr,
+    /// Source port, or zero (see above).
     pub src_port: u16,
+    /// Destination port, or zero (see above).
     pub dst_port: u16,
+    /// Transport protocol.
     pub protocol: Protocol,
 }
 

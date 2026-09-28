@@ -106,10 +106,12 @@ mod host {
             self.saturating_duration_since(earlier)
         }
 
+        /// Time elapsed from `earlier` to `self`; `None` if `earlier` is later.
         pub fn checked_duration_since(&self, earlier: Instant) -> Option<Duration> {
             self.0.checked_sub(earlier.0)
         }
 
+        /// Time elapsed from `earlier` to `self`; zero if `earlier` is later.
         pub fn saturating_duration_since(&self, earlier: Instant) -> Duration {
             self.0.saturating_sub(earlier.0)
         }
@@ -119,10 +121,12 @@ mod host {
             Instant::now().saturating_duration_since(*self)
         }
 
+        /// `self + d`, or `None` on overflow.
         pub fn checked_add(&self, d: Duration) -> Option<Instant> {
             self.0.checked_add(d).map(Instant)
         }
 
+        /// `self - d`, or `None` if that is before the clock's origin.
         pub fn checked_sub(&self, d: Duration) -> Option<Instant> {
             self.0.checked_sub(d).map(Instant)
         }

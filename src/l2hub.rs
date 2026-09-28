@@ -190,7 +190,10 @@ pub enum PortMode {
     /// tagged with `vlan` is also accepted, and any other tag is dropped as
     /// misconfiguration. Frames leaving are always untagged, so the station
     /// behind the port never sees 802.1Q at all.
-    Access { vlan: u16 },
+    Access {
+        /// The port's VLAN ID.
+        vlan: u16,
+    },
     /// An uplink carrying several VLANs, tagged.
     ///
     /// A frame arriving tagged is accepted if its VLAN is in `allowed`.
@@ -198,7 +201,9 @@ pub enum PortMode {
     /// otherwise. On the way out, frames are tagged, except those on the
     /// native VLAN which leave untagged.
     Trunk {
+        /// The VLANs the port carries tagged.
         allowed: VlanSet,
+        /// The VLAN untagged frames belong to; `None` drops them.
         native: Option<u16>,
     },
 }

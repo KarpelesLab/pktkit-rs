@@ -19,9 +19,13 @@ use core::fmt;
 pub struct EtherType(pub u16);
 
 impl EtherType {
+    /// IPv4.
     pub const IPV4: EtherType = EtherType(0x0800);
+    /// Address Resolution Protocol.
     pub const ARP: EtherType = EtherType(0x0806);
+    /// An IEEE 802.1Q VLAN tag.
     pub const VLAN: EtherType = EtherType(0x8100);
+    /// IPv6.
     pub const IPV6: EtherType = EtherType(0x86DD);
 
     /// The EtherType with value `v`.
