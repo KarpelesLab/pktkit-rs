@@ -17,6 +17,18 @@
 //! [`iroutes`](PeerConfig::iroutes); the rest are dropped. The adapter does
 //! no routing towards clients: each has its own device, and what the
 //! connector sends to it goes to that client.
+//!
+//! In tap mode each client is held to one source MAC address: the first
+//! unicast one it sends from, unless another client of the adapter already
+//! uses it. Frames from any other source MAC are dropped, as are VLAN-stacked
+//! frames. Its ARP must claim that MAC and the address it was given (or none,
+//! for an address probe), and its IPv6 neighbour discovery the same: a
+//! neighbour advertisement only for the given address, a solicitation only
+//! from it or from `::`, and no router advertisement or redirect at all. So
+//! a client given an IPv4 address takes no part in IPv6 neighbour discovery,
+//! link-local addresses included. Other traffic is not checked for its IP
+//! source, as OpenVPN does not check it in tap mode either; a client
+//! bridging a network of its own behind it (several MACs) is not supported.
 
 use std::collections::HashMap;
 use std::io;
@@ -186,6 +198,9 @@ pub struct Adapter {
     peers: Mutex<HashMap<PeerKey, OvpnPeer>>,
     /// For [`OvpnPeer::id`].
     next_id: AtomicU64,
+    /// Held while a tap client's MAC is learned, so two clients cannot
+    /// both take one MAC. Taken before `peers`.
+    learning: Mutex<()>,
     me: Weak<Adapter>,
 }
 
@@ -203,6 +218,7 @@ impl Adapter {
             connector: cfg.connector,
             peers: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(0),
+            learning: Mutex::new(()),
             me: me.clone(),
         });
 
@@ -333,7 +349,7 @@ impl Adapter {
                 (Some(dev), None, res)
             }
             Connector::L2(conn) => {
-                let dev = PeerL2Device::new(&self.me, key);
+                let dev = PeerL2Device::new(&self.me, key, cfg.ip);
                 let res = conn.connect_l2(dev.clone() as Arc<dyn L2Device>);
                 (None, Some(dev), res)
             }
@@ -502,10 +518,15 @@ struct PeerL2Device {
     key: PeerKey,
     handler: Mutex<Option<L2Handler>>,
     mac: MacAddr,
+    /// The address pushed to the client: the only one its ARP and
+    /// neighbour discovery may claim.
+    client_ip: IpAddr,
+    /// The source MAC the client sends from, learned from its first frame.
+    client_mac: Mutex<Option<MacAddr>>,
 }
 
 impl PeerL2Device {
-    fn new(adapter: &Weak<Adapter>, key: PeerKey) -> Arc<Self> {
+    fn new(adapter: &Weak<Adapter>, key: PeerKey, client_ip: IpAddr) -> Arc<Self> {
         // Derive a stable locally-administered MAC from the peer key bytes.
         let mut octets = [0u8; 6];
         let s = key.socket_addr();
@@ -524,7 +545,45 @@ impl PeerL2Device {
             key,
             handler: Mutex::new(None),
             mac: MacAddr(octets),
+            client_ip,
+            client_mac: Mutex::new(None),
         })
+    }
+
+    fn learned_mac(&self) -> Option<MacAddr> {
+        *self
+            .client_mac
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Whether the client may send from `src`: the MAC it was pinned to,
+    /// or, for its first frame, one no other client of the adapter uses.
+    fn source_mac_ok(&self, src: MacAddr) -> bool {
+        if src.is_multicast() || src == MacAddr([0; 6]) {
+            return false;
+        }
+        if let Some(mac) = self.learned_mac() {
+            return mac == src;
+        }
+        let Some(adapter) = self.adapter.upgrade() else {
+            return false;
+        };
+        let _learning = adapter
+            .learning
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let taken = adapter.peers().iter().any(|(k, p)| {
+            *k != self.key && p.l2.as_ref().is_some_and(|d| d.learned_mac() == Some(src))
+        });
+        if taken {
+            return false;
+        }
+        let mut mine = self
+            .client_mac
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *mine.get_or_insert(src) == src
     }
 
     /// The handler, cloned out so it is called with no lock held.
@@ -536,11 +595,124 @@ impl PeerL2Device {
     }
 
     fn deliver(&self, data: &[u8]) {
+        let frame = crate::Frame::from_slice(data);
+        // Without these checks a client could take another's MAC, or answer
+        // ARP and neighbour discovery for any address on the segment, and
+        // so draw other hosts' traffic to itself.
+        let Some(src) = frame.src_mac() else {
+            return;
+        };
+        if !self.source_mac_ok(src) || !claims_only(frame, src, self.client_ip) {
+            return;
+        }
         let h = self.handler();
         if let Some(h) = h {
-            let _ = h(crate::Frame::from_slice(data));
+            let _ = h(frame);
         }
     }
+}
+
+/// Whether the ARP or neighbour discovery in `frame`, from a client pinned
+/// to `mac` and given `ip`, claims no more than those; true for other
+/// traffic. A frame that cannot be parsed far enough to tell is refused.
+fn claims_only(frame: &crate::Frame, mac: MacAddr, ip: IpAddr) -> bool {
+    use crate::EtherType;
+    let payload = frame.payload();
+    match frame.ether_type() {
+        // A further tag would hide the frame's real type.
+        EtherType::VLAN | EtherType(0x88a8) => false,
+        EtherType::ARP => {
+            // htype 1 (Ethernet), ptype IPv4, 6-byte and 4-byte addresses.
+            if payload.len() < 28 || payload[..6] != [0, 1, 8, 0, 6, 4] {
+                return false;
+            }
+            let sender_ip =
+                std::net::Ipv4Addr::new(payload[14], payload[15], payload[16], payload[17]);
+            payload[8..14] == mac.0 && (IpAddr::V4(sender_ip) == ip || sender_ip.is_unspecified())
+        }
+        EtherType::IPV6 => ndp_claims_only(payload, mac, ip),
+        _ => true,
+    }
+}
+
+/// [`claims_only`] for an IPv6 packet: its neighbour discovery.
+fn ndp_claims_only(pkt: &[u8], mac: MacAddr, ip: IpAddr) -> bool {
+    if pkt.len() < 40 {
+        return false;
+    }
+    let mut src = [0u8; 16];
+    src.copy_from_slice(&pkt[8..24]);
+    let src = std::net::Ipv6Addr::from(src);
+    // Past the extension headers that may come before ICMPv6.
+    let (mut next, mut at) = (pkt[6], 40);
+    loop {
+        match next {
+            // Hop-by-hop, routing, destination options: length in 8-byte
+            // units, not counting the first 8.
+            0 | 43 | 60 => {
+                let Some(hdr) = pkt.get(at..at + 2) else {
+                    return false;
+                };
+                next = hdr[0];
+                at += (usize::from(hdr[1]) + 1) * 8;
+            }
+            // Fragment: neighbour discovery must not be fragmented (RFC
+            // 6980), and a later fragment has no ICMPv6 header to check.
+            44 => {
+                let Some(hdr) = pkt.get(at..at + 8) else {
+                    return false;
+                };
+                return hdr[0] != 58;
+            }
+            58 => break,
+            _ => return true,
+        }
+    }
+    let Some(icmp) = pkt.get(at..) else {
+        return false;
+    };
+    let Some(&kind) = icmp.first() else {
+        return false;
+    };
+    let target = |icmp: &[u8]| {
+        let mut t = [0u8; 16];
+        t.copy_from_slice(&icmp[8..24]);
+        IpAddr::V6(std::net::Ipv6Addr::from(t))
+    };
+    let options = match kind {
+        // Router solicitation: asks, claims nothing but its source MAC.
+        133 => icmp.get(8..),
+        // Router advertisement, redirect: a client is no router.
+        134 | 137 => return false,
+        // Neighbour solicitation: tells the target who the source is.
+        135 => {
+            if icmp.len() < 24 || !(src.is_unspecified() || IpAddr::V6(src) == ip) {
+                return false;
+            }
+            icmp.get(24..)
+        }
+        // Neighbour advertisement: claims the target.
+        136 => {
+            if icmp.len() < 24 || target(icmp) != ip {
+                return false;
+            }
+            icmp.get(24..)
+        }
+        _ => return true,
+    };
+    // Any link-layer address option must name the client's own MAC.
+    let mut opts = options.unwrap_or(&[]);
+    while opts.len() >= 2 {
+        let len = usize::from(opts[1]) * 8;
+        if len == 0 || opts.len() < len {
+            return false;
+        }
+        if matches!(opts[0], 1 | 2) && (len < 8 || opts[2..8] != mac.0) {
+            return false;
+        }
+        opts = &opts[len..];
+    }
+    true
 }
 
 impl L2Device for PeerL2Device {
@@ -681,6 +853,177 @@ mod tests {
         assert!(seen.lock().unwrap().is_empty());
         dev.deliver(&v4([10, 8, 0, 2]));
         assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    /// A tap adapter, and a device of its for a client given `ip`, listed
+    /// in its peer table as on_connect would list it.
+    fn tap_device(adapter: &Arc<Adapter>, port: u16, ip: &str) -> Arc<PeerL2Device> {
+        let key = PeerKey::new(
+            SocketAddr::from(([192, 0, 2, 1], port)),
+            crate::ovpn::Transport::Udp,
+        );
+        let dev = PeerL2Device::new(&adapter.me, key, ip.parse().unwrap());
+        adapter.peers().insert(
+            key,
+            OvpnPeer {
+                id: u64::from(port),
+                l3: None,
+                l2: Some(dev.clone()),
+                cleanup: Mutex::new(None),
+            },
+        );
+        dev
+    }
+
+    fn tap_adapter() -> Arc<Adapter> {
+        struct Nowhere;
+        impl L2Connector for Nowhere {
+            fn connect_l2(&self, _dev: Arc<dyn L2Device>) -> Result<Cleanup> {
+                Ok(Box::new(|| Ok(())))
+            }
+        }
+        let on_auth: OnAuth = Arc::new(|_| Err(io::Error::other("no auth in this test")));
+        Adapter::new(AdapterConfig::new(
+            crate::ovpn::tests::server_config(),
+            "127.0.0.1:0".parse().unwrap(),
+            Connector::L2(Arc::new(Nowhere)),
+            on_auth,
+        ))
+        .unwrap()
+    }
+
+    /// Frames a device passes on.
+    fn passed(dev: &PeerL2Device) -> Arc<Mutex<Vec<Vec<u8>>>> {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let s = seen.clone();
+        dev.set_handler(Arc::new(move |f: &crate::Frame| {
+            s.lock().unwrap().push(f.as_bytes().to_vec());
+            Ok(())
+        }));
+        seen
+    }
+
+    fn arp(mac: MacAddr, sender_mac: [u8; 6], sender_ip: [u8; 4]) -> Vec<u8> {
+        let mut p = vec![0, 1, 8, 0, 6, 4, 0, 1];
+        p.extend_from_slice(&sender_mac);
+        p.extend_from_slice(&sender_ip);
+        p.extend_from_slice(&[0; 6]);
+        p.extend_from_slice(&[10, 8, 0, 1]);
+        crate::build_frame(MacAddr([0xff; 6]), mac, crate::EtherType::ARP, &p)
+    }
+
+    /// An ICMPv6 neighbour discovery message of `kind` from `src`, about
+    /// `target`, with a link-layer address option naming `ll`.
+    fn ndp(mac: MacAddr, kind: u8, src: &str, target: &str, ll: [u8; 6]) -> Vec<u8> {
+        let src: std::net::Ipv6Addr = src.parse().unwrap();
+        let target: std::net::Ipv6Addr = target.parse().unwrap();
+        let mut icmp = vec![kind, 0, 0, 0, 0, 0, 0, 0];
+        if kind != 133 {
+            icmp.extend_from_slice(&target.octets());
+        }
+        icmp.extend_from_slice(&[if kind == 136 { 2 } else { 1 }, 1]);
+        icmp.extend_from_slice(&ll);
+        let mut p = vec![0x60, 0, 0, 0, 0, 0, 58, 255];
+        p[4..6].copy_from_slice(&(icmp.len() as u16).to_be_bytes());
+        p.extend_from_slice(&src.octets());
+        p.extend_from_slice(&[0xff; 16]);
+        p.extend_from_slice(&icmp);
+        crate::build_frame(MacAddr([0x33; 6]), mac, crate::EtherType::IPV6, &p)
+    }
+
+    /// A tap client is pinned to the first source MAC it sends from, and
+    /// its ARP and neighbour discovery may claim only that MAC and the
+    /// address it was given. Before, anything went: a client could answer
+    /// for any address on the segment, or send as any MAC.
+    #[test]
+    fn tap_clients_claim_only_their_own_mac_and_address() {
+        let adapter = tap_adapter();
+        let dev = tap_device(&adapter, 1, "10.8.0.2");
+        let seen = passed(&dev);
+        let me = MacAddr([2, 0, 0, 0, 0, 1]);
+        let other = MacAddr([2, 0, 0, 0, 0, 2]);
+        let ip = crate::build_frame(MacAddr([0xff; 6]), me, crate::EtherType::IPV4, &[0x45; 20]);
+        dev.deliver(&ip);
+        assert_eq!(seen.lock().unwrap().len(), 1, "first frame dropped");
+        let before = seen.lock().unwrap().len();
+        for bad in [
+            // Another source MAC.
+            crate::build_frame(
+                MacAddr([0xff; 6]),
+                other,
+                crate::EtherType::IPV4,
+                &[0x45; 20],
+            ),
+            // ARP for another address, or naming another MAC.
+            arp(me, me.0, [10, 8, 0, 3]),
+            arp(me, other.0, [10, 8, 0, 2]),
+            // Truncated ARP.
+            crate::build_frame(MacAddr([0xff; 6]), me, crate::EtherType::ARP, &[0, 1, 8, 0]),
+            // Neighbour discovery: advertising any address (the client has
+            // no IPv6 one), advertising a router, soliciting from a
+            // link-local source.
+            ndp(me, 136, "fe80::1", "fe80::1", me.0),
+            ndp(me, 134, "fe80::1", "::", me.0),
+            ndp(me, 135, "fe80::1", "fe80::99", me.0),
+            // Stacked VLAN tags.
+            crate::build_frame(
+                MacAddr([0xff; 6]),
+                me,
+                crate::EtherType::VLAN,
+                &[0, 1, 0x81, 0, 0, 2, 8, 6],
+            ),
+        ] {
+            dev.deliver(&bad);
+        }
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            before,
+            "a spoofing frame passed"
+        );
+        for good in [
+            arp(me, me.0, [10, 8, 0, 2]),
+            // An address probe (RFC 5227).
+            arp(me, me.0, [0, 0, 0, 0]),
+            // Duplicate address detection.
+            ndp(me, 135, "::", "fe80::99", me.0),
+            ndp(me, 133, "::", "::", me.0),
+        ] {
+            dev.deliver(&good);
+        }
+        assert_eq!(seen.lock().unwrap().len(), before + 4);
+
+        // With an IPv6 address, the client advertises that one only, and
+        // with its own MAC.
+        let dev6 = tap_device(&adapter, 2, "2001:db8::2");
+        let seen6 = passed(&dev6);
+        dev6.deliver(&ndp(other, 136, "2001:db8::2", "2001:db8::2", other.0));
+        dev6.deliver(&ndp(other, 136, "2001:db8::2", "2001:db8::3", other.0));
+        dev6.deliver(&ndp(other, 136, "2001:db8::2", "2001:db8::2", me.0));
+        dev6.deliver(&ndp(other, 135, "2001:db8::2", "2001:db8::9", other.0));
+        assert_eq!(seen6.lock().unwrap().len(), 2);
+        adapter.close();
+    }
+
+    /// A MAC another tap client sends from is not learned for a second
+    /// one: it would draw the first one's traffic to itself.
+    #[test]
+    fn tap_clients_cannot_share_a_mac() {
+        let adapter = tap_adapter();
+        let first = tap_device(&adapter, 1, "10.8.0.2");
+        let second = tap_device(&adapter, 2, "10.8.0.3");
+        let (seen1, seen2) = (passed(&first), passed(&second));
+        let mac = MacAddr([2, 0, 0, 0, 0, 1]);
+        let frame =
+            crate::build_frame(MacAddr([0xff; 6]), mac, crate::EtherType::IPV4, &[0x45; 20]);
+        first.deliver(&frame);
+        second.deliver(&frame);
+        assert_eq!(seen1.lock().unwrap().len(), 1);
+        assert!(seen2.lock().unwrap().is_empty());
+        // Once the first client is gone, its MAC is free.
+        adapter.on_disconnect(first.key);
+        second.deliver(&frame);
+        assert_eq!(seen2.lock().unwrap().len(), 1);
+        adapter.close();
     }
 
     /// The server's limits are the adapter's to set: here, a one-peer cap

@@ -105,6 +105,8 @@ pub struct PeerConfig {
     /// [`Adapter`](super::Adapter) passes on only packets from this address
     /// or from one of the [`iroutes`](Self::iroutes); any other source is
     /// dropped, as OpenVPN drops it ("bad source address from client").
+    /// In tap mode it is the only address the client's ARP and IPv6
+    /// neighbour discovery may claim (see [`Adapter`](super::Adapter)).
     pub ip: std::net::IpAddr,
     /// Peer/gateway address used in the net30 topology push (tun mode).
     pub gateway: std::net::IpAddr,
