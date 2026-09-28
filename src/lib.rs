@@ -101,7 +101,8 @@ pub use packet::Packet;
 pub use pipe::{PipeL2, PipeL3};
 pub use pool::{BufferPool, DEFAULT_MAX_BUF_CAPACITY, DEFAULT_MAX_POOLED, DEFAULT_MTU};
 pub use protocol::Protocol;
-pub use stats::{DeviceStats, HubCounters, HubStats, Stats};
+pub(crate) use stats::HubStats;
+pub use stats::{DeviceStats, HubCounters, Stats};
 
 /// Crate-wide `Result` alias.
 pub type Result<T> = std::io::Result<T>;

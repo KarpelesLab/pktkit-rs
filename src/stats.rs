@@ -126,7 +126,8 @@ impl DeviceStats {
     }
 }
 
-/// A snapshot of a hub's counters. See [`HubStats`].
+/// A snapshot of a hub's counters, as [`L2Hub::stats`](crate::L2Hub::stats)
+/// and [`L3Hub::stats`](crate::L3Hub::stats) return it.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct HubCounters {
@@ -150,7 +151,7 @@ pub struct HubCounters {
 /// leaving — so its counters answer a different question than a device's:
 /// not "how much traffic", but "did the hub know where to send it".
 #[derive(Debug, Default)]
-pub struct HubStats {
+pub(crate) struct HubStats {
     received: AtomicU64,
     forwarded: AtomicU64,
     flooded: AtomicU64,
@@ -194,18 +195,6 @@ impl HubStats {
             forwarded: self.forwarded.load(Ordering::Relaxed),
             flooded: self.flooded.load(Ordering::Relaxed),
             dropped: self.dropped.load(Ordering::Relaxed),
-        }
-    }
-
-    /// Zero every counter.
-    pub fn reset(&self) {
-        for c in [
-            &self.received,
-            &self.forwarded,
-            &self.flooded,
-            &self.dropped,
-        ] {
-            c.store(0, Ordering::Relaxed);
         }
     }
 }

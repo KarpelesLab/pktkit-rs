@@ -43,7 +43,7 @@ than the Go code, and the design is idiomatic Rust:
 - **icmp**: error generation with the RFC rules on when a reply is forbidden
 - **fragment**: IPv4 fragmentation for the send path
 - **checksum**: RFC 1071, pseudo-header, and RFC 1624 incremental update
-- **DeviceStats / HubStats**: rx/tx/drop counters, for when a packet vanishes
+- **DeviceStats / HubCounters**: rx/tx/drop counters, for when a packet vanishes
 
 ### Opt-in cargo features
 
