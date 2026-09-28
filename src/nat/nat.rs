@@ -286,6 +286,9 @@ impl Forwards {
 struct Expectations {
     list: Vec<Expectation>,
     ports: Arc<PortUse>,
+    /// No expectation lapses before this, so
+    /// [`purge_lapsed`](Self::purge_lapsed) need not look until then.
+    next_lapse: Option<Instant>,
 }
 
 impl std::ops::Deref for Expectations {
@@ -300,12 +303,26 @@ impl Expectations {
         Expectations {
             list: Vec::new(),
             ports,
+            next_lapse: None,
         }
     }
 
     fn push(&mut self, e: Expectation) {
         self.ports.acquire(e.outside_port);
+        self.next_lapse = Some(self.next_lapse.map_or(e.expires, |t| t.min(e.expires)));
         self.list.push(e);
+    }
+
+    /// Drop the lapsed expectations, releasing their ports. Cheap unless
+    /// one has lapsed: port allocation calls it on every new mapping, so
+    /// that a lapsed expectation holds its port no longer than it lives,
+    /// not until the next sweep.
+    fn purge_lapsed(&mut self, now: Instant) {
+        if self.next_lapse.is_none_or(|t| now <= t) {
+            return;
+        }
+        self.retain(|e| now <= e.expires);
+        self.next_lapse = self.list.iter().map(|e| e.expires).min();
     }
 
     fn remove(&mut self, i: usize) -> Expectation {
@@ -1110,6 +1127,7 @@ impl Nat {
     /// forward or a pending expectation will receive traffic on count too,
     /// or that traffic would reach a new session.
     fn alloc_port_locked(inner: &mut NatInner, want: u16) -> Option<u16> {
+        inner.expectations.purge_lapsed(Instant::now());
         Self::scan_port_locked(inner, want)
             .or_else(|| Self::reclaim_locked(inner).then(|| Self::scan_port_locked(inner, want))?)
     }
@@ -1129,6 +1147,7 @@ impl Nat {
     /// An even outside port that is free along with the next one, reclaiming
     /// idle mappings if there is none.
     fn alloc_pair_locked(inner: &mut NatInner) -> Option<u16> {
+        inner.expectations.purge_lapsed(Instant::now());
         Self::scan_pair_locked(inner)
             .or_else(|| Self::reclaim_locked(inner).then(|| Self::scan_pair_locked(inner))?)
     }
@@ -3190,6 +3209,24 @@ mod tests {
         let port = src_port(&o.lock().unwrap()[0]);
         assert_ne!(port, NAT_PORT_MIN, "handed out a forwarded port");
         assert_ne!(port, NAT_PORT_MIN + 1, "handed out an expected port");
+    }
+
+    #[test]
+    fn a_lapsed_expectation_does_not_hold_its_port() {
+        let (nat, _i, o) = setup();
+        let past = Instant::now() - Duration::from_secs(1);
+        nat.add_expectation(Expectation::new(PROTO_UDP, INSIDE, 5004, 40000, past));
+        // Not yet swept, yet the port is free for a new mapping to keep...
+        let p = build_udp(Ipv4Addr::new(10, 0, 0, 6), 40000, REMOTE, 53, b"q");
+        nat.inside().send(Packet::from_slice(&p)).unwrap();
+        assert_eq!(src_port(&o.lock().unwrap()[0]), 40000);
+        // ...and the pool counts it free again.
+        let inner = nat.inner.lock().unwrap();
+        assert!(inner.expectations.is_empty());
+        assert_eq!(
+            inner.ports.pool_free(None),
+            u32::from(NAT_PORT_MAX - NAT_PORT_MIN)
+        );
     }
 
     #[test]
