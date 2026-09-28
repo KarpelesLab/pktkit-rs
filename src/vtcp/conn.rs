@@ -525,6 +525,13 @@ pub struct Conn {
 
     // Output queue drained by callers via [`take_outgoing`] / returned from methods.
     outgoing: Vec<Vec<u8>>,
+
+    /// The time, read once at the start of each call into the connection
+    /// (see [`clock`](Self::clock)) rather than by every step of it that
+    /// needs it: a segment's processing would otherwise read the clock
+    /// half a dozen times, which on some hosts costs as much as the rest
+    /// of it together.
+    now: Instant,
 }
 
 impl std::fmt::Debug for Conn {
@@ -544,6 +551,7 @@ impl Conn {
     /// A connection in CLOSED, configured by `cfg`. Open it with
     /// [`connect`](Self::connect) or [`accept_syn`](Self::accept_syn).
     pub fn new(cfg: ConnConfig) -> Self {
+        let now = Instant::now();
         let rcv_shift = cfg.rcv_wscale();
         let mss = cfg.mss.max(1);
         let cc = make_cc(cfg.congestion, mss as u32);
@@ -594,7 +602,7 @@ impl Conn {
             ts_enabled: cfg.enable_timestamps,
             ts_ok: false,
             ts_recent: 0,
-            ts_recent_stamp: Instant::now(),
+            ts_recent_stamp: now,
             ts_base: super::secret::epoch(),
             ts_offset,
             last_ack_sent: None,
@@ -615,11 +623,21 @@ impl Conn {
             time_wait_deadline: None,
             keepalive_deadline: None,
             keepalive_sent: 0,
-            last_recv: Instant::now(),
+            last_recv: now,
             established_signaled: false,
             fin_recvd_signaled: false,
             outgoing: Vec::new(),
+            now,
         }
+    }
+
+    /// Read the clock for this call into the connection: every public
+    /// method that may send, receive or arm a timer starts with it, and
+    /// everything it does from there takes the time from `self.now`.
+    #[inline]
+    fn clock(&mut self) -> Instant {
+        self.now = Instant::now();
+        self.now
     }
 
     // --- Accessors ---------------------------------------------------------
@@ -694,6 +712,7 @@ impl Conn {
     /// For a Packet Too Big that came in off the network, use
     /// [`on_icmp_too_big`](Self::on_icmp_too_big), which checks it first.
     pub fn set_path_mtu(&mut self, mtu: u32) -> Vec<Vec<u8>> {
+        self.clock();
         let ipv6 = self.is_ipv6();
         let current = self.path_mtu();
         let mut mtu = mtu;
@@ -803,6 +822,7 @@ impl Conn {
 
     /// Initiate active open (send the initial SYN). Returns the SYN segment.
     pub fn connect(&mut self) -> Vec<Vec<u8>> {
+        self.clock();
         if self.state != State::Closed {
             return Vec::new();
         }
@@ -832,6 +852,7 @@ impl Conn {
 
     /// Process an incoming SYN, transition to SYN-RECEIVED, emit SYN-ACK.
     pub fn accept_syn(&mut self, syn: &Segment) -> Vec<Vec<u8>> {
+        self.clock();
         let iss = self.new_iss();
         self.open_passive(syn, iss)
     }
@@ -852,6 +873,7 @@ impl Conn {
     /// Nothing is sent now; the SYN-ACK went out, statelessly, already.
     #[cfg_attr(not(any(feature = "vclient", feature = "slirp")), allow(dead_code))]
     pub(crate) fn accept_cookie_syn_received(&mut self, ack: &Segment, our_iss: u32, mss: u16) {
+        self.clock();
         let syn = Segment {
             src_port: ack.src_port,
             dst_port: ack.dst_port,
@@ -908,6 +930,7 @@ impl Conn {
     /// window as the peer's (unscaled: a cookie cannot carry window scaling).
     #[cfg_attr(not(any(feature = "vclient", feature = "slirp")), allow(dead_code))]
     pub(crate) fn accept_cookie(&mut self, ack: &Segment, our_iss: u32, mss: u16) -> Vec<Vec<u8>> {
+        self.clock();
         let remote_seq = ack.seq;
         let initial_data = &ack.payload[..];
         if self.state != State::Closed && self.state != State::Listen {
@@ -1001,7 +1024,7 @@ impl Conn {
             && let Some((ts_val, _)) = get_timestamp(remote_opts)
         {
             self.ts_recent = ts_val;
-            self.ts_recent_stamp = Instant::now();
+            self.ts_recent_stamp = self.now;
             self.ts_ok = true;
         }
     }
@@ -1050,7 +1073,8 @@ impl Conn {
     }
 
     fn ts_now(&self) -> u32 {
-        (self.ts_base.elapsed().as_millis() as u32).wrapping_add(self.ts_offset)
+        (self.now.saturating_duration_since(self.ts_base).as_millis() as u32)
+            .wrapping_add(self.ts_offset)
     }
 
     /// PAWS validation at time `now`: drop segments with timestamps older
@@ -1168,7 +1192,7 @@ impl Conn {
     fn queue_oow_ack(&mut self, seg: &Segment) {
         let in_flow = seg.seg_len() > 0 && !seg.has_flag(flags::SYN) && !seg.has_flag(flags::RST);
         if in_flow {
-            self.last_oow_ack = Some(Instant::now());
+            self.last_oow_ack = Some(self.now);
             self.queue_ack();
         } else {
             self.queue_challenge_ack();
@@ -1182,7 +1206,7 @@ impl Conn {
     /// exemption), and two ends that disagree about the sequence space can
     /// ACK each other forever.
     fn queue_challenge_ack(&mut self) {
-        let now = Instant::now();
+        let now = self.now;
         if self
             .last_oow_ack
             .is_some_and(|t| now.duration_since(t) < OOW_ACK_INTERVAL)
@@ -1242,6 +1266,7 @@ impl Conn {
 
     /// Process an inbound segment. Returns any outgoing segments to transmit.
     pub fn handle_segment(&mut self, seg: &Segment) -> Vec<Vec<u8>> {
+        self.clock();
         match self.state {
             State::Closed => self.handle_closed(seg),
             State::Listen => Vec::new(), // pure passive open uses accept_syn
@@ -1263,7 +1288,7 @@ impl Conn {
     /// hold off the keepalive, FIN-WAIT-2 and zero-window give-up timers of
     /// a peer that is long gone.
     fn note_alive(&mut self) {
-        self.last_recv = Instant::now();
+        self.last_recv = self.now;
         self.keepalive_sent = 0;
         self.probes_out = 0;
     }
@@ -1687,7 +1712,7 @@ impl Conn {
     /// PAWS (RFC 7323 §5), and TS.Recent for the echo. False if `seg`
     /// must be dropped.
     fn check_paws(&mut self, seg: &Segment) -> bool {
-        if self.update_timestamp(seg, Instant::now()) {
+        if self.update_timestamp(seg, self.now) {
             return true;
         }
         // RFC 7323 §5.3 answers with an ACK, but through the invalid-
@@ -1773,7 +1798,7 @@ impl Conn {
     /// New data of `len` bytes came in (Linux's `tcp_event_data_recv`
     /// and `tcp_measure_rcv_mss`).
     fn note_data(&mut self, len: usize) {
-        let now = Instant::now();
+        let now = self.now;
         // The first data, or data after longer than an RTO without any:
         // the sender is (again) in slow start from a small window, and each
         // delayed ACK would hold it up.
@@ -1827,7 +1852,7 @@ impl Conn {
             }
             self.queue_ack();
         } else if self.delack_deadline.is_none() {
-            self.delack_deadline = Some(Instant::now() + DELAYED_ACK);
+            self.delack_deadline = Some(self.now + DELAYED_ACK);
         }
     }
 
@@ -1953,7 +1978,7 @@ impl Conn {
             .rcv_adv
             .filter(|&adv| seq_after(adv, nxt))
             .unwrap_or(nxt);
-        self.rcv_space.measure_window(nxt, edge, Instant::now());
+        self.rcv_space.measure_window(nxt, edge, self.now);
     }
 
     /// Dynamic right-sizing, after a read: grow the receive buffer to what
@@ -1961,7 +1986,7 @@ impl Conn {
     fn rcv_space_adjust(&mut self) {
         let srtt = Some(self.rto.srtt()).filter(|d| !d.is_zero());
         let mss = self.cfg.mss.max(1) as usize;
-        if let Some(want) = self.rcv_space.adjust(Instant::now(), srtt, mss) {
+        if let Some(want) = self.rcv_space.adjust(self.now, srtt, mss) {
             self.grow_recv(want);
         }
     }
@@ -2239,7 +2264,8 @@ impl Conn {
         }
         // The TSval was taken in the millisecond `age` before this one:
         // what has passed of this one belongs to the round trip too.
-        let into_ms = (self.ts_base.elapsed().as_nanos() % 1_000_000) as u64;
+        let since = self.now.saturating_duration_since(self.ts_base);
+        let into_ms = (since.as_nanos() % 1_000_000) as u64;
         Some(Duration::from_millis(u64::from(age)) + Duration::from_nanos(into_ms))
     }
 
@@ -2296,7 +2322,7 @@ impl Conn {
             // it.
             if self.er_deadline.is_none() {
                 let delay = (self.rto.srtt() / 4).max(ER_MIN_DELAY);
-                self.er_deadline = Some(Instant::now() + delay);
+                self.er_deadline = Some(self.now + delay);
             }
         } else if self.dup_acks <= 2 {
             // Limited Transmit (RFC 3042): a new segment for each of the
@@ -2539,7 +2565,7 @@ impl Conn {
             // (Linux's tcp_event_data_sent).
             if self
                 .last_data_recv
-                .is_some_and(|t| t.elapsed() < DELAYED_ACK)
+                .is_some_and(|t| self.now.saturating_duration_since(t) < DELAYED_ACK)
             {
                 self.pingpong = true;
             }
@@ -2583,7 +2609,7 @@ impl Conn {
     // --- Timers (synchronous, deadline-based) -----------------------------
 
     fn start_rto(&mut self) {
-        self.rto_deadline = Some(Instant::now() + self.rto.rto());
+        self.rto_deadline = Some(self.now + self.rto.rto());
     }
 
     fn stop_rto(&mut self) {
@@ -2594,7 +2620,7 @@ impl Conn {
         if self.persist_backoff == Duration::ZERO {
             self.persist_backoff = self.rto.rto();
         }
-        self.persist_deadline = Some(Instant::now() + self.persist_backoff);
+        self.persist_deadline = Some(self.now + self.persist_backoff);
     }
 
     fn stop_persist(&mut self) {
@@ -2606,12 +2632,12 @@ impl Conn {
         self.stop_keepalive();
         self.stop_persist();
         self.release_buffers();
-        self.time_wait_deadline = Some(Instant::now() + self.cfg.time_wait);
+        self.time_wait_deadline = Some(self.now + self.cfg.time_wait);
     }
 
     fn restart_time_wait(&mut self) {
         if self.time_wait_deadline.is_some() {
-            self.time_wait_deadline = Some(Instant::now() + self.cfg.time_wait);
+            self.time_wait_deadline = Some(self.now + self.cfg.time_wait);
         }
     }
 
@@ -2654,7 +2680,7 @@ impl Conn {
 
     fn start_keepalive(&mut self) {
         self.stop_keepalive();
-        self.keepalive_deadline = Some(Instant::now() + self.cfg.keepalive_idle);
+        self.keepalive_deadline = Some(self.now + self.cfg.keepalive_idle);
     }
 
     fn stop_keepalive(&mut self) {
@@ -2710,7 +2736,7 @@ impl Conn {
     /// fixed polling interval costs: a retransmission or a delayed ACK
     /// waits for the next poll.
     pub fn tick(&mut self) -> Vec<Vec<u8>> {
-        let now = Instant::now();
+        let now = self.clock();
 
         // Early Retransmit, ahead of the RTO: its retransmission restarts
         // the RTO, which then has nothing to do.
@@ -2952,7 +2978,7 @@ impl Conn {
         if self.persist_backoff > MAX_RTO {
             self.persist_backoff = MAX_RTO;
         }
-        self.persist_deadline = Some(Instant::now() + self.persist_backoff);
+        self.persist_deadline = Some(self.now + self.persist_backoff);
     }
 
     fn on_keepalive(&mut self) {
@@ -2980,7 +3006,7 @@ impl Conn {
             self.start_keepalive();
             return;
         }
-        if self.last_recv.elapsed() >= self.cfg.keepalive_idle {
+        if self.now.saturating_duration_since(self.last_recv) >= self.cfg.keepalive_idle {
             if self.keepalive_sent >= self.cfg.keepalive_count {
                 self.tear_down(State::Closed);
                 return;
@@ -3001,7 +3027,7 @@ impl Conn {
             self.keepalive_sent += 1;
         }
         if self.keepalive_sent > 0 {
-            self.keepalive_deadline = Some(Instant::now() + self.cfg.keepalive_interval);
+            self.keepalive_deadline = Some(self.now + self.cfg.keepalive_interval);
         } else {
             // Heard from the peer since the timer was set: the idle time
             // runs from then, not from now, or a probe could come up to
@@ -3022,6 +3048,7 @@ impl Conn {
     /// [`Conn::take_outgoing`]; without it a peer facing a closed window
     /// would wait on its persist timer.
     pub fn read(&mut self, buf: &mut [u8]) -> usize {
+        self.clock();
         let Some(rb) = self.recv_buf.as_mut() else {
             return 0;
         };
@@ -3069,6 +3096,7 @@ impl Conn {
     /// (possibly less than `buf.len()`), schedules any sends the window allows,
     /// and returns the byte count accepted alongside any new outgoing segments.
     pub fn write(&mut self, buf: &[u8]) -> (usize, Vec<Vec<u8>>) {
+        self.clock();
         if self.closed {
             return (0, Vec::new());
         }
@@ -3093,6 +3121,7 @@ impl Conn {
     /// does on a socket. Turning it off sends at once whatever it was
     /// holding back, as Linux does; those segments are returned.
     pub fn set_nodelay(&mut self, nodelay: bool) -> Vec<Vec<u8>> {
+        self.clock();
         self.cfg.nodelay = nodelay;
         if nodelay
             && !self.closed
@@ -3106,6 +3135,7 @@ impl Conn {
 
     /// Initiate graceful close (FIN). Returns any segments produced.
     pub fn close(&mut self) -> Vec<Vec<u8>> {
+        self.clock();
         if self.closed {
             return Vec::new();
         }
@@ -3166,7 +3196,8 @@ impl Conn {
     /// nothing left to abort and would only cut TIME-WAIT short (Linux's
     /// socket is in CLOSE by then, where `tcp_close` sends nothing).
     pub fn release(&mut self) -> Vec<Vec<u8>> {
-        self.released.get_or_insert_with(Instant::now);
+        let now = self.clock();
+        self.released.get_or_insert(now);
         if matches!(self.state, State::TimeWait | State::Closed) {
             // Unread data kept for the application goes with it.
             self.release_buffers();
@@ -3181,6 +3212,7 @@ impl Conn {
     /// the peer has acknowledged nothing, so it holds nothing to reset.
     /// Nothing is sent from CLOSED either.
     pub fn abort(&mut self) -> Vec<Vec<u8>> {
+        self.clock();
         if self.state == State::Closed {
             return Vec::new();
         }
