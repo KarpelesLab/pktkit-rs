@@ -100,6 +100,11 @@ pub struct L2Adapter {
 
     // Self-Arc, for use by closures that need to refer back to us.
     weak_self: Mutex<Weak<L2Adapter>>,
+
+    /// Set by [`close`](L2Device::close) to end the timer thread, which
+    /// waits on the condvar between runs so that it ends at once.
+    #[cfg(not(target_family = "wasm"))]
+    timer_stop: Arc<(Mutex<bool>, std::sync::Condvar)>,
 }
 
 impl core::fmt::Debug for L2Adapter {
@@ -127,8 +132,12 @@ impl L2Adapter {
     }
 
     /// `timer` starts the thread that runs the neighbour timers; tests
-    /// leave it out to drive time themselves.
-    fn build(dev: Arc<dyn L3Device>, cfg: L2AdapterConfig, timer: bool) -> Arc<L2Adapter> {
+    /// and the fuzz targets leave it out to drive time themselves.
+    pub(crate) fn build(
+        dev: Arc<dyn L3Device>,
+        cfg: L2AdapterConfig,
+        timer: bool,
+    ) -> Arc<L2Adapter> {
         let mac = cfg.mac.unwrap_or_else(MacAddr::random_local_unicast);
         let a = Arc::new(L2Adapter {
             mac,
@@ -151,6 +160,8 @@ impl L2Adapter {
             // reported in full.
             icmp_limit: RateLimiter::new(10, arp::PENDING_MAX_PKTS as u32),
             weak_self: Mutex::new(Weak::new()),
+            #[cfg(not(target_family = "wasm"))]
+            timer_stop: Arc::default(),
         });
         *a.weak_self.lock().unwrap() = Arc::downgrade(&a);
         a.set_gw_v4(cfg.gateway_v4);
@@ -828,17 +839,34 @@ impl L2Device for L2Adapter {
     fn close(&self) -> Result<()> {
         #[cfg(feature = "dhcp")]
         self.stop_dhcp();
+        // The timers only ever send: solicitations, probes and ICMP errors,
+        // none of which a closed adapter has any business sending.
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let (stopped, wake) = &*self.timer_stop;
+            *stopped.lock().unwrap() = true;
+            wake.notify_all();
+        }
         Ok(())
     }
 }
 
-/// Run the adapter's timers until it is dropped.
+/// Run the adapter's timers until it is closed or dropped.
 #[cfg(not(target_family = "wasm"))]
 fn spawn_timer(a: &Arc<L2Adapter>) {
     let weak = Arc::downgrade(a);
+    let stop = a.timer_stop.clone();
     std::thread::spawn(move || {
+        let (stopped, wake) = &*stop;
         loop {
-            std::thread::sleep(TIMER_INTERVAL);
+            let guard = stopped.lock().unwrap();
+            let (guard, _) = wake
+                .wait_timeout_while(guard, TIMER_INTERVAL, |stopped| !*stopped)
+                .unwrap();
+            if *guard {
+                return;
+            }
+            drop(guard);
             let Some(a) = weak.upgrade() else {
                 return;
             };
@@ -1063,6 +1091,32 @@ mod tests {
     }
 
     type Out = Arc<Mutex<Vec<Vec<u8>>>>;
+
+    /// Once closed, the adapter's timer thread sends nothing more: no
+    /// solicitation retries into a device that is gone.
+    #[test]
+    fn close_stops_the_timers() {
+        let pipe = Arc::new(PipeL3::new("10.0.0.5/24".parse().unwrap()));
+        let adapter = L2Adapter::build(pipe.clone(), L2AdapterConfig::default(), true);
+        let out: Out = Arc::default();
+        let oc = out.clone();
+        adapter.set_handler(Arc::new(move |f: &Frame| {
+            oc.lock().unwrap().push(f.as_bytes().to_vec());
+            Ok(())
+        }));
+        let src: IpAddr = "10.0.0.5".parse().unwrap();
+        let dst: IpAddr = "10.0.0.6".parse().unwrap();
+        let udp = crate::build::build_udp(src, dst, 1000, 2000, b"hi");
+        let pkt = crate::build::build_ip(src, dst, Protocol::UDP, 64, &udp).unwrap();
+        pipe.inject(Packet::from_slice(&pkt)).unwrap();
+        assert_eq!(solicited(&take(&out)), [dst]);
+
+        adapter.close().unwrap();
+        // Two retransmissions' worth, and then some: a timer still running
+        // would have solicited again by now.
+        std::thread::sleep(arp::RETRANS_TIMER * 2 + Duration::from_millis(500));
+        assert!(take(&out).is_empty(), "the timers ran on after close");
+    }
 
     fn rig(addr: &str) -> (Arc<PipeL3>, Arc<L2Adapter>, Out) {
         let pipe = Arc::new(PipeL3::new(addr.parse().unwrap()));

@@ -493,19 +493,18 @@ pub fn l2adapter_frames(data: &[u8]) {
     use crate::{IpPrefix, L2Adapter, L2AdapterConfig, L2Device, L3Device, MacAddr, PipeL3};
     use std::sync::Arc;
 
-    // An adapter spawns its ARP queue's sweeper thread, so one serves every
-    // input, as the wg body does with its handler.
-    static ADAPTER: std::sync::OnceLock<(Arc<PipeL3>, Arc<L2Adapter>)> = std::sync::OnceLock::new();
-    let (inner, adapter) = ADAPTER.get_or_init(|| {
-        let inner = Arc::new(PipeL3::new("10.0.0.2/24".parse::<IpPrefix>().unwrap()));
-        let adapter = L2Adapter::new(
-            inner.clone(),
-            L2AdapterConfig::default()
-                .mac(MacAddr([2, 0, 0, 0, 0, 2]))
-                .gateway_v4("10.0.0.1".parse().unwrap()),
-        );
-        (inner, adapter)
-    });
+    // A fresh adapter for each input, and without the timer thread: one
+    // running in the background, and state carried over from the inputs
+    // before, would make a crash depend on more than the input that found
+    // it.
+    let inner = Arc::new(PipeL3::new("10.0.0.2/24".parse::<IpPrefix>().unwrap()));
+    let adapter = L2Adapter::build(
+        inner.clone(),
+        L2AdapterConfig::default()
+            .mac(MacAddr([2, 0, 0, 0, 0, 2]))
+            .gateway_v4("10.0.0.1".parse().unwrap()),
+        false,
+    );
     for msg in messages(data) {
         if msg.first().is_some_and(|b| b & 1 == 0) {
             // From the network.
