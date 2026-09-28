@@ -453,14 +453,7 @@ impl Nat {
     /// (RFC 919), which like the limited one never leaves that network.
     /// /31 and /32 have none (RFC 3021).
     fn is_inside_broadcast(&self, ip: Ipv4Addr) -> bool {
-        let prefix = self.inside.addr();
-        match prefix.addr() {
-            IpAddr::V4(a) if (1..=30).contains(&prefix.bits()) => {
-                let host = u32::MAX >> prefix.bits();
-                u32::from(ip) == u32::from(a) | host
-            }
-            _ => false,
-        }
+        is_directed_broadcast(self.inside.addr(), ip)
     }
 
     /// IPv4 address bound to the outside interface.
@@ -1604,6 +1597,9 @@ impl Nat {
             }
             return;
         }
+        if !forwardable_v4(dst_ip, self.outside.addr()) {
+            return;
+        }
         // The NAT forwards what it translates, so, as any router must (RFC
         // 1812 §5.3.1), it spends a hop of it, and owes the sender a Time
         // Exceeded when none is left. A ping to the public address is the
@@ -2516,6 +2512,35 @@ impl L3Device for NatNsSide {
     fn close(&self) -> Result<()> {
         Ok(())
     }
+}
+
+/// Whether `ip` is `prefix`'s directed broadcast address (RFC 919). /31 and
+/// /32 have none (RFC 3021).
+fn is_directed_broadcast(prefix: IpPrefix, ip: Ipv4Addr) -> bool {
+    match prefix.addr() {
+        IpAddr::V4(a) if (1..=30).contains(&prefix.bits()) => {
+            let host = u32::MAX >> prefix.bits();
+            u32::from(ip) == u32::from(a) | host
+        }
+        _ => false,
+    }
+}
+
+/// Whether a translator may send a packet to `ip` out of the outside
+/// network `outside`. Loopback and "this network" (0/8) name the sender
+/// itself, 240/4 is reserved (RFC 1122 §3.2.1.3, RFC 1812 §5.3.7), and
+/// multicast, the limited broadcast and the outside network's directed
+/// broadcast would reach every host there on the public address's behalf;
+/// link-local addresses (169.254/16) never leave their link (RFC 3927
+/// §2.7), which for an inside host is not the outside one. None of them is
+/// a peer a NAT session can have.
+pub(crate) fn forwardable_v4(ip: Ipv4Addr, outside: IpPrefix) -> bool {
+    let first = ip.octets()[0];
+    !(ip.is_loopback()
+        || first == 0
+        || first >= 224
+        || ip.is_link_local()
+        || is_directed_broadcast(outside, ip))
 }
 
 /// Hand a translated datagram to `send`, cut back into fragments no larger
@@ -5135,5 +5160,25 @@ mod tests {
         let p = build_udp(REMOTE, 53, PUBLIC, 40000, b"ok");
         nat.outside().send(Packet::from_slice(&p)).unwrap();
         assert_eq!(i.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn special_destinations_are_not_forwarded() {
+        let (nat, _i, o) = setup();
+        for d in [
+            Ipv4Addr::new(127, 0, 0, 1),
+            Ipv4Addr::new(0, 0, 0, 0),
+            Ipv4Addr::new(0, 1, 2, 3),
+            Ipv4Addr::new(203, 0, 113, 255),
+            Ipv4Addr::new(240, 0, 0, 1),
+            Ipv4Addr::new(169, 254, 169, 254),
+        ] {
+            let p = build_udp(INSIDE, 1000, d, 53, b"q");
+            nat.inside().send(Packet::from_slice(&p)).unwrap();
+        }
+        assert!(o.lock().unwrap().is_empty());
+        let p = build_udp(INSIDE, 1000, REMOTE, 53, b"q");
+        nat.inside().send(Packet::from_slice(&p)).unwrap();
+        assert_eq!(o.lock().unwrap().len(), 1);
     }
 }

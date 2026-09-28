@@ -9,7 +9,7 @@
 use crate::nat::frag::FragTable;
 use crate::nat::helper::{PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP};
 use crate::nat::l4::csum_replace;
-use crate::nat::nat::{RECLAIM_INTERVAL, SWEEP_INTERVAL, frag_info};
+use crate::nat::nat::{RECLAIM_INTERVAL, SWEEP_INTERVAL, forwardable_v4, frag_info};
 use crate::nat::ports::{PortKey, PortMap, PortUse};
 use crate::nat::track::{HostQuota, MappingHold, NatLimits, PeerQuotas, Peers, Quota};
 use crate::time::Instant;
@@ -348,6 +348,12 @@ impl Nat64 {
         let Some(dst_v4) = self.pref64().and_then(|p| p.extract(dst_v6)) else {
             return;
         };
+        // The Well-Known Prefix holds only global addresses, but a
+        // network-specific one can stand for any IPv4 address, broadcast
+        // and multicast included, which no session reaches.
+        if !forwardable_v4(dst_v4, self.outside.addr()) {
+            return;
+        }
         let payload_len = u16::from_be_bytes([pkt[4], pkt[5]]) as usize;
         let src_v6 = read_v6(&pkt[8..24]);
         // Before anything is answered, too: an error sent to a spoofed
@@ -3049,5 +3055,38 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(3))
             .expect("deadlocked");
         assert_eq!(got, 2);
+    }
+
+    #[test]
+    fn special_destinations_under_a_network_specific_prefix_are_dropped() {
+        let nat = Nat64::new(pfx("2001:db8:122::/96"), pfx("198.51.100.1/24"));
+        let captured = Arc::new(StdMutex::new(Vec::<Vec<u8>>::new()));
+        let c = captured.clone();
+        nat.outside().set_handler(Arc::new(move |p| {
+            c.lock().unwrap().push(p.as_bytes().to_vec());
+            Ok(())
+        }));
+        let client: Ipv6Addr = "2001:db8:1::100".parse().unwrap();
+        let send = |v4: [u8; 4]| {
+            let mut o = "2001:db8:122::".parse::<Ipv6Addr>().unwrap().octets();
+            o[12..].copy_from_slice(&v4);
+            let pkt = build_v6_udp(client, 5555, Ipv6Addr::from(o), 53, b"x");
+            nat.inside().send(Packet::from_slice(&pkt)).unwrap();
+        };
+        for v4 in [
+            [255, 255, 255, 255],
+            [127, 0, 0, 1],
+            [198, 51, 100, 255],
+            [224, 0, 0, 1],
+            [0, 0, 0, 0],
+            [240, 0, 0, 1],
+            [169, 254, 1, 1],
+        ] {
+            send(v4);
+        }
+        assert!(captured.lock().unwrap().is_empty());
+        // A private address is fine under a network-specific prefix.
+        send([10, 0, 0, 1]);
+        assert_eq!(captured.lock().unwrap().len(), 1);
     }
 }
