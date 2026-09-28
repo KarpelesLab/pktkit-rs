@@ -1,4 +1,11 @@
 //! Congestion control. NewReno (RFC 5681) and HighSpeed TCP (RFC 3649).
+//!
+//! Both count bytes, not ACKs (RFC 3465): a receiver that delays its ACKs
+//! acknowledges two segments with each, and counting ACKs would halve the
+//! window's growth, in slow start and in congestion avoidance alike. Slow
+//! start takes up to L = 2*SMSS per ACK (RFC 3465 §2.2), enough to double
+//! the window per round trip against a delayed-ACK receiver without
+//! letting one stretch ACK burst the window open.
 
 /// Pluggable congestion-control trait.
 ///
@@ -73,6 +80,9 @@ pub struct NewReno {
     dup_ack_cnt: u32,
     recovery: bool,
     recovery_seq: u32,
+    /// Bytes acknowledged in congestion avoidance towards the next
+    /// segment of growth (RFC 3465 §2.1's `bytes_acked`).
+    ca_acked: u32,
 }
 
 impl NewReno {
@@ -90,6 +100,7 @@ impl NewReno {
             dup_ack_cnt: 0,
             recovery: false,
             recovery_seq: 0,
+            ca_acked: 0,
         }
     }
 
@@ -98,6 +109,11 @@ impl NewReno {
     pub fn ssthresh(&self) -> u32 {
         self.ssthresh
     }
+}
+
+/// Slow start's growth for an ACK of `bytes_acked` (RFC 3465 §2.2, L = 2).
+fn slow_start_inc(bytes_acked: u32, mss: u32) -> u32 {
+    bytes_acked.min(mss.saturating_mul(2))
 }
 
 impl CongestionController for NewReno {
@@ -115,14 +131,17 @@ impl CongestionController for NewReno {
             return;
         }
         if self.cwnd < self.ssthresh {
-            let inc = bytes_acked.min(self.mss);
-            self.cwnd = self.cwnd.saturating_add(inc);
+            self.cwnd = self
+                .cwnd
+                .saturating_add(slow_start_inc(bytes_acked, self.mss));
         } else {
-            let mut inc = self.mss.saturating_mul(self.mss) / self.cwnd.max(1);
-            if inc == 0 {
-                inc = 1;
+            // A segment per window's worth of bytes acknowledged (RFC 3465
+            // §2.1), however many ACKs that took.
+            self.ca_acked = self.ca_acked.saturating_add(bytes_acked);
+            if self.ca_acked >= self.cwnd {
+                self.ca_acked -= self.cwnd;
+                self.cwnd = self.cwnd.saturating_add(self.mss);
             }
-            self.cwnd = self.cwnd.saturating_add(inc);
         }
     }
 
@@ -148,6 +167,7 @@ impl CongestionController for NewReno {
             self.ssthresh = (flight_size / 2).max(2 * self.mss);
         }
         self.cwnd = self.mss;
+        self.ca_acked = 0;
         self.recovery = false;
         self.dup_ack_cnt = 0;
         self.recovery_seq = 0;
@@ -156,6 +176,7 @@ impl CongestionController for NewReno {
     fn on_fast_retransmit(&mut self, flight_size: u32, snd_nxt: u32) {
         self.ssthresh = (flight_size / 2).max(2 * self.mss);
         self.cwnd = self.ssthresh.saturating_add(3 * self.mss);
+        self.ca_acked = 0;
         self.recovery = true;
         self.recovery_seq = snd_nxt;
     }
@@ -223,6 +244,10 @@ pub struct HighSpeed {
     dup_ack_cnt: u32,
     recovery: bool,
     recovery_seq: u32,
+    /// Growth earned in congestion avoidance and not yet applied, in
+    /// bytes: a(w) segments per window of bytes acknowledged, a fraction
+    /// of a byte at a time.
+    ca_credit: f64,
 }
 
 impl HighSpeed {
@@ -241,6 +266,7 @@ impl HighSpeed {
             dup_ack_cnt: 0,
             recovery: false,
             recovery_seq: 0,
+            ca_credit: 0.0,
         }
     }
 
@@ -298,14 +324,20 @@ impl CongestionController for HighSpeed {
             return;
         }
         if self.cwnd < self.ssthresh {
-            let inc = bytes_acked.min(self.mss);
-            self.cwnd = self.cwnd.saturating_add(inc);
+            self.cwnd = self
+                .cwnd
+                .saturating_add(slow_start_inc(bytes_acked, self.mss));
         } else {
-            let w_segs = self.cwnd / self.mss;
-            let a = Self::a(w_segs);
-            let inc = (a * self.mss as f64 * self.mss as f64 / self.cwnd as f64) as u32;
-            let inc = inc.max(1);
-            self.cwnd = self.cwnd.saturating_add(inc);
+            // a(w) segments per window of bytes acknowledged (RFC 3649 §5,
+            // counted in bytes as RFC 3465 §2.1 does).
+            let a = Self::a(self.cwnd / self.mss);
+            self.ca_credit +=
+                a * self.mss as f64 * f64::from(bytes_acked) / f64::from(self.cwnd.max(1));
+            let inc = self.ca_credit.floor();
+            self.ca_credit -= inc;
+            self.cwnd = self
+                .cwnd
+                .saturating_add(inc.min(f64::from(u32::MAX)) as u32);
         }
     }
 
@@ -329,6 +361,7 @@ impl CongestionController for HighSpeed {
             self.ssthresh = self.decreased(flight_size);
         }
         self.cwnd = self.mss;
+        self.ca_credit = 0.0;
         self.recovery = false;
         self.dup_ack_cnt = 0;
         self.recovery_seq = 0;
@@ -337,6 +370,7 @@ impl CongestionController for HighSpeed {
     fn on_fast_retransmit(&mut self, flight_size: u32, snd_nxt: u32) {
         self.ssthresh = self.decreased(flight_size);
         self.cwnd = self.ssthresh.saturating_add(3 * self.mss);
+        self.ca_credit = 0.0;
         self.recovery = true;
         self.recovery_seq = snd_nxt;
     }
@@ -449,6 +483,36 @@ mod tests {
             cc.on_new_ack(mss, initial);
             assert_eq!(cc.send_window(), initial + mss);
         }
+    }
+
+    /// Against a receiver that ACKs every other segment, slow start still
+    /// doubles the window per round trip, and congestion avoidance still
+    /// adds a segment per round trip (RFC 3465).
+    #[test]
+    fn byte_counting_keeps_growth_with_delayed_acks() {
+        let mss = 1000;
+        let controllers: [Box<dyn CongestionController>; 2] =
+            [Box::new(NewReno::new(mss)), Box::new(HighSpeed::new(mss))];
+        for mut cc in controllers {
+            let w = cc.send_window();
+            for _ in 0..w / (2 * mss) {
+                cc.on_new_ack(2 * mss, w);
+            }
+            assert_eq!(cc.send_window(), 2 * w);
+            // A stretch ACK counts for two segments at most.
+            cc.on_new_ack(10 * mss, u32::MAX);
+            assert_eq!(cc.send_window(), 2 * w + 2 * mss);
+        }
+
+        let mut nr = NewReno::new(mss);
+        nr.on_fast_retransmit(40 * mss, 0);
+        nr.exit_recovery();
+        let w = nr.send_window();
+        assert_eq!(w, 20 * mss);
+        for _ in 0..w / (2 * mss) {
+            nr.on_new_ack(2 * mss, w);
+        }
+        assert_eq!(nr.send_window(), w + mss);
     }
 
     #[test]
