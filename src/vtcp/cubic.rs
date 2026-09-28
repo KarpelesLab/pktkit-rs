@@ -290,6 +290,13 @@ impl CongestionController for Cubic {
         self.credit = 0.0;
     }
 
+    fn restart(&mut self, cwnd: u32, ssthresh: u32) {
+        self.cwnd = cwnd.max(self.mss);
+        self.ssthresh = ssthresh;
+        self.epoch = None;
+        self.credit = 0.0;
+    }
+
     fn cwnd(&self) -> u32 {
         self.cwnd
     }

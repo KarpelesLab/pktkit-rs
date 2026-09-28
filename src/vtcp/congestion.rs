@@ -92,6 +92,10 @@ pub trait CongestionController: Send {
     /// `ssthresh`, and to the growth state before the episode where the
     /// controller keeps one.
     fn undo(&mut self, cwnd: u32, ssthresh: u32);
+    /// The window was cut for disuse, not congestion: after an idle spell
+    /// (RFC 5681 §4.1) or a long application-limited one (RFC 7661
+    /// §4.4.3). Growth starts afresh from `cwnd`.
+    fn restart(&mut self, cwnd: u32, ssthresh: u32);
     /// The congestion window, in bytes.
     fn cwnd(&self) -> u32;
     /// The slow-start threshold, in bytes; `u32::MAX` until the first loss.
@@ -180,6 +184,10 @@ impl CongestionController for NewReno {
         self.cwnd = cwnd.max(self.mss);
         self.ssthresh = ssthresh;
         self.ca_acked = 0;
+    }
+
+    fn restart(&mut self, cwnd: u32, ssthresh: u32) {
+        self.undo(cwnd, ssthresh);
     }
 
     fn cwnd(&self) -> u32 {
@@ -317,6 +325,10 @@ impl CongestionController for HighSpeed {
         self.cwnd = cwnd.max(self.mss);
         self.ssthresh = ssthresh;
         self.ca_credit = 0.0;
+    }
+
+    fn restart(&mut self, cwnd: u32, ssthresh: u32) {
+        self.undo(cwnd, ssthresh);
     }
 
     fn cwnd(&self) -> u32 {

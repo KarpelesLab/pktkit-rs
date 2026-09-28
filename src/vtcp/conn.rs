@@ -20,6 +20,7 @@ use std::time::Duration;
 use super::autotune::{self, Budget, RcvSpace};
 use super::congestion::{Ack, CongestionController, HighSpeed, NewReno, initial_window};
 use super::cubic::Cubic;
+use super::cwv::{self, PipeAck};
 use super::options::{
     self, SackBlock, TcpOption, get_sack_blocks, get_timestamp, get_wscale, has_sack_perm,
     mss_option, sack_option, sack_perm_option, timestamp_option, wscale_option,
@@ -302,6 +303,15 @@ pub struct ConnConfig {
     pub enable_sack: bool,
     /// The congestion controller. CUBIC by default.
     pub congestion: CongestionKind,
+    /// Start again from the initial window after sending nothing for an
+    /// RTO (RFC 5681 §4.1): the window halves for every RTO of the spell,
+    /// down to the initial window, as on Linux with
+    /// `tcp_slow_start_after_idle` (on by default there too). What the
+    /// path carried before a pause is no measure of what it will take
+    /// after, and a full window sent at once may overflow a queue others
+    /// have filled meanwhile. Off, the window is kept for up to five
+    /// minutes of disuse, as RFC 7661 allows. On by default.
+    pub slow_start_after_idle: bool,
     /// Probe an idle connection with keepalives. Off by default.
     pub keepalive: bool,
     /// Idle time before the first keepalive probe. 300 s by default.
@@ -374,6 +384,7 @@ setters! {
         set enable_timestamps: bool;
         set enable_sack: bool;
         set congestion: CongestionKind;
+        set slow_start_after_idle: bool;
         set keepalive: bool;
         set keepalive_idle: Duration;
         set keepalive_interval: Duration;
@@ -401,6 +412,7 @@ impl Default for ConnConfig {
             enable_timestamps: true,
             enable_sack: true,
             congestion: CongestionKind::default(),
+            slow_start_after_idle: true,
             keepalive: false,
             keepalive_idle: DEFAULT_KEEPALIVE_IDLE,
             keepalive_interval: DEFAULT_KEEPALIVE_INTERVAL,
@@ -530,6 +542,14 @@ pub struct Conn {
     tlp_end: Option<u32>,
     /// TLP.is_retrans: that probe resent the last segment.
     tlp_retrans: bool,
+    /// Congestion window validation (RFC 7661): what the path has carried
+    /// lately, and since when cwnd has been more than twice that (the
+    /// non-validated phase).
+    pipe_ack: PipeAck,
+    nvp_since: Option<Instant>,
+    /// When data last went out, for the restart after idle (Linux's
+    /// `lsndtime`).
+    last_data_sent: Option<Instant>,
     /// An RTT sample came in since the last probe (RFC 8985 §7.3), so
     /// probes cannot keep SRTT from following a longer path.
     rtt_sampled: bool,
@@ -714,6 +734,9 @@ impl Conn {
             pto_deadline: None,
             tlp_end: None,
             tlp_retrans: false,
+            pipe_ack: PipeAck::new(now),
+            nvp_since: None,
+            last_data_sent: None,
             rtt_sampled: false,
             delack_deadline: None,
             quick_acks: 0,
@@ -2495,6 +2518,15 @@ impl Conn {
                 snd_nxt: self.send_buf.as_ref().unwrap().nxt(),
             });
         }
+        // RFC 7661: what the path carried, sampled outside loss recovery
+        // only, and forgotten once one is over (§4.2, §4.4.1).
+        if exiting {
+            self.pipe_ack.reset();
+            self.nvp_since = None;
+        } else if advanced && self.ca == CaState::Open {
+            self.pipe_ack.on_ack(self.now, ack, self.rto.srtt());
+            self.validate_cwnd();
+        }
         // F-RTO step 2b sends up to two new segments (RFC 5682 §2.1).
         if frto_was != self.frto && matches!(self.frto, Frto::Second { .. }) {
             let cap = self.in_flight().saturating_add(2 * mss);
@@ -2742,7 +2774,8 @@ impl Conn {
         let sb = self.send_buf.as_ref().unwrap();
         let (flight, nxt) = (sb.unacked() as u32, sb.nxt());
         self.begin_undo(false);
-        self.cc.on_loss(flight);
+        let flight_used = self.loss_flight(flight);
+        self.cc.on_loss(flight_used);
         self.recover = nxt;
         self.ca = CaState::Recovery;
         // RFC 6937 §3's RecoverFS: the flight the reduction is spread over.
@@ -2753,6 +2786,91 @@ impl Conn {
         // moot.
         self.tlp_end = None;
         self.pto_deadline = None;
+    }
+
+    /// Note whether cwnd is validated (RFC 7661 §4.3): the non-validated
+    /// phase begins when pipeACK falls below half of cwnd, and its time
+    /// counts from then.
+    fn validate_cwnd(&mut self) {
+        let p = self.pipe_ack.value(self.now, self.rto.srtt());
+        if cwv::non_validated(p, self.cc.cwnd()) {
+            self.nvp_since.get_or_insert(self.now);
+        } else {
+            self.nvp_since = None;
+        }
+    }
+
+    /// The flight a loss response is to be based on, for a loss found with
+    /// `flight` bytes outstanding. In the non-validated phase cwnd is not
+    /// what was in use: RFC 7661 §4.4.1 bases the response on
+    /// max(pipeACK, LossFlightSize), and cwnd is brought down to that
+    /// first, so the controller's cut starts from what the path carried.
+    /// RFC 7661 also takes what was retransmitted off at the end of
+    /// recovery; PRR has by then brought the flight down in step with what
+    /// was delivered, which already leaves the losses out.
+    fn loss_flight(&mut self, flight: u32) -> u32 {
+        if self.nvp_since.is_none() {
+            return flight;
+        }
+        let used = self
+            .pipe_ack
+            .value(self.now, self.rto.srtt())
+            .unwrap_or(0)
+            .max(flight);
+        if self.cc.cwnd() > used {
+            self.cc.set_cwnd(used);
+        }
+        self.nvp_since = None;
+        used
+    }
+
+    /// Before new data goes out: a window unused for a while is cut back.
+    /// After an idle spell of more than an RTO, halved per RTO down to the
+    /// initial window, as Linux's `tcp_cwnd_restart` does (RFC 5681 §4.1,
+    /// RFC 2861's decay); ssthresh keeps three quarters of it, so slow
+    /// start regains what the pause took. Without that, or short of it,
+    /// after RFC 7661's non-validated period: halved once per period
+    /// (§4.4.3).
+    fn restart_idle_window(&mut self) {
+        if self.ca != CaState::Open {
+            return;
+        }
+        let mss = self.mss as u32;
+        let iw = initial_window(mss);
+        let idle_from = self.last_data_sent.filter(|_| {
+            self.cfg.slow_start_after_idle && self.send_buf.as_ref().unwrap().unacked() == 0
+        });
+        let rto = self.rto.rto();
+        if let Some(t) = idle_from
+            && self.now.saturating_duration_since(t) > rto
+        {
+            let cwnd = self.cc.cwnd();
+            let restart = iw.min(cwnd);
+            let ssthresh = self.cc.ssthresh().max(cwnd / 2 + cwnd / 4);
+            let mut left = self.now.saturating_duration_since(t);
+            let mut w = cwnd;
+            while left > rto && w > restart {
+                left -= rto;
+                w >>= 1;
+            }
+            self.cc.restart(w.max(restart), ssthresh);
+            self.pipe_ack.reset();
+            self.nvp_since = None;
+            // Once per spell.
+            self.last_data_sent = Some(self.now);
+            return;
+        }
+        self.validate_cwnd();
+        let Some(mut since) = self.nvp_since else {
+            return;
+        };
+        while self.now.saturating_duration_since(since) >= cwv::NVP {
+            let cwnd = self.cc.cwnd();
+            let ssthresh = self.cc.ssthresh().max(cwnd / 2 + cwnd / 4);
+            self.cc.restart((cwnd / 2).max(iw).min(cwnd), ssthresh);
+            since += cwv::NVP;
+        }
+        self.nvp_since = Some(since);
     }
 
     /// In fast recovery.
@@ -2908,6 +3026,7 @@ impl Conn {
             self.tlp_end = None;
             if self.ca == CaState::Open {
                 let flight = self.send_buf.as_ref().unwrap().unacked() as u32;
+                let flight = self.loss_flight(flight);
                 self.cc.on_loss(flight);
                 self.cc.set_cwnd(self.cc.ssthresh());
                 self.undo.marker = None;
@@ -2969,6 +3088,7 @@ impl Conn {
         self.score.on_retransmit(seq, len, self.now, tsval);
         self.note_sent(len);
         self.note_retransmission(seq, len, tsval);
+        self.last_data_sent = Some(self.now);
         // Karn's algorithm: no timing of a segment that went twice.
         self.rto.invalidate_timing();
         // Linux re-arms the RTO for the first segment only: re-arming it
@@ -3033,6 +3153,7 @@ impl Conn {
         self.score
             .on_send(snd_nxt, len as u32, false, self.now, tsval);
         self.note_sent(len as u32);
+        self.last_data_sent = Some(self.now);
         // Answering the peer's data within a delayed ACK's time (Linux's
         // tcp_event_data_sent).
         if self
@@ -3051,6 +3172,9 @@ impl Conn {
         // Lost data before new data: the receiver can deliver nothing past
         // the first hole until it is filled.
         self.retransmit_lost();
+        if self.send_buf.as_ref().unwrap().pending() > 0 {
+            self.restart_idle_window();
+        }
         let mut sent_new = false;
         loop {
             let pending = self.send_buf.as_ref().unwrap().pending();
@@ -3385,6 +3509,9 @@ impl Conn {
             frto = !zero_window && (fresh || self.frto != Frto::Off);
             self.frto = Frto::Off;
             self.cc.on_retransmit_timeout(flight, repeated);
+            // RFC 7661 §4.4: a timeout ends the non-validated phase.
+            self.pipe_ack.reset();
+            self.nvp_since = None;
             // A SYN or SYN-ACK alone is not a loss the data's repair has to
             // track.
             if !self.score.is_empty() {
@@ -6163,6 +6290,99 @@ mod tests {
         assert_eq!(client.cc.cwnd(), cwnd);
     }
 
+    /// A pair that has exchanged a segment of data, the client's window
+    /// set to 64 segments.
+    fn idle_pair(port: u16, ss_after_idle: bool) -> (Conn, Conn) {
+        let conf = |l, r| big(l, r).slow_start_after_idle(ss_after_idle);
+        let mut client = Conn::new(conf(port, 80));
+        let mut server = Conn::new(conf(80, port));
+        drive_handshake(&mut client, &mut server);
+        let (_, data) = client.write(&[1; 1000]);
+        let mut acks = deliver(&mut server, &data);
+        acks.extend(delack_expired(&mut server));
+        deliver(&mut client, &acks);
+        assert_eq!(client.in_flight(), 0);
+        client.cc.set_cwnd(64_000);
+        (client, server)
+    }
+
+    /// Sending again after an idle spell of more than an RTO starts from
+    /// a window halved per RTO of it, down to the initial window, as Linux
+    /// does; ssthresh is left where it was (or at three quarters of the
+    /// old window, if lower), so slow start regains it.
+    #[test]
+    fn idle_restart_decays_cwnd() {
+        let (mut client, _server) = idle_pair(40281, true);
+        let rto = client.rto.rto();
+        advance(rto * 2 + Duration::from_millis(1));
+        client.write(&[2; 100]);
+        assert_eq!(client.cc.cwnd(), 16_000, "halved twice");
+        assert_eq!(client.cc.ssthresh(), u32::MAX);
+
+        let (mut client, _server) = idle_pair(40282, true);
+        client.cc.undo(64_000, 40_000);
+        advance(rto * 10);
+        client.write(&[2; 100]);
+        assert_eq!(client.cc.cwnd(), 10_000, "down to the initial window");
+        assert_eq!(client.cc.ssthresh(), 48_000);
+
+        // Less than an RTO is no idle spell.
+        let (mut client, _server) = idle_pair(40283, true);
+        advance(rto / 2);
+        client.write(&[2; 100]);
+        assert_eq!(client.cc.cwnd(), 64_000);
+    }
+
+    /// Without the restart the window is kept through a pause (RFC 7661),
+    /// until the non-validated period ends: then it is halved (§4.4.3).
+    #[test]
+    fn non_validated_window_kept_for_the_period() {
+        let (mut client, _server) = idle_pair(40284, false);
+        let rto = client.rto.rto();
+        advance(rto * 10);
+        client.write(&[2; 100]);
+        assert_eq!(client.cc.cwnd(), 64_000, "kept");
+
+        let (mut client, _server) = idle_pair(40285, false);
+        let srtt = Duration::from_millis(10);
+        let t = test_now();
+        client.pipe_ack.reset();
+        client.pipe_ack.on_ack(t, 0, srtt);
+        client.pipe_ack.on_ack(t + srtt, 2_000, srtt);
+        client.now = t + srtt;
+        client.validate_cwnd();
+        assert!(client.nvp_since.is_some(), "non-validated");
+        advance(Duration::from_secs(60));
+        client.write(&[2; 100]);
+        assert_eq!(client.cc.cwnd(), 64_000, "within the period");
+        advance(cwv::NVP);
+        client.write(&[2; 100]);
+        assert_eq!(client.cc.cwnd(), 32_000, "halved at its end");
+        assert_eq!(client.cc.ssthresh(), u32::MAX);
+    }
+
+    /// A loss in the non-validated phase is answered from what was in
+    /// use, max(pipeACK, flight), not from the window kept (RFC 7661
+    /// §4.4.1).
+    #[test]
+    fn loss_in_non_validated_phase_uses_pipe_ack() {
+        let (mut client, _server) = idle_pair(40286, false);
+        let srtt = Duration::from_millis(10);
+        let t = test_now();
+        client.pipe_ack.reset();
+        client.pipe_ack.on_ack(t, 0, srtt);
+        client.pipe_ack.on_ack(t + srtt, 8_000, srtt);
+        client.now = t + srtt;
+        client.validate_cwnd();
+        assert_eq!(client.loss_flight(3_000), 8_000);
+        assert_eq!(client.cc.cwnd(), 8_000);
+        assert!(client.nvp_since.is_none(), "the loss ends the phase");
+        // Validated, the flight is what counts, and cwnd is left alone.
+        client.cc.set_cwnd(64_000);
+        assert_eq!(client.loss_flight(3_000), 3_000);
+        assert_eq!(client.cc.cwnd(), 64_000);
+    }
+
     fn syn_with(opts: Vec<TcpOption>) -> Segment {
         Segment {
             src_port: 40290,
@@ -7197,6 +7417,7 @@ mod tests {
         blackout: bool,
         autotune: [bool; 2],
         congestion: [CongestionKind; 2],
+        ss_after_idle: [bool; 2],
     }
 
     impl StressCfg {
@@ -7223,6 +7444,7 @@ mod tests {
                     CONTROLLERS[r.below(3) as usize],
                     CONTROLLERS[r.below(3) as usize],
                 ],
+                ss_after_idle: pair(&mut r),
             }
         }
     }
@@ -7323,6 +7545,7 @@ mod tests {
                 .recv_buf_size(sc.buf)
                 .autotune(sc.autotune[i])
                 .congestion(sc.congestion[i])
+                .slow_start_after_idle(sc.ss_after_idle[i])
                 .send_buf_max(sc.buf * 4)
                 .recv_buf_max(sc.buf * 4)
         };

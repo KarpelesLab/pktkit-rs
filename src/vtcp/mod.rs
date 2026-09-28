@@ -28,7 +28,12 @@
 //!   runs RFC 9406 HyStart++, which leaves slow start when the round trip
 //!   rises rather than when the bottleneck's queue overflows. NewReno and
 //!   RFC 3649 HighSpeed TCP are the others.
-//! - RFC 7661 §4.3: no cwnd growth while the sender is application-limited.
+//! - RFC 7661: congestion window validation. No cwnd growth while the
+//!   sender is application-limited; a window left unused (pipeACK under
+//!   half of it) is kept for five minutes, a loss meanwhile answered from
+//!   what was in use. After an idle spell of more than an RTO the window
+//!   decays towards the initial window first (RFC 5681 §4.1), as Linux's
+//!   does by default.
 //! - RFC 7323: window scaling, timestamps (PAWS, and an RTT sample from
 //!   every ACK, weighed as its Appendix G suggests).
 //! - RFC 2018: SACK, with RFC 6675's scoreboard and pipe.
@@ -85,6 +90,7 @@ pub(crate) mod autotune;
 pub(crate) mod congestion;
 pub(crate) mod conn;
 pub(crate) mod cubic;
+pub(crate) mod cwv;
 pub(crate) mod options;
 pub(crate) mod recvbuf;
 pub(crate) mod rto;
