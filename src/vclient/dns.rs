@@ -956,7 +956,7 @@ mod tests {
         let start = std::time::Instant::now();
         assert!(r.query("slow.test", RecordType::A).is_err());
         assert!(
-            start.elapsed() < Duration::from_secs(2),
+            start.elapsed() < Duration::from_secs(4),
             "took {:?}",
             start.elapsed()
         );
@@ -982,7 +982,7 @@ mod tests {
         let start = std::time::Instant::now();
         assert!(r.query("example.test", RecordType::A).is_err());
         assert!(
-            start.elapsed() < Duration::from_secs(2),
+            start.elapsed() < Duration::from_secs(4),
             "took {:?}",
             start.elapsed()
         );

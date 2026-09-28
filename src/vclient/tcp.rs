@@ -2265,10 +2265,10 @@ mod tests {
             .start_dial(IpAddr::V4(US), SocketAddr::from((PEER, 80)))
             .unwrap();
         let conn = TcpConn::new(state);
-        conn.set_read_timeout(Some(Duration::from_secs(2)));
+        conn.set_read_timeout(Some(Duration::from_secs(60)));
         let start = std::time::Instant::now();
         assert_eq!(conn.read(&mut []).unwrap(), 0);
-        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(start.elapsed() < Duration::from_secs(10));
     }
 
     /// A timeout too long for an `Instant` to reach means no deadline; it

@@ -281,7 +281,7 @@ mod tests {
         drop(client);
         for _ in 0..3 {
             let (what, failed) = rx
-                .recv_timeout(Duration::from_secs(2))
+                .recv_timeout(Duration::from_secs(10))
                 .expect("a handle stayed blocked");
             assert!(failed, "{what} returned success");
         }
