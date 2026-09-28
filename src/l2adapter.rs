@@ -85,8 +85,9 @@ pub struct L2Adapter {
     /// anyone has turned out to be using it.
     #[cfg(feature = "dhcp")]
     probe: Mutex<Option<(Ipv4Addr, bool)>>,
-    /// The source address and MAC of the last DHCP server message: where a
-    /// unicast to that server goes, kept apart from the ARP cache.
+    /// The address and MAC of the server the DHCP client last took a
+    /// DHCPACK from: where a unicast to that server goes, kept apart from
+    /// the ARP cache.
     #[cfg(feature = "dhcp")]
     dhcp_server: Mutex<Option<(Ipv4Addr, MacAddr)>>,
 
@@ -395,12 +396,20 @@ impl L2Adapter {
                             if let Some(c) = dhcp
                                 && c.is_active()
                             {
-                                if let (Some(mac), Some(ip)) = (f.src_mac(), pkt.ipv4_src_addr())
+                                // Where the client's RENEW and RELEASE go,
+                                // so learnt only from a reply the client
+                                // took (its transaction, from its server),
+                                // sent from the server's own address and
+                                // port: from any datagram off port 67, any
+                                // station could redirect them to itself.
+                                let server = c.handle_reply(&udp[8..]);
+                                if let (Some(sid), Some(mac), Some(ip)) =
+                                    (server, f.src_mac(), pkt.ipv4_src_addr())
+                                    && ip == sid
                                     && udp[0..2] == 67u16.to_be_bytes()
                                 {
                                     *self.dhcp_server.lock().unwrap() = Some((ip, mac));
                                 }
-                                c.handle_packet(&udp[8..]);
                                 return;
                             }
                         }
@@ -2127,22 +2136,57 @@ mod tests {
         assert_eq!(Frame::from_slice(&sent[0]).dst_mac(), Some(server_mac));
     }
 
+    /// A DHCP reply from `server` at `server_mac`, as the adapter's
+    /// client receives it off the wire: for transaction `xid`, granting
+    /// `us`, and naming `server_id` as the server.
+    #[cfg(feature = "dhcp")]
+    fn dhcp_reply(
+        adapter: &L2Adapter,
+        (server, server_mac, server_id): (Ipv4Addr, MacAddr, Ipv4Addr),
+        us: Ipv4Addr,
+        xid: u32,
+        msg: u8,
+    ) -> Vec<u8> {
+        use crate::dhcp::wire;
+        let mut b = wire::Builder::new(2, xid, adapter.mac);
+        b.yiaddr(us)
+            .message_type(msg)
+            .ipv4_option(wire::OPT_SUBNET_MASK, [255, 255, 255, 0].into())
+            .u32_option(wire::OPT_LEASE_TIME, 3600)
+            .ipv4_option(wire::OPT_SERVER_ID, server_id);
+        let udp = crate::build::build_udp(server.into(), us.into(), 67, 68, &b.finish());
+        let pkt = crate::build::build_ipv4(server, us, Protocol::UDP, 64, &udp);
+        build_frame(adapter.mac, server_mac, EtherType::IPV4, &pkt)
+    }
+
+    /// Start the adapter's DHCP client and return its transaction ID.
+    #[cfg(feature = "dhcp")]
+    fn dhcp_started(adapter: &Arc<L2Adapter>, out: &Out) -> u32 {
+        adapter.start_dhcp();
+        let discover = take(out);
+        crate::dhcp::wire::Parsed::from_bytes(&discover[0][42..])
+            .unwrap()
+            .xid
+    }
+
     #[cfg(feature = "dhcp")]
     #[test]
     fn dhcp_unicasts_go_where_the_server_answered_from() {
         use crate::dhcp::ClientTransport;
+        use crate::dhcp::wire::{MSG_ACK, MSG_OFFER};
         let (pipe, adapter, out) = rig("0.0.0.0/0");
-        adapter.start_dhcp();
+        let xid = dhcp_started(&adapter, &out);
         let t = AdapterDhcpTransport {
             weak: Arc::downgrade(&adapter),
         };
         // The DHCP server shares the router's address, and answers no ARP.
         let (us, server) = (Ipv4Addr::new(10, 0, 0, 5), Ipv4Addr::new(10, 0, 0, 1));
         let server_mac = MacAddr([2, 0xdd, 0, 0, 0, 1]);
-        let udp = crate::build::build_udp(server.into(), us.into(), 67, 68, &[0; 240]);
-        let reply = crate::build::build_ipv4(server, us, Protocol::UDP, 64, &udp);
-        let f = build_frame(adapter.mac, server_mac, EtherType::IPV4, &reply);
-        adapter.send(Frame::from_slice(&f)).unwrap();
+        let from = (server, server_mac, server);
+        for msg in [MSG_OFFER, MSG_ACK] {
+            let f = dhcp_reply(&adapter, from, us, xid, msg);
+            adapter.send(Frame::from_slice(&f)).unwrap();
+        }
         adapter.stop_dhcp();
         t.on_bound("10.0.0.5/24".parse().unwrap(), Some(server));
         take(&out);
@@ -2159,6 +2203,64 @@ mod tests {
         pipe.inject(Packet::from_slice(&v4_packet(us.octets(), server.octets())))
             .unwrap();
         assert_eq!(solicited(&take(&out)), [IpAddr::V4(server)]);
+    }
+
+    /// Only a reply the client took says where its server is. Anyone else
+    /// sending from port 67 -- with the server's address, even -- must not
+    /// get the client's RENEW and RELEASE sent to it.
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn dhcp_server_mac_is_learnt_only_from_a_reply_the_client_took() {
+        use crate::dhcp::wire::{MSG_ACK, MSG_OFFER};
+        let (_pipe, adapter, out) = rig("0.0.0.0/0");
+        let xid = dhcp_started(&adapter, &out);
+        let (us, server) = (Ipv4Addr::new(10, 0, 0, 5), Ipv4Addr::new(10, 0, 0, 1));
+        let server_mac = MacAddr([2, 0xdd, 0, 0, 0, 1]);
+        let evil = MacAddr([2, 0xee, 0, 0, 0, 1]);
+        let learnt = || *adapter.dhcp_server.lock().unwrap();
+
+        // Not a lease the client took: another transaction's ACK, and an
+        // OFFER (which the client selects, but is no lease yet).
+        let forged = [
+            dhcp_reply(&adapter, (server, evil, server), us, xid ^ 1, MSG_ACK),
+            dhcp_reply(&adapter, (server, evil, server), us, xid, MSG_OFFER),
+        ];
+        for f in &forged {
+            adapter.send(Frame::from_slice(f)).unwrap();
+            assert_eq!(learnt(), None, "learnt from a reply not taken");
+        }
+        // The client is now REQUESTING the OFFER above. An ACK it takes,
+        // but sent from an address not the server's; then garbage.
+        let other = Ipv4Addr::new(10, 0, 0, 9);
+        let f = dhcp_reply(&adapter, (other, evil, server), us, xid, MSG_ACK);
+        adapter.send(Frame::from_slice(&f)).unwrap();
+        assert_eq!(learnt(), None, "learnt from a sender not the server");
+        let udp = crate::build::build_udp(server.into(), us.into(), 67, 68, &[0; 240]);
+        let pkt = crate::build::build_ipv4(server, us, Protocol::UDP, 64, &udp);
+        let f = build_frame(adapter.mac, evil, EtherType::IPV4, &pkt);
+        adapter.send(Frame::from_slice(&f)).unwrap();
+        assert_eq!(learnt(), None, "learnt from garbage");
+        adapter.stop_dhcp();
+
+        // The genuine exchange.
+        let (_pipe, adapter, out) = rig("0.0.0.0/0");
+        let xid = dhcp_started(&adapter, &out);
+        for msg in [MSG_OFFER, MSG_ACK] {
+            let f = dhcp_reply(&adapter, (server, server_mac, server), us, xid, msg);
+            adapter.send(Frame::from_slice(&f)).unwrap();
+        }
+        assert_eq!(
+            *adapter.dhcp_server.lock().unwrap(),
+            Some((server, server_mac))
+        );
+        // And a forger after it changes nothing.
+        let f = dhcp_reply(&adapter, (server, evil, server), us, xid ^ 1, MSG_ACK);
+        adapter.send(Frame::from_slice(&f)).unwrap();
+        assert_eq!(
+            *adapter.dhcp_server.lock().unwrap(),
+            Some((server, server_mac))
+        );
+        adapter.stop_dhcp();
     }
 
     #[test]

@@ -478,19 +478,26 @@ impl Client {
 
     /// Process an inbound DHCP UDP payload (full BOOTP message).
     pub fn handle_packet(&self, udp_payload: &[u8]) {
-        let p = match wire::Parsed::from_bytes(udp_payload) {
-            Some(p) => p,
-            None => return,
-        };
+        let _ = self.handle_reply(udp_payload);
+    }
+
+    /// As [`handle_packet`](Self::handle_packet), and if the message was a
+    /// DHCPACK the client took -- for its transaction, granting a lease --
+    /// the server identifier of the server it now holds that lease from.
+    /// Only then does the transport know a message to have come from the
+    /// client's server: anything else on port 67 may be anyone's.
+    pub(crate) fn handle_reply(&self, udp_payload: &[u8]) -> Option<Ipv4Addr> {
+        let p = wire::Parsed::from_bytes(udp_payload)?;
         if p.op != 2 || p.chaddr != self.shared.mac {
-            return; // not a BOOTREPLY for us
+            return None; // not a BOOTREPLY for us
         }
 
         let now = Instant::now();
+        let mut accepted = None;
         {
             let mut i = self.shared.inner.lock().unwrap();
             if i.xid != p.xid {
-                return;
+                return None;
             }
             let (event, out) = match (i.state, p.msg_type) {
                 // RFC 2131 Table 3: an OFFER and an ACK carry the address
@@ -521,6 +528,7 @@ impl Client {
                     if p.server_id.is_some() {
                         i.server_ip = p.server_id;
                     }
+                    accepted = i.server_ip;
                     let lease = lease_timers(
                         i.requested_at.unwrap_or(now),
                         p.lease_time.unwrap_or(0),
@@ -556,6 +564,7 @@ impl Client {
             self.shared.queue_step(&i, event, out);
         }
         self.shared.deliver();
+        accepted
     }
 
     /// Run whatever timer has come due: retransmit an unanswered DISCOVER
