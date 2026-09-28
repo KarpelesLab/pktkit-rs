@@ -2,7 +2,7 @@ use crate::icmp::{self, RateLimiter};
 use crate::l2hub::DepthGuard;
 use crate::{Cleanup, HubCounters, HubStats, L3Device, L3Handler, Packet, Result};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 /// RFC 4443 §2.4(f) wants generated errors rate-limited; this is a modest
@@ -13,6 +13,8 @@ const ICMP_BURST: u32 = 50;
 struct Port {
     dev: Arc<dyn L3Device>,
     id: u64,
+    /// See [`L3Hub::set_strict_rpf`].
+    strict_rpf: AtomicBool,
 }
 
 static PORT_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -106,6 +108,7 @@ impl L3Hub {
         let port = Arc::new(Port {
             dev: dev.clone(),
             id,
+            strict_rpf: AtomicBool::new(false),
         });
         self.ports.write().unwrap().push(port);
 
@@ -143,6 +146,42 @@ impl L3Hub {
                 *self.default_route.lock().unwrap() = Some(p.id);
                 return;
             }
+        }
+    }
+
+    /// Check the source address of what arrives on a port: strict unicast
+    /// reverse-path forwarding (RFC 3704 §2.2). Off by default.
+    ///
+    /// The hub routes on destination alone, so by default a device may send
+    /// from any address it likes -- another device's, or one nobody has --
+    /// and its packets are delivered, and answered, as though they were
+    /// that address's. With the check on, a packet from this port is
+    /// dropped unless the hub would route its source address back to this
+    /// same port:
+    ///
+    /// - an address some device has as its own belongs to that device;
+    /// - otherwise, it must be inside one of the longest prefixes that
+    ///   contain it, and this port's is one of those;
+    /// - an address no device's prefix contains belongs to the
+    ///   [default route](Self::set_default_route).
+    ///
+    /// Unspecified and link-local sources are link-scoped, not routed, and
+    /// pass (a DHCP DISCOVER is sent from 0.0.0.0, Neighbor Discovery from
+    /// fe80::/10).
+    ///
+    /// Being strict, it also drops what it cannot tell from spoofing:
+    /// asymmetric paths, and a station on a network several devices share
+    /// that is reached through the default route (the third rule in the
+    /// type's documentation) sending from its own address, which the check
+    /// attributes to whichever sharing device was attached first. Turn it
+    /// on for edge ports, whose addresses are known, rather than for the
+    /// default route or a device with networks of its own behind it.
+    ///
+    /// A port that is not attached is left alone.
+    pub fn set_strict_rpf(&self, handle: &L3HubHandle, on: bool) {
+        let ports = self.ports.read().unwrap();
+        if let Some(p) = ports.iter().find(|p| p.id == handle.id) {
+            p.strict_rpf.store(on, Ordering::Relaxed);
         }
     }
 
@@ -192,7 +231,16 @@ impl L3Hub {
 
         // A detached device may still hold the handler it was given; what
         // it sends is no longer the hub's to route.
-        if !ports.iter().any(|p| p.id == source_id) {
+        let Some(source) = ports.iter().find(|p| p.id == source_id) else {
+            self.stats.record_dropped();
+            return;
+        };
+
+        if source.strict_rpf.load(Ordering::Relaxed)
+            && !pkt
+                .src_addr()
+                .is_some_and(|src| self.reverse_path_ok(&ports, source_id, src))
+        {
             self.stats.record_dropped();
             return;
         }
@@ -282,6 +330,47 @@ impl L3Hub {
             Some(_) if sender_side => Route::Default,
             Some((_, p)) => Route::Port(p),
             None => Route::Default,
+        }
+    }
+
+    /// Whether the hub would route `src` back to port `from`; see
+    /// [`set_strict_rpf`](Self::set_strict_rpf).
+    fn reverse_path_ok(&self, ports: &[Arc<Port>], from: u64, src: IpAddr) -> bool {
+        let link_scoped = match src {
+            IpAddr::V4(a) => a.is_unspecified() || a.is_link_local(),
+            IpAddr::V6(a) => a.is_unspecified() || a.is_unicast_link_local(),
+        };
+        if link_scoped {
+            return true;
+        }
+        // The longest prefix containing `src`, and whether `from`'s is
+        // among those that long.
+        let mut best: Option<u8> = None;
+        let mut from_best = false;
+        for p in ports {
+            let prefix = p.dev.addr();
+            if !prefix.is_valid() || !prefix.contains(src) {
+                continue;
+            }
+            if prefix.addr() == src {
+                return p.id == from;
+            }
+            let bits = prefix.bits();
+            match best {
+                Some(b) if b > bits => continue,
+                Some(b) if b == bits => {}
+                _ => {
+                    best = Some(bits);
+                    from_best = false;
+                }
+            }
+            from_best |= p.id == from;
+        }
+        match best {
+            // Nobody's own address (an owner returned above), but inside
+            // a network: that network's.
+            Some(_) => from_best,
+            None => *self.default_route.lock().unwrap() == Some(from),
         }
     }
 
@@ -837,5 +926,58 @@ mod tests {
         let nd = crate::build::build_ipv6(s, d, crate::Protocol::UDP, 255, &udp);
         hub.route(Packet::from_slice(&nd), ha.id);
         assert_eq!(b.inner.lock().unwrap()[2], nd);
+    }
+
+    #[test]
+    fn strict_rpf_drops_spoofed_sources() {
+        let hub = Arc::new(L3Hub::new());
+        let a = sink("10.0.0.1/24");
+        let b = sink("10.0.1.1/24");
+        let gw = sink("172.16.0.1/16");
+        let ha = hub.connect(a.clone());
+        let _hb = hub.connect(b.clone());
+        let gw_arc: Arc<dyn L3Device> = Arc::new(gw.clone());
+        let hg = hub.connect_arc(gw_arc.clone());
+        hub.set_default_route(&gw_arc);
+        hub.set_strict_rpf(&ha, true);
+        hub.set_strict_rpf(&hg, true);
+
+        // `a` claiming `b`'s own address, an address in `b`'s network, and
+        // one only the default route would lead to.
+        for src in [[10, 0, 1, 1], [10, 0, 1, 5], [8, 8, 8, 8]] {
+            hub.route(Packet::from_slice(&v4(src, [10, 0, 1, 1])), ha.id);
+        }
+        assert_eq!(count(&b), 0, "spoofed sources were routed");
+
+        // Its own address, and others in its own network, pass.
+        for src in [[10, 0, 0, 1], [10, 0, 0, 9]] {
+            hub.route(Packet::from_slice(&v4(src, [10, 0, 1, 1])), ha.id);
+        }
+        assert_eq!(count(&b), 2);
+
+        // The default route may send from anywhere nobody here has, but
+        // not as `a`.
+        hub.route(Packet::from_slice(&v4([8, 8, 8, 8], [10, 0, 1, 1])), hg.id);
+        hub.route(Packet::from_slice(&v4([10, 0, 0, 1], [10, 0, 1, 1])), hg.id);
+        assert_eq!(count(&b), 3);
+
+        // Link-scoped sources are not routed, and pass.
+        hub.route(
+            Packet::from_slice(&v4([0, 0, 0, 0], [255, 255, 255, 255])),
+            ha.id,
+        );
+        assert_eq!(count(&b), 4, "a DHCP DISCOVER was dropped");
+    }
+
+    #[test]
+    fn source_addresses_are_not_checked_by_default() {
+        let hub = Arc::new(L3Hub::new());
+        let a = sink("10.0.0.1/24");
+        let b = sink("10.0.1.1/24");
+        let ha = hub.connect(a.clone());
+        let _hb = hub.connect(b.clone());
+        hub.route(Packet::from_slice(&v4([10, 0, 1, 1], [10, 0, 1, 1])), ha.id);
+        hub.route(Packet::from_slice(&v4([10, 0, 2, 9], [10, 0, 1, 5])), ha.id);
+        assert_eq!(count(&b), 2);
     }
 }
