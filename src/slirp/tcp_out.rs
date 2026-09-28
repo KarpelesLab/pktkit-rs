@@ -43,11 +43,17 @@ use std::time::Duration;
 /// client usually keeps retransmitting its SYN.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Send and receive buffer of the virtual side of each bridge. The virtual
-/// link is in-process, so its round trip is short and a window this size
-/// keeps it full; the engine's 1 MiB default would let a guest that stops
-/// reading, or sends to a server that does, pin 2 MiB per bridge: 8 GiB
-/// over the 2048 bridges of each address family.
+/// Initial send and receive buffer of the virtual side of each bridge.
+/// When the guest is in-process its round trip is short and a window this
+/// size keeps it full; the engine's 1 MiB default would let a guest that
+/// stops reading, or sends to a server that does, pin 2 MiB per bridge: 8
+/// GiB over the 2048 bridges of each address family.
+///
+/// A guest further away (behind a VPN, say) needs more, so the buffers
+/// auto-tune from here up to the engine's default maximum. They grow only
+/// while data moves at a rate that needs them, and what all connections grow
+/// by together is bounded process-wide: however many bridges a guest grows
+/// and then stalls, they hold this much each, plus that bound in all.
 const BRIDGE_BUF: usize = 256 * 1024;
 
 /// Longest a pump waits on the virtual side before looking again, although
@@ -664,8 +670,8 @@ mod tests {
     }
     use crate::vtcp::segment::flags;
 
-    /// What a guest can make a bridge hold is bounded by BRIDGE_BUF, not by
-    /// the engine's larger default.
+    /// A bridge starts at BRIDGE_BUF, not at the engine's larger default:
+    /// only a transfer that needs more grows it.
     #[test]
     fn bridge_buffers_are_bounded() {
         let mut client = Conn::new(ConnConfig::default().local_port(5000).remote_port(80));
