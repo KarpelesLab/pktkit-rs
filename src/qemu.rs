@@ -390,8 +390,15 @@ pub fn dial_tcp(addr: impl ToSocketAddrs) -> Result<Arc<Conn>> {
 /// `idle`: how long the peer may go without sending before it is hung up
 /// on. The receive timeout is the socket's, which the clones share, but only
 /// the reader reads.
+///
+/// The timeout is only set when there is one: a fresh socket has none, and
+/// on Darwin and the BSDs `setsockopt` fails with `EINVAL` on a socket whose
+/// peer has already gone, which for a socket that was never touched would
+/// be a failure over nothing.
 fn tcp_conn(s: TcpStream, idle: Option<Duration>, slot: Option<PeerSlot>) -> Result<Arc<Conn>> {
-    s.set_read_timeout(idle)?;
+    if idle.is_some() {
+        s.set_read_timeout(idle)?;
+    }
     let (w, c) = (s.try_clone()?, s.try_clone()?);
     let shutdown = Arc::new(move || {
         let _ = c.shutdown(Shutdown::Both);
@@ -411,7 +418,9 @@ pub fn dial_unix(path: impl AsRef<Path>) -> Result<Arc<Conn>> {
 /// As [`tcp_conn`].
 #[cfg(unix)]
 fn unix_conn(s: UnixStream, idle: Option<Duration>, slot: Option<PeerSlot>) -> Result<Arc<Conn>> {
-    s.set_read_timeout(idle)?;
+    if idle.is_some() {
+        s.set_read_timeout(idle)?;
+    }
     let (w, c) = (s.try_clone()?, s.try_clone()?);
     let shutdown = Arc::new(move || {
         let _ = c.shutdown(Shutdown::Both);
@@ -591,25 +600,31 @@ impl Listener {
     /// Block until a peer arrives, then wrap it as a [`Conn`]. Peers past
     /// [`max_peers`](ListenerConfig::max_peers) are hung up on as they
     /// arrive, and the wait goes on.
+    ///
+    /// An error is the listener's own. One peer's socket that cannot be set
+    /// up -- it was reset before it was accepted, or no thread could be had
+    /// for it -- costs that peer alone: it is hung up on and the wait goes
+    /// on. Returned, the error would end [`serve`](crate::serve), and with
+    /// it every connection after, on the say-so of whoever connected.
     pub fn accept(&self) -> Result<Arc<Conn>> {
         let idle = self.cfg.idle_timeout;
         loop {
             // Accepted before the check, and dropped if over: left in the
             // backlog, a refused peer would sit connected to nothing.
-            match &self.socket {
+            let conn = match &self.socket {
                 Socket::Tcp(l) => {
                     let s = l.accept()?.0;
-                    if let Some(slot) = self.reserve() {
-                        return tcp_conn(s, idle, Some(slot));
-                    }
+                    self.reserve().map(|slot| tcp_conn(s, idle, Some(slot)))
                 }
                 #[cfg(unix)]
                 Socket::Unix(l) => {
                     let s = l.accept()?.0;
-                    if let Some(slot) = self.reserve() {
-                        return unix_conn(s, idle, Some(slot));
-                    }
+                    self.reserve().map(|slot| unix_conn(s, idle, Some(slot)))
                 }
+            };
+            // A failed setup has already dropped the socket, and its slot.
+            if let Some(Ok(conn)) = conn {
+                return Ok(conn);
             }
         }
     }
@@ -935,6 +950,53 @@ mod tests {
             client.writer_done.wait_timeout(CLOSE_GRACE + ECHO_TIMEOUT),
             "writer still stuck on the peer"
         );
+    }
+
+    /// A peer gone before it is accepted costs that peer, not the listener.
+    /// On Darwin and the BSDs, setting any socket option on it fails with
+    /// `EINVAL` (a Unix-domain peer that closed leaves its socket in just
+    /// that state), and that error, returned from `accept`, used to end
+    /// `serve` for everyone after.
+    #[test]
+    #[cfg(unix)]
+    fn a_peer_gone_before_accept_does_not_stop_the_listener() {
+        for idle in [None, Some(Duration::from_secs(60))] {
+            let tmp = std::env::temp_dir().join(format!(
+                "pktkit-qemu-gone-{}-{}.sock",
+                std::process::id(),
+                idle.is_some()
+            ));
+            let cfg = match idle {
+                Some(d) => ListenerConfig::default().idle_timeout(d),
+                None => ListenerConfig::default(),
+            };
+            let ln = Listener::bind_unix(&tmp).unwrap().with_config(cfg);
+            drop(UnixStream::connect(&tmp).unwrap());
+            let live = dial_unix(&tmp).unwrap();
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                // The dead peer may come back as a Conn that hangs up at
+                // once; what must not come back is an error.
+                for _ in 0..2 {
+                    let r = ln
+                        .accept()
+                        .map(|c| c.set_handler(Arc::new(|_: &Frame| Ok(()))));
+                    if tx.send(r).is_err() {
+                        return;
+                    }
+                }
+            });
+            // Something is accepted: the live peer, at least.
+            let first = rx.recv_timeout(ECHO_TIMEOUT).expect("nothing accepted");
+            first.unwrap_or_else(|e| panic!("idle {idle:?}: accept failed: {e}"));
+            // And whatever comes next is no error either. With nothing
+            // coming, the dead peer was skipped and the live one taken.
+            if let Ok(r) = rx.recv_timeout(Duration::from_millis(500)) {
+                r.unwrap_or_else(|e| panic!("idle {idle:?}: accept failed: {e}"));
+            }
+            drop(live);
+            let _ = std::fs::remove_file(&tmp);
+        }
     }
 
     #[test]
