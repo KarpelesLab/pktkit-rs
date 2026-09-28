@@ -356,12 +356,15 @@ struct Port {
     /// switch, which has an unknowable number of stations behind it.
     mac_limit: Option<usize>,
     mode: PortMode,
+    /// See [`L2Hub::set_port_secure`].
+    secure: bool,
 }
 
 /// The configurable half of a [`Port`], handed to [`L2Hub::reconfigure`].
 struct PortSettings {
     mac_limit: Option<usize>,
     mode: PortMode,
+    secure: bool,
 }
 
 /// The connected ports, in both the shapes the forwarding path needs.
@@ -526,7 +529,12 @@ fn decrement(counts: &mut HashMap<u64, usize>, port_id: u64) {
 /// Entries age out after five minutes without traffic, and are refreshed once
 /// they are more than halfway there -- so a busy station stays learned without
 /// taking the table's write lock on every frame. The table holds at most 8192
-/// entries overall and, by default, 1024 per port.
+/// entries overall and, by default, 1024 per port. A full table learns
+/// nothing new until entries age out, and it evicts nothing to make room:
+/// traffic for a station it could not learn is flooded, which a station
+/// able to fill the table can then overhear. Lower the per-port limit on
+/// edge ports, and see [`set_port_secure`](Self::set_port_secure), which
+/// also stops a port claiming an address learned on another.
 ///
 /// [`stats`](Self::stats) reports what the hub did with each frame.
 ///
@@ -620,6 +628,40 @@ impl L2Hub {
         self.reconfigure(handle.id, |p| p.mac_limit = limit);
     }
 
+    /// Turn port security on or off for a port. Off by default.
+    ///
+    /// A switch learns from whatever source address a frame carries, so by
+    /// default any port may claim any address: a station that sends one
+    /// frame from its neighbour's MAC has the neighbour's traffic
+    /// delivered to it until the neighbour speaks again. And a port at its
+    /// [MAC limit](Self::set_port_mac_limit), or a full table, still has
+    /// its frames forwarded, just not learned.
+    ///
+    /// On a secure port:
+    ///
+    /// - the addresses it learns are held there: a frame from another port
+    ///   claiming one is dropped, and the address does not move, until it
+    ///   ages out (five minutes without traffic) or the port is
+    ///   disconnected;
+    /// - a frame whose source address it cannot learn -- the port is at its
+    ///   limit, the table is full, or another secure port holds the
+    ///   address -- is dropped instead of forwarded.
+    ///
+    /// Combined with a small limit (one, for a port with a single station
+    /// behind it), this is the sticky port security of hardware switches:
+    /// the port speaks for the stations it first saw and nobody else, and
+    /// cannot help fill the table. Filling the table matters because a
+    /// station that cannot be learned has its traffic flooded to every
+    /// port, which is inherent to a learning switch; the per-port limits
+    /// are what keep a few ports from doing it.
+    ///
+    /// Leave it off on uplinks to other switches, and wherever a station
+    /// may legitimately move between ports faster than it ages out.
+    /// Changing the setting keeps what the port has learned.
+    pub fn set_port_secure(&self, handle: &L2HubHandle, secure: bool) {
+        self.reconfigure(handle.id, |p| p.secure = secure);
+    }
+
     /// Set how a port handles VLAN tags. See [`PortMode`].
     ///
     /// Ports start [`transparent`](PortMode::transparent), passing every VLAN
@@ -654,6 +696,7 @@ impl L2Hub {
             let mut cfg = PortSettings {
                 mac_limit: slot.mac_limit,
                 mode: slot.mode.clone(),
+                secure: slot.secure,
             };
             if let Some(edit) = edit.take() {
                 edit(&mut cfg);
@@ -663,6 +706,7 @@ impl L2Hub {
                 id: slot.id,
                 mac_limit: cfg.mac_limit,
                 mode: cfg.mode,
+                secure: cfg.secure,
             });
             break;
         }
@@ -697,6 +741,7 @@ impl L2Hub {
                 id,
                 mac_limit: Some(DEFAULT_PORT_MAC_LIMIT),
                 mode: PortMode::transparent(),
+                secure: false,
             }));
             *guard = PortTable::from_list(list);
         }
@@ -767,7 +812,10 @@ impl L2Hub {
         if bytes[6] & 1 == 0 {
             let mut mac = [0u8; 6];
             mac.copy_from_slice(&bytes[6..12]);
-            self.learn((vlan, mac), source);
+            if !self.learn(&ports, (vlan, mac), source) {
+                self.stats.record_dropped();
+                return;
+            }
         }
 
         let mut egress = Egress::new(f);
@@ -802,25 +850,41 @@ impl L2Hub {
         }
     }
 
-    /// Record that `key` lives on `source`.
+    /// Record that `key` lives on `source`. False if the frame it came in
+    /// must be dropped, under [port security](Self::set_port_secure).
     ///
     /// The fast path takes only a read lock: an address that is already
     /// learned, has not moved, and is not near expiry needs no write at all,
     /// which is the overwhelmingly common case on a busy link.
-    fn learn(&self, key: MacKey, source: &Arc<Port>) {
+    fn learn(&self, ports: &PortTable, key: MacKey, source: &Arc<Port>) -> bool {
         let now = Instant::now();
+        // Held by another, secure, port: not ours to claim. Checked under
+        // the read lock too, so a station repeating the claim does not
+        // take the write lock for every frame.
+        let held = |e: &MacEntry| {
+            e.port_id != source.id
+                && e.expires > now
+                && ports.get(e.port_id).is_some_and(|p| p.secure)
+        };
         {
             let table = self.mac_table.read().unwrap();
-            if let Some(e) = table.entries.get(&key)
-                && e.port_id == source.id
-                && e.expires.saturating_duration_since(now) > MAC_AGING / 2
-            {
-                return;
+            if let Some(e) = table.entries.get(&key) {
+                if e.port_id == source.id
+                    && e.expires.saturating_duration_since(now) > MAC_AGING / 2
+                {
+                    return true;
+                }
+                if held(e) {
+                    return false;
+                }
             }
         }
 
         // Either new, moved, or past halfway to expiry: take the write lock.
         let mut table = self.mac_table.write().unwrap();
+        if table.entries.get(&key).is_some_and(held) {
+            return false;
+        }
         let known = table.entries.get(&key).map(|e| e.port_id);
         if known != Some(source.id) {
             // A new address has to fit both budgets, and one moving here has
@@ -841,7 +905,7 @@ impl L2Hub {
                     // that entry is wrong now; forget it and let frames for
                     // it flood until it can be learned again.
                     table.remove(&key);
-                    return;
+                    return !source.secure;
                 }
             }
         }
@@ -852,6 +916,7 @@ impl L2Hub {
                 expires: now + MAC_AGING,
             },
         );
+        true
     }
 
     /// Resolve `key` to where a frame for it goes.
@@ -2095,5 +2160,99 @@ mod tests {
                 .is_none_or(|e| e.port_id != ha.id),
             "left pointing at the port it moved away from"
         );
+    }
+
+    // --- Port security -----------------------------------------------------
+
+    #[test]
+    fn a_secure_port_drops_frames_from_sources_it_cannot_learn() {
+        let hub = Arc::new(L2Hub::new());
+        let ports = sinks(&hub, 2);
+        hub.set_port_mac_limit(&ports[0].1, Some(2));
+        hub.set_port_secure(&ports[0].1, true);
+        let from = |src: u8| {
+            let mac = MacAddr([2, 0, 0, 0, 0xaa, src]);
+            let f = build_frame(MacAddr::broadcast(), mac, EtherType::IPV4, &[0; 40]);
+            hub.forward_from(Frame::from_slice(&f), ports[0].1.id);
+        };
+        from(1);
+        from(2);
+        assert_eq!(ports[1].0.inner.lock().unwrap().len(), 2);
+        // A third station behind a port allowed two: not learned, and on a
+        // secure port not forwarded either.
+        from(3);
+        assert_eq!(ports[1].0.inner.lock().unwrap().len(), 2, "forwarded");
+        assert_eq!(hub.mac_table_len(), 2);
+        // The two it knows still get through.
+        from(1);
+        assert_eq!(ports[1].0.inner.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn an_address_on_a_secure_port_cannot_be_taken_over() {
+        let hub = Arc::new(L2Hub::new());
+        let ports = sinks(&hub, 3);
+        let (victim, thief, peer) = (&ports[0], &ports[1], &ports[2]);
+        hub.set_port_secure(&victim.1, true);
+        let station: MacAddr = "02:00:00:00:aa:aa".parse().unwrap();
+        let announce = build_frame(MacAddr::broadcast(), station, EtherType::IPV4, &[0; 40]);
+        hub.forward_from(Frame::from_slice(&announce), victim.1.id);
+
+        // Another port claims the address: the frame goes nowhere, and the
+        // address stays where it was learned.
+        peer.0.inner.lock().unwrap().clear();
+        thief.0.inner.lock().unwrap().clear();
+        hub.forward_from(Frame::from_slice(&announce), thief.1.id);
+        assert!(peer.0.inner.lock().unwrap().is_empty(), "spoof forwarded");
+        let to_station = build_frame(station, peer.0.mac, EtherType::IPV4, &[0; 40]);
+        victim.0.inner.lock().unwrap().clear();
+        hub.forward_from(Frame::from_slice(&to_station), peer.1.id);
+        assert!(thief.0.inner.lock().unwrap().is_empty(), "traffic stolen");
+        assert_eq!(victim.0.inner.lock().unwrap().len(), 1);
+
+        // Once the address ages out it may move, as a station that really
+        // changed ports does.
+        age_out(&hub);
+        hub.forward_from(Frame::from_slice(&announce), thief.1.id);
+        hub.forward_from(Frame::from_slice(&to_station), peer.1.id);
+        assert_eq!(
+            thief.0.inner.lock().unwrap().len(),
+            1,
+            "no move after aging"
+        );
+    }
+
+    #[test]
+    fn a_secure_port_that_leaves_frees_its_addresses() {
+        let hub = Arc::new(L2Hub::new());
+        let ports = sinks(&hub, 1);
+        let hv = hub.connect(Sink::default());
+        hub.set_port_secure(&hv, true);
+        let station: MacAddr = "02:00:00:00:aa:aa".parse().unwrap();
+        let announce = build_frame(MacAddr::broadcast(), station, EtherType::IPV4, &[0; 40]);
+        hub.forward_from(Frame::from_slice(&announce), hv.id);
+        hv.close();
+        hub.forward_from(Frame::from_slice(&announce), ports[0].1.id);
+        let t = hub.mac_table.read().unwrap();
+        assert_eq!(
+            t.entries.get(&(0, station.octets())).map(|e| e.port_id),
+            Some(ports[0].1.id)
+        );
+    }
+
+    #[test]
+    fn without_port_security_a_station_may_still_move() {
+        // The default is unchanged: an address follows the last port it was
+        // seen on (see a_station_that_moves_ports_is_relearned), and a port
+        // at its limit still forwards.
+        let hub = Arc::new(L2Hub::new());
+        let ports = sinks(&hub, 2);
+        hub.set_port_mac_limit(&ports[0].1, Some(1));
+        for src in [1u8, 2] {
+            let mac = MacAddr([2, 0, 0, 0, 0xaa, src]);
+            let f = build_frame(MacAddr::broadcast(), mac, EtherType::IPV4, &[0; 40]);
+            hub.forward_from(Frame::from_slice(&f), ports[0].1.id);
+        }
+        assert_eq!(ports[1].0.inner.lock().unwrap().len(), 2);
     }
 }
