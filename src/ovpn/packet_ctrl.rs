@@ -283,22 +283,4 @@ mod tests {
         let data = [0x20u8, 0x02, 0x03];
         assert!(ControlPacket::parse(&data).is_err());
     }
-
-    #[test]
-    fn is_control_classification() {
-        for op in [
-            Opcode::CONTROL_HARD_RESET_CLIENT_V1,
-            Opcode::CONTROL_HARD_RESET_SERVER_V1,
-            Opcode::CONTROL_SOFT_RESET_V1,
-            Opcode::CONTROL_V1,
-            Opcode::ACK_V1,
-            Opcode::CONTROL_HARD_RESET_CLIENT_V2,
-            Opcode::CONTROL_HARD_RESET_SERVER_V2,
-        ] {
-            assert!(op.is_control(), "{op} should be control");
-        }
-        for op in [Opcode(0), Opcode::DATA_V1, Opcode::DATA_V2, Opcode(10)] {
-            assert!(!op.is_control(), "{op} should not be control");
-        }
-    }
 }

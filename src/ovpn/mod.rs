@@ -5,7 +5,7 @@
 //! channel uses purecrypto's AES-GCM / AES-CBC + HMAC.
 //!
 //! What works:
-//! - [`Options`] parse / `Display` (`V4,dev-type tun,…`).
+//! - The options string (`V4,dev-type tun,…`), parsed and rendered.
 //! - TLS control channel over the reliable layer, with sessions routed by
 //!   session id as in OpenVPN's `ssl.c`.
 //! - Key-method 2 key exchange and TLS-1.0 PRF key derivation.
@@ -53,9 +53,11 @@ mod window;
 #[cfg(not(target_family = "wasm"))]
 pub use adapter::{Adapter, AdapterConfig, Connector};
 pub use addr::{PeerKey, Transport};
-pub use consts::{AES, CBC, CipherBlockMethod, CipherCryptoAlg, GCM};
-pub use opcode::Opcode;
-pub use options::{AuthHash, Options};
+pub(crate) use consts::{CipherBlockMethod, CipherCryptoAlg, GCM};
+pub(crate) use opcode::Opcode;
+// For the fuzz body, which parses the options string on its own.
+#[cfg(feature = "fuzzing")]
+pub(crate) use options::Options;
 pub use peer::{AuthInfo, AuthRequest, OnAuth, Peer, PeerConfig, PeerOutput, PeerTimers};
 #[cfg(not(target_family = "wasm"))]
 pub use server::{OnConnect, OnData, OnDisconnect, Server, ServerConfig};

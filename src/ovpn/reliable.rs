@@ -310,6 +310,7 @@ impl Reliable {
     /// seen either: the peer's reset (packet 0) as received, and ours as
     /// sent and acknowledged. For a session opened after the server answered
     /// the client's reset statelessly (ssl.c session_skip_to_pre_start).
+    #[cfg(not(target_family = "wasm"))]
     pub fn skip_reset(&mut self) {
         self.out_counter = self.out_counter.max(1);
         self.in_counter = self.in_counter.max(1);

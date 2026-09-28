@@ -417,7 +417,9 @@ impl Peer {
     /// answer carried, and `remote_id` is the client's. The hard resets
     /// then count as exchanged: pass the client's packet that proved it to
     /// [`handle_packet`](Self::handle_packet) next.
-    pub fn open_after_stateless_reset(&mut self, remote_id: [u8; 8]) -> io::Result<()> {
+    // Only the server answers resets statelessly, and it is absent on wasm.
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn open_after_stateless_reset(&mut self, remote_id: [u8; 8]) -> io::Result<()> {
         let local_id = self
             .first_local_id
             .ok_or_else(|| invalid("the peer already opened a session"))?;
@@ -1232,6 +1234,8 @@ impl Session {
 
     /// Open a session whose hard resets were exchanged statelessly: the
     /// client's reset was answered, ours acknowledged.
+    // Only the server answers resets statelessly, and it is absent on wasm.
+    #[cfg(not(target_family = "wasm"))]
     fn after_reset(local_id: [u8; 8], remote_id: [u8; 8], timers: PeerTimers) -> Session {
         let mut ks = KeyState::new(0, local_id, remote_id, &timers, Instant::now());
         ks.reliable.skip_reset();

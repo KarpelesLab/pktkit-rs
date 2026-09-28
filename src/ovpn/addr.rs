@@ -11,7 +11,9 @@ use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 /// Transport protocol of a peer connection.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Transport {
+    /// A UDP socket, one datagram per packet.
     Udp,
+    /// A TCP connection, packets framed with a 2-byte length.
     Tcp,
 }
 
