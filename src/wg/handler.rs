@@ -62,6 +62,14 @@ pub(crate) fn replaying_accepted() -> bool {
 /// it if it needs to keep the data (e.g. for later `accept_unknown_peer`).
 pub type UnknownPeerFn = Arc<dyn Fn(NoisePublicKey, SocketAddr, &[u8]) + Send + Sync + 'static>;
 
+/// Told which peers a handler has just dropped from its table, and by
+/// which handler. What a [`Server`](crate::wg::Server) or
+/// [`Adapter`](crate::wg::Adapter) keeps per peer has to go with them: a
+/// handler also drops peers by itself (expired ones, in maintenance or to
+/// make room for a newcomer), and without being told, those two kept an
+/// endpoint and a device for every key ever accepted.
+pub(crate) type PeerRemovedFn = dyn Fn(&Handler, &[NoisePublicKey]) + Send + Sync;
+
 /// Per-handler configuration.
 #[derive(Clone, Default)]
 #[non_exhaustive]
@@ -268,6 +276,9 @@ pub struct Handler {
     /// share one UDP port and a packet is routed to them by receiver index,
     /// so an index has to be unique across all of them, not only here.
     group: RwLock<Weak<crate::wg::MultiHandler>>,
+    /// Who to tell when peers leave the table. Held weakly, so a server or
+    /// adapter that goes away stops being told without having to unregister.
+    removal_hooks: Mutex<Vec<Weak<PeerRemovedFn>>>,
 }
 
 impl std::fmt::Debug for Handler {
@@ -308,6 +319,7 @@ impl Handler {
             cookie_checker: Mutex::new(crate::wg::cookie::CookieChecker::new(&pub_key)),
             ratelimiter: Mutex::default(),
             group: RwLock::new(Weak::new()),
+            removal_hooks: Mutex::default(),
         }))
     }
 
@@ -387,7 +399,22 @@ impl Handler {
         self.forget_peers(std::slice::from_ref(peer_key));
     }
 
-    /// Tear down the session state of peers already out of the table.
+    /// Call `hook` whenever peers leave the table, for as long as it is
+    /// alive. It runs with none of the handler's locks held.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    pub(crate) fn watch_removals(&self, hook: &Arc<PeerRemovedFn>) {
+        let mut hooks = self.removal_hooks.lock().expect("hooks lock");
+        hooks.retain(|w| w.strong_count() > 0);
+        if !hooks
+            .iter()
+            .any(|w| std::ptr::addr_eq(w.as_ptr(), Arc::as_ptr(hook)))
+        {
+            hooks.push(Arc::downgrade(hook));
+        }
+    }
+
+    /// Tear down the session state of peers already out of the table, and
+    /// tell the watchers.
     fn forget_peers(&self, gone: &[NoisePublicKey]) {
         if gone.is_empty() {
             return;
@@ -406,6 +433,26 @@ impl Handler {
             .write()
             .expect("keypairs lock")
             .retain(|_, kp| !gone.contains(&kp.peer_key));
+        drop(sess);
+        // Outside every lock: the hooks take their owners' locks and run
+        // connector cleanups, caller code that may call back in here.
+        let hooks: Vec<Arc<PeerRemovedFn>> = {
+            let mut g = self.removal_hooks.lock().expect("hooks lock");
+            g.retain(|w| w.strong_count() > 0);
+            g.iter().filter_map(Weak::upgrade).collect()
+        };
+        for hook in hooks {
+            hook(self, gone);
+        }
+    }
+
+    /// Whether `peer_key` is in the table, expired or not.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    pub(crate) fn has_peer(&self, peer_key: &NoisePublicKey) -> bool {
+        self.peers
+            .read()
+            .expect("peers lock")
+            .contains_key(peer_key)
     }
 
     /// True if the peer is in the authorized table and (if `expires_at` is

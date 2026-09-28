@@ -14,7 +14,7 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock, Weak};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use crate::Result;
 use crate::wg::NoisePublicKey;
@@ -22,7 +22,7 @@ use crate::wg::constants::{
     MESSAGE_COOKIE_REPLY_TYPE, MESSAGE_INITIATION_TYPE, MESSAGE_RESPONSE_TYPE,
     MESSAGE_TRANSPORT_TYPE,
 };
-use crate::wg::handler::{Handler, PacketResult};
+use crate::wg::handler::{Handler, PacketResult, PeerRemovedFn};
 use crate::wg::handshake::check_mac1;
 
 /// A processed-packet result tagged with the handler that produced it.
@@ -45,6 +45,8 @@ pub struct MultiHandler {
     /// Handed to members, which look each other up through it when drawing
     /// an index.
     me: Weak<MultiHandler>,
+    /// Removal hooks to install on members, those added later included.
+    removal_hooks: Mutex<Vec<Weak<PeerRemovedFn>>>,
 }
 
 impl MultiHandler {
@@ -73,6 +75,7 @@ impl MultiHandler {
             MultiHandler {
                 handlers: RwLock::new(handlers),
                 me: me.clone(),
+                removal_hooks: Mutex::default(),
             }
         }))
     }
@@ -109,8 +112,32 @@ impl MultiHandler {
             ));
         }
         h.set_group(self.me.clone());
+        // A server over this multiplexer has to hear of its peers going
+        // whichever member drops them, not only the members it started with.
+        {
+            let mut hooks = self.removal_hooks.lock().expect("hooks lock");
+            hooks.retain(|w| w.strong_count() > 0);
+            for hook in hooks.iter().filter_map(Weak::upgrade) {
+                h.watch_removals(&hook);
+            }
+        }
         g.push(h);
         Ok(())
+    }
+
+    /// [`Handler::watch_removals`] on every member, present and future.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    pub(crate) fn watch_removals(&self, hook: &Arc<PeerRemovedFn>) {
+        // Under the members lock, so a handler being added gets the hook
+        // either from this loop or from add_handler.
+        let g = self.handlers.read().expect("multihandler lock");
+        self.removal_hooks
+            .lock()
+            .expect("hooks lock")
+            .push(Arc::downgrade(hook));
+        for h in g.iter() {
+            h.watch_removals(hook);
+        }
     }
 
     /// Remove the member with public key `pubkey` and return it, or `None`

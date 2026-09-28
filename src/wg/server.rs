@@ -18,7 +18,7 @@ use std::time::Duration;
 use crate::Result;
 use crate::wg::NoisePublicKey;
 use crate::wg::TimerAction;
-use crate::wg::handler::{Handler, PacketResult, PacketType};
+use crate::wg::handler::{Handler, PacketResult, PacketType, PeerRemovedFn};
 use crate::wg::multihandler::MultiHandler;
 
 /// Callback fired when decrypted transport data arrives.
@@ -92,6 +92,9 @@ pub struct Server {
     /// Plaintext waiting for a session with its peer: sent while there was
     /// none (or it had expired), and flushed once a handshake completes.
     staged: Mutex<Staged>,
+    /// Installed on the handler(s), which hold it weakly: it lives as long
+    /// as the server.
+    removal_hook: Arc<PeerRemovedFn>,
 }
 
 /// Plaintext held per peer until a handshake gives it a keypair, with the
@@ -196,20 +199,35 @@ impl Server {
             cfg.read_buffer_size
         };
 
-        Ok(Arc::new(Server {
-            handler: cfg.handler,
-            multi_handler: cfg.multi_handler,
-            on_packet: cfg.on_packet,
-            on_peer_connected: cfg.on_peer_connected,
-            maintenance_interval: interval,
-            read_buffer_size: rb,
-            conn: Mutex::new(None),
-            done: Arc::new(AtomicBool::new(false)),
-            threads: Mutex::new(Vec::new()),
-            peer_addrs: RwLock::new(std::collections::HashMap::new()),
-            peer_handlers: RwLock::new(std::collections::HashMap::new()),
-            staged: Mutex::new(Staged::default()),
-        }))
+        let server = Arc::new_cyclic(|me: &std::sync::Weak<Server>| {
+            let me = me.clone();
+            let removal_hook: Arc<PeerRemovedFn> = Arc::new(move |h, gone| {
+                if let Some(s) = me.upgrade() {
+                    s.peers_removed(h, gone);
+                }
+            });
+            Server {
+                handler: cfg.handler,
+                multi_handler: cfg.multi_handler,
+                on_packet: cfg.on_packet,
+                on_peer_connected: cfg.on_peer_connected,
+                maintenance_interval: interval,
+                read_buffer_size: rb,
+                conn: Mutex::new(None),
+                done: Arc::new(AtomicBool::new(false)),
+                threads: Mutex::new(Vec::new()),
+                peer_addrs: RwLock::new(std::collections::HashMap::new()),
+                peer_handlers: RwLock::new(std::collections::HashMap::new()),
+                staged: Mutex::new(Staged::default()),
+                removal_hook,
+            }
+        });
+        if let Some(mh) = server.multi_handler.as_ref() {
+            mh.watch_removals(&server.removal_hook);
+        } else if let Some(h) = server.handler.as_ref() {
+            h.watch_removals(&server.removal_hook);
+        }
+        Ok(server)
     }
 
     /// Start the read loop + maintenance thread. Blocks until [`Server::close`]
@@ -406,6 +424,32 @@ impl Server {
             .write()
             .expect("handler lock")
             .remove(peer);
+    }
+
+    /// `from` dropped the peers in `gone` from its table. Those no handler
+    /// knows any more are forgotten; one another member still has is only
+    /// no longer routed to `from`.
+    fn peers_removed(&self, from: &Handler, gone: &[NoisePublicKey]) {
+        for peer in gone {
+            if !self.known_anywhere(peer) {
+                // One authorized again meanwhile loses at worst its
+                // endpoint, which its next authenticated packet records.
+                self.forget_peer(peer);
+                continue;
+            }
+            let mut handlers = self.peer_handlers.write().expect("handler lock");
+            if handlers.get(peer).is_some_and(|h| std::ptr::eq(&**h, from)) {
+                handlers.remove(peer);
+            }
+        }
+    }
+
+    /// Whether any handler has `peer` in its table, expired or not.
+    fn known_anywhere(&self, peer: &NoisePublicKey) -> bool {
+        match self.multi_handler.as_ref() {
+            Some(mh) => mh.handlers().iter().any(|h| h.has_peer(peer)),
+            None => self.handler.as_ref().is_some_and(|h| h.has_peer(peer)),
+        }
     }
 
     /// Send what was staged for `peer` once it has a session.
@@ -634,6 +678,7 @@ impl Drop for StopOnDrop {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wg::NoisePrivateKey;
     use crate::wg::handler::Config;
 
     fn server(on_packet: OnPacketFn) -> (Arc<Server>, Arc<Handler>, SocketAddr) {
@@ -972,5 +1017,45 @@ mod tests {
         assert_eq!(Arc::strong_count(&s), 2);
         s.close().unwrap();
         serve.join().unwrap().unwrap();
+    }
+
+    /// A peer the handler drops by itself, or that is removed from it
+    /// directly, takes its endpoint with it. Before, the server kept one for
+    /// every key ever accepted, however long gone.
+    #[test]
+    fn a_peer_the_handler_drops_loses_its_endpoint() {
+        use crate::wg::handler::EXPIRED_PEER_GRACE;
+        let h = Handler::new(Config::default().unknown_peer_limit(2)).unwrap();
+        let (s, _sock) = idle_server(&h);
+        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let key = |i: u8| crate::wg::crypto::x25519_public(&NoisePrivateKey([i; 32]));
+        let known = |k: NoisePublicKey| {
+            s.peer_addrs.write().unwrap().insert(k, addr);
+        };
+        let long_expired = Instant::now() - EXPIRED_PEER_GRACE - Duration::from_secs(1);
+
+        // Removed directly.
+        h.add_peer(key(1));
+        known(key(1));
+        h.remove_peer(&key(1));
+        assert_eq!(s.peer_addr(&key(1)), None, "removed");
+
+        // Expired, then pruned by maintenance.
+        h.add_peer(key(2));
+        known(key(2));
+        h.set_peer_expiry(&key(2), long_expired);
+        h.maintenance();
+        assert_eq!(s.peer_addr(&key(2)), None, "pruned");
+
+        // Evicted for a newcomer, one after the other: the endpoints never
+        // outnumber the table.
+        for i in 10..20 {
+            h.add_unknown_peer(key(i)).unwrap();
+            known(key(i));
+            h.set_peer_expiry(&key(i), Instant::now() - Duration::from_secs(1));
+            assert!(s.peer_addrs.read().unwrap().len() <= 2);
+        }
+        assert_eq!(h.peers().len(), 2);
+        assert_eq!(s.peer_addrs.read().unwrap().len(), 2);
     }
 }

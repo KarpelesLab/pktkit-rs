@@ -14,7 +14,7 @@ use std::thread;
 
 use crate::accept::{Cleanup, L3Connector};
 use crate::iface::{L3Device, L3Handler};
-use crate::wg::handler::{Config as HandlerConfig, Handler};
+use crate::wg::handler::{Config as HandlerConfig, Handler, PeerRemovedFn};
 use crate::wg::multihandler::MultiHandler;
 use crate::wg::server::{OnPacketFn, OnPeerConnectedFn, Server, ServerConfig};
 use crate::wg::{NoisePresharedKey, NoisePrivateKey, NoisePublicKey};
@@ -87,6 +87,8 @@ pub struct Adapter {
     addr: IpPrefix,
     peers: RwLock<std::collections::HashMap<NoisePublicKey, WgPeer>>,
     closed: AtomicBool,
+    /// Installed on the handler(s), which hold it weakly.
+    removal_hook: Arc<PeerRemovedFn>,
 }
 
 impl Drop for Adapter {
@@ -189,6 +191,7 @@ impl Adapter {
         let weak_for_cb: Arc<OnceLock<Weak<Adapter>>> = Arc::new(OnceLock::new());
         let weak_for_cb_pkt = weak_for_cb.clone();
         let weak_for_cb_conn = weak_for_cb.clone();
+        let weak_for_cb_rm = weak_for_cb.clone();
 
         // OnPacket: deliver decrypted bytes to the matching peer device.
         let on_packet: OnPacketFn =
@@ -238,6 +241,15 @@ impl Adapter {
                 read_buffer_size: 65535,
             }
         };
+        // Peers the handler drops by itself (expired, or evicted for a
+        // newcomer) or that are removed from it directly: their devices go
+        // with them.
+        let removal_hook: Arc<PeerRemovedFn> = Arc::new(move |_h, gone| {
+            if let Some(a) = weak_for_cb_rm.get().and_then(Weak::upgrade) {
+                a.peers_removed(gone);
+            }
+        });
+
         let handler = server_cfg.handler.clone();
         let multi = server_cfg.multi_handler.clone();
         let server = Server::new(server_cfg)?;
@@ -250,8 +262,14 @@ impl Adapter {
             addr: cfg.addr,
             peers: RwLock::new(std::collections::HashMap::new()),
             closed: AtomicBool::new(false),
+            removal_hook,
         });
         let _ = weak_for_cb.set(Arc::downgrade(&me));
+        if let Some(mh) = me.multi_handler.as_ref() {
+            mh.watch_removals(&me.removal_hook);
+        } else if let Some(h) = me.handler.as_ref() {
+            h.watch_removals(&me.removal_hook);
+        }
         Ok(me)
     }
 
@@ -406,13 +424,7 @@ impl Adapter {
         // Cleanups are caller code, and this may run from Drop, on the
         // server's read loop: one that panics must not skip the rest.
         for p in peers {
-            let cleanup = p
-                .cleanup
-                .into_inner()
-                .unwrap_or_else(PoisonError::into_inner);
-            if let Some(cleanup) = cleanup {
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(cleanup));
-            }
+            run_cleanup(p);
         }
         if let Some(mh) = self.multi_handler.as_ref() {
             return mh.close();
@@ -486,11 +498,50 @@ impl Adapter {
 
     fn teardown_peer(&self, key: &NoisePublicKey) {
         let removed = self.peers.write().expect("peers lock").remove(key);
-        if let Some(p) = removed
-            && let Some(cleanup) = p.cleanup.lock().expect("cleanup lock").take()
-        {
-            let _ = cleanup();
+        if let Some(p) = removed {
+            run_cleanup(p);
         }
+    }
+
+    /// A handler dropped the peers in `gone`: tear down the devices of
+    /// those no handler knows any more.
+    fn peers_removed(&self, gone: &[NoisePublicKey]) {
+        let removed: Vec<WgPeer> = {
+            // Decided under the lock on_peer_connected wires a device
+            // under, after checking the peer is authorized: a peer
+            // authorized again meanwhile either is seen here or is wired
+            // after.
+            let mut peers = self.peers.write().expect("peers lock");
+            gone.iter()
+                .filter(|k| !self.known_anywhere(k))
+                .filter_map(|k| peers.remove(k))
+                .collect()
+        };
+        for p in removed {
+            run_cleanup(p);
+        }
+    }
+
+    /// Whether any handler has `key` in its table, expired or not.
+    fn known_anywhere(&self, key: &NoisePublicKey) -> bool {
+        if let Some(mh) = self.multi_handler.as_ref() {
+            mh.handlers().iter().any(|h| h.has_peer(key))
+        } else {
+            self.handler.as_ref().is_some_and(|h| h.has_peer(key))
+        }
+    }
+}
+
+/// Run a removed peer's connector cleanup. It is caller code, and may run
+/// on the server's read loop or maintenance thread (a handler dropping
+/// peers by itself): a panic in it must not take those down.
+fn run_cleanup(p: WgPeer) {
+    let cleanup = p
+        .cleanup
+        .into_inner()
+        .unwrap_or_else(PoisonError::into_inner);
+    if let Some(cleanup) = cleanup {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(cleanup));
     }
 }
 
@@ -870,5 +921,97 @@ mod tests {
         }
         drop(a);
         assert_eq!(n.load(Ordering::SeqCst), 2);
+    }
+
+    /// Peers the handler drops by itself -- evicted for a newcomer, or
+    /// pruned long after their expiry -- or that are removed from it
+    /// directly lose their device, whose cleanup runs, and their endpoint.
+    /// Before, an adapter taking every key it was offered kept a device and
+    /// an endpoint for each, however long gone.
+    #[test]
+    fn peers_the_handler_drops_are_torn_down() {
+        use crate::wg::handler::EXPIRED_PEER_GRACE;
+        struct Counting(Arc<AtomicUsize>);
+        impl L3Connector for Counting {
+            fn connect_l3(&self, _dev: Arc<dyn L3Device>) -> Result<Cleanup> {
+                let n = self.0.clone();
+                Ok(Box::new(move || {
+                    n.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }))
+            }
+        }
+        const LIMIT: usize = 2;
+        const N: usize = 6;
+        let cleaned = Arc::new(AtomicUsize::new(0));
+        let slot: Arc<OnceLock<Weak<Adapter>>> = Arc::default();
+        let s = slot.clone();
+        let a = Adapter::new(
+            AdapterConfig::new(
+                crate::wg::generate_private_key().unwrap(),
+                Arc::new(Counting(cleaned.clone())),
+                "10.0.0.1/24".parse().unwrap(),
+            )
+            .unknown_peer_limit(LIMIT)
+            .on_unknown_peer(Arc::new(move |key, addr, pkt: &[u8]| {
+                if let Some(a) = s.get().and_then(Weak::upgrade) {
+                    let _ = a.accept_unknown_peer(key, pkt, addr);
+                }
+            })),
+        )
+        .unwrap();
+        let _ = slot.set(Arc::downgrade(&a));
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let saddr = sock.local_addr().unwrap();
+        let _t = a.spawn_serve(sock);
+        let h = a.handler().unwrap();
+        let spub = a.public_key();
+        let wired = |a: &Adapter| a.peers.read().unwrap().len();
+        let endpoints = |a: &Adapter, keys: &[NoisePublicKey]| {
+            keys.iter()
+                .filter(|k| a.server.peer_addr(k).is_some())
+                .count()
+        };
+
+        let mut keys = Vec::new();
+        for _ in 0..N {
+            // Whoever is in the table has lapsed, and makes room.
+            for k in &keys {
+                h.set_peer_expiry(k, crate::time::Instant::now() - Duration::from_secs(1));
+            }
+            let c = Handler::new(HandlerConfig::default()).unwrap();
+            c.add_peer(spub);
+            let cs = UdpSocket::bind("127.0.0.1:0").unwrap();
+            cs.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            cs.send_to(&c.initiate_handshake(&spub).unwrap(), saddr)
+                .unwrap();
+            let mut buf = [0u8; 256];
+            cs.recv_from(&mut buf).expect("no handshake response");
+            let key = c.public_key();
+            keys.push(key);
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !a.peers.read().unwrap().contains_key(&key) {
+                assert!(std::time::Instant::now() < deadline, "never wired");
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(wired(&a) <= LIMIT, "{} devices", wired(&a));
+            assert!(endpoints(&a, &keys) <= LIMIT);
+        }
+        assert_eq!(cleaned.load(Ordering::SeqCst), N - LIMIT);
+
+        // Removed from the handler directly, not through the adapter.
+        h.remove_peer(&keys[N - 1]);
+        assert_eq!(wired(&a), LIMIT - 1);
+        assert_eq!(cleaned.load(Ordering::SeqCst), N - LIMIT + 1);
+
+        // Pruned by maintenance, long past expiry.
+        let long_ago = crate::time::Instant::now() - EXPIRED_PEER_GRACE - Duration::from_secs(1);
+        h.set_peer_expiry(&keys[N - 2], long_ago);
+        h.maintenance();
+        assert_eq!(wired(&a), 0);
+        assert_eq!(endpoints(&a, &keys), 0);
+        assert_eq!(cleaned.load(Ordering::SeqCst), N);
+        a.close().unwrap();
+        assert_eq!(cleaned.load(Ordering::SeqCst), N, "a cleanup ran twice");
     }
 }
