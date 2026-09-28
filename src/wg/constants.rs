@@ -92,16 +92,16 @@ pub(crate) const MIN_INITIATION_INTERVAL: Duration =
 /// Size of the per-keypair replay window.
 pub(crate) const WINDOW_SIZE: usize = 8192;
 
-/// Maximum number of in-flight handshakes per handler before new entries are
-/// rejected.
-pub(crate) const MAX_HANDSHAKES: usize = 10000;
+/// Keypairs a handler indexes for one peer at most: its session's next,
+/// current and previous (the reference's `keypairs` slots). With one
+/// session and one pending initiation per peer, this is what bounds the
+/// handler's per-connection state: by the peer table, not by one cap
+/// shared across peers, which unknown peers (or enough ordinary ones)
+/// could fill and so stop everyone else rekeying.
+pub(crate) const MAX_KEYPAIRS_PER_PEER: usize = 3;
 
-/// Maximum number of established sessions per handler.
-pub(crate) const MAX_SESSIONS: usize = 10000;
-
-/// Default for [`Config::unknown_peer_limit`](crate::wg::Config): no more
-/// peers than can hold a session at once.
-pub(crate) const DEFAULT_UNKNOWN_PEER_LIMIT: usize = MAX_SESSIONS;
+/// Default for [`Config::unknown_peer_limit`](crate::wg::Config).
+pub(crate) const DEFAULT_UNKNOWN_PEER_LIMIT: usize = 10000;
 
 // === Key sizes =============================================================
 

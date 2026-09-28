@@ -92,8 +92,13 @@ pub struct Config {
     /// is refused. An `on_unknown_peer` that accepts every key would
     /// otherwise let anyone grow the peer table without end, one fresh key
     /// per initiation. Peers added with [`Handler::add_peer`] are not
-    /// limited, but count. `None` uses the default (10000, the most that
-    /// can hold a session at once).
+    /// limited, but count. `None` uses the default (10000).
+    ///
+    /// A peer holds at most one session, three keypairs and one pending
+    /// handshake, so this also bounds the session state unknown peers can
+    /// make the handler keep. There is no separate cap on sessions or
+    /// keypairs that they could fill: a peer in the table, the operator's
+    /// above all, can always rekey.
     pub unknown_peer_limit: Option<usize>,
 }
 
@@ -923,6 +928,8 @@ impl Handler {
         // One pending initiation per peer, as in the reference: a retry
         // supersedes the last, and a response to the old one is refused.
         // Keeping them would stack up an entry per retry.
+        // With initiations only built for authorized peers, that bounds the
+        // table by the peer table.
         g.retain(|_, old| old.remote_static != hs.remote_static);
         // allocate_index handed out a free index, but another handshake may
         // have drawn the same one since: refuse rather than replace it.
@@ -931,9 +938,6 @@ impl Handler {
                 io::ErrorKind::AddrInUse,
                 "local index in use",
             ));
-        }
-        if g.len() >= crate::wg::constants::MAX_HANDSHAKES {
-            return Err(io::Error::other("handshake table full"));
         }
         g.insert(idx, hs);
         Ok(())
@@ -985,15 +989,21 @@ impl Handler {
 
     /// Index `kp` and give it a slot in `peer_key`'s session, via `place`,
     /// which returns the keypairs it displaced; their index entries go too.
-    /// Capacity is checked before anything is touched, so a refusal leaves
-    /// no orphan entry behind.
+    /// Everything is checked before anything is touched, so a refusal
+    /// leaves no orphan entry behind.
+    ///
+    /// There is no table-wide cap: every indexed keypair sits in one of its
+    /// peer's three slots, and the peer table bounds the peers (the unknown
+    /// ones by [`unknown_peer_limit`](Config::unknown_peer_limit)). A shared
+    /// cap of 10000 keypairs let unknown peers accepted up to the limit, or
+    /// some 3400 ordinary ones at steady state, fill it, after which every
+    /// peer's rekey failed and its session died at REJECT_AFTER_TIME.
     fn install(
         &self,
         peer_key: NoisePublicKey,
         kp: Arc<Keypair>,
         place: impl FnOnce(&mut Session, Arc<Keypair>) -> Vec<Arc<Keypair>>,
     ) -> Result<()> {
-        use crate::wg::constants::{MAX_HANDSHAKES, MAX_SESSIONS};
         let mut sess = self.sessions.write().expect("sessions lock");
         let mut kps = self.keypairs.write().expect("keypairs lock");
         // Checked here, under the sessions lock, and not only by the caller:
@@ -1005,12 +1015,6 @@ impl Handler {
                 io::ErrorKind::PermissionDenied,
                 "peer not authorized",
             ));
-        }
-        if sess.len() >= MAX_SESSIONS && !sess.contains_key(&peer_key) {
-            return Err(io::Error::other("session table full"));
-        }
-        if kps.len() >= MAX_HANDSHAKES {
-            return Err(io::Error::other("keypair table full"));
         }
         // The index was free when allocated; one drawn again meanwhile must
         // not take over another keypair's entry.
@@ -1032,6 +1036,13 @@ impl Handler {
         for old in place(s, kp) {
             kps.remove(&old.local_index);
         }
+        debug_assert!(
+            [&s.keypair_current, &s.keypair_prev, &s.keypair_next]
+                .iter()
+                .filter(|k| k.is_some())
+                .count()
+                <= crate::wg::constants::MAX_KEYPAIRS_PER_PEER
+        );
         Ok(())
     }
 
@@ -2265,6 +2276,74 @@ mod tests {
         assert!(b.get_peer_info(&recent.public_key()).is_some());
         assert!(b.get_peer_info(&never.public_key()).is_some());
         assert!(holds_state_for(&b, &never.public_key()));
+    }
+
+    /// A keypair for `peer`, indexed nowhere yet, without a handshake.
+    fn stub_keypair(h: &Handler, peer: NoisePublicKey) -> Arc<Keypair> {
+        Arc::new(Keypair {
+            send_key: [1; CHACHAPOLY_KEY_SIZE],
+            receive_key: [2; CHACHAPOLY_KEY_SIZE],
+            send_counter: AtomicU64::new(0),
+            created: Instant::now(),
+            local_index: h.allocate_index().unwrap(),
+            remote_index: 1,
+            peer_key: peer,
+            is_initiator: true,
+            replay_filter: SlidingWindow::new(),
+        })
+    }
+
+    /// Unknown peers accepted up to the limit, each with a session, must
+    /// not keep a peer that already has one from rekeying. Before, one
+    /// table-wide cap of 10000 keypairs was shared by every peer: filled,
+    /// every rekey failed ("keypair table full") and each session died at
+    /// REJECT_AFTER_TIME.
+    #[test]
+    fn unknown_peers_cannot_block_a_rekey() {
+        let b = Handler::new(Config::default()).unwrap();
+        let l = Handler::new(Config::default()).unwrap();
+        l.add_peer(b.public_key());
+        b.add_peer(l.public_key());
+        handshake(&l, &b);
+        for i in 0u32.. {
+            let mut k = [0x55; 32];
+            k[..4].copy_from_slice(&i.to_le_bytes());
+            let k = NoisePublicKey(k);
+            if b.add_unknown_peer(k).is_err() {
+                break;
+            }
+            b.install_responder_keypair(k, stub_keypair(&b, k)).unwrap();
+        }
+        handshake(&l, &b);
+        handshake(&b, &l);
+        let pkt = l.encrypt(b"after", &b.public_key()).unwrap();
+        assert_eq!(b.process_packet(&pkt, &loopback()).unwrap().data, b"after");
+    }
+
+    /// Nor may ordinary peers at steady state, each holding its current,
+    /// previous and next keypairs: 3334 of them were enough before.
+    #[test]
+    fn peers_at_steady_state_can_all_rekey() {
+        let b = Handler::new(Config::default()).unwrap();
+        let keys: Vec<NoisePublicKey> = (0u32..4000)
+            .map(|i| {
+                let mut k = [0x66; 32];
+                k[..4].copy_from_slice(&i.to_le_bytes());
+                NoisePublicKey(k)
+            })
+            .collect();
+        for &k in &keys {
+            b.add_peer(k);
+            for _ in 0..2 {
+                b.install_initiator_keypair(k, stub_keypair(&b, k)).unwrap();
+            }
+            b.install_responder_keypair(k, stub_keypair(&b, k)).unwrap();
+        }
+        for &k in &keys {
+            b.install_responder_keypair(k, stub_keypair(&b, k)).unwrap();
+            b.install_initiator_keypair(k, stub_keypair(&b, k)).unwrap();
+        }
+        assert!(b.keypairs.read().unwrap().len() <= 3 * keys.len());
     }
 
     /// Only peers taken from on_unknown_peer are dropped by the handler
