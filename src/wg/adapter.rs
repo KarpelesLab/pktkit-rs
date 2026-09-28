@@ -5,6 +5,14 @@
 //! encrypted and pushed onto the UDP socket; packets from the peer are
 //! decrypted and delivered through the device handler installed by the
 //! connector (typically a NAT engine for namespace isolation).
+//!
+//! A peer given [allowed IPs](Adapter::set_allowed_ips) has only packets
+//! whose source lies in them delivered, the receive half of WireGuard's
+//! cryptokey routing (whitepaper §2), and its device reports the first of
+//! them as its address, so an [`L3Hub`](crate::L3Hub) routes that prefix to
+//! it. A peer given none takes any source and reports
+//! [`AdapterConfig::addr`], unless
+//! [`require_allowed_ips`](AdapterConfig::require_allowed_ips) is set.
 
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
@@ -30,7 +38,8 @@ pub struct AdapterConfig {
     pub multi_handler: Option<Arc<MultiHandler>>,
     /// Per-peer L3 connector. **Required** — see crate-level docs.
     pub connector: Arc<dyn L3Connector + Send + Sync>,
-    /// Address advertised by each peer device. The connector typically uses
+    /// Address advertised by each peer device that has no
+    /// [allowed IPs](Adapter::set_allowed_ips). The connector typically uses
     /// this to seed routing decisions.
     pub addr: IpPrefix,
     /// Optional callback for unauthorized peers.
@@ -40,6 +49,13 @@ pub struct AdapterConfig {
     /// `None` uses the default (10000). Ignored if `multi_handler` is set:
     /// its handlers carry their own.
     pub unknown_peer_limit: Option<usize>,
+    /// Deliver nothing from a peer until it is given
+    /// [allowed IPs](Adapter::set_allowed_ips), as the kernel does, and
+    /// have its device report no address. Off by default, where such a
+    /// peer may send from any source and its device reports
+    /// [`addr`](Self::addr): that is how an adapter behaved before allowed
+    /// IPs existed, and it lets one peer pass for another.
+    pub require_allowed_ips: bool,
 }
 
 setters! {
@@ -47,6 +63,7 @@ setters! {
         some multi_handler: Arc<MultiHandler>;
         some on_unknown_peer: crate::wg::handler::UnknownPeerFn;
         some unknown_peer_limit: usize;
+        set require_allowed_ips: bool;
     }
 }
 
@@ -65,6 +82,7 @@ impl AdapterConfig {
             addr,
             on_unknown_peer: None,
             unknown_peer_limit: None,
+            require_allowed_ips: false,
         }
     }
 }
@@ -74,6 +92,7 @@ impl std::fmt::Debug for AdapterConfig {
         f.debug_struct("AdapterConfig")
             .field("multi_handler", &self.multi_handler.is_some())
             .field("addr", &self.addr)
+            .field("require_allowed_ips", &self.require_allowed_ips)
             .finish()
     }
 }
@@ -85,7 +104,12 @@ pub struct Adapter {
     server: Arc<Server>,
     connector: Arc<dyn L3Connector + Send + Sync>,
     addr: IpPrefix,
+    require_allowed_ips: bool,
     peers: RwLock<std::collections::HashMap<NoisePublicKey, WgPeer>>,
+    /// Per peer, whether or not it is connected yet; each device holds a
+    /// copy. Written under `peers`, so a device being wired cannot miss a
+    /// change.
+    allowed_ips: RwLock<std::collections::HashMap<NoisePublicKey, Vec<IpPrefix>>>,
     closed: AtomicBool,
     /// Installed on the handler(s), which hold it weakly.
     removal_hook: Arc<PeerRemovedFn>,
@@ -118,6 +142,12 @@ pub(crate) struct PeerL3Device {
     key: NoisePublicKey,
     handler: Mutex<Option<L3Handler>>,
     addr: Mutex<IpPrefix>,
+    /// The sources the peer may send from; `None` if it was given none.
+    allowed: RwLock<Option<Vec<IpPrefix>>>,
+    /// Whether a peer given no allowed IPs is refused everything.
+    strict: bool,
+    /// What the device reports while the peer has no allowed IPs.
+    fallback_addr: IpPrefix,
 }
 
 impl std::fmt::Debug for PeerL3Device {
@@ -129,16 +159,64 @@ impl std::fmt::Debug for PeerL3Device {
 }
 
 impl PeerL3Device {
-    fn new(adapter: &Arc<Adapter>, key: NoisePublicKey, addr: IpPrefix) -> Arc<Self> {
-        Arc::new(PeerL3Device {
+    fn new(
+        adapter: &Arc<Adapter>,
+        key: NoisePublicKey,
+        allowed: Option<Vec<IpPrefix>>,
+    ) -> Arc<Self> {
+        let strict = adapter.require_allowed_ips;
+        let fallback_addr = if strict {
+            IpPrefix::default()
+        } else {
+            adapter.addr
+        };
+        let dev = Arc::new(PeerL3Device {
             adapter: Arc::downgrade(adapter),
             key,
             handler: Mutex::new(None),
-            addr: Mutex::new(addr),
-        })
+            addr: Mutex::new(fallback_addr),
+            allowed: RwLock::new(None),
+            strict,
+            fallback_addr,
+        });
+        dev.set_allowed(allowed);
+        dev
+    }
+
+    /// Take `allowed` as the peer's allowed IPs, and report the first as the
+    /// device's address: the peer's own, conventionally, and so where a hub
+    /// should route to it. A device reports one prefix; the others still
+    /// pass the source check. With an empty list, the device owns nothing.
+    fn set_allowed(&self, allowed: Option<Vec<IpPrefix>>) {
+        let addr = match &allowed {
+            Some(list) => list.first().copied().unwrap_or_default(),
+            None => self.fallback_addr,
+        };
+        *self.allowed.write().expect("allowed lock") = allowed;
+        *self.addr.lock().expect("addr lock") = addr;
+    }
+
+    /// Whether the peer may send `data`: its source must be in the peer's
+    /// allowed IPs, when it has any (or when they are required). Otherwise
+    /// it could pass for another peer, or any host at all, to whatever the
+    /// connector leads to.
+    fn admits(&self, data: &[u8]) -> bool {
+        let allowed = self.allowed.read().expect("allowed lock");
+        let list = match allowed.as_deref() {
+            Some(list) => list,
+            None if self.strict => return false,
+            None => return true,
+        };
+        let p = Packet::from_slice(data);
+        p.is_valid()
+            && p.src_addr()
+                .is_some_and(|src| list.iter().any(|r| r.contains(src)))
     }
 
     fn deliver(&self, data: &[u8]) {
+        if !self.admits(data) {
+            return;
+        }
         // Not under the lock: the guard of an `if let` scrutinee lives
         // through its block, and a handler that calls set_handler (or
         // anything that does) would wait on itself.
@@ -260,7 +338,9 @@ impl Adapter {
             server,
             connector: cfg.connector,
             addr: cfg.addr,
+            require_allowed_ips: cfg.require_allowed_ips,
             peers: RwLock::new(std::collections::HashMap::new()),
+            allowed_ips: RwLock::default(),
             closed: AtomicBool::new(false),
             removal_hook,
         });
@@ -369,7 +449,47 @@ impl Adapter {
         crate::wg::handler::replay_accepted(|| self.server.handle_packet(packet, addr))
     }
 
-    /// Remove a peer and tear down its plumbing.
+    /// Set the prefixes `key` may send from (WireGuard's allowed IPs),
+    /// replacing any set before; whether or not the peer is authorized or
+    /// connected yet. A decrypted packet from the peer whose source lies in
+    /// none of them is dropped, the receive half of WireGuard's cryptokey
+    /// routing (whitepaper §2).
+    ///
+    /// The peer's device reports the first prefix as its
+    /// [`addr`](L3Device::addr), conventionally the peer's own /32 or /128,
+    /// so an [`L3Hub`](crate::L3Hub) routes it to this peer; the others
+    /// pass the source check but are not routed by it. An empty list lets
+    /// nothing through, and the device reports no address.
+    ///
+    /// A peer never given any takes any source and its device reports
+    /// [`AdapterConfig::addr`], unless
+    /// [`require_allowed_ips`](AdapterConfig::require_allowed_ips) is set.
+    /// [`remove_peer`](Self::remove_peer) forgets them, as does the handler
+    /// dropping the peer by itself.
+    pub fn set_allowed_ips(&self, key: &NoisePublicKey, ips: Vec<IpPrefix>) {
+        // Written, not read: two calls at once must leave the map and the
+        // device agreeing.
+        let peers = self.peers.write().expect("peers lock");
+        self.allowed_ips
+            .write()
+            .expect("allowed lock")
+            .insert(*key, ips.clone());
+        if let Some(p) = peers.get(key) {
+            p.dev.set_allowed(Some(ips));
+        }
+    }
+
+    /// The allowed IPs set for `key`, or `None` if it has none.
+    pub fn allowed_ips(&self, key: &NoisePublicKey) -> Option<Vec<IpPrefix>> {
+        self.allowed_ips
+            .read()
+            .expect("allowed lock")
+            .get(key)
+            .cloned()
+    }
+
+    /// Remove a peer and tear down its plumbing, and forget its
+    /// [allowed IPs](Self::set_allowed_ips).
     pub fn remove_peer(&self, key: &NoisePublicKey) {
         if let Some(mh) = self.multi_handler.as_ref() {
             for h in mh.handlers() {
@@ -450,7 +570,7 @@ impl Adapter {
         // The connector is caller code and may call back into the adapter
         // (remove_peer, close) while it wires the device, so it runs
         // without the peers lock held.
-        let dev = PeerL3Device::new(self, key, self.addr);
+        let dev = PeerL3Device::new(self, key, self.allowed_ips(&key));
         let dev_dyn: Arc<dyn L3Device> = dev.clone();
         let cleanup = match self.connector.connect_l3(dev_dyn) {
             Ok(c) => c,
@@ -466,6 +586,12 @@ impl Adapter {
             && self.is_authorized(&key)
             && !peers.contains_key(&key);
         if keep {
+            // set_allowed_ips may have run since the device was made; it
+            // writes under this lock, so it is seen now or finds the device.
+            let allowed = self.allowed_ips(&key);
+            if *dev.allowed.read().expect("allowed lock") != allowed {
+                dev.set_allowed(allowed);
+            }
             peers.insert(
                 key,
                 WgPeer {
@@ -501,7 +627,11 @@ impl Adapter {
     }
 
     fn teardown_peer(&self, key: &NoisePublicKey) {
-        let removed = self.peers.write().expect("peers lock").remove(key);
+        let removed = {
+            let mut peers = self.peers.write().expect("peers lock");
+            self.allowed_ips.write().expect("allowed lock").remove(key);
+            peers.remove(key)
+        };
         if let Some(p) = removed {
             run_cleanup(p);
         }
@@ -516,9 +646,13 @@ impl Adapter {
             // authorized again meanwhile either is seen here or is wired
             // after.
             let mut peers = self.peers.write().expect("peers lock");
+            let mut allowed = self.allowed_ips.write().expect("allowed lock");
             gone.iter()
                 .filter(|k| !self.known_anywhere(k))
-                .filter_map(|k| peers.remove(k))
+                .filter_map(|k| {
+                    allowed.remove(k);
+                    peers.remove(k)
+                })
                 .collect()
         };
         for p in removed {
@@ -562,6 +696,9 @@ mod tests {
             key: NoisePublicKey([1; 32]),
             handler: Mutex::new(None),
             addr: Mutex::new("10.0.0.1/24".parse().unwrap()),
+            allowed: RwLock::new(None),
+            strict: false,
+            fallback_addr: "10.0.0.1/24".parse().unwrap(),
         });
         let (tx, rx) = std::sync::mpsc::channel();
         let tx = Mutex::new(tx);
@@ -925,6 +1062,113 @@ mod tests {
         }
         drop(a);
         assert_eq!(n.load(Ordering::SeqCst), 2);
+    }
+
+    /// Wires each device to a handler counting what it is handed, and keeps
+    /// the devices, in the order connected.
+    struct Capture(Arc<Mutex<Vec<Arc<dyn L3Device>>>>, Arc<AtomicUsize>);
+    impl L3Connector for Capture {
+        fn connect_l3(&self, dev: Arc<dyn L3Device>) -> Result<Cleanup> {
+            let n = self.1.clone();
+            dev.set_handler(Arc::new(move |_p: &Packet| {
+                n.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }));
+            self.0.lock().unwrap().push(dev);
+            Ok(Box::new(|| Ok(())))
+        }
+    }
+
+    fn capture_adapter(
+        cfg: impl FnOnce(AdapterConfig) -> AdapterConfig,
+    ) -> (
+        Arc<Adapter>,
+        Arc<Mutex<Vec<Arc<dyn L3Device>>>>,
+        Arc<AtomicUsize>,
+    ) {
+        let (devs, n) = (Arc::default(), Arc::new(AtomicUsize::new(0)));
+        let a = Adapter::new(cfg(AdapterConfig::new(
+            crate::wg::generate_private_key().unwrap(),
+            Arc::new(Capture(Arc::clone(&devs), n.clone())),
+            "10.0.0.1/24".parse().unwrap(),
+        )))
+        .unwrap();
+        (a, devs, n)
+    }
+
+    fn from(src: &str) -> Vec<u8> {
+        crate::build::build_ipv4(
+            src.parse().unwrap(),
+            "10.0.0.1".parse().unwrap(),
+            crate::Protocol::UDP,
+            64,
+            &[0; 8],
+        )
+    }
+
+    fn prefixes(list: &[&str]) -> Vec<IpPrefix> {
+        list.iter().map(|p| p.parse().unwrap()).collect()
+    }
+
+    /// Cryptokey routing (whitepaper §2): a peer given allowed IPs has only
+    /// packets from inside them delivered, and its device reports the
+    /// first, so a hub routes that prefix to it. Before, a peer could send
+    /// from any source, another peer's included, and every device reported
+    /// the same address. A peer given none is unrestricted, as before.
+    #[test]
+    fn allowed_ips_filter_sources_and_address_the_device() {
+        let (a, devs, n) = capture_adapter(|c| c);
+        let (p, q) = (NoisePublicKey([1; 32]), NoisePublicKey([2; 32]));
+        a.add_peer(p);
+        a.add_peer(q);
+        a.set_allowed_ips(&p, prefixes(&["10.0.0.2/32", "192.168.5.0/24"]));
+        a.on_peer_connected(p);
+        a.on_peer_connected(q);
+        let dev = |i: usize| devs.lock().unwrap()[i].addr();
+        assert_eq!(dev(0), "10.0.0.2/32".parse().unwrap());
+        assert_eq!(dev(1), "10.0.0.1/24".parse().unwrap());
+        let delivered = || n.load(Ordering::SeqCst);
+
+        a.on_packet(&from("10.0.0.2"), p);
+        a.on_packet(&from("192.168.5.9"), p);
+        assert_eq!(delivered(), 2);
+        a.on_packet(&from("10.0.0.3"), p);
+        a.on_packet(&[0x45; 3], p);
+        assert_eq!(delivered(), 2, "spoofed source delivered");
+        a.on_packet(&from("10.0.0.3"), q);
+        assert_eq!(delivered(), 3, "unrestricted peer refused");
+
+        // Set once connected, it applies at once.
+        a.set_allowed_ips(&q, prefixes(&["10.0.0.3/32"]));
+        assert_eq!(dev(1), "10.0.0.3/32".parse().unwrap());
+        a.on_packet(&from("10.0.0.2"), q);
+        assert_eq!(delivered(), 3);
+        assert_eq!(a.allowed_ips(&q), Some(prefixes(&["10.0.0.3/32"])));
+        // None at all: nothing is delivered, and nothing routed to it.
+        a.set_allowed_ips(&q, Vec::new());
+        a.on_packet(&from("10.0.0.3"), q);
+        assert_eq!(delivered(), 3);
+        assert_eq!(dev(1), IpPrefix::default());
+
+        // Removing the peer forgets them.
+        a.remove_peer(&p);
+        assert_eq!(a.allowed_ips(&p), None);
+    }
+
+    /// With `require_allowed_ips`, a peer given no allowed IPs gets nothing
+    /// through, as in the kernel.
+    #[test]
+    fn required_allowed_ips_refuse_a_peer_without_any() {
+        let (a, devs, n) = capture_adapter(|c| c.require_allowed_ips(true));
+        let p = NoisePublicKey([1; 32]);
+        a.add_peer(p);
+        a.on_peer_connected(p);
+        assert_eq!(devs.lock().unwrap()[0].addr(), IpPrefix::default());
+        a.on_packet(&from("10.0.0.2"), p);
+        assert_eq!(n.load(Ordering::SeqCst), 0);
+        a.set_allowed_ips(&p, prefixes(&["10.0.0.2/32"]));
+        a.on_packet(&from("10.0.0.2"), p);
+        assert_eq!(n.load(Ordering::SeqCst), 1);
     }
 
     /// Peers the handler drops by itself -- evicted for a newcomer, or
