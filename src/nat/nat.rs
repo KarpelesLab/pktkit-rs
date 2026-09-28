@@ -229,6 +229,9 @@ pub struct Nat {
 
     /// When packet handling next sweeps (see [`SWEEP_INTERVAL`]).
     next_sweep: Mutex<Instant>,
+    /// When a local helper next has a timer due (see
+    /// [`next_deadline`](Nat::next_deadline)).
+    helper_timer: Mutex<Option<Instant>>,
 
     /// Gates the ICMP errors the NAT sends itself.
     icmp_limit: crate::icmp::RateLimiter,
@@ -474,6 +477,7 @@ impl Nat {
             frags: Mutex::new(FragTable::default()),
             out_frags: Mutex::new(FragTable::default()),
             next_sweep: Mutex::new(Instant::now() + SWEEP_INTERVAL),
+            helper_timer: Mutex::new(None),
             icmp_limit: crate::icmp::RateLimiter::new(ICMP_RATE, ICMP_BURST),
             echo_limit: crate::icmp::RateLimiter::new(ICMP_RATE, ICMP_BURST),
         })
@@ -1538,12 +1542,67 @@ impl Nat {
     /// timer to release state while no traffic flows, or to expire entries
     /// closer to their timeouts.
     pub fn sweep(&self) {
-        self.sweep_at(Instant::now());
+        let now = Instant::now();
+        self.tick_helpers_at(now);
+        self.sweep_at(now);
     }
 
-    /// Sweep if [`SWEEP_INTERVAL`] has passed since the last time.
+    /// When a local helper next has a timer to run: the UPnP service's
+    /// control connections retransmit what the client has not
+    /// acknowledged, on a TCP engine's timers. `None` while none is armed.
+    ///
+    /// Handling any packet runs whatever is due, so while traffic flows
+    /// nothing else is needed. A NAT that can go quiet should have
+    /// [`tick`](Self::tick) called when this comes due: otherwise a reply
+    /// lost on its way to the client waits for the next packet to be
+    /// resent. It moves with every packet handled, so read it again after
+    /// each.
+    pub fn next_deadline(&self) -> Option<Instant> {
+        *self.helper_timer.lock().unwrap()
+    }
+
+    /// Run the local helpers' timers that are due (see
+    /// [`next_deadline`](Self::next_deadline)). Harmless to call early or
+    /// often.
+    pub fn tick(&self) {
+        self.tick_helpers_at(Instant::now());
+    }
+
+    /// A local helper has a timer due at `at`: have it run then, by
+    /// packet handling or [`tick`](Self::tick).
+    pub(crate) fn wake_helpers_at(&self, at: Instant) {
+        let mut t = self.helper_timer.lock().unwrap();
+        if t.is_none_or(|t| at < t) {
+            *t = Some(at);
+        }
+    }
+
+    /// Run the helpers' timers if one is due at `now`.
+    fn tick_helpers_at(&self, now: Instant) {
+        {
+            let mut t = self.helper_timer.lock().unwrap();
+            if t.is_none_or(|t| now < t) {
+                return;
+            }
+            // Cleared first: what the helpers arm from here on, including
+            // from packets handled meanwhile, lands on a clean slate.
+            *t = None;
+        }
+        let helpers: Vec<_> = self.inner.lock().unwrap().helpers.clone();
+        for h in helpers {
+            if let Some(lh) = h.as_local()
+                && let Some(next) = lh.tick(self, now)
+            {
+                self.wake_helpers_at(next);
+            }
+        }
+    }
+
+    /// Sweep if [`SWEEP_INTERVAL`] has passed since the last time, and run
+    /// the helpers' due timers.
     fn maybe_sweep(&self) {
         let now = Instant::now();
+        self.tick_helpers_at(now);
         {
             let mut next = self.next_sweep.lock().unwrap();
             if now < *next {

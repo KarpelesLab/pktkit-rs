@@ -63,7 +63,7 @@ const MAX_CTRL_CONNS: usize = 64;
 const MAX_CTRL_CONNS_PER_CLIENT: usize = 8;
 
 /// A control connection with no traffic for this long is dropped: a SOAP
-/// exchange takes milliseconds, and nothing else drives the engine's timers.
+/// exchange takes milliseconds.
 const CTRL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Default [`UPnPConfig::max_mappings`].
@@ -530,6 +530,10 @@ EXT:\r\n\r\n",
             // Reap fully-closed connections so the table does not grow.
             if cc.conn.is_closed() {
                 remove = true;
+            } else if let Some(at) = cc.conn.next_deadline() {
+                // The engine armed a timer: a retransmission of the reply,
+                // a delayed ACK. The NAT runs it when due.
+                nat.wake_helpers_at(at);
             }
         }
 
@@ -543,6 +547,41 @@ EXT:\r\n\r\n",
             nat.send_inside_in(ns, Packet::from_slice(&ip));
         }
         true
+    }
+
+    /// Run the control connections' due timers at `now`, sending what they
+    /// produce, and return when the next one is due. Idle connections are
+    /// reaped here too, so a NAT that only ticks still lets them go.
+    fn tick_ctrl(&self, nat: &Nat, now: Instant) -> Option<Instant> {
+        let inside_ip = nat.inside_addr()?;
+        let mut outgoing: Vec<(u64, Ipv4Addr, Vec<u8>)> = Vec::new();
+        let mut next: Option<Instant> = None;
+        {
+            let mut table = self.ctrl.lock().unwrap();
+            table.retain(|k, c| {
+                if now.saturating_duration_since(c.last) >= CTRL_IDLE_TIMEOUT {
+                    return false;
+                }
+                if c.conn.next_deadline().is_some_and(|d| d <= now) {
+                    for seg in c.conn.tick() {
+                        outgoing.push((k.ns, c.client_ip, seg));
+                    }
+                }
+                if c.conn.is_closed() {
+                    return false;
+                }
+                // Past the idle timeout the connection goes, timers or not.
+                let reap = c.last + CTRL_IDLE_TIMEOUT;
+                let due = c.conn.next_deadline().map_or(reap, |d| d.min(reap));
+                next = Some(next.map_or(due, |n| n.min(due)));
+                true
+            });
+        }
+        for (ns, client_ip, seg) in outgoing {
+            let ip = wrap_tcp_v4(inside_ip, client_ip, &seg);
+            nat.send_inside_in(ns, Packet::from_slice(&ip));
+        }
+        next
     }
 
     /// Answer one HTTP request on the control port. A control point fetches
@@ -885,6 +924,10 @@ impl LocalHelper for UPnPHelper {
             PROTO_TCP => self.handle_tcp(nat, ns, bytes, ihl),
             _ => false,
         }
+    }
+
+    fn tick(&self, nat: &Nat, now: Instant) -> Option<Instant> {
+        self.tick_ctrl(nat, now)
     }
 }
 
@@ -1800,6 +1843,52 @@ Content-Length: {len}\r\n\r\n",
         }
         assert!(conn.is_established());
         (conn, synack.unwrap())
+    }
+
+    /// The reply to a request is lost on its way to the client. Nothing
+    /// else comes from the client, which has had its request acknowledged
+    /// and just waits; the NAT's timer resends the reply.
+    #[test]
+    fn a_lost_reply_is_retransmitted() {
+        let nat = Nat::new(pfx("10.0.0.1/24"), pfx("203.0.113.1/24"));
+        let h = Arc::new(UPnPHelper::new(UPnPConfig::default()));
+        nat.add_local_helper(h.clone());
+        let to_client = Arc::new(StdMutex::new(Vec::<Vec<u8>>::new()));
+        let tc = to_client.clone();
+        nat.inside().set_handler(Arc::new(move |p| {
+            tc.lock().unwrap().push(p.as_bytes().to_vec());
+            Ok(())
+        }));
+        let (client, inside_ip) = (Ipv4Addr::new(10, 0, 0, 9), Ipv4Addr::new(10, 0, 0, 1));
+        let (mut conn, _) = establish(&h, &nat, &to_client, (client, 30001));
+        let (_, segs) = conn.write(format!("GET {ROOT_DESC_PATH} HTTP/1.1\r\n\r\n").as_bytes());
+        for seg in segs {
+            let ip = wrap_tcp_v4(client, inside_ip, &seg);
+            h.handle_local(&nat, crate::Packet::from_slice(&ip));
+        }
+        let lost = std::mem::take(&mut *to_client.lock().unwrap());
+        assert!(!lost.is_empty(), "a reply went out, and was lost");
+        assert!(nat.next_deadline().is_some(), "its retransmission is timed");
+
+        let mut reply = Vec::new();
+        let start = Instant::now();
+        while !reply.windows(4).any(|w| w == b"\r\n\r\n") {
+            assert!(start.elapsed() < Duration::from_secs(30), "never resent");
+            let due = nat.next_deadline().expect("a timer while unacknowledged");
+            std::thread::sleep(due.saturating_duration_since(Instant::now()));
+            nat.tick();
+            for pkt in std::mem::take(&mut *to_client.lock().unwrap()) {
+                let seg = Segment::parse(&pkt[20..]).unwrap();
+                for ack in conn.handle_segment(&seg) {
+                    let ip = wrap_tcp_v4(client, inside_ip, &ack);
+                    h.handle_local(&nat, crate::Packet::from_slice(&ip));
+                }
+            }
+            let mut buf = [0u8; 4096];
+            let n = conn.read(&mut buf);
+            reply.extend_from_slice(&buf[..n]);
+        }
+        assert!(reply.starts_with(b"HTTP/1.1 200 OK"));
     }
 
     #[test]

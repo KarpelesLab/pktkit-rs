@@ -190,6 +190,16 @@ pub trait LocalHelper: Helper {
         let _ = namespace;
         self.handle_local(nat, pkt)
     }
+
+    /// Run whatever of the helper's timers is due at `now`, such as a TCP
+    /// engine's retransmissions, and return when the next one is. A helper
+    /// that arms a timer while handling a packet tells the NAT with
+    /// [`Nat::wake_helpers_at`](super::nat::Nat::wake_helpers_at). The
+    /// default has no timers.
+    fn tick(&self, nat: &super::nat::Nat, now: Instant) -> Option<Instant> {
+        let _ = (nat, now);
+        None
+    }
 }
 
 /// An expected future connection registered by an ALG so the NAT will pass
