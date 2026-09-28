@@ -179,15 +179,19 @@ fn udp_to_a_closed_host_port_is_refused() {
 }
 
 /// A host server that writes a message in two small pieces, with
-/// TCP_NODELAY set, gets its answer from the guest a round trip sooner
-/// than if the bridge re-imposed Nagle: that would hold the second piece
-/// until the guest had acknowledged the first.
+/// TCP_NODELAY set, has both sent on to the guest as they come: the bridge
+/// must not re-impose Nagle, which would hold the second piece until the
+/// guest had acknowledged the first, a round trip later.
+///
+/// Timed where the pieces leave the stack rather than end to end: a busy CI
+/// runner adds its own delays to a whole exchange, but not to the gap
+/// between two segments sent milliseconds apart.
 #[cfg(feature = "impair")]
 #[test]
 fn the_bridge_adds_no_nagle_delay_to_small_writes() {
     use pktkit::impair::{ImpairL3, Impairment};
-    // Long enough that scheduling noise on a loaded runner stays well
-    // inside the gap between two one-way trips and four.
+    // A round trip on this link is 300 ms: a second piece held for the
+    // first one's ACK would leave at least that long after it.
     const ONE_WAY: Duration = Duration::from_millis(150);
     let stack = pktkit::slirp::Stack::new();
     stack
@@ -199,44 +203,58 @@ fn the_bridge_adds_no_nagle_delay_to_small_writes() {
         client.clone() as Arc<dyn L3Device>,
         Impairment::default().delay(ONE_WAY),
     );
-    connect_l3(stack.clone(), Delayed(link));
+    let sent: Sent = Arc::default();
+    connect_l3(stack.clone(), Delayed(link, sent.clone()));
 
     let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let dest = server.local_addr().unwrap();
-    let rounds = std::thread::spawn(move || {
+    let host = std::thread::spawn(move || {
         let (mut s, _) = server.accept().unwrap();
         s.set_nodelay(true).unwrap();
-        let mut times = Vec::new();
-        for _ in 0..5 {
-            let start = std::time::Instant::now();
-            s.write_all(&[1; 10]).unwrap();
-            std::thread::sleep(Duration::from_millis(5));
-            s.write_all(&[2; 10]).unwrap();
-            let mut b = [0u8; 1];
-            s.read_exact(&mut b).unwrap();
-            times.push(start.elapsed());
-        }
-        times
+        // Once the guest has spoken the bridge is up, and each piece goes
+        // out as it is written; before, both would wait in the socket for
+        // the handshake to finish and leave together.
+        let mut go = [0u8; 1];
+        s.read_exact(&mut go).unwrap();
+        s.write_all(&[1; 10]).unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        s.write_all(&[2; 10]).unwrap();
+        let mut b = [0u8; 1];
+        s.read_exact(&mut b).unwrap();
     });
     let mut c = client.dial_tcp(dest).unwrap();
     c.set_read_timeout(Some(Duration::from_secs(10)));
-    for _ in 0..5 {
-        let mut msg = [0u8; 20];
-        c.read_exact(&mut msg).unwrap();
-        c.write_all(b"k").unwrap();
+    c.write_all(b"g").unwrap();
+    let mut msg = [0u8; 20];
+    c.read_exact(&mut msg).unwrap();
+    c.write_all(b"k").unwrap();
+    host.join().unwrap();
+
+    // When the stack sent each byte of the message on (first copy only).
+    let sent = sent.lock().unwrap();
+    let mut at = Vec::new();
+    for &(t, len) in sent.iter() {
+        if at.len() < 20 {
+            at.extend(std::iter::repeat_n(t, len.min(20 - at.len())));
+        }
     }
-    let best = rounds.join().unwrap().into_iter().min().unwrap();
-    // Two one-way trips (≈ 300 ms) without Nagle, four (≈ 600 ms) with it.
+    assert_eq!(at.len(), 20, "the message never left the stack");
+    let gap = at[19] - at[0];
     assert!(
-        best < ONE_WAY * 3,
-        "answer took {best:?}: the second piece waited on an ACK"
+        gap < ONE_WAY,
+        "the second piece left {gap:?} after the first: it waited on an ACK"
     );
 }
 
-/// `connect_l3` takes its second device by value.
+/// When the stack sent a TCP segment toward the guest, and its payload size.
+#[cfg(feature = "impair")]
+type Sent = Arc<Mutex<Vec<(std::time::Instant, usize)>>>;
+
+/// `connect_l3` takes its second device by value. Notes the TCP payloads
+/// the stack sends through it.
 #[cfg(feature = "impair")]
 #[derive(Debug)]
-struct Delayed(Arc<pktkit::impair::ImpairL3>);
+struct Delayed(Arc<pktkit::impair::ImpairL3>, Sent);
 
 #[cfg(feature = "impair")]
 impl L3Device for Delayed {
@@ -244,6 +262,19 @@ impl L3Device for Delayed {
         self.0.set_handler(h)
     }
     fn send(&self, p: &Packet) -> pktkit::Result<()> {
+        let b = p.as_bytes();
+        if b.len() >= 40 && b[0] >> 4 == 4 && b[9] == 6 {
+            let ihl = usize::from(b[0] & 0x0f) * 4;
+            let total = usize::from(u16::from_be_bytes([b[2], b[3]]));
+            let doff = b.get(ihl + 12).map_or(0, |d| usize::from(d >> 4) * 4);
+            let len = total.saturating_sub(ihl + doff);
+            if len > 0 {
+                self.1
+                    .lock()
+                    .unwrap()
+                    .push((std::time::Instant::now(), len));
+            }
+        }
         self.0.send(p)
     }
     fn addr(&self) -> IpPrefix {
