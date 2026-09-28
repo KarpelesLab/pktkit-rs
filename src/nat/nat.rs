@@ -501,6 +501,29 @@ impl Nat {
         known && Some(ip) != self.inside_addr() && !self.is_inside_broadcast(ip)
     }
 
+    /// Whether `ip` may be the source of a packet arriving from outside
+    /// (RFC 2827, RFC 3704 ingress filtering). Addresses of the inside
+    /// networks live behind the NAT, and the NAT's own are its own; loopback,
+    /// "this network" (0/8), multicast and the reserved 240/4 (with the
+    /// limited broadcast) are never a sender's (RFC 1122 §3.2.1.3, RFC 1812
+    /// §5.3.7). A packet claiming any of them is forged: delivered, it would
+    /// pass for traffic from a trusted inside peer or from the NAT itself.
+    /// (Hairpinned packets carry the public source, and never come this way.)
+    fn outside_source_ok(&self, ip: Ipv4Addr) -> bool {
+        let a = IpAddr::V4(ip);
+        let special =
+            ip.is_loopback() || ip.octets()[0] == 0 || ip.is_multicast() || ip.octets()[0] >= 240;
+        let own = Some(ip) == self.outside_addr() || Some(ip) == self.inside_addr();
+        let inside = self.inside.addr().contains(a)
+            || self
+                .inside_routes
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .any(|r| r.contains(a));
+        !(special || own || inside)
+    }
+
     /// Networks reached through a router on the inside, whose hosts the NAT
     /// translates as well as those on the inside network itself.
     ///
@@ -1944,6 +1967,11 @@ impl Nat {
 
     fn handle_inbound(&self, pkt_in: &[u8]) {
         self.maybe_sweep();
+        if !self.outside_source_ok(Ipv4Addr::new(
+            pkt_in[12], pkt_in[13], pkt_in[14], pkt_in[15],
+        )) {
+            return;
+        }
         let owned;
         let (pkt, fmax): (&[u8], _) = if let Some(d) = self.defragger.lock().unwrap().clone() {
             match d.inbound.reassemble(0, pkt_in) {
@@ -5086,5 +5114,31 @@ mod tests {
         }
         let inner = nat.inner.lock().unwrap();
         assert_eq!(inner.expectations.len(), 256);
+    }
+
+    #[test]
+    fn forged_outside_sources_are_dropped() {
+        let (nat, i, _o) = setup();
+        nat.set_inside_routes(vec![pfx("172.16.0.0/16")]);
+        let p = build_udp(INSIDE, 40000, REMOTE, 53, b"q");
+        nat.inside().send(Packet::from_slice(&p)).unwrap();
+        for src in [
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(10, 0, 0, 7),
+            Ipv4Addr::new(172, 16, 3, 4),
+            Ipv4Addr::new(127, 0, 0, 1),
+            Ipv4Addr::new(0, 1, 2, 3),
+            Ipv4Addr::new(224, 0, 0, 1),
+            Ipv4Addr::new(240, 0, 0, 1),
+            Ipv4Addr::BROADCAST,
+            PUBLIC,
+        ] {
+            let p = build_udp(src, 53, PUBLIC, 40000, b"evil");
+            nat.outside().send(Packet::from_slice(&p)).unwrap();
+        }
+        assert!(i.lock().unwrap().is_empty());
+        let p = build_udp(REMOTE, 53, PUBLIC, 40000, b"ok");
+        nat.outside().send(Packet::from_slice(&p)).unwrap();
+        assert_eq!(i.lock().unwrap().len(), 1);
     }
 }
