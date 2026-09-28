@@ -2340,4 +2340,45 @@ mod tests {
             .count();
         assert!(sequential < 2, "{ports:?}");
     }
+
+    /// An off-path attacker who knows a dial's local port sends a SYN
+    /// ahead of the server's SYN-ACK. The SYN-ACK then must not complete
+    /// the handshake on the attacker's sequence space: data at the
+    /// attacker's sequence numbers never reaches the reader.
+    #[test]
+    fn blind_syn_during_dial_cannot_inject() {
+        let (stack, out) = capturing_stack();
+        let st = stack
+            .start_dial(IpAddr::V4(US), SocketAddr::from((PEER, 80)))
+            .unwrap();
+        let lport = st.key.local_port;
+        let iss = last_sent(&out).seq;
+        let feed = |seg: Segment| {
+            stack.handle_inbound(Packet::from_slice(&inbound(seg)), IpAddr::V4(US));
+        };
+        let seg = |seq: u32, ack: u32, flags: u8, payload: &[u8]| Segment {
+            src_port: 80,
+            dst_port: lport,
+            seq,
+            ack,
+            flags,
+            window: 65535,
+            payload: payload.to_vec(),
+            ..Default::default()
+        };
+        const EVIL: u32 = 0x4141_0000;
+        const REAL: u32 = 0x1000_0000;
+        feed(seg(EVIL, 0, flags::SYN, b""));
+        feed(seg(REAL, iss.wrapping_add(1), flags::SYN | flags::ACK, b""));
+        assert_ne!(st.conn.lock().unwrap().state(), State::Established);
+        feed(seg(
+            EVIL.wrapping_add(1),
+            // Blind: an ACK a little behind ours, as any acceptable one is.
+            iss,
+            flags::ACK | flags::PSH,
+            b"EVIL",
+        ));
+        let mut buf = [0u8; 64];
+        assert_eq!(st.conn.lock().unwrap().read(&mut buf), 0);
+    }
 }

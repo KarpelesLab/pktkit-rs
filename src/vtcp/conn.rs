@@ -1318,31 +1318,24 @@ impl Conn {
             return self.take_outgoing();
         }
 
-        // 1) Sequence number check.
-        if !self.segment_acceptable(seg) {
-            let syn_rcvd_simopen = self.state == State::SynReceived
-                && seg.has_flag(flags::SYN)
-                && seg.has_flag(flags::ACK)
-                && self
-                    .send_buf
-                    .as_ref()
-                    .map(|s| s.nxt() == seg.ack)
-                    .unwrap_or(false);
-            if !syn_rcvd_simopen {
-                if self.acks_past_closed_window(seg) {
-                    return self.handle_ack_past_closed_window(seg);
-                }
-                if !seg.has_flag(flags::RST) {
-                    if self.state == State::TimeWait && seg.has_flag(flags::FIN) {
-                        // The peer lost our last ACK: always answer.
-                        self.restart_time_wait();
-                        self.queue_ack();
-                    } else {
-                        self.queue_oow_ack(seg);
-                    }
-                }
-                return self.take_outgoing();
+        let simopen_synack = self.is_simopen_synack(seg);
+
+        // 1) Sequence number check. The SYN-ACK completing a simultaneous
+        // open repeats the peer's SYN, before RCV.NXT.
+        if !self.segment_acceptable(seg) && !simopen_synack {
+            if self.acks_past_closed_window(seg) {
+                return self.handle_ack_past_closed_window(seg);
             }
+            if !seg.has_flag(flags::RST) {
+                if self.state == State::TimeWait && seg.has_flag(flags::FIN) {
+                    // The peer lost our last ACK: always answer.
+                    self.restart_time_wait();
+                    self.queue_ack();
+                } else {
+                    self.queue_oow_ack(seg);
+                }
+            }
+            return self.take_outgoing();
         }
 
         // 2) RST.
@@ -1359,8 +1352,11 @@ impl Conn {
             return self.take_outgoing();
         }
 
-        // 4) SYN in a synchronized state ≠ SYN-RECEIVED → challenge ACK.
-        if seg.has_flag(flags::SYN) && self.state != State::SynReceived {
+        // 4) Any other SYN → challenge ACK (RFC 5961 §4). In SYN-RECEIVED
+        // too: a SYN-ACK there that does not restate the IRS is not the
+        // peer's, and taking it would complete the handshake on a sequence
+        // space a blind attacker's SYN chose.
+        if seg.has_flag(flags::SYN) && !simopen_synack {
             self.queue_challenge_ack();
             return self.take_outgoing();
         }
@@ -1389,6 +1385,22 @@ impl Conn {
             }
             _ => self.take_outgoing(),
         }
+    }
+
+    /// The peer's SYN-ACK completing a simultaneous open: it repeats the
+    /// SYN we took in SYN-SENT, so its SEQ is our IRS (RFC 9293
+    /// §3.10.7.3), and acknowledges ours. Only the SEQ ties it to that
+    /// SYN: an off-path attacker who knows our port can send a bare SYN
+    /// before the real SYN-ACK, and without this check the real SYN-ACK,
+    /// whatever its SEQ, would complete the handshake on the attacker's.
+    fn is_simopen_synack(&self, seg: &Segment) -> bool {
+        self.state == State::SynReceived
+            && seg.flags & (flags::SYN | flags::ACK | flags::RST) == flags::SYN | flags::ACK
+            && self.send_buf.as_ref().is_some_and(|s| s.nxt() == seg.ack)
+            && self
+                .recv_buf
+                .as_ref()
+                .is_some_and(|r| seg.seq.wrapping_add(1) == r.nxt())
     }
 
     fn handle_syn_sent(&mut self, seg: &Segment) -> Vec<Vec<u8>> {
@@ -5266,6 +5278,56 @@ mod tests {
         deliver(&mut b, &a_synack);
         assert_eq!(a.state(), State::Established);
         assert_eq!(read_all(&mut a), b"early");
+    }
+
+    // RFC 5961 §4: a blind SYN during a connect puts us in SYN-RECEIVED on
+    // the attacker's sequence space, but the real SYN-ACK, whose SEQ is not
+    // that IRS, must not complete the handshake there: it draws a challenge
+    // ACK instead, and the attacker's data never gets in.
+    #[test]
+    fn blind_syn_during_connect_does_not_set_the_irs() {
+        const EVIL: u32 = 0x4141_0000;
+        let mut client = Conn::new(cfg(40332, 80));
+        let mut server = Conn::new(cfg(80, 40332));
+        let syn = client.connect();
+        let evil = Segment {
+            src_port: 80,
+            dst_port: 40332,
+            seq: EVIL,
+            flags: flags::SYN,
+            window: 4096,
+            ..Default::default()
+        };
+        client.handle_segment(&evil);
+        assert_eq!(client.state(), State::SynReceived);
+
+        let synack = server.accept_syn(&parse(&syn[0]));
+        let out = deliver(&mut client, &synack);
+        assert_ne!(client.state(), State::Established);
+        let challenge = parse(&out[0]);
+        assert_eq!(challenge.flags, flags::ACK);
+
+        let iss = client.send_buf.as_ref().unwrap().una();
+        // Blind, the attacker cannot know SND.NXT; this ACK, a little
+        // behind it, would do once the handshake were done.
+        client.handle_segment(&Segment {
+            seq: EVIL.wrapping_add(1),
+            ack: iss,
+            flags: flags::ACK | flags::PSH,
+            payload: b"EVIL".to_vec(),
+            ..evil.clone()
+        });
+        assert_eq!(read_all(&mut client), b"");
+
+        // A SYN-ACK restating the IRS is the one a simultaneous open
+        // expects, and still completes it.
+        client.handle_segment(&Segment {
+            seq: EVIL,
+            ack: iss.wrapping_add(1),
+            flags: flags::SYN | flags::ACK,
+            ..evil
+        });
+        assert_eq!(client.state(), State::Established);
     }
 
     // A connection accepted from a SYN cookie still takes a reordered
