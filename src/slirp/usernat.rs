@@ -36,6 +36,7 @@ use crate::slirp::tcp_out::{TcpOutConn, build_refused_rst, build_rst_for_stray};
 use crate::slirp::tcp_stream::{ConnState, Endpoints, Offer, tick_conn};
 use crate::slirp::udp::{SendFn as UdpSendFn, UdpConn};
 use crate::slirp::udp6::{SendFn as UdpSendFn6, UdpConn6};
+use crate::vtcp::alarm::Alarm;
 use crate::vtcp::segment::{Segment, flags as tcp_flags};
 use crate::vtcp::{Conn, ConnConfig};
 use crate::{IpPrefix, Protocol, Result, connect_l3};
@@ -138,6 +139,9 @@ const MAX_UDP_FLOWS: usize = if cfg!(test) { 8 } else { 2048 };
 
 /// Time a UDP flow may sit idle before its socket is reaped.
 const UDP_IDLE: Duration = Duration::from_secs(60);
+/// Longest the TCP tick thread sleeps: the handshake deadlines and the
+/// TIME-WAIT caps are checked when it wakes, not on deadlines of their own.
+const HOUSEKEEPING: Duration = Duration::from_millis(100);
 
 /// The error for an operation on a stack that has been shut down.
 fn shut_down() -> io::Error {
@@ -233,6 +237,8 @@ struct Inner {
     /// MTU of the link to the guests; see [`Stack::set_mtu`].
     mtu: AtomicU32,
     closed: AtomicBool,
+    /// Wakes the tick thread when a connection's timer comes due.
+    alarm: Arc<Alarm>,
 }
 
 /// A namespace-isolated [`L3Device`] handed out by [`Stack::connect_l3`].
@@ -330,6 +336,7 @@ impl Stack {
             filter: RwLock::new(None),
             mtu: AtomicU32::new(DEFAULT_MTU),
             closed: AtomicBool::new(false),
+            alarm: Arc::new(Alarm::new()),
         });
 
         // Maintenance thread: GC idle UDP flows and closed TCP connections.
@@ -365,14 +372,19 @@ impl Stack {
             }
         });
 
-        // Tick thread: drive vtcp timers (RTO / keepalive / TIME-WAIT) for
-        // every vtcp-backed connection — both inbound accepts (`virt_tcp*`) and
-        // outbound NAT bridges (`tcp*`) — every 100ms, and reap any that have
-        // reached CLOSED.
+        // Tick thread: drive vtcp timers (RTO / delayed ACK / keepalive /
+        // TIME-WAIT) for every vtcp-backed connection — both inbound
+        // accepts (`virt_tcp*`) and outbound NAT bridges (`tcp*`) — as they
+        // come due, and reap any that have reached CLOSED. Each connection
+        // arms the alarm with its next deadline as it is ticked, and again
+        // whenever its traffic moves that earlier; the handshake deadlines
+        // and TIME-WAIT caps are looked at on every wakeup, at least every
+        // HOUSEKEEPING.
         let weak_tick = Arc::downgrade(&inner);
+        let alarm = inner.alarm.clone();
         thread::spawn(move || {
             loop {
-                thread::sleep(Duration::from_millis(100));
+                alarm.sleep_until(Instant::now() + HOUSEKEEPING);
                 let inner = match weak_tick.upgrade() {
                     Some(i) => i,
                     None => return,
@@ -380,6 +392,7 @@ impl Stack {
                 if inner.closed.load(Ordering::Acquire) {
                     return;
                 }
+                alarm.begin();
                 let conns: Vec<(Key, Arc<ConnState>)> = inner
                     .virt_tcp
                     .lock()
@@ -660,6 +673,7 @@ impl Stack {
             let _ = l.close();
         }
         Self::close_flows(&self.inner, |_| true);
+        self.inner.alarm.ring();
         // Namespace sides point back at the stack; dropping them here breaks
         // that cycle for peers whose cleanup never runs.
         self.inner.ns_sides.lock().expect("poisoned").clear();
@@ -928,6 +942,7 @@ impl Stack {
             remote_port: src_port,
         };
         let conn = TcpOutConn::pending(endpoints, &seg, Self::mss(inner, false), sink);
+        conn.state().set_alarm(inner.alarm.clone());
         // Register before the dial can answer, so the client's ACK of the
         // SYN-ACK resolves to this connection rather than drawing a RST.
         inner
@@ -1057,6 +1072,7 @@ impl Stack {
         let mut conn = Conn::new(Self::passive_config(inner, &endpoints));
         let synack = conn.accept_syn(&seg);
         let state = ConnState::new_in(ns, endpoints, conn, Self::sink(inner, ns));
+        state.set_alarm(inner.alarm.clone());
         Self::register_passive(table, key, state, listener, Some(slot), synack);
         Ok(())
     }
@@ -1097,6 +1113,7 @@ impl Stack {
             (Some(slot), Vec::new())
         };
         let state = ConnState::new_in(ns, endpoints, conn, Self::sink(inner, ns));
+        state.set_alarm(inner.alarm.clone());
         Self::register_passive(table, key, state, listener, slot, segs);
         Ok(())
     }
@@ -1393,6 +1410,7 @@ impl Stack {
             remote_port: src_port,
         };
         let conn = TcpOutConn::pending(endpoints, &seg, Self::mss(inner, true), sink);
+        conn.state().set_alarm(inner.alarm.clone());
         // Register before the dial can answer (see the v4 path).
         inner
             .tcp6

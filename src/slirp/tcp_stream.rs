@@ -11,12 +11,13 @@
 //! and pushed into the virtual network through the stack's dispatch sink.
 
 use crate::time::Instant;
+use crate::vtcp::alarm::Alarm;
 use crate::vtcp::segment::Segment;
 use crate::vtcp::{Conn, State};
 use std::collections::VecDeque;
 use std::io::{self};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 /// Endpoint addressing for an accepted virtual connection. The "local" side is
@@ -119,6 +120,10 @@ pub(crate) struct ConnState {
     pub(crate) sink: Arc<dyn Fn(&[u8]) + Send + Sync>,
     /// Segments on their way to the sink, in the order the engine made them.
     outbox: Mutex<Outbox>,
+    /// The stack's tick thread, woken when this connection's next timer
+    /// comes due before it would otherwise look (see
+    /// [`set_alarm`](Self::set_alarm)).
+    alarm: OnceLock<Arc<Alarm>>,
     /// For a passively opened connection: hands it to its listener once the
     /// handshake completes, unless the deadline passes first.
     pending_accept: Mutex<Option<PendingAccept>>,
@@ -196,10 +201,17 @@ impl ConnState {
             signal: Condvar::new(),
             sink,
             outbox: Mutex::new(Outbox::default()),
+            alarm: OnceLock::new(),
             pending_accept: Mutex::new(None),
             held: Mutex::new(None),
             error: Mutex::new(None),
         })
+    }
+
+    /// Have the connection wake `alarm` whenever its next timer moves
+    /// earlier. Without one, it is ticked on its owner's schedule.
+    pub(crate) fn set_alarm(&self, alarm: Arc<Alarm>) {
+        let _ = self.alarm.set(alarm);
     }
 
     fn fail(&self, kind: io::ErrorKind) {
@@ -327,7 +339,13 @@ impl ConnState {
     /// seeing a hole and then data from beyond it, would answer every
     /// segment with a duplicate ACK and fast-retransmit its way through the
     /// transfer. The re-entrant call only queues; the outermost sender sends.
+    ///
+    /// Whatever made the segments may also have moved the connection's next
+    /// timer, which the tick thread learns here.
     pub(crate) fn emit(&self, conn: MutexGuard<'_, Conn>, segs: Vec<Vec<u8>>) {
+        if let Some(alarm) = self.alarm.get() {
+            alarm.arm(conn.next_deadline());
+        }
         let mut out = self.outbox.lock().expect("poisoned");
         out.segs.extend(segs);
         drop(conn);
@@ -638,7 +656,7 @@ pub(crate) fn tick_conn(state: &Arc<ConnState>) -> bool {
     // segments from the peer do, and `deliver` wakes the waiters for those.
     // What a timer can do is end the connection, or move it on to another
     // state; waking every waiter on every tick regardless would wake each
-    // thread blocked on any connection of the stack ten times a second.
+    // thread blocked on any connection of the stack at every timer of any.
     if changed {
         state.signal.notify_all();
     }
