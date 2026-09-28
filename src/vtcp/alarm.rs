@@ -2,8 +2,8 @@
 //!
 //! The drivers (`vclient`, `slirp`) run every connection's timers from one
 //! thread. Polling on a fixed interval fires each timer up to that
-//! interval late, which for a delayed ACK (40 ms) or an Early Retransmit (a
-//! quarter of an RTT) is most of the timer. Instead the thread sleeps until
+//! interval late, which for a delayed ACK (40 ms) or RACK's reordering timer
+//! (a quarter of an RTT) is most of the timer. Instead the thread sleeps until
 //! the earliest deadline, and a connection whose deadline moves earlier
 //! than that (data sent, a delayed ACK armed) wakes it.
 

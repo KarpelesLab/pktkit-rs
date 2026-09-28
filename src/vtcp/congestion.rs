@@ -7,37 +7,28 @@
 //! the window per round trip against a delayed-ACK receiver without
 //! letting one stretch ACK burst the window open.
 
-/// Pluggable congestion-control trait.
+/// Pluggable congestion control: the window, and how it grows and shrinks.
 ///
-/// The connection treats this as an opaque controller; it only cares about
-/// the current send window and a handful of events.
+/// Loss recovery is the connection's: it detects losses (RACK, or
+/// duplicate ACKs without SACK), decides when a recovery episode starts
+/// and ends, paces the window down to ssthresh during it (RFC 6937), and
+/// undoes a response found spurious. The controller only says how much to
+/// cut and how fast to grow back.
 pub trait CongestionController: Send {
-    /// New (cumulative) ACK: `bytes_acked` bytes were freshly acknowledged.
-    fn on_ack(&mut self, bytes_acked: u32);
-    /// New (cumulative) ACK, with `flight_size` the bytes that were
-    /// outstanding before it. The connection calls this rather than
-    /// [`on_ack`](Self::on_ack): a flight well short of the window means
-    /// the sender was limited by the application or the receiver, not by
-    /// cwnd, and growing cwnd then would validate nothing (RFC 7661 §4.3,
-    /// RFC 5681 §3.1). The default ignores the flight.
-    fn on_new_ack(&mut self, bytes_acked: u32, flight_size: u32) {
-        let _ = flight_size;
-        self.on_ack(bytes_acked);
-    }
-    /// A duplicate ACK arrived. Returns true on the 3rd dup ACK (caller
-    /// should trigger fast retransmit).
-    fn on_dup_ack(&mut self) -> bool;
-    /// RTO fired; loss inferred via timeout.
-    fn on_timeout(&mut self);
-    /// RTO fired with `flight_size` bytes outstanding; the connection calls
-    /// this rather than [`on_timeout`](Self::on_timeout). `repeated` is set
-    /// when the segment had already been retransmitted by the timer, in
-    /// which case RFC 5681 §3.1 holds ssthresh where the first timeout put
-    /// it. The default ignores both.
-    fn on_retransmit_timeout(&mut self, flight_size: u32, repeated: bool) {
-        let _ = (flight_size, repeated);
-        self.on_timeout();
-    }
+    /// A cumulative ACK outside fast recovery: `bytes_acked` bytes were
+    /// newly delivered, with `flight_size` bytes outstanding before it. A
+    /// flight well short of the window means the sender was limited by
+    /// the application or the receiver, not by cwnd, and growing cwnd then
+    /// would validate nothing (RFC 7661 §4.3, RFC 5681 §3.1).
+    fn on_ack(&mut self, bytes_acked: u32, flight_size: u32);
+    /// A loss was detected with `flight_size` bytes outstanding: set
+    /// ssthresh. The connection then brings cwnd down to it.
+    fn on_loss(&mut self, flight_size: u32);
+    /// The retransmission timer fired with `flight_size` bytes outstanding:
+    /// set ssthresh, and cwnd to the loss window. `repeated` is set when
+    /// the segment had already been retransmitted by the timer, in which
+    /// case RFC 5681 §3.1 holds ssthresh where the first timeout put it.
+    fn on_retransmit_timeout(&mut self, flight_size: u32, repeated: bool);
     /// The SYN or SYN-ACK was lost and resent; the handshake has just
     /// completed. RFC 5681 §3.1 has data start from the loss window (one
     /// segment) with ssthresh untouched. The default does that as a
@@ -45,17 +36,6 @@ pub trait CongestionController: Send {
     fn on_handshake_loss(&mut self) {
         self.on_retransmit_timeout(0, true);
     }
-    /// Fast retransmit triggered; enter recovery.
-    fn on_fast_retransmit(&mut self, flight_size: u32, snd_nxt: u32);
-    /// A partial ACK during fast recovery (RFC 6582 §3.2 step 5):
-    /// `bytes_acked` bytes were acknowledged, but not everything outstanding
-    /// when recovery began, and the caller is retransmitting the next hole.
-    /// The default leaves the window alone.
-    fn on_partial_ack(&mut self, bytes_acked: u32) {
-        let _ = bytes_acked;
-    }
-    /// Recovery has completed (cumulative ACK passed `recovery_seq`).
-    fn exit_recovery(&mut self);
     /// The connection now sends segments of `mss` bytes: the path MTU
     /// turned out smaller than the handshake's MSS allowed. Not a loss
     /// signal, so the window stays; only the per-segment steps change. The
@@ -63,12 +43,18 @@ pub trait CongestionController: Send {
     fn set_mss(&mut self, mss: u32) {
         let _ = mss;
     }
-    /// Current congestion window in bytes.
-    fn send_window(&self) -> u32;
-    /// True while in fast recovery.
-    fn in_recovery(&self) -> bool;
-    /// The recovery point: the SND.NXT at entry to recovery.
-    fn recovery_seq(&self) -> u32;
+    /// Set cwnd: fast recovery reduces it an ACK at a time, and sets it to
+    /// ssthresh when done.
+    fn set_cwnd(&mut self, cwnd: u32);
+    /// The congestion window, in bytes.
+    fn cwnd(&self) -> u32;
+    /// The slow-start threshold, in bytes; `u32::MAX` until the first loss.
+    fn ssthresh(&self) -> u32;
+}
+
+/// RFC 6928's initial window, `min(10*MSS, max(2*MSS, 14600))`.
+pub fn initial_window(mss: u32) -> u32 {
+    (10 * mss).min((2 * mss).max(14600))
 }
 
 /// RFC 5681 NewReno: slow start, congestion avoidance, fast retransmit & recovery.
@@ -77,37 +63,21 @@ pub struct NewReno {
     cwnd: u32,
     ssthresh: u32,
     mss: u32,
-    dup_ack_cnt: u32,
-    recovery: bool,
-    recovery_seq: u32,
     /// Bytes acknowledged in congestion avoidance towards the next
     /// segment of growth (RFC 3465 §2.1's `bytes_acked`).
     ca_acked: u32,
 }
 
 impl NewReno {
-    /// Initial CWND per RFC 6928 (`min(10*MSS, max(2*MSS, 14600))`).
+    /// A controller for segments of `mss` bytes, starting from RFC 6928's
+    /// initial window.
     pub fn new(mss: u32) -> Self {
-        let mut initial = 10 * mss;
-        let alt = (2 * mss).max(14600);
-        if alt < initial {
-            initial = alt;
-        }
         Self {
-            cwnd: initial,
+            cwnd: initial_window(mss),
             ssthresh: u32::MAX,
             mss,
-            dup_ack_cnt: 0,
-            recovery: false,
-            recovery_seq: 0,
             ca_acked: 0,
         }
-    }
-
-    /// The slow-start threshold, in bytes; `u32::MAX` until the first loss.
-    #[cfg(test)]
-    pub fn ssthresh(&self) -> u32 {
-        self.ssthresh
     }
 }
 
@@ -117,16 +87,11 @@ fn slow_start_inc(bytes_acked: u32, mss: u32) -> u32 {
 }
 
 impl CongestionController for NewReno {
-    fn on_ack(&mut self, bytes_acked: u32) {
-        self.on_new_ack(bytes_acked, u32::MAX);
-    }
-
     fn set_mss(&mut self, mss: u32) {
         self.mss = mss.max(1);
     }
 
-    fn on_new_ack(&mut self, bytes_acked: u32, flight_size: u32) {
-        self.dup_ack_cnt = 0;
+    fn on_ack(&mut self, bytes_acked: u32, flight_size: u32) {
         if !cwnd_limited(self.cwnd, self.ssthresh, self.mss, flight_size) {
             return;
         }
@@ -145,61 +110,31 @@ impl CongestionController for NewReno {
         }
     }
 
-    fn on_dup_ack(&mut self) -> bool {
-        self.dup_ack_cnt += 1;
-        if self.dup_ack_cnt == 3 && !self.recovery {
-            return true;
-        }
-        if self.recovery && self.dup_ack_cnt > 3 {
-            self.cwnd = self.cwnd.saturating_add(self.mss);
-        }
-        false
-    }
-
-    fn on_timeout(&mut self) {
-        self.on_retransmit_timeout(self.cwnd, false);
+    fn on_loss(&mut self, flight_size: u32) {
+        // RFC 5681 eq. (4): half the flight, not of cwnd, which may never
+        // have been filled.
+        self.ssthresh = (flight_size / 2).max(2 * self.mss);
+        self.ca_acked = 0;
     }
 
     fn on_retransmit_timeout(&mut self, flight_size: u32, repeated: bool) {
-        // RFC 5681 eq. (4): half the flight, not of cwnd, which may never
-        // have been filled.
         if !repeated {
-            self.ssthresh = (flight_size / 2).max(2 * self.mss);
+            self.on_loss(flight_size);
         }
         self.cwnd = self.mss;
         self.ca_acked = 0;
-        self.recovery = false;
-        self.dup_ack_cnt = 0;
-        self.recovery_seq = 0;
     }
 
-    fn on_fast_retransmit(&mut self, flight_size: u32, snd_nxt: u32) {
-        self.ssthresh = (flight_size / 2).max(2 * self.mss);
-        self.cwnd = self.ssthresh.saturating_add(3 * self.mss);
-        self.ca_acked = 0;
-        self.recovery = true;
-        self.recovery_seq = snd_nxt;
+    fn set_cwnd(&mut self, cwnd: u32) {
+        self.cwnd = cwnd.max(self.mss);
     }
 
-    fn on_partial_ack(&mut self, bytes_acked: u32) {
-        self.cwnd = deflate(self.cwnd, self.mss, bytes_acked);
-    }
-
-    fn exit_recovery(&mut self) {
-        self.cwnd = self.ssthresh;
-        self.recovery = false;
-        self.dup_ack_cnt = 0;
-        self.recovery_seq = 0;
-    }
-
-    fn send_window(&self) -> u32 {
+    fn cwnd(&self) -> u32 {
         self.cwnd
     }
-    fn in_recovery(&self) -> bool {
-        self.recovery
-    }
-    fn recovery_seq(&self) -> u32 {
-        self.recovery_seq
+
+    fn ssthresh(&self) -> u32 {
+        self.ssthresh
     }
 }
 
@@ -216,18 +151,6 @@ fn cwnd_limited(cwnd: u32, ssthresh: u32, mss: u32, flight: u32) -> bool {
     }
 }
 
-/// Partial window deflation, RFC 6582 §3.2 step 5: take back what the ACK
-/// says has left the network, and add one segment for the retransmission if a
-/// full one was acknowledged. The duplicate-ACK count is kept, so the
-/// inflation that follows carries on.
-fn deflate(cwnd: u32, mss: u32, bytes_acked: u32) -> u32 {
-    let mut cwnd = cwnd.saturating_sub(bytes_acked);
-    if bytes_acked >= mss {
-        cwnd = cwnd.saturating_add(mss);
-    }
-    cwnd.max(mss)
-}
-
 // --- HighSpeed TCP (RFC 3649) ----------------------------------------------
 
 const HS_LOW_WINDOW: u32 = 38; // segments
@@ -241,9 +164,6 @@ pub struct HighSpeed {
     cwnd: u32,
     ssthresh: u32,
     mss: u32,
-    dup_ack_cnt: u32,
-    recovery: bool,
-    recovery_seq: u32,
     /// Growth earned in congestion avoidance and not yet applied, in
     /// bytes: a(w) segments per window of bytes acknowledged, a fraction
     /// of a byte at a time.
@@ -254,26 +174,12 @@ impl HighSpeed {
     /// A controller for segments of `mss` bytes, starting from RFC 6928's
     /// initial window.
     pub fn new(mss: u32) -> Self {
-        let mut initial = 10 * mss;
-        let alt = (2 * mss).max(14600);
-        if alt < initial {
-            initial = alt;
-        }
         Self {
-            cwnd: initial,
+            cwnd: initial_window(mss),
             ssthresh: u32::MAX,
             mss,
-            dup_ack_cnt: 0,
-            recovery: false,
-            recovery_seq: 0,
             ca_credit: 0.0,
         }
-    }
-
-    /// The slow-start threshold, in bytes; `u32::MAX` until the first loss.
-    #[cfg(test)]
-    pub fn ssthresh(&self) -> u32 {
-        self.ssthresh
     }
 
     fn b(w: u32) -> f64 {
@@ -310,16 +216,11 @@ impl HighSpeed {
 }
 
 impl CongestionController for HighSpeed {
-    fn on_ack(&mut self, bytes_acked: u32) {
-        self.on_new_ack(bytes_acked, u32::MAX);
-    }
-
     fn set_mss(&mut self, mss: u32) {
         self.mss = mss.max(1);
     }
 
-    fn on_new_ack(&mut self, bytes_acked: u32, flight_size: u32) {
-        self.dup_ack_cnt = 0;
+    fn on_ack(&mut self, bytes_acked: u32, flight_size: u32) {
         if !cwnd_limited(self.cwnd, self.ssthresh, self.mss, flight_size) {
             return;
         }
@@ -341,59 +242,29 @@ impl CongestionController for HighSpeed {
         }
     }
 
-    fn on_dup_ack(&mut self) -> bool {
-        self.dup_ack_cnt += 1;
-        if self.dup_ack_cnt == 3 && !self.recovery {
-            return true;
-        }
-        if self.recovery && self.dup_ack_cnt > 3 {
-            self.cwnd = self.cwnd.saturating_add(self.mss);
-        }
-        false
-    }
-
-    fn on_timeout(&mut self) {
-        self.on_retransmit_timeout(self.cwnd, false);
+    fn on_loss(&mut self, flight_size: u32) {
+        self.ssthresh = self.decreased(flight_size);
+        self.ca_credit = 0.0;
     }
 
     fn on_retransmit_timeout(&mut self, flight_size: u32, repeated: bool) {
         if !repeated {
-            self.ssthresh = self.decreased(flight_size);
+            self.on_loss(flight_size);
         }
         self.cwnd = self.mss;
         self.ca_credit = 0.0;
-        self.recovery = false;
-        self.dup_ack_cnt = 0;
-        self.recovery_seq = 0;
     }
 
-    fn on_fast_retransmit(&mut self, flight_size: u32, snd_nxt: u32) {
-        self.ssthresh = self.decreased(flight_size);
-        self.cwnd = self.ssthresh.saturating_add(3 * self.mss);
-        self.ca_credit = 0.0;
-        self.recovery = true;
-        self.recovery_seq = snd_nxt;
+    fn set_cwnd(&mut self, cwnd: u32) {
+        self.cwnd = cwnd.max(self.mss);
     }
 
-    fn on_partial_ack(&mut self, bytes_acked: u32) {
-        self.cwnd = deflate(self.cwnd, self.mss, bytes_acked);
-    }
-
-    fn exit_recovery(&mut self) {
-        self.cwnd = self.ssthresh;
-        self.recovery = false;
-        self.dup_ack_cnt = 0;
-        self.recovery_seq = 0;
-    }
-
-    fn send_window(&self) -> u32 {
+    fn cwnd(&self) -> u32 {
         self.cwnd
     }
-    fn in_recovery(&self) -> bool {
-        self.recovery
-    }
-    fn recovery_seq(&self) -> u32 {
-        self.recovery_seq
+
+    fn ssthresh(&self) -> u32 {
+        self.ssthresh
     }
 }
 
@@ -401,38 +272,35 @@ impl CongestionController for HighSpeed {
 mod tests {
     use super::*;
 
+    fn both(mss: u32) -> [Box<dyn CongestionController>; 2] {
+        [Box::new(NewReno::new(mss)), Box::new(HighSpeed::new(mss))]
+    }
+
     #[test]
     fn slow_start_grows_per_ack() {
         let mut nr = NewReno::new(1460);
-        let initial = nr.send_window();
-        nr.on_ack(1460);
-        assert!(nr.send_window() > initial);
+        let initial = nr.cwnd();
+        nr.on_ack(1460, u32::MAX);
+        assert!(nr.cwnd() > initial);
     }
 
     #[test]
     fn timeout_collapses_cwnd_to_one_mss() {
-        let mut nr = NewReno::new(1460);
-        nr.on_timeout();
-        assert_eq!(nr.send_window(), 1460);
+        for mut cc in both(1460) {
+            cc.on_retransmit_timeout(30_000, false);
+            assert_eq!(cc.cwnd(), 1460);
+            assert_eq!(cc.ssthresh(), 15_000);
+        }
     }
 
     #[test]
-    fn third_dup_ack_triggers_fast_retransmit() {
-        let mut nr = NewReno::new(1460);
-        assert!(!nr.on_dup_ack());
-        assert!(!nr.on_dup_ack());
-        assert!(nr.on_dup_ack());
-    }
-
-    #[test]
-    fn fast_retransmit_then_exit() {
-        let mut nr = NewReno::new(1460);
-        nr.on_fast_retransmit(20_000, 50_000);
-        assert!(nr.in_recovery());
-        assert_eq!(nr.recovery_seq(), 50_000);
-        nr.exit_recovery();
-        assert!(!nr.in_recovery());
-        assert_eq!(nr.send_window(), nr.ssthresh());
+    fn loss_sets_ssthresh() {
+        for mut cc in both(1000) {
+            cc.set_cwnd(30_000);
+            cc.on_loss(30_000);
+            assert_eq!(cc.ssthresh(), 15_000);
+            assert_eq!(cc.cwnd(), 30_000, "cwnd is the connection's to bring down");
+        }
     }
 
     #[test]
@@ -442,7 +310,7 @@ mod tests {
         let mss = 1000;
         let mut hs = HighSpeed::new(mss);
         hs.cwnd = 4_000_000_000;
-        hs.on_fast_retransmit(hs.cwnd, 0);
+        hs.on_loss(hs.cwnd);
         assert_eq!(hs.ssthresh(), 3_600_000_000);
     }
 
@@ -460,7 +328,7 @@ mod tests {
 
         let mut hs = HighSpeed::new(mss);
         hs.cwnd = 30 * mss;
-        hs.on_fast_retransmit(20 * mss, 0);
+        hs.on_loss(20 * mss);
         assert_eq!(hs.ssthresh(), 10 * mss);
         let mut hs = HighSpeed::new(mss);
         hs.cwnd = 30 * mss;
@@ -472,16 +340,14 @@ mod tests {
     #[test]
     fn cwnd_grows_only_when_in_use() {
         let mss = 1000;
-        let controllers: [Box<dyn CongestionController>; 2] =
-            [Box::new(NewReno::new(mss)), Box::new(HighSpeed::new(mss))];
-        for mut cc in controllers {
-            let initial = cc.send_window();
+        for mut cc in both(mss) {
+            let initial = cc.cwnd();
             for _ in 0..100 {
-                cc.on_new_ack(mss, 2 * mss);
+                cc.on_ack(mss, 2 * mss);
             }
-            assert_eq!(cc.send_window(), initial);
-            cc.on_new_ack(mss, initial);
-            assert_eq!(cc.send_window(), initial + mss);
+            assert_eq!(cc.cwnd(), initial);
+            cc.on_ack(mss, initial);
+            assert_eq!(cc.cwnd(), initial + mss);
         }
     }
 
@@ -491,28 +357,26 @@ mod tests {
     #[test]
     fn byte_counting_keeps_growth_with_delayed_acks() {
         let mss = 1000;
-        let controllers: [Box<dyn CongestionController>; 2] =
-            [Box::new(NewReno::new(mss)), Box::new(HighSpeed::new(mss))];
-        for mut cc in controllers {
-            let w = cc.send_window();
+        for mut cc in both(mss) {
+            let w = cc.cwnd();
             for _ in 0..w / (2 * mss) {
-                cc.on_new_ack(2 * mss, w);
+                cc.on_ack(2 * mss, w);
             }
-            assert_eq!(cc.send_window(), 2 * w);
+            assert_eq!(cc.cwnd(), 2 * w);
             // A stretch ACK counts for two segments at most.
-            cc.on_new_ack(10 * mss, u32::MAX);
-            assert_eq!(cc.send_window(), 2 * w + 2 * mss);
+            cc.on_ack(10 * mss, u32::MAX);
+            assert_eq!(cc.cwnd(), 2 * w + 2 * mss);
         }
 
         let mut nr = NewReno::new(mss);
-        nr.on_fast_retransmit(40 * mss, 0);
-        nr.exit_recovery();
-        let w = nr.send_window();
+        nr.on_loss(40 * mss);
+        nr.set_cwnd(nr.ssthresh());
+        let w = nr.cwnd();
         assert_eq!(w, 20 * mss);
         for _ in 0..w / (2 * mss) {
-            nr.on_new_ack(2 * mss, w);
+            nr.on_ack(2 * mss, w);
         }
-        assert_eq!(nr.send_window(), w + mss);
+        assert_eq!(nr.cwnd(), w + mss);
     }
 
     #[test]
@@ -521,9 +385,9 @@ mod tests {
         let mut nr = NewReno::new(mss);
         let mut hs = HighSpeed::new(mss);
         for _ in 0..5 {
-            nr.on_ack(mss);
-            hs.on_ack(mss);
+            nr.on_ack(mss, u32::MAX);
+            hs.on_ack(mss, u32::MAX);
         }
-        assert_eq!(nr.send_window(), hs.send_window());
+        assert_eq!(nr.cwnd(), hs.cwnd());
     }
 }

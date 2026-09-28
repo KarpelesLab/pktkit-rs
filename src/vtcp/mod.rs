@@ -4,8 +4,8 @@
 //! Rust (it began as a port of the Go `vtcp` subpackage). It is IP-agnostic
 //! and Ethernet-agnostic — callers feed inbound segments via
 //! [`Conn::handle_segment`] and transmit whatever the connection returns.
-//! [`Conn::tick`] drives the RTO, Early Retransmit, persist, keepalive,
-//! FIN-WAIT-2 and TIME-WAIT timers; there is no background thread. Call it
+//! [`Conn::tick`] drives the RTO, RACK's reordering timer, the tail loss
+//! probe, persist, keepalive, FIN-WAIT-2 and TIME-WAIT timers; there is no background thread. Call it
 //! when [`Conn::next_deadline`] comes due: a timer fires only as precisely
 //! as it is driven.
 //!
@@ -14,9 +14,10 @@
 //! - RFC 6298: RTO smoothing + Karn's algorithm, with Linux's constants
 //!   (200 ms floor under the variance term, 1 s initial RTO).
 //! - RFC 5681: congestion control (slow start, congestion avoidance, fast
-//!   retransmit/recovery), with RFC 6582's NewReno partial-ACK handling,
-//!   RFC 3042 Limited Transmit and RFC 6928's initial window; cwnd grows
-//!   by bytes acknowledged (RFC 3465, L = 2).
+//!   retransmit/recovery) and RFC 6928's initial window; cwnd grows by
+//!   bytes acknowledged (RFC 3465, L = 2). Against a peer without SACK,
+//!   losses are found by three duplicate ACKs, with RFC 3042 Limited
+//!   Transmit and RFC 6582's NewReno partial-ACK handling.
 //! - RFC 1122 §4.2.3.2, RFC 5681 §4.2: delayed ACKs (40 ms, at least every
 //!   second full-sized segment, at once for anything out of order), with
 //!   Linux's quick-ACK and ping-pong modes.
@@ -24,10 +25,15 @@
 //! - RFC 7661 §4.3: no cwnd growth while the sender is application-limited.
 //! - RFC 7323: window scaling, timestamps (PAWS, and an RTT sample from
 //!   every ACK, weighed as its Appendix G suggests).
-//! - RFC 2018: SACK, and RFC 6675 SACK-based loss recovery.
+//! - RFC 2018: SACK, with RFC 6675's scoreboard and pipe.
+//! - RFC 8985: RACK-TLP. With SACK, losses are found by time rather than
+//!   by counting duplicates: a segment is lost once one sent after it has
+//!   been delivered and a reordering window (a quarter of the minimum RTT)
+//!   has passed, which repairs losses in small flights and lost
+//!   retransmissions alike, and rides out reordering. A tail loss probe
+//!   two round trips after the last ACK draws the feedback that shows a
+//!   loss at the end of a flight, which otherwise only the RTO would.
 //! - RFC 2883: D-SACK, reporting data received twice.
-//! - RFC 5827: Early Retransmit, for a flight too small to draw three
-//!   duplicate ACKs.
 //! - RFC 5961: challenge ACKs against blind RST, SYN and data injection,
 //!   rate-limited.
 //! - RFC 6191: a new SYN may reuse a 4-tuple in TIME-WAIT when its
@@ -66,6 +72,7 @@ pub(crate) mod conn;
 pub(crate) mod options;
 pub(crate) mod recvbuf;
 pub(crate) mod rto;
+pub(crate) mod scoreboard;
 pub(crate) mod secret;
 pub(crate) mod segment;
 pub(crate) mod sendbuf;

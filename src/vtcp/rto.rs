@@ -41,22 +41,16 @@ pub struct RtoState {
     time_seq: u32,
 }
 
-impl Default for RtoState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl RtoState {
     /// No sample yet: the RTO is [`DEFAULT_RTO`] (RFC 6298 §2.1).
-    pub fn new() -> Self {
+    pub fn new(now: Instant) -> Self {
         Self {
             srtt: Duration::ZERO,
             rttvar: Duration::ZERO,
             rto: DEFAULT_RTO,
             measured: false,
             timing: false,
-            time_sent: Instant::now(),
+            time_sent: now,
             time_seq: 0,
         }
     }
@@ -119,20 +113,20 @@ impl RtoState {
         self.srtt
     }
 
-    /// Mark a segment as in-flight for RTT measurement.
-    pub fn start_timing(&mut self, seq: u32) {
+    /// Mark a segment sent at `now` as in-flight for RTT measurement.
+    pub fn start_timing(&mut self, seq: u32, now: Instant) {
         if self.timing {
             return;
         }
         self.timing = true;
-        self.time_sent = Instant::now();
+        self.time_sent = now;
         self.time_seq = seq;
     }
 
-    /// If the ACK covers the timed segment, record the sample. Returns true
-    /// when a sample was taken.
-    pub fn ack_received(&mut self, ack: u32) -> bool {
-        match self.timed_rtt(ack) {
+    /// If the ACK, arriving at `now`, covers the timed segment, record the
+    /// sample. Returns true when a sample was taken.
+    pub fn ack_received(&mut self, ack: u32, now: Instant) -> bool {
+        match self.timed_rtt(ack, now) {
             Some(rtt) => {
                 self.sample(rtt);
                 true
@@ -141,14 +135,15 @@ impl RtoState {
         }
     }
 
-    /// If the ACK covers the timed segment, the round trip it took, for
-    /// the caller to [sample](Self::sample_of); timing stops either way.
-    pub fn timed_rtt(&mut self, ack: u32) -> Option<Duration> {
+    /// If the ACK, arriving at `now`, covers the timed segment, the round
+    /// trip it took, for the caller to [sample](Self::sample_of); timing
+    /// stops either way.
+    pub fn timed_rtt(&mut self, ack: u32, now: Instant) -> Option<Duration> {
         if !self.timing || !seq_after(ack, self.time_seq) {
             return None;
         }
         self.timing = false;
-        Some(self.time_sent.elapsed())
+        Some(now.saturating_duration_since(self.time_sent))
     }
 
     /// Karn's algorithm: drop the current sample on retransmit.
@@ -169,11 +164,10 @@ impl RtoState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::thread::sleep;
 
     #[test]
     fn first_sample_sets_srtt_and_rto() {
-        let mut r = RtoState::new();
+        let mut r = RtoState::new(Instant::now());
         r.sample(Duration::from_millis(100));
         assert_eq!(r.srtt(), Duration::from_millis(100));
         // RTO = SRTT + 4*RTTVAR = 100 + 4*50 = 300ms
@@ -182,7 +176,7 @@ mod tests {
 
     #[test]
     fn backoff_doubles_rto() {
-        let mut r = RtoState::new();
+        let mut r = RtoState::new(Instant::now());
         let before = r.rto();
         r.backoff();
         assert_eq!(r.rto(), before * 2);
@@ -190,7 +184,7 @@ mod tests {
 
     #[test]
     fn rto_floor_is_min_rto() {
-        let mut r = RtoState::new();
+        let mut r = RtoState::new(Instant::now());
         r.sample(Duration::from_micros(1));
         assert!(r.rto() >= MIN_RTO);
     }
@@ -199,7 +193,7 @@ mod tests {
     /// round trip must not bring the RTO down to it.
     #[test]
     fn rto_stays_clear_of_a_steady_rtt() {
-        let mut r = RtoState::new();
+        let mut r = RtoState::new(Instant::now());
         for _ in 0..100 {
             r.sample(Duration::from_millis(300));
         }
@@ -211,7 +205,7 @@ mod tests {
     /// up to the cap.
     #[test]
     fn initial_rto_and_cap() {
-        let mut r = RtoState::new();
+        let mut r = RtoState::new(Instant::now());
         assert_eq!(r.rto(), Duration::from_secs(1));
         for _ in 0..10 {
             r.backoff();
@@ -223,7 +217,7 @@ mod tests {
     /// sample a window does (RFC 7323 Appendix G).
     #[test]
     fn per_ack_samples_are_weighed_by_the_window() {
-        let (mut once, mut each) = (RtoState::new(), RtoState::new());
+        let (mut once, mut each) = (RtoState::new(Instant::now()), RtoState::new(Instant::now()));
         once.sample(Duration::from_millis(100));
         each.sample(Duration::from_millis(100));
         once.sample(Duration::from_millis(200));
@@ -236,19 +230,19 @@ mod tests {
 
     #[test]
     fn karns_invalidation() {
-        let mut r = RtoState::new();
-        r.start_timing(100);
+        let mut r = RtoState::new(Instant::now());
+        r.start_timing(100, Instant::now());
         r.invalidate_timing();
         // ACK after invalidation must not record a sample.
-        assert!(!r.ack_received(200));
+        assert!(!r.ack_received(200, Instant::now()));
     }
 
     #[test]
     fn ack_records_sample() {
-        let mut r = RtoState::new();
-        r.start_timing(100);
-        sleep(Duration::from_millis(5));
-        assert!(r.ack_received(101));
+        let mut r = RtoState::new(Instant::now());
+        let t0 = Instant::now();
+        r.start_timing(100, t0);
+        assert!(r.ack_received(101, t0 + Duration::from_millis(5)));
         assert!(r.srtt() > Duration::ZERO);
     }
 }

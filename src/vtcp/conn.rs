@@ -24,7 +24,8 @@ use super::options::{
     mss_option, sack_option, sack_perm_option, timestamp_option, wscale_option,
 };
 use super::recvbuf::RecvBuf;
-use super::rto::{MAX_RTO, RtoState};
+use super::rto::{DEFAULT_RTO, MAX_RTO, RtoState};
+use super::scoreboard::{DUP_THRESH, Delivery, Scoreboard, dsack_block};
 use super::segment::{Segment, flags};
 use super::sendbuf::SendBuf;
 use super::seqspace::{
@@ -64,8 +65,15 @@ pub const ORPHAN_RETRIES: u32 = 8;
 /// die out before a new one can take its 4-tuple. A new connection that
 /// needs the 4-tuple sooner can have it (see [`Conn::accepts_new_syn`]).
 pub const TIME_WAIT_DURATION: Duration = Duration::from_secs(60);
-/// Floor for the Early Retransmit delay, as in Linux's delayed ER.
-const ER_MIN_DELAY: Duration = Duration::from_millis(2);
+/// What a loss probe allows for the delayed ACK of a lone segment (RFC
+/// 8985 §7.2's TLP.max_ack_delay): Linux's, `TCP_RTO_MIN`, which covers
+/// the 200 ms some receivers delay by.
+const TLP_MAX_ACK_DELAY: Duration = Duration::from_millis(200);
+/// Slack on a loss probe of more than one segment, as Linux's
+/// `TCP_TIMEOUT_MIN`: at short round trips two SRTTs are within the jitter
+/// of the ACK path and the timer's own wake-up, and a probe would go out
+/// before ACKs already on their way.
+const TLP_MIN_SLACK: Duration = Duration::from_millis(2);
 /// How long an ACK may be delayed: Linux's `TCP_DELACK_MIN`, which is also
 /// where its adaptive delay sits for anything but a slow trickle. RFC 9293
 /// §3.8.6.3 allows up to 500 ms, and RFC 5681 §4.2 asks for less.
@@ -149,6 +157,19 @@ impl State {
     }
 }
 
+/// Where loss recovery stands (Linux's `icsk_ca_state`, less its CWR and
+/// Disorder, which nothing here needs apart).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaState {
+    /// Nothing deemed lost.
+    Open,
+    /// Fast recovery (RFC 6675 §5): losses found by RACK, or by duplicate
+    /// ACKs without SACK, are being repaired.
+    Recovery,
+    /// Recovery after a retransmission timeout (RFC 5681 §3.1).
+    Loss,
+}
+
 /// Choice of congestion controller.
 #[derive(Debug, Clone, Copy, Default)]
 pub enum CongestionKind {
@@ -196,7 +217,8 @@ pub struct ConnConfig {
     pub enable_timestamps: bool,
     /// Offer SACK (RFC 2018); used only if the peer offers it too. On by
     /// default: without it a receiver can only report the first hole in the
-    /// stream, and a sender repairs one hole per round trip.
+    /// stream, a sender repairs one hole per round trip, and neither RACK
+    /// nor the tail loss probe (RFC 8985), which need it, can run.
     pub enable_sack: bool,
     /// The congestion controller. HighSpeed by default.
     pub congestion: CongestionKind,
@@ -385,36 +407,39 @@ pub struct Conn {
     rto: RtoState,
     rto_deadline: std::option::Option<Instant>,
     retries: u32,
-    /// SND.NXT when the last RTO fired, while data sent before it is still
-    /// unacknowledged: go-back-N's limit. Everything below it counts as
-    /// lost (RFC 5681 §3.1, RFC 6298 §5): the send loop resends it from
-    /// HighRxt on, as cwnd allows, before any new data, so slow start
-    /// repairs a whole lost flight in a logarithmic number of round trips
-    /// rather than a hole per round trip.
-    rto_recover: std::option::Option<u32>,
-    /// RFC 6582's `recover` after a timeout: SND.NXT when the RTO fired.
-    /// Go-back-N ends once the cumulative ACK reaches it, but segments it
-    /// resent needlessly still draw duplicate ACKs there: only an ACK past
-    /// it shows new data getting through (§3.2 step 1). Until then
-    /// duplicates do not start fast retransmit.
-    timeout_recover: std::option::Option<u32>,
+    /// What is in flight, SACKed and deemed lost, segment by segment.
+    score: Scoreboard,
+    /// Where loss recovery stands.
+    ca: CaState,
+    /// RecoveryPoint (RFC 6675), RFC 6582's `recover`: SND.NXT when the
+    /// current, or last, recovery episode began. Whatever was sent before
+    /// it and is deemed lost is resent before new data, as the window
+    /// allows, so a lost flight is repaired in a few round trips, not a
+    /// hole per round trip.
+    recover: u32,
     /// Our SYN or SYN-ACK timed out and was resent. The data transfer then
     /// starts from the loss window (RFC 5681 §3.1), not the initial window.
     syn_lost: bool,
     /// When we last answered an invalid segment (a challenge ACK or an
     /// out-of-window duplicate), for the RFC 5961 §7 throttle.
     last_oow_ack: std::option::Option<Instant>,
-    /// Duplicate ACKs since the last new one.
+    /// Duplicate ACKs since the last new one, from a peer without SACK.
     dup_acks: u32,
-    /// HighRxt (RFC 6675): the end of the highest range retransmitted in the
-    /// current recovery, so each lost hole is resent once per episode.
-    high_rxt: u32,
-    /// Extra room beyond cwnd for Limited Transmit (RFC 3042): one segment
-    /// per duplicate ACK, for the first two.
-    limited_transmit: u32,
-    /// When a pending Early Retransmit goes out, unless a new ACK comes
-    /// first (RFC 5827 §6's delay against reordering).
-    er_deadline: std::option::Option<Instant>,
+    /// The segments those duplicates say left the network, in bytes
+    /// (Linux's Reno `sacked_out`).
+    reno_sacked: u32,
+    /// RACK's reordering timer (RFC 8985 §5.4): when what was sent before
+    /// the last delivered segment, and is not yet deemed lost, will be.
+    reo_deadline: std::option::Option<Instant>,
+    /// The tail loss probe timeout (RFC 8985 §7.2).
+    pto_deadline: std::option::Option<Instant>,
+    /// TLP.end_seq: SND.NXT when the probe in flight went out.
+    tlp_end: Option<u32>,
+    /// TLP.is_retrans: that probe resent the last segment.
+    tlp_retrans: bool,
+    /// An RTT sample came in since the last probe (RFC 8985 §7.3), so
+    /// probes cannot keep SRTT from following a longer path.
+    rtt_sampled: bool,
 
     // Delayed ACK (RFC 9293 §3.8.6.3, RFC 5681 §4.2).
     /// When the ACK held back for data received goes out on its own,
@@ -555,7 +580,7 @@ impl Conn {
     /// A connection in CLOSED, configured by `cfg`. Open it with
     /// [`connect`](Self::connect) or [`accept_syn`](Self::accept_syn).
     pub fn new(cfg: ConnConfig) -> Self {
-        let now = Instant::now();
+        let now = wall_clock();
         let rcv_shift = cfg.rcv_wscale();
         let mss = cfg.mss.max(1);
         let cc = make_cc(cfg.congestion, mss as u32);
@@ -576,17 +601,21 @@ impl Conn {
             mss,
             path_mss: u16::MAX,
             cc,
-            rto: RtoState::new(),
+            rto: RtoState::new(now),
             rto_deadline: None,
             retries: 0,
-            rto_recover: None,
-            timeout_recover: None,
+            score: Scoreboard::new(0, now),
+            ca: CaState::Open,
+            recover: 0,
             syn_lost: false,
             last_oow_ack: None,
             dup_acks: 0,
-            high_rxt: 0,
-            limited_transmit: 0,
-            er_deadline: None,
+            reno_sacked: 0,
+            reo_deadline: None,
+            pto_deadline: None,
+            tlp_end: None,
+            tlp_retrans: false,
+            rtt_sampled: false,
             delack_deadline: None,
             quick_acks: 0,
             pingpong: false,
@@ -641,7 +670,7 @@ impl Conn {
     /// everything it does from there takes the time from `self.now`.
     #[inline]
     fn clock(&mut self) -> Instant {
-        self.now = Instant::now();
+        self.now = wall_clock();
         self.now
     }
 
@@ -773,12 +802,11 @@ impl Conn {
     }
 
     /// Everything in flight was sent at an MSS the path cannot carry: mark
-    /// it lost and let the timeout-recovery loop resend it, cut to the new
-    /// size, from SND.UNA on as cwnd allows. What the peer SACKed got
-    /// through and stays. Unlike a timeout, no congestion is inferred, so
-    /// ssthresh and the RTO are left alone, and cwnd too outside fast
-    /// recovery; `timeout_recover` keeps
-    /// the duplicate ACKs the resends draw from starting fast retransmit.
+    /// it lost and resend it, cut to the new size, from SND.UNA on as cwnd
+    /// allows, as Linux's `tcp_simple_retransmit` does. What the peer
+    /// SACKed got through and stays. Unlike a timeout, no congestion is
+    /// inferred, so ssthresh and the RTO are left alone, and cwnd too
+    /// outside fast recovery.
     fn resend_after_mtu_drop(&mut self) {
         if !self.state.is_synchronized() {
             return;
@@ -788,23 +816,24 @@ impl Conn {
         };
         // A FIN alone is never too big. A zero window is the persist
         // timer's to probe, with segments already cut to the new size.
-        if sb.retransmit_data(1).is_none() || self.snd_wnd == 0 {
+        if sb.data_at(sb.una(), 1).is_empty() || self.snd_wnd == 0 {
             return;
         }
-        let (una, nxt) = (sb.una(), sb.nxt());
+        let nxt = sb.nxt();
         // Fast recovery gives way, as Linux's CA_Loss replaces CA_Recovery:
-        // its repairs would run from HighRxt past `recover` and at the old
-        // size. The loss it was recovering from has cut the window
-        // already; ending it just deflates cwnd to that.
-        if self.cc.in_recovery() {
-            self.cc.exit_recovery();
+        // the loss it was recovering from has cut the window already;
+        // ending it just brings cwnd down to that.
+        if self.ca == CaState::Recovery {
+            self.cc.set_cwnd(self.cc.ssthresh());
         }
-        self.rto_recover = Some(nxt);
-        self.timeout_recover = Some(nxt);
-        self.high_rxt = una;
+        self.score.mark_all_lost();
+        self.ca = CaState::Loss;
+        self.recover = nxt;
+        self.reno_sacked = 0;
         self.dup_acks = 0;
-        self.er_deadline = None;
-        self.limited_transmit = 0;
+        self.tlp_end = None;
+        self.pto_deadline = None;
+        self.reo_deadline = None;
         self.flush_send_queue();
     }
 
@@ -833,6 +862,7 @@ impl Conn {
         }
         let iss = self.new_iss();
         self.send_buf = Some(SendBuf::new(self.cfg.send_buf_size, iss));
+        self.score = Scoreboard::new(iss, self.now);
         self.recv_buf = Some(RecvBuf::new(0, self.cfg.recv_buf_size));
         self.state = State::SynSent;
 
@@ -850,7 +880,7 @@ impl Conn {
         };
         self.queue_seg(syn);
         self.send_buf.as_mut().unwrap().advance_sent(1); // SYN consumes 1 seq
-        self.rto.start_timing(iss);
+        self.rto.start_timing(iss, self.now);
         self.start_rto();
         self.take_outgoing()
     }
@@ -898,6 +928,7 @@ impl Conn {
         self.negotiate_options(&syn.options);
 
         self.send_buf = Some(SendBuf::new(self.cfg.send_buf_size, iss));
+        self.score = Scoreboard::new(iss, self.now);
         self.recv_buf = Some(RecvBuf::new(
             syn.seq.wrapping_add(1),
             self.cfg.recv_buf_size,
@@ -919,7 +950,7 @@ impl Conn {
         };
         self.queue_seg(synack);
         self.send_buf.as_mut().unwrap().advance_sent(1);
-        self.rto.start_timing(iss);
+        self.rto.start_timing(iss, self.now);
 
         self.syn_data = syn.payload.clone();
 
@@ -946,6 +977,7 @@ impl Conn {
             self.cfg.send_buf_size,
             our_iss.wrapping_add(1),
         ));
+        self.score = Scoreboard::new(our_iss.wrapping_add(1), self.now);
         self.recv_buf = Some(RecvBuf::new(remote_seq, self.cfg.recv_buf_size));
         // Seeds MAX.SND.WND too: at zero, every reordered older ACK would be
         // dropped until the next window update.
@@ -1271,6 +1303,8 @@ impl Conn {
         if let Some(s) = self.send_buf.as_mut() {
             s.advance_sent(1); // FIN consumes 1 seq
         }
+        let tsval = self.ts_now();
+        self.score.on_send(snd_nxt, 1, true, self.now, tsval);
         self.fin_queued = false;
         self.fin_sent = true;
         if self.rto_deadline.is_none() {
@@ -1327,11 +1361,12 @@ impl Conn {
             self.cc.on_handshake_loss();
             self.rto.reset_after_syn_loss();
         }
-        self.rto_recover = None;
-        self.timeout_recover = None;
+        self.ca = CaState::Open;
         self.dup_acks = 0;
+        self.reno_sacked = 0;
         if let Some(sb) = self.send_buf.as_ref() {
-            self.high_rxt = sb.una();
+            self.score = Scoreboard::new(sb.una(), self.now);
+            self.score.set_rack(self.sack_ok);
         }
     }
 
@@ -1656,7 +1691,7 @@ impl Conn {
             // scaled. Scaling it made the first real ACK look like a window
             // change, so it could not count as a duplicate.
             self.set_snd_wnd(seg.window as u32);
-            self.rto.ack_received(seg.ack);
+            self.rtt_sampled |= self.rto.ack_received(seg.ack, self.now);
             self.state = State::Established;
             self.handshake_done();
 
@@ -1721,7 +1756,7 @@ impl Conn {
         }
         self.send_buf.as_mut().unwrap().acknowledge(seg.ack);
         // The SYN-ACK's round trip, unless it was resent (Karn).
-        self.rto.ack_received(seg.ack);
+        self.rtt_sampled |= self.rto.ack_received(seg.ack, self.now);
         self.retries = 0;
         self.stop_rto();
         self.set_snd_wnd((seg.window as u32) << self.snd_wnd_shift);
@@ -2069,7 +2104,7 @@ impl Conn {
         if !self.cfg.autotune || !self.snd_nospace {
             return;
         }
-        let cwnd = self.cc.send_window();
+        let cwnd = self.cc.cwnd();
         let sb = self.send_buf.as_ref().unwrap();
         if sb.pending() >= self.mss as usize
             || sb.unacked() as u32 >= self.snd_wnd
@@ -2122,12 +2157,6 @@ impl Conn {
     fn set_snd_wnd(&mut self, wnd: u32) {
         self.snd_wnd = wnd;
         self.max_snd_wnd = self.max_snd_wnd.max(wnd);
-        if wnd == 0 {
-            // A pending Early Retransmit would go past the right edge. The
-            // receiver shutting its window explains the missing ACKs as
-            // well as a loss does, and the RTO still covers a real one.
-            self.er_deadline = None;
-        }
     }
 
     /// Process the ACK field. Returns false if the segment must be dropped
@@ -2148,125 +2177,206 @@ impl Conn {
         }
         // The window comes first: the flush below must see this segment's.
         let wnd_changed = self.update_send_window(seg);
-        if !seq_after(ack, una) {
-            // The scoreboard first: a retransmission below must see what
-            // this ACK reports.
-            let mut new_sack = false;
-            if self.sack_ok {
-                let blocks = get_sack_blocks(opts);
-                if !blocks.is_empty() {
-                    new_sack = self.send_buf.as_mut().unwrap().mark_sacked(&blocks);
-                }
-            }
-            // RFC 5681 §2: only an ACK of SND.UNA with data outstanding, no
-            // payload or FIN, and the same window is a duplicate. A window
-            // update is not a loss signal, and its window must be used. With
-            // SACK, RFC 6675 §2 counts one that reports data not SACKed
-            // before whatever its window: that is a segment arriving above a
-            // hole, even at a receiver whose window moves as its application
-            // reads.
-            //
-            // Nor is an ACK of a zero window: it is what a probe draws, and
-            // the receiver taking nothing says nothing about loss.
-            if ack == una
-                && una != snd_nxt
-                && (!wnd_changed || new_sack)
-                && self.snd_wnd > 0
-                && seg.payload.is_empty()
-                && !seg.has_flag(flags::FIN)
-            {
-                self.on_dup_ack(snd_nxt);
-            }
-            if wnd_changed {
-                if self.snd_wnd > 0 && self.persist_deadline.is_some() {
-                    self.stop_persist();
-                }
-                self.flush_send_queue();
-            }
-            return true;
-        }
-
+        let now = self.now;
+        let ecr = self.ts_echo(seg);
         let flight = self.send_buf.as_ref().unwrap().unacked() as u32;
-        let acked = self.send_buf.as_mut().unwrap().acknowledge(ack);
-        self.retries = 0;
-        self.dup_acks = 0;
-        self.er_deadline = None;
-        self.limited_transmit = 0;
-        // An ACK short of the recovery point means the segment after it was
-        // lost too. Resend it now; waiting would cost an RTO per hole.
-        let fast_partial = self.cc.in_recovery() && seq_before(ack, self.cc.recovery_seq());
-        let rto_partial = match self.rto_recover {
-            Some(r) if seq_before(ack, r) => true,
-            Some(_) => {
-                self.rto_recover = None;
-                false
-            }
-            None => false,
-        };
-        // RFC 6675 §5.1 would let a SACK sender start a new recovery once
-        // the ACK reaches the mark, but duplicates count here without new
-        // SACK information, so needless resends would still look like loss.
-        if self.timeout_recover.is_some_and(|r| seq_after(ack, r)) {
-            self.timeout_recover = None;
-        }
-        if fast_partial {
-            self.cc.on_partial_ack(acked);
-        } else {
-            // After a timeout this is slow start, which a partial ACK
-            // should keep growing.
-            self.cc.on_new_ack(acked, flight);
-        }
+        let advanced = seq_after(ack, una);
 
+        // The scoreboard: what this ACK says reached the receiver.
+        self.score.begin_ack();
+        let mut acked = 0;
+        let mut d = Delivery::default();
+        if advanced {
+            acked = self.send_buf.as_mut().unwrap().acknowledge(ack);
+            d = self.score.ack(ack, now, ecr);
+        }
+        let mut dsack = None;
+        let mut sack_seen = false;
         if self.sack_ok {
             let blocks = get_sack_blocks(opts);
             if !blocks.is_empty() {
-                self.send_buf.as_mut().unwrap().mark_sacked(&blocks);
-            }
-        }
-        if fast_partial && self.sack_ok {
-            // With SACK, the hole at SND.UNA may already have gone out this
-            // episode through retransmit_lost_hole; resending it would be
-            // spurious and spoil RTT timing. RFC 6675 §5 NextSeg: only what
-            // lies at or past HighRxt is due.
-            let una = self.send_buf.as_ref().unwrap().una();
-            if seq_after_eq(una, self.high_rxt) {
-                let _ = self.retransmit();
-            } else {
-                let _ = self.retransmit_lost_hole();
-            }
-        } else if fast_partial {
-            let _ = self.retransmit();
-        } else if rto_partial {
-            // The rest of what the timeout marked lost goes out from the
-            // send loop below, as far as the grown cwnd allows. Nothing
-            // below SND.UNA needs it any more.
-            let una = self.send_buf.as_ref().unwrap().una();
-            if seq_before(self.high_rxt, una) {
-                self.high_rxt = una;
+                sack_seen = true;
+                dsack = dsack_block(&blocks, ack);
+                let rest = &blocks[dsack.is_some() as usize..];
+                d.merge(self.score.sack(rest, now, ecr));
             }
         }
 
-        if self.snd_wnd > 0 && self.persist_deadline.is_some() {
+        // RFC 5681 §2: only an ACK of SND.UNA with data outstanding, no
+        // payload or FIN, and the same window is a duplicate. A window
+        // update is not a loss signal, and its window must be used. With
+        // SACK, RFC 6675 §2 counts one that reports data not SACKed before
+        // whatever its window: that is a segment arriving above a hole,
+        // even at a receiver whose window moves as its application reads.
+        //
+        // Nor is an ACK of a zero window: it is what a probe draws, and
+        // the receiver taking nothing says nothing about loss.
+        let bare = seg.payload.is_empty() && !seg.has_flag(flags::FIN);
+        let dup = !advanced
+            && ack == una
+            && una != snd_nxt
+            && (!wnd_changed || d.delivered > 0)
+            && self.snd_wnd > 0
+            && bare;
+
+        if advanced {
+            self.retries = 0;
+            self.sample_rtt(seg, flight);
+        }
+        // A duplicate of the loss probe itself, SACK-less: both copies
+        // arrived (RFC 8985 §7.4.2, case 2).
+        let probe_dup = !advanced && !sack_seen && !wnd_changed && bare;
+        self.tlp_on_ack(ack, dsack, probe_dup);
+        self.recover_on_ack(ack, advanced, acked, d, dsack.is_some(), dup, flight);
+
+        if self.snd_wnd > 0 && self.persist_deadline.is_some() && (advanced || wnd_changed) {
             self.stop_persist();
         }
-
-        self.sample_rtt(seg, flight);
-
-        if self.cc.in_recovery() && seq_after_eq(ack, self.cc.recovery_seq()) {
-            self.cc.exit_recovery();
-        }
-
-        if self.send_buf.as_ref().unwrap().unacked() > 0 {
-            self.start_rto();
-        } else {
-            self.stop_rto();
+        if advanced {
+            if self.send_buf.as_ref().unwrap().unacked() > 0 {
+                self.start_rto();
+            } else {
+                self.stop_rto();
+            }
         }
 
         self.flush_send_queue();
-        // After the flush, as Linux's tcp_check_space: only once what the
-        // buffer held has gone out does it show whether it ran dry.
-        self.sndbuf_expand();
+        if advanced {
+            // RFC 8985 §7.2: on an ACK of new data, too.
+            self.schedule_loss_probe();
+            // After the flush, as Linux's tcp_check_space: only once what
+            // the buffer held has gone out does it show whether it ran dry.
+            self.sndbuf_expand();
+        }
         true
+    }
+
+    /// TSecr of `seg`, if timestamps are on and it echoes one.
+    fn ts_echo(&self, seg: &Segment) -> Option<u32> {
+        if !self.ts_ok {
+            return None;
+        }
+        get_timestamp(&seg.options)
+            .map(|(_, ecr)| ecr)
+            .filter(|&e| e != 0)
+    }
+
+    /// Loss detection and the recovery state machine, for an ACK that
+    /// `advanced` SND.UNA to `ack` by `acked` bytes (the scoreboard counted
+    /// `d` newly delivered), with `flight` bytes outstanding before it.
+    #[allow(clippy::too_many_arguments)]
+    fn recover_on_ack(
+        &mut self,
+        ack: u32,
+        advanced: bool,
+        acked: u32,
+        d: Delivery,
+        dsack: bool,
+        dup: bool,
+        flight: u32,
+    ) {
+        let mss = self.mss as u32;
+        // Without SACK, each duplicate stands for a segment that left the
+        // network, as Linux's Reno emulation counts it: the pipe shrinks by
+        // a segment, which is Limited Transmit (RFC 3042) before recovery
+        // and RFC 5681's window inflation during it.
+        if !self.sack_ok {
+            if dup {
+                self.dup_acks += 1;
+                if self.ca != CaState::Loss {
+                    let unacked = self.send_buf.as_ref().unwrap().unacked() as u32;
+                    let holes = self.score.lost_bytes().max(mss);
+                    self.reno_sacked = (self.reno_sacked + mss).min(unacked.saturating_sub(holes));
+                }
+            } else if advanced {
+                self.dup_acks = 0;
+                // The duplicates stood for segments this ACK covers, less
+                // the one it was waiting for.
+                self.reno_sacked = self.reno_sacked.saturating_sub(acked.saturating_sub(mss));
+            }
+        }
+
+        let mut exiting = false;
+        if advanced && self.ca != CaState::Open && self.recovered(ack) {
+            // RFC 6675 §5: done once RecoveryPoint is acknowledged; without
+            // SACK, only past it (RFC 6582 §3.2 step 1 and §4.1: segments
+            // resent needlessly draw duplicates right at it).
+            if self.ca == CaState::Recovery {
+                self.cc.set_cwnd(self.cc.ssthresh());
+            }
+            self.ca = CaState::Open;
+            self.reno_sacked = 0;
+            exiting = true;
+        } else if advanced && self.ca == CaState::Recovery && !self.sack_ok {
+            // A partial ACK (RFC 6582 §3.2 step 5): the segment it stops at
+            // was lost too.
+            self.score.mark_head_lost();
+        }
+
+        // Growth, outside fast recovery: in slow start after a timeout too.
+        if advanced && self.ca != CaState::Recovery {
+            let bytes = if self.sack_ok { d.delivered } else { acked };
+            self.cc.on_ack(bytes, flight);
+        }
+
+        if self.sack_ok {
+            self.rack_detect(dsack, exiting);
+        } else if dup && self.dup_acks == DUP_THRESH && self.ca == CaState::Open {
+            // RFC 5681 §3.2: the third duplicate ACK.
+            self.score.mark_head_lost();
+        }
+        if self.ca == CaState::Open && self.score.lost_bytes() > 0 {
+            self.enter_recovery();
+        }
+    }
+
+    /// Whether an ACK up to `ack` ends the current recovery episode.
+    fn recovered(&self, ack: u32) -> bool {
+        if self.sack_ok {
+            seq_after_eq(ack, self.recover)
+        } else {
+            seq_after(ack, self.recover)
+        }
+    }
+
+    /// RACK (RFC 8985 §6.2 steps 4 and 5) after an ACK, or when the
+    /// reordering timer fires: mark what is overdue lost, and time the rest.
+    fn rack_detect(&mut self, dsack: bool, exiting: bool) {
+        let recovering = self.ca != CaState::Open;
+        let reo = self
+            .score
+            .reo_wnd(dsack, recovering, exiting, self.rto.srtt());
+        let (_, wait) = self.score.detect_loss(self.now, reo);
+        self.reo_deadline = wait.map(|w| self.now + w);
+    }
+
+    /// Enter fast recovery (RFC 6675 §5, RFC 5681 §3.2): something is
+    /// deemed lost.
+    fn enter_recovery(&mut self) {
+        let sb = self.send_buf.as_ref().unwrap();
+        let (flight, nxt) = (sb.unacked() as u32, sb.nxt());
+        self.cc.on_loss(flight);
+        self.cc.set_cwnd(self.cc.ssthresh());
+        self.recover = nxt;
+        self.ca = CaState::Recovery;
+        // RFC 8985 §7.1: a probe of the flight this recovery repairs is
+        // moot.
+        self.tlp_end = None;
+        self.pto_deadline = None;
+        // Fast retransmit (RFC 5681 §3.2 step 2, RFC 6675 §5 step 4.3):
+        // the first lost segment goes now, whatever the pipe.
+        let room = self.send_mss() as u32;
+        if self.snd_wnd > 0
+            && let Some((seq, len, fin)) = self.score.next_lost(room)
+        {
+            self.resend(seq, len, fin);
+        }
+    }
+
+    /// In fast recovery.
+    #[cfg(test)]
+    fn in_recovery(&self) -> bool {
+        self.ca == CaState::Recovery
     }
 
     /// Take the RTT samples an ACK that advanced SND.UNA offers: the timed
@@ -2276,7 +2386,7 @@ impl Conn {
     /// make ambiguous, since it carries a TSval of its own. `flight` is
     /// what was outstanding before the ACK.
     fn sample_rtt(&mut self, seg: &Segment, flight: u32) {
-        let timed = self.rto.timed_rtt(seg.ack);
+        let timed = self.rto.timed_rtt(seg.ack, self.now);
         let Some(rtt) = timed.or_else(|| self.ts_echo_rtt(seg)) else {
             return;
         };
@@ -2288,20 +2398,18 @@ impl Conn {
             1
         };
         self.rto.sample_of(rtt, per_window);
+        self.score.rtt_sample(rtt, self.now);
+        self.rtt_sampled = true;
     }
 
     /// The round trip the timestamp echoed in `seg` has made, if it has
     /// one: at least its age in whole milliseconds, and less than one more.
     /// Rounded up, not down: a sample never reads shorter than the path.
     fn ts_echo_rtt(&self, seg: &Segment) -> Option<Duration> {
-        if !self.ts_ok {
-            return None;
-        }
-        let (_, ecr) = get_timestamp(&seg.options)?;
-        // Zero is what a peer that has no TSval to echo sends (Linux reads
-        // it so too), and a wild echo reads as a huge (or negative) age.
+        let ecr = self.ts_echo(seg)?;
+        // A wild echo reads as a huge (or negative) age.
         let age = self.ts_now().wrapping_sub(ecr);
-        if ecr == 0 || age >= 1 << 20 {
+        if age >= 1 << 20 {
             return None;
         }
         // The TSval was taken in the millisecond `age` before this one:
@@ -2311,251 +2419,249 @@ impl Conn {
         Some(Duration::from_millis(u64::from(age)) + Duration::from_nanos(into_ms))
     }
 
-    fn on_dup_ack(&mut self, snd_nxt: u32) {
-        self.dup_acks += 1;
-        let threshold_reached = self.cc.on_dup_ack();
-        if self.cc.in_recovery() {
-            // A duplicate ACK means a segment left the network. With SACK,
-            // spend it on the next hole the scoreboard shows lost (RFC 6675
-            // §5 NextSeg rule 1): otherwise every hole after the first waits
-            // a round trip for its partial ACK. Failing that, RFC 5681 §3.2
-            // step 4: new data into the room cwnd inflation made.
-            if !self.retransmit_lost_hole() {
-                self.flush_send_queue();
-            }
-            return;
-        }
-        if self.timeout_recover.is_some() {
-            // SND.UNA has not passed `recover` from the last timeout, so these
-            // duplicates report losses that timeout recovery is already
-            // repairing, one partial ACK at a time, or segments go-back-N
-            // resent needlessly. Fast retransmit now would cut ssthresh
-            // twice for one loss event, inflate cwnd far past the single
-            // segment slow start restarted from, and resend yet more of
-            // what already arrived (RFC 6582 §3.2 step 1, §4).
-            //
-            // Their SACK blocks may show retransmissions arrived, which
-            // leaves room in cwnd for the send loop to resend more of what
-            // the timeout marked lost.
-            self.flush_send_queue();
-            return;
-        }
-        let sb = self.send_buf.as_ref().unwrap();
-        let flight = sb.unacked() as u32;
-        let mss = self.mss as u32;
-        // Early Retransmit (RFC 5827 §3.1): with fewer than four segments
-        // out and nothing new that may be sent, three duplicates can never
-        // arrive, and the loss would wait for the RTO. Retransmit after one
-        // fewer than there are segments outstanding.
-        let oseg = flight.div_ceil(mss);
-        let can_send_new = sb.pending() > 0 && self.snd_wnd > flight;
-        let early = oseg < 4 && !can_send_new && self.dup_acks >= oseg.saturating_sub(1).max(1);
-        // RFC 6675 §5 step 2: loss recovery also starts once the scoreboard
-        // alone shows the first unacknowledged segment lost (IsLost), as
-        // when one ACK SACKs several segments at once: waiting for a third
-        // duplicate could then mean waiting for the RTO.
-        let lost = self.sack_ok && sb.is_lost(sb.una(), 3, mss);
-        if threshold_reached || lost {
-            self.fast_retransmit(flight, snd_nxt);
-        } else if early {
-            // With so few duplicates, a segment merely reordered looks lost.
-            // Wait a quarter of an RTT for it (RFC 5827 §6, and Linux's
-            // delayed ER); a new ACK in the meantime cancels. tick() sends
-            // it.
-            if self.er_deadline.is_none() {
-                let delay = (self.rto.srtt() / 4).max(ER_MIN_DELAY);
-                self.er_deadline = Some(self.now + delay);
-            }
-        } else if self.dup_acks <= 2 {
-            // Limited Transmit (RFC 3042): a new segment for each of the
-            // first two duplicates keeps ACKs coming, so a small window can
-            // still reach the three that fast retransmit needs.
-            self.limited_transmit = self.dup_acks * mss;
-            self.flush_send_queue();
-        }
+    /// Bytes in flight: RFC 6675's pipe, less what a peer without SACK has
+    /// reported leaving the network with duplicate ACKs.
+    fn in_flight(&self) -> u32 {
+        self.score.pipe().saturating_sub(self.reno_sacked)
     }
 
-    /// Enter fast recovery (RFC 5681 §3.2) and resend the first hole.
-    fn fast_retransmit(&mut self, flight: u32, snd_nxt: u32) {
-        self.limited_transmit = 0;
-        self.er_deadline = None;
-        self.cc.on_fast_retransmit(flight, snd_nxt);
-        self.high_rxt = self.send_buf.as_ref().unwrap().una();
-        let _ = self.retransmit();
-    }
-
-    /// The Early Retransmit delay ran out with no new ACK: the segment
-    /// was lost after all, unless recovery has started since.
-    fn on_er_timeout(&mut self) {
-        self.er_deadline = None;
+    /// Arm the loss probe timeout (RFC 8985 §7.2), or disarm it where a
+    /// probe has no place: without SACK, during recovery, once anything is
+    /// SACKed (the reordering timer's business), or with nothing out.
+    fn schedule_loss_probe(&mut self) {
+        self.pto_deadline = None;
         let Some(sb) = self.send_buf.as_ref() else {
             return;
         };
-        if self.dup_acks == 0 || self.cc.in_recovery() || sb.unacked() == 0 || self.snd_wnd == 0 {
+        if !self.sack_ok
+            || self.ca != CaState::Open
+            || self.score.sacked_segs() > 0
+            || sb.unacked() == 0
+            || !self.state.is_synchronized()
+        {
             return;
         }
-        let (flight, snd_nxt) = (sb.unacked() as u32, sb.nxt());
-        self.fast_retransmit(flight, snd_nxt);
-    }
-
-    /// Resend the oldest unacknowledged data. Returns false when there is
-    /// none (at most the FIN is outstanding).
-    fn retransmit(&mut self) -> bool {
-        let room = self.send_mss();
-        let Some((seq, data)) = self
-            .send_buf
-            .as_ref()
-            .unwrap()
-            .retransmit_data(room)
-            .map(|(seq, d)| (seq, d.to_vec()))
-        else {
-            return false;
+        let srtt = self.rto.srtt();
+        let pto = if srtt.is_zero() {
+            DEFAULT_RTO
+        } else if sb.unacked() <= self.mss as usize {
+            // A lone segment's ACK may be delayed.
+            srtt * 2 + TLP_MAX_ACK_DELAY
+        } else {
+            srtt * 2 + TLP_MIN_SLACK
         };
-        self.send_retransmission(seq, data);
-        true
+        let mut at = self.now + pto;
+        if let Some(rto) = self.rto_deadline
+            && rto < at
+        {
+            at = rto;
+        }
+        self.pto_deadline = Some(at);
     }
 
-    /// Resend the next hole past HighRxt that the SACK scoreboard shows
-    /// lost. Returns false if there is none (or no SACK).
-    fn retransmit_lost_hole(&mut self) -> bool {
-        if !self.sack_ok {
-            return false;
-        }
-        let mss = self.mss as u32;
-        let room = self.send_mss();
-        let Some((seq, data)) = self
-            .send_buf
-            .as_ref()
-            .unwrap()
-            .lost_hole_from(self.high_rxt, room, 3, mss)
-            .map(|(seq, d)| (seq, d.to_vec()))
-        else {
-            return false;
+    /// The loss probe timeout expired (RFC 8985 §7.3): send one segment,
+    /// new data if there is any, else the last one again, to draw the ACK
+    /// that lets RACK see a tail loss, rather than wait for the RTO.
+    fn on_loss_probe(&mut self) {
+        self.pto_deadline = None;
+        let Some(sb) = self.send_buf.as_ref() else {
+            return;
         };
-        self.send_retransmission(seq, data);
-        true
+        let (unacked, pending, una) = (sb.unacked() as u32, sb.pending(), sb.una());
+        if unacked == 0 {
+            return;
+        }
+        if self.tlp_end.is_none()
+            && self.rtt_sampled
+            && self.ca == CaState::Open
+            && self.score.sacked_segs() == 0
+            && self.snd_wnd > 0
+            && self.state.is_synchronized()
+        {
+            let room = self.send_mss();
+            let rcv_room = self.snd_wnd.saturating_sub(unacked) as usize;
+            let n = room.min(pending).min(rcv_room);
+            if n > 0 {
+                self.send_new(n);
+                self.tlp_retrans = false;
+            } else if let Some((seq, len, fin)) = self.score.last(room as u32) {
+                self.resend(seq, len, fin);
+                self.tlp_retrans = true;
+            }
+            self.tlp_end = Some(self.send_buf.as_ref().unwrap().nxt());
+            self.rtt_sampled = false;
+        }
+        // The RTO, not another probe, is the last resort.
+        if seq_before(una, self.send_buf.as_ref().unwrap().nxt()) {
+            self.start_rto();
+        }
     }
 
-    fn send_retransmission(&mut self, seq: u32, data: Vec<u8>) {
-        let end = seq.wrapping_add(data.len() as u32);
-        if seq_after(end, self.high_rxt) {
-            self.high_rxt = end;
+    /// TLP recovery detection (RFC 8985 §7.4.2) for an ACK up to `ack`,
+    /// carrying `dsack` if any; `probe_dup` if it is a duplicate without
+    /// SACK blocks.
+    fn tlp_on_ack(&mut self, ack: u32, dsack: Option<SackBlock>, probe_dup: bool) {
+        let Some(end) = self.tlp_end else {
+            return;
+        };
+        if seq_before(ack, end) {
+            return;
         }
+        if !self.tlp_retrans {
+            self.tlp_end = None;
+        } else if dsack.is_some_and(|b| seq_before(b.left, end) && seq_after_eq(b.right, end)) {
+            // Case 1: the original and the probe both arrived.
+            self.tlp_end = None;
+        } else if seq_after(ack, end) {
+            // The probe repaired a loss: respond to it as to any other.
+            self.tlp_end = None;
+            if self.ca == CaState::Open {
+                let flight = self.send_buf.as_ref().unwrap().unacked() as u32;
+                self.cc.on_loss(flight);
+                self.cc.set_cwnd(self.cc.ssthresh());
+            }
+        } else if probe_dup {
+            // Case 2, from a receiver without D-SACK.
+            self.tlp_end = None;
+        }
+    }
+
+    /// The reordering timer expired (RFC 8985 §6.2 step 5): what it waited
+    /// on is lost unless an ACK came first.
+    fn on_reorder_timeout(&mut self) {
+        self.reo_deadline = None;
+        if !self.sack_ok || !self.state.is_synchronized() || self.send_buf.is_none() {
+            return;
+        }
+        self.rack_detect(false, false);
+        if self.ca == CaState::Open && self.score.lost_bytes() > 0 {
+            self.enter_recovery();
+        }
+        self.flush_send_queue();
+    }
+
+    /// Send `[seq, seq+len)` again, or the FIN at `seq` if `fin`.
+    fn resend(&mut self, seq: u32, len: u32, fin: bool) {
         let rcv_nxt = self.recv_buf.as_ref().unwrap().nxt();
+        let sb = self.send_buf.as_ref().unwrap();
+        let una = sb.una();
+        let payload = if fin {
+            Vec::new()
+        } else {
+            sb.data_at(seq, len as usize).to_vec()
+        };
+        if !fin && payload.is_empty() {
+            return;
+        }
+        let len = if fin { 1 } else { payload.len() as u32 };
         let mut seg = Segment {
             src_port: self.cfg.local_port,
             dst_port: self.cfg.remote_port,
             seq,
             ack: rcv_nxt,
+            flags: if fin {
+                flags::FIN | flags::ACK
+            } else {
+                flags::ACK | flags::PSH
+            },
+            window: self.rcv_window(),
+            payload,
+            ..Default::default()
+        };
+        self.add_options(&mut seg);
+        self.queue_seg(seg);
+        let tsval = self.ts_now();
+        self.score.on_retransmit(seq, len, self.now, tsval);
+        // Karn's algorithm: no timing of a segment that went twice.
+        self.rto.invalidate_timing();
+        // Linux re-arms the RTO for the first segment only: re-arming it
+        // for every retransmission would put off the timeout of a lost one
+        // for as long as recovery goes on.
+        if seq == una || self.rto_deadline.is_none() {
+            self.start_rto();
+        }
+    }
+
+    /// Resend what the scoreboard deems lost, lowest first, while the pipe
+    /// has room (RFC 6675 §5 NextSeg rule 1, RFC 8985's retransmissions).
+    fn retransmit_lost(&mut self) {
+        // A zero window is the persist timer's and the RTO's to probe.
+        if self.snd_wnd == 0 || !self.state.is_synchronized() {
+            return;
+        }
+        while self.in_flight() < self.cc.cwnd() {
+            let room = self.send_mss() as u32;
+            let Some((seq, len, fin)) = self.score.next_lost(room) else {
+                break;
+            };
+            // Nothing past the right edge but the first segment (Linux's
+            // tcp_retransmit_skb): the receiver would drop it.
+            let una = self.send_buf.as_ref().unwrap().una();
+            if seq != una && !seq_before(seq, una.wrapping_add(self.snd_wnd)) {
+                break;
+            }
+            self.resend(seq, len, fin);
+        }
+    }
+
+    /// Send `n` bytes of new data as one segment.
+    fn send_new(&mut self, n: usize) {
+        let opts = self.segment_options();
+        let data = self.send_buf.as_ref().unwrap().peek_unsent(n).to_vec();
+        if data.is_empty() {
+            return;
+        }
+        let snd_nxt = self.send_buf.as_ref().unwrap().nxt();
+        let rcv_nxt = self.recv_buf.as_ref().unwrap().nxt();
+        let seg = Segment {
+            src_port: self.cfg.local_port,
+            dst_port: self.cfg.remote_port,
+            seq: snd_nxt,
+            ack: rcv_nxt,
             flags: flags::ACK | flags::PSH,
             window: self.rcv_window(),
             payload: data,
+            options: opts,
             ..Default::default()
         };
-        self.add_options(&mut seg);
+        let len = seg.payload.len();
         self.queue_seg(seg);
-        self.rto.invalidate_timing();
-        self.start_rto();
-    }
-
-    /// Bytes counted against cwnd. Normally everything unacknowledged; in
-    /// timeout recovery, what the timeout marked lost has left the network
-    /// (RFC 5681 §3.1), so only what has been resent since and not SACKed,
-    /// plus anything new sent past `recover`, is still in it (Linux's
-    /// packets_out - lost_out - sacked_out + retrans_out).
-    fn in_flight(&self) -> u32 {
-        let sb = self.send_buf.as_ref().unwrap();
-        let Some(recover) = self.rto_recover else {
-            return sb.unacked() as u32;
-        };
-        let una = sb.una();
-        let resent_to = if seq_after(self.high_rxt, una) {
-            self.high_rxt
-        } else {
-            una
-        };
-        let resent = resent_to.wrapping_sub(una) - sb.sacked_between(una, resent_to);
-        let new = if seq_after(sb.nxt(), recover) {
-            sb.nxt().wrapping_sub(recover)
-        } else {
-            0
-        };
-        resent + new
-    }
-
-    /// Timeout recovery's go-back-N: resend what the timeout marked lost,
-    /// from HighRxt up, skipping what the receiver has SACKed since, while
-    /// cwnd has room. The FIN too, once the data before it has gone.
-    fn rto_retransmit(&mut self) {
-        let Some(recover) = self.rto_recover else {
-            return;
-        };
-        // A zero window is the persist timer's and the RTO's to probe.
-        if self.snd_wnd == 0 {
-            return;
+        self.send_buf.as_mut().unwrap().advance_sent(len);
+        let tsval = self.ts_now();
+        self.score
+            .on_send(snd_nxt, len as u32, false, self.now, tsval);
+        // Answering the peer's data within a delayed ACK's time (Linux's
+        // tcp_event_data_sent).
+        if self
+            .last_data_recv
+            .is_some_and(|t| self.now.saturating_duration_since(t) < DELAYED_ACK)
+        {
+            self.pingpong = true;
         }
-        while self.in_flight() < self.cc.send_window() {
-            let room = self.send_mss();
-            let sb = self.send_buf.as_ref().unwrap();
-            let from = if seq_after(self.high_rxt, sb.una()) {
-                self.high_rxt
-            } else {
-                sb.una()
-            };
-            if let Some((seq, data)) = sb.next_unsacked(from, room, recover) {
-                let data = data.to_vec();
-                self.send_retransmission(seq, data);
-                continue;
-            }
-            let fin_seq = sb.nxt().wrapping_sub(1);
-            if self.fin_sent
-                && !self.fin_acked()
-                && seq_before(fin_seq, recover)
-                && seq_before_eq(from, fin_seq)
-            {
-                self.resend_fin();
-                self.high_rxt = fin_seq.wrapping_add(1);
-            }
-            break;
+        self.rto.start_timing(snd_nxt, self.now);
+        if self.rto_deadline.is_none() {
+            self.start_rto();
         }
-    }
-
-    fn resend_fin(&mut self) {
-        // queue_fin advances NXT by 1, which a retransmit must not do.
-        let fin_seq = self.send_buf.as_ref().unwrap().nxt().wrapping_sub(1);
-        let rcv_nxt = self.recv_buf.as_ref().unwrap().nxt();
-        let mut seg = Segment {
-            src_port: self.cfg.local_port,
-            dst_port: self.cfg.remote_port,
-            seq: fin_seq,
-            ack: rcv_nxt,
-            flags: flags::FIN | flags::ACK,
-            window: self.rcv_window(),
-            ..Default::default()
-        };
-        self.add_options(&mut seg);
-        self.queue_seg(seg);
     }
 
     fn flush_send_queue(&mut self) {
         // Lost data before new data: the receiver can deliver nothing past
         // the first hole until it is filled.
-        self.rto_retransmit();
+        self.retransmit_lost();
+        let mut sent_new = false;
         loop {
             let pending = self.send_buf.as_ref().unwrap().pending();
             if pending == 0 {
                 break;
             }
-            let cc_wnd = self.cc.send_window().saturating_add(self.limited_transmit);
-            let cc_room = cc_wnd.saturating_sub(self.in_flight());
+            let cc_room = self.cc.cwnd().saturating_sub(self.in_flight());
             let unacked = self.send_buf.as_ref().unwrap().unacked() as u32;
             let rcv_room = self.snd_wnd.saturating_sub(unacked);
             if cc_room == 0 || rcv_room == 0 {
                 break;
             }
             let avail = cc_room.min(rcv_room) as usize;
-            let opts = self.segment_options();
-            let room = self.payload_room(&opts);
+            let room = self.send_mss();
             let n = avail.min(room).min(pending);
 
             // Sender SWS avoidance (RFC 9293 §3.8.6.2.1): avoid tiny
@@ -2578,44 +2684,8 @@ impl Conn {
             if !big_enough && self.send_buf.as_ref().unwrap().unacked() > 0 && !self.fin_queued {
                 break;
             }
-
-            let data: Vec<u8> = {
-                let s = self.send_buf.as_ref().unwrap();
-                let d = s.peek_unsent(n);
-                if d.is_empty() {
-                    break;
-                }
-                d.to_vec()
-            };
-
-            let snd_nxt = self.send_buf.as_ref().unwrap().nxt();
-            let rcv_nxt = self.recv_buf.as_ref().unwrap().nxt();
-            let seg = Segment {
-                src_port: self.cfg.local_port,
-                dst_port: self.cfg.remote_port,
-                seq: snd_nxt,
-                ack: rcv_nxt,
-                flags: flags::ACK | flags::PSH,
-                window: self.rcv_window(),
-                payload: data,
-                options: opts,
-                ..Default::default()
-            };
-            let len = seg.payload.len();
-            self.queue_seg(seg);
-            self.send_buf.as_mut().unwrap().advance_sent(len);
-            // Answering the peer's data within a delayed ACK's time
-            // (Linux's tcp_event_data_sent).
-            if self
-                .last_data_recv
-                .is_some_and(|t| self.now.saturating_duration_since(t) < DELAYED_ACK)
-            {
-                self.pingpong = true;
-            }
-            self.rto.start_timing(snd_nxt);
-            if self.send_buf.as_ref().unwrap().unacked() > 0 && self.rto_deadline.is_none() {
-                self.start_rto();
-            }
+            self.send_new(n);
+            sent_new = true;
         }
 
         if self.fin_queued
@@ -2631,6 +2701,7 @@ impl Conn {
             let unacked = self.send_buf.as_ref().unwrap().unacked() as u32;
             if self.snd_wnd > unacked {
                 self.queue_fin();
+                sent_new = true;
             } else if unacked == 0 && self.persist_deadline.is_none() {
                 self.start_persist();
             }
@@ -2646,6 +2717,10 @@ impl Conn {
             && self.persist_deadline.is_none()
         {
             self.start_persist();
+        }
+        if sent_new {
+            // RFC 8985 §7.2: after new data goes out.
+            self.schedule_loss_probe();
         }
     }
 
@@ -2747,10 +2822,9 @@ impl Conn {
                 next = Some(next.map_or(d, |n| n.min(d)));
             }
         };
-        if !self.closed {
-            consider(self.er_deadline);
-        }
         if live {
+            consider(self.reo_deadline);
+            consider(self.pto_deadline);
             consider(self.rto_deadline);
             consider(self.persist_deadline);
             consider(self.keepalive_deadline);
@@ -2781,13 +2855,20 @@ impl Conn {
     pub fn tick(&mut self) -> Vec<Vec<u8>> {
         let now = self.clock();
 
-        // Early Retransmit, ahead of the RTO: its retransmission restarts
-        // the RTO, which then has nothing to do.
-        if let Some(d) = self.er_deadline
+        let live = !self.closed && self.state != State::Closed;
+        // RACK's reordering timer and the loss probe, ahead of the RTO:
+        // what they send restarts it, and then it has nothing to do.
+        if let Some(d) = self.reo_deadline
             && now >= d
-            && !self.closed
+            && live
         {
-            self.on_er_timeout();
+            self.on_reorder_timeout();
+        }
+        if let Some(d) = self.pto_deadline
+            && now >= d
+            && live
+        {
+            self.on_loss_probe();
         }
         // RTO.
         if let Some(d) = self.rto_deadline
@@ -2874,14 +2955,38 @@ impl Conn {
         self.rto.backoff();
         self.rto.invalidate_timing();
         let synchronized = self.state.is_synchronized();
+        self.reo_deadline = None;
+        self.pto_deadline = None;
+        self.tlp_end = None;
         if synchronized {
             // Only the first timeout of a segment sets ssthresh (RFC 5681
             // §3.1); `retries` counts timeouts without an ACK in between. A
             // zero window does not count them, but its timeouts after the
             // first are probes, not new losses.
-            let repeated = self.retries > 1 || (zero_window && self.rto_recover.is_some());
-            let flight = self.send_buf.as_ref().map_or(0, |s| s.unacked() as u32);
+            let repeated = self.retries > 1 || (zero_window && self.ca == CaState::Loss);
+            let sb = self.send_buf.as_ref().unwrap();
+            let (flight, nxt) = (sb.unacked() as u32, sb.nxt());
             self.cc.on_retransmit_timeout(flight, repeated);
+            // A SYN or SYN-ACK alone is not a loss the data's repair has to
+            // track.
+            if !self.score.is_empty() {
+                // A receiver that still holds the first segment SACKed would
+                // have acknowledged it: it has dropped what it SACKed, and
+                // RFC 2018 §8 has the sender stop relying on any of it.
+                // Otherwise SACKs stay, as Linux keeps them: what the
+                // receiver holds need not go again.
+                if self.score.head_sacked() {
+                    self.score.clear_sacks();
+                }
+                if self.sack_ok {
+                    let reo = self.score.reo_wnd(false, true, false, self.rto.srtt());
+                    self.score.mark_lost_on_rto(self.now, reo);
+                } else {
+                    self.score.mark_all_lost();
+                }
+                self.ca = CaState::Loss;
+                self.recover = nxt;
+            }
         } else {
             // With only the SYN or SYN-ACK out there is no flight to halve:
             // ssthresh would drop to its 2-segment floor and hold the whole
@@ -2890,22 +2995,7 @@ impl Conn {
             self.syn_lost = true;
         }
         self.dup_acks = 0;
-        self.er_deadline = None;
-        self.limited_transmit = 0;
-        if let Some(sb) = self.send_buf.as_mut() {
-            sb.clear_sacked();
-            // A SYN or SYN-ACK alone is not a loss the data's repair has to
-            // track: left set, `recover` would outlive the handshake and
-            // have the first real loss's duplicate ACKs ignored.
-            if synchronized && sb.unacked() > 0 {
-                self.rto_recover = Some(sb.nxt());
-                self.timeout_recover = self.rto_recover;
-            }
-            // A new repair episode: everything from SND.UNA is due again,
-            // and a HighRxt left from an earlier one would hide the holes
-            // below it from the scan.
-            self.high_rxt = sb.una();
-        }
+        self.reno_sacked = 0;
 
         match self.state {
             State::SynSent => {
@@ -2929,15 +3019,11 @@ impl Conn {
             | State::FinWait1
             | State::Closing
             | State::LastAck => {
-                // Data before the FIN goes first; the FIN is resent on its own
-                // once only it is outstanding.
-                let resent = self.retransmit();
-                if !resent && self.fin_sent && !self.fin_acked() {
-                    self.resend_fin();
-                    let nxt = self.send_buf.as_ref().unwrap().nxt();
-                    if seq_before(self.high_rxt, nxt) {
-                        self.high_rxt = nxt;
-                    }
+                // RFC 6298 §5.4: the first unacknowledged segment, whatever
+                // the window; the rest follows as ACKs open cwnd.
+                let room = self.send_mss() as u32;
+                if let Some((seq, len, fin)) = self.score.head(room) {
+                    self.resend(seq, len, fin);
                 }
             }
             _ => {}
@@ -3000,9 +3086,11 @@ impl Conn {
         // SND.NXT behind a peer that took it but whose ACK was lost, and
         // our segments look stale to that peer.
         let sb = self.send_buf.as_ref().unwrap();
-        let (seq, payload) = match sb.retransmit_data(1) {
-            Some((seq, d)) => (seq, d.to_vec()),
-            None => (sb.una().wrapping_sub(1), Vec::new()),
+        let first = sb.data_at(sb.una(), 1);
+        let (seq, payload) = if first.is_empty() {
+            (sb.una().wrapping_sub(1), Vec::new())
+        } else {
+            (sb.una(), first.to_vec())
         };
         let rcv_nxt = self.recv_buf.as_ref().unwrap().nxt();
         let mut seg = Segment {
@@ -3279,7 +3367,8 @@ impl Conn {
         self.state = new_state;
         self.closed = new_state == State::Closed;
         self.stop_rto();
-        self.er_deadline = None;
+        self.reo_deadline = None;
+        self.pto_deadline = None;
         self.delack_deadline = None;
         self.stop_keepalive();
         self.stop_persist();
@@ -3316,6 +3405,16 @@ impl Conn {
     }
 }
 
+/// The time now. Tests move it on at will: RACK and TLP go by the time
+/// between events, which tests cannot wait out for real.
+#[inline]
+fn wall_clock() -> Instant {
+    #[cfg(test)]
+    return Instant::now() + tests::skew();
+    #[cfg(not(test))]
+    Instant::now()
+}
+
 impl Drop for Conn {
     fn drop(&mut self) {
         self.budget.release(self.grown);
@@ -3336,6 +3435,25 @@ mod tests {
     use super::*;
     use crate::vtcp::options::get_mss;
     use crate::vtcp::rto::DEFAULT_RTO;
+
+    thread_local! {
+        static SKEW: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
+    }
+
+    /// How far this thread's connections' clock is ahead of the real one.
+    pub(super) fn skew() -> Duration {
+        SKEW.with(|s| s.get())
+    }
+
+    /// Move this thread's connections' clock on by `d`.
+    fn advance(d: Duration) {
+        SKEW.with(|s| s.set(s.get() + d));
+    }
+
+    /// The time as this thread's connections see it.
+    fn test_now() -> Instant {
+        Instant::now() + skew()
+    }
 
     fn cfg(local: u16, remote: u16) -> ConnConfig {
         ConnConfig {
@@ -3511,9 +3629,14 @@ mod tests {
         c.tick()
     }
 
+    /// Let the RTO run out: time moves on by as much.
     fn fire_rto(c: &mut Conn) -> Vec<Vec<u8>> {
         assert!(c.rto_deadline.is_some(), "RTO not armed");
-        c.rto_deadline = Some(Instant::now());
+        advance(c.rto.rto());
+        c.rto_deadline = Some(test_now());
+        // Not a loss probe, nor RACK's timer, which would have gone first.
+        c.pto_deadline = None;
+        c.reo_deadline = None;
         c.tick()
     }
 
@@ -3794,7 +3917,7 @@ mod tests {
 
         let (_, pong) = server.write(b"pong");
         let edge_ack = client.handle_segment(&parse(&pong[0]));
-        let seg = parse(&edge_ack[0]);
+        let seg = parse(edge_ack.last().unwrap());
         assert_eq!(seg.payload.len(), 0);
         assert_eq!(
             seg.seq
@@ -4259,16 +4382,20 @@ mod tests {
                     for s in sides.iter_mut() {
                         s.conn.last_oow_ack = None;
                     }
+                    advance(Duration::from_micros(rng.below(20_000)));
                     let c = &mut sides[i].conn;
-                    let now = Instant::now();
+                    let now = test_now();
                     if c.rto_deadline.is_some() {
                         c.rto_deadline = Some(now);
                     }
                     if c.persist_deadline.is_some() {
                         c.persist_deadline = Some(now);
                     }
-                    if c.er_deadline.is_some() {
-                        c.er_deadline = Some(now);
+                    if c.reo_deadline.is_some() {
+                        c.reo_deadline = Some(now);
+                    }
+                    if c.pto_deadline.is_some() {
+                        c.pto_deadline = Some(now);
                     }
                     if c.delack_deadline.is_some() {
                         c.delack_deadline = Some(now);
@@ -4433,8 +4560,9 @@ mod tests {
         let ack = deliver(&mut client, &synack);
         deliver(&mut server, &ack);
         assert_eq!(server.state(), State::Established);
-        assert!(
-            client.rto_recover.is_none(),
+        assert_eq!(
+            client.ca,
+            CaState::Open,
             "timeout recovery outlived the SYN"
         );
         // After the lost SYN data starts from one segment. Stand in for the
@@ -4446,7 +4574,7 @@ mod tests {
         assert_eq!(segs.len(), 10);
         let dups = deliver(&mut server, &segs[1..]);
         let out = deliver(&mut client, &dups);
-        assert!(client.cc.in_recovery(), "no fast retransmit");
+        assert!(client.in_recovery(), "no fast retransmit");
         assert!(seqs(&out).contains(&parse(&segs[0]).seq));
     }
 
@@ -4477,13 +4605,13 @@ mod tests {
         deliver(&mut server, &ack);
         assert_eq!(server.state(), State::Established);
         let mss = server.mss as u32;
-        assert_eq!(server.cc.send_window(), mss, "loss window");
+        assert_eq!(server.cc.cwnd(), mss, "loss window");
         assert_eq!(server.rto.rto(), Duration::from_secs(3));
         stream_rounds(&mut server, &mut client, 4);
         assert!(
-            server.cc.send_window() >= 16 * mss,
+            server.cc.cwnd() >= 16 * mss,
             "not in slow start: cwnd {}",
-            server.cc.send_window() / mss
+            server.cc.cwnd() / mss
         );
     }
 
@@ -4498,7 +4626,7 @@ mod tests {
         let synack = server.accept_syn(&parse(&syn[0]));
         deliver(&mut client, &synack);
         assert_eq!(client.state(), State::Established);
-        assert_eq!(client.cc.send_window(), client.mss as u32);
+        assert_eq!(client.cc.cwnd(), client.mss as u32);
         let (_, segs) = client.write(&[1; 5000]);
         assert_eq!(segs.len(), 1, "one segment, not the initial window");
     }
@@ -4575,28 +4703,30 @@ mod tests {
         deliver(client, &acks);
     }
 
-    fn seqs(pkts: &[Vec<u8>]) -> Vec<u32> {
-        pkts.iter().map(|p| parse(p).seq).collect()
+    /// A connected pair whose round trips take `rtt`, timed by both ends:
+    /// the handshake's, and a round trip of data as [`warm_up`] sends.
+    fn rtt_pair(conf: impl Fn(u16, u16) -> ConnConfig, port: u16, rtt: Duration) -> (Conn, Conn) {
+        let mut client = Conn::new(conf(port, 80));
+        let mut server = Conn::new(conf(80, port));
+        let syn = client.connect();
+        advance(rtt / 2);
+        let synack = server.accept_syn(&parse(&syn[0]));
+        advance(rtt / 2);
+        let ack = deliver(&mut client, &synack);
+        advance(rtt / 2);
+        deliver(&mut server, &ack);
+        let (_, data) = client.write(&[0; 100]);
+        advance(rtt / 2);
+        let mut acks = deliver(&mut server, &data);
+        read_all(&mut server);
+        acks.extend(server.take_outgoing());
+        advance(rtt / 2);
+        deliver(&mut client, &acks);
+        (client, server)
     }
 
-    /// Three segments out, the first lost: only two duplicates can come
-    /// back, never the three fast retransmit waits for. RFC 5827 retransmits
-    /// on the second instead of leaving it to the RTO.
-    #[test]
-    fn early_retransmit_with_a_small_flight() {
-        let mut client = Conn::new(big(40220, 80));
-        let mut server = Conn::new(big(80, 40220));
-        drive_handshake(&mut client, &mut server);
-        warm_up(&mut client, &mut server);
-        let (_, segs) = client.write(&[5; 3000]);
-        assert_eq!(segs.len(), 3);
-        let dups = deliver(&mut server, &segs[1..]);
-        assert_eq!(dups.len(), 2);
-        assert!(deliver(&mut client, &dups).is_empty(), "ER is delayed");
-        let out = fire_er(&mut client);
-        assert_eq!(seqs(&out), vec![parse(&segs[0]).seq]);
-        deliver(&mut server, &out);
-        assert_eq!(read_all(&mut server).len(), 3000);
+    fn seqs(pkts: &[Vec<u8>]) -> Vec<u32> {
+        pkts.iter().map(|p| parse(p).seq).collect()
     }
 
     /// The first segment is lost and the duplicate ACKs for the rest are
@@ -4617,13 +4747,10 @@ mod tests {
 
         let rexmit = fire_rto(&mut client);
         assert_eq!(seqs(&rexmit), vec![parse(&segs[0]).seq]);
-        let cwnd = client.cc.send_window();
+        let cwnd = client.cc.cwnd();
         let out = deliver(&mut client, &late_dups);
-        assert!(
-            !client.cc.in_recovery(),
-            "fast recovery during RTO recovery"
-        );
-        assert_eq!(client.cc.send_window(), cwnd);
+        assert!(!client.in_recovery(), "fast recovery during RTO recovery");
+        assert_eq!(client.cc.cwnd(), cwnd);
         assert!(
             !seqs(&out).contains(&parse(&segs[0]).seq),
             "resent again, sent {:?}",
@@ -4653,14 +4780,13 @@ mod tests {
             .collect();
         let late_dups = deliver(&mut server, &arrived);
 
-        client.high_rxt = client.send_buf.as_ref().unwrap().nxt();
         let rexmit = fire_rto(&mut client);
         assert_eq!(seqs(&rexmit), vec![parse(&segs[0]).seq]);
-        let cwnd = client.cc.send_window();
+        let cwnd = client.cc.cwnd();
         let out = deliver(&mut client, &late_dups);
         assert!(out.is_empty(), "past cwnd, sent {:?}", seqs(&out));
-        assert!(!client.cc.in_recovery());
-        assert_eq!(client.cc.send_window(), cwnd);
+        assert!(!client.in_recovery());
+        assert_eq!(client.cc.cwnd(), cwnd);
 
         // The partial ACK the first retransmission draws stops at segment
         // 5: the go-back-N resend goes straight to it.
@@ -4675,7 +4801,7 @@ mod tests {
         let acks = deliver(&mut server, &out);
         assert_eq!(read_all(&mut server).len(), 10_000);
         assert!(deliver(&mut client, &acks).is_empty(), "hole resent twice");
-        assert!(client.rto_recover.is_none());
+        assert_eq!(client.ca, CaState::Open);
     }
 
     /// With SACK, an ACK reporting newly SACKed data is a duplicate even
@@ -4698,7 +4824,7 @@ mod tests {
             *d = seg.marshal();
         }
         let out = deliver(&mut client, &dups);
-        assert!(client.cc.in_recovery(), "no fast retransmit");
+        assert!(client.in_recovery(), "no fast retransmit");
         assert!(seqs(&out).contains(&parse(&segs[0]).seq));
     }
 
@@ -4718,18 +4844,209 @@ mod tests {
         // three.
         let dups = deliver(&mut server, &segs[1..4]);
         let out = deliver(&mut client, &dups[dups.len() - 1..]);
-        assert!(client.cc.in_recovery(), "no recovery on IsLost");
+        assert!(client.in_recovery(), "no recovery on IsLost");
         assert_eq!(seqs(&out)[0], parse(&segs[0]).seq);
 
-        // Two segments' worth SACKed is not yet enough.
-        let mut client = Conn::new(big(40242, 80));
-        let mut server = Conn::new(big(80, 40242));
-        drive_handshake(&mut client, &mut server);
-        warm_up(&mut client, &mut server);
+        // Two segments SACKed are not yet enough: RACK gives the first a
+        // quarter of the round trip to turn up (RFC 8985 §6.2 step 4).
+        let rtt = Duration::from_millis(100);
+        let (mut client, mut server) = rtt_pair(big, 40242, rtt);
         let (_, segs) = client.write(&[8; 10_000]);
+        advance(rtt / 2);
         let dups = deliver(&mut server, &segs[1..3]);
+        advance(rtt / 2);
         deliver(&mut client, &dups[dups.len() - 1..]);
-        assert!(!client.cc.in_recovery());
+        assert!(!client.in_recovery());
+        assert!(client.reo_deadline.is_some(), "reordering timer");
+    }
+
+    // --- RACK-TLP (RFC 8985) ---------------------------------------------
+
+    /// Let whatever timer is due by now run (RACK's, the loss probe's,
+    /// the RTO's), without moving it forward.
+    fn tick_due(c: &mut Conn) -> Vec<Vec<u8>> {
+        c.tick()
+    }
+
+    /// Segment 0 of ten lost, 1 and 2 SACKed a round trip later: fewer
+    /// than DupThresh and no reordering seen, so RACK gives segment 0 a
+    /// quarter of the minimum RTT on top of the round trip, and then
+    /// retransmits it without waiting for the RTO or a third duplicate.
+    #[test]
+    fn rack_marks_a_loss_once_the_reordering_window_passes() {
+        let rtt = Duration::from_millis(100);
+        let (mut client, mut server) = rtt_pair(big, 40700, rtt);
+        let (_, segs) = client.write(&[8; 10_000]);
+        advance(rtt / 2);
+        let dups = deliver(&mut server, &segs[1..3]);
+        advance(rtt / 2);
+        assert!(deliver(&mut client, &dups).is_empty());
+        let due = client.reo_deadline.expect("reordering timer");
+        // Due a quarter RTT after the round trip of segment 0, which went
+        // out together with segments 1 and 2.
+        let wait = due.saturating_duration_since(test_now());
+        assert!(
+            wait > Duration::from_millis(20) && wait <= Duration::from_millis(26),
+            "{wait:?}"
+        );
+        advance(Duration::from_millis(10));
+        assert!(tick_due(&mut client).is_empty(), "not yet");
+        advance(Duration::from_millis(20));
+        let out = tick_due(&mut client);
+        assert_eq!(
+            seqs(&out)[..1],
+            [parse(&segs[0]).seq],
+            "RACK retransmission"
+        );
+        assert!(client.in_recovery());
+        assert_eq!(client.retries, 0, "no RTO");
+    }
+
+    /// The same, but segment 0 was only reordered: it arrives within the
+    /// window, so nothing is resent, no recovery starts, and RACK learns
+    /// the path reorders.
+    #[test]
+    fn reordering_within_the_window_is_not_loss() {
+        let rtt = Duration::from_millis(100);
+        let (mut client, mut server) = rtt_pair(big, 40701, rtt);
+        let (_, segs) = client.write(&[8; 10_000]);
+        advance(rtt / 2);
+        let mut acks = deliver(&mut server, &segs[1..3]);
+        advance(Duration::from_millis(10));
+        acks.extend(deliver(&mut server, &segs[..1]));
+        acks.extend(deliver(&mut server, &segs[3..]));
+        acks.extend(delack_expired(&mut server));
+        advance(rtt / 2);
+        let out = deliver(&mut client, &acks);
+        let resent: Vec<u32> = seqs(&out)
+            .into_iter()
+            .filter(|&s| seq_before(s, parse(&segs[9]).seq + 1000))
+            .collect();
+        assert!(resent.is_empty(), "resent {resent:?}");
+        assert!(!client.in_recovery());
+        assert!(client.score.reordering_seen());
+        assert_eq!(client.reo_deadline, None);
+        advance(rtt);
+        assert!(
+            tick_due(&mut client)
+                .iter()
+                .all(|p| parse(p).payload.is_empty())
+        );
+    }
+
+    /// Three SACKed segments show the loss at once while no reordering has
+    /// been seen (RFC 8985 §6.2 step 4's DupThresh).
+    #[test]
+    fn three_sacked_segments_mark_the_loss_at_once() {
+        let rtt = Duration::from_millis(100);
+        let (mut client, mut server) = rtt_pair(big, 40702, rtt);
+        let (_, segs) = client.write(&[8; 10_000]);
+        advance(rtt / 2);
+        let dups = deliver(&mut server, &segs[1..4]);
+        advance(rtt / 2);
+        let out = deliver(&mut client, &dups);
+        assert!(client.in_recovery());
+        assert_eq!(seqs(&out)[0], parse(&segs[0]).seq);
+    }
+
+    /// The last two segments of a flight are lost. No ACK will ever show
+    /// it, and before RACK-TLP only the RTO found it. The loss probe goes
+    /// out two SRTTs after the last ACK instead, resending the last
+    /// segment; its SACK has RACK find the one before it lost, and fast
+    /// recovery repairs it: no timeout.
+    #[test]
+    fn tail_loss_probe_recovers_without_an_rto() {
+        let rtt = Duration::from_millis(100);
+        let (mut client, mut server) = rtt_pair(big, 40703, rtt);
+        let data: Vec<u8> = (0..10_000u32).map(|i| (i * 3) as u8).collect();
+        let (_, segs) = client.write(&data);
+        advance(rtt / 2);
+        let mut acks = deliver(&mut server, &segs[..8]);
+        acks.extend(delack_expired(&mut server));
+        advance(rtt / 2);
+        deliver(&mut client, &acks);
+        let pto = client.pto_deadline.expect("loss probe armed");
+        let rto = client.rto_deadline.unwrap();
+        assert!(pto < rto, "the probe comes before the RTO");
+        let wait = pto.saturating_duration_since(test_now());
+        assert!(wait >= 2 * client.rto.srtt(), "{wait:?}");
+
+        advance(wait);
+        let probe = tick_due(&mut client);
+        assert_eq!(seqs(&probe), vec![parse(&segs[9]).seq], "the last segment");
+        assert_eq!(
+            client.tlp_end,
+            Some(client.send_buf.as_ref().unwrap().nxt())
+        );
+        advance(rtt / 2);
+        let acks = deliver(&mut server, &probe);
+        advance(rtt / 2);
+        let mut out = deliver(&mut client, &acks);
+        if out.is_empty() {
+            // One SACKed segment: RACK waits out its reordering window.
+            advance(
+                client
+                    .reo_deadline
+                    .unwrap()
+                    .saturating_duration_since(test_now()),
+            );
+            out = tick_due(&mut client);
+        }
+        assert_eq!(seqs(&out), vec![parse(&segs[8]).seq]);
+        advance(rtt / 2);
+        let acks = deliver(&mut server, &out);
+        advance(rtt / 2);
+        deliver(&mut client, &acks);
+        assert_eq!(read_all(&mut server), data);
+        assert_eq!(client.retries, 0, "no RTO");
+        assert_eq!(client.send_buf.as_ref().unwrap().unacked(), 0);
+    }
+
+    /// A probe for a flight of one segment also allows for a delayed ACK
+    /// (RFC 8985 §7.2); and none is scheduled without SACK.
+    #[test]
+    fn loss_probe_timing() {
+        let rtt = Duration::from_millis(50);
+        let (mut client, _server) = rtt_pair(big, 40704, rtt);
+        client.write(&[1; 500]);
+        let wait = client
+            .pto_deadline
+            .unwrap()
+            .saturating_duration_since(test_now());
+        let srtt = client.rto.srtt();
+        let want = (2 * srtt + TLP_MAX_ACK_DELAY).min(client.rto.rto());
+        assert!(
+            wait.abs_diff(want) < Duration::from_millis(1),
+            "{wait:?} vs {want:?}"
+        );
+
+        let (mut client, _server) = rtt_pair(|l, r| big(l, r).enable_sack(false), 40705, rtt);
+        client.write(&[1; 500]);
+        assert_eq!(client.pto_deadline, None);
+    }
+
+    /// A loss probe of new data counts as a probe too: only one at a time,
+    /// and the RTO is the last resort after it.
+    #[test]
+    fn loss_probe_sends_new_data_first() {
+        let rtt = Duration::from_millis(100);
+        let (mut client, _server) = rtt_pair(big, 40706, rtt);
+        let (_, segs) = client.write(&[2; 30_000]);
+        assert_eq!(segs.len(), 10, "cwnd holds back the rest");
+        let next = parse(&segs[9]).seq + 1000;
+        advance(
+            client
+                .pto_deadline
+                .unwrap()
+                .saturating_duration_since(test_now()),
+        );
+        let probe = tick_due(&mut client);
+        assert_eq!(seqs(&probe), vec![next]);
+        assert_eq!(client.pto_deadline, None);
+        assert!(client.rto_deadline.is_some());
+        // No second probe while the first is out.
+        client.pto_deadline = Some(test_now());
+        assert!(tick_due(&mut client).is_empty());
     }
 
     /// The MSS counts payload only; options come out of it (RFC 6691 §2,
@@ -4769,60 +5086,6 @@ mod tests {
         assert!(!get_sack_blocks(&parse(&out[0]).options).is_empty());
         fits(&out);
         fits(&fire_rto(&mut server));
-    }
-
-    /// The receiver closes its window while an Early Retransmit is pending.
-    /// A retransmission now would go past the right edge, and entering
-    /// recovery would halve cwnd for flow control, not loss.
-    #[test]
-    fn zero_window_cancels_early_retransmit() {
-        let mut client = Conn::new(big(40227, 80));
-        let mut server = Conn::new(big(80, 40227));
-        drive_handshake(&mut client, &mut server);
-        warm_up(&mut client, &mut server);
-        let (_, segs) = client.write(&[5; 3000]);
-        let dups = deliver(&mut server, &segs[1..]);
-        assert!(deliver(&mut client, &dups).is_empty());
-        assert!(client.er_deadline.is_some());
-        let una = client.send_buf.as_ref().unwrap().una();
-        let mut shut = bare_ack(&client, &server, una, 0);
-        shut.seq = parse(&dups[0]).seq;
-        client.handle_segment(&shut);
-        assert_eq!(client.snd_wnd, 0);
-        assert!(client.er_deadline.is_none(), "ER still pending");
-
-        // Nor does one that was already due fire into the closed window.
-        client.dup_acks = 2;
-        client.er_deadline = Some(Instant::now());
-        let out = client.tick();
-        assert!(out.is_empty(), "sent {:?}", seqs(&out));
-        assert!(!client.cc.in_recovery());
-    }
-
-    fn fire_er(c: &mut Conn) -> Vec<Vec<u8>> {
-        assert!(c.er_deadline.is_some(), "early retransmit not pending");
-        c.er_deadline = Some(Instant::now());
-        c.tick()
-    }
-
-    /// The first segment was only reordered: it arrives during the Early
-    /// Retransmit delay, and its ACK cancels the retransmission (RFC 5827
-    /// §6), which would have been spurious and halved cwnd.
-    #[test]
-    fn early_retransmit_waits_out_reordering() {
-        let mut client = Conn::new(big(40340, 80));
-        let mut server = Conn::new(big(80, 40340));
-        drive_handshake(&mut client, &mut server);
-        warm_up(&mut client, &mut server);
-        let (_, segs) = client.write(&[5; 3000]);
-        let dups = deliver(&mut server, &segs[1..]);
-        assert!(deliver(&mut client, &dups).is_empty());
-        let late = deliver(&mut server, &segs[..1]);
-        deliver(&mut client, &late);
-        assert!(client.er_deadline.is_none());
-        assert!(client.tick().is_empty());
-        assert!(!client.cc.in_recovery());
-        assert_eq!(read_all(&mut server).len(), 3000);
     }
 
     /// With the window full and more to send, the first two duplicates
@@ -5011,14 +5274,14 @@ mod tests {
         client.snd_wnd = 0;
         client.write(b"abcdef");
         let una = client.send_buf.as_ref().unwrap().una();
-        let cwnd = client.cc.send_window();
+        let cwnd = client.cc.cwnd();
         fire_persist(&mut client);
         for _ in 0..3 {
             let out = client.handle_segment(&bare_ack(&client, &server, una, 0));
             assert!(out.is_empty(), "retransmitted on a zero-window ACK");
         }
-        assert!(!client.cc.in_recovery());
-        assert_eq!(client.cc.send_window(), cwnd);
+        assert!(!client.in_recovery());
+        assert_eq!(client.cc.cwnd(), cwnd);
     }
 
     /// B fills A's receive window and A's application stops reading, and
@@ -5171,14 +5434,16 @@ mod tests {
     #[test]
     fn application_limited_sender_keeps_cwnd() {
         let (mut client, mut server) = established(40280);
-        let cwnd = client.cc.send_window();
+        let cwnd = client.cc.cwnd();
+        let mut out = Vec::new();
         for _ in 0..200 {
             let (_, data) = client.write(&[1; 100]);
-            let acks = deliver(&mut server, &data);
+            out.extend(data);
+            let acks = deliver(&mut server, &out);
             read_all(&mut server);
-            deliver(&mut client, &acks);
+            out = deliver(&mut client, &acks);
         }
-        assert_eq!(client.cc.send_window(), cwnd);
+        assert_eq!(client.cc.cwnd(), cwnd);
     }
 
     fn syn_with(opts: Vec<TcpOption>) -> Segment {
@@ -5455,17 +5720,17 @@ mod tests {
         let initial_cwnd = 10 * 536;
         let mut c = Conn::new(cfg(80, 40290));
         c.accept_syn(&syn_with(vec![mss_option(536)]));
-        assert_eq!(c.cc.send_window(), initial_cwnd, "passive open");
+        assert_eq!(c.cc.cwnd(), initial_cwnd, "passive open");
 
         let mut c = Conn::new(cfg(80, 40290));
         c.accept_cookie(&cookie_ack(), 5000, 536);
-        assert_eq!(c.cc.send_window(), initial_cwnd, "SYN cookie");
+        assert_eq!(c.cc.cwnd(), initial_cwnd, "SYN cookie");
 
         let mut c = Conn::new(cfg(80, 40290));
         c.connect();
         c.handle_segment(&syn_with(vec![mss_option(536)]));
         assert_eq!(c.state(), State::SynReceived);
-        assert_eq!(c.cc.send_window(), initial_cwnd, "simultaneous open");
+        assert_eq!(c.cc.cwnd(), initial_cwnd, "simultaneous open");
     }
 
     // Keepalive and persist are independent timers: a keepalive that
@@ -5990,7 +6255,7 @@ mod tests {
         assert_eq!((client.mss(), client.path_mtu()), (1440, 1500));
         let (_, flight) = client.write(&[7; 5000]);
         assert!(flight.iter().all(|p| v6_len(p) == 1500));
-        let cwnd = client.cc.send_window();
+        let cwnd = client.cc.cwnd();
         let rto = client.rto_deadline;
 
         let first = parse(&flight[0]);
@@ -6006,7 +6271,7 @@ mod tests {
         assert_eq!(client.mss(), 1440);
         let resent = client.on_icmp_too_big(1400, first.seq);
         assert_eq!((client.mss(), client.path_mtu()), (1340, 1400));
-        assert_eq!(client.cc.send_window(), cwnd, "cwnd cut for a MTU drop");
+        assert_eq!(client.cc.cwnd(), cwnd, "cwnd cut for a MTU drop");
         assert!(!resent.is_empty());
         assert!(resent.iter().all(|p| v6_len(p) <= 1400), "still too big");
         assert_eq!(parse(&resent[0]).seq, first.seq, "not from SND.UNA");
@@ -6148,7 +6413,7 @@ mod tests {
             out = Vec::new();
             for a in &acks {
                 out.extend(client.handle_segment(&parse(a)));
-                fast_recovery |= client.cc.in_recovery();
+                fast_recovery |= client.in_recovery();
             }
             let una = client.send_buf.as_ref().unwrap().una();
             if seq_after(una, recover.wrapping_add(200_000)) {
@@ -6251,12 +6516,12 @@ mod tests {
         }
         let (una, nxt) = (sb.una(), sb.nxt());
         assert!(seq_before_eq(una, nxt), "{}: SND.UNA past SND.NXT", ctx());
-        if let Some(r) = c.rto_recover {
-            assert!(seq_after_eq(r, una), "{}: recover below SND.UNA", ctx());
-            assert!(seq_before_eq(r, nxt), "{}: recover past SND.NXT", ctx());
+        if !c.closed && c.state != State::TimeWait {
+            c.score.check();
+            assert_eq!(c.score.end_seq(), nxt, "{}: scoreboard end", ctx());
             assert!(
-                seq_before_eq(c.high_rxt, r) || !seq_after(c.high_rxt, una),
-                "{}: HighRxt past recover",
+                c.score.is_empty() || c.score.head(u32::MAX).unwrap().0 == una,
+                "{}: scoreboard start",
                 ctx()
             );
             assert!(
@@ -6266,9 +6531,24 @@ mod tests {
                 c.in_flight(),
                 sb.unacked()
             );
-        }
-        if let Some(r) = c.timeout_recover {
-            assert!(seq_before_eq(r, nxt), "{}: recover past SND.NXT", ctx());
+            assert!(
+                c.ca != CaState::Open || c.score.lost_bytes() == 0,
+                "{}: losses left unrepaired",
+                ctx()
+            );
+            if c.ca != CaState::Open {
+                assert!(
+                    seq_before_eq(c.recover, nxt),
+                    "{}: recover past SND.NXT",
+                    ctx()
+                );
+            }
+            // Something always stands ready to act on what is out.
+            assert!(
+                sb.unacked() == 0 || c.rto_deadline.is_some() || c.persist_deadline.is_some(),
+                "{}: data out and no timer",
+                ctx()
+            );
         }
         if let Some(rb) = c.recv_buf.as_ref()
             && !c.closed
@@ -6453,12 +6733,14 @@ mod tests {
                     for s in sides.iter_mut() {
                         s.conn.last_oow_ack = None;
                     }
+                    advance(Duration::from_micros(rng.below(20_000)));
                     let c = &mut sides[i].conn;
-                    let now = Instant::now();
+                    let now = test_now();
                     for d in [
                         &mut c.rto_deadline,
                         &mut c.persist_deadline,
-                        &mut c.er_deadline,
+                        &mut c.reo_deadline,
+                        &mut c.pto_deadline,
                         &mut c.delack_deadline,
                     ] {
                         if d.is_some() {
@@ -6527,7 +6809,7 @@ mod tests {
         // The handshake timed a round trip of next to nothing, which would
         // pace the receiver's measurements; these tests stand for their
         // round trips with RcvSpace::backdate instead.
-        server.rto = RtoState::new();
+        server.rto = RtoState::new(test_now());
         (client, server)
     }
 
@@ -6642,7 +6924,7 @@ mod tests {
         let cap = client.send_buf.as_ref().unwrap().capacity();
         assert!(cap > 1 << 16, "not grown: {cap}");
         assert!(cap <= 1 << 20);
-        let cwnd = client.cc.send_window() as usize;
+        let cwnd = client.cc.cwnd() as usize;
         assert!(cap <= 2 * cwnd, "grown past twice cwnd: {cap} for {cwnd}");
 
         let (mut client, mut server) = tuned_pair(40506, tuned, usize::MAX);
@@ -6695,9 +6977,9 @@ mod tests {
         assert_eq!(client.next_deadline(), Some(rto));
         client.keepalive_deadline = Some(rto + Duration::from_secs(1));
         assert_eq!(client.next_deadline(), Some(rto));
-        client.er_deadline = Some(rto - Duration::from_millis(1));
-        assert_eq!(client.next_deadline(), client.er_deadline);
-        client.er_deadline = None;
+        client.reo_deadline = Some(rto - Duration::from_millis(1));
+        assert_eq!(client.next_deadline(), client.reo_deadline);
+        client.reo_deadline = None;
         let acks = deliver(&mut server, &data);
         deliver(&mut client, &acks);
         assert_eq!(client.next_deadline(), client.keepalive_deadline);
@@ -6721,7 +7003,7 @@ mod tests {
                 established(40611)
             };
             let (_, data) = client.write(&[1; 100]);
-            client.rto = RtoState::new();
+            client.rto = RtoState::new(test_now());
             let acks = deliver(&mut server, &data);
             deliver(&mut client, &acks);
             assert_eq!(client.rto.rto() < DEFAULT_RTO, ts, "timestamps {ts}");
