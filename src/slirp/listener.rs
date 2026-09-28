@@ -8,7 +8,7 @@
 
 use crate::Result;
 use crate::slirp::tcp_stream::{ConnState, Offer, TcpStream};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -41,6 +41,86 @@ impl Drop for HalfOpenSlot {
     }
 }
 
+/// Established connections a full accept queue had no room for, in the
+/// order they found it full, offered again as `accept` makes room (see
+/// `ConnState::complete_accept`).
+///
+/// Every tick offers each of them again, up to [`HALF_OPEN_CAP`] per
+/// listener, so the check that one is already listed is a set lookup rather
+/// than a walk of the list. An entry goes stale when its connection is
+/// dropped (its handshake ran out of time, or the peer reset it) or taken
+/// by a later offer; stale entries are skipped when room is offered and
+/// swept out once they make up most of the list, which keeps it within a
+/// small multiple of the live entries, themselves bounded by the half-open
+/// slots each holds.
+#[derive(Debug, Default)]
+pub(crate) struct Waiting {
+    order: VecDeque<Weak<ConnState>>,
+    /// The connections listed in `order`, by address. The `Weak` in
+    /// `order` keeps the allocation, so an address is not reused while it
+    /// is here.
+    listed: HashSet<usize>,
+    /// The length of `order` at which stale entries are next swept out.
+    sweep_at: usize,
+}
+
+impl Waiting {
+    fn id(state: &Weak<ConnState>) -> usize {
+        state.as_ptr() as usize
+    }
+
+    /// List `state`, unless it already is.
+    pub(crate) fn add(&mut self, state: &Arc<ConnState>) {
+        let weak = Arc::downgrade(state);
+        if !self.listed.insert(Self::id(&weak)) {
+            return;
+        }
+        self.order.push_back(weak);
+        if self.order.len() >= self.sweep_at.max(2 * HALF_OPEN_CAP) {
+            self.sweep();
+        }
+    }
+
+    /// Unlist `state`: its listener has taken or refused it.
+    pub(crate) fn remove(&mut self, state: &Arc<ConnState>) {
+        self.listed.remove(&(Arc::as_ptr(state) as usize));
+    }
+
+    /// The listed connection that has waited longest and is still alive.
+    pub(crate) fn pop(&mut self) -> Option<Arc<ConnState>> {
+        while let Some(weak) = self.order.pop_front() {
+            if !self.listed.remove(&Self::id(&weak)) {
+                continue;
+            }
+            if let Some(state) = weak.upgrade() {
+                return Some(state);
+            }
+        }
+        None
+    }
+
+    /// Drop the entries of connections that are gone or no longer listed.
+    fn sweep(&mut self) {
+        let listed = &mut self.listed;
+        self.order.retain(|w| {
+            let live = w.strong_count() > 0;
+            let id = Self::id(w);
+            if !live {
+                listed.remove(&id);
+            }
+            live && listed.contains(&id)
+        });
+        // Swept again only once the list has doubled: a sweep costs the
+        // list's length, so this keeps each addition's share constant.
+        self.sweep_at = 2 * self.order.len();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.order.len()
+    }
+}
+
 /// Key used to find a listener by (IP, port). Wildcard IP is `0.0.0.0`.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub(crate) struct ListenerKey {
@@ -57,9 +137,8 @@ pub struct Listener {
     queue: Mutex<VecDeque<Arc<ConnState>>>,
     /// Signalled when a connection is enqueued or the listener is closed.
     signal: Condvar,
-    /// Established connections the full queue had no room for, offered
-    /// again as `accept` makes room (see `ConnState::complete_accept`).
-    waiting: Mutex<VecDeque<Weak<ConnState>>>,
+    /// Established connections the full queue had no room for.
+    waiting: Mutex<Waiting>,
     /// Removes this listener from the stack's table; taken by the first close.
     unregister: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Connections still in their handshake; see [`HalfOpenSlot`].
@@ -82,7 +161,7 @@ impl Listener {
             closed: Arc::new(AtomicBool::new(false)),
             queue: Mutex::new(VecDeque::new()),
             signal: Condvar::new(),
-            waiting: Mutex::new(VecDeque::new()),
+            waiting: Mutex::new(Waiting::default()),
             unregister: Mutex::new(None),
             half_open: Arc::new(AtomicUsize::new(0)),
         }
@@ -111,16 +190,13 @@ impl Listener {
             return Offer::Refused;
         }
         if q.len() >= ACCEPT_QUEUE_CAP {
-            let mut w = self.waiting.lock().expect("poisoned");
             // Offered again on every tick until room appears: listed once.
-            let weak = Arc::downgrade(state);
-            if !w.iter().any(|x| x.ptr_eq(&weak)) {
-                w.push_back(weak);
-            }
+            self.waiting.lock().expect("poisoned").add(state);
             return Offer::Full;
         }
         q.push_back(state.clone());
         drop(q);
+        self.waiting.lock().expect("poisoned").remove(state);
         self.signal.notify_one();
         Offer::Taken
     }
@@ -151,13 +227,9 @@ impl Listener {
     /// Offer the room `accept` has just made to the connection that has
     /// waited longest for it, rather than leave it to the next tick.
     fn offer_waiting(&self) {
-        loop {
-            let next = self.waiting.lock().expect("poisoned").pop_front();
-            let Some(weak) = next else { return };
-            if let Some(state) = weak.upgrade() {
-                state.complete_accept();
-                return;
-            }
+        let next = self.waiting.lock().expect("poisoned").pop();
+        if let Some(state) = next {
+            state.complete_accept();
         }
     }
 
@@ -270,5 +342,44 @@ mod tests {
             "queued on a closed listener"
         );
         assert!(l.queue.lock().unwrap().is_empty());
+    }
+
+    /// Connections that waited for room and then went, whether dropped or
+    /// taken by a later offer, must not stay on the waiting list: a full
+    /// queue meeting a stream of handshakes would otherwise grow it, and
+    /// the walk that each offer made of it, without bound.
+    #[test]
+    fn the_waiting_list_forgets_connections_that_went() {
+        let l = Listener::new("10.0.0.1:80".parse().unwrap());
+        let queued: Vec<_> = (0..ACCEPT_QUEUE_CAP).map(|_| dummy_state()).collect();
+        for s in &queued {
+            assert_eq!(l.enqueue(s), Offer::Taken);
+        }
+        // Handshakes that found the queue full and then timed out.
+        for _ in 0..20_000 {
+            assert_eq!(l.enqueue(&dummy_state()), Offer::Full);
+        }
+        assert!(l.waiting.lock().unwrap().len() <= 2 * HALF_OPEN_CAP);
+        // Ones still alive, offered again on every tick: listed once.
+        let alive: Vec<_> = (0..HALF_OPEN_CAP).map(|_| dummy_state()).collect();
+        for _ in 0..3 {
+            for s in &alive {
+                assert_eq!(l.enqueue(s), Offer::Full);
+            }
+        }
+        assert!(l.waiting.lock().unwrap().len() <= 2 * HALF_OPEN_CAP);
+        // Room made on the side, and every one of them taken by an offer.
+        l.queue.lock().unwrap().clear();
+        for s in alive.iter().take(ACCEPT_QUEUE_CAP) {
+            assert_eq!(l.enqueue(s), Offer::Taken);
+        }
+        // The rest are the only ones left to offer room to.
+        let mut w = l.waiting.lock().unwrap();
+        let mut left = 0;
+        while let Some(s) = w.pop() {
+            assert!(alive[ACCEPT_QUEUE_CAP..].iter().any(|a| Arc::ptr_eq(a, &s)));
+            left += 1;
+        }
+        assert_eq!(left, HALF_OPEN_CAP - ACCEPT_QUEUE_CAP);
     }
 }

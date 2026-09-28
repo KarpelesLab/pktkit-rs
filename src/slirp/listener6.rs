@@ -8,13 +8,13 @@
 //! queue.
 
 use crate::Result;
-use crate::slirp::listener::{ACCEPT_QUEUE_CAP, HalfOpenSlot};
+use crate::slirp::listener::{ACCEPT_QUEUE_CAP, HalfOpenSlot, Waiting};
 use crate::slirp::tcp_stream::{ConnState, Offer, TcpStream};
 use std::collections::VecDeque;
 use std::io;
 use std::net::{Ipv6Addr, SocketAddrV6};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex};
 
 /// Key used to find a listener by (IP, port). Wildcard IP is `::`.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
@@ -32,9 +32,8 @@ pub struct Listener6 {
     queue: Mutex<VecDeque<Arc<ConnState>>>,
     /// Signalled when a connection is enqueued or the listener is closed.
     signal: Condvar,
-    /// Established connections the full queue had no room for, offered
-    /// again as `accept` makes room (see `ConnState::complete_accept`).
-    waiting: Mutex<VecDeque<Weak<ConnState>>>,
+    /// Established connections the full queue had no room for.
+    waiting: Mutex<Waiting>,
     /// Removes this listener from the stack's table; taken by the first close.
     unregister: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Connections still in their handshake; see [`HalfOpenSlot`].
@@ -57,7 +56,7 @@ impl Listener6 {
             closed: Arc::new(AtomicBool::new(false)),
             queue: Mutex::new(VecDeque::new()),
             signal: Condvar::new(),
-            waiting: Mutex::new(VecDeque::new()),
+            waiting: Mutex::new(Waiting::default()),
             unregister: Mutex::new(None),
             half_open: Arc::new(AtomicUsize::new(0)),
         }
@@ -86,16 +85,13 @@ impl Listener6 {
             return Offer::Refused;
         }
         if q.len() >= ACCEPT_QUEUE_CAP {
-            let mut w = self.waiting.lock().expect("poisoned");
             // Offered again on every tick until room appears: listed once.
-            let weak = Arc::downgrade(state);
-            if !w.iter().any(|x| x.ptr_eq(&weak)) {
-                w.push_back(weak);
-            }
+            self.waiting.lock().expect("poisoned").add(state);
             return Offer::Full;
         }
         q.push_back(state.clone());
         drop(q);
+        self.waiting.lock().expect("poisoned").remove(state);
         self.signal.notify_one();
         Offer::Taken
     }
@@ -127,13 +123,9 @@ impl Listener6 {
     /// Offer the room `accept` has just made to the connection that has
     /// waited longest for it, rather than leave it to the next tick.
     fn offer_waiting(&self) {
-        loop {
-            let next = self.waiting.lock().expect("poisoned").pop_front();
-            let Some(weak) = next else { return };
-            if let Some(state) = weak.upgrade() {
-                state.complete_accept();
-                return;
-            }
+        let next = self.waiting.lock().expect("poisoned").pop();
+        if let Some(state) = next {
+            state.complete_accept();
         }
     }
 
