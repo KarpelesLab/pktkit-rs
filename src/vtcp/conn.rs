@@ -592,6 +592,16 @@ pub struct Conn {
     /// cwnd held back data that was ready to go since the last ACK (for
     /// BBR's C.is_cwnd_limited).
     cwnd_blocked: bool,
+    /// Whether cwnd was in use over the current window of data, as Linux's
+    /// tcp_cwnd_validate keeps it: cwnd held data back, or the most the
+    /// window had in flight (`max_flight`), until SND.UNA passes
+    /// `cwnd_usage_seq`, SND.NXT when the window began. What the
+    /// controllers' growth goes by (RFC 7661): with pacing, what is in
+    /// flight when an ACK comes is short of cwnd even for a sender that
+    /// fills it, as the rest of the round's data waits on the pacer.
+    is_cwnd_limited: bool,
+    max_flight: u32,
+    cwnd_usage_seq: u32,
 
     // Pacing: a token bucket filled at the pacing rate, holding up to two
     // send quanta (see `pace_quantum`).
@@ -602,6 +612,16 @@ pub struct Conn {
     /// When enough credit will have built up to send again, while data is
     /// held back by pacing alone.
     pace_deadline: std::option::Option<Instant>,
+    /// The smoothed round trip pacing goes by: SRTT's average (1/8) of
+    /// the send-to-ACK times of the newest segment each ACK delivers,
+    /// taken to the nanosecond as Linux takes its SRTT to the microsecond.
+    /// The RTO's SRTT will not do: its samples between timed segments come
+    /// from timestamp echoes, rounded up to the millisecond, and a path
+    /// shorter than that would be paced at a fraction of what it carries.
+    pace_srtt: Option<Duration>,
+    /// How late the pacing timer was when data it held back was last
+    /// looked at again (see `pace_ready`).
+    pace_late: Duration,
 
     // Delayed ACK (RFC 9293 §3.8.6.3, RFC 5681 §4.2).
     /// When the ACK held back for data received goes out on its own,
@@ -788,9 +808,14 @@ impl Conn {
             last_data_sent: None,
             rtt_sampled: false,
             cwnd_blocked: false,
+            is_cwnd_limited: false,
+            max_flight: 0,
+            cwnd_usage_seq: 0,
             pace_credit: 0.0,
             pace_stamp: now,
             pace_deadline: None,
+            pace_srtt: None,
+            pace_late: Duration::ZERO,
             delack_deadline: None,
             quick_acks: 0,
             pingpong: false,
@@ -2284,14 +2309,15 @@ impl Conn {
     /// in it has been sent with room to spare in both windows. Against a
     /// peer that does not read, or a full cwnd, a larger buffer would only
     /// hold more data waiting. Less than a segment left unsent is the tail
-    /// that sender SWS avoidance holds back, not a window's doing.
+    /// that sender SWS avoidance holds back, not a window's doing; nor is
+    /// what waits on the pacer, which will go within the round trip.
     fn sndbuf_expand(&mut self) {
         if !self.cfg.autotune || !self.snd_nospace {
             return;
         }
         let cwnd = self.cc.cwnd();
         let sb = self.send_buf.as_ref().unwrap();
-        if sb.pending() >= self.mss as usize
+        if (sb.pending() >= self.mss as usize && self.pace_deadline.is_none())
             || sb.unacked() as u32 >= self.snd_wnd
             || self.in_flight() >= cwnd
         {
@@ -2389,6 +2415,9 @@ impl Conn {
             }
         }
         let rs = self.score.rate_sample();
+        if let Some(r) = self.score.ack_rtt() {
+            self.pace_srtt = Some(self.pace_srtt.map_or(r, |s| (s * 7 + r) / 8));
+        }
 
         // RFC 5681 §2: only an ACK of SND.UNA with data outstanding, no
         // payload or FIN, and the same window is a duplicate. A window
@@ -2577,7 +2606,8 @@ impl Conn {
         // set cwnd for it.
         if advanced && self.ca != CaState::Recovery && !undone && !model {
             let bytes = if self.sack_ok { d.delivered } else { acked };
-            let a = self.ack_info(bytes, flight, rtt, ack, rs, delivered, 0);
+            let use_ = self.cwnd_use(flight);
+            let a = self.ack_info(bytes, use_, rtt, ack, rs, delivered, 0);
             self.cc.on_ack(&a);
         }
         // RFC 7661: what the path carried, sampled outside loss recovery
@@ -3338,7 +3368,10 @@ impl Conn {
 
     fn flush_send_queue(&mut self) {
         // Anything held back by pacing is looked at again now.
-        self.pace_deadline = None;
+        self.pace_late = self
+            .pace_deadline
+            .take()
+            .map_or(Duration::ZERO, |d| self.now.saturating_duration_since(d));
         let pending = self.send_buf.as_ref().unwrap().pending();
         if self.cc.model_based() && (pending > 0 || self.score.lost_bytes() > 0) {
             let idle = self.in_flight() == 0 && self.score.rate().is_app_limited();
@@ -3432,6 +3465,35 @@ impl Conn {
             // RFC 8985 §7.2: after new data goes out.
             self.schedule_loss_probe();
         }
+        self.cwnd_validate();
+    }
+
+    /// Note, after sending what may be sent, whether cwnd held anything
+    /// back (Linux's tcp_cwnd_validate; see `is_cwnd_limited`).
+    fn cwnd_validate(&mut self) {
+        let sb = self.send_buf.as_ref().unwrap();
+        let (una, nxt, unacked) = (sb.una(), sb.nxt(), sb.unacked() as u32);
+        let waiting = sb.pending() > 0 || self.score.lost_bytes() > 0;
+        let limited = waiting && self.in_flight().saturating_add(self.mss as u32) > self.cc.cwnd();
+        if !seq_before(una, self.cwnd_usage_seq)
+            || limited
+            || (!self.is_cwnd_limited && unacked > self.max_flight)
+        {
+            self.is_cwnd_limited = limited;
+            self.max_flight = unacked;
+            self.cwnd_usage_seq = nxt;
+        }
+    }
+
+    /// The flight a controller is to judge cwnd's use by, for an ACK that
+    /// found `flight` outstanding: cwnd itself if it held data back this
+    /// window, else the most the window had out.
+    fn cwnd_use(&self, flight: u32) -> u32 {
+        if self.is_cwnd_limited {
+            flight.max(self.cc.cwnd())
+        } else {
+            flight.max(self.max_flight)
+        }
     }
 
     // --- Pacing ---------------------------------------------------------------
@@ -3447,7 +3509,8 @@ impl Conn {
     /// outstanding, if more) per SRTT, doubled while cwnd is under half
     /// of ssthresh so slow start can still double it each round trip, and
     /// 1.2 times after, a little ahead of the ACK clock. None before a
-    /// round trip has been measured: there is nothing to pace by.
+    /// round trip has been measured: there is nothing to pace by. See
+    /// `pace_srtt` for the round trip.
     fn pace_rate(&self) -> Option<u64> {
         if !self.pacing_on() {
             return None;
@@ -3455,7 +3518,7 @@ impl Conn {
         if let Some(r) = self.cc.pacing_rate() {
             return Some(r.max(1));
         }
-        let srtt = self.rto.srtt();
+        let srtt = self.pace_srtt.unwrap_or_else(|| self.rto.srtt());
         if srtt.is_zero() {
             return None;
         }
@@ -3479,15 +3542,19 @@ impl Conn {
     }
 
     /// Whether pacing lets a segment go now. The credit grows at the
-    /// pacing rate to two quanta: one to send, one more to make up for a
-    /// timer that fired late, without which a coarse clock would cap the
-    /// rate below what was asked. A sender idle for a while may thus burst
-    /// two quanta, no more.
+    /// pacing rate to two quanta, and more by what the pacing timer was
+    /// late (up to a round trip): data held back that long would have been
+    /// sent had the timer been on time, and a host whose timers slip by a
+    /// few milliseconds would otherwise pace a slow flow at a fraction of
+    /// its rate. A sender idle for a while may burst two quanta, no more.
     fn pace_ready(&mut self) -> bool {
         let Some(rate) = self.pace_rate() else {
             return true;
         };
-        let cap = 2.0 * self.pace_quantum(rate);
+        let late = self
+            .pace_late
+            .min(self.pace_srtt.unwrap_or_else(|| self.rto.srtt()));
+        let cap = 2.0 * self.pace_quantum(rate) + rate as f64 * late.as_secs_f64();
         let dt = self.now.saturating_duration_since(self.pace_stamp);
         self.pace_stamp = self.now;
         self.pace_credit = (self.pace_credit + rate as f64 * dt.as_secs_f64()).min(cap);
@@ -3663,13 +3730,15 @@ impl Conn {
         {
             self.on_loss_probe();
         }
-        // Pacing released what it held back.
+        // Pacing released what it held back (the flush takes the deadline,
+        // and how late it is).
         if let Some(d) = self.pace_deadline
             && now >= d
         {
-            self.pace_deadline = None;
             if live && self.state.is_synchronized() && self.send_buf.is_some() {
                 self.flush_send_queue();
+            } else {
+                self.pace_deadline = None;
             }
         }
         // RTO.
@@ -8553,6 +8622,82 @@ mod tests {
         assert_eq!(all.len(), 10, "the whole initial window at once");
         assert_eq!(client.pace_deadline, None);
         c.abort();
+    }
+
+    /// A round trip far under the timestamp clock's millisecond: pacing
+    /// goes by the send-to-ACK time, not by an SRTT of echoes rounded up
+    /// to the millisecond, which would pace at a fraction of the path.
+    #[test]
+    fn pacing_goes_by_a_precise_round_trip() {
+        let conf = |l, r| paced(l, r).enable_timestamps(true);
+        let rtt = Duration::from_micros(200);
+        let (mut client, mut server) = rtt_pair(conf, 40720, rtt);
+        for _ in 0..20 {
+            let (_, data) = client.write(&[1; 3000]);
+            advance(rtt / 2);
+            let acks = deliver(&mut server, &data);
+            read_all(&mut server);
+            let mut acks = acks;
+            acks.extend(delack_expired(&mut server));
+            advance(rtt / 2);
+            deliver(&mut client, &acks);
+        }
+        let precise = client.pace_srtt.unwrap();
+        assert!(precise < Duration::from_millis(1), "{precise:?}");
+        // Whatever the RTO's SRTT has made of it.
+        for _ in 0..50 {
+            client.rto.sample_of(Duration::from_millis(5), 1);
+        }
+        let rate = client.pace_rate().unwrap() as f64;
+        let want = f64::from(client.cc.cwnd()) / precise.as_secs_f64();
+        assert!(rate >= 1.2 * want * 0.99, "{rate} for {want}");
+    }
+
+    /// The pacing timer serviced late: what it held back that long goes
+    /// at once, rather than the rate losing what the timer lost.
+    #[test]
+    fn a_late_pacing_timer_is_made_up_for() {
+        let rtt = Duration::from_millis(100);
+        let (mut client, _server) = rtt_pair(paced, 40721, rtt);
+        client.cc.set_cwnd(400 * 1000);
+        client.cc.on_loss(800 * 1000);
+        advance(Duration::from_millis(20));
+        client.write(&vec![1; 60_000]);
+        let rate = client.pace_rate().unwrap() as f64;
+        let quantum = client.pace_quantum(rate as u64);
+        let due = client.pace_deadline.unwrap();
+        // Five milliseconds late.
+        advance(due.saturating_duration_since(test_now()) + Duration::from_millis(5));
+        let sent: usize = client.tick().iter().map(|p| parse(p).payload.len()).sum();
+        let owed = quantum + rate * 0.005;
+        assert!(
+            (sent as f64 - owed).abs() <= 1500.0,
+            "{sent} sent, {owed} owed"
+        );
+    }
+
+    /// Paced, what is in flight when an ACK comes is short of cwnd even
+    /// for a sender that keeps it full: the rest waits on the pacer. The
+    /// controller is told cwnd was in use, so it grows.
+    #[test]
+    fn a_paced_sender_counts_as_using_its_window() {
+        let rtt = Duration::from_millis(100);
+        let (mut client, mut server) = rtt_pair(paced, 40722, rtt);
+        let (_, data) = client.write(&vec![1; 60_000]);
+        assert!(data.len() < 10, "paced");
+        advance(rtt);
+        let mut out = data;
+        while let Some(due) = client.pace_deadline {
+            advance(due.saturating_duration_since(test_now()));
+            out.extend(client.tick());
+        }
+        assert!(client.is_cwnd_limited, "cwnd held data back");
+        let flight = client.send_buf.as_ref().unwrap().unacked() as u32;
+        assert_eq!(client.cwnd_use(flight / 2), client.cc.cwnd());
+        let cwnd = client.cc.cwnd();
+        let acks = deliver(&mut server, &out[..2]);
+        deliver(&mut client, &acks);
+        assert!(client.cc.cwnd() > cwnd, "slow start grew");
     }
 
     /// A path through a bottleneck of `rate` bytes per second with a

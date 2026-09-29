@@ -21,10 +21,12 @@ pub struct Ack {
     pub now: Instant,
     /// Bytes newly delivered.
     pub bytes_acked: u32,
-    /// Bytes outstanding before it. A flight well short of the window
-    /// means the sender was limited by the application or the receiver,
-    /// not by cwnd, and growing cwnd then would validate nothing (RFC 7661
-    /// §4.4, RFC 5681 §3.1).
+    /// Bytes outstanding before it, or the most the current window of
+    /// data had out if more, or cwnd if cwnd held data back in it (as
+    /// Linux's tcp_is_cwnd_limited judges): how much of cwnd is in use. A
+    /// flight well short of the window means the sender was limited by the
+    /// application or the receiver, not by cwnd, and growing cwnd then
+    /// would validate nothing (RFC 7661 §4.4, RFC 5681 §3.1).
     pub flight: u32,
     /// The round trip it measured, if it measured one.
     pub rtt: Option<Duration>,
