@@ -210,4 +210,30 @@ mod tests {
         assert_eq!(ms_to_duration(1e300), Duration::MAX);
         assert_eq!(ms_to_duration(f64::MAX), Duration::MAX);
     }
+
+    /// On Apple hosts a wait is taken in halves, down to 50 µs, so the
+    /// OS's timer slack (half the wait, up to 10 ms) only ever applies to
+    /// a short last slice; elsewhere it is taken whole. Checked without a
+    /// clock: how late a real wait ends says as much about the machine as
+    /// about this.
+    #[test]
+    fn waits_are_sliced_where_timers_are_coarse() {
+        let ms25 = Duration::from_millis(25);
+        let tiny = Duration::from_micros(40);
+        assert_eq!(wait_slice(tiny), tiny);
+        assert_eq!(wait_slice(Duration::ZERO), Duration::ZERO);
+        if cfg!(target_vendor = "apple") {
+            assert_eq!(wait_slice(ms25), ms25 / 2);
+            // Halving converges: a 25 ms wait is a handful of slices.
+            let (mut left, mut slices) = (ms25, 0);
+            while left > Duration::ZERO {
+                let s = wait_slice(left).max(Duration::from_nanos(1));
+                left = left.saturating_sub(s);
+                slices += 1;
+                assert!(slices < 32, "the wait never ends");
+            }
+        } else {
+            assert_eq!(wait_slice(ms25), ms25);
+        }
+    }
 }

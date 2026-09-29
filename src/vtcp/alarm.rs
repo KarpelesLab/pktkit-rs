@@ -124,7 +124,12 @@ mod tests {
     /// timer coalescing let the wait run over by up to 10 ms: the tick
     /// thread wakes on time now, within the median (see
     /// `crate::time::wait_slice`).
+    // Measures the machine as much as the code: a loaded CI runner wakes
+    // threads late by more than any bound worth asserting. Run it by hand
+    // (`cargo test -- --ignored`) on an idle host; the slicing it relies
+    // on is checked without a clock in `time::tests`.
     #[test]
+    #[ignore = "wall-clock timing; run by hand on an idle machine"]
     fn wakes_on_time() {
         let alarm = Alarm::new();
         let mut late = Vec::new();

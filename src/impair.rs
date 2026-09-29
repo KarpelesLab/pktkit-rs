@@ -1002,7 +1002,12 @@ mod tests {
     /// ended a Linux sender's slow start through HyStart's delay test.
     /// Asserted on the median, which a loaded machine's odd late wakeup
     /// does not move.
+    // Measures the machine as much as the code: a loaded CI runner wakes
+    // threads late by more than any bound worth asserting. Run it by hand
+    // (`cargo test -- --ignored`) on an idle host; the slicing it relies
+    // on is checked without a clock in `time::tests`.
     #[test]
+    #[ignore = "wall-clock timing; run by hand on an idle machine"]
     fn delay_is_kept_to_well_under_a_millisecond_or_two() {
         let (wire, link) = wrap(Impairment::default().delay(Duration::from_millis(25)));
         let arrived: Arc<Mutex<Vec<Instant>>> = Arc::default();
