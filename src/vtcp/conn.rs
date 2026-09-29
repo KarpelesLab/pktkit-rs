@@ -758,6 +758,10 @@ pub struct Conn {
     /// §3.10.7.2-3): before the handshake completes, the SYN may come from
     /// a spoofed source.
     syn_data: Vec<u8>,
+    /// Where the data our SYN carried ended, once SND.NXT went back for it
+    /// to follow the handshake: below this, data at SND.NXT has been sent
+    /// before, and is a retransmission to ECN (RFC 3168 §6.1.5).
+    syn_data_end: Option<u32>,
     /// The peer's initial sequence number, which a retransmission of its
     /// SYN repeats. RCV.NXT alone does not give it once Fast Open data has
     /// moved it past the SYN.
@@ -945,6 +949,7 @@ impl Conn {
             snd_wl: None,
             rcv_adv: None,
             syn_data: Vec::new(),
+            syn_data_end: None,
             irs: 0,
             fin_pending: false,
             pending_fin_seq: 0,
@@ -1984,8 +1989,15 @@ impl Conn {
     }
 
     fn queue_seg(&mut self, mut seg: Segment) {
-        let new_data =
+        let mut new_data =
             !seg.payload.is_empty() && self.send_buf.as_ref().is_some_and(|s| s.nxt() == seg.seq);
+        if new_data && let Some(end) = self.syn_data_end {
+            if seq_before(seg.seq, end) {
+                new_data = false;
+            } else {
+                self.syn_data_end = None;
+            }
+        }
         let ip = self.ecn.mark(&mut seg, new_data);
         self.outgoing_ecn.push(ip);
         if seg.has_flag(flags::ACK) && self.recv_buf.is_some() {
@@ -2493,6 +2505,9 @@ impl Conn {
                 // What of the SYN's data the server did not take goes
                 // again once the handshake is done (RFC 7413 §4.2.2).
                 self.tfo.data_acked = sb.unacked() == 0;
+                if !self.tfo.data_acked {
+                    self.syn_data_end = Some(sb.nxt());
+                }
                 sb.rewind_to(sb.una());
             }
             self.retries = 0;
@@ -2530,6 +2545,7 @@ impl Conn {
         if self.tfo.syn_data > 0 {
             self.tfo.syn_data = 0;
             let sb = self.send_buf.as_mut().unwrap();
+            self.syn_data_end = Some(sb.nxt());
             sb.rewind_to(sb.una().wrapping_add(1));
         }
         self.irs = seg.seq;
@@ -10600,6 +10616,35 @@ mod tests {
         deliver(&mut s, &out);
         assert_eq!(s.state(), State::Established);
         assert_eq!(read_all(&mut s), b"hello");
+    }
+
+    /// Data the SYN carried and the server did not take goes again after
+    /// the handshake as a retransmission: with classic ECN, Not-ECT (RFC
+    /// 3168 §6.1.5). What follows it is new.
+    #[test]
+    fn syn_data_resent_is_not_ect() {
+        let mut c = Conn::new(tfo_cfg(41167, 80).ecn(EcnMode::Classic));
+        let mut s = Conn::new(tfo_cfg(80, 41167));
+        let (_, syn) = c.connect_fast_open(Some(&[1, 2, 3, 4, 5, 6, 7, 8]), None, b"hello");
+        let synack = deliver_syn(&mut s, &syn);
+        assert!(!s.fast_open_accepted());
+        let out = deliver(&mut c, &synack);
+        let out = marked(&c, out);
+        assert_eq!(c.ecn.fb, Feedback::Classic);
+        let (data, ip) = out
+            .iter()
+            .map(|(p, e)| (parse(p), *e))
+            .find(|(p, _)| !p.payload.is_empty())
+            .expect("data not resent");
+        assert_eq!(data.payload, b"hello");
+        assert_eq!(ip, IpEcn::NOT_ECT, "a retransmission sent ECN-capable");
+        let pkts: Vec<Vec<u8>> = out.into_iter().map(|(p, _)| p).collect();
+        let mut acks = deliver(&mut s, &pkts);
+        acks.extend(delack_expired(&mut s));
+        deliver(&mut c, &acks);
+        let (_, more) = c.write(b"more");
+        let more = marked(&c, more);
+        assert_eq!(more[0].1, IpEcn::ECT0);
     }
 
     fn deliver_syn(s: &mut Conn, syn: &[Vec<u8>]) -> Vec<Vec<u8>> {
