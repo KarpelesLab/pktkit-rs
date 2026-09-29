@@ -398,7 +398,9 @@ impl Engine {
                     match q.heap.peek() {
                         Some(Reverse(head)) if head.at <= now => break,
                         Some(Reverse(head)) => {
-                            let wait = head.at - now;
+                            // A delay line that wanders by the timer's slack
+                            // adds jitter nobody asked for.
+                            let wait = crate::time::wait_slice(head.at - now);
                             q = self.wake.wait_timeout(q, wait).unwrap().0;
                         }
                         None => q = self.wake.wait(q).unwrap(),
@@ -993,6 +995,33 @@ mod tests {
             "delivered after {:?}",
             start.elapsed()
         );
+    }
+
+    /// The delay is the delay asked for, not that plus the OS's timer
+    /// slack: macOS let a lone 25 ms wait run 8 to 10 ms over, jitter that
+    /// ended a Linux sender's slow start through HyStart's delay test.
+    /// Asserted on the median, which a loaded machine's odd late wakeup
+    /// does not move.
+    #[test]
+    fn delay_is_kept_to_well_under_a_millisecond_or_two() {
+        let (wire, link) = wrap(Impairment::default().delay(Duration::from_millis(25)));
+        let arrived: Arc<Mutex<Vec<Instant>>> = Arc::default();
+        let a = arrived.clone();
+        link.set_handler(Arc::new(move |_: &Frame| {
+            a.lock().unwrap().push(Instant::now());
+            Ok(())
+        }));
+        let mut late = Vec::new();
+        for i in 0..9 {
+            let sent = Instant::now();
+            wire.deliver(Frame::from_slice(&frame(i)));
+            // Each alone in the queue: one long wait apiece.
+            std::thread::sleep(Duration::from_millis(40));
+            let got = *arrived.lock().unwrap().last().expect("delivered");
+            late.push(got.saturating_duration_since(sent + Duration::from_millis(25)));
+        }
+        late.sort();
+        assert!(late[4] < Duration::from_millis(3), "late by {late:?}");
     }
 
     #[test]

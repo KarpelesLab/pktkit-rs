@@ -58,6 +58,32 @@ fn ms_to_duration(ms: f64) -> std::time::Duration {
     }
 }
 
+/// How long to wait, of the `remaining` time to a deadline, before looking
+/// at the clock again, for a timer thread that must wake on time.
+///
+/// macOS coalesces timers: a thread of default QoS blocked in a timed wait
+/// wakes up to half the timeout late, up to 10 ms, so a 25 ms wait ends
+/// after 33 to 35. For a delay line or a TCP timer that is error of the
+/// size of what it measures: an impaired link whose delay wanders by 10 ms
+/// looks congested to a sender watching its RTT (HyStart ends slow start on
+/// it), and a delayed ACK meant for 40 ms goes out after 50. Halving the
+/// wait each time bounds the lateness by the last, short, wait's: tens of
+/// microseconds, for a handful of extra wakeups. Elsewhere timers are
+/// already precise (Linux's default slack is 50 µs), and the whole wait is
+/// taken at once.
+#[allow(dead_code)] // used by the timer threads of some features only
+#[inline]
+pub(crate) fn wait_slice(remaining: std::time::Duration) -> std::time::Duration {
+    #[cfg(target_vendor = "apple")]
+    {
+        const FINE: std::time::Duration = std::time::Duration::from_micros(50);
+        if remaining > FINE {
+            return remaining / 2;
+        }
+    }
+    remaining
+}
+
 /// Time since the Unix epoch, or zero if the clock is set before it.
 #[inline]
 #[allow(dead_code)] // unused under some feature sets

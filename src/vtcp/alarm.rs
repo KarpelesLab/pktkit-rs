@@ -86,7 +86,8 @@ impl Alarm {
             if now >= at {
                 return;
             }
-            g = match self.wake.wait_timeout(g, Duration::from_nanos(at - now)) {
+            let wait = crate::time::wait_slice(Duration::from_nanos(at - now));
+            g = match self.wake.wait_timeout(g, wait) {
                 Ok((g, _)) => g,
                 Err(e) => e.into_inner().0,
             };
@@ -117,6 +118,25 @@ mod tests {
         let slept = start.elapsed();
         assert!(slept >= Duration::from_millis(20), "{slept:?}");
         assert!(slept < Duration::from_secs(5), "{slept:?}");
+    }
+
+    /// A delayed ACK armed for 40 ms went out after 50 on macOS, whose
+    /// timer coalescing let the wait run over by up to 10 ms: the tick
+    /// thread wakes on time now, within the median (see
+    /// `crate::time::wait_slice`).
+    #[test]
+    fn wakes_on_time() {
+        let alarm = Alarm::new();
+        let mut late = Vec::new();
+        for _ in 0..7 {
+            alarm.begin();
+            let due = Instant::now() + Duration::from_millis(25);
+            alarm.arm(Some(due));
+            alarm.sleep_until(due + Duration::from_secs(10));
+            late.push(Instant::now().saturating_duration_since(due));
+        }
+        late.sort();
+        assert!(late[3] < Duration::from_millis(3), "late by {late:?}");
     }
 
     #[test]
