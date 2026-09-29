@@ -71,6 +71,18 @@
 //!   3522) and F-RTO after a timeout (RFC 5682) tell a spurious
 //!   retransmission, and RFC 4015's response puts cwnd and ssthresh back.
 //!   D-SACKs also widen RACK's reordering window.
+//! - RFC 1191, RFC 8201: path MTU discovery, from ICMP Fragmentation
+//!   Needed and Packet Too Big messages ([`Conn::on_icmp_too_big`]), each
+//!   checked against what is in flight (RFC 5927 §4.1).
+//! - RFC 4821: Packetization Layer PMTUD, where ICMP does not get through
+//!   (see [`MtuProbing`]). Once the first segment keeps timing out, a black
+//!   hole is suspected and the MSS drops to a base of 1024 bytes; probes,
+//!   ordinary data segments larger than the MSS, then search up for what
+//!   the path carries, as Linux's `tcp_mtu_probing` does. A probe lost to
+//!   its size costs no window.
+//! - RFC 7413: TCP Fast Open, opt in ([`ConnConfig::fast_open`]): a server
+//!   gives cookies, and takes the data of a SYN that brings one back before
+//!   the handshake completes. `vclient` is the client side.
 //! - RFC 5961: challenge ACKs against blind RST, SYN and data injection,
 //!   rate-limited.
 //! - RFC 6191: a new SYN may reuse a 4-tuple in TIME-WAIT when its

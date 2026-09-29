@@ -58,7 +58,7 @@ than the Go code, and the design is idiomatic Rust:
 | `afpacket`   | Bind an L2 device to an existing interface (Linux `AF_PACKET`)               |
 | `xdp`        | Linux XDP: load/attach eBPF on a device's RX path, capture chosen IP prefixes |
 | `afxdp`      | Linux AF_XDP zero-copy sockets (builds on `xdp`)                             |
-| `vtcp`       | Pure-Rust TCP engine (congestion, SACK, timestamps, window scaling, ECN, SYN cookies) |
+| `vtcp`       | Pure-Rust TCP engine: CUBIC/BBRv3, RACK-TLP, SACK, ECN, PLPMTUD, Fast Open ([below](#the-tcp-engine-vtcp)) |
 | `slirp`      | Userspace NAT stack routing virtual traffic to real sockets                    |
 | `vclient`    | High-level virtual client: `dial`, `listen`, DNS, minimal HTTP                |
 | `nat`        | Packet-level IPv4 NAT + NAT64 + ALGs (FTP, SIP, H.323, PPTP, TFTP, IRC)      |
@@ -77,6 +77,57 @@ That includes [fullrust](https://github.com/KarpelesLab/fullrust)'s
 `afxdp` work there too, making their syscalls directly; `tuntap` and
 `afpacket` are the unsupported stubs.
 
+### The TCP engine (`vtcp`)
+
+A sans-I/O TCP (`vtcp::Conn`: feed it segments, drive its timers, send what
+it returns) behind `vclient` and `slirp`, with what a modern Linux TCP does:
+
+- **Handshake and state machine** (RFC 9293): window scaling and timestamps
+  (RFC 7323: PAWS, an RTT sample from every ACK), SACK (RFC 2018), SYN
+  cookies for listeners past their backlog (RFC 4987), keyed ISNs (RFC 6528),
+  challenge ACKs against blind injection (RFC 5961), TIME-WAIT reuse by
+  timestamps (RFC 6191), keepalives, zero-window probes, a FIN-WAIT-2
+  timeout.
+- **Loss recovery**: RACK-TLP (RFC 8985) finds losses by time and probes the
+  tail of a flight; PRR (RFC 6937) spreads fast recovery's reduction over the
+  round trip; RFC 6675's scoreboard, with NewReno partial ACKs (RFC 6582) and
+  Limited Transmit (RFC 3042) against peers without SACK. D-SACK (RFC 2883),
+  Eifel (RFC 3522) and F-RTO (RFC 5682) tell a spurious retransmission, and
+  its window cut is undone (RFC 3708, RFC 4015).
+- **Congestion control**: CUBIC with HyStart++ (RFC 9438, RFC 9406; the
+  default), BBRv3 (draft-ietf-ccwg-bbr, over delivery rate estimation),
+  NewReno (RFC 5681) and HighSpeed (RFC 3649); congestion window validation
+  (RFC 7661) and restart after idle. Pacing, as Linux's: each round trip's
+  data spread over it.
+- **ECN**: classic (RFC 3168, with RFC 8511's gentler back-off) and accurate
+  (RFC 9768, AccECN), negotiated in the handshake.
+- **Buffers auto-tuned** as Linux's: the receive window follows what the
+  application reads per round trip, the send buffer the congestion window.
+  Delayed ACKs (RFC 1122, RFC 5681) with quick-ACK and ping-pong modes.
+- **Path MTU**: ICMP Packet Too Big / Fragmentation Needed (RFC 1191, RFC
+  8201), checked against what is in flight (RFC 5927); and where ICMP is
+  filtered, PLPMTUD (RFC 4821): a black hole found from repeated timeouts,
+  and the MTU searched for with probes, as Linux's `tcp_mtu_probing`.
+- **TCP Fast Open** (RFC 7413), opt-in: data in the SYN, answered before the
+  handshake completes, so a request takes one round trip instead of two.
+
+Each connection is set up by a `vtcp::ConnConfig`; `vclient::ClientConfig::tcp`
+and `slirp::Stack::set_tcp` take a `vtcp::Tuning` for the connections they
+open:
+
+```rust,ignore
+// requires: --features "vclient"
+use pktkit::vclient::{Client, ClientConfig};
+use pktkit::vtcp::{CongestionKind, Tuning};
+
+let client = Client::new(ClientConfig::default().tcp(
+    Tuning::default().congestion(CongestionKind::Bbr).fast_open(true),
+));
+// With Fast Open, the request rides in the SYN once the server has given a
+// cookie (the first connection asks for it).
+let conn = client.dial_tcp_with_data("10.0.0.1:80".parse()?, b"GET / HTTP/1.0\r\n\r\n")?;
+```
+
 ### WebAssembly
 
 `full` also builds for `wasm32-unknown-unknown` (browsers, and hosts that
@@ -86,7 +137,8 @@ sockets there, so the crate works as a sans-I/O stack that the embedder drives:
 - **Absent:** `slirp` and `qemu`, which are built on host sockets, and the
   socket-owning `wg::Server` / `wg::Adapter` and `ovpn::Server` /
   `ovpn::Adapter`. `vclient`'s `Resolver` and HTTP client are also absent, and
-  so are `vclient`'s blocking `dial_tcp` and `serve_with_done`. The sans-I/O
+  so are `vclient`'s blocking `dial_tcp`, `dial_tcp_with_data` and
+  `serve_with_done`. The sans-I/O
   cores (`wg::Handler`, `ovpn::Peer`, `nat`, `vtcp`, the codecs) are all
   there.
 - **Nothing blocks.** `vclient`'s `TcpConn`, `UdpConn` and `Listener` return
