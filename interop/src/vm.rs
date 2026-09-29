@@ -5,6 +5,7 @@
 use crate::image::{Arch, Image};
 use pktkit::qemu;
 use std::collections::HashMap;
+use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -93,9 +94,22 @@ impl Reply {
     }
 }
 
+/// The QEMU process, killed and reaped when dropped, whatever state it is
+/// in: a boot that fails half-way must not leave it running.
+#[derive(Debug)]
+struct Qemu(Child);
+
+impl Drop for Qemu {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+        crate::guard::clear_qemu_pid();
+    }
+}
+
 #[derive(Debug)]
 pub struct Vm {
-    child: Child,
+    child: Qemu,
     ctl: BufReader<TcpStream>,
     ctl_w: TcpStream,
     pub kernel: String,
@@ -118,12 +132,24 @@ fn accept_timeout<T: Send + 'static>(
 }
 
 impl Vm {
-    pub fn boot(arch: Arch, accel: Accel, image: &Image, results: &Path) -> io::Result<Vm> {
+    /// Boot the guest. QEMU writes its pid to `pidfile`, for the next run to
+    /// find if this one is killed before it can clean up; its own messages
+    /// go to `qemu.log` in `results`, not to our stderr, which a guest that
+    /// outlived us would otherwise hold open (and whoever reads our output
+    /// would wait on).
+    pub fn boot(
+        arch: Arch,
+        accel: Accel,
+        image: &Image,
+        results: &Path,
+        pidfile: &Path,
+    ) -> io::Result<Vm> {
         let nic_ln = qemu::Listener::bind_tcp("127.0.0.1:0")?;
         let nic_port = nic_ln.local_addr()?.port();
         let ctl_ln = TcpListener::bind("127.0.0.1:0")?;
         let ctl_port = ctl_ln.local_addr()?.port();
         let console_log = results.join("console.log");
+        let qemu_log = results.join("qemu.log");
 
         let (bin, machine, console) = match arch {
             Arch::Aarch64 => ("qemu-system-aarch64", "virt", "ttyAMA0"),
@@ -159,27 +185,60 @@ impl Vm {
                 "socket,id=ctl,host=127.0.0.1,port={ctl_port},server=off"
             ))
             .args(["-device", "virtconsole,chardev=ctl"])
+            .arg("-pidfile")
+            .arg(pidfile)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::inherit());
-        let child = cmd
-            .spawn()
-            .map_err(|e| io::Error::other(format!("{bin}: {e}")))?;
+            .stderr(File::create(&qemu_log)?);
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::process::CommandExt;
+            // Whatever kills the harness, SIGKILL included, takes the
+            // guest with it. The signal follows the thread that forked,
+            // which is the main thread, there for the whole run.
+            unsafe {
+                cmd.pre_exec(|| {
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+        let child = Qemu(
+            cmd.spawn()
+                .map_err(|e| io::Error::other(format!("{bin}: {e}")))?,
+        );
+        crate::guard::set_qemu_pid(child.0.id());
+        // A boot that fails because QEMU quit says why QEMU quit.
+        let failed = |mut child: Qemu, e: io::Error| -> io::Error {
+            if let Ok(Some(st)) = child.0.try_wait() {
+                let log = std::fs::read_to_string(&qemu_log).unwrap_or_default();
+                return io::Error::other(format!("QEMU exited ({st}): {}", log.trim()));
+            }
+            e
+        };
 
         let boot_limit = match accel {
             Accel::Tcg => Duration::from_secs(300),
             _ => Duration::from_secs(60),
         };
-        let nic = accept_timeout(
+        let nic = match accept_timeout(
             move || nic_ln.accept(),
             boot_limit,
             "NIC connection from QEMU",
-        )?;
-        let (ctl, _) = accept_timeout(
+        ) {
+            Ok(n) => n,
+            Err(e) => return Err(failed(child, e)),
+        };
+        let (ctl, _) = match accept_timeout(
             move || ctl_ln.accept(),
             boot_limit,
             "console connection from QEMU",
-        )?;
+        ) {
+            Ok(c) => c,
+            Err(e) => return Err(failed(child, e)),
+        };
         ctl.set_nodelay(true)?;
         let ctl_w = ctl.try_clone()?;
         let mut vm = Vm {
@@ -265,21 +324,21 @@ impl Vm {
 
     /// Whether the guest is still there.
     pub fn alive(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(None))
+        matches!(self.child.0.try_wait(), Ok(None))
     }
 }
 
 impl Drop for Vm {
+    /// Ask the guest to power off, and give it a moment; `Qemu`'s own drop
+    /// then kills it if it has not.
     fn drop(&mut self) {
         let _ = writeln!(self.ctl_w, "quit");
         let end = Instant::now() + Duration::from_secs(5);
         while Instant::now() < end {
-            if let Ok(Some(_)) = self.child.try_wait() {
+            if let Ok(Some(_)) = self.child.0.try_wait() {
                 return;
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
     }
 }

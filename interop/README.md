@@ -35,7 +35,17 @@ cargo run --release -- --list
 
 Options: `--arch aarch64|x86_64`, `--accel hvf|kvm|tcg` (the fastest
 available by default: HVF on macOS, KVM where `/dev/kvm` is usable, TCG
-otherwise or for a foreign arch), `--kernel lts|stable`, `--keep-pcaps`.
+otherwise or for a foreign arch), `--kernel lts|stable`, `--keep-pcaps`,
+`--deadline SECS` (the whole run's limit: 15 minutes for `--quick`, 90
+otherwise).
+
+The guest never outlives the harness: it is powered off at the end of the
+run, killed on SIGINT, SIGTERM or SIGHUP, when a test overruns (10
+minutes) or the run its deadline (exit status 124), and, on a Linux host,
+by the kernel if the harness dies of anything else. On macOS a harness
+killed with SIGKILL leaves QEMU behind; the next run finds it through
+`target/qemu-<arch>.pid` and kills it. The exit status is 0 only if no
+test failed; QEMU's own messages are in `qemu.log` beside the report.
 
 The first run downloads Alpine's kernel and busybox into `interop/.cache`
 (40 MB for `lts`); later runs reuse them, and refresh the package index

@@ -2,6 +2,7 @@
 //! and slirp) against the Linux kernel's TCP, in a QEMU guest. See
 //! README.md.
 
+mod guard;
 mod image;
 mod net;
 mod pattern;
@@ -15,7 +16,7 @@ use pktkit::impair::Impairment;
 use pktkit::vclient::{Client, ClientConfig};
 use pktkit::vtcp::Tuning;
 use std::fmt::Write as _;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use vm::{Accel, Reply, Vm};
 use xfer::{Run, ServerMode, VcEnd};
@@ -201,12 +202,18 @@ struct Opts {
     filter: Vec<String>,
     keep_pcaps: bool,
     list: bool,
+    /// The whole run's limit, after which the watchdog ends it.
+    deadline: Option<Duration>,
 }
+
+/// How long one test may take before the watchdog gives up on it: well
+/// past any test's own limits, which cover everything it waits for.
+const TEST_LIMIT: Duration = Duration::from_secs(600);
 
 fn usage() -> ! {
     eprintln!(
         "usage: interop [--arch aarch64|x86_64] [--kernel lts|stable] [--accel hvf|kvm|tcg] [--quick] \
-         [--keep-pcaps] [--list] [FILTER...]"
+         [--keep-pcaps] [--deadline SECS] [--list] [FILTER...]"
     );
     std::process::exit(2);
 }
@@ -220,6 +227,7 @@ fn opts() -> Opts {
         filter: Vec::new(),
         keep_pcaps: false,
         list: false,
+        deadline: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -246,6 +254,13 @@ fn opts() -> Opts {
             "--quick" => o.quick = true,
             "--keep-pcaps" => o.keep_pcaps = true,
             "--list" => o.list = true,
+            "--deadline" => {
+                o.deadline = Some(Duration::from_secs(
+                    args.next()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or_else(|| usage()),
+                ))
+            }
             "-h" | "--help" => usage(),
             f if f.starts_with('-') => usage(),
             f => o.filter.push(f.to_string()),
@@ -255,6 +270,14 @@ fn opts() -> Opts {
 }
 
 fn main() {
+    guard::install_signal_handlers();
+    // Everything the run owns, the guest included, is dropped by the time
+    // `run` returns; `process::exit` would skip that.
+    let code = run();
+    std::process::exit(code);
+}
+
+fn run() -> i32 {
     let o = opts();
     let all = tests::all();
     let chosen: Vec<&Test> = all
@@ -266,11 +289,11 @@ fn main() {
         for t in &chosen {
             println!("{}", t.name);
         }
-        return;
+        return 0;
     }
     if chosen.is_empty() {
         eprintln!("no test matches");
-        std::process::exit(2);
+        return 2;
     }
     let accel = o.accel.unwrap_or_else(|| Accel::best(o.arch));
     let dir = image::root()
@@ -279,12 +302,31 @@ fn main() {
         .join(o.arch.name());
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("results directory");
+    let pidfile = image::root()
+        .join("target")
+        .join(format!("qemu-{}.pid", o.arch.name()));
+    guard::kill_stale(&pidfile);
+
+    let progress = Arc::new(Mutex::new(guard::Progress::default()));
+    let deadline = o.deadline.unwrap_or(if o.quick {
+        Duration::from_secs(15 * 60)
+    } else {
+        Duration::from_secs(90 * 60)
+    });
+    guard::watchdog(
+        progress.clone(),
+        Instant::now() + deadline,
+        &dir.join("report.txt"),
+    );
 
     let t0 = Instant::now();
-    let img = image::build(o.arch, o.kernel).unwrap_or_else(|e| {
-        eprintln!("image: {e}");
-        std::process::exit(1);
-    });
+    let img = match image::build(o.arch, o.kernel) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("image: {e}");
+            return 1;
+        }
+    };
     eprintln!(
         "image: {} ({}), built in {:.1?}",
         img.kernel_pkg,
@@ -292,14 +334,17 @@ fn main() {
         t0.elapsed()
     );
     let t0 = Instant::now();
-    let vm = Vm::boot(o.arch, accel, &img, &dir).unwrap_or_else(|e| {
-        eprintln!(
-            "boot ({}): {e}; see {}",
-            accel.name(),
-            dir.join("console.log").display()
-        );
-        std::process::exit(1);
-    });
+    let vm = match Vm::boot(o.arch, accel, &img, &dir, &pidfile) {
+        Ok(vm) => vm,
+        Err(e) => {
+            eprintln!(
+                "boot ({}): {e}; see {}",
+                accel.name(),
+                dir.join("console.log").display()
+            );
+            return 1;
+        }
+    };
     eprintln!(
         "guest: Linux {} on {} ({}), up in {:.1?}",
         vm.kernel,
@@ -331,13 +376,31 @@ fn main() {
     );
     let mut failed = 0;
     let mut skipped = 0;
+    // What the watchdog writes out if it has to end the run.
+    let checkpoint = |report: &str, test: Option<&'static str>| {
+        let mut p = progress.lock().unwrap_or_else(|e| e.into_inner());
+        p.report = report.to_string();
+        p.test = test.map(|t| (t, Instant::now() + TEST_LIMIT));
+    };
     for t in &chosen {
+        checkpoint(&report, Some(t.name));
         let pcap = dir.join(format!("{}.pcap", t.name));
         let _ = ctx.net.station.capture(Some(&pcap));
         ctx.notes.clear();
         let start = Instant::now();
         eprintln!("--- {}", t.name);
-        let r = ctx.reset().and_then(|()| (t.run)(&mut ctx));
+        // A test that panics fails, and the run goes on to the next.
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ctx.reset().and_then(|()| (t.run)(&mut ctx))
+        }))
+        .unwrap_or_else(|p| {
+            let msg = p
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| p.downcast_ref::<&str>().copied())
+                .unwrap_or("?");
+            Err(format!("panicked: {msg}"))
+        });
         let _ = ctx.net.station.capture(None);
         let took = start.elapsed();
         let (status, keep) = match &r {
@@ -381,8 +444,11 @@ fn main() {
         chosen.len() - (failed + skipped).min(chosen.len()),
         chosen.len()
     );
+    checkpoint(&report, None);
     let _ = std::fs::write(dir.join("report.txt"), &report);
     println!("{report}");
     println!("results: {}", dir.display());
-    std::process::exit(if failed > 0 { 1 } else { 0 });
+    // Power the guest off now, rather than leave it to the end of `main`.
+    drop(ctx);
+    if failed > 0 { 1 } else { 0 }
 }

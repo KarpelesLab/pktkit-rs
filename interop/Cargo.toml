@@ -15,6 +15,11 @@ members = [".", "agent"]
 path = ".."
 features = ["qemu", "impair", "pcap", "vclient", "slirp", "l2adapter"]
 
+# Signals, and killing a guest left behind: the harness runs on a Unix
+# host (Linux or macOS).
+[dependencies]
+libc = "0.2"
+
 [[bin]]
 name = "interop"
 path = "src/main.rs"

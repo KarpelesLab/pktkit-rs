@@ -284,10 +284,13 @@ jobs:
         run: cargo test --release --manifest-path interop/Cargo.toml
       # The quick matrix: correctness, negotiation both ways, and two
       # impaired links. The full one runs locally (see interop/README.md).
+      # The harness ends itself (and the guest) past --deadline; the step's
+      # own limit is the backstop should that fail too.
       - name: Run the interop suite
-        run: cargo run --release --manifest-path interop/Cargo.toml -- --arch x86_64 --quick
+        timeout-minutes: 14
+        run: cargo run --release --manifest-path interop/Cargo.toml -- --arch x86_64 --quick --deadline 720
       - name: Keep the results (pcaps, console, report)
-        if: failure()
+        if: failure() || cancelled()
         uses: actions/upload-artifact@v4
         with:
           name: interop-results
