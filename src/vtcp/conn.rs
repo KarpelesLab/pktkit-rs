@@ -4209,6 +4209,11 @@ impl Conn {
         if self.cc.model_based() && (pending > 0 || self.score.lost_bytes() > 0) {
             let idle = self.in_flight() == 0 && self.score.rate().is_app_limited();
             self.cc.on_transmit(self.now, idle);
+        } else if pending > 0
+            && self.send_buf.as_ref().unwrap().unacked() == 0
+            && let Some(t) = self.last_data_sent
+        {
+            self.cc.on_tx_start(self.now, t);
         }
         // Lost data before new data: the receiver can deliver nothing past
         // the first hole until it is filled.
@@ -8010,6 +8015,67 @@ mod tests {
         client.write(&[2; 100]);
         assert_eq!(client.cc.cwnd(), 32_000, "halved at its end");
         assert_eq!(client.cc.ssthresh(), u32::MAX);
+    }
+
+    /// With the window kept through an idle spell, CUBIC takes up its
+    /// curve where it left it: the spell is not time on the curve, or the
+    /// first round back would find W_cubic far above the window.
+    #[test]
+    fn cubic_curve_skips_idle_time() {
+        let rtt = Duration::from_millis(20);
+        // A round trip, the sender kept cwnd-limited if `more`.
+        let round = |client: &mut Conn, server: &mut Conn, out: &mut Vec<Vec<u8>>, more| {
+            if more {
+                // Topped up to twice cwnd, in whole segments: a runt at the
+                // end would wait for Nagle.
+                let sb = client.send_buf.as_ref().unwrap();
+                let held = sb.pending() + sb.unacked();
+                let n = (2 * client.cc.cwnd() as usize).saturating_sub(held) / 1000 * 1000;
+                let (_, segs) = client.write(&vec![0; n]);
+                out.extend(segs);
+            }
+            advance(rtt / 2);
+            let mut acks = deliver(server, out);
+            read_all(server);
+            acks.extend(server.take_outgoing());
+            acks.extend(delack_expired(server));
+            advance(rtt / 2);
+            *out = deliver(client, &acks);
+        };
+        let run = |port, gap: Duration| {
+            let conf = |l, r| {
+                let mut c = big(l, r)
+                    .slow_start_after_idle(false)
+                    .autotune(false)
+                    .congestion(CongestionKind::Cubic);
+                c.send_buf_size = 16 << 20;
+                c.recv_buf_size = 16 << 20;
+                c
+            };
+            let (mut client, mut server) = rtt_pair(conf, port, rtt);
+            client.cc.set_cwnd(400_000);
+            client.cc.on_loss(400_000);
+            client.cc.set_cwnd(client.cc.ssthresh());
+            let mut out = Vec::new();
+            for _ in 0..10 {
+                round(&mut client, &mut server, &mut out, true);
+            }
+            // Run dry: everything sent is acknowledged.
+            let mut n = 0;
+            while !out.is_empty() || client.send_buf.as_ref().unwrap().unacked() > 0 {
+                round(&mut client, &mut server, &mut out, false);
+                n += 1;
+                assert!(n < 10, "never ran dry");
+            }
+            advance(gap);
+            for _ in 0..5 {
+                round(&mut client, &mut server, &mut out, true);
+            }
+            client.cc.cwnd()
+        };
+        let busy = run(40287, Duration::ZERO);
+        let idle = run(40288, Duration::from_secs(5));
+        assert!(idle.abs_diff(busy) <= busy / 50, "{idle} vs {busy}");
     }
 
     /// A loss in the non-validated phase is answered from what was in

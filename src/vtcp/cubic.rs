@@ -13,8 +13,9 @@
 //! curve is read one minimum RTT ahead (its `delay_min`, where RFC 9438
 //! §4.2 has SRTT, which queueing inflates), fast convergence is on, and
 //! the time the sender spends application-limited is left out of the
-//! curve's clock (RFC 9438 §5.8; Linux shifts the epoch after an idle
-//! spell, this does so for any ACK that finds the window not in use).
+//! curve's clock (RFC 9438 §5.8): as Linux, the epoch moves on by an idle
+//! spell when sending resumes, and this also moves it on for any ACK that
+//! finds the window not in use.
 //!
 //! Windows are kept in bytes: C is in segments per second cubed, so the
 //! curve scales by the MSS.
@@ -98,6 +99,8 @@ pub struct Cubic {
     /// When the last ACK came, for leaving application-limited time out of
     /// the curve's clock.
     last_ack: Option<Instant>,
+    /// When sending last resumed from idle, for counting idle time once.
+    tx_start: Option<Instant>,
     hystart: HyStart,
     saved: Option<Saved>,
     /// Sending is paced (see [`SS_LIMIT`]).
@@ -120,6 +123,7 @@ impl Cubic {
             credit: 0.0,
             delay_min: None,
             last_ack: None,
+            tx_start: None,
             hystart: HyStart::new(),
             saved: None,
             paced: false,
@@ -285,6 +289,23 @@ impl CongestionController for Cubic {
         }
         if limited {
             self.avoid_congestion(a);
+        }
+    }
+
+    /// A sender back from idle with its window intact (the restart after
+    /// idle off, or too short an idle for it) resumes the curve where it
+    /// left it, as Linux does: no ACK came to leave the idle time out.
+    fn on_tx_start(&mut self, now: Instant, last_sent: Instant) {
+        // Told again while nothing goes: count each stretch once.
+        let from = self.tx_start.map_or(last_sent, |t| t.max(last_sent));
+        let idle = now.saturating_duration_since(from);
+        self.tx_start = Some(now);
+        if let Some(e) = self.epoch.as_mut() {
+            e.start = (e.start + idle).min(now);
+        }
+        // Nor again as the gap to the next ACK.
+        if self.last_ack.is_some() {
+            self.last_ack = Some(now);
         }
     }
 
@@ -823,6 +844,28 @@ mod tests {
         let t1 = t0 + Duration::from_secs(10);
         c.on_ack(&ack(t1 + rtt, 2 * MSS, c.cwnd()));
         assert!(c.cwnd() - cwnd < 5 * MSS, "jumped to {}", c.cwnd());
+    }
+
+    /// Idle with nothing in flight, then back with a full window, the
+    /// window restart not having cut it (slow start after idle off, or an
+    /// idle shorter than the RTO): the curve goes on from where it was,
+    /// not from where the idle time would have carried it.
+    #[test]
+    fn idle_time_is_left_out() {
+        let rtt = Duration::from_millis(20);
+        let run = |gap: Duration| {
+            let mut c = after_loss(1000, rtt);
+            let t0 = Instant::now();
+            trajectory(&mut c, t0, rtt, 10);
+            let t1 = t0 + rtt * 10 + gap;
+            c.on_tx_start(t1, t0 + rtt * 10);
+            // Tried again before anything went: not counted twice.
+            c.on_tx_start(t1, t0 + rtt * 10);
+            trajectory(&mut c, t1, rtt, 5);
+            c.cwnd()
+        };
+        let (busy, idle) = (run(Duration::ZERO), run(Duration::from_secs(5)));
+        assert!(idle.abs_diff(busy) <= 2 * MSS, "{idle} vs {busy}");
     }
 
     /// Drive HyStart++ through rounds of `per_round` ACKs, each round's

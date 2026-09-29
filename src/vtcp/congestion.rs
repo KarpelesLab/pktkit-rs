@@ -134,6 +134,13 @@ pub trait CongestionController: Send {
     fn on_transmit(&mut self, now: Instant, idle: bool) {
         let _ = (now, idle);
     }
+    /// About to send with nothing outstanding, data having last gone out
+    /// at `last_sent` (Linux's CA_EVENT_TX_START). Told again each time
+    /// sending is tried until something goes. Only a controller that is
+    /// not model-based is told.
+    fn on_tx_start(&mut self, now: Instant, last_sent: Instant) {
+        let _ = (now, last_sent);
+    }
     /// The controller wants the samples until what is in flight is
     /// delivered marked application-limited (BBR's ProbeRTT). Taken once.
     fn take_app_limited(&mut self) -> bool {
