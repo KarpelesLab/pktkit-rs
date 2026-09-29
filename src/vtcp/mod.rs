@@ -121,6 +121,7 @@ pub(crate) mod secret;
 pub(crate) mod segment;
 pub(crate) mod sendbuf;
 pub(crate) mod seqspace;
+pub(crate) mod tuning;
 // The listeners that answer SYNs statelessly past their backlog.
 #[cfg(any(feature = "vclient", feature = "slirp", test))]
 pub(crate) mod syncookie;
@@ -130,6 +131,7 @@ pub use ecn::EcnMode;
 pub use options::{TcpOption, kind};
 pub use plpmtud::MtuProbing;
 pub use segment::{Segment, flags};
+pub use tuning::Tuning;
 
 // nat's UPnP tests read the window scale off a SYN-ACK.
 #[cfg(all(test, feature = "nat"))]

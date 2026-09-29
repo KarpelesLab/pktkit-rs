@@ -16,9 +16,10 @@
 
 use crate::time::Instant;
 use crate::vtcp::ecn::IpEcn;
+use crate::vtcp::fastopen::{self, Gate};
 use crate::vtcp::segment::flags;
 use crate::vtcp::syncookie::SynCookies;
-use crate::vtcp::{Conn, ConnConfig, State, segment::Segment};
+use crate::vtcp::{Conn, ConnConfig, State, Tuning, segment::Segment};
 use crate::{IpPrefix, Packet, Protocol, checksum};
 use std::collections::{HashMap, VecDeque};
 use std::io::{self};
@@ -813,6 +814,14 @@ pub(crate) struct TcpStack {
     /// The link MTU connections size their segments for (see
     /// [`ClientConfig::mtu`](super::ClientConfig::mtu)).
     mtu: u32,
+    /// The TCP settings of every connection (see
+    /// [`ClientConfig::tcp`](super::ClientConfig::tcp)).
+    tuning: Tuning,
+    /// Accepted connections with Fast Open data whose handshake has not
+    /// completed, bounded as RFC 7413 §5.1 asks.
+    fast_open_gate: Arc<Gate>,
+    /// Fast Open cookies from the servers dialed, by address.
+    fast_open_cache: Mutex<HashMap<IpAddr, FastOpenEntry>>,
     /// Set by `shutdown`: stops the tick thread and refuses new work.
     stop: Arc<Mutex<bool>>,
     /// Wakes the tick thread when a timer comes due.
@@ -822,18 +831,25 @@ pub(crate) struct TcpStack {
 impl TcpStack {
     #[cfg(test)]
     pub fn new(sink: Arc<dyn Fn(&[u8]) + Send + Sync>) -> Arc<TcpStack> {
-        Self::with_mtu(sink, DEFAULT_MTU)
+        Self::with_config(sink, DEFAULT_MTU, Tuning::default())
     }
 
     /// A stack whose connections size their segments for a link MTU of
-    /// `mtu` bytes.
-    pub fn with_mtu(sink: Arc<dyn Fn(&[u8]) + Send + Sync>, mtu: u32) -> Arc<TcpStack> {
+    /// `mtu` bytes, and take `tuning`.
+    pub fn with_config(
+        sink: Arc<dyn Fn(&[u8]) + Send + Sync>,
+        mtu: u32,
+        tuning: Tuning,
+    ) -> Arc<TcpStack> {
         let stack = Arc::new(TcpStack {
             conns: Mutex::new(HashMap::new()),
             listeners: Mutex::new(HashMap::new()),
             sink,
             next_port: Mutex::new(0),
             mtu,
+            tuning,
+            fast_open_gate: Gate::new(fastopen::MAX_PENDING),
+            fast_open_cache: Mutex::new(HashMap::new()),
             stop: Arc::new(Mutex::new(false)),
             alarm: Arc::new(Alarm::new()),
         });
@@ -898,9 +914,13 @@ impl TcpStack {
             {
                 // Given up silently, as Linux drops an expired request: a
                 // RST would be one more packet to an address that may well
-                // be spoofed, and nobody has seen this connection yet.
+                // be spoofed, and nobody has seen this connection yet,
+                // unless it came with Fast Open data: then the application
+                // has, and learns why it ended.
                 let _ = conn.abort();
+                cs.fail(io::ErrorKind::TimedOut);
                 drop(conn);
+                cs.signal.notify_all();
                 self.forget(&cs);
                 continue;
             }
@@ -954,6 +974,20 @@ impl TcpStack {
 
     /// Open a connection and send the SYN, without waiting for the answer.
     pub fn start_dial(&self, local_ip: IpAddr, remote: SocketAddr) -> io::Result<Arc<ConnState>> {
+        self.start_dial_with(local_ip, remote, None).map(|(s, _)| s)
+    }
+
+    /// [`start_dial`](Self::start_dial), and with `data`, and Fast Open
+    /// on, the SYN carries what of it the server may take (see
+    /// [`Client::dial_tcp_with_data`](super::Client::dial_tcp_with_data)),
+    /// or asks for a cookie. Returns how much of `data` the connection
+    /// took, the rest being the caller's to write once it is up.
+    fn start_dial_with(
+        &self,
+        local_ip: IpAddr,
+        remote: SocketAddr,
+        data: Option<&[u8]>,
+    ) -> io::Result<(Arc<ConnState>, usize)> {
         // The port is picked and the connection registered under the one
         // lock, so two dials cannot pick the same 4-tuple. `stop` is checked
         // under it too, as `shutdown` drains the table after setting it: a
@@ -980,7 +1014,7 @@ impl TcpStack {
             keepalive: true,
             ..Default::default()
         };
-        let conn = Conn::new(cfg);
+        let conn = Conn::new(self.tuning.apply(cfg));
         let key = ConnKey {
             local_port,
             remote: remote.ip(),
@@ -999,11 +1033,51 @@ impl TcpStack {
 
         // Send SYN.
         let mut conn = state.conn.lock().unwrap();
-        let segs = conn.connect();
+        let (taken, segs) = match data.filter(|_| self.tuning.fast_open) {
+            Some(data) => {
+                let entry = self
+                    .fast_open_cache
+                    .lock()
+                    .unwrap()
+                    .get(&remote.ip())
+                    .cloned()
+                    .unwrap_or_default();
+                if entry.resting(Instant::now()) {
+                    (0, conn.connect())
+                } else {
+                    conn.connect_fast_open(entry.cookie.as_deref(), entry.mss, data)
+                }
+            }
+            None => (0, conn.connect()),
+        };
         state.queue(&conn, segs);
         drop(conn);
         state.flush();
-        Ok(state)
+        Ok((state, taken))
+    }
+
+    /// Keep what a Fast Open dial's handshake taught about its server: the
+    /// cookie it gave, and whether a SYN with data went unanswered.
+    #[cfg(not(target_family = "wasm"))]
+    fn learn_fast_open(&self, remote: IpAddr, conn: &Conn) {
+        let mut cache = self.fast_open_cache.lock().unwrap();
+        if !cache.contains_key(&remote) && cache.len() >= FAST_OPEN_CACHE {
+            // Any will do: a server forgotten costs a round trip once.
+            if let Some(&k) = cache.keys().next() {
+                cache.remove(&k);
+            }
+        }
+        let e = cache.entry(remote).or_default();
+        if let Some(c) = conn.fast_open_cookie() {
+            e.cookie = Some(c.to_vec());
+            e.mss = Some(conn.mss());
+        }
+        if conn.fast_open_syn_lost() {
+            e.syn_losses = e.syn_losses.saturating_add(1);
+            e.last_loss = Some(Instant::now());
+        } else if conn.state().is_synchronized() {
+            e.syn_losses = 0;
+        }
     }
 
     /// Open a connection and hand it back at once, still handshaking.
@@ -1013,16 +1087,38 @@ impl TcpStack {
         Ok(conn)
     }
 
-    /// Dial a remote endpoint, blocking until the handshake completes or fails.
+    /// Dial a remote endpoint, blocking until the handshake completes or
+    /// fails, and write `data` (see [`start_dial`](Self::start_dial)).
     #[cfg(not(target_family = "wasm"))]
     pub fn dial(
         &self,
         local_ip: IpAddr,
         remote: SocketAddr,
         connect_timeout: Duration,
+        data: Option<&[u8]>,
     ) -> io::Result<TcpConn> {
-        let state = self.start_dial(local_ip, remote)?;
+        let (state, taken) = self.start_dial_with(local_ip, remote, data)?;
+        let conn = self.await_handshake(&state, connect_timeout)?;
+        if let Some(data) = data {
+            if self.tuning.fast_open {
+                self.learn_fast_open(remote.ip(), &state.conn.lock().unwrap());
+            }
+            let mut rest = &data[taken..];
+            while !rest.is_empty() {
+                let n = conn.write(rest)?;
+                rest = &rest[n..];
+            }
+        }
+        Ok(conn)
+    }
 
+    /// Wait for `state`'s handshake, as [`dial`](Self::dial) does.
+    #[cfg(not(target_family = "wasm"))]
+    fn await_handshake(
+        &self,
+        state: &Arc<ConnState>,
+        connect_timeout: Duration,
+    ) -> io::Result<TcpConn> {
         // Wait for the handshake. The peer may have sent data or even closed
         // by the time we look, so any synchronized state (or a completed
         // handshake since torn down) counts, not just ESTABLISHED.
@@ -1036,7 +1132,7 @@ impl TcpStack {
             }
             if conn.is_closed() {
                 drop(conn);
-                self.forget(&state);
+                self.forget(state);
                 return Err(io::Error::new(
                     io::ErrorKind::ConnectionRefused,
                     "connection reset during handshake",
@@ -1049,7 +1145,7 @@ impl TcpStack {
             let now = Instant::now();
             if now >= deadline {
                 drop(conn);
-                self.forget(&state);
+                self.forget(state);
                 return Err(io::Error::new(io::ErrorKind::TimedOut, "connect timeout"));
             }
             let (c, _) = state.signal.wait_timeout(conn, deadline - now).unwrap();
@@ -1294,8 +1390,7 @@ impl TcpStack {
         syn: &Segment,
         ecn: IpEcn,
     ) {
-        let mut conn = Conn::new(passive_config(local_ip, remote, syn, self.mss_for(remote)));
-        let synack = conn.accept_syn_ecn(syn, ecn);
+        let conn = Conn::new(self.passive_config(local_ip, remote, syn));
         let key = passive_key(remote, syn);
         let state = ConnState::new(
             key,
@@ -1305,8 +1400,32 @@ impl TcpStack {
             self.alarm.clone(),
             Some(pending),
         );
-        if self.register(key, &state) {
-            state.wrap_and_send(synack);
+        let mut conn = state.conn.lock().unwrap();
+        if self.tuning.fast_open {
+            // Fast Open data is the listener's to hold until accepted, as
+            // any data before then, and counts against the same budget:
+            // with no room left, it waits for the handshake instead.
+            let offered = matches!(
+                fastopen::offer(&syn.options),
+                Some(fastopen::Offer::Cookie(_))
+            );
+            let room = offered && !syn.payload.is_empty() && state.admit(syn);
+            conn.set_fast_open_gate(Some(self.fast_open_gate.clone()), !room);
+        }
+        let synack = conn.accept_syn_ecn(syn, ecn);
+        // With Fast Open data in, the application may take the connection
+        // now, before the handshake completes, and answer.
+        let early = conn.fast_open_accepted();
+        drop(conn);
+        if !self.register(key, &state) {
+            return;
+        }
+        if early {
+            state.connected.store(true, Ordering::Release);
+        }
+        state.wrap_and_send(synack);
+        if early && !state.after_segment() {
+            self.forget(&state);
         }
     }
 
@@ -1321,7 +1440,7 @@ impl TcpStack {
         ack: &Segment,
         mss: u16,
     ) {
-        let conn = Conn::new(passive_config(local_ip, remote, ack, self.mss_for(remote)));
+        let conn = Conn::new(self.passive_config(local_ip, remote, ack));
         let key = passive_key(remote, ack);
         let pending = PendingAccept {
             listener,
@@ -1377,7 +1496,7 @@ impl TcpStack {
         ack: &Segment,
         mss: u16,
     ) {
-        let mut conn = Conn::new(passive_config(local_ip, remote, ack, self.mss_for(remote)));
+        let mut conn = Conn::new(self.passive_config(local_ip, remote, ack));
         conn.accept_cookie_syn_received(ack, ack.ack.wrapping_sub(1), mss);
         let key = passive_key(remote, ack);
         let state = ConnState::new(
@@ -1423,6 +1542,20 @@ impl TcpStack {
     /// The MSS connections to `remote` advertise, and send with at most.
     fn mss_for(&self, remote: IpAddr) -> u16 {
         mss_for_mtu(self.mtu, remote)
+    }
+
+    /// Configuration for a connection opened by `seg`, the peer's SYN or
+    /// the ACK completing a cookie handshake.
+    fn passive_config(&self, local_ip: IpAddr, remote: IpAddr, seg: &Segment) -> ConnConfig {
+        self.tuning.apply(ConnConfig {
+            local_addr: Some(SocketAddr::new(local_ip, seg.dst_port)),
+            remote_addr: Some(SocketAddr::new(remote, seg.src_port)),
+            local_port: seg.dst_port,
+            remote_port: seg.src_port,
+            mss: self.mss_for(remote),
+            keepalive: true,
+            ..Default::default()
+        })
     }
 
     /// Take an ICMP message about a packet we sent. A Fragmentation Needed
@@ -1510,17 +1643,39 @@ fn mss_for_mtu(mtu: u32, remote: IpAddr) -> u16 {
     ) as u16
 }
 
-/// Configuration for a connection opened by `seg`, the peer's SYN or the
-/// ACK completing a cookie handshake.
-fn passive_config(local_ip: IpAddr, remote: IpAddr, seg: &Segment, mss: u16) -> ConnConfig {
-    ConnConfig {
-        local_addr: Some(SocketAddr::new(local_ip, seg.dst_port)),
-        remote_addr: Some(SocketAddr::new(remote, seg.src_port)),
-        local_port: seg.dst_port,
-        remote_port: seg.src_port,
-        mss,
-        keepalive: true,
-        ..Default::default()
+/// Servers whose Fast Open cookies a client keeps.
+#[cfg(not(target_family = "wasm"))]
+const FAST_OPEN_CACHE: usize = 1024;
+
+/// What a client knows of a server's Fast Open.
+#[derive(Debug, Clone, Default)]
+struct FastOpenEntry {
+    /// The cookie the server gave.
+    cookie: Option<Vec<u8>>,
+    /// The MSS the connection that got it sent with: what the SYN's data is
+    /// sized for.
+    mss: Option<u16>,
+    /// SYNs with data in a row that went unanswered, and when the last did.
+    syn_losses: u32,
+    last_loss: Option<Instant>,
+}
+
+impl FastOpenEntry {
+    /// Whether Fast Open to this server rests for now, as on Linux: after
+    /// two SYNs with data went unanswered in a row, for two minutes,
+    /// doubling with each further one, up to an hour. One loss may be the
+    /// network's; more say something on the way drops such SYNs, or the
+    /// server does, and each costs the connection a SYN timeout.
+    fn resting(&self, now: Instant) -> bool {
+        let Some(last) = self.last_loss else {
+            return false;
+        };
+        if self.syn_losses < 2 {
+            return false;
+        }
+        let rest =
+            Duration::from_secs(60 << (self.syn_losses - 1).min(6)).min(Duration::from_secs(3600));
+        now.saturating_duration_since(last) < rest
     }
 }
 
@@ -1835,6 +1990,66 @@ mod tests {
         feed(syn(4002));
         stack.shutdown();
         assert_eq!(listener.state.half_open.load(Ordering::Acquire), 0);
+    }
+
+    /// `ClientConfig::tcp` reaches every connection, dialed or accepted.
+    #[test]
+    fn tuning_applies_to_dialed_and_accepted_connections() {
+        use crate::vtcp::{CongestionKind, EcnMode, MtuProbing};
+        let tuning = Tuning::default()
+            .congestion(CongestionKind::Bbr)
+            .ecn(EcnMode::Accurate)
+            .pacing(false)
+            .send_buf_max(3 << 20)
+            .recv_buf_max(5 << 20)
+            .fast_open(true)
+            .mtu_probing(MtuProbing::Always);
+        let sink: Arc<dyn Fn(&[u8]) + Send + Sync> = Arc::new(|_: &[u8]| {});
+        let stack = TcpStack::with_config(sink, DEFAULT_MTU, tuning);
+        let dialed = stack
+            .start_dial(IpAddr::V4(US), SocketAddr::from((PEER, 80)))
+            .unwrap();
+        let _listener = stack.listen(own(US), 80).unwrap();
+        stack.handle_inbound(Packet::from_slice(&inbound(syn_from(4000))), IpAddr::V4(US));
+        let accepted = stack
+            .conns
+            .lock()
+            .unwrap()
+            .values()
+            .find(|c| c.key.local_port == 80)
+            .cloned()
+            .expect("SYN not accepted");
+        for cs in [dialed, accepted] {
+            let conn = cs.conn.lock().unwrap();
+            let c = conn.config();
+            assert_eq!(c.congestion, CongestionKind::Bbr);
+            assert_eq!(c.ecn, EcnMode::Accurate);
+            assert!(!c.pacing && c.fast_open);
+            assert_eq!((c.send_buf_max, c.recv_buf_max), (3 << 20, 5 << 20));
+            assert_eq!(c.mtu_probing, MtuProbing::Always);
+            assert!(c.keepalive, "the driver's own settings stay");
+        }
+    }
+
+    /// Fast Open to a server rests after SYNs with data keep going
+    /// unanswered, for longer each time.
+    #[test]
+    fn fast_open_rests_after_lost_syns() {
+        let now = Instant::now();
+        let mut e = FastOpenEntry {
+            cookie: Some(vec![1; 8]),
+            ..Default::default()
+        };
+        assert!(!e.resting(now));
+        e.syn_losses = 1;
+        e.last_loss = Some(now);
+        assert!(!e.resting(now), "one loss may be the network's");
+        e.syn_losses = 2;
+        assert!(e.resting(now + Duration::from_secs(119)));
+        assert!(!e.resting(now + Duration::from_secs(120)));
+        e.syn_losses = 30;
+        assert!(e.resting(now + Duration::from_secs(3599)));
+        assert!(!e.resting(now + Duration::from_secs(3600)));
     }
 
     fn syn_from(port: u16) -> Segment {
@@ -2405,7 +2620,12 @@ mod tests {
             s.shutdown();
         });
         let err = stack
-            .dial(IpAddr::V4(US), SocketAddr::from((PEER, 81)), Duration::MAX)
+            .dial(
+                IpAddr::V4(US),
+                SocketAddr::from((PEER, 81)),
+                Duration::MAX,
+                None,
+            )
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
     }

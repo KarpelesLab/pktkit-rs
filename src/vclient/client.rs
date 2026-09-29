@@ -14,6 +14,7 @@ use super::tcp::{self, TcpConn, TcpStack};
 use super::udp::{UdpConn, UdpStack};
 use crate::defrag::Reassembler;
 use crate::time::Instant;
+use crate::vtcp::Tuning;
 use crate::{IpPrefix, L3Device, L3Handler, Packet, Result};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -38,6 +39,17 @@ pub struct ClientConfig {
     /// MTU discovery can lower it further for one connection (ICMP
     /// Fragmentation Needed / Packet Too Big), never raise it.
     pub mtu: Option<u32>,
+    /// TCP settings for the connections the client dials and accepts: the
+    /// congestion controller, ECN, pacing, how far the buffers may grow,
+    /// Fast Open and PLPMTUD. vtcp's defaults by default.
+    ///
+    /// With [`fast_open`](Tuning::fast_open) on, the client takes Fast
+    /// Open (RFC 7413) on both sides: its listeners take the data of a SYN
+    /// with a valid cookie before the handshake completes, and
+    /// [`Client::dial_tcp_with_data`] sends its first data in the SYN to a
+    /// server that has given it a cookie. A request then gets its answer in
+    /// one round trip, not two.
+    pub tcp: Tuning,
 }
 
 setters! {
@@ -45,6 +57,7 @@ setters! {
         some prefix: IpPrefix;
         set dns: Vec<IpAddr>;
         some mtu: u32;
+        set tcp: Tuning;
     }
 }
 
@@ -98,7 +111,11 @@ impl Client {
                 }));
             }
         });
-        let tcp = TcpStack::with_mtu(sink.clone(), cfg.mtu.unwrap_or(tcp::DEFAULT_MTU));
+        let tcp = TcpStack::with_config(
+            sink.clone(),
+            cfg.mtu.unwrap_or(tcp::DEFAULT_MTU),
+            cfg.tcp.clone(),
+        );
         let udp = UdpStack::new(sink);
 
         Arc::new(Client {
@@ -182,7 +199,32 @@ impl Client {
     #[cfg(not(target_family = "wasm"))]
     pub fn dial_tcp_timeout(&self, addr: SocketAddr, timeout: Duration) -> Result<TcpConn> {
         let local_ip = self.local_ip_for(addr)?;
-        self.tcp.dial(local_ip, addr, timeout)
+        self.tcp.dial(local_ip, addr, timeout, None)
+    }
+
+    /// Open a TCP connection to `addr` and send `data`, as
+    /// [`dial_tcp`](Self::dial_tcp) followed by a write of all of it, but
+    /// with TCP Fast Open (RFC 7413) when [`ClientConfig::tcp`] turns it
+    /// on: the data then rides in the SYN, and the server can answer
+    /// before the handshake completes, a round trip sooner. Linux's
+    /// `sendto` with `MSG_FASTOPEN` does the same.
+    ///
+    /// The first connection to a server asks it for a cookie, which the
+    /// client keeps for the next ones; until then, and whenever the server
+    /// does not take the data (it does not do Fast Open, or its cookie has
+    /// aged out), the data goes after the handshake, as without. After a
+    /// SYN with data goes unanswered, as it does through middleboxes that
+    /// drop such SYNs, the client leaves Fast Open to that server alone for
+    /// a while.
+    ///
+    /// The data may reach the server twice (RFC 7413 §6): a SYN can be
+    /// duplicated on the way. Send only what is safe to repeat, such as an
+    /// idempotent request, or a TLS ClientHello.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn dial_tcp_with_data(&self, addr: SocketAddr, data: &[u8]) -> Result<TcpConn> {
+        let local_ip = self.local_ip_for(addr)?;
+        self.tcp
+            .dial(local_ip, addr, Duration::from_secs(10), Some(data))
     }
 
     /// Replace the DNS servers [`resolve`](Self::resolve) queries.

@@ -875,3 +875,116 @@ fn a_configured_mtu_bounds_both_directions() {
     assert_eq!(too_big.load(Ordering::Relaxed), 0);
     assert_eq!(largest.load(Ordering::Relaxed), 1280);
 }
+
+/// Wire `a` and `b` back to back, noting the payload of every SYN `a`
+/// sends, and silently dropping packets larger than `black_hole` bytes
+/// (zero for none), as a path whose ICMP messages are filtered does.
+fn sniffed_link(
+    a: &Arc<pktkit::vclient::Client>,
+    b: &Arc<pktkit::vclient::Client>,
+    black_hole: usize,
+) -> Arc<Mutex<Vec<usize>>> {
+    let syns = Arc::new(Mutex::new(Vec::new()));
+    for (from, to, note) in [(a, b, Some(syns.clone())), (b, a, None)] {
+        let to_w = Arc::downgrade(to);
+        from.set_handler(Arc::new(move |p: &Packet| {
+            if let Some(syns) = &note
+                && let Ok(seg) = Segment::parse(p.payload())
+                && seg.flags & pktkit::vtcp::flags::SYN != 0
+            {
+                syns.lock().unwrap().push(seg.payload.len());
+            }
+            if black_hole > 0 && p.len() > black_hole {
+                return Ok(());
+            }
+            if let Some(to) = to_w.upgrade() {
+                let _ = to.send(p);
+            }
+            Ok(())
+        }));
+    }
+    syns
+}
+
+/// TCP Fast Open (RFC 7413): the first connection gets a cookie; the next
+/// ones carry their request in the SYN, which the server reads and answers
+/// before the handshake completes. Without it, or with the server not
+/// taking it, the request goes after the handshake, as a plain dial and
+/// write would send it.
+#[test]
+fn fast_open_puts_the_request_in_the_syn() {
+    use pktkit::vtcp::Tuning;
+    use std::io::Read;
+
+    for (client_tfo, server_tfo, want) in [
+        (true, true, [0, 4, 4]),
+        (true, false, [0, 0, 0]),
+        (false, true, [0, 0, 0]),
+    ] {
+        let mk = |last: u8, tfo: bool| {
+            let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, last));
+            pktkit::vclient::Client::new(
+                pktkit::vclient::ClientConfig::default()
+                    .prefix(IpPrefix::new(ip, 24))
+                    .tcp(Tuning::default().fast_open(tfo)),
+            )
+        };
+        let (a, b) = (mk(2, client_tfo), mk(3, server_tfo));
+        let syns = sniffed_link(&a, &b, 0);
+        let listener = b.listen_tcp(LISTEN_PORT).unwrap();
+        let server = std::thread::spawn(move || {
+            for _ in 0..3 {
+                let mut s = listener.accept().unwrap();
+                let mut req = [0; 4];
+                s.read_exact(&mut req).unwrap();
+                assert_eq!(&req, b"ping");
+                s.write_all(b"pong").unwrap();
+            }
+        });
+        let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3)), LISTEN_PORT);
+        for _ in 0..3 {
+            let mut c = a.dial_tcp_with_data(dst, b"ping").unwrap();
+            let mut resp = [0; 4];
+            c.read_exact(&mut resp).unwrap();
+            assert_eq!(&resp, b"pong");
+        }
+        server.join().unwrap();
+        assert_eq!(
+            *syns.lock().unwrap(),
+            want,
+            "client {client_tfo}, server {server_tfo}"
+        );
+    }
+}
+
+/// PLPMTUD, on by default once a black hole shows: across a link that
+/// silently drops what is larger than 1400 bytes, with no ICMP message to
+/// say so, a bulk transfer each way still completes, in segments that fit.
+#[test]
+fn a_black_hole_is_found_without_icmp() {
+    use std::io::Read;
+
+    const SIZE: usize = 1 << 20;
+    let (a, b) = (client(2), client(3));
+    sniffed_link(&a, &b, 1400);
+    let listener = b.listen_tcp(LISTEN_PORT).unwrap();
+    let data: Vec<u8> = (0..SIZE).map(|i| (i * 7 + i / 999) as u8).collect();
+    let sent = data.clone();
+    let server = std::thread::spawn(move || {
+        let mut s = listener.accept().unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(30)));
+        s.write_all(&sent).unwrap();
+        let mut back = vec![0; SIZE];
+        s.read_exact(&mut back).unwrap();
+        back
+    });
+    let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3)), LISTEN_PORT);
+    let mut conn = a.dial_tcp(dst).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(30)));
+    conn.set_write_timeout(Some(Duration::from_secs(30)));
+    let mut got = vec![0u8; SIZE];
+    conn.read_exact(&mut got).expect("download stalled");
+    assert!(got == data, "download corrupted");
+    conn.write_all(&data).expect("upload stalled");
+    assert!(server.join().unwrap() == data, "upload corrupted");
+}
