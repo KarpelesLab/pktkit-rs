@@ -89,6 +89,13 @@ impl SendBuf {
         self.nxt = self.nxt.wrapping_add(n as u32);
     }
 
+    /// Take SND.NXT back to `seq`, between SND.UNA and SND.NXT: what was
+    /// sent past it counts as never sent, and goes again as new data.
+    pub fn rewind_to(&mut self, seq: u32) {
+        debug_assert!(!seq_after(seq, self.nxt) && !seq_after(self.una, seq));
+        self.nxt = seq;
+    }
+
     /// Cumulative ACK at `ack`; returns the number of bytes newly freed.
     pub fn acknowledge(&mut self, mut ack: u32) -> u32 {
         if !seq_after(ack, self.una) {

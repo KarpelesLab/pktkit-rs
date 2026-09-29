@@ -17,6 +17,8 @@ pub mod kind {
     pub const Sack: u8 = 5;
     /// Timestamps (RFC 7323).
     pub const Timestamp: u8 = 8;
+    /// TCP Fast Open cookie, or a request for one (RFC 7413).
+    pub const FastOpen: u8 = 34;
 }
 
 /// A parsed TCP option (kind + raw payload, excluding the kind and length

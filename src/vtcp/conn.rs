@@ -23,6 +23,7 @@ use super::congestion::{Ack, CongestionController, HighSpeed, Lost, NewReno, ini
 use super::cubic::Cubic;
 use super::cwv::{self, PipeAck};
 use super::ecn::{Ecn, EcnMode, IpEcn};
+use super::fastopen::{self, FastOpen, Gate};
 use super::options::{
     self, SackBlock, TcpOption, get_sack_blocks, get_timestamp, get_wscale, has_sack_perm,
     mss_option, sack_option, sack_perm_option, timestamp_option, wscale_option,
@@ -420,6 +421,25 @@ pub struct ConnConfig {
     /// messages do not tell it (see [`MtuProbing`]). By default, once
     /// full-sized segments keep timing out, as on Linux.
     pub mtu_probing: MtuProbing,
+    /// TCP Fast Open (RFC 7413), for a connection opened with
+    /// [`Conn::accept_syn`], as Linux's `TCP_FASTOPEN` does on a listener:
+    /// a SYN asking for a cookie is given one, and the data of a SYN that
+    /// brings a valid cookie back is taken at once, readable before the
+    /// handshake completes, and the application may answer it straight
+    /// away. A request and its response then take one round trip, not two.
+    ///
+    /// The cookie is a MAC of the peer's address, which proves the SYN
+    /// comes from it, so `local_addr` and `remote_addr` must be set. At
+    /// most 64 connections with such data wait for their handshake at a
+    /// time (RFC 7413 §5.1); past that, a SYN's data waits for the
+    /// handshake, as it does without Fast Open.
+    ///
+    /// Off by default, as on Linux, because the application has to be
+    /// ready for what RFC 7413 §6 warns of: a SYN may be duplicated on the
+    /// way, and its data delivered twice, to two connections. Only
+    /// requests safe to repeat belong in a SYN. `vclient` sends them
+    /// (see its `ClientConfig::tcp`).
+    pub fast_open: bool,
 }
 
 setters! {
@@ -449,6 +469,7 @@ setters! {
         set nodelay: bool;
         set ecn: EcnMode;
         set mtu_probing: MtuProbing;
+        set fast_open: bool;
     }
 }
 
@@ -480,6 +501,7 @@ impl Default for ConnConfig {
             nodelay: false,
             ecn: EcnMode::default(),
             mtu_probing: MtuProbing::default(),
+            fast_open: false,
         }
     }
 }
@@ -767,6 +789,9 @@ pub struct Conn {
     outgoing_ecn: Vec<IpEcn>,
     last_marks: Vec<IpEcn>,
 
+    /// TCP Fast Open (RFC 7413).
+    tfo: FastOpen,
+
     // ECN (RFC 3168, RFC 9768).
     ecn: Ecn,
     /// The codepoint the segment being processed arrived with.
@@ -916,6 +941,7 @@ impl Conn {
             outgoing: Vec::new(),
             outgoing_ecn: Vec::new(),
             last_marks: Vec::new(),
+            tfo: FastOpen::default(),
             ecn: Ecn::default(),
             rx_ecn: IpEcn::NOT_ECT,
             cwr_high: None,
@@ -957,6 +983,12 @@ impl Conn {
     #[inline]
     pub fn fin_received(&self) -> bool {
         self.fin_recvd_signaled
+    }
+
+    /// The configuration the connection was made with.
+    #[cfg(test)]
+    pub(crate) fn config(&self) -> &ConnConfig {
+        &self.cfg
     }
 
     /// [`ConnConfig::local_addr`].
@@ -1265,6 +1297,129 @@ impl Conn {
         self.take_outgoing()
     }
 
+    /// Active open with TCP Fast Open (RFC 7413): take `data`, as much as
+    /// the send buffer holds, and send the SYN. With the server's `cookie`,
+    /// the SYN carries what of the data fits beside its options in a
+    /// segment of `mss` (the server's, as last seen, or the default for
+    /// the family), and the server may take it at once; what does not fit,
+    /// or what the server does not take, goes once the handshake is done.
+    /// Without a cookie, the SYN asks for one ([`fast_open_cookie`](Self::fast_open_cookie)
+    /// has it once the SYN-ACK is in) and all the data waits for the
+    /// handshake. Returns what was taken of `data`, and the SYN.
+    #[cfg_attr(not(feature = "vclient"), allow(dead_code))]
+    pub(crate) fn connect_fast_open(
+        &mut self,
+        cookie: Option<&[u8]>,
+        mss: Option<u16>,
+        data: &[u8],
+    ) -> (usize, Vec<Vec<u8>>) {
+        self.clock();
+        if self.state != State::Closed {
+            return (0, Vec::new());
+        }
+        let iss = self.new_iss();
+        let mut sb = SendBuf::new(self.cfg.send_buf_size, iss);
+        // The buffer counts the SYN's sequence number as a byte of its own,
+        // so the data after it lines up with the sequence space; the
+        // SYN-ACK frees it, as it would any byte it acknowledges.
+        sb.write(&[0]);
+        let n = sb.write(data);
+        sb.advance_sent(1);
+        self.send_buf = Some(sb);
+        self.score = Scoreboard::new(iss, self.now);
+        self.recv_buf = Some(RecvBuf::new(0, self.cfg.recv_buf_size));
+        self.state = State::SynSent;
+        self.tfo.offered = true;
+        self.tfo.request = Some(cookie.map_or_else(Vec::new, <[u8]>::to_vec));
+
+        let opts = self.build_syn_options();
+        let payload = match cookie {
+            Some(_) => {
+                let default = if self.is_ipv6() { 1220 } else { 536 };
+                let mss = mss
+                    .unwrap_or(default)
+                    .min(self.cfg.mss.max(1))
+                    .min(self.path_mss);
+                let room = usize::from(mss).saturating_sub(options::options_len(&opts));
+                self.send_buf.as_ref().unwrap().peek_unsent(room).to_vec()
+            }
+            None => Vec::new(),
+        };
+        let (ecn, ae) = self.ecn.syn_flags(self.cfg.ecn);
+        let syn = Segment {
+            src_port: self.cfg.local_port,
+            dst_port: self.cfg.remote_port,
+            seq: iss,
+            ack: 0,
+            flags: flags::SYN | ecn,
+            ae,
+            window: self.syn_window(),
+            options: opts,
+            payload,
+            ..Default::default()
+        };
+        self.tfo.syn_data = syn.payload.len() as u32;
+        self.send_buf
+            .as_mut()
+            .unwrap()
+            .advance_sent(syn.payload.len());
+        self.queue_seg(syn);
+        self.rto.start_timing(iss, self.now);
+        self.start_rto();
+        (n, self.take_outgoing())
+    }
+
+    /// The Fast Open cookie the server's SYN-ACK brought, after
+    /// [`connect_fast_open`](Self::connect_fast_open): the one to send
+    /// next time.
+    #[cfg_attr(
+        any(not(feature = "vclient"), target_family = "wasm"),
+        allow(dead_code)
+    )]
+    pub(crate) fn fast_open_cookie(&self) -> Option<&[u8]> {
+        self.tfo.cookie.as_deref()
+    }
+
+    /// Whether the SYN of [`connect_fast_open`](Self::connect_fast_open)
+    /// carried data that went unanswered: the server, or something on the
+    /// way to it, may drop SYNs with data (RFC 7413 §4.1.3.1), and a client
+    /// had better not send it one again for a while.
+    #[cfg_attr(
+        any(not(feature = "vclient"), target_family = "wasm"),
+        allow(dead_code)
+    )]
+    pub(crate) fn fast_open_syn_lost(&self) -> bool {
+        self.tfo.syn_data_lost
+    }
+
+    /// Whether the server's SYN-ACK acknowledged all the data of our SYN.
+    #[cfg(test)]
+    pub(crate) fn fast_open_data_acked(&self) -> bool {
+        self.tfo.data_acked
+    }
+
+    /// Server side: whether this connection took data from its SYN (see
+    /// [`ConnConfig::fast_open`]), so it may be read, and written to,
+    /// before the handshake completes.
+    #[cfg_attr(not(any(feature = "vclient", feature = "slirp")), allow(dead_code))]
+    pub(crate) fn fast_open_accepted(&self) -> bool {
+        self.tfo.accepted
+    }
+
+    /// Server side, before [`accept_syn`](Self::accept_syn): count this
+    /// connection, if it takes Fast Open data, at `gate` rather than the
+    /// process's, and take none at all if `refuse_data` (the driver has no
+    /// room for it before the handshake completes).
+    #[cfg_attr(not(any(feature = "vclient", feature = "slirp")), allow(dead_code))]
+    pub(crate) fn set_fast_open_gate(
+        &mut self,
+        gate: Option<std::sync::Arc<Gate>>,
+        refuse_data: bool,
+    ) {
+        self.tfo.gate = gate;
+        self.tfo.refuse_data = refuse_data;
+    }
+
     /// Process an incoming SYN, transition to SYN-RECEIVED, emit SYN-ACK.
     pub fn accept_syn(&mut self, syn: &Segment) -> Vec<Vec<u8>> {
         self.accept_syn_ecn(syn, IpEcn::NOT_ECT)
@@ -1314,6 +1469,7 @@ impl Conn {
         }
         self.negotiate_options(&syn.options);
         self.ecn.on_syn(self.cfg.ecn, syn, self.rx_ecn);
+        let fast_open = self.fast_open_syn(syn);
 
         self.send_buf = Some(SendBuf::new(self.cfg.send_buf_size, iss));
         self.score = Scoreboard::new(iss, self.now);
@@ -1322,6 +1478,21 @@ impl Conn {
             self.cfg.recv_buf_size,
         ));
         self.state = State::SynReceived;
+        if fast_open == Some(true) {
+            // The data is the application's now, and the SYN-ACK
+            // acknowledges it. What the application answers may go before
+            // the handshake completes, within the SYN's window (never
+            // scaled, RFC 7323 §2.2): the buffer counts the SYN-ACK's
+            // sequence number as a byte, so the answer lines up after it,
+            // and the scoreboard starts past it.
+            self.recv_buf
+                .as_mut()
+                .unwrap()
+                .insert(syn.seq.wrapping_add(1), &syn.payload);
+            self.send_buf.as_mut().unwrap().write(&[0]);
+            self.score = Scoreboard::new(iss.wrapping_add(1), self.now);
+            self.set_snd_wnd(u32::from(syn.window));
+        }
 
         let opts = self.build_syn_options();
         let win = self.syn_window();
@@ -1342,10 +1513,42 @@ impl Conn {
         self.send_buf.as_mut().unwrap().advance_sent(1);
         self.rto.start_timing(iss, self.now);
 
-        self.syn_data = syn.payload.clone();
+        // Data in a SYN whose Fast Open cookie did not let it in is not
+        // kept either (RFC 7413 §4.2.2): the client sends it again after
+        // the handshake.
+        if fast_open.is_none() {
+            self.syn_data = syn.payload.clone();
+        }
 
         self.start_rto();
         self.take_outgoing()
+    }
+
+    /// The Fast Open option of a SYN we are answering, if we take Fast
+    /// Open: `None` without one, else whether its data is taken. A request
+    /// for a cookie, or a cookie no longer valid, is answered with a fresh
+    /// one in the SYN-ACK. Data comes in with a valid cookie while this
+    /// connection's gate has room for one more pending handshake.
+    fn fast_open_syn(&mut self, syn: &Segment) -> Option<bool> {
+        if !self.cfg.fast_open {
+            return None;
+        }
+        let offer = fastopen::offer(&syn.options)?;
+        let (Some(local), Some(remote)) = (self.cfg.local_addr, self.cfg.remote_addr) else {
+            return None;
+        };
+        let (server, client) = (local.ip(), remote.ip());
+        if !matches!(offer, fastopen::Offer::Cookie(c) if fastopen::valid(server, client, c)) {
+            self.tfo.reply = Some(fastopen::cookie(server, client));
+            return Some(false);
+        }
+        if syn.payload.is_empty() || self.tfo.refuse_data {
+            return Some(false);
+        }
+        let gate = self.tfo.gate.clone().unwrap_or_else(Gate::global);
+        self.tfo.slot = Some(gate.take()?);
+        self.tfo.accepted = true;
+        Some(true)
     }
 
     /// Skip SYN-RECEIVED and jump straight to ESTABLISHED via a validated
@@ -1412,6 +1615,11 @@ impl Conn {
             opts.push(timestamp_option(self.ts_now(), 0));
         } else if synack && self.ts_ok {
             opts.push(timestamp_option(self.ts_now(), self.ts_recent));
+        }
+        if !synack && let Some(c) = self.tfo.request.as_deref() {
+            opts.push(fastopen::option(c));
+        } else if synack && let Some(c) = self.tfo.reply {
+            opts.push(fastopen::option(&c));
         }
         opts
     }
@@ -1775,10 +1983,15 @@ impl Conn {
         self.dup_acks = 0;
         self.reno_sacked = 0;
         if let Some(sb) = self.send_buf.as_ref() {
-            self.score = Scoreboard::new(sb.una(), self.now);
+            // A Fast Open server may have sent data already, which stays.
+            if self.score.is_empty() {
+                self.score = Scoreboard::new(sb.una(), self.now);
+            }
             self.score.set_rack(self.sack_ok);
             self.score.set_track_losses(self.cc.model_based());
         }
+        // No longer a pending Fast Open connection.
+        self.tfo.slot = None;
     }
 
     fn handle_closed(&mut self, seg: &Segment) -> Vec<Vec<u8>> {
@@ -2097,7 +2310,19 @@ impl Conn {
             // Normal SYN-ACK.
             self.ecn
                 .on_synack(self.cfg.ecn, seg, self.rx_ecn, seg.seq.wrapping_add(1));
-            self.send_buf.as_mut().unwrap().acknowledge(seg.ack);
+            if self.tfo.offered
+                && let Some(fastopen::Offer::Cookie(c)) = fastopen::offer(&seg.options)
+            {
+                self.tfo.cookie = Some(c.to_vec());
+            }
+            let sb = self.send_buf.as_mut().unwrap();
+            sb.acknowledge(seg.ack);
+            if self.tfo.syn_data > 0 {
+                // What of the SYN's data the server did not take goes
+                // again once the handshake is done (RFC 7413 §4.2.2).
+                self.tfo.data_acked = sb.unacked() == 0;
+                sb.rewind_to(sb.una());
+            }
             self.retries = 0;
             self.stop_rto();
             self.recv_buf = Some(RecvBuf::new(
@@ -2127,7 +2352,13 @@ impl Conn {
             return self.take_outgoing();
         }
 
-        // Simultaneous open: bare SYN without ACK.
+        // Simultaneous open: bare SYN without ACK. Data our SYN carried
+        // goes after the handshake.
+        if self.tfo.syn_data > 0 {
+            self.tfo.syn_data = 0;
+            let sb = self.send_buf.as_mut().unwrap();
+            sb.rewind_to(sb.una().wrapping_add(1));
+        }
         self.recv_buf = Some(RecvBuf::new(
             seg.seq.wrapping_add(1),
             self.cfg.recv_buf_size,
@@ -2159,8 +2390,16 @@ impl Conn {
     }
 
     fn handle_syn_received(&mut self, seg: &Segment) -> Vec<Vec<u8>> {
-        let snd_nxt = self.send_buf.as_ref().unwrap().nxt();
-        if seg.ack != snd_nxt {
+        let sb = self.send_buf.as_ref().unwrap();
+        let (una, snd_nxt) = (sb.una(), sb.nxt());
+        // A Fast Open server may have sent data after its SYN-ACK, which
+        // the ACK may cover in part or not at all.
+        let valid = if self.tfo.accepted {
+            seq_after(seg.ack, una) && seq_before_eq(seg.ack, snd_nxt)
+        } else {
+            seg.ack == snd_nxt
+        };
+        if !valid {
             let rst = Segment {
                 src_port: self.cfg.local_port,
                 dst_port: self.cfg.remote_port,
@@ -2171,12 +2410,20 @@ impl Conn {
             self.queue_seg(rst);
             return self.take_outgoing();
         }
-        self.send_buf.as_mut().unwrap().acknowledge(seg.ack);
+        // The SYN-ACK; any data after it is process_ack's, below.
+        self.send_buf
+            .as_mut()
+            .unwrap()
+            .acknowledge(una.wrapping_add(1));
         self.ecn.on_handshake_ack(seg);
         // The SYN-ACK's round trip, unless it was resent (Karn).
         self.rtt_sampled |= self.rto.ack_received(seg.ack, self.now);
         self.retries = 0;
-        self.stop_rto();
+        if self.send_buf.as_ref().unwrap().unacked() == 0 {
+            self.stop_rto();
+        } else {
+            self.start_rto();
+        }
         self.set_snd_wnd((seg.window as u32) << self.snd_wnd_shift);
         self.state = State::Established;
         self.handshake_done();
@@ -3747,7 +3994,11 @@ impl Conn {
             let big_enough = n >= room
                 || (half_wnd > 0 && n >= half_wnd as usize)
                 || (self.cfg.nodelay && n == pending);
-            if !big_enough && self.send_buf.as_ref().unwrap().unacked() > 0 && !self.fin_queued {
+            // Nagle waits on data in flight, not on the SYN-ACK a Fast Open
+            // server answers before the handshake completes.
+            let syn = usize::from(self.state == State::SynReceived);
+            let in_flight = self.send_buf.as_ref().unwrap().unacked() > syn;
+            if !big_enough && in_flight && !self.fin_queued {
                 break;
             }
             if !self.pace_ready() {
@@ -4228,6 +4479,16 @@ impl Conn {
 
         match self.state {
             State::SynSent => {
+                // A SYN with data unanswered goes again without it, nor its
+                // cookie: something on the way may drop SYNs that carry
+                // data (RFC 7413 §4.1.3.1). SND.NXT stays past the data, as
+                // on Linux: the server may have taken it from the first SYN
+                // and lost only its SYN-ACK, whose ACK then covers it. If
+                // the SYN-ACK does not, the data follows the handshake.
+                if self.tfo.syn_data > 0 {
+                    self.tfo.syn_data_lost = true;
+                    self.tfo.request = None;
+                }
                 let opts = self.build_syn_options();
                 let win = self.syn_window();
                 let una = self.send_buf.as_ref().unwrap().una();
@@ -4491,7 +4752,10 @@ impl Conn {
         if self.closed {
             return (0, Vec::new());
         }
-        if self.state != State::Established && self.state != State::CloseWait {
+        // A Fast Open server answers what the SYN brought before the
+        // handshake completes.
+        let early = self.state == State::SynReceived && self.tfo.accepted;
+        if self.state != State::Established && self.state != State::CloseWait && !early {
             return (0, Vec::new());
         }
         // Before the new data is queued (draft-ietf-ccwg-bbr §4.1.2.4).
@@ -4635,6 +4899,7 @@ impl Conn {
         self.stop_keepalive();
         self.stop_persist();
         self.time_wait_deadline = None;
+        self.tfo.slot = None;
         if self.closed {
             self.signal_established();
             self.signal_fin_recvd();
@@ -8155,6 +8420,9 @@ mod tests {
         /// searches for the path MTU: without, a black hole is the end of
         /// the connection.
         black_hole: [u32; 2],
+        /// TCP Fast Open, on both ends: 0 off; the client's SYN asks for a
+        /// cookie (1), brings a valid one and data (2), or a stale one (3).
+        fast_open: u64,
     }
 
     impl StressCfg {
@@ -8197,6 +8465,7 @@ mod tests {
                 ecn_path: Rng(splitmix(seed ^ 0xECE) | 1).below(6),
                 mtu_probing: [MtuProbing::Off; 2],
                 black_hole: [0; 2],
+                fast_open: Rng(splitmix(seed ^ 0xF0) | 1).below(8).saturating_sub(4),
             }
             .with_black_holes(seed)
         }
@@ -8328,8 +8597,13 @@ mod tests {
         let sc = StressCfg::new(seed);
         let mut rng = Rng(splitmix(seed) | 1);
         let mk = |local, remote, i: usize| {
-            cfg(local, remote)
-                .enable_timestamps(sc.ts[i])
+            // Fast Open's cookie goes by the addresses.
+            let c = if sc.fast_open > 0 {
+                tfo_cfg(local, remote)
+            } else {
+                cfg(local, remote)
+            };
+            c.enable_timestamps(sc.ts[i])
                 .enable_sack(sc.sack[i])
                 .mss(sc.mss)
                 .no_window_scaling(!sc.wscale[i])
@@ -8345,10 +8619,8 @@ mod tests {
                 .mtu_probing(sc.mtu_probing[i])
         };
         let mut ecn_rng = Rng(splitmix(seed ^ 0xEC0) | 1);
-        let mut a = Conn::new(mk(40300, 80, 0));
+        let a = Conn::new(mk(40300, 80, 0));
         let b = Conn::new(mk(80, 40300, 1));
-        let syn = a.connect();
-        let syn = marked(&a, syn);
         let max_len = (sc.buf as u64 * 2).min(400_000);
         let mut sides = [a, b].map(|conn| {
             let len = rng.below(max_len) as usize;
@@ -8360,6 +8632,18 @@ mod tests {
                 close_called: false,
             }
         });
+        let syn = match sc.fast_open {
+            0 => sides[0].conn.connect(),
+            k => {
+                let valid = fastopen::cookie([10, 0, 0, 1].into(), [10, 0, 0, 2].into());
+                let cookie = [None, Some(&valid[..]), Some(&[0xAA; 8][..])][k as usize - 1];
+                let s = &mut sides[0];
+                let (n, syn) = s.conn.connect_fast_open(cookie, None, &s.to_send);
+                s.written = n;
+                syn
+            }
+        };
+        let syn = marked(&sides[0].conn, syn);
         // Segments with their IP-ECN codepoints.
         let mut links: [Vec<(Vec<u8>, IpEcn)>; 2] = [syn, Vec::new()];
         let done = |s: &[Side; 2]| {
@@ -9585,6 +9869,195 @@ mod tests {
         assert_eq!(again.seq, probe.seq);
         assert!(again.payload.len() <= 1024);
         assert_eq!(c.mss(), 1024);
+    }
+
+    // --- TCP Fast Open -------------------------------------------------------
+
+    /// A client at 10.0.0.2 and a server at 10.0.0.1 taking Fast Open.
+    fn tfo_cfg(local: u16, remote: u16) -> ConnConfig {
+        let ip = |port: u16| {
+            if port == 80 {
+                [10, 0, 0, 1]
+            } else {
+                [10, 0, 0, 2]
+            }
+        };
+        cfg(local, remote)
+            .local_addr((ip(local), local).into())
+            .remote_addr((ip(remote), remote).into())
+            .send_buf_size(1 << 16)
+            .recv_buf_size(1 << 16)
+            .fast_open(true)
+    }
+
+    /// A cookie from the server, as a first connection gets it.
+    fn tfo_cookie(port: u16) -> Vec<u8> {
+        let mut c = Conn::new(tfo_cfg(port, 80));
+        let mut s = Conn::new(tfo_cfg(80, port));
+        let (n, syn) = c.connect_fast_open(None, None, b"");
+        assert_eq!(n, 0);
+        let syn = parse(&syn[0]);
+        assert_eq!(
+            fastopen::offer(&syn.options),
+            Some(fastopen::Offer::Request)
+        );
+        assert!(syn.payload.is_empty());
+        let synack = s.accept_syn(&syn);
+        assert!(!s.fast_open_accepted());
+        let ack = deliver(&mut c, &synack);
+        assert_eq!(c.state(), State::Established);
+        deliver(&mut s, &ack);
+        assert_eq!(s.state(), State::Established);
+        c.fast_open_cookie().expect("no cookie").to_vec()
+    }
+
+    // RFC 7413: with a cookie, the request rides in the SYN and the server
+    // reads it, and answers, before the handshake completes: the answer is
+    // in one round trip.
+    #[test]
+    fn fast_open_answers_in_one_round_trip() {
+        let cookie = tfo_cookie(40800);
+        assert_eq!(cookie.len(), fastopen::COOKIE_LEN);
+        let mut c = Conn::new(tfo_cfg(40801, 80));
+        let mut s = Conn::new(tfo_cfg(80, 40801));
+        let (n, syn) = c.connect_fast_open(Some(&cookie), None, b"GET /");
+        assert_eq!(n, 5);
+        let syn = parse(&syn[0]);
+        assert_eq!(syn.payload, b"GET /");
+        let synack = s.accept_syn(&syn);
+        assert!(s.fast_open_accepted());
+        assert_eq!(s.state(), State::SynReceived);
+        assert_eq!(read_all(&mut s), b"GET /");
+        let synack_seg = parse(&synack[0]);
+        assert_eq!(
+            synack_seg.ack,
+            syn.seq.wrapping_add(6),
+            "data not acknowledged"
+        );
+        assert!(fastopen::offer(&synack_seg.options).is_none());
+        // The answer goes at once.
+        let (n, answer) = s.write(b"200 OK");
+        assert_eq!(n, 6);
+        assert_eq!(answer.len(), 1);
+
+        // The client takes the SYN-ACK, then the answer.
+        let ack = deliver(&mut c, &synack);
+        assert_eq!(c.state(), State::Established);
+        assert!(c.fast_open_data_acked());
+        let ack2 = deliver(&mut c, &answer);
+        assert_eq!(read_all(&mut c), b"200 OK");
+        // The ACK of the SYN-ACK alone completes the handshake, with the
+        // answer still out; the next acknowledges it.
+        deliver(&mut s, &ack);
+        assert_eq!(s.state(), State::Established);
+        assert!(s.rto_deadline.is_some(), "answer out with no timer");
+        deliver(&mut s, &ack2);
+        assert_eq!(s.send_buf.as_ref().unwrap().unacked(), 0);
+        // Both ways on from there.
+        let (_, more) = c.write(b"more");
+        deliver(&mut s, &more);
+        assert_eq!(read_all(&mut s), b"more");
+    }
+
+    // A cookie the server does not know gets the data dropped and a fresh
+    // cookie back; the client sends the data again after the handshake.
+    #[test]
+    fn a_bad_cookie_falls_back_to_the_handshake() {
+        let mut c = Conn::new(tfo_cfg(40802, 80));
+        let mut s = Conn::new(tfo_cfg(80, 40802));
+        let (_, syn) = c.connect_fast_open(Some(&[1, 2, 3, 4, 5, 6, 7, 8]), None, b"hello");
+        let synack = deliver_syn(&mut s, &syn);
+        assert!(!s.fast_open_accepted());
+        assert!(read_all(&mut s).is_empty());
+        let synack_seg = parse(&synack[0]);
+        assert_eq!(synack_seg.ack, parse(&syn[0]).seq.wrapping_add(1));
+        let fresh = match fastopen::offer(&synack_seg.options) {
+            Some(fastopen::Offer::Cookie(c)) => c.to_vec(),
+            o => panic!("{o:?}"),
+        };
+        let out = deliver(&mut c, &synack);
+        assert!(!c.fast_open_data_acked());
+        assert_eq!(c.fast_open_cookie(), Some(&fresh[..]));
+        let data = out.iter().map(|p| parse(p)).find(|p| !p.payload.is_empty());
+        assert_eq!(data.expect("data not resent").payload, b"hello");
+        deliver(&mut s, &out);
+        assert_eq!(s.state(), State::Established);
+        assert_eq!(read_all(&mut s), b"hello");
+    }
+
+    fn deliver_syn(s: &mut Conn, syn: &[Vec<u8>]) -> Vec<Vec<u8>> {
+        s.accept_syn(&parse(&syn[0]))
+    }
+
+    // A SYN with data that goes unanswered is sent again without it, and
+    // without the cookie; the data follows the handshake.
+    #[test]
+    fn a_lost_syn_with_data_goes_again_without_it() {
+        let cookie = tfo_cookie(40803);
+        let mut c = Conn::new(tfo_cfg(40804, 80));
+        let mut s = Conn::new(tfo_cfg(80, 40804));
+        let (_, _lost) = c.connect_fast_open(Some(&cookie), None, b"hello");
+        let again = fire_rto(&mut c);
+        let syn = parse(&again[0]);
+        assert!(syn.payload.is_empty());
+        assert!(fastopen::offer(&syn.options).is_none());
+        assert!(c.fast_open_syn_lost());
+        let synack = deliver_syn(&mut s, &again);
+        let out = deliver(&mut c, &synack);
+        deliver(&mut s, &out);
+        assert_eq!(read_all(&mut s), b"hello");
+    }
+
+    // Without Fast Open, a server leaves the option be, and SYN data
+    // waits for the handshake as RFC 9293 has it.
+    #[test]
+    fn fast_open_is_opt_in() {
+        let cookie = tfo_cookie(40805);
+        let mut c = Conn::new(tfo_cfg(40806, 80));
+        let mut s = Conn::new(tfo_cfg(80, 40806).fast_open(false));
+        let (_, syn) = c.connect_fast_open(Some(&cookie), None, b"hello");
+        let synack = deliver_syn(&mut s, &syn);
+        assert!(fastopen::offer(&parse(&synack[0]).options).is_none());
+        assert!(read_all(&mut s).is_empty());
+        assert!(s.write(b"no").0 == 0, "wrote before the handshake");
+        let out = deliver(&mut c, &synack);
+        deliver(&mut s, &out);
+        assert_eq!(read_all(&mut s), b"hello");
+    }
+
+    // RFC 7413 §5.1: past the gate's capacity a SYN's data waits for the
+    // handshake; a place is given back once a handshake completes.
+    #[test]
+    fn pending_fast_open_connections_are_capped() {
+        let cookie = tfo_cookie(40807);
+        let gate = Gate::new(1);
+        let open = |port: u16| {
+            let mut c = Conn::new(tfo_cfg(port, 80));
+            let mut s = Conn::new(tfo_cfg(80, port));
+            s.set_fast_open_gate(Some(gate.clone()), false);
+            let (_, syn) = c.connect_fast_open(Some(&cookie), None, b"x");
+            let synack = deliver_syn(&mut s, &syn);
+            (c, s, synack)
+        };
+        let (mut c1, mut s1, synack1) = open(40808);
+        assert!(s1.fast_open_accepted());
+        let (_, s2, _) = open(40809);
+        assert!(!s2.fast_open_accepted(), "past the cap");
+        assert_eq!(gate.pending(), 1);
+        let ack = deliver(&mut c1, &synack1);
+        deliver(&mut s1, &ack);
+        assert_eq!(gate.pending(), 0);
+        let (_, s3, _) = open(40810);
+        assert!(s3.fast_open_accepted());
+        drop(s3);
+        assert_eq!(gate.pending(), 0, "a dropped connection keeps its place");
+        // A driver with no room refuses the data.
+        let mut c = Conn::new(tfo_cfg(40811, 80));
+        let mut s = Conn::new(tfo_cfg(80, 40811));
+        s.set_fast_open_gate(None, true);
+        let (_, syn) = c.connect_fast_open(Some(&cookie), None, b"x");
+        deliver_syn(&mut s, &syn);
+        assert!(!s.fast_open_accepted());
     }
 
     // --- ECN -----------------------------------------------------------------

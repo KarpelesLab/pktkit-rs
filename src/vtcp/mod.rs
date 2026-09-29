@@ -110,6 +110,7 @@ pub(crate) mod conn;
 pub(crate) mod cubic;
 pub(crate) mod cwv;
 pub(crate) mod ecn;
+pub(crate) mod fastopen;
 pub(crate) mod options;
 pub(crate) mod plpmtud;
 pub(crate) mod rate;
