@@ -525,9 +525,17 @@ impl TcpConn {
     /// Initiate a graceful close (sends FIN).
     pub fn close(&self) -> io::Result<()> {
         let mut conn = self.state.conn.lock().unwrap();
+        let before = Waiters::of(&conn);
         let segs = conn.close();
+        // Before the handshake completes there is nothing to finish: the
+        // connection closes at once, and a reader or writer blocked on it
+        // would otherwise wait for a segment that never comes.
+        let wake = before.wake(&conn);
         self.state.queue(&conn, segs);
         drop(conn);
+        if wake {
+            self.state.signal.notify_all();
+        }
         self.state.flush();
         Ok(())
     }
@@ -1856,6 +1864,26 @@ mod tests {
         let conns = stack.conns.lock().unwrap();
         assert!(Arc::ptr_eq(&conns[&first.key], &first));
         assert!(Arc::ptr_eq(&conns[&second.key], &second));
+    }
+
+    /// Closing a connection still in SYN-SENT closes it at once, and wakes
+    /// a reader blocked on it.
+    #[test]
+    fn close_in_syn_sent_wakes_a_reader() {
+        let (stack, _out) = capturing_stack();
+        let remote = SocketAddr::from((PEER, 80));
+        let conn = Arc::new(stack.dial_nonblocking(IpAddr::V4(US), remote).unwrap());
+        conn.set_nonblocking(false);
+        let c2 = conn.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(c2.read(&mut [0u8; 16]).map_err(|e| e.kind())));
+        // Let the reader block; if it has not yet, it finds the connection
+        // closed when it gets there, and the test passes either way.
+        std::thread::sleep(Duration::from_millis(50));
+        conn.close().unwrap();
+        assert!(conn.state.conn.lock().unwrap().is_closed());
+        let got = rx.recv_timeout(Duration::from_secs(30));
+        assert!(got.is_ok(), "reader still blocked after close()");
     }
 
     fn capturing_stack() -> (Arc<TcpStack>, Arc<Mutex<Vec<Vec<u8>>>>) {
