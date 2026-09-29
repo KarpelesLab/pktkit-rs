@@ -96,6 +96,19 @@ pub struct TcpInfo {
     pub rcv_mss: u32,
     /// The path MTU we send for.
     pub path_mtu: u32,
+    /// The window scale shifts the handshake agreed on (RFC 7323 §2): the
+    /// peer's, which its windows are scaled by, and ours. `None` when
+    /// either end did not offer window scaling. Linux's `tcpi_snd_wscale`
+    /// and `tcpi_rcv_wscale`, with `TCPI_OPT_WSCALE`.
+    pub wscale: Option<(u8, u8)>,
+    /// SACK (RFC 2018) was agreed on (`TCPI_OPT_SACK`).
+    pub sack: bool,
+    /// Timestamps (RFC 7323) were agreed on (`TCPI_OPT_TIMESTAMPS`).
+    pub timestamps: bool,
+    /// Fast Open (RFC 7413) data in the SYN was taken: the server's
+    /// SYN-ACK acknowledged the data of our SYN, or, as the server, we
+    /// took the data of the peer's (`TCPI_OPT_SYN_DATA`).
+    pub syn_data: bool,
     /// Smoothed round-trip time (RFC 6298).
     pub srtt: Option<Duration>,
     /// Round-trip time variation (RFC 6298).
@@ -306,6 +319,9 @@ pub(crate) struct Counters {
     /// counted delivered, and delivered CE-marked.
     pub delivered_before: u64,
     pub delivered_ce_before: u64,
+    /// The minimum RTT the scoreboard it replaced had seen, which the
+    /// new one, with no samples of its own, would otherwise lose.
+    pub min_rtt_before: Option<std::time::Duration>,
 }
 
 #[cfg(test)]

@@ -1065,9 +1065,15 @@ impl Conn {
             snd_mss: mss,
             rcv_mss: self.rcv_mss,
             path_mtu: self.path_mtu(),
+            wscale: self
+                .wscale_ok
+                .then_some((self.snd_wnd_shift, self.rcv_wnd_shift)),
+            sack: self.sack_ok,
+            timestamps: self.ts_ok,
+            syn_data: self.tfo.data_acked || self.tfo.accepted,
             srtt: measured.then(|| self.rto.srtt()),
             rttvar: measured.then(|| self.rto.rttvar()),
-            min_rtt: self.score.min_rtt(),
+            min_rtt: self.score.min_rtt().or(st.min_rtt_before),
             rto: self.rto.rto(),
             backoff: self.retries,
             rcv_rtt,
@@ -5165,6 +5171,7 @@ impl Conn {
             let reordered = self.score.reordered();
             self.stats.delivered_before += self.score.rate().delivered();
             self.stats.delivered_ce_before += self.score.rate().delivered_ce();
+            self.stats.min_rtt_before = self.score.min_rtt().or(self.stats.min_rtt_before);
             self.score = Scoreboard::new(sb.una(), self.now);
             self.score.inherit_reordered(reordered);
         }
@@ -5408,12 +5415,41 @@ mod tests {
         assert_eq!((c.unacked, c.send_queued, s.recv_queued), (0, 0, 0));
         assert_eq!(c.pacing_rate, None, "pacing is off");
         assert_eq!(c.ecn, EcnMode::Off);
+        // What the handshake agreed on, as each end saw it.
+        assert!(c.sack && s.sack);
+        assert!(!c.timestamps && !s.timestamps, "cfg turns them off");
+        assert!(!c.syn_data && !s.syn_data);
+        let (ws, wr) = c.wscale.expect("both ends offer window scaling");
+        assert_eq!(s.wscale, Some((wr, ws)));
         assert!(
             c.busy_time >= Duration::from_millis(20),
             "{:?}",
             c.busy_time
         );
         assert_eq!(c.rwnd_limited, Duration::ZERO);
+    }
+
+    /// The minimum RTT outlives the scoreboard, which goes at TIME-WAIT:
+    /// `info` read after the close, when a transfer is summed up, still
+    /// has it, as Linux's `tcpi_min_rtt` does.
+    #[test]
+    fn info_keeps_min_rtt_through_time_wait() {
+        freeze();
+        let (mut client, mut server) = established(40007);
+        let (_, out) = client.write(&[1; 1000]);
+        advance(Duration::from_millis(10));
+        let mut acks = deliver(&mut server, &out);
+        acks.extend(delack_expired(&mut server));
+        deliver(&mut client, &acks);
+        let before = client.info().min_rtt;
+        assert!(before.is_some());
+        read_all(&mut server);
+        let fin = client.close();
+        let mut back = deliver(&mut server, &fin);
+        back.extend(server.close());
+        deliver(&mut client, &back);
+        assert_eq!(client.state(), State::TimeWait);
+        assert_eq!(client.info().min_rtt, before);
     }
 
     /// A writer blocked on a full send buffer is worth waking once a
