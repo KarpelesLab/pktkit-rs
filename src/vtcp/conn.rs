@@ -1107,7 +1107,13 @@ impl Conn {
             unacked: sb.map_or(0, |s| s.unacked() as u32),
             recv_queued: rb.map_or(0, |r| r.readable()),
             snd_wnd: self.snd_wnd,
-            rcv_wnd: self.rcv_wnd_bytes(),
+            // Unscaled, the header cannot say more than 64 KiB, whatever
+            // the buffer would take.
+            rcv_wnd: if self.wscale_ok {
+                self.rcv_wnd_bytes()
+            } else {
+                self.rcv_wnd_bytes().min(65535)
+            },
             hystart: hystart.map(|(p, _)| p),
             slow_start_exit: self.ss_exit.map(|(r, _)| r),
             slow_start_exit_cwnd: self.ss_exit.map(|(_, c)| c),
@@ -1751,8 +1757,9 @@ impl Conn {
         let mut opts = Vec::with_capacity(4);
         // What we can receive, not the MSS we send with.
         opts.push(mss_option(self.cfg.mss.max(1)));
-        // A SYN always offers wscale; shift=0 means "I support it".
-        if !synack || self.wscale_ok {
+        // A SYN offers wscale unless configured not to; shift=0 still
+        // means "I support it" (RFC 7323 §2.2).
+        if !self.cfg.no_window_scaling && (!synack || self.wscale_ok) {
             opts.push(wscale_option(self.rcv_wnd_shift));
         }
         if self.sack_enabled && (!synack || self.sack_ok) {
@@ -1803,7 +1810,12 @@ impl Conn {
     fn negotiate_options(&mut self, remote_opts: &[TcpOption]) {
         let ipv6 = self.is_ipv6();
         self.set_mss(options::peer_mss(remote_opts, ipv6));
-        if let Some(ws) = get_wscale(remote_opts) {
+        // Scaling is in force only if both ends offered it (RFC 7323
+        // §2.2): a SYN-ACK answers only a SYN that did, and a SYN's offer
+        // is declined by leaving it out of the SYN-ACK.
+        if !self.cfg.no_window_scaling
+            && let Some(ws) = get_wscale(remote_opts)
+        {
             self.snd_wnd_shift = ws.min(14);
             self.wscale_ok = true;
         }
@@ -5421,6 +5433,16 @@ mod tests {
         assert!(!c.syn_data && !s.syn_data);
         let (ws, wr) = c.wscale.expect("both ends offer window scaling");
         assert_eq!(s.wscale, Some((wr, ws)));
+
+        // Without window scaling, what is advertised is what the header
+        // holds.
+        let unscaled = |l, r| conf(l, r).no_window_scaling(true).recv_buf_size(1 << 20);
+        let mut a = Conn::new(unscaled(40011, 80));
+        let mut b = Conn::new(unscaled(80, 40011));
+        drive_handshake(&mut a, &mut b);
+        let (ia, ib) = (a.info(), b.info());
+        assert_eq!((ia.wscale, ib.wscale), (None, None));
+        assert_eq!((ia.rcv_wnd, ib.snd_wnd), (65535, 65535));
         assert!(
             c.busy_time >= Duration::from_millis(20),
             "{:?}",

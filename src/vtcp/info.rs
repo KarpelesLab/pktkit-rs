@@ -191,7 +191,8 @@ pub struct TcpInfo {
     pub recv_queued: usize,
     /// The peer's window (SND.WND).
     pub snd_wnd: u32,
-    /// The window we advertise (RCV.WND).
+    /// The window we advertise (RCV.WND), at most 64 KiB without window
+    /// scaling.
     pub rcv_wnd: u32,
 
     /// HyStart++'s phase; `None` for a controller other than CUBIC.
