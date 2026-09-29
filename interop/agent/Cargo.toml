@@ -1,0 +1,11 @@
+[package]
+name = "pktkit-interop-agent"
+version = "0.0.0"
+publish = false
+edition = "2024"
+description = "Runs inside the interop guest: drives the Linux TCP stack on the harness's orders."
+
+# The agent runs on Linux only, as the guest's init; built for
+# <arch>-unknown-linux-musl, statically, by the harness.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

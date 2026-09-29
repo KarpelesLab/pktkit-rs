@@ -1,0 +1,33 @@
+[package]
+name = "pktkit-interop"
+version = "0.0.0"
+publish = false
+edition = "2024"
+description = "Interoperability tests of pktkit's TCP engine against a real Linux kernel, booted in QEMU."
+
+# The harness runs on the host; the agent is cross-built for the guest. Not
+# part of the pktkit package or its dependency policy: cargo-deny checks the
+# library's manifest, and this workspace is separate from it.
+[workspace]
+members = [".", "agent"]
+
+[dependencies.pktkit]
+path = ".."
+features = ["qemu", "impair", "pcap", "vclient", "slirp", "l2adapter"]
+
+[[bin]]
+name = "interop"
+path = "src/main.rs"
+
+# vtcp's throughput is part of what is measured: an unoptimised build would
+# measure the compiler instead. Tests of the harness itself run optimised
+# too, so `cargo test` and `cargo run --release` share one build of pktkit.
+[profile.dev]
+opt-level = 2
+
+[profile.release]
+debug = 1
+
+[profile.release.package.pktkit-interop-agent]
+debug = 0
+strip = true

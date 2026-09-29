@@ -1,0 +1,10 @@
+# The guest agent is a static musl binary. rustup's musl targets ship their
+# own C runtime and libc, so with the linker Rust bundles, cross-building it
+# needs no C toolchain for the guest, from macOS or Linux alike.
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = ["-C", "link-self-contained=yes", "-C", "target-feature=+crt-static"]
+
+[target.x86_64-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = ["-C", "link-self-contained=yes", "-C", "target-feature=+crt-static"]

@@ -12,9 +12,10 @@ documentation = "https://docs.rs/pktkit"
 readme = "README.md"
 keywords = ["networking", "packet", "tcp", "wireguard", "tun"]
 categories = ["network-programming", "virtualization"]
-# The fuzzing harness and the wasm smoke test are separate crates that depend
-# on this one; they have no business in the published package.
-exclude = ["fuzz", "tests/wasm", ".github"]
+# The fuzzing harness, the interop suite and the wasm smoke test are separate
+# crates that depend on this one; they have no business in the published
+# package.
+exclude = ["fuzz", "interop", "tests/wasm", ".github"]
 
 [features]
 # By default we ship only the core: Frame, Packet, hubs, pipes, traits.
