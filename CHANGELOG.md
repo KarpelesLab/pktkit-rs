@@ -6,6 +6,61 @@ semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/KarpelesLab/pktkit-rs/compare/v0.1.8...v0.2.0) - 2026-09-29
+
+### Added
+
+- *(vtcp)* a black hole's timeouts cost no window, nor its stragglers
+- *(slirp)* Stack::set_tcp, and Fast Open for bridges and listeners
+- *(vclient)* TCP tuning passthrough, Fast Open dials and listeners
+- *(vtcp)* TCP Fast Open (RFC 7413)
+- *(vtcp)* PLPMTUD, black-hole detection and MTU probing (RFC 4821)
+- *(impair)* mark ECN-capable packets CE
+- *(vtcp)* BBR's response to ECN
+- *(vclient, slirp)* carry ECN codepoints between IP and vtcp
+- *(vtcp)* ECN, classic (RFC 3168) and accurate (RFC 9768)
+- *(vtcp)* BBR (draft-ietf-ccwg-bbr) on delivery rate estimation
+- *(vtcp)* pace sending, on by default
+- *(vtcp)* validate the congestion window (RFC 7661), restart it after idle
+- *(vtcp)* CUBIC (RFC 9438) with HyStart++ (RFC 9406), now the default
+- *(vtcp)* undo spurious loss responses (RFC 3708, 3522, 5682, 4015)
+- *(vtcp)* Proportional Rate Reduction in fast recovery (RFC 6937)
+- *(vtcp)* RACK-TLP loss detection (RFC 8985)
+- *(vtcp)* report data received twice with D-SACK (RFC 2883)
+- *(vtcp)* offer TCP timestamps by default
+- *(vtcp)* delay ACKs as RFC 9293 and RFC 5681 allow, with Linux's quick-ACK mode
+- *(vtcp)* count bytes acknowledged, not ACKs, to grow cwnd (RFC 3465)
+- *(vtcp)* sample the RTT from every ACK with timestamps, and floor the RTO as Linux
+- *(vtcp)* report when the next timer is due
+- *(vtcp)* auto-tune send and receive buffers as Linux does
+
+### Fixed
+
+- *(nat, vclient, slirp)* keep CE marks through fragment reassembly
+- *(vtcp)* let BBR's Startup see a plateau through reordering
+- *(vtcp)* pace by a precise round trip, and keep a paced window growing
+- *(vtcp)* bound out-of-order data by memory, not by a count of holes
+- *(vtcp)* have Eifel judge the ACK of the retransmission itself
+- *(nat)* run the UPnP control connections' TCP timers
+- *(vtcp)* renege on SACKs less, and act on a renege at once
+- *(vtcp)* keep TSvals running on across connections to the same host
+- *(slirp)* run TCP timers when they are due, not every 100 ms
+- *(vclient)* run TCP timers when they are due, not every 100 ms
+- *(nat)* keep UPnP control connection buffers fixed
+- *(slirp)* let bridge buffers grow past their 256 KiB start
+
+### Other
+
+- stop two timing tests failing on loaded CI runners
+- *(fuzz)* the vtcp conversation covers PLPMTUD and Fast Open
+- *(vtcp)* tail loss probe test no longer races the real clock
+- what the vtcp engine does, PLPMTUD and Fast Open among it
+- *(vtcp)* keep RACK's per-ACK scan short
+- *(vtcp)* list delayed ACKs and byte counting among the RFCs
+- *(vtcp)* build TCP options in place, and stop copying each payload twice
+- *(vtcp)* read the clock once per call, not at every step
+- *(readme)* drive vclient's timers when Client::next_timer says
+
 ## [0.1.8](https://github.com/KarpelesLab/pktkit-rs/compare/v0.1.7...v0.1.8) - 2026-09-28
 
 ### Added
