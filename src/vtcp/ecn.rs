@@ -168,7 +168,15 @@ pub(crate) struct Ecn {
     syns: u32,
     /// Something received calls for an ACK at once.
     ack_now: bool,
+    /// AccECN sender: the prevailing fraction of packets marked CE, in
+    /// 1/1024ths, a moving average (weight 1/8) over the ACKs that made
+    /// progress. None to begin with: until marks are seen, none are
+    /// presumed hidden.
+    ce_frac: u32,
 }
+
+/// `Ecn::ce_frac`'s unit.
+const FRAC_ONE: u32 = 1024;
 
 impl Ecn {
     /// The ECN flags our SYN carries: `(flags, ae)`. The request goes on
@@ -421,14 +429,27 @@ impl Ecn {
                     return None;
                 }
                 let mut delta = ace(seg).wrapping_sub(self.s_cep) & 7;
-                // RFC 9768 §3.2.2.5.2: the counter may have wrapped over an
-                // ACK of more than seven packets. Assume it did as often as
-                // it could have, as Linux does without the AccECN option:
-                // a congestion signal missed is worse than one overstated.
-                let pkts = delivered.div_ceil(mss.max(1));
-                if pkts > 7 {
-                    delta = pkts - ((pkts - delta) & 7);
+                let pkts = delivered.div_ceil(mss.max(1)).min(1 << 20);
+                // RFC 9768 §3.2.2.5.2: the three-bit counter may have
+                // wrapped over an ACK of more than seven packets, unseen.
+                // Appendix A.2.1's simplest answer takes it to have wrapped
+                // as often as it could, as if every packet the ACK covers
+                // were marked. That is ruinous against a receiver whose ACKs
+                // routinely cover more than seven packets (Linux, which
+                // acknowledges each batch GRO coalesced, up to 45 packets):
+                // each ACK then reads as seven marks or more, unmarked as
+                // it is, and the window is cut every round trip. So, as the
+                // appendix goes on to suggest, the worst case is taken for
+                // the marks this ACK would carry at the prevailing marking
+                // rate, not for all its packets: a wrap is presumed only
+                // where eight marks or more were likely, under heavy
+                // marking; under light marking the count is taken as it is.
+                let expected = (pkts * self.ce_frac).div_ceil(FRAC_ONE);
+                if expected > 7 && expected >= delta {
+                    delta = expected - ((expected - delta) & 7);
                 }
+                let sample = delta.min(pkts) * FRAC_ONE / pkts.max(1);
+                self.ce_frac = self.ce_frac - (self.ce_frac >> 3) + (sample >> 3);
                 self.s_cep = self.s_cep.wrapping_add(delta);
                 (self.respond && delta > 0).then(|| delta.saturating_mul(mss).min(delivered).max(1))
             }
@@ -715,19 +736,60 @@ mod tests {
         assert!(total > 8, "never wrapped");
     }
 
-    /// Over an ACK of more than seven packets the counter may have wrapped
-    /// unseen; it is taken to have, as often as it could.
+    /// Under heavy marking, an ACK of more than seven packets may have
+    /// wrapped the counter unseen; it is taken to have, as often as it
+    /// could.
     #[test]
     fn ace_assumes_the_worst_over_a_stretch_ack() {
         let (_, mut server) = accurate_pair();
+        // Every packet marked: ACKs of two packets, two marks each.
+        let mut cep = CEP_INIT;
+        for i in 0..20 {
+            cep += 2;
+            let mut a = ack(2 + i);
+            set_ace(&mut a, cep & 7);
+            assert_eq!(server.on_ack(&a, true, 2000, 1000), Some(2000));
+        }
+        let cep_before = cep;
         let mut a = ack(2);
-        set_ace(&mut a, (CEP_INIT + 1) & 7);
+        set_ace(&mut a, (cep_before + 1) & 7);
         // 10 packets: 1 or 9 marked; 9 it is.
         assert_eq!(server.on_ack(&a, true, 10_000, 1000), Some(9000));
         // Not on an ACK without progress: it may be an old one.
         let mut b = ack(2);
-        set_ace(&mut b, (CEP_INIT + 12) & 7);
+        set_ace(&mut b, (cep_before + 12) & 7);
         assert_eq!(server.on_ack(&b, false, 0, 1000), None);
+    }
+
+    /// A receiver that routinely acknowledges eight packets at once (as
+    /// Linux does behind GRO) has its ACE count taken as it is: were each
+    /// such ACK assumed to have wrapped the counter, an unmarked transfer
+    /// would read as every packet marked. Under light marking, no ACK is
+    /// likely to hide eight marks, however many packets it covers.
+    #[test]
+    fn ace_trusts_a_receiver_that_thins_its_acks() {
+        let (_, mut server) = accurate_pair();
+        let mut cep = CEP_INIT;
+        let mut counted = 0;
+        for i in 0..50u32 {
+            // One mark in every fifth ACK, of one to eight packets.
+            if i % 5 == 0 {
+                cep += 1;
+            }
+            let mut a = ack(2 + i);
+            set_ace(&mut a, cep & 7);
+            let pkts = [8, 3, 8, 5, 1, 8, 6, 2][i as usize % 8];
+            counted += server
+                .on_ack(&a, true, pkts * 1000, 1000)
+                .map_or(0, |b| b / 1000);
+        }
+        assert_eq!(counted, 10);
+        assert_eq!(server.sent_ce(), 10);
+        // A stretch of 45, as GRO makes: at the prevailing 4% it would
+        // carry two marks, no wrap; none it is.
+        let mut a = ack(100);
+        set_ace(&mut a, cep & 7);
+        assert_eq!(server.on_ack(&a, true, 45_000, 1000), None);
     }
 
     /// AccECN asks for an ACK when marking starts, and after two marks.
