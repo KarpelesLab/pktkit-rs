@@ -33,7 +33,7 @@ use super::plpmtud::{self, MtuProbing, Probe, Search};
 use super::rate::RateSample;
 use super::recvbuf::RecvBuf;
 use super::rto::{DEFAULT_RTO, MAX_RTO, RtoState};
-use super::scoreboard::{DUP_THRESH, Delivery, Scoreboard, dsack_block};
+use super::scoreboard::{DUP_THRESH, Delivery, Scoreboard, dsack_block, dsack_valid};
 use super::segment::{Segment, flags};
 use super::sendbuf::SendBuf;
 use super::seqspace::{
@@ -3074,8 +3074,12 @@ impl Conn {
             let blocks = get_sack_blocks(opts);
             if !blocks.is_empty() {
                 sack_seen = true;
-                dsack = dsack_block(&blocks, ack);
-                let rest = &blocks[dsack.is_some() as usize..];
+                // A D-SACK block that cannot be valid is left out
+                // altogether, as Linux skips it: neither a D-SACK nor
+                // SACK information.
+                let shaped = dsack_block(&blocks, ack);
+                dsack = shaped.filter(|&b| dsack_valid(b, snd_nxt));
+                let rest = &blocks[shaped.is_some() as usize..];
                 self.score.set_mss(u32::from(self.mss));
                 d.merge(self.score.sack(rest, now, ecr));
             }
@@ -7321,6 +7325,36 @@ mod tests {
         let out = deliver(&mut client, &dsack);
         assert_eq!(client.info().undos, 1);
         assert!(seqs(&out).contains(&lost), "the other loss was dropped");
+    }
+
+    /// A D-SACK block reaching past SND.NXT, or reversed, reports nothing
+    /// the receiver could have had twice: one spanning everything would
+    /// show every retransmission needless and undo a real loss response.
+    #[test]
+    fn an_impossible_dsack_undoes_nothing() {
+        let (mut client, server, segs, late_and_rexmit) = spurious_fast_retransmit(false, 40738);
+        advance(Duration::from_millis(50));
+        deliver(&mut client, &late_and_rexmit[..1]);
+        assert!(client.in_recovery());
+        let una = client.send_buf.as_ref().unwrap().una();
+        let nxt = client.send_buf.as_ref().unwrap().nxt();
+        let first = parse(&segs[0]).seq;
+        for block in [
+            SackBlock {
+                left: first,
+                right: nxt.wrapping_add(1000),
+            },
+            SackBlock {
+                left: una,
+                right: first,
+            },
+        ] {
+            let mut forged = bare_ack(&client, &server, una, 0xFFFF);
+            forged.options = vec![sack_option(&[block])];
+            client.handle_segment(&forged);
+            assert!(client.in_recovery(), "undone by {block:?}");
+            assert_eq!(client.info().undos, 0);
+        }
     }
 
     /// With timestamps, the ACK of the late original echoes its TSval,

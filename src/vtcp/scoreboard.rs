@@ -1134,17 +1134,24 @@ fn sent_after(t1: u64, seq1: u64, t2: u64, seq2: u64) -> bool {
 
 /// The D-SACK block of an ACK's SACK blocks, if it has one (RFC 2883 §4):
 /// a first block below the cumulative ACK, or inside the second block.
+/// Whether it can be believed is [`dsack_valid`]'s to say.
 pub(crate) fn dsack_block(blocks: &[SackBlock], ack: u32) -> Option<SackBlock> {
     let first = *blocks.first()?;
-    if !seq_after(first.right, first.left) {
-        return None;
-    }
     if seq_before_eq(first.right, ack) || seq_before(first.left, ack) {
         return Some(first);
     }
     let second = blocks.get(1)?;
     (seq_before_eq(second.left, first.left) && seq_before_eq(first.right, second.right))
         .then_some(first)
+}
+
+/// Whether a D-SACK block reports data we sent, `snd_nxt` being SND.NXT:
+/// not reversed or empty, and not reaching past what was sent, as Linux's
+/// tcp_is_sackblock_valid has it. One that does is not the receiver's to
+/// have seen twice, and taken as it is, one block spanning everything
+/// would show every retransmission of an episode needless.
+pub(crate) fn dsack_valid(b: SackBlock, snd_nxt: u32) -> bool {
+    seq_after(b.right, b.left) && seq_before_eq(b.right, snd_nxt)
 }
 
 #[cfg(test)]
@@ -1531,6 +1538,10 @@ mod tests {
         assert_eq!(dsack_block(&[b(40, 50), b(30, 60)], 20), Some(b(40, 50)));
         assert_eq!(dsack_block(&[b(40, 50), b(60, 70)], 20), None);
         assert_eq!(dsack_block(&[], 20), None);
+        assert!(dsack_valid(b(10, 20), 20));
+        assert!(!dsack_valid(b(10, 21), 20), "past SND.NXT");
+        assert!(!dsack_valid(b(10, 10), 20), "empty");
+        assert!(!dsack_valid(b(15, 10), 20), "reversed");
     }
 
     #[test]
