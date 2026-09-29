@@ -19,6 +19,7 @@ use crate::vtcp::ecn::IpEcn;
 use crate::vtcp::fastopen::{self, Gate};
 use crate::vtcp::segment::flags;
 use crate::vtcp::syncookie::SynCookies;
+use crate::vtcp::waiters::{Waiters, lock_for_delivery};
 use crate::vtcp::{Conn, ConnConfig, State, Tuning, segment::Segment};
 use crate::{IpPrefix, Packet, Protocol, checksum};
 use std::collections::{HashMap, VecDeque};
@@ -933,7 +934,9 @@ impl TcpStack {
                 continue;
             }
             let ended = conn.fin_received();
+            let before = Waiters::of(&conn);
             let segs = conn.tick();
+            let wake = before.wake(&conn);
             cs.queue(&conn, segs);
             let closed = conn.is_closed();
             let state = conn.state();
@@ -947,7 +950,9 @@ impl TcpStack {
             }
             drop(conn);
             cs.flush();
-            cs.signal.notify_all();
+            if wake {
+                cs.signal.notify_all();
+            }
             if closed {
                 self.forget(&cs);
             } else if state == State::TimeWait {
@@ -1237,8 +1242,9 @@ impl TcpStack {
             existing = None;
         }
         if let Some(state) = existing {
+            let wake;
             {
-                let mut conn = state.conn.lock().unwrap();
+                let mut conn = lock_for_delivery(&state.conn).unwrap();
                 // The ACK completing a handshake while the accept queue is
                 // full is dropped, and the connection stays in
                 // SYN-RECEIVED, as Linux does unless told to abort on
@@ -1256,6 +1262,7 @@ impl TcpStack {
                 // Closing marks the FIN as received too, so this tells a
                 // stream that had ended from one cut short.
                 let ended = conn.fin_received();
+                let before = Waiters::of(&conn);
                 let segs = if state.admit(&seg) {
                     conn.handle_segment_ecn(&seg, ecn)
                 } else {
@@ -1277,6 +1284,7 @@ impl TcpStack {
                 if seg.has_flag(flags::RST) && conn.is_closed() && !ended {
                     state.fail(io::ErrorKind::ConnectionReset);
                 }
+                wake = before.wake(&conn);
                 state.queue(&conn, segs);
             }
             // The client's sink contains a panicking handler, but a sink
@@ -1286,7 +1294,9 @@ impl TcpStack {
             if !state.after_segment() {
                 self.forget(&state);
             }
-            state.signal.notify_all();
+            if wake {
+                state.signal.notify_all();
+            }
             if let Err(panic) = sent {
                 std::panic::resume_unwind(panic);
             }

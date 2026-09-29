@@ -141,6 +141,9 @@ pub(crate) mod segment;
 pub(crate) mod sendbuf;
 pub(crate) mod seqspace;
 pub(crate) mod tuning;
+// How the drivers hand segments to connections their callers block on.
+#[cfg(any(feature = "vclient", feature = "slirp"))]
+pub(crate) mod waiters;
 // The listeners that answer SYNs statelessly past their backlog.
 #[cfg(any(feature = "vclient", feature = "slirp", test))]
 pub(crate) mod syncookie;

@@ -42,6 +42,11 @@ use super::seqspace::{
 
 // --- Tunables -------------------------------------------------------------
 
+/// The most free send buffer a blocked writer waits for (see
+/// `Conn::writable`).
+#[cfg_attr(not(any(feature = "vclient", feature = "slirp")), allow(dead_code))]
+const WRITE_WAKE_MAX: usize = 256 << 10;
+
 /// Default MSS: the largest segment we accept, and send when the peer
 /// allows it.
 pub const DEFAULT_MSS: u16 = 1460;
@@ -999,6 +1004,31 @@ impl Conn {
     #[inline]
     pub fn fin_received(&self) -> bool {
         self.fin_recvd_signaled
+    }
+
+    /// Bytes received and not yet read.
+    #[inline]
+    #[cfg_attr(not(any(feature = "vclient", feature = "slirp")), allow(dead_code))]
+    pub(crate) fn readable(&self) -> usize {
+        self.recv_buf.as_ref().map_or(0, |rb| rb.readable())
+    }
+
+    /// Whether a writer waiting for room in the send buffer is worth
+    /// waking: once a third of it is free, as Linux's
+    /// sk_stream_is_writeable has it (free space at least half of what is
+    /// queued), or 256 KiB of a large one. Waking it for every segment's
+    /// worth an ACK frees would have it take the connection's lock once
+    /// per ACK, and fight the thread delivering those ACKs for it (see
+    /// `waiters`). Not a third of a large one: a buffer auto-tuning has
+    /// grown to its limit is what keeps a long path's window full, and
+    /// refilled only a third at a time it would keep a sixth of it empty
+    /// on average.
+    #[inline]
+    #[cfg_attr(not(any(feature = "vclient", feature = "slirp")), allow(dead_code))]
+    pub(crate) fn writable(&self) -> bool {
+        self.send_buf
+            .as_ref()
+            .is_none_or(|sb| sb.available() >= (sb.capacity() / 3).min(WRITE_WAKE_MAX))
     }
 
     /// A snapshot of the connection's state and counters, for diagnosis:
@@ -5384,6 +5414,22 @@ mod tests {
             c.busy_time
         );
         assert_eq!(c.rwnd_limited, Duration::ZERO);
+    }
+
+    /// A writer blocked on a full send buffer is worth waking once a
+    /// third of it is free, not for every byte an ACK frees.
+    #[test]
+    fn writable_once_a_third_of_the_send_buffer_is_free() {
+        let (mut client, mut server) = established(40006);
+        let (n, out) = client.write(&[1; 4096]);
+        assert_eq!(n, 4096);
+        assert!(!client.writable(), "full");
+        // The first segment's ACK frees 1460 bytes, over a third of 4096.
+        let mut ack = deliver(&mut server, &out[..1]);
+        ack.extend(delack_expired(&mut server));
+        assert!(!ack.is_empty());
+        deliver(&mut client, &ack);
+        assert!(client.writable());
     }
 
     /// Time with data waiting on a closed receive window counts as

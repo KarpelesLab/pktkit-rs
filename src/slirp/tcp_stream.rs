@@ -14,6 +14,7 @@ use crate::time::Instant;
 use crate::vtcp::alarm::Alarm;
 use crate::vtcp::ecn::IpEcn;
 use crate::vtcp::segment::Segment;
+use crate::vtcp::waiters::{Waiters, lock_for_delivery};
 use crate::vtcp::{Conn, State};
 use std::collections::VecDeque;
 use std::io::{self};
@@ -407,15 +408,19 @@ impl ConnState {
         if self.held_back(seg, ecn) {
             return;
         }
-        let mut conn = self.conn.lock().expect("poisoned");
+        let mut conn = lock_for_delivery(&self.conn).expect("poisoned");
         // A FIN before the RST means the stream had already ended whole.
         let ended = conn.fin_received();
+        let before = Waiters::of(&conn);
         let segs = conn.handle_segment_ecn(seg, ecn);
         if seg.has_flag(crate::vtcp::segment::flags::RST) && conn.is_closed() && !ended {
             self.fail(io::ErrorKind::ConnectionReset);
         }
+        let wake = before.wake(&conn);
         self.emit(conn, segs);
-        self.signal.notify_all();
+        if wake {
+            self.signal.notify_all();
+        }
     }
 }
 
