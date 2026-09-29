@@ -111,6 +111,7 @@ pub(crate) mod cubic;
 pub(crate) mod cwv;
 pub(crate) mod ecn;
 pub(crate) mod options;
+pub(crate) mod plpmtud;
 pub(crate) mod rate;
 pub(crate) mod recvbuf;
 pub(crate) mod rto;
@@ -126,6 +127,7 @@ pub(crate) mod syncookie;
 pub use conn::{CongestionKind, Conn, ConnConfig, State};
 pub use ecn::EcnMode;
 pub use options::{TcpOption, kind};
+pub use plpmtud::MtuProbing;
 pub use segment::{Segment, flags};
 
 // nat's UPnP tests read the window scale off a SYN-ACK.

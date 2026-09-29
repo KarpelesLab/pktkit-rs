@@ -810,6 +810,59 @@ impl Scoreboard {
         !self.segs.is_empty() && self.mark_lost(0)
     }
 
+    /// Mark lost what of `[seq, end)` is outstanding, neither SACKed nor
+    /// already lost. Returns whether anything was.
+    pub fn mark_range_lost(&mut self, seq: u32, end: u32) -> bool {
+        let start = if seq_before(seq, self.una) {
+            self.una_off
+        } else {
+            self.off(seq)
+        };
+        let end = if seq_before(end, self.una) {
+            self.una_off
+        } else {
+            self.off(end)
+        };
+        let Some(mut i) = self.idx(start) else {
+            return false;
+        };
+        if self.segs[i].start < start {
+            self.split(i, start);
+            i += 1;
+        }
+        let mut marked = false;
+        while i < self.segs.len() && self.segs[i].start < end {
+            if self.segs[i].end > end && !self.segs[i].has(FIN) {
+                self.split(i, end);
+            }
+            marked |= self.mark_lost(i);
+            i += 1;
+        }
+        marked
+    }
+
+    /// Whether anything outside `[seq, end)` is deemed lost.
+    pub fn lost_outside(&self, seq: u32, end: u32) -> bool {
+        let (Some(&first), Some(&last)) = (self.lost_set.first(), self.lost_set.last()) else {
+            return false;
+        };
+        let start = if seq_before(seq, self.una) {
+            self.una_off
+        } else {
+            self.off(seq)
+        };
+        first < start || last >= self.off(end)
+    }
+
+    /// Whether the receiver has SACKed the segment holding `seq`.
+    pub fn sacked_at(&self, seq: u32) -> bool {
+        if seq_before(seq, self.una) {
+            return false;
+        }
+        self.idx(self.off(seq))
+            .is_some_and(|i| self.segs[i].has(SACKED))
+    }
+
     /// Forget every SACK: the receiver has reneged on them.
     pub fn clear_sacks(&mut self) {
         for s in self.segs.iter_mut() {

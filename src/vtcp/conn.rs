@@ -27,6 +27,7 @@ use super::options::{
     self, SackBlock, TcpOption, get_sack_blocks, get_timestamp, get_wscale, has_sack_perm,
     mss_option, sack_option, sack_perm_option, timestamp_option, wscale_option,
 };
+use super::plpmtud::{self, MtuProbing, Probe, Search};
 use super::rate::RateSample;
 use super::recvbuf::RecvBuf;
 use super::rto::{DEFAULT_RTO, MAX_RTO, RtoState};
@@ -414,6 +415,11 @@ pub struct ConnConfig {
     /// The engine writes no IP headers: `vclient` and `slirp` set the
     /// codepoints it asks for, and pass on the marks that arrive.
     pub ecn: EcnMode,
+    /// Packetization Layer Path MTU Discovery (RFC 4821): whether the
+    /// connection finds the path MTU from what gets delivered, where ICMP
+    /// messages do not tell it (see [`MtuProbing`]). By default, once
+    /// full-sized segments keep timing out, as on Linux.
+    pub mtu_probing: MtuProbing,
 }
 
 setters! {
@@ -442,6 +448,7 @@ setters! {
         set time_wait: Duration;
         set nodelay: bool;
         set ecn: EcnMode;
+        set mtu_probing: MtuProbing;
     }
 }
 
@@ -472,6 +479,7 @@ impl Default for ConnConfig {
             time_wait: TIME_WAIT_DURATION,
             nodelay: false,
             ecn: EcnMode::default(),
+            mtu_probing: MtuProbing::default(),
         }
     }
 }
@@ -536,10 +544,17 @@ pub struct Conn {
     /// which bounds how far below SND.UNA a genuine ACK can be.
     max_snd_wnd: u32,
     mss: u16,
+    /// The most the peer takes, and we send, whatever the path: the peer's
+    /// MSS capped by ours (Linux's `mss_clamp`).
+    mss_clamp: u16,
     /// The most the path lets us send with, from Packet Too Big messages
     /// (see [`Conn::set_path_mtu`]): caps `mss` from then on, the
     /// handshake's included.
     path_mss: u16,
+    /// PLPMTUD's search (RFC 4821), which caps `mss` too while it runs.
+    plpmtud: Search,
+    /// Its probe in flight.
+    mtu_probe: Option<Probe>,
     cc: Box<dyn CongestionController>,
 
     // RTO management.
@@ -805,7 +820,21 @@ impl Conn {
             snd_wnd: DEFAULT_WINDOW_SIZE as u32,
             max_snd_wnd: 0,
             mss,
+            mss_clamp: mss,
             path_mss: u16::MAX,
+            plpmtud: {
+                let v6 = cfg
+                    .remote_addr
+                    .or(cfg.local_addr)
+                    .is_some_and(|a| a.is_ipv6());
+                let (overhead, floor) = if v6 {
+                    (60, IPV6_MIN_PATH_MTU)
+                } else {
+                    (40, IPV4_MIN_PATH_MTU)
+                };
+                Search::new(cfg.mtu_probing, overhead, floor, now)
+            },
+            mtu_probe: None,
             cc,
             rto: RtoState::new(now),
             rto_deadline: None,
@@ -942,8 +971,9 @@ impl Conn {
     }
 
     /// The MSS the connection sends with: the peer's, capped by our own
-    /// ([`ConnConfig::mss`]) and by the path MTU. Options in a segment come
-    /// out of it, so a segment's payload may be a little less.
+    /// ([`ConnConfig::mss`]) and by the path MTU, as ICMP reported it or
+    /// PLPMTUD found it ([`ConnConfig::mtu_probing`]). Options in a segment
+    /// come out of it, so a segment's payload may be a little less.
     #[inline]
     pub fn mss(&self) -> u16 {
         self.mss
@@ -991,15 +1021,21 @@ impl Conn {
         } else {
             IPV4_MIN_PATH_MTU
         };
-        let mss = (mtu.max(floor) - self.header_overhead()).min(u16::MAX as u32) as u16;
+        let mtu = mtu.max(floor);
+        let mss = (mtu - self.header_overhead()).min(u16::MAX as u32) as u16;
         if mss >= self.path_mss {
             return self.take_outgoing();
         }
         self.path_mss = mss;
-        if mss < self.mss {
-            self.mss = mss;
-            self.cc.set_mss(mss as u32);
+        self.plpmtud.clamp(mtu);
+        // A probe larger than the path is a failure, told outright.
+        let probe = self.mtu_probe.take_if(|p| p.mtu > mtu);
+        let before = self.mss;
+        self.sync_mss();
+        if self.mss < before {
             self.resend_after_mtu_drop();
+        } else if let Some(p) = probe {
+            self.resend_probe(p);
         }
         self.take_outgoing()
     }
@@ -1048,7 +1084,20 @@ impl Conn {
         if sb.data_at(sb.una(), 1).is_empty() || self.snd_wnd == 0 {
             return;
         }
-        let nxt = sb.nxt();
+        self.mtu_probe = None;
+        self.score.mark_all_lost();
+        self.enter_simple_loss();
+        self.reo_deadline = None;
+        self.flush_send_queue();
+    }
+
+    /// Recover from losses to a segment's size, not to congestion, as
+    /// Linux's `tcp_simple_retransmit` does: what the scoreboard marks lost
+    /// is resent, as cwnd allows, without cutting it. Unlike a timeout, no
+    /// congestion is inferred, so ssthresh and the RTO are left alone, and
+    /// cwnd too outside fast recovery.
+    fn enter_simple_loss(&mut self) {
+        let nxt = self.send_buf.as_ref().unwrap().nxt();
         // Fast recovery gives way, as Linux's CA_Loss replaces CA_Recovery:
         // the loss it was recovering from has cut the window already;
         // ending it just brings cwnd down to that.
@@ -1057,7 +1106,6 @@ impl Conn {
         if (self.ca == CaState::Recovery || reducing) && !self.cc.model_based() {
             self.cc.set_cwnd(self.cc.ssthresh());
         }
-        self.score.mark_all_lost();
         self.ca = CaState::Loss;
         self.recover = nxt;
         // Nothing to undo, nor a timeout for F-RTO to judge.
@@ -1067,8 +1115,90 @@ impl Conn {
         self.dup_acks = 0;
         self.tlp_end = None;
         self.pto_deadline = None;
-        self.reo_deadline = None;
-        self.flush_send_queue();
+    }
+
+    /// An MTU probe was too big for the path, as ICMP says: resend just it,
+    /// cut to the MSS.
+    fn resend_probe(&mut self, p: Probe) {
+        if !self.state.is_synchronized() || self.send_buf.is_none() {
+            return;
+        }
+        self.plpmtud.on_failure(p.mtu, self.now);
+        if self.score.mark_range_lost(p.start, p.end) {
+            self.enter_simple_loss();
+            self.flush_send_queue();
+        }
+    }
+
+    /// Losses were found (RACK, or duplicate ACKs) with nothing deemed lost
+    /// before: start fast recovery, unless all that is lost is an MTU probe
+    /// (RFC 4821 §7.6.2): then the path would not take its size, which is
+    /// no sign of congestion, and it alone is resent at the MSS, as Linux's
+    /// `tcp_mtup_probe_failed` has it.
+    fn on_losses_found(&mut self) {
+        if let Some(p) = self.mtu_probe
+            && !self.score.lost_outside(p.start, p.end)
+        {
+            self.mtu_probe = None;
+            self.plpmtud.on_failure(p.mtu, self.now);
+            self.enter_simple_loss();
+            return;
+        }
+        self.enter_recovery();
+    }
+
+    /// Set `mss` from what caps it: the peer, the path as ICMP reported it,
+    /// and PLPMTUD's search (Linux's `tcp_sync_mss`).
+    fn sync_mss(&mut self) {
+        let mut mss = self.mss_clamp.min(self.path_mss);
+        if let Some(cap) = self.plpmtud.cap() {
+            let found = cap
+                .saturating_sub(self.header_overhead())
+                .max(u32::from(options::MIN_MSS));
+            mss = mss.min(found.min(u32::from(u16::MAX)) as u16);
+        }
+        if mss != self.mss {
+            self.mss = mss;
+            self.cc.set_mss(u32::from(mss));
+        }
+    }
+
+    /// The MTU probe to send now, if one is due and there is room for it
+    /// (Linux's `tcp_mtu_probe`), as its payload and MTU: `room` is what an
+    /// ordinary segment would carry beside `opts`, `pending` the data
+    /// waiting, and `cc_room` and `rcv_room` what cwnd and the peer's
+    /// window let go. A probe needs enough data behind it for the segments
+    /// that follow to show its loss by their SACKs or duplicate ACKs, not
+    /// only a timeout; and a window large enough (11 segments, as Linux
+    /// asks) that one segment lost to its size costs little.
+    fn probe_due(
+        &mut self,
+        opts: &[TcpOption],
+        room: usize,
+        pending: usize,
+        cc_room: u32,
+        rcv_room: u32,
+    ) -> Option<(usize, u32)> {
+        if self.mtu_probe.is_some()
+            || self.ca != CaState::Open
+            || self.cwr_high.is_some()
+            || !matches!(self.state, State::Established | State::CloseWait)
+            || self.cc.cwnd() < 11 * u32::from(self.mss)
+        {
+            return None;
+        }
+        let mtu = self.plpmtud.next_probe(self.now)?;
+        let payload = (mtu as usize)
+            .checked_sub(self.header_overhead() as usize + options::options_len(opts))?;
+        let need = payload + (DUP_THRESH as usize + 1) * usize::from(self.mss);
+        if payload <= room
+            || pending < need
+            || (rcv_room as usize) < need
+            || (cc_room as usize) < payload
+        {
+            return None;
+        }
+        Some((payload, mtu))
     }
 
     /// Drain any queued outgoing segments.
@@ -1290,7 +1420,10 @@ impl Conn {
     /// counts in segments, to match: a SYN's MSS applies only after `new`
     /// made one.
     fn set_mss(&mut self, mss: u16) {
-        self.mss = mss.min(self.cfg.mss.max(1)).min(self.path_mss);
+        self.mss_clamp = mss.min(self.cfg.mss.max(1));
+        let max = u32::from(self.mss_clamp.min(self.path_mss)) + self.header_overhead();
+        self.plpmtud.set_max(max);
+        self.sync_mss();
         self.cc = make_cc(
             self.cfg.congestion,
             self.mss as u32,
@@ -2504,6 +2637,14 @@ impl Conn {
         if let Some(b) = ce_bytes {
             self.score.on_ce(u64::from(b));
         }
+        // An MTU probe delivered, as sent: the path carries its size.
+        if let Some(p) = self.mtu_probe
+            && (seq_after_eq(ack, p.end) || self.score.sacked_at(p.start))
+        {
+            self.mtu_probe = None;
+            self.plpmtud.on_success(p.mtu, now);
+            self.sync_mss();
+        }
         let rs = self.score.rate_sample();
         if let Some(r) = self.score.ack_rtt() {
             self.pace_srtt = Some(self.pace_srtt.map_or(r, |s| (s * 7 + r) / 8));
@@ -2740,7 +2881,7 @@ impl Conn {
             self.score.mark_head_lost();
         }
         if self.ca == CaState::Open && self.score.lost_bytes() > 0 {
-            self.enter_recovery();
+            self.on_losses_found();
         }
         if self.ca == CaState::Recovery || (self.ca == CaState::Open && self.cwr_high.is_some()) {
             self.prr_update(delivered);
@@ -3390,7 +3531,7 @@ impl Conn {
         }
         self.rack_detect(false, false);
         if self.ca == CaState::Open && self.score.lost_bytes() > 0 {
-            self.enter_recovery();
+            self.on_losses_found();
         }
         if self.cc.model_based() {
             self.feed_losses();
@@ -3415,6 +3556,19 @@ impl Conn {
             return;
         }
         let len = if fin { 1 } else { payload.len() as u32 };
+        // Resending the probe settles it: lost, and to its size unless
+        // something sent before it was lost too, which says congestion.
+        if let Some(p) = self.mtu_probe.as_mut() {
+            if seq_before(seq, p.start) {
+                p.others_lost = true;
+            } else if seq_before(seq, p.end) {
+                let p = *p;
+                self.mtu_probe = None;
+                if !p.others_lost {
+                    self.plpmtud.on_failure(p.mtu, self.now);
+                }
+            }
+        }
         let mut seg = Segment {
             src_port: self.cfg.local_port,
             dst_port: self.cfg.remote_port,
@@ -3558,6 +3712,22 @@ impl Conn {
                 break;
             }
             let avail = cc_room.min(rcv_room) as usize;
+            if let Some((n, mtu)) = self.probe_due(&opts, room, pending, cc_room, rcv_room) {
+                if !self.pace_ready() {
+                    self.pace_wait();
+                    break;
+                }
+                let start = self.send_buf.as_ref().unwrap().nxt();
+                self.send_new(n, opts);
+                self.mtu_probe = Some(Probe {
+                    start,
+                    end: start.wrapping_add(n as u32),
+                    mtu,
+                    others_lost: false,
+                });
+                sent_new = true;
+                continue;
+            }
             let n = avail.min(room).min(pending);
 
             // Sender SWS avoidance (RFC 9293 §3.8.6.2.1): avoid tiny
@@ -4080,6 +4250,9 @@ impl Conn {
             | State::FinWait1
             | State::Closing
             | State::LastAck => {
+                if !zero_window && self.retries >= plpmtud::BLACK_HOLE_RTOS {
+                    self.check_black_hole();
+                }
                 // RFC 6298 §5.4: the first unacknowledged segment, whatever
                 // the window; the rest follows as ACKs open cwnd.
                 let room = self.send_mss() as u32;
@@ -4095,6 +4268,27 @@ impl Conn {
             _ => {}
         }
         self.start_rto();
+    }
+
+    /// Timeouts keep coming for the first segment (RFC 4821 §5): the path
+    /// may have a black hole that drops it for its size and sends no ICMP
+    /// message to say so. Lower the MSS to PLPMTUD's base, or to half the
+    /// segment if that is smaller already, for its retransmission, and let
+    /// probing find what the path carries from there.
+    fn check_black_hole(&mut self) {
+        let Some((_, len, false)) = self.score.head(u32::MAX) else {
+            return;
+        };
+        // As it goes again: cut to the MSS, with the options it carries
+        // now. A segment small enough, however often it times out, is not
+        // the path's MTU's doing.
+        let opts = options::options_len(&self.segment_options()) as u32;
+        let size = (len + opts).min(u32::from(self.mss)) + self.header_overhead();
+        if let Some(low) = self.plpmtud.black_hole_target(size) {
+            self.plpmtud.on_black_hole(low, self.now);
+            self.mtu_probe = None;
+            self.sync_mss();
+        }
     }
 
     /// Count a zero-window probe about to be sent; true if the connection
@@ -7954,6 +8148,13 @@ mod tests {
         ecn: [EcnMode; 2],
         /// What the link does to ECN: see [`ecn_hop`].
         ecn_path: u64,
+        /// Each end's PLPMTUD.
+        mtu_probing: [MtuProbing; 2],
+        /// Each direction's black hole, zero for none: packets larger than
+        /// this vanish without an ICMP message. Only where the sender
+        /// searches for the path MTU: without, a black hole is the end of
+        /// the connection.
+        black_hole: [u32; 2],
     }
 
     impl StressCfg {
@@ -7994,7 +8195,26 @@ mod tests {
                     [modes[e.below(4) as usize], modes[e.below(4) as usize]]
                 },
                 ecn_path: Rng(splitmix(seed ^ 0xECE) | 1).below(6),
+                mtu_probing: [MtuProbing::Off; 2],
+                black_hole: [0; 2],
             }
+            .with_black_holes(seed)
+        }
+
+        fn with_black_holes(mut self, seed: u64) -> Self {
+            let mut m = Rng(splitmix(seed ^ 0x3D1) | 1);
+            let modes = [MtuProbing::Off, MtuProbing::OnBlackHole, MtuProbing::Always];
+            for i in 0..2 {
+                self.mtu_probing[i] = modes[m.below(3) as usize];
+                // Between the smallest MTU a black hole can take the
+                // connection to and the largest segment it sends.
+                let widest = u64::from(self.mss) + 40;
+                let floor = u64::from(IPV4_MIN_PATH_MTU);
+                if self.mtu_probing[i] != MtuProbing::Off && m.below(3) == 0 {
+                    self.black_hole[i] = (floor + m.below(widest - floor + 1)) as u32;
+                }
+            }
+            self
         }
     }
 
@@ -8122,6 +8342,7 @@ mod tests {
                 .send_buf_max(sc.buf * 4)
                 .recv_buf_max(sc.buf * 4)
                 .ecn(sc.ecn[i])
+                .mtu_probing(sc.mtu_probing[i])
         };
         let mut ecn_rng = Rng(splitmix(seed ^ 0xEC0) | 1);
         let mut a = Conn::new(mk(40300, 80, 0));
@@ -8212,6 +8433,11 @@ mod tests {
                         let c = &mut sides[i].conn;
                         links[i].extend(sent_by(c, |c| c.on_icmp_too_big(path_mtu[i], seg.seq)));
                         check_invariants(c, &ctx);
+                        continue;
+                    }
+                    // Whether either end struggles or not: it is PLPMTUD's
+                    // to get out of.
+                    if sc.black_hole[i] > 0 && 20 + pkt.len() as u32 > sc.black_hole[i] {
                         continue;
                     }
                     // As in lossy_run, the link stops losing while either end
@@ -8941,6 +9167,11 @@ mod tests {
         /// Data segments sent again, and how far data has been sent.
         retransmitted: u64,
         sent_end: Option<u32>,
+        /// A black hole: packets larger than this many bytes (with an IPv4
+        /// header) vanish, and nobody says so; zero lets all through.
+        black_hole: u32,
+        /// Packets it swallowed.
+        swallowed: u64,
     }
 
     /// `pkts`, which `c` has just returned, with their codepoints.
@@ -8974,6 +9205,8 @@ mod tests {
                 marked: 0,
                 retransmitted: 0,
                 sent_end: None,
+                black_hole: 0,
+                swallowed: 0,
             };
             p.send(syn);
             p
@@ -8993,6 +9226,10 @@ mod tests {
                 }
                 if self.loss_ppm > 0 && self.rng.below(1_000_000) < self.loss_ppm {
                     self.lost += 1;
+                    continue;
+                }
+                if self.black_hole > 0 && 20 + pkt.len() as u32 > self.black_hole {
+                    self.swallowed += 1;
                     continue;
                 }
                 let start = self.busy_until.max(now);
@@ -9207,6 +9444,147 @@ mod tests {
         read_all(&mut s);
         deliver(&mut c, &acks);
         assert!(!c.score.rate().is_app_limited());
+    }
+
+    // --- PLPMTUD -------------------------------------------------------------
+
+    /// A bulk transfer over a path whose MTU is 1400 with nobody to say so:
+    /// larger packets vanish without an ICMP message. PLPMTUD finds the
+    /// black hole from the timeouts, drops to the base MSS, and probes back
+    /// up to within a few bytes of the path's MTU, where the transfer runs
+    /// at nearly the link's rate. Starting from the base, `Always` never
+    /// falls in.
+    #[test]
+    fn a_black_hole_is_found_and_the_mss_converges_below_it() {
+        for (mode, port) in [
+            (MtuProbing::OnBlackHole, 40720),
+            (MtuProbing::Always, 40721),
+        ] {
+            let mut p = bulk(ConnConfig::default().mtu_probing(mode), 2.0, port);
+            p.black_hole = 1400;
+            p.run_for(Duration::from_secs(10));
+            let mtu = p.a.path_mtu();
+            assert!(mtu <= 1400 && mtu > 1400 - 16, "{mode:?}: MTU {mtu}");
+            let goodput = p.goodput(Duration::from_secs(5));
+            assert!(goodput > 0.85 * p.rate, "{mode:?}: goodput {goodput}");
+            if mode == MtuProbing::Always {
+                assert!(p.swallowed < 20, "{} swallowed", p.swallowed);
+            }
+            // The probes lost to their size cost no window.
+            assert!(!p.a.is_closed());
+        }
+    }
+
+    /// Without PLPMTUD the same path is the end of the connection: every
+    /// full-sized segment is lost, and so is every retransmission of it.
+    #[test]
+    fn without_probing_a_black_hole_stalls() {
+        let mut p = bulk(
+            ConnConfig::default().mtu_probing(MtuProbing::Off),
+            2.0,
+            40722,
+        );
+        p.black_hole = 1400;
+        p.run_for(Duration::from_secs(10));
+        assert_eq!(p.received, 0);
+        assert_eq!(p.a.path_mtu(), 1500);
+    }
+
+    /// With ICMP getting through as it should, PLPMTUD stays out of the
+    /// way: a clean path sees no probes and no change of MSS, and repeated
+    /// timeouts of small segments are not taken for a black hole.
+    #[test]
+    fn a_clean_path_is_left_alone() {
+        let mut p = bulk(ConnConfig::default(), 2.0, 40723);
+        p.run_for(Duration::from_secs(3));
+        assert_eq!(p.a.path_mtu(), 1500);
+        assert!(p.a.plpmtud.cap().is_none());
+
+        let (mut c, _s) = established(40724);
+        c.write(&[1; 100]);
+        fire_rto(&mut c);
+        fire_rto(&mut c);
+        fire_rto(&mut c);
+        assert_eq!(c.mss(), 1460, "small segments timing out");
+    }
+
+    fn probing(local: u16, remote: u16) -> ConnConfig {
+        cfg(local, remote)
+            .mtu_probing(MtuProbing::Always)
+            .send_buf_size(1 << 20)
+            .recv_buf_size(1 << 20)
+    }
+
+    /// A connection probing from the base MSS, with a window wide enough
+    /// for a probe, and the segments of its first write.
+    fn probing_pair(port: u16) -> (Conn, Conn, Vec<Segment>, Segment) {
+        let mut c = Conn::new(probing(port, 80));
+        let mut s = Conn::new(probing(80, port));
+        drive_handshake(&mut c, &mut s);
+        assert_eq!(c.mss(), 1024);
+        c.cc.set_cwnd(40 * 1024);
+        let (_, out) = c.write(&vec![5; 100_000]);
+        let out: Vec<Segment> = out.iter().map(|p| parse(p)).collect();
+        let probe = out
+            .iter()
+            .find(|p| p.payload.len() > 1024)
+            .expect("no probe")
+            .clone();
+        (c, s, out, probe)
+    }
+
+    /// A probe lost to its size, while what follows it arrives, is resent
+    /// alone, at the MSS, and the window stays as it was.
+    #[test]
+    fn a_probe_lost_to_its_size_keeps_the_window() {
+        let (mut c, mut s, out, probe) = probing_pair(40725);
+        let end = probe.seq.wrapping_add(probe.payload.len() as u32);
+        let acks: Vec<_> = out
+            .iter()
+            .filter(|p| p.seq != probe.seq)
+            .flat_map(|p| s.handle_segment(p))
+            .collect();
+        let cwnd = c.cc.cwnd();
+        let resent: Vec<Segment> = deliver(&mut c, &acks).iter().map(|p| parse(p)).collect();
+        let again: Vec<_> = resent
+            .iter()
+            .filter(|p| seq_in_range(p.seq, probe.seq, end))
+            .collect();
+        assert!(!again.is_empty(), "probe not resent");
+        assert!(again.iter().all(|p| p.payload.len() <= 1024), "too big");
+        assert!(c.cc.cwnd() >= cwnd, "window cut for a probe");
+        assert!(c.mtu_probe.is_none());
+        assert_eq!(c.mss(), 1024);
+        // Nothing else went again.
+        assert!(resent.iter().all(|p| !seq_before(p.seq, probe.seq)));
+        // Once it is in, the next probe tries a smaller size.
+        let acks: Vec<_> = again.iter().flat_map(|p| s.handle_segment(p)).collect();
+        deliver(&mut c, &acks);
+        assert!(!c.in_recovery());
+    }
+
+    /// A probe delivered raises the MSS to its size.
+    #[test]
+    fn a_probe_delivered_raises_the_mss() {
+        let (mut c, mut s, out, probe) = probing_pair(40727);
+        let acks: Vec<_> = out.iter().flat_map(|p| s.handle_segment(p)).collect();
+        deliver(&mut c, &acks);
+        assert_eq!(u32::from(c.mss()), probe.payload.len() as u32);
+        assert_eq!(c.path_mtu(), 40 + probe.payload.len() as u32);
+    }
+
+    /// A Packet Too Big for a probe settles it at once: the search takes
+    /// the reported MTU as its ceiling, and the probe goes again at the MSS.
+    #[test]
+    fn packet_too_big_for_a_probe() {
+        let (mut c, _s, _out, probe) = probing_pair(40726);
+        let resent = c.on_icmp_too_big(1100, probe.seq);
+        assert!(c.mtu_probe.is_none());
+        assert_eq!(c.plpmtud.range().1, 1100);
+        let again = parse(&resent[0]);
+        assert_eq!(again.seq, probe.seq);
+        assert!(again.payload.len() <= 1024);
+        assert_eq!(c.mss(), 1024);
     }
 
     // --- ECN -----------------------------------------------------------------
