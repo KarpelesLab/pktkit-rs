@@ -87,6 +87,10 @@ sized for the fast link), and a fresh vclient.
   loss each way; reordering; 50 Mbit/s with CE marking past 10 ms of queue;
   50 Mbit/s with a 100-packet drop-tail queue. These report throughput and
   what held each sender back; they fail only if a transfer does.
+- Slow start over long paths (`ramp_linux_cubic_sender`): Linux's CUBIC
+  sending to vtcp, and vtcp's to Linux, at 10, 50 and 100 ms round trips,
+  with Linux's HyStart counters (`TCPHystart*`) and how far vtcp's
+  receive buffer grew.
 
 ## Findings
 
@@ -119,6 +123,17 @@ odd one out:
   sends each window as a burst, draws a mark every round trip and collapses
   (4 Mbit/s of 50) where vtcp, which paces, holds 39. Not a bug either side;
   the test marks at 10 ms, as a classic AQM would.
+- On macOS, a Linux CUBIC sender left slow start at 56 to 336 segments
+  without a loss, by HyStart's delay test, and sent to vtcp at 28 to 80
+  Mbit/s over a 50 ms round trip. vtcp's ACKs were not to blame (every
+  second segment, within microseconds, window growing to 16 MiB): the
+  delay line was. macOS lets a timed wait run late by up to half its
+  length, 10 ms at most, so the 25 ms each way wandered by as much from
+  one round trip to the next, which HyStart takes for a queue building.
+  vtcp's own timers ran late the same way (a 40 ms delayed ACK after 50).
+  Both now wait in halving steps on Apple hosts, and wake within tens of
+  microseconds; Linux then sends at slow start's bound (260 Mbit/s for
+  16 MiB at 50 ms, 131 at 100).
 
 ## CI
 

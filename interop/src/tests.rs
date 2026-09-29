@@ -65,6 +65,7 @@ pub fn all() -> Vec<Test> {
         t!(impaired_reorder, false),
         t!(impaired_rate_ecn, false),
         t!(impaired_rate_droptail, false),
+        t!(ramp_linux_cubic_sender, false),
     ]
 }
 
@@ -891,17 +892,15 @@ fn impaired(
         // rate was held back by the receiver's window, or by its own
         // controller.
         let lx = &down.linux;
-        let vr = down.vc.info().ok();
         ctx.note(format!(
             "       Linux sender: cwnd {} ssthresh {} busy {} ms, rwnd-limited {} ms, rtt {} us; \
-             vtcp receiver: rcv_wnd {} recv_buf {}",
+             vtcp receiver: recv_buf grew to {}",
             lx.get("cwnd"),
             lx.get("ssthresh"),
             lx.num("busy_us") / 1000,
             lx.num("rwnd_limited_us") / 1000,
             lx.get("rtt_us"),
-            vr.map_or(0, |i| i.rcv_wnd),
-            vr.map_or(0, |i| i.recv_buf),
+            down.vc.recv_buf_peak,
         ));
         if let Some(i) = vi {
             ctx.note(format!(
@@ -977,4 +976,61 @@ fn impaired_rate_droptail(ctx: &mut Ctx) -> Result<(), String> {
         .rate_bps(50_000_000)
         .queue_limit(100);
     impaired(ctx, imp, 16 * MIB, false, 10.0)
+}
+
+/// How a Linux CUBIC sender ramps up towards vtcp over long paths with no
+/// loss, next to vtcp's own CUBIC towards Linux: slow start should carry
+/// either to the path's rate in a few round trips. HyStart (Linux's
+/// `hystart_detect`) ends slow start early on a train of ACKs that comes
+/// back too spread out, or on RTT samples that grow within a round, so a
+/// receiver whose ACKs come late or in bursts caps its sender here.
+fn ramp_linux_cubic_sender(ctx: &mut Ctx) -> Result<(), String> {
+    let n = 16 * MIB;
+    const KEYS: [&str; 4] = [
+        "TcpExt.TCPHystartTrainDetect",
+        "TcpExt.TCPHystartTrainCwnd",
+        "TcpExt.TCPHystartDelayDetect",
+        "TcpExt.TCPHystartDelayCwnd",
+    ];
+    let mut fails = Vec::new();
+    for ms in [5u64, 25, 50] {
+        ctx.impair(
+            Impairment::default()
+                .delay(Duration::from_millis(ms))
+                .queue_limit(20_000),
+        );
+        let c = ctx.client(Tuning::default());
+        let limit = ctx.limit(n, 5.0);
+        let up = ctx.vc_to_linux(&c, "cc=cubic", n, 0, false, limit)?;
+        let before = ctx.vm.netstat()?;
+        let down = ctx.vc_to_linux(&c, "cc=cubic", 0, n, false, limit)?;
+        let after = ctx.vm.netstat()?;
+        for r in [&up, &down] {
+            if !r.ok() {
+                fails.push(format!("{ms} ms: {}", r.failure()));
+            }
+        }
+        let d: Vec<u64> = KEYS
+            .iter()
+            .map(|k| after.num(k).saturating_sub(before.num(k)))
+            .collect();
+        let lx = &down.linux;
+        ctx.note(format!(
+            "RTT {:>3} ms: Linux→vtcp {:>12} (cwnd {} ssthresh {} rtt {} us, retrans {}), \
+             vtcp→Linux {:>12}",
+            2 * ms,
+            mbps(down.mbps_linux_to_vc()),
+            lx.get("cwnd"),
+            lx.get("ssthresh"),
+            lx.get("rtt_us"),
+            lx.get("total_retrans"),
+            mbps(up.mbps_vc_to_linux()),
+        ));
+        ctx.note(format!(
+            "            HyStart train {} (cwnd {}), delay {} (cwnd {}); vtcp recv_buf grew to {}",
+            d[0], d[1], d[2], d[3], down.vc.recv_buf_peak,
+        ));
+    }
+    ensure!(fails.is_empty(), "{}", fails.join("; "));
+    Ok(())
 }

@@ -170,6 +170,7 @@ impl Ctx {
                 elapsed: Duration::ZERO,
                 err: Some("no connection".into()),
                 info: None,
+                recv_buf_peak: 0,
             });
         Ok(Run {
             vc,

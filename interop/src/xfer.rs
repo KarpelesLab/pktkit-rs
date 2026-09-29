@@ -72,6 +72,9 @@ pub struct VcEnd {
     pub elapsed: Duration,
     pub err: Option<String>,
     pub info: Option<TcpInfo>,
+    /// The largest the receive buffer grew to while data came in: `info`
+    /// is read after the close, when the growth has been given back.
+    pub recv_buf_peak: usize,
 }
 
 impl VcEnd {
@@ -84,6 +87,7 @@ impl VcEnd {
             elapsed: start.elapsed(),
             err: Some(err),
             info: None,
+            recv_buf_peak: 0,
         }
     }
 
@@ -128,21 +132,36 @@ fn send_pattern(c: &impl Stream, seed: u64, n: u64, skip: u64) -> io::Result<()>
     Ok(())
 }
 
-fn recv_pattern(c: &impl Stream, seed: u64) -> (Verifier, Option<Duration>, Option<io::Error>) {
+struct Received {
+    v: Verifier,
+    /// From the first byte to EOF.
+    time: Option<Duration>,
+    err: Option<io::Error>,
+    recv_buf_peak: usize,
+}
+
+fn recv_pattern(c: &impl Stream, seed: u64) -> Received {
     let mut v = Verifier::new(seed);
     let mut buf = vec![0u8; CHUNK];
     let mut first = None;
-    loop {
+    let mut peak = 0;
+    let err = loop {
         match c.read(&mut buf) {
-            Ok(0) => break,
+            Ok(0) => break None,
             Ok(n) => {
                 first.get_or_insert_with(Instant::now);
                 v.update(&buf[..n]);
+                peak = peak.max(c.info().recv_buf);
             }
-            Err(e) => return (v, first.map(|f: Instant| f.elapsed()), Some(e)),
+            Err(e) => break Some(e),
         }
+    };
+    Received {
+        v,
+        time: first.map(|f: Instant| f.elapsed()),
+        err,
+        recv_buf_peak: peak,
     }
-    (v, first.map(|f| f.elapsed()), None)
 }
 
 /// Wait until our FIN, and everything before it, is acknowledged.
@@ -177,16 +196,17 @@ fn client_body(
 ) -> VcEnd {
     let werr = send_pattern(c, seed, send, skip).err();
     let _ = c.close();
-    let (v, rx_time, rerr) = recv_pattern(c, reverse_seed(seed));
+    let r = recv_pattern(c, reverse_seed(seed));
     wait_acked(c, Duration::from_secs(10));
     VcEnd {
-        rx: v.len,
-        rx_ok: v.ok(recv),
-        bad_at: v.bad_at,
-        rx_time,
+        rx: r.v.len,
+        rx_ok: r.v.ok(recv),
+        bad_at: r.v.bad_at,
+        rx_time: r.time,
         elapsed: start.elapsed(),
-        err: werr.or(rerr).map(|e| err_name(&e)),
+        err: werr.or(r.err).map(|e| err_name(&e)),
         info: Some(c.info()),
+        recv_buf_peak: r.recv_buf_peak,
     }
 }
 
@@ -265,11 +285,12 @@ fn serve_one<S: Stream>(c: S, mode: ServerMode, send: u64, seed: u64, timeout: D
                 elapsed: start.elapsed(),
                 err: None,
                 info: Some(info),
+                recv_buf_peak: 0,
             }
         }
         ServerMode::Sink => {
-            let (v, rx_time, rerr) = recv_pattern(&c, seed);
-            let werr = if rerr.is_none() {
+            let r = recv_pattern(&c, seed);
+            let werr = if r.err.is_none() {
                 send_pattern(&c, reverse_seed(seed), send, 0).err()
             } else {
                 None
@@ -277,13 +298,14 @@ fn serve_one<S: Stream>(c: S, mode: ServerMode, send: u64, seed: u64, timeout: D
             let _ = c.close();
             wait_acked(&c, Duration::from_secs(10));
             VcEnd {
-                rx: v.len,
-                rx_ok: v.bad_at.is_none(),
-                bad_at: v.bad_at,
-                rx_time,
+                rx: r.v.len,
+                rx_ok: r.v.bad_at.is_none(),
+                bad_at: r.v.bad_at,
+                rx_time: r.time,
                 elapsed: start.elapsed(),
-                err: rerr.or(werr).map(|e| err_name(&e)),
+                err: r.err.or(werr).map(|e| err_name(&e)),
                 info: Some(c.info()),
+                recv_buf_peak: r.recv_buf_peak,
             }
         }
     }
