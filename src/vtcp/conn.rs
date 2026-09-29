@@ -453,6 +453,13 @@ pub struct ConnConfig {
     /// way, and its data delivered twice, to two connections. Only
     /// requests safe to repeat belong in a SYN. `vclient` sends them
     /// (see its `ClientConfig::tcp`).
+    ///
+    /// On `wasm32-unknown-unknown`, which has no entropy source, the key
+    /// the cookies are made with can be guessed (as can ISNs and SYN
+    /// cookies): a peer may then forge a cookie for an address it does
+    /// not own, and have its SYN's data taken and answered, which makes
+    /// the server an amplifier for spoofed traffic towards that address.
+    /// Leave it off there when peers may be hostile.
     pub fast_open: bool,
 }
 

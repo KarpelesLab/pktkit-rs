@@ -35,7 +35,9 @@ pub struct Tuning {
     /// a `vclient::Client`, also send it: `Client::dial_tcp_with_data` puts
     /// the first data in the SYN once the server has given a cookie. Off by
     /// default: SYN data may be delivered twice (RFC 7413 §6), so only
-    /// requests safe to repeat belong in it.
+    /// requests safe to repeat belong in it. On `wasm32-unknown-unknown`
+    /// cookies can be forged (see [`ConnConfig::fast_open`]): leave it off
+    /// there when peers may be hostile.
     pub fast_open: bool,
     /// Packetization Layer Path MTU Discovery ([`ConnConfig::mtu_probing`]).
     /// Once full-sized segments keep timing out, by default.

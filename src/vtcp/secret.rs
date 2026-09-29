@@ -11,7 +11,8 @@
 //! `RandomState` from allocation addresses, which an attacker can guess. The
 //! wall clock at first use is mixed in there, which is the best the target
 //! offers without an import of its own; an embedder facing hostile peers on
-//! that target should not rely on ISN or cookie secrecy.
+//! that target should not rely on ISN or cookie secrecy, Fast Open cookies
+//! included.
 
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash};

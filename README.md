@@ -174,6 +174,12 @@ const imports = {
 WASI provides a clock and `random_get` natively, so nothing extra is needed
 there.
 
+`vtcp` keys its initial sequence numbers, SYN cookies and Fast Open cookies
+with std's `RandomState`, which on `wasm32-unknown-unknown` has no entropy
+source and can be guessed. Keep Fast Open off there if peers may be hostile:
+a forged cookie would have the stack answer SYN data for an address the
+sender does not own.
+
 ### Dependency policy
 
 `pktkit` depends on:
