@@ -336,12 +336,14 @@ pub fn vtcp_segment(data: &[u8]) {
 /// delivered, dropped, reordered, duplicated, or corrupted at chosen offsets.
 /// Corruptions start from a segment that is valid for the connection, so
 /// they reach the state machine rather than its first sequence check. The
-/// first byte picks each side's ECN setting; the top bits of a delivery's
-/// byte, the IP-ECN codepoint the network leaves on it.
+/// first byte picks each side's ECN setting, their PLPMTUD, and whether we
+/// open with TCP Fast Open (with a valid cookie, and data in the SYN); the
+/// top bits of a delivery's byte, the IP-ECN codepoint the network leaves
+/// on it.
 #[cfg(feature = "vtcp")]
 pub fn vtcp_conversation(data: &[u8]) {
     use crate::vtcp::ecn::IpEcn;
-    use crate::vtcp::{Conn, ConnConfig, EcnMode, Segment};
+    use crate::vtcp::{Conn, ConnConfig, EcnMode, MtuProbing, Segment};
     use std::collections::VecDeque;
 
     let modes = [
@@ -351,21 +353,46 @@ pub fn vtcp_conversation(data: &[u8]) {
         EcnMode::Accurate,
     ];
     let first = data.first().copied().unwrap_or(0) as usize;
+    let probing = [
+        MtuProbing::OnBlackHole,
+        MtuProbing::Off,
+        MtuProbing::Always,
+        MtuProbing::OnBlackHole,
+    ][(first >> 4) & 3];
+    let fast_open = first & 0x40 != 0;
+    let addr = |port: u16| -> std::net::SocketAddr {
+        let ip = if port == 80 {
+            [10, 0, 0, 1]
+        } else {
+            [10, 0, 0, 2]
+        };
+        (ip, port).into()
+    };
     let cfg = |local, remote, ecn| {
         ConnConfig::default()
             .local_port(local)
             .remote_port(remote)
+            .local_addr(addr(local))
+            .remote_addr(addr(remote))
             .mss(536)
             .send_buf_size(4096)
             .recv_buf_size(4096)
             .ecn(ecn)
+            .mtu_probing(probing)
+            .fast_open(fast_open)
     };
     let mut us = Conn::new(cfg(40000, 80, modes[first & 3]));
     let mut peer = Conn::new(cfg(80, 40000, modes[(first >> 2) & 3]));
     // Segments the peer has sent that the network still holds.
     let mut wire: VecDeque<Vec<u8>> = VecDeque::new();
 
-    let Some(syn) = us.connect().into_iter().next() else {
+    let syn = if fast_open {
+        let cookie = crate::vtcp::fastopen::cookie(addr(80).ip(), addr(40000).ip());
+        us.connect_fast_open(Some(&cookie), None, b"hello").1
+    } else {
+        us.connect()
+    };
+    let Some(syn) = syn.into_iter().next() else {
         return;
     };
     let Ok(syn) = Segment::parse(&syn) else {
