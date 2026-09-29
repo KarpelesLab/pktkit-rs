@@ -2397,7 +2397,6 @@ impl Conn {
         if !seg.has_flag(flags::ACK) {
             return self.take_outgoing();
         }
-        self.ecn.on_receive(seg, self.rx_ecn);
 
         match self.state {
             State::SynReceived => self.handle_syn_received(seg),
@@ -3014,6 +3013,13 @@ impl Conn {
             self.queue_challenge_ack();
             return false;
         }
+        // The segment is the peer's: past the sequence check, PAWS (which
+        // every caller runs first) and this one. Only now do its CE mark
+        // and CWR count. A blind attacker who guessed only a SEQ in the
+        // window could otherwise have the connection report congestion
+        // that never was, or stop reporting congestion that was. Before
+        // the ACK is taken, so that what it lets go carries the echo.
+        self.ecn.on_receive(seg, self.rx_ecn);
         // Before anything this ACK lets go (draft-ietf-ccwg-bbr §4.1.2.4).
         self.check_app_limited();
         // The window comes first: the flush below must see this segment's.
@@ -10728,6 +10734,64 @@ mod tests {
 
     fn ecn_pair(cm: EcnMode, sm: EcnMode, port: u16) -> (Conn, Conn) {
         ecn_pair_via(cm, sm, port, |_, _| {})
+    }
+
+    /// A segment an off-path attacker could send, knowing the ports and
+    /// guessing a SEQ in `victim`'s window but not an acceptable ACK.
+    fn blind_segment(victim: &Conn, from: u16, to: u16, ecn_flags: u8) -> Segment {
+        Segment {
+            src_port: from,
+            dst_port: to,
+            seq: victim.recv_buf.as_ref().unwrap().nxt().wrapping_add(100),
+            ack: victim
+                .send_buf
+                .as_ref()
+                .unwrap()
+                .nxt()
+                .wrapping_add(1 << 30),
+            flags: flags::ACK | ecn_flags,
+            window: 1000,
+            ..Default::default()
+        }
+    }
+
+    /// A CE mark on a segment whose ACK fails RFC 5961's check is not
+    /// counted: an AccECN receiver would report congestion that never was,
+    /// and the sender cut its window for it.
+    #[test]
+    fn a_blind_ce_mark_is_not_counted_accecn() {
+        let (mut c, mut s) = ecn_pair(EcnMode::Accurate, EcnMode::Accurate, 41160);
+        let (_, data) = c.write(&[1; 20_000]);
+        s.handle_segment_ecn(&blind_segment(&s, 41160, 80, 0), IpEcn::CE);
+        assert_eq!(s.ecn.received_ce(), 0, "counted a forged mark");
+        let acks = deliver_marked(&mut s, &marked(&c, data), as_is);
+        deliver_marked(&mut c, &acks, as_is);
+        assert_eq!(c.stats.ecn_reductions, 0);
+    }
+
+    /// Classic ECN: a blind CE mark does not start the echo, a blind CWR
+    /// does not stop it, and neither does a mark or CWR on a pure ACK,
+    /// which the sender never sends ECN-capable (Linux's tcp_ecn_check_ce
+    /// and tcp_ecn_accept_cwr look at data only).
+    #[test]
+    fn classic_ecn_takes_ce_and_cwr_from_the_peer_s_data_only() {
+        let (mut c, mut s) = ecn_pair(EcnMode::Classic, EcnMode::Passive, 41161);
+        s.handle_segment_ecn(&blind_segment(&s, 41161, 80, 0), IpEcn::CE);
+        assert!(!s.ecn.echoing(), "a forged mark echoed");
+        let ack = bare_ack(&s, &c, s.send_buf.as_ref().unwrap().nxt(), 1000);
+        s.handle_segment_ecn(&ack, IpEcn::CE);
+        assert!(!s.ecn.echoing(), "a pure ACK's mark echoed");
+
+        let (_, data) = c.write(&[1; 5000]);
+        let first = |i, e| if i == 0 { IpEcn::CE } else { e };
+        deliver_marked(&mut s, &marked(&c, data), first);
+        assert!(s.ecn.echoing());
+        s.handle_segment_ecn(&blind_segment(&s, 41161, 80, flags::CWR), IpEcn::NOT_ECT);
+        assert!(s.ecn.echoing(), "a forged CWR stopped the echo");
+        let mut cwr = bare_ack(&s, &c, s.send_buf.as_ref().unwrap().nxt(), 1000);
+        cwr.flags |= flags::CWR;
+        s.handle_segment_ecn(&cwr, IpEcn::NOT_ECT);
+        assert!(s.ecn.echoing(), "a pure ACK's CWR stopped the echo");
     }
 
     /// Who asks for which ECN, and what each end ends up with: RFC 3168's

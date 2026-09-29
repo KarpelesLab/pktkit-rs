@@ -306,19 +306,25 @@ impl Ecn {
         }
     }
 
-    /// Receiver: `seg`, which arrived with `ip`, passed the sequence check.
+    /// Receiver: `seg`, which arrived with `ip`, passed the sequence, PAWS
+    /// and ACK checks.
     pub fn on_receive(&mut self, seg: &Segment, ip: IpEcn) {
         let data = !seg.payload.is_empty();
         let ce = ip == IpEcn::CE;
         self.ack_now = false;
         match self.fb {
             Feedback::Off => {}
+            // Only a segment carrying data counts, as Linux's
+            // tcp_ecn_accept_cwr and tcp_ecn_check_ce have it: RFC 3168
+            // §6.1.4 sends pure ACKs Not-ECT, so a CE mark on one is not
+            // the sender's, and a CWR goes on new data.
+            Feedback::Classic if !data => {}
             Feedback::Classic => {
-                // The sender has reduced (Linux's tcp_ecn_accept_cwr),
-                // before this segment's own mark, if any, asks again.
+                // The sender has reduced, before this segment's own mark,
+                // if any, asks again.
                 if seg.has_flag(flags::CWR) {
                     self.demand_cwr = false;
-                    self.ack_now |= data;
+                    self.ack_now = true;
                 }
                 if ce {
                     // An ACK at once: the sender may have a small window,
