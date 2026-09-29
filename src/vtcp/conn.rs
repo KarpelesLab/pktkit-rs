@@ -15,6 +15,7 @@
 
 use crate::time::Instant;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::autotune::{self, Budget, RcvSpace};
@@ -714,6 +715,10 @@ pub struct Conn {
     // Buffer auto-tuning.
     /// Where buffer growth is drawn from, process-wide.
     budget: &'static Budget,
+    /// A share of it this connection's growth is also held to, where its
+    /// owner keeps one (a slirp namespace), so that one peer cannot take
+    /// all of it.
+    budget_share: Option<Arc<Budget>>,
     /// What this connection's buffers have grown by, drawn from `budget`.
     grown: usize,
     /// The receive buffer's share of `grown`. Its limit may stand higher
@@ -940,6 +945,7 @@ impl Conn {
             last_data_recv: None,
             ack_pushed: false,
             budget: &autotune::GLOBAL,
+            budget_share: None,
             grown: 0,
             rcv_grown: 0,
             snd_nospace: false,
@@ -2974,11 +2980,9 @@ impl Conn {
             65535
         };
         let want = want.min(self.cfg.recv_max()).min(advertisable);
-        let budget = self.budget;
-        let Some(rb) = self.recv_buf.as_mut() else {
+        let Some(cur) = self.recv_buf.as_ref().map(|rb| rb.limit()) else {
             return;
         };
-        let cur = rb.limit();
         // Zero is no limit at all.
         if cur == 0 || want <= cur {
             return;
@@ -2987,10 +2991,44 @@ impl Conn {
         // the limit may be a window advertised before and no longer paid
         // for.
         let funded = self.cfg.recv_buf_size + self.rcv_grown;
-        let got = budget.reserve(want - funded);
+        let got = self.reserve_growth(want - funded);
         self.rcv_grown += got;
         self.grown += got;
+        let rb = self.recv_buf.as_mut().unwrap();
         rb.set_limit(cur.max(funded + got));
+    }
+
+    /// Take up to `want` bytes of growth from the budget, and from the
+    /// share the connection is held to, if any.
+    fn reserve_growth(&self, want: usize) -> usize {
+        let Some(share) = self.budget_share.as_deref() else {
+            return self.budget.reserve(want);
+        };
+        let allowed = share.reserve(want);
+        let got = self.budget.reserve(allowed);
+        share.release(allowed - got);
+        got
+    }
+
+    /// Give `n` bytes of growth back.
+    fn release_budget(&self, n: usize) {
+        self.budget.release(n);
+        if let Some(share) = self.budget_share.as_deref() {
+            share.release(n);
+        }
+    }
+
+    /// Hold the connection's buffer growth to `share` besides the budget
+    /// every connection draws on. Set before any growth.
+    #[cfg_attr(any(not(feature = "slirp"), target_family = "wasm"), allow(dead_code))]
+    pub(crate) fn set_budget_share(&mut self, share: Arc<Budget>) {
+        debug_assert_eq!(self.grown, 0);
+        self.budget_share = Some(share);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn budget_share(&self) -> Option<&Arc<Budget>> {
+        self.budget_share.as_ref()
     }
 
     /// Bring a receive limit left above what is paid for (after an idle
@@ -3045,7 +3083,8 @@ impl Conn {
         if let Some(sb) = self.send_buf.as_mut() {
             sb.set_capacity(self.cfg.send_buf_size);
         }
-        self.budget.release(std::mem::take(&mut self.grown));
+        let grown = std::mem::take(&mut self.grown);
+        self.release_budget(grown);
         self.rcv_grown = 0;
         self.settle_recv_limit();
         self.rcv_space
@@ -3073,16 +3112,12 @@ impl Conn {
             return;
         }
         let want = autotune::sndbuf_target(cwnd, self.mss as u32).min(self.cfg.send_max());
-        let budget = self.budget;
-        let Some(sb) = self.send_buf.as_mut() else {
-            return;
-        };
         let cur = sb.capacity();
         if want <= cur {
             return;
         }
-        let got = budget.reserve(want - cur);
-        sb.set_capacity(cur + got);
+        let got = self.reserve_growth(want - cur);
+        self.send_buf.as_mut().unwrap().set_capacity(cur + got);
         self.grown += got;
     }
 
@@ -3096,7 +3131,8 @@ impl Conn {
             rb.set_limit(self.cfg.recv_buf_size);
         }
         self.rcv_grown = 0;
-        self.budget.release(std::mem::take(&mut self.grown));
+        let grown = std::mem::take(&mut self.grown);
+        self.release_budget(grown);
     }
 
     /// Apply the segment's window, per RFC 9293 §3.10.7.4: only from a
@@ -5416,7 +5452,7 @@ fn wall_clock() -> Instant {
 
 impl Drop for Conn {
     fn drop(&mut self) {
-        self.budget.release(self.grown);
+        self.release_budget(self.grown);
     }
 }
 
@@ -9901,6 +9937,31 @@ mod tests {
         assert!(server.grown > 0);
         drop(server);
         assert_eq!(budget.used(), client.grown);
+    }
+
+    /// A share of the budget bounds the growth of the connections held to
+    /// it, however much the budget itself has left, and is given back
+    /// with it.
+    #[test]
+    fn budget_share_bounds_growth() {
+        let (mut client, mut server) = tuned_pair(40511, tuned, usize::MAX);
+        let budget = client.budget;
+        let share = Arc::new(Budget::new(100_000));
+        client.set_budget_share(share.clone());
+        server.set_budget_share(share.clone());
+        tuned_rounds(&mut client, &mut server, 1 << 18, 12);
+        assert_eq!(client.grown + server.grown, 100_000);
+        assert_eq!((budget.used(), share.used()), (100_000, 100_000));
+        drop((client, server));
+        assert_eq!((budget.used(), share.used()), (0, 0));
+
+        // The budget running out first leaves the share untouched.
+        let (mut client, mut server) = tuned_pair(40512, tuned, 50_000);
+        let budget = client.budget;
+        client.set_budget_share(share.clone());
+        server.set_budget_share(share.clone());
+        tuned_rounds(&mut client, &mut server, 1 << 18, 12);
+        assert_eq!((budget.used(), share.used()), (50_000, 50_000));
     }
 
     /// Stream `rounds` round trips from `tx` to `rx` as [`tuned_rounds`]

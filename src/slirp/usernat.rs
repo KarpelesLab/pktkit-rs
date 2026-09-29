@@ -37,6 +37,7 @@ use crate::slirp::tcp_stream::{ConnState, Endpoints, Offer, tick_conn};
 use crate::slirp::udp::{SendFn as UdpSendFn, UdpConn};
 use crate::slirp::udp6::{SendFn as UdpSendFn6, UdpConn6};
 use crate::vtcp::alarm::Alarm;
+use crate::vtcp::autotune::{AUTOTUNE_BUDGET, Budget};
 use crate::vtcp::ecn::IpEcn;
 use crate::vtcp::fastopen::{self, Gate};
 use crate::vtcp::segment::{Segment, flags as tcp_flags};
@@ -224,6 +225,9 @@ struct Inner {
     listeners6: Mutex<HashMap<ListenerKey6, Weak<Listener6>>>,
     // Per-namespace sides (each device attached via ConnectL3).
     ns_sides: Mutex<HashMap<u64, Arc<NsSide>>>,
+    /// Namespace 0's share of the buffer auto-tuning budget, which it is
+    /// held to once peers are attached (see [`budget_share`]).
+    ns0_budget: Arc<Budget>,
     ns_counter: AtomicU64,
     /// Outbound dials still waiting on the real destination; each holds a
     /// thread, so they are capped separately from established flows.
@@ -258,6 +262,8 @@ pub struct NsSide {
     ns: u64,
     handler: Mutex<Option<L3Handler>>,
     addr: RwLock<IpPrefix>,
+    /// Its connections' share of the buffer auto-tuning budget.
+    budget: Arc<Budget>,
 }
 
 impl core::fmt::Debug for NsSide {
@@ -337,6 +343,7 @@ impl Stack {
             listeners: Mutex::new(HashMap::new()),
             listeners6: Mutex::new(HashMap::new()),
             ns_sides: Mutex::new(HashMap::new()),
+            ns0_budget: Arc::new(Budget::new(AUTOTUNE_BUDGET / NS_SHARE)),
             ns_counter: AtomicU64::new(0),
             dials: Arc::new(Mutex::new(Dials::default())),
             defrag: Mutex::new(HashMap::new()),
@@ -979,6 +986,10 @@ impl Stack {
             sink,
         );
         conn.state().set_alarm(inner.alarm.clone());
+        if let Some(share) = budget_share(inner, ns) {
+            let mut c = conn.state().conn.lock().expect("poisoned");
+            c.set_budget_share(share);
+        }
         // Register before the dial can answer, so the client's ACK of the
         // SYN-ACK resolves to this connection rather than drawing a RST.
         inner
@@ -1119,6 +1130,7 @@ impl Stack {
             return Self::dispatch_fitted(inner, ns, &endpoints.wrap(&synack.marshal()));
         };
         let mut conn = Conn::new(Self::passive_config(inner, &endpoints));
+        share_budget(inner, ns, &mut conn);
         // Fast Open data is readable before the handshake completes, which
         // takes a place in the accept queue at once.
         conn.set_fast_open_gate(Some(inner.fast_open_gate.clone()), listener.queue_full());
@@ -1147,6 +1159,7 @@ impl Stack {
             return Ok(());
         }
         let mut conn = Conn::new(Self::passive_config(inner, &endpoints));
+        share_budget(inner, ns, &mut conn);
         let iss = ack.ack.wrapping_sub(1);
         let (slot, segs) = if !listener.queue_full() {
             (None, conn.accept_cookie(ack, iss, mss))
@@ -1475,6 +1488,10 @@ impl Stack {
             sink,
         );
         conn.state().set_alarm(inner.alarm.clone());
+        if let Some(share) = budget_share(inner, ns) {
+            let mut c = conn.state().conn.lock().expect("poisoned");
+            c.set_budget_share(share);
+        }
         // Register before the dial can answer (see the v4 path).
         inner
             .tcp6
@@ -1779,6 +1796,7 @@ impl Stack {
         let side = Arc::new(NsSide {
             stack: self.inner.clone(),
             ns,
+            budget: Arc::new(Budget::new(AUTOTUNE_BUDGET / NS_SHARE)),
             handler: Mutex::new(None),
             addr: RwLock::new(*self.inner.addr.read().expect("poisoned")),
         });
@@ -1898,6 +1916,26 @@ fn call_handler(h: &L3Handler, pkt: &[u8]) -> Result<()> {
 /// attached, it has others to leave room for (see [`NS_SHARE`]).
 fn ns0_shared(inner: &Inner) -> bool {
     !inner.ns_sides.lock().expect("poisoned").is_empty()
+}
+
+/// The share of the process-wide buffer auto-tuning budget that
+/// namespace `ns`'s connections are held to, like the caps here (see
+/// [`NS_SHARE`]): a guest whose connections grow their buffers, or hold
+/// them grown, leaves the other guests, and every other connection in the
+/// process, room to grow theirs. None for namespace 0 while alone.
+fn budget_share(inner: &Inner, ns: u64) -> Option<Arc<Budget>> {
+    let sides = inner.ns_sides.lock().expect("poisoned");
+    if ns == 0 {
+        return (!sides.is_empty()).then(|| inner.ns0_budget.clone());
+    }
+    sides.get(&ns).map(|s| s.budget.clone())
+}
+
+/// Hold `conn` to namespace `ns`'s share of the auto-tuning budget.
+fn share_budget(inner: &Inner, ns: u64, conn: &mut Conn) {
+    if let Some(share) = budget_share(inner, ns) {
+        conn.set_budget_share(share);
+    }
 }
 
 /// The part of the stack-wide cap `global` that namespace `ns` may hold.
@@ -3773,6 +3811,45 @@ mod tests {
             held.keys().any(|k| k.src_port == 5555),
             "another namespace's SYN found no room"
         );
+    }
+
+    /// Each namespace's connections draw on a share of the buffer
+    /// auto-tuning budget of their own, as they do on the stack's caps, so
+    /// one guest cannot hold all of it; namespace 0 alone is not held to
+    /// one.
+    #[test]
+    fn namespaces_have_their_own_budget_share() {
+        let s = Stack::new();
+        let _l = s.listen("tcp", "10.0.0.1:80").unwrap();
+        let inject0 = |p: &[u8]| L3Device::send(&*s, Packet::from_slice(p)).unwrap();
+        inject0(&syn_to_80(4000));
+        let (_a, _ca, inject_a) = attach_recorder(&s);
+        let (_b, _cb, inject_b) = attach_recorder(&s);
+        inject_a(Packet::from_slice(&syn_to_80(4001))).unwrap();
+        inject_b(Packet::from_slice(&syn_to_80(4002))).unwrap();
+        let t = s.inner.virt_tcp.lock().unwrap();
+        let share = |port: u16| {
+            let (k, state) = t.iter().find(|(k, _)| k.src_port == port).unwrap();
+            let conn = state.conn.lock().unwrap();
+            (k.ns, conn.budget_share().cloned())
+        };
+        let (ns0, none) = share(4000);
+        assert_eq!(ns0, 0);
+        assert!(none.is_none(), "namespace 0 alone held to a share");
+        let ((na, a), (nb, b)) = (share(4001), share(4002));
+        let (a, b) = (a.unwrap(), b.unwrap());
+        assert!(!Arc::ptr_eq(&a, &b), "namespaces share a share");
+        let sides = s.inner.ns_sides.lock().unwrap();
+        assert!(Arc::ptr_eq(&a, &sides[&na].budget));
+        assert!(Arc::ptr_eq(&b, &sides[&nb].budget));
+        drop(sides);
+        drop(t);
+        // With peers attached, namespace 0 is held to its share too.
+        inject0(&syn_to_80(4003));
+        let t = s.inner.virt_tcp.lock().unwrap();
+        let (_, state) = t.iter().find(|(k, _)| k.src_port == 4003).unwrap();
+        let share0 = state.conn.lock().unwrap().budget_share().cloned().unwrap();
+        assert!(Arc::ptr_eq(&share0, &s.inner.ns0_budget));
     }
 
     /// Past the backlog, a SYN is answered with a cookie and no state; the
