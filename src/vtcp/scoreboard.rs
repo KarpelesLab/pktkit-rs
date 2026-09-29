@@ -805,6 +805,17 @@ impl Scoreboard {
         }
     }
 
+    /// Every segment of data longer than `max` bytes is lost: sent before
+    /// the MSS came down, it is too large for the path.
+    pub fn mark_longer_lost(&mut self, max: u32) {
+        for i in 0..self.segs.len() {
+            let s = &self.segs[i];
+            if !s.has(FIN) && s.len() > u64::from(max) {
+                self.mark_lost(i);
+            }
+        }
+    }
+
     /// The first segment is lost (fast retransmit, or a NewReno partial ACK).
     pub fn mark_head_lost(&mut self) -> bool {
         !self.segs.is_empty() && self.mark_lost(0)

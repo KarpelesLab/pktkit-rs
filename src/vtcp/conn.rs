@@ -577,6 +577,11 @@ pub struct Conn {
     plpmtud: Search,
     /// Its probe in flight.
     mtu_probe: Option<Probe>,
+    /// A timeout lowered the MSS for a suspected black hole, and its
+    /// retransmission at the new size is on its way: if that is ACKed
+    /// before another timeout, the losses were the segments' size, not
+    /// congestion (see `undo_black_hole`).
+    black_hole_undo: bool,
     cc: Box<dyn CongestionController>,
 
     // RTO management.
@@ -860,6 +865,7 @@ impl Conn {
                 Search::new(cfg.mtu_probing, overhead, floor, now)
             },
             mtu_probe: None,
+            black_hole_undo: false,
             cc,
             rto: RtoState::new(now),
             rto_deadline: None,
@@ -3061,6 +3067,9 @@ impl Conn {
         if !undone && self.ca == CaState::Loss && self.frto != Frto::Off {
             undone = self.frto_on_ack(ev);
         }
+        if advanced && std::mem::take(&mut self.black_hole_undo) {
+            self.undo_black_hole(acked);
+        }
 
         let mut exiting = undone && was != CaState::Open;
         if advanced && self.ca != CaState::Open && self.recovered(ack) {
@@ -4380,6 +4389,8 @@ impl Conn {
     }
 
     fn on_rto_timeout(&mut self) {
+        // The retransmission at a lowered MSS did not get through either.
+        self.black_hole_undo = false;
         let zero_window =
             self.snd_wnd == 0 && !matches!(self.state, State::SynSent | State::SynReceived);
         if zero_window {
@@ -4511,15 +4522,17 @@ impl Conn {
             | State::FinWait1
             | State::Closing
             | State::LastAck => {
-                if !zero_window && self.retries >= plpmtud::BLACK_HOLE_RTOS {
-                    self.check_black_hole();
-                }
+                // A timeout for a black hole's doing is no spurious one
+                // for F-RTO to find: the loss is real, the size's.
+                let black_hole = !zero_window
+                    && self.retries >= plpmtud::BLACK_HOLE_RTOS
+                    && self.check_black_hole();
                 // RFC 6298 §5.4: the first unacknowledged segment, whatever
                 // the window; the rest follows as ACKs open cwnd.
                 let room = self.send_mss() as u32;
                 if let Some((seq, len, fin)) = self.score.head(room) {
                     self.resend(seq, len, fin);
-                    if frto && self.ca == CaState::Loss {
+                    if frto && !black_hole && self.ca == CaState::Loss {
                         self.frto = Frto::First {
                             head_end: seq.wrapping_add(len),
                         };
@@ -4536,9 +4549,10 @@ impl Conn {
     /// message to say so. Lower the MSS to PLPMTUD's base, or to half the
     /// segment if that is smaller already, for its retransmission, and let
     /// probing find what the path carries from there.
-    fn check_black_hole(&mut self) {
+    /// Returns whether it did.
+    fn check_black_hole(&mut self) -> bool {
         let Some((_, len, false)) = self.score.head(u32::MAX) else {
-            return;
+            return false;
         };
         // As it goes again: cut to the MSS, with the options it carries
         // now. A segment small enough, however often it times out, is not
@@ -4549,6 +4563,40 @@ impl Conn {
             self.plpmtud.on_black_hole(low, self.now);
             self.mtu_probe = None;
             self.sync_mss();
+            // Whatever else went out at the old size is as lost, not only
+            // what the timeout marked, as Linux's tcp_simple_retransmit
+            // has it: left to RACK, each would take a timeout of its own,
+            // nothing sent after it getting through to show its loss.
+            self.score
+                .mark_longer_lost(u32::from(self.mss).saturating_sub(opts));
+            self.black_hole_undo = true;
+            return true;
+        }
+        false
+    }
+
+    /// The first retransmission after a black hole was suspected got
+    /// through at the smaller size: the timeouts that found it were the
+    /// segments' size, not congestion. Their window cut is undone, as RFC
+    /// 4015 undoes a spurious timeout's (ssthresh back, and cwnd to what
+    /// is in flight and an initial window at most), but unlike a spurious
+    /// timeout the losses were real: what went out at the old size is
+    /// still resent. Without this, a black hole at the start of a transfer
+    /// would leave it in congestion avoidance from a few segments, which
+    /// on a long path takes CUBIC tens of seconds to grow out of.
+    fn undo_black_hole(&mut self, acked: u32) {
+        if self.undo.marker.take().is_none() || self.cc.model_based() {
+            return;
+        }
+        let iw = initial_window(u32::from(self.mss));
+        let cwnd = self
+            .cc
+            .cwnd()
+            .max(self.in_flight().saturating_add(acked.min(iw)));
+        let ssthresh = self.cc.ssthresh().max(self.undo.pipe_prev);
+        self.cc.undo(cwnd, ssthresh);
+        if self.undo.timeout {
+            self.rto_adapt = Some((self.undo.srtt_prev, self.undo.rttvar_prev, self.recover));
         }
     }
 
@@ -9757,6 +9805,24 @@ mod tests {
             // The probes lost to their size cost no window.
             assert!(!p.a.is_closed());
         }
+    }
+
+    /// The timeouts that found the black hole were no congestion: once the
+    /// retransmission at the smaller size gets through, their window cut
+    /// is undone, and slow start goes on where it was.
+    #[test]
+    fn a_black_hole_costs_no_window() {
+        let mut p = bulk(ConnConfig::default(), 2.0, 40728);
+        p.black_hole = 1400;
+        for _ in 0..100 {
+            if p.received > 0 {
+                break;
+            }
+            p.run_for(Duration::from_millis(50));
+        }
+        assert!(p.received > 0, "never got through");
+        assert!(p.a.retries == 0 && p.a.mss() <= 1360, "{:?}", p.a);
+        assert_eq!(p.a.cc.ssthresh(), u32::MAX, "slow start cut short");
     }
 
     /// Without PLPMTUD the same path is the end of the connection: every
