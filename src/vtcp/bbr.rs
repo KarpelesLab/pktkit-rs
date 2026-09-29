@@ -203,6 +203,11 @@ pub struct Bbr {
     // Loss recovery and undo.
     prior_cwnd: u32,
     in_recovery: bool,
+    /// Fast recovery began and the next ACK has not yet set cwnd for it.
+    recovery_entered: bool,
+    /// The first round of fast recovery: cwnd lets out only what is
+    /// delivered (BBR.packet_conservation).
+    packet_conservation: bool,
     recovery_round: u64,
     undo_state: Option<State>,
     undo_bw_shortterm: u64,
@@ -286,6 +291,8 @@ impl Bbr {
             mark_app_limited: false,
             prior_cwnd: 0,
             in_recovery: false,
+            recovery_entered: false,
+            packet_conservation: false,
             recovery_round: 0,
             undo_state: None,
             undo_bw_shortterm: 0,
@@ -441,6 +448,7 @@ impl Bbr {
             self.round_count += 1;
             self.rounds_since_probe_up += 1;
             self.round_start = true;
+            self.packet_conservation = false;
             self.cwnd_limited_prev = self.cwnd_limited_now;
             self.cwnd_limited_now = false;
         } else {
@@ -958,16 +966,39 @@ impl Bbr {
         }
     }
 
-    /// SetCwnd (§5.6.4.6), with the ProbeRTT and model bounds.
-    fn set_cwnd(&mut self, newly_acked: u64) {
-        let max_inflight = self.max_inflight();
+    /// BBRModulateCwndForRecovery (§5.6.4.4), as Linux's
+    /// bbr_set_cwnd_to_recover_or_restore: what was lost comes off cwnd,
+    /// so that an ACK releases at most twice what it delivered, and for
+    /// the first round of fast recovery cwnd holds what is in flight to
+    /// what gets delivered (packet conservation). Its start cuts cwnd to
+    /// the flight, dropping any of it the sender was not using.
+    fn modulate_cwnd_for_recovery(&mut self, newly_acked: u64, newly_lost: u64) -> u64 {
         let mut cwnd = u64::from(self.cwnd);
-        if self.full_bw_reached {
-            cwnd = (cwnd + newly_acked).min(max_inflight);
-        } else if cwnd < max_inflight || self.delivered < u64::from(self.init_cwnd) {
-            cwnd += newly_acked;
+        if newly_lost > 0 {
+            cwnd = cwnd.saturating_sub(newly_lost).max(self.mss64());
         }
-        cwnd = cwnd.max(self.min_pipe_cwnd());
+        let inflight = u64::from(self.inflight);
+        if std::mem::take(&mut self.recovery_entered) {
+            cwnd = inflight + newly_acked.max(self.mss64());
+        }
+        if self.packet_conservation {
+            cwnd = cwnd.max(inflight + newly_acked);
+        }
+        cwnd
+    }
+
+    /// SetCwnd (§5.6.4.6), with the ProbeRTT and model bounds.
+    fn set_cwnd(&mut self, newly_acked: u64, newly_lost: u64) {
+        let max_inflight = self.max_inflight();
+        let mut cwnd = self.modulate_cwnd_for_recovery(newly_acked, newly_lost);
+        if !self.packet_conservation {
+            if self.full_bw_reached {
+                cwnd = (cwnd + newly_acked).min(max_inflight);
+            } else if cwnd < max_inflight || self.delivered < u64::from(self.init_cwnd) {
+                cwnd += newly_acked;
+            }
+            cwnd = cwnd.max(self.min_pipe_cwnd());
+        }
         if self.state == State::ProbeRtt {
             cwnd = cwnd.min(self.probe_rtt_cwnd());
         }
@@ -1017,6 +1048,12 @@ impl CongestionController for Bbr {
         }
         let rs = a.rs.unwrap_or_default();
         let (rate, delivered) = (rs.delivery_rate, rs.delivered);
+        if self.recovery_entered {
+            // Packet conservation lasts a round, which starts now: Linux's
+            // "start round now" as it enters recovery.
+            self.packet_conservation = true;
+            self.start_round();
+        }
 
         // UpdateModelAndState.
         if a.rs.is_some() {
@@ -1061,7 +1098,7 @@ impl CongestionController for Bbr {
 
         // UpdateControlParameters.
         self.set_pacing_rate_with_gain(self.pacing_gain);
-        self.set_cwnd(u64::from(a.newly_acked));
+        self.set_cwnd(u64::from(a.newly_acked), u64::from(a.newly_lost));
     }
 
     /// HandleLostPacket (§5.5.10.2).
@@ -1092,6 +1129,7 @@ impl CongestionController for Bbr {
         self.save_cwnd();
         self.save_state_upon_loss();
         self.in_recovery = true;
+        self.recovery_entered = true;
         self.recovery_round = self.round_count;
     }
 
@@ -1101,6 +1139,8 @@ impl CongestionController for Bbr {
         self.save_cwnd();
         self.save_state_upon_loss();
         self.in_recovery = true;
+        self.recovery_entered = false;
+        self.packet_conservation = false;
         self.recovery_round = self.round_count;
         self.cwnd = self.mss;
     }
@@ -1111,6 +1151,8 @@ impl CongestionController for Bbr {
 
     fn on_recovery_exit(&mut self) {
         self.in_recovery = false;
+        self.recovery_entered = false;
+        self.packet_conservation = false;
         self.restore_cwnd();
     }
 
@@ -1144,6 +1186,8 @@ impl CongestionController for Bbr {
     /// HandleSpuriousLossDetection (§5.5.11.2).
     fn undo(&mut self, _cwnd: u32, _ssthresh: u32) {
         self.in_recovery = false;
+        self.recovery_entered = false;
+        self.packet_conservation = false;
         self.restore_cwnd();
         self.is_loss_in_round = false;
         self.reset_full_bw();
@@ -1640,5 +1684,58 @@ mod tests {
         assert_eq!(f.b.cwnd(), MSS);
         f.b.on_recovery_exit();
         assert_eq!(f.b.cwnd(), cwnd);
+    }
+
+    /// Fast recovery starts from what is in flight plus what the ACK
+    /// delivered, not from the window before it: a burst of losses must
+    /// not leave room for a burst of sending. For its first round cwnd
+    /// lets out only what is delivered, less what is lost; its end brings
+    /// the window from before it back.
+    #[test]
+    fn fast_recovery_conserves_packets() {
+        let rate = 10_000_000;
+        let mut f = Feed::new();
+        f.until(rate, State::ProbeBwCruise, 50);
+        for _ in 0..3 {
+            f.round(rate, 500_000, false);
+        }
+        let before = f.b.cwnd();
+        assert!(before > 400_000, "{before}");
+        // 60% of the flight lost at once.
+        f.b.on_loss(before);
+        f.lose(300_000, 500_000, 0);
+        // Everything these ACKs deliver was sent before recovery began:
+        // its first round.
+        let sent_at = f.delivered - 1;
+        let ack = |f: &mut Feed, acked: u32, lost: u32, inflight: u32| {
+            f.now += Duration::from_millis(1);
+            let rs = RateSample {
+                delivery_rate: rate,
+                delivered: u64::from(acked),
+                interval: RTT,
+                prior_delivered: sent_at,
+                tx_in_flight: 500_000,
+                ..RateSample::default()
+            };
+            f.delivered += u64::from(acked);
+            let a = Ack {
+                rs: Some(rs),
+                newly_lost: lost,
+                inflight,
+                delivered: f.delivered,
+                newest_rtt: Some(RTT),
+                ..Ack::of(f.now, acked, inflight)
+            };
+            f.b.on_ack(&a);
+        };
+        ack(&mut f, 10_000, 300_000, 190_000);
+        assert_eq!(f.b.cwnd(), 200_000, "not cut to the flight and the ACK");
+        // Later in the round: no growth, and a loss comes off.
+        ack(&mut f, 10_000, 0, 180_000);
+        assert_eq!(f.b.cwnd(), 200_000);
+        ack(&mut f, 10_000, 20_000, 150_000);
+        assert_eq!(f.b.cwnd(), 180_000);
+        f.b.on_recovery_exit();
+        assert_eq!(f.b.cwnd(), before);
     }
 }
