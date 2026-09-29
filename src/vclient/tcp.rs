@@ -157,6 +157,20 @@ impl ConnState {
         taken
     }
 
+    /// Give back `len` bytes [`admit`](Self::admit) charged for data that
+    /// was not kept after all.
+    fn refund(&self, len: usize) {
+        let mut charge = self.charge.lock().unwrap();
+        let Some(c) = charge.as_mut() else {
+            return;
+        };
+        let len = len.min(c.bytes);
+        c.bytes -= len;
+        if let Some(listener) = c.listener.upgrade() {
+            listener.unaccepted_bytes.fetch_sub(len, Ordering::AcqRel);
+        }
+    }
+
     /// Record why the connection failed; the first reason sticks.
     fn fail(&self, kind: io::ErrorKind) {
         self.error.lock().unwrap().get_or_insert(kind);
@@ -1442,6 +1456,11 @@ impl TcpStack {
         // With Fast Open data in, the application may take the connection
         // now, before the handshake completes, and answer.
         let early = conn.fast_open_accepted();
+        // Charged before the engine judged the cookie (or found no room at
+        // its gate): data it dropped holds nothing.
+        if self.tuning.fast_open && !early {
+            state.refund(syn.payload.len());
+        }
         drop(conn);
         if !self.register(key, &state) {
             return;
@@ -2398,6 +2417,27 @@ mod tests {
         // Accepted, it takes data again: what was dropped comes back.
         feed(data(2 + 65_000, 1000));
         assert_eq!(conn.read(&mut buf).unwrap(), 1000);
+    }
+
+    /// A SYN whose Fast Open cookie is not ours has its data dropped, and
+    /// charged to nothing: it would otherwise hold the listener's budget
+    /// for data it does not have until the handshake completes or fails.
+    #[test]
+    fn bogus_fast_open_cookie_is_not_charged() {
+        let (stack, out) = capturing_stack();
+        let stack = TcpStack::with_config(
+            stack.sink.clone(),
+            DEFAULT_MTU,
+            Tuning::default().fast_open(true),
+        );
+        let listener = stack.listen(own(US), 80).unwrap();
+        let mut syn = syn_from(4000);
+        syn.options = vec![crate::vtcp::fastopen::option(&[0xAA; 8])];
+        syn.payload = vec![7; 60_000];
+        stack.handle_inbound(Packet::from_slice(&inbound(syn)), IpAddr::V4(US));
+        assert_eq!(last_sent(&out).ack, 2, "SYN data taken");
+        let held = listener.state.unaccepted_bytes.load(Ordering::Acquire);
+        assert_eq!(held, 0, "charged for data that was dropped");
     }
 
     /// Data on the ACK completing a SYN-cookie handshake counts against the
