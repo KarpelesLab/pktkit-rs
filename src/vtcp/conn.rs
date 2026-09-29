@@ -22,6 +22,7 @@ use super::bbr::Bbr;
 use super::congestion::{Ack, CongestionController, HighSpeed, Lost, NewReno, initial_window};
 use super::cubic::Cubic;
 use super::cwv::{self, PipeAck};
+use super::ecn::{Ecn, EcnMode, IpEcn};
 use super::options::{
     self, SackBlock, TcpOption, get_sack_blocks, get_timestamp, get_wscale, has_sack_perm,
     mss_option, sack_option, sack_perm_option, timestamp_option, wscale_option,
@@ -245,6 +246,8 @@ struct AckEvent {
     rtt: Option<Duration>,
     /// Its delivery rate sample, if it delivered anything.
     rs: Option<RateSample>,
+    /// Its ECN feedback reports CE marks.
+    ce: bool,
 }
 
 /// Choice of congestion controller.
@@ -405,6 +408,12 @@ pub struct ConnConfig {
     /// cannot wait out a delayed ACK. Off by default;
     /// [`Conn::set_nodelay`] changes it on an open connection.
     pub nodelay: bool,
+    /// Explicit Congestion Notification (RFC 3168, and RFC 9768's
+    /// AccECN): whether to ask for it in the handshake, and accept it. By
+    /// default a peer's request is accepted, and none made, as on Linux.
+    /// The engine writes no IP headers: `vclient` and `slirp` set the
+    /// codepoints it asks for, and pass on the marks that arrive.
+    pub ecn: EcnMode,
 }
 
 setters! {
@@ -432,6 +441,7 @@ setters! {
         set fin_wait2_timeout: Option<Duration>;
         set time_wait: Duration;
         set nodelay: bool;
+        set ecn: EcnMode;
     }
 }
 
@@ -461,6 +471,7 @@ impl Default for ConnConfig {
             fin_wait2_timeout: Some(DEFAULT_FIN_WAIT2_TIMEOUT),
             time_wait: TIME_WAIT_DURATION,
             nodelay: false,
+            ecn: EcnMode::default(),
         }
     }
 }
@@ -736,6 +747,19 @@ pub struct Conn {
 
     // Output queue drained by callers via [`take_outgoing`] / returned from methods.
     outgoing: Vec<Vec<u8>>,
+    /// The IP-ECN codepoint each of `outgoing` is to be sent with, and
+    /// those of the segments last drained (see `ecn_marks`).
+    outgoing_ecn: Vec<IpEcn>,
+    last_marks: Vec<IpEcn>,
+
+    // ECN (RFC 3168, RFC 9768).
+    ecn: Ecn,
+    /// The codepoint the segment being processed arrived with.
+    rx_ecn: IpEcn,
+    /// A reduction for ECN feedback is under way (Linux's CWR state), until
+    /// data past this, SND.NXT when it began, is acknowledged: one per
+    /// window of data, as for losses (RFC 3168 §6.1.2).
+    cwr_high: Option<u32>,
 
     /// The time, read once at the start of each call into the connection
     /// (see [`clock`](Self::clock)) rather than by every step of it that
@@ -861,6 +885,11 @@ impl Conn {
             established_signaled: false,
             fin_recvd_signaled: false,
             outgoing: Vec::new(),
+            outgoing_ecn: Vec::new(),
+            last_marks: Vec::new(),
+            ecn: Ecn::default(),
+            rx_ecn: IpEcn::NOT_ECT,
+            cwr_high: None,
             now,
         }
     }
@@ -1023,7 +1052,9 @@ impl Conn {
         // Fast recovery gives way, as Linux's CA_Loss replaces CA_Recovery:
         // the loss it was recovering from has cut the window already;
         // ending it just brings cwnd down to that.
-        if self.ca == CaState::Recovery {
+        // So does a reduction for ECN. BBR sets cwnd by its model.
+        let reducing = self.cwr_high.take().is_some();
+        if (self.ca == CaState::Recovery || reducing) && !self.cc.model_based() {
             self.cc.set_cwnd(self.cc.ssthresh());
         }
         self.score.mark_all_lost();
@@ -1042,7 +1073,21 @@ impl Conn {
 
     /// Drain any queued outgoing segments.
     pub fn take_outgoing(&mut self) -> Vec<Vec<u8>> {
+        self.last_marks = std::mem::take(&mut self.outgoing_ecn);
         std::mem::take(&mut self.outgoing)
+    }
+
+    /// The IP-ECN codepoint for each of `segs`, which this connection has
+    /// just returned (from any call, and before the next): what the IP
+    /// layer sets in each one's header. Not-ECT for all if they are not
+    /// what it returned.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn ecn_marks(&self, segs: &[Vec<u8>]) -> Vec<IpEcn> {
+        if self.last_marks.len() == segs.len() {
+            self.last_marks.clone()
+        } else {
+            vec![IpEcn::NOT_ECT; segs.len()]
+        }
     }
 
     // --- Active / passive open --------------------------------------------
@@ -1071,12 +1116,14 @@ impl Conn {
 
         let opts = self.build_syn_options();
         let win = self.syn_window();
+        let (ecn, ae) = self.ecn.syn_flags(self.cfg.ecn);
         let syn = Segment {
             src_port: self.cfg.local_port,
             dst_port: self.cfg.remote_port,
             seq: iss,
             ack: 0,
-            flags: flags::SYN,
+            flags: flags::SYN | ecn,
+            ae,
             window: win,
             options: opts,
             ..Default::default()
@@ -1090,7 +1137,14 @@ impl Conn {
 
     /// Process an incoming SYN, transition to SYN-RECEIVED, emit SYN-ACK.
     pub fn accept_syn(&mut self, syn: &Segment) -> Vec<Vec<u8>> {
+        self.accept_syn_ecn(syn, IpEcn::NOT_ECT)
+    }
+
+    /// [`accept_syn`](Self::accept_syn) for a SYN that arrived with IP-ECN
+    /// codepoint `ecn`, which an AccECN SYN-ACK reports.
+    pub(crate) fn accept_syn_ecn(&mut self, syn: &Segment, ecn: IpEcn) -> Vec<Vec<u8>> {
         self.clock();
+        self.rx_ecn = ecn;
         let iss = self.new_iss();
         self.open_passive(syn, iss)
     }
@@ -1129,6 +1183,7 @@ impl Conn {
             return Vec::new();
         }
         self.negotiate_options(&syn.options);
+        self.ecn.on_syn(self.cfg.ecn, syn, self.rx_ecn);
 
         self.send_buf = Some(SendBuf::new(self.cfg.send_buf_size, iss));
         self.score = Scoreboard::new(iss, self.now);
@@ -1141,12 +1196,14 @@ impl Conn {
         let opts = self.build_syn_options();
         let win = self.syn_window();
         let rcv_nxt = self.recv_buf.as_ref().unwrap().nxt();
+        let (ecn, ae) = self.ecn.synack_flags();
         let synack = Segment {
             src_port: self.cfg.local_port,
             dst_port: self.cfg.remote_port,
             seq: iss,
             ack: rcv_nxt,
-            flags: flags::SYN | flags::ACK,
+            flags: flags::SYN | flags::ACK | ecn,
+            ae,
             window: win,
             options: opts,
             ..Default::default()
@@ -1420,7 +1477,11 @@ impl Conn {
         self.rcv_wnd_bytes().min(65535) as u16
     }
 
-    fn queue_seg(&mut self, seg: Segment) {
+    fn queue_seg(&mut self, mut seg: Segment) {
+        let new_data =
+            !seg.payload.is_empty() && self.send_buf.as_ref().is_some_and(|s| s.nxt() == seg.seq);
+        let ip = self.ecn.mark(&mut seg, new_data);
+        self.outgoing_ecn.push(ip);
         if seg.has_flag(flags::ACK) && self.recv_buf.is_some() {
             // Whatever we send acknowledges everything received so far.
             self.delack_deadline = None;
@@ -1530,7 +1591,14 @@ impl Conn {
 
     /// Process an inbound segment. Returns any outgoing segments to transmit.
     pub fn handle_segment(&mut self, seg: &Segment) -> Vec<Vec<u8>> {
+        self.handle_segment_ecn(seg, IpEcn::NOT_ECT)
+    }
+
+    /// [`handle_segment`](Self::handle_segment) for a segment that arrived
+    /// with IP-ECN codepoint `ecn`.
+    pub(crate) fn handle_segment_ecn(&mut self, seg: &Segment, ecn: IpEcn) -> Vec<Vec<u8>> {
         self.clock();
+        self.rx_ecn = ecn;
         match self.state {
             State::Closed => self.handle_closed(seg),
             State::Listen => Vec::new(), // pure passive open uses accept_syn
@@ -1726,12 +1794,14 @@ impl Conn {
         let win = self.syn_window();
         let una = self.send_buf.as_ref().unwrap().una();
         let rcv_nxt = self.recv_buf.as_ref().unwrap().nxt();
+        let (ecn, ae) = self.ecn.synack_flags();
         let synack = Segment {
             src_port: self.cfg.local_port,
             dst_port: self.cfg.remote_port,
             seq: una,
             ack: rcv_nxt,
-            flags: flags::SYN | flags::ACK,
+            flags: flags::SYN | flags::ACK | ecn,
+            ae,
             window: win,
             options: opts,
             ..Default::default()
@@ -1748,6 +1818,7 @@ impl Conn {
             && seg.flags & (flags::SYN | flags::ACK | flags::RST) == flags::SYN
             && seq_before(seg.seq, self.recv_buf.as_ref().unwrap().nxt())
         {
+            self.ecn.on_syn_again(seg);
             self.resend_syn_ack();
             return self.take_outgoing();
         }
@@ -1816,6 +1887,7 @@ impl Conn {
         if !seg.has_flag(flags::ACK) {
             return self.take_outgoing();
         }
+        self.ecn.on_receive(seg, self.rx_ecn);
 
         match self.state {
             State::SynReceived => self.handle_syn_received(seg),
@@ -1890,6 +1962,8 @@ impl Conn {
 
         if seg.has_flag(flags::ACK) {
             // Normal SYN-ACK.
+            self.ecn
+                .on_synack(self.cfg.ecn, seg, self.rx_ecn, seg.seq.wrapping_add(1));
             self.send_buf.as_mut().unwrap().acknowledge(seg.ack);
             self.retries = 0;
             self.stop_rto();
@@ -1965,6 +2039,7 @@ impl Conn {
             return self.take_outgoing();
         }
         self.send_buf.as_mut().unwrap().acknowledge(seg.ack);
+        self.ecn.on_handshake_ack(seg);
         // The SYN-ACK's round trip, unless it was resent (Karn).
         self.rtt_sampled |= self.rto.ack_received(seg.ack, self.now);
         self.retries = 0;
@@ -2074,6 +2149,11 @@ impl Conn {
             ack_now = true;
         } else if self.state == State::FinWait1 && self.fin_acked() {
             self.state = State::FinWait2;
+        }
+        // ECN feedback that must not wait (see `Ecn::on_receive`).
+        if self.ecn.take_ack_now() {
+            need_ack = true;
+            ack_now = true;
         }
 
         if need_ack {
@@ -2414,6 +2494,12 @@ impl Conn {
                 d.merge(self.score.sack(rest, now, ecr));
             }
         }
+        // ECN feedback: whether it reports congestion.
+        let progress = advanced || d.delivered > 0;
+        let delivered_now = d.delivered.max(acked);
+        let ce_bytes = self
+            .ecn
+            .on_ack(seg, progress, delivered_now, self.mss as u32);
         let rs = self.score.rate_sample();
         if let Some(r) = self.score.ack_rtt() {
             self.pace_srtt = Some(self.pace_srtt.map_or(r, |s| (s * 7 + r) / 8));
@@ -2456,6 +2542,7 @@ impl Conn {
             ecr,
             rtt,
             rs,
+            ce: ce_bytes.is_some(),
         });
 
         if self.snd_wnd > 0 && self.persist_deadline.is_some() && (advanced || wnd_changed) {
@@ -2513,6 +2600,7 @@ impl Conn {
             ecr,
             rtt,
             rs,
+            ce,
         } = ev;
         let mss = self.mss as u32;
         let model = self.cc.model_based();
@@ -2600,11 +2688,27 @@ impl Conn {
             // was lost too.
             self.score.mark_head_lost();
         }
+        // A reduction for ECN is over once data sent after it began is
+        // acknowledged: past its start, not up to it, as Linux has it, so
+        // the CWR it sent has reached the receiver.
+        if advanced && self.cwr_high.is_some_and(|h| seq_after(ack, h)) {
+            self.cwr_high = None;
+            if !model && self.ca == CaState::Open {
+                self.cc.set_cwnd(self.cc.ssthresh());
+            }
+        }
+        // ECN feedback: congestion, a round trip before any loss would
+        // show it (RFC 3168 §6.1.2). Answered before growth, as Linux's
+        // tcp_fastretrans_alert comes before tcp_cong_control.
+        if ce {
+            self.enter_cwr();
+        }
 
         // Growth, outside fast recovery: in slow start after a timeout too.
         // Not on the ACK that undid a response: RFC 4015 step (9) has just
-        // set cwnd for it.
-        if advanced && self.ca != CaState::Recovery && !undone && !model {
+        // set cwnd for it. Nor during a reduction for ECN, which PRR runs.
+        if advanced && self.ca != CaState::Recovery && !undone && !model && self.cwr_high.is_none()
+        {
             let bytes = if self.sack_ok { d.delivered } else { acked };
             let use_ = self.cwnd_use(flight);
             let a = self.ack_info(bytes, use_, rtt, ack, rs, delivered, 0);
@@ -2634,7 +2738,7 @@ impl Conn {
         if self.ca == CaState::Open && self.score.lost_bytes() > 0 {
             self.enter_recovery();
         }
-        if self.ca == CaState::Recovery {
+        if self.ca == CaState::Recovery || (self.ca == CaState::Open && self.cwr_high.is_some()) {
             self.prr_update(delivered);
         }
         // A model-based controller takes every ACK, once the losses it
@@ -2926,7 +3030,7 @@ impl Conn {
     /// Count `len` bytes sent, for PRR and pacing.
     #[inline]
     fn note_sent(&mut self, len: u32) {
-        if self.ca == CaState::Recovery {
+        if self.ca == CaState::Recovery || self.cwr_high.is_some() {
             self.prr_out += u64::from(len);
         }
         if self.pacing_on() {
@@ -2959,19 +3063,64 @@ impl Conn {
     fn enter_recovery(&mut self) {
         let sb = self.send_buf.as_ref().unwrap();
         let (flight, nxt) = (sb.unacked() as u32, sb.nxt());
+        // A loss while the window is coming down for ECN is part of the
+        // same congestion: the reduction goes on, not a second one on top
+        // (Linux's tcp_enter_recovery in CWR). Nor would undoing the loss
+        // response bring back what ECN took.
+        let reducing = self.cwr_high.take().is_some() && !self.cc.model_based();
         self.begin_undo(false);
-        let flight_used = self.loss_flight(flight);
-        self.cc.on_loss(flight_used);
+        if reducing {
+            self.undo.pipe_prev = self.cc.ssthresh();
+        } else {
+            let flight_used = self.loss_flight(flight);
+            self.cc.on_loss(flight_used);
+            // RFC 6937 §3's RecoverFS: the flight the reduction is spread
+            // over.
+            self.recover_fs = flight.max(1);
+            self.prr_delivered = 0;
+            self.prr_out = 0;
+        }
         self.recover = nxt;
         self.ca = CaState::Recovery;
-        // RFC 6937 §3's RecoverFS: the flight the reduction is spread over.
-        self.recover_fs = flight.max(1);
-        self.prr_delivered = 0;
-        self.prr_out = 0;
+        self.ecn.queue_cwr();
         // RFC 8985 §7.1: a probe of the flight this recovery repairs is
         // moot.
         self.tlp_end = None;
         self.pto_deadline = None;
+    }
+
+    /// ECN feedback reported congestion: reduce the window (RFC 3168
+    /// §6.1.2), once per window of data and not during loss recovery,
+    /// which has reduced it already. Nothing is resent, and nothing is to
+    /// undo: a mark is never spurious. PRR brings the window down over the
+    /// round trip, as in fast recovery (Linux's CWR state).
+    ///
+    /// By less than for a loss, in congestion avoidance: RFC 8511's
+    /// Alternative Backoff with ECN (see `on_ecn`), which FreeBSD offers
+    /// and Linux does not. Only an AQM marks, and it marks while the queue
+    /// is still short: a cut by β from there leaves the link idle, for
+    /// seconds on a long fat path, as a cut at a shallow buffer's overflow
+    /// does. Against a queue marking at a fifth of the BDP it was worth a
+    /// quarter more goodput, at the same queueing delay.
+    ///
+    /// A model-based controller answers from the ACK itself.
+    fn enter_cwr(&mut self) {
+        if self.ca != CaState::Open || self.cwr_high.is_some() {
+            return;
+        }
+        let sb = self.send_buf.as_ref().unwrap();
+        let (flight, nxt) = (sb.unacked() as u32, sb.nxt());
+        self.cwr_high = Some(nxt);
+        self.ecn.queue_cwr();
+        if self.cc.model_based() {
+            return;
+        }
+        let used = self.loss_flight(flight);
+        self.cc.on_ecn(used);
+        self.recover_fs = flight.max(1);
+        self.prr_delivered = 0;
+        self.prr_out = 0;
+        self.undo.marker = None;
     }
 
     /// Note whether cwnd is validated (RFC 7661 §4.3): the non-validated
@@ -3211,7 +3360,7 @@ impl Conn {
         } else if seq_after(ack, end) {
             // The probe repaired a loss: respond to it as to any other.
             self.tlp_end = None;
-            if self.ca == CaState::Open && !self.cc.model_based() {
+            if self.ca == CaState::Open && !self.cc.model_based() && self.cwr_high.is_none() {
                 let flight = self.send_buf.as_ref().unwrap().unacked() as u32;
                 let flight = self.loss_flight(flight);
                 self.cc.on_loss(flight);
@@ -3773,6 +3922,8 @@ impl Conn {
         if self.fin_wait2_deadline().is_some_and(|d| now >= d) {
             let rst = self.abort();
             self.outgoing.extend(rst);
+            let marks = std::mem::take(&mut self.last_marks);
+            self.outgoing_ecn.extend(marks);
         }
         // Keepalive.
         if let Some(d) = self.keepalive_deadline
@@ -3835,7 +3986,13 @@ impl Conn {
             // §3.1); `retries` counts timeouts without an ACK in between. A
             // zero window does not count them, but its timeouts after the
             // first are probes, not new losses.
-            let repeated = self.retries > 1 || (zero_window && self.ca == CaState::Loss);
+            // Nor one during a reduction for ECN, which has set it for this
+            // window already (Linux's tcp_enter_loss).
+            let repeated = self.retries > 1
+                || (zero_window && self.ca == CaState::Loss)
+                || (self.cwr_high.take().is_some() && !self.cc.model_based());
+            self.cwr_high = None;
+            self.ecn.queue_cwr();
             let sb = self.send_buf.as_ref().unwrap();
             let (flight, nxt) = (sb.unacked() as u32, sb.nxt());
             // A new episode keeps what undoing it would take; a timeout in
@@ -3896,11 +4053,13 @@ impl Conn {
                 let opts = self.build_syn_options();
                 let win = self.syn_window();
                 let una = self.send_buf.as_ref().unwrap().una();
+                let (ecn, ae) = self.ecn.syn_flags(self.cfg.ecn);
                 let syn = Segment {
                     src_port: self.cfg.local_port,
                     dst_port: self.cfg.remote_port,
                     seq: una,
-                    flags: flags::SYN,
+                    flags: flags::SYN | ecn,
+                    ae,
                     window: win,
                     options: opts,
                     ..Default::default()
@@ -7784,6 +7943,9 @@ mod tests {
         congestion: [CongestionKind; 2],
         ss_after_idle: [bool; 2],
         pacing: [bool; 2],
+        ecn: [EcnMode; 2],
+        /// What the link does to ECN: see [`ecn_hop`].
+        ecn_path: u64,
     }
 
     impl StressCfg {
@@ -7812,7 +7974,42 @@ mod tests {
                 ],
                 ss_after_idle: pair(&mut r),
                 pacing: pair(&mut r),
+                // Drawn apart, so each seed keeps the run it had before.
+                ecn: {
+                    let mut e = Rng(splitmix(seed ^ 0xEC) | 1);
+                    let modes = [
+                        EcnMode::Off,
+                        EcnMode::Passive,
+                        EcnMode::Classic,
+                        EcnMode::Accurate,
+                    ];
+                    [modes[e.below(4) as usize], modes[e.below(4) as usize]]
+                },
+                ecn_path: Rng(splitmix(seed ^ 0xECE) | 1).below(6),
             }
+        }
+    }
+
+    /// A packet crossing a link that, by `path`: leaves ECN be (0); marks
+    /// ECN-capable packets CE, now and then (1) or half the time (2);
+    /// clears every IP mark (3); clears the TCP ECN flags, as a middlebox
+    /// may (4); or sets codepoints at random, Not-ECT ones included (5).
+    /// None of it may cost a byte: ECN only ever changes how fast data is
+    /// sent.
+    fn ecn_hop(path: u64, rng: &mut Rng, pkt: Vec<u8>, ecn: IpEcn) -> (Vec<u8>, IpEcn) {
+        let ect = matches!(ecn, IpEcn::ECT0 | IpEcn::ECT1);
+        match path {
+            1 if ect && rng.below(10) == 0 => (pkt, IpEcn::CE),
+            2 if ect && rng.below(2) == 0 => (pkt, IpEcn::CE),
+            3 => (pkt, IpEcn::NOT_ECT),
+            4 => {
+                let mut seg = parse(&pkt);
+                seg.ae = false;
+                seg.flags &= !(flags::ECE | flags::CWR);
+                (seg.marshal(), ecn)
+            }
+            5 => (pkt, IpEcn(rng.below(4) as u8)),
+            _ => (pkt, ecn),
         }
     }
 
@@ -7916,10 +8113,13 @@ mod tests {
                 .pacing(sc.pacing[i])
                 .send_buf_max(sc.buf * 4)
                 .recv_buf_max(sc.buf * 4)
+                .ecn(sc.ecn[i])
         };
+        let mut ecn_rng = Rng(splitmix(seed ^ 0xEC0) | 1);
         let mut a = Conn::new(mk(40300, 80, 0));
         let b = Conn::new(mk(80, 40300, 1));
         let syn = a.connect();
+        let syn = marked(&a, syn);
         let max_len = (sc.buf as u64 * 2).min(400_000);
         let mut sides = [a, b].map(|conn| {
             let len = rng.below(max_len) as usize;
@@ -7931,7 +8131,8 @@ mod tests {
                 close_called: false,
             }
         });
-        let mut links: [Vec<Vec<u8>>; 2] = [syn, Vec::new()];
+        // Segments with their IP-ECN codepoints.
+        let mut links: [Vec<(Vec<u8>, IpEcn)>; 2] = [syn, Vec::new()];
         let done = |s: &[Side; 2]| {
             s.iter().all(|x| {
                 x.close_called
@@ -7968,13 +8169,13 @@ mod tests {
                         let end = (s.written + 1 + rng.below(20_000) as usize).min(s.to_send.len());
                         let (n, out) = s.conn.write(&s.to_send[s.written..end]);
                         s.written += n;
-                        links[i].extend(out);
+                        links[i].extend(marked(&s.conn, out));
                     } else if !s.close_called
                         && !matches!(s.conn.state(), State::Closed | State::SynSent)
                         && rng.below(4) == 0
                     {
                         s.close_called = true;
-                        links[i].extend(s.conn.close());
+                        links[i].extend(sent_by(&mut s.conn, Conn::close));
                     }
                 }
                 2..=3 => {
@@ -7982,7 +8183,7 @@ mod tests {
                     let mut buf = vec![0u8; 1 + rng.below(30_000) as usize];
                     let n = s.conn.read(&mut buf);
                     s.received.extend_from_slice(&buf[..n]);
-                    links[i].extend(s.conn.take_outgoing());
+                    links[i].extend(sent_by(&mut s.conn, Conn::take_outgoing));
                 }
                 4..=10 => {
                     if links[i].is_empty() {
@@ -7993,7 +8194,7 @@ mod tests {
                     } else {
                         0
                     };
-                    let pkt = links[i].remove(k);
+                    let (pkt, ecn) = links[i].remove(k);
                     if rng.below(20_000) == 0 {
                         let now = path_mtu[i].min(sc.mss as u32 + 40);
                         path_mtu[i] = IPV4_MIN_PATH_MTU + rng.below(now as u64) as u32 / 2;
@@ -8001,7 +8202,7 @@ mod tests {
                     if 20 + pkt.len() as u32 > path_mtu[i] {
                         let seg = parse(&pkt);
                         let c = &mut sides[i].conn;
-                        links[i].extend(c.on_icmp_too_big(path_mtu[i], seg.seq));
+                        links[i].extend(sent_by(c, |c| c.on_icmp_too_big(path_mtu[i], seg.seq)));
                         check_invariants(c, &ctx);
                         continue;
                     }
@@ -8023,20 +8224,21 @@ mod tests {
                         continue;
                     }
                     if fate == 99 {
-                        links[i].insert(0, pkt.clone());
+                        links[i].insert(0, (pkt.clone(), ecn));
                     }
+                    let (pkt, ecn) = ecn_hop(sc.ecn_path, &mut ecn_rng, pkt, ecn);
                     let seg = parse(&pkt);
                     let peer = &mut sides[1 - i].conn;
                     let out = if peer.state() == State::Closed
                         && !peer.is_closed()
                         && seg.flags & (flags::SYN | flags::ACK) == flags::SYN
                     {
-                        peer.accept_syn(&seg)
+                        peer.accept_syn_ecn(&seg, ecn)
                     } else {
-                        peer.handle_segment(&seg)
+                        peer.handle_segment_ecn(&seg, ecn)
                     };
                     check_invariants(peer, &ctx);
-                    links[1 - i].extend(out);
+                    links[1 - i].extend(marked(peer, out));
                 }
                 _ => {
                     // Time passes: usually once the links are quiet, but
@@ -8068,7 +8270,7 @@ mod tests {
                             *d = Some(now);
                         }
                     }
-                    links[i].extend(c.tick());
+                    links[i].extend(sent_by(c, Conn::tick));
                     check_invariants(c, &ctx);
                 }
             }
@@ -8714,14 +8916,29 @@ mod tests {
         loss_ppm: u64,
         rng: Rng,
         busy_until: Instant,
-        fwd: std::collections::VecDeque<(Instant, Vec<u8>)>,
-        rev: std::collections::VecDeque<(Instant, Vec<u8>)>,
+        /// Packets in flight each way, with their IP-ECN codepoints.
+        fwd: std::collections::VecDeque<(Instant, Vec<u8>, IpEcn)>,
+        rev: std::collections::VecDeque<(Instant, Vec<u8>, IpEcn)>,
         received: u64,
         drops: u64,
         /// Packets lost at random.
         lost: u64,
         /// Queueing delay each packet met at the bottleneck.
         queue_delays: Vec<Duration>,
+        /// A step AQM: ECN-capable packets that find more than this many
+        /// bytes queued ahead are marked CE; zero marks none.
+        mark_bytes: f64,
+        /// Packets marked CE.
+        marked: u64,
+        /// Data segments sent again, and how far data has been sent.
+        retransmitted: u64,
+        sent_end: Option<u32>,
+    }
+
+    /// `pkts`, which `c` has just returned, with their codepoints.
+    fn marked(c: &Conn, pkts: Vec<Vec<u8>>) -> Vec<(Vec<u8>, IpEcn)> {
+        let marks = c.ecn_marks(&pkts);
+        pkts.into_iter().zip(marks).collect()
     }
 
     impl Path {
@@ -8745,28 +8962,49 @@ mod tests {
                 drops: 0,
                 lost: 0,
                 queue_delays: Vec::new(),
+                mark_bytes: 0.0,
+                marked: 0,
+                retransmitted: 0,
+                sent_end: None,
             };
             p.send(syn);
             p
         }
 
+        /// Send what `a` has just returned.
         fn send(&mut self, pkts: Vec<Vec<u8>>) {
             let now = test_now();
-            for pkt in pkts {
+            for (pkt, mut ecn) in marked(&self.a, pkts) {
+                let seg = parse(&pkt);
+                if !seg.payload.is_empty() {
+                    let end = seg.seq.wrapping_add(seg.data_len());
+                    match self.sent_end {
+                        Some(e) if seq_before(seg.seq, e) => self.retransmitted += 1,
+                        _ => self.sent_end = Some(end),
+                    }
+                }
                 if self.loss_ppm > 0 && self.rng.below(1_000_000) < self.loss_ppm {
                     self.lost += 1;
                     continue;
                 }
                 let start = self.busy_until.max(now);
                 let wait = start.saturating_duration_since(now);
-                if wait.as_secs_f64() * self.rate > self.queue {
+                let backlog = wait.as_secs_f64() * self.rate;
+                if backlog > self.queue {
                     self.drops += 1;
                     continue;
+                }
+                if self.mark_bytes > 0.0
+                    && backlog > self.mark_bytes
+                    && matches!(ecn, IpEcn::ECT0 | IpEcn::ECT1)
+                {
+                    ecn = IpEcn::CE;
+                    self.marked += 1;
                 }
                 self.queue_delays.push(wait);
                 let done = start + Duration::from_secs_f64(pkt.len() as f64 / self.rate);
                 self.busy_until = done;
-                self.fwd.push_back((done + self.delay, pkt));
+                self.fwd.push_back((done + self.delay, pkt, ecn));
             }
         }
 
@@ -8797,29 +9035,32 @@ mod tests {
                     return;
                 }
                 while self.fwd.front().is_some_and(|x| x.0 <= now) {
-                    let (_, pkt) = self.fwd.pop_front().unwrap();
+                    let (_, pkt, ecn) = self.fwd.pop_front().unwrap();
                     let seg = parse(&pkt);
-                    let mut out = if self.b.state() == State::Closed && !self.b.is_closed() {
-                        self.b.accept_syn(&seg)
+                    let out = if self.b.state() == State::Closed && !self.b.is_closed() {
+                        self.b.accept_syn_ecn(&seg, ecn)
                     } else {
-                        self.b.handle_segment(&seg)
+                        self.b.handle_segment_ecn(&seg, ecn)
                     };
+                    let mut out = marked(&self.b, out);
                     let got = read_all(&mut self.b);
                     self.received += got.len() as u64;
-                    out.extend(self.b.take_outgoing());
-                    for p in out {
-                        self.rev.push_back((now + self.delay, p));
+                    let more = self.b.take_outgoing();
+                    out.extend(marked(&self.b, more));
+                    for (p, e) in out {
+                        self.rev.push_back((now + self.delay, p, e));
                     }
                 }
                 while self.rev.front().is_some_and(|x| x.0 <= now) {
-                    let (_, pkt) = self.rev.pop_front().unwrap();
-                    let out = self.a.handle_segment(&parse(&pkt));
+                    let (_, pkt, ecn) = self.rev.pop_front().unwrap();
+                    let out = self.a.handle_segment_ecn(&parse(&pkt), ecn);
                     self.send(out);
                 }
                 let out = self.a.tick();
                 self.send(out);
-                for p in self.b.tick() {
-                    self.rev.push_back((now + self.delay, p));
+                let out = self.b.tick();
+                for (p, e) in marked(&self.b, out) {
+                    self.rev.push_back((now + self.delay, p, e));
                 }
             }
         }
@@ -8958,5 +9199,340 @@ mod tests {
         read_all(&mut s);
         deliver(&mut c, &acks);
         assert!(!c.score.rate().is_app_limited());
+    }
+
+    // --- ECN -----------------------------------------------------------------
+
+    use super::super::ecn::Feedback;
+
+    /// Deliver `pkts` with their codepoints, as `path` leaves them, and
+    /// return the replies with theirs.
+    fn deliver_marked(
+        to: &mut Conn,
+        pkts: &[(Vec<u8>, IpEcn)],
+        path: impl Fn(usize, IpEcn) -> IpEcn,
+    ) -> Vec<(Vec<u8>, IpEcn)> {
+        let mut out = Vec::new();
+        for (i, (p, e)) in pkts.iter().enumerate() {
+            let r = to.handle_segment_ecn(&parse(p), path(i, *e));
+            out.extend(marked(to, r));
+        }
+        out
+    }
+
+    /// What `f` has `c` send, with the codepoints.
+    fn sent_by(c: &mut Conn, f: impl FnOnce(&mut Conn) -> Vec<Vec<u8>>) -> Vec<(Vec<u8>, IpEcn)> {
+        let out = f(c);
+        marked(c, out)
+    }
+
+    fn as_is(_: usize, e: IpEcn) -> IpEcn {
+        e
+    }
+
+    /// A handshake carrying codepoints, each segment through `path`.
+    fn ecn_pair_via(
+        cm: EcnMode,
+        sm: EcnMode,
+        port: u16,
+        path: impl Fn(&mut Segment, &mut IpEcn),
+    ) -> (Conn, Conn) {
+        let mut c = Conn::new(big(port, 80).ecn(cm));
+        let mut s = Conn::new(big(80, port).ecn(sm));
+        let hop = |pkts: Vec<(Vec<u8>, IpEcn)>| {
+            pkts.into_iter()
+                .map(|(p, mut e)| {
+                    let mut seg = parse(&p);
+                    path(&mut seg, &mut e);
+                    (seg, e)
+                })
+                .collect::<Vec<_>>()
+        };
+        let syn = c.connect();
+        let syn = marked(&c, syn);
+        assert_eq!(syn[0].1, IpEcn::NOT_ECT, "a SYN is never ECN-capable");
+        let syn = hop(syn);
+        let synack = s.accept_syn_ecn(&syn[0].0, syn[0].1);
+        let synack = marked(&s, synack);
+        assert_eq!(synack[0].1, IpEcn::NOT_ECT);
+        let synack = hop(synack);
+        let ack = c.handle_segment_ecn(&synack[0].0, synack[0].1);
+        for (seg, e) in hop(marked(&c, ack)) {
+            s.handle_segment_ecn(&seg, e);
+        }
+        assert_eq!(
+            (c.state(), s.state()),
+            (State::Established, State::Established)
+        );
+        (c, s)
+    }
+
+    fn ecn_pair(cm: EcnMode, sm: EcnMode, port: u16) -> (Conn, Conn) {
+        ecn_pair_via(cm, sm, port, |_, _| {})
+    }
+
+    /// Who asks for which ECN, and what each end ends up with: RFC 3168's
+    /// and RFC 9768's negotiation between each pair of settings.
+    #[test]
+    fn ecn_negotiation_matrix() {
+        use EcnMode::*;
+        let modes = [Off, Passive, Classic, Accurate];
+        for (i, &cm) in modes.iter().enumerate() {
+            for (j, &sm) in modes.iter().enumerate() {
+                let want = match (cm, sm) {
+                    (Off | Passive, _) | (_, Off) => Feedback::Off,
+                    (Accurate, Accurate) => Feedback::Accurate,
+                    _ => Feedback::Classic,
+                };
+                let (c, s) = ecn_pair(cm, sm, 41000 + (i * 4 + j) as u16);
+                assert_eq!((c.ecn.fb, s.ecn.fb), (want, want), "{cm:?} to {sm:?}");
+                let on = want != Feedback::Off;
+                assert_eq!((c.ecn.ect, s.ecn.ect), (on, on), "{cm:?} to {sm:?}");
+                assert_eq!((c.ecn.active(), s.ecn.active()), (on, on));
+            }
+        }
+    }
+
+    /// Classic ECN end to end: a CE mark has every ACK echo ECE until the
+    /// sender's CWR gets through; the sender cuts its window once for all
+    /// of them, sends CWR once, resends nothing, and leaves loss recovery
+    /// alone. Only new data is ECN-capable.
+    #[test]
+    fn classic_ecn_echo_reduces_once_without_retransmitting() {
+        let (mut c, mut s) = ecn_pair(EcnMode::Classic, EcnMode::Passive, 41100);
+        let (_, data) = c.write(&[1; 60_000]);
+        let data = marked(&c, data);
+        assert_eq!(data.len(), 10, "the initial window");
+        assert!(
+            data.iter().all(|(_, e)| *e == IpEcn::ECT0),
+            "new data is ECT"
+        );
+        let mut acks = deliver_marked(&mut s, &data, |i, e| if i == 0 { IpEcn::CE } else { e });
+        acks.extend(sent_by(&mut s, delack_expired));
+        assert!(!acks.is_empty());
+        for (a, e) in &acks {
+            assert!(parse(a).has_flag(flags::ECE), "not echoed");
+            assert_eq!(*e, IpEcn::NOT_ECT, "a pure ACK is not ECT");
+        }
+        let end = parse(&data[9].0).seq.wrapping_add(1000);
+
+        let mut sent = Vec::new();
+        let mut ssthresh = None;
+        for a in &acks {
+            sent.extend(deliver_marked(&mut c, std::slice::from_ref(a), as_is));
+            let st = c.cc.ssthresh();
+            assert!(st <= 7_000, "not cut by β: {st}");
+            assert_eq!(*ssthresh.get_or_insert(st), st, "cut twice");
+            assert_eq!(c.ca, CaState::Open, "no loss recovery");
+            assert_eq!(c.score.lost_bytes(), 0);
+        }
+        assert!(c.cwr_high.is_some());
+        assert!(!sent.is_empty(), "PRR sends on");
+        for (p, e) in &sent {
+            let seg = parse(p);
+            assert!(seq_after_eq(seg.seq, end), "resent {}", seg.seq);
+            assert_eq!(*e, IpEcn::ECT0);
+        }
+        let cwr: Vec<_> = sent
+            .iter()
+            .map(|(p, _)| parse(p).has_flag(flags::CWR))
+            .collect();
+        assert!(
+            cwr[0] && !cwr[1..].contains(&true),
+            "CWR once, first: {cwr:?}"
+        );
+
+        // The CWR stops the echo; its ACKs end the reduction.
+        let mut acks = deliver_marked(&mut s, &sent, as_is);
+        acks.extend(sent_by(&mut s, delack_expired));
+        assert!(acks.iter().all(|(a, _)| !parse(a).has_flag(flags::ECE)));
+        assert!(!s.ecn.echoing());
+        let out = deliver_marked(&mut c, &acks, as_is);
+        assert!(c.cwr_high.is_none(), "reduction not over");
+        assert_eq!(c.cc.ssthresh(), ssthresh.unwrap());
+
+        // A mark in the next window is a new signal: cut again.
+        assert!(!out.is_empty());
+        let acks = deliver_marked(&mut s, &out, |_, _| IpEcn::CE);
+        deliver_marked(&mut c, &acks, as_is);
+        assert!(c.cc.ssthresh() < ssthresh.unwrap(), "no second cut");
+    }
+
+    /// A retransmission is not ECN-capable under classic ECN (RFC 3168
+    /// §6.1.5), nor a window probe; under AccECN, as on Linux, it is.
+    #[test]
+    fn retransmissions_are_ect_only_with_accecn() {
+        for (mode, port, want) in [
+            (EcnMode::Classic, 41101, IpEcn::NOT_ECT),
+            (EcnMode::Accurate, 41102, IpEcn::ECT0),
+        ] {
+            let (mut c, _s) = ecn_pair(mode, mode, port);
+            let (_, data) = c.write(&[1; 3000]);
+            assert!(marked(&c, data).iter().all(|(_, e)| *e == IpEcn::ECT0));
+            let re = fire_rto(&mut c);
+            let re = marked(&c, re);
+            assert!(!parse(&re[0].0).payload.is_empty());
+            assert_eq!(re[0].1, want, "{mode:?}");
+        }
+    }
+
+    /// AccECN end to end: the ACE field counts every mark, across its
+    /// wrap, the sender's count follows the receiver's, and all the marks
+    /// of a window make one reduction. Pure ACKs are ECN-capable too.
+    #[test]
+    fn accecn_counts_every_mark() {
+        let (mut c, mut s) = ecn_pair(EcnMode::Accurate, EcnMode::Accurate, 41110);
+        let mut total = 0;
+        let mut ssthresh = None;
+        let mut carry = Vec::new();
+        for round in 0..6 {
+            let (_, data) = c.write(&[1; 20_000]);
+            let mut out = std::mem::take(&mut carry);
+            out.extend(marked(&c, data));
+            out.extend(sent_by(&mut c, Conn::take_outgoing));
+            // Marks on every segment of the first rounds.
+            let mark = |_, e| if round < 3 { IpEcn::CE } else { e };
+            total += if round < 3 { out.len() } else { 0 };
+            let mut acks = deliver_marked(&mut s, &out, mark);
+            read_all(&mut s);
+            acks.extend(sent_by(&mut s, Conn::take_outgoing));
+            acks.extend(sent_by(&mut s, delack_expired));
+            assert!(acks.iter().all(|(_, e)| *e == IpEcn::ECT0), "ACKs are ECT");
+            carry = deliver_marked(&mut c, &acks, as_is);
+            if round == 0 {
+                ssthresh = Some(c.cc.ssthresh());
+                assert!(ssthresh < Some(u32::MAX), "no reduction");
+            }
+        }
+        assert_eq!(s.ecn.received_ce() as usize, total);
+        assert_eq!(c.ecn.sent_ce() as usize, total);
+        assert!(total > 8, "the counter never wrapped");
+        assert_eq!(c.score.lost_bytes(), 0);
+        assert!(
+            c.cc.ssthresh() < ssthresh.unwrap(),
+            "later windows' marks cut again"
+        );
+    }
+
+    /// RFC 3168 §6.1.1.1: an ECN SYN may be dropped by the path, so a
+    /// retransmitted SYN no longer asks; AccECN asks once more first (RFC
+    /// 9768 §3.1.4).
+    #[test]
+    fn syn_retransmissions_stop_asking_for_ecn() {
+        let ecn = |s: &Segment| (s.ae, s.flags & (flags::ECE | flags::CWR));
+        let mut c = Conn::new(big(41120, 80).ecn(EcnMode::Classic));
+        let syn = parse(&c.connect()[0]);
+        assert_eq!(ecn(&syn), (false, flags::ECE | flags::CWR));
+        let re = parse(&fire_rto(&mut c)[0]);
+        assert_eq!(ecn(&re), (false, 0));
+
+        let mut c = Conn::new(big(41121, 80).ecn(EcnMode::Accurate));
+        let all = (true, flags::ECE | flags::CWR);
+        assert_eq!(ecn(&parse(&c.connect()[0])), all);
+        assert_eq!(ecn(&parse(&fire_rto(&mut c)[0])), all);
+        assert_eq!(ecn(&parse(&fire_rto(&mut c)[0])), (false, 0));
+        // A server answering only that gives no ECN.
+        let mut s = Conn::new(big(80, 41121).ecn(EcnMode::Accurate));
+        let synack = s.accept_syn(&parse(&fire_rto(&mut c)[0]));
+        assert_eq!(s.ecn.fb, Feedback::Off);
+        deliver(&mut c, &synack);
+        assert_eq!(c.ecn.fb, Feedback::Off);
+    }
+
+    /// What a path that meddles with ECN leaves of it (RFC 9768 §3.1.5,
+    /// §3.2.2.1, §3.2.2.3): a middlebox clearing the TCP flags leaves no
+    /// ECN, or none trusted; one rewriting the IP field of the SYN leaves
+    /// the client sending Not-ECT; one bleaching IP marks leaves nothing
+    /// to answer, but no harm.
+    #[test]
+    fn ecn_through_meddling_paths() {
+        use EcnMode::Accurate;
+        let clear = |s: &mut Segment| {
+            s.ae = false;
+            s.flags &= !(flags::ECE | flags::CWR);
+        };
+        // Flags cleared both ways: no ECN at all.
+        let (c, s) = ecn_pair_via(Accurate, Accurate, 41130, |s, _| clear(s));
+        assert_eq!((c.ecn.fb, s.ecn.fb), (Feedback::Off, Feedback::Off));
+        // Only on the SYN-ACK: the client sees no ECN; the server, AccECN
+        // but a zeroed ACE on the ACK completing the handshake, which it
+        // takes as the middlebox's, and so neither sends ECT nor answers.
+        let (c, s) = ecn_pair_via(Accurate, Accurate, 41131, |s, _| {
+            if s.has_flag(flags::SYN) && s.has_flag(flags::ACK) {
+                clear(s)
+            }
+        });
+        assert_eq!(c.ecn.fb, Feedback::Off);
+        assert_eq!(s.ecn.fb, Feedback::Accurate);
+        assert!(!s.ecn.ect && !s.ecn.respond);
+        // Only on the ACK of the SYN-ACK: the same for the server; the
+        // client goes on with AccECN.
+        let (c, s) = ecn_pair_via(Accurate, Accurate, 41132, |s, _| {
+            if !s.has_flag(flags::SYN) {
+                clear(s)
+            }
+        });
+        assert!(c.ecn.ect && !s.ecn.ect && !s.ecn.respond);
+        // The SYN arrives ECT(0) though sent Not-ECT: the SYN-ACK says so,
+        // and the client, still in AccECN, sends Not-ECT from then on.
+        let (mut c, _) = ecn_pair_via(Accurate, Accurate, 41133, |s, e| {
+            if s.has_flag(flags::SYN) && !s.has_flag(flags::ACK) {
+                *e = IpEcn::ECT0;
+            }
+        });
+        assert_eq!(c.ecn.fb, Feedback::Accurate);
+        let (_, data) = c.write(&[1; 1000]);
+        assert_eq!(marked(&c, data)[0].1, IpEcn::NOT_ECT);
+
+        // Classic ECN over a path that clears every IP mark: nothing to
+        // answer, and nothing goes amiss.
+        let (mut c, mut s) = ecn_pair(EcnMode::Classic, EcnMode::Classic, 41134);
+        let mut carry = Vec::new();
+        for round in 0..20 {
+            let mut out = std::mem::take(&mut carry);
+            if round < 5 {
+                let (_, data) = c.write(&[1; 20_000]);
+                out.extend(marked(&c, data));
+            }
+            out.extend(sent_by(&mut c, Conn::take_outgoing));
+            let mut acks = deliver_marked(&mut s, &out, |_, _| IpEcn::NOT_ECT);
+            read_all(&mut s);
+            acks.extend(sent_by(&mut s, delack_expired));
+            carry = deliver_marked(&mut c, &acks, |_, _| IpEcn::NOT_ECT);
+        }
+        assert_eq!(c.cc.ssthresh(), u32::MAX);
+        assert_eq!(c.send_buf.as_ref().unwrap().unacked(), 0);
+    }
+
+    /// Over a deep queue that marks past a fifth of the BDP, ECN keeps
+    /// CUBIC's queue short with no loss at all, where without it CUBIC
+    /// fills the queue until it overflows.
+    #[test]
+    fn ecn_keeps_a_marking_queue_short_without_loss() {
+        let run = |mode, port| {
+            let conf = ConnConfig::default().ecn(mode);
+            let mut p = bulk(conf, 2.0, port);
+            p.mark_bytes = 0.2 * p.rate * 0.04;
+            p.run_for(Duration::from_secs(3));
+            p.queue_delays.clear();
+            let goodput = p.goodput(Duration::from_secs(10));
+            let mut q = p.queue_delays.clone();
+            q.sort();
+            (p, goodput, q[q.len() / 2])
+        };
+        for (mode, port) in [(EcnMode::Classic, 41140), (EcnMode::Accurate, 41141)] {
+            let (p, goodput, median) = run(mode, port);
+            assert!(p.marked > 0, "{mode:?}: never marked");
+            assert_eq!((p.drops, p.retransmitted), (0, 0), "{mode:?}");
+            assert!(goodput > 0.85 * p.rate, "{mode:?}: goodput {goodput}");
+            assert!(median < Duration::from_millis(10), "{mode:?}: {median:?}");
+        }
+        let (p, _, median) = run(EcnMode::Off, 41142);
+        assert_eq!(p.marked, 0);
+        assert!(
+            p.drops > 0 || median > Duration::from_millis(20),
+            "without ECN: {} drops, {median:?}",
+            p.drops
+        );
     }
 }

@@ -335,22 +335,33 @@ pub fn vtcp_segment(data: &[u8]) {
 /// what each side does and what becomes of the peer's segments on the way:
 /// delivered, dropped, reordered, duplicated, or corrupted at chosen offsets.
 /// Corruptions start from a segment that is valid for the connection, so
-/// they reach the state machine rather than its first sequence check.
+/// they reach the state machine rather than its first sequence check. The
+/// first byte picks each side's ECN setting; the top bits of a delivery's
+/// byte, the IP-ECN codepoint the network leaves on it.
 #[cfg(feature = "vtcp")]
 pub fn vtcp_conversation(data: &[u8]) {
-    use crate::vtcp::{Conn, ConnConfig, Segment};
+    use crate::vtcp::ecn::IpEcn;
+    use crate::vtcp::{Conn, ConnConfig, EcnMode, Segment};
     use std::collections::VecDeque;
 
-    let cfg = |local, remote| {
+    let modes = [
+        EcnMode::Off,
+        EcnMode::Passive,
+        EcnMode::Classic,
+        EcnMode::Accurate,
+    ];
+    let first = data.first().copied().unwrap_or(0) as usize;
+    let cfg = |local, remote, ecn| {
         ConnConfig::default()
             .local_port(local)
             .remote_port(remote)
             .mss(536)
             .send_buf_size(4096)
             .recv_buf_size(4096)
+            .ecn(ecn)
     };
-    let mut us = Conn::new(cfg(40000, 80));
-    let mut peer = Conn::new(cfg(80, 40000));
+    let mut us = Conn::new(cfg(40000, 80, modes[first & 3]));
+    let mut peer = Conn::new(cfg(80, 40000, modes[(first >> 2) & 3]));
     // Segments the peer has sent that the network still holds.
     let mut wire: VecDeque<Vec<u8>> = VecDeque::new();
 
@@ -365,7 +376,7 @@ pub fn vtcp_conversation(data: &[u8]) {
     fn to_peer(peer: &mut Conn, wire: &mut VecDeque<Vec<u8>>, segs: Vec<Vec<u8>>) {
         for s in segs {
             if let Ok(seg) = Segment::parse(&s) {
-                wire.extend(peer.handle_segment(&seg));
+                wire.extend(peer.handle_segment_ecn(&seg, IpEcn::ECT0));
             }
         }
     }
@@ -385,7 +396,7 @@ pub fn vtcp_conversation(data: &[u8]) {
                 if let Some(s) = wire.pop_front()
                     && let Ok(seg) = Segment::parse(&s)
                 {
-                    let out = us.handle_segment(&seg);
+                    let out = us.handle_segment_ecn(&seg, IpEcn::from_bits(op >> 6));
                     to_peer(&mut peer, &mut wire, out);
                 }
             }

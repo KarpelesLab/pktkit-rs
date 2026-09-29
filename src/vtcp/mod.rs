@@ -59,6 +59,13 @@
 //!   ACKs report delivered, a segment for about every other ACK, rather
 //!   than inflating with every duplicate ACK or going quiet and bursting.
 //! - RFC 2883: D-SACK, reporting data received twice.
+//! - RFC 3168: ECN. Where both ends agree to it (see [`EcnMode`]; by
+//!   default a peer's request is accepted, none made), a queue marking
+//!   packets Congestion Experienced has the window cut, once per round
+//!   trip, with nothing to resend: by RFC 8511's gentler β in congestion
+//!   avoidance (0.85 for CUBIC), as marks come while the queue is still
+//!   short. RFC 9768's AccECN has the receiver count the marks rather than
+//!   flag them, which BBR's response goes by.
 //! - Undoing a needless loss response: D-SACKs for everything an episode
 //!   retransmitted (RFC 3708), the Eifel detection's timestamp echo (RFC
 //!   3522) and F-RTO after a timeout (RFC 5682) tell a spurious
@@ -102,6 +109,7 @@ pub(crate) mod congestion;
 pub(crate) mod conn;
 pub(crate) mod cubic;
 pub(crate) mod cwv;
+pub(crate) mod ecn;
 pub(crate) mod options;
 pub(crate) mod rate;
 pub(crate) mod recvbuf;
@@ -116,6 +124,7 @@ pub(crate) mod seqspace;
 pub(crate) mod syncookie;
 
 pub use conn::{CongestionKind, Conn, ConnConfig, State};
+pub use ecn::EcnMode;
 pub use options::{TcpOption, kind};
 pub use segment::{Segment, flags};
 

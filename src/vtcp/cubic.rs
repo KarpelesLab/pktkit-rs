@@ -28,6 +28,11 @@ use std::time::Duration;
 const C: f64 = 0.4;
 /// β_cubic (RFC 9438 §4.6).
 const BETA: f64 = 0.7;
+/// β_ecn (RFC 8511, ABE): the cut for ECN marks in congestion avoidance.
+/// A queue that marks early is short, and a cut by β_cubic from its
+/// threshold would leave the link idle for seconds; RFC 8511 found 0.85
+/// best for CUBIC. FreeBSD offers it; Linux cuts by β_cubic.
+const BETA_ECN: f64 = 0.85;
 /// α_cubic = 3(1 − β)/(1 + β) (RFC 9438 §4.3): the Reno-friendly
 /// estimate's additive increase, for the same average window as Reno's
 /// AIMD(1, 0.5).
@@ -190,7 +195,27 @@ impl Cubic {
     /// The multiplicative decrease's ssthresh for a flight of `flight`
     /// bytes (RFC 9438 Figure 5).
     fn decreased(&self, flight: u32) -> u32 {
-        ((f64::from(flight) * BETA) as u32).max(2 * self.mss)
+        self.decreased_by(flight, BETA)
+    }
+
+    fn decreased_by(&self, flight: u32, beta: f64) -> u32 {
+        ((f64::from(flight) * beta) as u32).max(2 * self.mss)
+    }
+
+    /// A congestion event with `flight` bytes out: a cut by `beta`.
+    fn reduce(&mut self, flight: u32, beta: f64) {
+        let w = f64::from(self.cwnd);
+        // Fast convergence (§4.7): a flow losing below its last W_max
+        // leaves room for newcomers by aiming lower.
+        self.w_max = Some(match self.w_max {
+            Some(m) if FAST_CONVERGENCE && w < m => w * (1.0 + beta) / 2.0,
+            _ => w,
+        });
+        self.cwnd_prior = w;
+        self.ssthresh = self.decreased_by(flight, beta);
+        self.epoch = None;
+        self.credit = 0.0;
+        self.hystart.finish();
     }
 }
 
@@ -242,18 +267,18 @@ impl CongestionController for Cubic {
     }
 
     fn on_loss(&mut self, flight_size: u32) {
-        let w = f64::from(self.cwnd);
-        // Fast convergence (§4.7): a flow losing below its last W_max
-        // leaves room for newcomers by aiming lower.
-        self.w_max = Some(match self.w_max {
-            Some(m) if FAST_CONVERGENCE && w < m => w * (1.0 + BETA) / 2.0,
-            _ => w,
-        });
-        self.cwnd_prior = w;
-        self.ssthresh = self.decreased(flight_size);
-        self.epoch = None;
-        self.credit = 0.0;
-        self.hystart.finish();
+        self.reduce(flight_size, BETA);
+    }
+
+    /// RFC 8511's β_ecn in congestion avoidance; in slow start, which a
+    /// mark ends having overshot by up to a window, β_cubic (RFC 8511 §3).
+    fn on_ecn(&mut self, flight_size: u32) {
+        let beta = if self.cwnd < self.ssthresh {
+            BETA
+        } else {
+            BETA_ECN
+        };
+        self.reduce(flight_size, beta);
     }
 
     fn on_retransmit_timeout(&mut self, flight_size: u32, repeated: bool) {
@@ -576,6 +601,29 @@ mod tests {
 
     /// A timeout: one segment, ssthresh at β of the flight, and the next
     /// congestion avoidance starts its curve at its own window (K = 0).
+    /// ECN marks cut by β_ecn = 0.85 in congestion avoidance (RFC 8511),
+    /// by β_cubic in slow start.
+    #[test]
+    fn ecn_marks_cut_less_in_congestion_avoidance() {
+        let mut c = Cubic::new(MSS);
+        c.cwnd = 100 * MSS;
+        c.on_ecn(100 * MSS);
+        assert_eq!(c.ssthresh(), 70 * MSS, "slow start");
+        c.set_cwnd(c.ssthresh());
+        c.on_ecn(70 * MSS);
+        assert_eq!(c.ssthresh(), 59_500);
+        // Fast convergence by β_ecn too: below W_max, aim at (1+β)/2 of it.
+        assert_eq!(c.w_max, Some(70_000.0 * 1.85 / 2.0));
+
+        let mut r = super::super::congestion::NewReno::new(MSS);
+        r.set_cwnd(100 * MSS);
+        r.on_ecn(100 * MSS);
+        assert_eq!(r.ssthresh(), 50 * MSS, "slow start");
+        r.set_cwnd(r.ssthresh());
+        r.on_ecn(50 * MSS);
+        assert_eq!(r.ssthresh(), 40 * MSS);
+    }
+
     #[test]
     fn timeout_resets_w_max() {
         let mut c = after_loss(100, Duration::from_millis(10));

@@ -146,6 +146,13 @@ pub trait CongestionController: Send {
     /// A loss was detected with `flight_size` bytes outstanding: set
     /// ssthresh. The connection then brings cwnd down to it.
     fn on_loss(&mut self, flight_size: u32);
+    /// ECN feedback reported CE marks with `flight_size` bytes
+    /// outstanding: set ssthresh, as for a loss (RFC 3168 §6.1.2) unless
+    /// the controller answers marks otherwise. Only a controller that is
+    /// not model-based is told.
+    fn on_ecn(&mut self, flight_size: u32) {
+        self.on_loss(flight_size);
+    }
     /// The retransmission timer fired with `flight_size` bytes outstanding:
     /// set ssthresh, and cwnd to the loss window. `repeated` is set when
     /// the segment had already been retransmitted by the timer, in which
@@ -249,6 +256,16 @@ impl CongestionController for NewReno {
         // RFC 5681 eq. (4): half the flight, not of cwnd, which may never
         // have been filled.
         self.ssthresh = (flight_size / 2).max(2 * self.mss);
+        self.ca_acked = 0;
+    }
+
+    /// RFC 8511 (ABE): marks in congestion avoidance cut to 0.8 of the
+    /// flight, not half; in slow start, half.
+    fn on_ecn(&mut self, flight_size: u32) {
+        if self.cwnd < self.ssthresh {
+            return self.on_loss(flight_size);
+        }
+        self.ssthresh = ((u64::from(flight_size) * 4 / 5) as u32).max(2 * self.mss);
         self.ca_acked = 0;
     }
 

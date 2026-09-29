@@ -19,6 +19,13 @@ pub mod flags {
     pub const ACK: u8 = 0x10;
     /// The urgent pointer is significant.
     pub const URG: u8 = 0x20;
+    /// ECN-Echo (RFC 3168): on a SYN, a request for ECN; on a SYN-ACK,
+    /// its acceptance; after the handshake, a congestion signal. With
+    /// AccECN (RFC 9768) the lowest bit of the ACE counter.
+    pub const ECE: u8 = 0x40;
+    /// Congestion Window Reduced (RFC 3168): the sender has answered an
+    /// ECN-Echo. With AccECN the middle bit of the ACE counter.
+    pub const CWR: u8 = 0x80;
 }
 
 /// A parsed TCP segment (header + options + payload).
@@ -38,6 +45,9 @@ pub struct Segment {
     pub ack: u32,
     /// Flag bits; see [`flags`].
     pub flags: u8,
+    /// The AE flag (RFC 9768), once the reserved bit before CWR: the top
+    /// bit of AccECN's ACE counter, and part of its SYN's request.
+    pub ae: bool,
     /// Advertised window, unscaled as on the wire.
     pub window: u16,
     /// Checksum as parsed; ignored by [`marshal`](Self::marshal).
@@ -72,6 +82,7 @@ impl Segment {
             seq: u32::from_be_bytes([raw[4], raw[5], raw[6], raw[7]]),
             ack: u32::from_be_bytes([raw[8], raw[9], raw[10], raw[11]]),
             flags: raw[13],
+            ae: raw[12] & 1 != 0,
             window: u16::from_be_bytes([raw[14], raw[15]]),
             checksum: u16::from_be_bytes([raw[16], raw[17]]),
             urgent: u16::from_be_bytes([raw[18], raw[19]]),
@@ -97,7 +108,7 @@ impl Segment {
         out[2..4].copy_from_slice(&self.dst_port.to_be_bytes());
         out[4..8].copy_from_slice(&self.seq.to_be_bytes());
         out[8..12].copy_from_slice(&self.ack.to_be_bytes());
-        out[12] = ((hdr_len / 4) as u8) << 4;
+        out[12] = (((hdr_len / 4) as u8) << 4) | u8::from(self.ae);
         out[13] = self.flags;
         out[14..16].copy_from_slice(&self.window.to_be_bytes());
         // checksum left at 0
@@ -179,6 +190,21 @@ mod tests {
         let p = Segment::parse(&raw).unwrap();
         assert_eq!(p.payload, b"hello");
         assert_eq!(get_mss(&p.options), 1460);
+    }
+
+    #[test]
+    fn ae_flag_round_trips() {
+        let s = Segment {
+            flags: flags::SYN | flags::ECE | flags::CWR,
+            ae: true,
+            ..Default::default()
+        };
+        let raw = s.marshal();
+        assert_eq!(raw[12], (5 << 4) | 1);
+        let p = Segment::parse(&raw).unwrap();
+        assert!(p.ae);
+        assert_eq!(p.flags, flags::SYN | flags::ECE | flags::CWR);
+        assert!(!Segment::parse(&Segment::default().marshal()).unwrap().ae);
     }
 
     #[test]
