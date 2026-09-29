@@ -62,6 +62,8 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --all --check
+      # The interop suite is a workspace of its own.
+      - run: cargo fmt --all --check --manifest-path interop/Cargo.toml
 
   clippy:
     name: Clippy
@@ -233,6 +235,64 @@ jobs:
             echo "--- $t ---"
             cargo fuzz run "$t" -- -max_total_time=20 -print_final_stats=1
           done
+
+  interop:
+    name: Interop (vtcp against Linux in QEMU)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          # The guest agent is a static musl binary, linked with rust-lld.
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: interop
+      # GitHub's Linux runners have KVM, but /dev/kvm is root's alone.
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Install QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-x86
+      # The guest's kernel and busybox come from Alpine; key the cache by the
+      # kernel build the branch has now, so a new one is fetched once. The
+      # branch is interop/src/image.rs's ALPINE_BRANCH.
+      - name: Look up the Alpine kernel
+        id: alpine
+        run: |
+          v=$(curl -fsSL https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/APKINDEX.tar.gz \
+            | tar -xzO APKINDEX | awk '/^P:linux-virt$/ {f=1} f && /^V:/ && !done {print substr($0, 3); done = 1}')
+          echo "kernel=$v" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: interop/.cache
+          key: interop-alpine-v3.24-x86_64-${{ steps.alpine.outputs.kernel }}
+          restore-keys: interop-alpine-v3.24-x86_64-
+      - name: Clippy (harness and agent)
+        working-directory: interop
+        run: |
+          cargo clippy --all-targets -- -D warnings
+          cargo clippy -p pktkit-interop-agent --target x86_64-unknown-linux-musl -- -D warnings
+      - name: Unit tests of the harness
+        run: cargo test --release --manifest-path interop/Cargo.toml
+      # The quick matrix: correctness, negotiation both ways, and two
+      # impaired links. The full one runs locally (see interop/README.md).
+      - name: Run the interop suite
+        run: cargo run --release --manifest-path interop/Cargo.toml -- --arch x86_64 --quick
+      - name: Keep the results (pcaps, console, report)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: interop-results
+          path: interop/target/results
+          if-no-files-found: ignore
 
   audit:
     name: Dependency audit
