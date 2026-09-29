@@ -310,13 +310,13 @@ impl ConnState {
         let Some(PendingAccept { accept, .. }) = pending.as_mut() else {
             return true;
         };
-        if !self
-            .conn
-            .lock()
-            .expect("poisoned")
-            .state()
-            .is_synchronized()
-        {
+        // Up once the handshake completes, or once data came in with the
+        // SYN (Fast Open), which the application may read and answer now.
+        let up = {
+            let conn = self.conn.lock().expect("poisoned");
+            conn.state().is_synchronized() || conn.fast_open_accepted()
+        };
+        if !up {
             return true;
         }
         match accept(self) {

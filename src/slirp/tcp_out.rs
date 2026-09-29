@@ -30,8 +30,9 @@ use crate::Result;
 use crate::slirp::tcp_stream::{ConnState, Endpoints};
 use crate::time::Instant;
 use crate::vtcp::ecn::IpEcn;
+use crate::vtcp::fastopen::Gate;
 use crate::vtcp::segment::Segment;
-use crate::vtcp::{Conn, ConnConfig, State};
+use crate::vtcp::{Conn, ConnConfig, State, Tuning};
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream};
@@ -115,11 +116,16 @@ impl TcpOutConn {
     /// The caller registers the bridge in its connection table before calling
     /// `start_dial`, so that neither the client's retransmitted SYNs nor its
     /// ACK of the SYN-ACK can miss it and draw a spurious RST.
+    ///
+    /// The virtual side takes `tuning`; with Fast Open, data from the SYN
+    /// counts at `gate` until the handshake completes.
     pub(crate) fn pending(
         endpoints: Endpoints,
         syn: &Segment,
         syn_ecn: IpEcn,
         mss: u16,
+        tuning: &Tuning,
+        gate: Option<Arc<Gate>>,
         sink: Arc<dyn Fn(&[u8]) + Send + Sync>,
     ) -> Arc<TcpOutConn> {
         let (local_addr, remote_addr, local_port, remote_port) = match endpoints {
@@ -165,9 +171,11 @@ impl TcpOutConn {
             recv_buf_size: BRIDGE_BUF,
             ..Default::default()
         };
+        let mut conn = Conn::new(tuning.apply(cfg));
+        conn.set_fast_open_gate(gate, false);
 
         Arc::new(TcpOutConn {
-            state: ConnState::new(endpoints, Conn::new(cfg), sink),
+            state: ConnState::new(endpoints, conn, sink),
             remote: Mutex::new(None),
             closed: Arc::new(AtomicBool::new(false)),
             syn: Mutex::new(Some(syn.clone())),
@@ -265,23 +273,23 @@ impl TcpOutConn {
         *pending = None;
         drop(pending);
         self.state.emit(conn, synack);
+        // Fast Open data in the SYN goes to the server now, and its answer
+        // may come back before the client's ACK.
+        self.start_pumps();
     }
 
-    /// Start the byte pumps if the client has just completed the handshake.
+    /// Start the byte pumps if the client has just completed the handshake,
+    /// or sent data the engine took from its SYN (Fast Open).
     fn start_pumps(self: &Arc<Self>) {
         let remote_read = {
             let mut hs = self.handshake.lock().expect("poisoned");
             // Checked and taken under the lock the deadline is taken under
             // too, so exactly one of the ACK and the deadline gets it.
-            if hs.is_none()
-                || !self
-                    .state
-                    .conn
-                    .lock()
-                    .expect("poisoned")
-                    .state()
-                    .is_synchronized()
-            {
+            let up = {
+                let conn = self.state.conn.lock().expect("poisoned");
+                conn.state().is_synchronized() || conn.fast_open_accepted()
+            };
+            if hs.is_none() || !up {
                 return;
             }
             hs.take().expect("checked above").1
@@ -692,6 +700,8 @@ mod tests {
             &syn,
             IpEcn::NOT_ECT,
             1460,
+            &Tuning::default(),
+            None,
             Arc::new(|_: &[u8]| {}),
         );
         let mut conn = bridge.state().conn.lock().unwrap();

@@ -403,3 +403,104 @@ fn a_v6_listener_write_through_a_narrower_hop_completes() {
     assert!(got == data, "transfer corrupted");
     assert!(too_big.load(Ordering::Relaxed) > 0);
 }
+
+/// [`Shared`], noting the payload of every SYN the client sends.
+#[derive(Debug)]
+struct Sniffed(Arc<Client>, Arc<Mutex<Vec<usize>>>);
+
+impl L3Device for Sniffed {
+    fn set_handler(&self, h: L3Handler) {
+        let syns = self.1.clone();
+        self.0.set_handler(Arc::new(move |p: &Packet| {
+            if let Ok(seg) = pktkit::vtcp::Segment::parse(p.payload())
+                && seg.flags & pktkit::vtcp::flags::SYN != 0
+            {
+                syns.lock().unwrap().push(seg.payload.len());
+            }
+            h(p)
+        }))
+    }
+    fn send(&self, p: &Packet) -> pktkit::Result<()> {
+        self.0.send(p)
+    }
+    fn addr(&self) -> IpPrefix {
+        self.0.addr()
+    }
+    fn set_addr(&self, p: IpPrefix) -> pktkit::Result<()> {
+        self.0.set_addr(p)
+    }
+    fn close(&self) -> pktkit::Result<()> {
+        self.0.close()
+    }
+}
+
+/// TCP Fast Open through the stack, once `Stack::set_tcp` turns it on: to
+/// a listener of the stack and to a server on the host alike, the first
+/// dial gets a cookie, and the next ones carry their request in the SYN.
+#[test]
+fn fast_open_through_the_stack() {
+    use pktkit::vtcp::{CongestionKind, Tuning};
+
+    let stack = pktkit::slirp::Stack::new();
+    stack
+        .set_addr(IpPrefix::new(IpAddr::V4(STACK_IP), 24))
+        .unwrap();
+    stack.set_tcp(
+        Tuning::default()
+            .fast_open(true)
+            .congestion(CongestionKind::Bbr),
+    );
+    let client = Client::new(
+        ClientConfig::default()
+            .prefix(IpPrefix::new(IpAddr::V4(CLIENT_IP), 24))
+            .tcp(Tuning::default().fast_open(true)),
+    );
+    let syns = Arc::new(Mutex::new(Vec::new()));
+    connect_l3(stack.clone(), Sniffed(client.clone(), syns.clone()));
+
+    let serve = |accept: Box<dyn Fn() -> Option<Box<dyn ReadWrite>> + Send>| {
+        std::thread::spawn(move || {
+            for _ in 0..3 {
+                let mut s = accept().unwrap();
+                let mut req = [0; 4];
+                s.read_exact(&mut req).unwrap();
+                assert_eq!(&req, b"ping");
+                s.write_all(b"pong").unwrap();
+            }
+        })
+    };
+    let listener = stack.listen("tcp", &format!("{STACK_IP}:8080")).unwrap();
+    let virt = serve(Box::new(move || {
+        listener
+            .accept()
+            .ok()
+            .map(|s| Box::new(s) as Box<dyn ReadWrite>)
+    }));
+    let host = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = host.local_addr().unwrap().port();
+    let real = serve(Box::new(move || {
+        host.accept()
+            .ok()
+            .map(|(s, _)| Box::new(s) as Box<dyn ReadWrite>)
+    }));
+
+    for dest in [
+        SocketAddr::from((STACK_IP, 8080)),
+        SocketAddr::from(([127, 0, 0, 1], port)),
+    ] {
+        syns.lock().unwrap().clear();
+        for _ in 0..3 {
+            let mut c = client.dial_tcp_with_data(dest, b"ping").unwrap();
+            c.set_read_timeout(Some(Duration::from_secs(10)));
+            let mut resp = [0; 4];
+            c.read_exact(&mut resp).unwrap();
+            assert_eq!(&resp, b"pong");
+        }
+        assert_eq!(*syns.lock().unwrap(), [0, 4, 4], "to {dest}");
+    }
+    virt.join().unwrap();
+    real.join().unwrap();
+}
+
+trait ReadWrite: Read + Write + Send {}
+impl<T: Read + Write + Send> ReadWrite for T {}

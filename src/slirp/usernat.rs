@@ -38,8 +38,9 @@ use crate::slirp::udp::{SendFn as UdpSendFn, UdpConn};
 use crate::slirp::udp6::{SendFn as UdpSendFn6, UdpConn6};
 use crate::vtcp::alarm::Alarm;
 use crate::vtcp::ecn::IpEcn;
+use crate::vtcp::fastopen::{self, Gate};
 use crate::vtcp::segment::{Segment, flags as tcp_flags};
-use crate::vtcp::{Conn, ConnConfig};
+use crate::vtcp::{Conn, ConnConfig, Tuning};
 use crate::{IpPrefix, Protocol, Result, connect_l3};
 
 use crate::time::Instant;
@@ -237,6 +238,11 @@ struct Inner {
     filter: RwLock<Option<DestFilter>>,
     /// MTU of the link to the guests; see [`Stack::set_mtu`].
     mtu: AtomicU32,
+    /// TCP settings of the connections from then on; see [`Stack::set_tcp`].
+    tuning: RwLock<Tuning>,
+    /// Connections with Fast Open data whose handshake has not completed,
+    /// bounded as RFC 7413 §5.1 asks.
+    fast_open_gate: Arc<Gate>,
     closed: AtomicBool,
     /// Wakes the tick thread when a connection's timer comes due.
     alarm: Arc<Alarm>,
@@ -336,6 +342,8 @@ impl Stack {
             defrag: Mutex::new(HashMap::new()),
             filter: RwLock::new(None),
             mtu: AtomicU32::new(DEFAULT_MTU),
+            tuning: RwLock::new(Tuning::default()),
+            fast_open_gate: Gate::new(fastopen::MAX_PENDING),
             closed: AtomicBool::new(false),
             alarm: Arc::new(Alarm::new()),
         });
@@ -622,6 +630,21 @@ impl Stack {
     /// The MTU of the link to the guests; see [`set_mtu`](Self::set_mtu).
     pub fn mtu(&self) -> u32 {
         self.inner.mtu.load(Ordering::Relaxed)
+    }
+
+    /// Set the TCP settings of the connections that terminate the guests'
+    /// TCP: those the guests open to the host's destinations, and those to
+    /// the stack's own [listeners](Self::listen). vtcp's defaults until
+    /// set; connections already open keep theirs.
+    ///
+    /// With [`fast_open`](Tuning::fast_open) on, a guest that does TCP
+    /// Fast Open (RFC 7413) gets a cookie, and from then on its SYN's data
+    /// is taken at once: passed on to the host's destination as soon as it
+    /// is reached, or readable from the listener's [`TcpStream`](super::TcpStream)
+    /// before the handshake completes, and the answer sent without waiting
+    /// for it.
+    pub fn set_tcp(&self, tuning: Tuning) {
+        *self.inner.tuning.write().expect("poisoned") = tuning;
     }
 
     /// The host address to dial for a guest's `dest` over `proto`, or `None`
@@ -946,7 +969,15 @@ impl Stack {
             remote_ip: src,
             remote_port: src_port,
         };
-        let conn = TcpOutConn::pending(endpoints, &seg, ecn, Self::mss(inner, false), sink);
+        let conn = TcpOutConn::pending(
+            endpoints,
+            &seg,
+            ecn,
+            Self::mss(inner, false),
+            &inner.tuning.read().expect("poisoned"),
+            Some(inner.fast_open_gate.clone()),
+            sink,
+        );
         conn.state().set_alarm(inner.alarm.clone());
         // Register before the dial can answer, so the client's ACK of the
         // SYN-ACK resolves to this connection rather than drawing a RST.
@@ -1035,7 +1066,7 @@ impl Stack {
     /// The configuration of a connection passively opened at `endpoints`.
     fn passive_config(inner: &Inner, endpoints: &Endpoints) -> ConnConfig {
         let (local, remote) = (endpoints.local_addr(), endpoints.peer_addr());
-        ConnConfig {
+        inner.tuning.read().expect("poisoned").apply(ConnConfig {
             local_addr: Some(local),
             remote_addr: Some(remote),
             local_port: local.port(),
@@ -1043,7 +1074,7 @@ impl Stack {
             mss: Self::mss(inner, local.is_ipv6()),
             keepalive: true,
             ..Default::default()
-        }
+        })
     }
 
     /// Passive-open a server-side `vtcp::Conn` for an inbound SYN to
@@ -1088,6 +1119,9 @@ impl Stack {
             return Self::dispatch_fitted(inner, ns, &endpoints.wrap(&synack.marshal()));
         };
         let mut conn = Conn::new(Self::passive_config(inner, &endpoints));
+        // Fast Open data is readable before the handshake completes, which
+        // takes a place in the accept queue at once.
+        conn.set_fast_open_gate(Some(inner.fast_open_gate.clone()), listener.queue_full());
         let synack = conn.accept_syn_ecn(&seg, ecn);
         let state = ConnState::new_in(ns, endpoints, conn, Self::sink(inner, ns));
         state.set_alarm(inner.alarm.clone());
@@ -1431,7 +1465,15 @@ impl Stack {
             remote_ip: src,
             remote_port: src_port,
         };
-        let conn = TcpOutConn::pending(endpoints, &seg, ecn, Self::mss(inner, true), sink);
+        let conn = TcpOutConn::pending(
+            endpoints,
+            &seg,
+            ecn,
+            Self::mss(inner, true),
+            &inner.tuning.read().expect("poisoned"),
+            Some(inner.fast_open_gate.clone()),
+            sink,
+        );
         conn.state().set_alarm(inner.alarm.clone());
         // Register before the dial can answer (see the v4 path).
         inner
@@ -3772,6 +3814,30 @@ mod tests {
         assert_eq!(&buf[..2], b"hi");
     }
 
+    /// `Stack::set_tcp` reaches the connections opened from then on.
+    #[test]
+    fn tcp_settings_apply_to_new_connections() {
+        use crate::vtcp::{CongestionKind, EcnMode};
+        let s = Stack::new();
+        let _l = s.listen("tcp", "10.0.0.1:80").unwrap();
+        let _captured = capture(&s);
+        s.set_tcp(
+            Tuning::default()
+                .congestion(CongestionKind::NewReno)
+                .ecn(EcnMode::Off)
+                .recv_buf_max(3 << 20),
+        );
+        L3Device::send(&*s, Packet::from_slice(&syn_to_80(10000))).unwrap();
+        let t = s.inner.virt_tcp.lock().unwrap();
+        let cs = t.values().next().expect("SYN not taken");
+        let conn = cs.conn.lock().unwrap();
+        let c = conn.config();
+        assert_eq!(c.congestion, CongestionKind::NewReno);
+        assert_eq!(c.ecn, EcnMode::Off);
+        assert_eq!(c.recv_buf_max, 3 << 20);
+        assert!(c.keepalive, "the stack's own settings stay");
+    }
+
     /// Guests flooding a listener from every share of its backlog still
     /// do not lock another guest out: its SYN gets a cookie.
     #[test]
@@ -4314,6 +4380,8 @@ mod tests {
             &syn,
             IpEcn::NOT_ECT,
             1460,
+            &Tuning::default(),
+            None,
             Arc::new(|_: &[u8]| {}),
         );
         *bridge.remote.lock().unwrap() = Some(Arc::new(ours));
@@ -4614,6 +4682,8 @@ mod tests {
             &syn,
             IpEcn::NOT_ECT,
             1460,
+            &Tuning::default(),
+            None,
             Arc::new(|_: &[u8]| {}),
         );
         {
