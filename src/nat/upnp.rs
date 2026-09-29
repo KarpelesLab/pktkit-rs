@@ -452,6 +452,10 @@ EXT:\r\n\r\n",
                     send_buf_size: MAX_REQUEST_BYTES,
                     recv_buf_max: MAX_REQUEST_BYTES,
                     send_buf_max: MAX_REQUEST_BYTES,
+                    // The segments are wrapped without the codepoints ECN
+                    // would ask for, nor are the marks on the client's read:
+                    // agreeing to it would leave its marks unanswered.
+                    ecn: crate::vtcp::EcnMode::Off,
                     ..Default::default()
                 };
                 table.insert(

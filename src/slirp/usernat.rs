@@ -37,6 +37,7 @@ use crate::slirp::tcp_stream::{ConnState, Endpoints, Offer, tick_conn};
 use crate::slirp::udp::{SendFn as UdpSendFn, UdpConn};
 use crate::slirp::udp6::{SendFn as UdpSendFn6, UdpConn6};
 use crate::vtcp::alarm::Alarm;
+use crate::vtcp::ecn::IpEcn;
 use crate::vtcp::segment::{Segment, flags as tcp_flags};
 use crate::vtcp::{Conn, ConnConfig};
 use crate::{IpPrefix, Protocol, Result, connect_l3};
@@ -825,6 +826,8 @@ impl Stack {
         let src_port = u16::from_be_bytes([tcp[0], tcp[1]]);
         let dst_port = u16::from_be_bytes([tcp[2], tcp[3]]);
         let flags = tcp[13];
+        // The congestion marks the network put on it, for the engine.
+        let ecn = IpEcn::from_bits(crate::packet::ip_ecn(pkt));
 
         let key = Key {
             ns,
@@ -843,7 +846,7 @@ impl Stack {
         }
         if let Some(state) = virt {
             if let Ok(seg) = Segment::parse(tcp) {
-                state.deliver(&seg);
+                state.deliver_ecn(&seg, ecn);
             }
             if !state.complete_accept() {
                 inner.virt_tcp.lock().expect("poisoned").remove(&key);
@@ -856,7 +859,9 @@ impl Stack {
         if opens_connection(flags) {
             let listener = Self::find_listener(inner, dst, dst_port);
             if let Some(listener) = listener {
-                return Self::accept_syn_v4(inner, ns, tcp, src, dst, src_port, dst_port, listener);
+                return Self::accept_syn_v4(
+                    inner, ns, tcp, ecn, src, dst, src_port, dst_port, listener,
+                );
             }
         }
 
@@ -871,7 +876,7 @@ impl Stack {
             existing = None;
         }
         if let Some(c) = existing {
-            return c.handle_segment(tcp);
+            return c.handle_segment(tcp, ecn);
         }
 
         // The ACK completing a handshake a listener answered with a cookie?
@@ -941,7 +946,7 @@ impl Stack {
             remote_ip: src,
             remote_port: src_port,
         };
-        let conn = TcpOutConn::pending(endpoints, &seg, Self::mss(inner, false), sink);
+        let conn = TcpOutConn::pending(endpoints, &seg, ecn, Self::mss(inner, false), sink);
         conn.state().set_alarm(inner.alarm.clone());
         // Register before the dial can answer, so the client's ACK of the
         // SYN-ACK resolves to this connection rather than drawing a RST.
@@ -988,6 +993,7 @@ impl Stack {
         inner: &Arc<Inner>,
         ns: u64,
         tcp: &[u8],
+        ecn: IpEcn,
         src: Ipv4Addr,
         dst: Ipv4Addr,
         src_port: u16,
@@ -1007,7 +1013,16 @@ impl Stack {
             remote_ip: src,
             remote_port: src_port,
         };
-        Self::accept_syn(inner, ns, &inner.virt_tcp, key, endpoints, tcp, &listener)
+        Self::accept_syn(
+            inner,
+            ns,
+            &inner.virt_tcp,
+            key,
+            endpoints,
+            tcp,
+            ecn,
+            &listener,
+        )
     }
 
     /// Whether namespace `ns` may open no more virtual connections in `table`.
@@ -1034,7 +1049,9 @@ impl Stack {
     /// Passive-open a server-side `vtcp::Conn` for an inbound SYN to
     /// `listener`, register it in `table` and send the SYN-ACK. The
     /// connection joins the listener's queue when an inbound segment
-    /// completes the handshake (see `ConnState::complete_accept`).
+    /// completes the handshake (see `ConnState::complete_accept`). The SYN
+    /// arrived with IP-ECN codepoint `ecn`.
+    #[allow(clippy::too_many_arguments)]
     fn accept_syn<K: NsKey, L: Backlog>(
         inner: &Arc<Inner>,
         ns: u64,
@@ -1042,6 +1059,7 @@ impl Stack {
         key: K,
         endpoints: Endpoints,
         tcp: &[u8],
+        ecn: IpEcn,
         listener: &Arc<L>,
     ) -> Result<()> {
         if Self::virt_full(inner, ns, table) {
@@ -1070,7 +1088,7 @@ impl Stack {
             return Self::dispatch_fitted(inner, ns, &endpoints.wrap(&synack.marshal()));
         };
         let mut conn = Conn::new(Self::passive_config(inner, &endpoints));
-        let synack = conn.accept_syn(&seg);
+        let synack = conn.accept_syn_ecn(&seg, ecn);
         let state = ConnState::new_in(ns, endpoints, conn, Self::sink(inner, ns));
         state.set_alarm(inner.alarm.clone());
         Self::register_passive(table, key, state, listener, Some(slot), synack);
@@ -1303,6 +1321,8 @@ impl Stack {
         let src_port = u16::from_be_bytes([tcp[0], tcp[1]]);
         let dst_port = u16::from_be_bytes([tcp[2], tcp[3]]);
         let flags = tcp[13];
+        // The congestion marks the network put on it, for the engine.
+        let ecn = IpEcn::from_bits(crate::packet::ip_ecn(pkt));
 
         let key = Key6 {
             ns,
@@ -1321,7 +1341,7 @@ impl Stack {
         }
         if let Some(state) = virt {
             if let Ok(seg) = Segment::parse(tcp) {
-                state.deliver(&seg);
+                state.deliver_ecn(&seg, ecn);
             }
             if !state.complete_accept() {
                 inner.virt_tcp6.lock().expect("poisoned").remove(&key);
@@ -1334,7 +1354,9 @@ impl Stack {
         if opens_connection(flags) {
             let listener = Self::find_listener6(inner, dst, dst_port);
             if let Some(listener) = listener {
-                return Self::accept_syn_v6(inner, ns, tcp, src, dst, src_port, dst_port, listener);
+                return Self::accept_syn_v6(
+                    inner, ns, tcp, ecn, src, dst, src_port, dst_port, listener,
+                );
             }
         }
 
@@ -1347,7 +1369,7 @@ impl Stack {
             existing = None;
         }
         if let Some(c) = existing {
-            return c.handle_segment(tcp);
+            return c.handle_segment(tcp, ecn);
         }
 
         // The ACK completing a cookie handshake, as in the IPv4 path.
@@ -1409,7 +1431,7 @@ impl Stack {
             remote_ip: src,
             remote_port: src_port,
         };
-        let conn = TcpOutConn::pending(endpoints, &seg, Self::mss(inner, true), sink);
+        let conn = TcpOutConn::pending(endpoints, &seg, ecn, Self::mss(inner, true), sink);
         conn.state().set_alarm(inner.alarm.clone());
         // Register before the dial can answer (see the v4 path).
         inner
@@ -1445,6 +1467,7 @@ impl Stack {
         inner: &Arc<Inner>,
         ns: u64,
         tcp: &[u8],
+        ecn: IpEcn,
         src: Ipv6Addr,
         dst: Ipv6Addr,
         src_port: u16,
@@ -1464,7 +1487,16 @@ impl Stack {
             remote_ip: src,
             remote_port: src_port,
         };
-        Self::accept_syn(inner, ns, &inner.virt_tcp6, key, endpoints, tcp, &listener)
+        Self::accept_syn(
+            inner,
+            ns,
+            &inner.virt_tcp6,
+            key,
+            endpoints,
+            tcp,
+            ecn,
+            &listener,
+        )
     }
 
     fn handle_ipv6_udp(
@@ -4280,6 +4312,7 @@ mod tests {
                 remote_port: 5000,
             },
             &syn,
+            IpEcn::NOT_ECT,
             1460,
             Arc::new(|_: &[u8]| {}),
         );
@@ -4579,6 +4612,7 @@ mod tests {
                 remote_port: cport,
             },
             &syn,
+            IpEcn::NOT_ECT,
             1460,
             Arc::new(|_: &[u8]| {}),
         );
@@ -4822,5 +4856,78 @@ mod tests {
         assert_eq!(payloads(&captured), [vec![2; 10]]);
         stream.write(&[3; 10]).unwrap();
         assert_eq!(payloads(&captured), [vec![3; 10]]);
+    }
+
+    /// A guest asking for ECN gets it: the SYN-ACK accepts, the stack's
+    /// data goes out ECN-capable, and a CE mark on the guest's data comes
+    /// back as ECN-Echo.
+    #[test]
+    fn a_guest_asking_for_ecn_gets_it() {
+        let stack = Stack::new();
+        stack
+            .set_addr(IpPrefix::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 24))
+            .unwrap();
+        let captured = capture(&stack);
+        let (us, peer) = (Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 5));
+        let listener = stack.listen("tcp", "10.0.0.1:80").unwrap();
+        let send = |p: &[u8]| L3Device::send(&*stack, Packet::from_slice(p)).unwrap();
+        let syn = Segment {
+            src_port: 4001,
+            dst_port: 80,
+            seq: 1000,
+            flags: tcp_flags::SYN | tcp_flags::ECE | tcp_flags::CWR,
+            window: 32768,
+            options: vec![crate::vtcp::options::mss_option(1460)],
+            ..Default::default()
+        };
+        send(&crate::slirp::packet::build_packet4(
+            peer,
+            us,
+            &syn.marshal(),
+        ));
+        let pkt = captured.lock().unwrap().remove(0);
+        let synack = Segment::parse(&pkt[20..]).unwrap();
+        let ecn_flags = synack.flags & (tcp_flags::ECE | tcp_flags::CWR);
+        assert_eq!(ecn_flags, tcp_flags::ECE, "ECN not accepted");
+        assert_eq!(crate::packet::ip_ecn(&pkt), 0, "a SYN-ACK is not ECT");
+        let ack = synack.seq.wrapping_add(1);
+        send(&build_tcp_v4_packet(
+            peer,
+            4001,
+            us,
+            80,
+            1001,
+            ack,
+            tcp_flags::ACK,
+            &[],
+        ));
+        let stream = listener.accept().unwrap();
+        captured.lock().unwrap().clear();
+
+        stream.write(&[7; 100]).unwrap();
+        let pkt = captured.lock().unwrap().remove(0);
+        assert_eq!(Segment::parse(&pkt[20..]).unwrap().payload.len(), 100);
+        assert_eq!(crate::packet::ip_ecn(&pkt), 2, "data not ECT(0)");
+        assert_eq!(ipv4_header_checksum(&pkt[..20]), 0, "IP checksum");
+
+        // Marked on the way in: echoed.
+        let mut data = build_tcp_v4_packet(
+            peer,
+            4001,
+            us,
+            80,
+            1001,
+            ack.wrapping_add(100),
+            tcp_flags::ACK | tcp_flags::PSH,
+            &[1; 50],
+        );
+        crate::packet::set_ip_ecn(&mut data, 3);
+        send(&data);
+        let out = captured.lock().unwrap().clone();
+        assert!(
+            out.iter()
+                .any(|p| Segment::parse(&p[20..]).unwrap().has_flag(tcp_flags::ECE)),
+            "no ECN-Echo"
+        );
     }
 }

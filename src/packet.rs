@@ -111,6 +111,35 @@ pub(crate) fn skip_ipv6_ext(buf: &[u8], mut next_header: u8, mut offset: usize) 
 /// chain cannot make the walk unbounded.
 pub const MAX_EXT_HEADERS: usize = 16;
 
+/// The ECN field (RFC 3168 §5) of the IPv4 or IPv6 header `pkt` starts
+/// with; zero (Not-ECT) for anything else.
+#[cfg_attr(not(any(feature = "vclient", feature = "slirp")), allow(dead_code))]
+pub(crate) fn ip_ecn(pkt: &[u8]) -> u8 {
+    match (pkt.first().map(|b| b >> 4), pkt.get(1)) {
+        (Some(4), Some(b)) => b & 3,
+        (Some(6), Some(b)) => (b >> 4) & 3,
+        _ => 0,
+    }
+}
+
+/// Set the ECN field of the IPv4 or IPv6 header `pkt` starts with,
+/// keeping an IPv4 header checksum right. Anything else is left alone.
+#[cfg_attr(not(any(feature = "vclient", feature = "slirp")), allow(dead_code))]
+pub(crate) fn set_ip_ecn(pkt: &mut [u8], ecn: u8) {
+    let ecn = ecn & 3;
+    match pkt.first().map(|b| b >> 4) {
+        Some(4) if pkt.len() >= 20 => {
+            let old = [pkt[0], pkt[1]];
+            pkt[1] = (pkt[1] & 0xFC) | ecn;
+            let sum = u16::from_be_bytes([pkt[10], pkt[11]]);
+            let new = crate::checksum::incremental_update(sum, &old, &[pkt[0], pkt[1]]);
+            pkt[10..12].copy_from_slice(&new.to_be_bytes());
+        }
+        Some(6) if pkt.len() >= 2 => pkt[1] = (pkt[1] & 0xCF) | (ecn << 4),
+        _ => {}
+    }
+}
+
 /// A raw IP packet (no Ethernet header).
 ///
 /// `Packet` is a `#[repr(transparent)]` newtype around `[u8]`. Accessors are
@@ -1345,6 +1374,26 @@ mod tests {
         p.set_ipv4_dst_addr(Ipv4Addr::new(192, 168, 1, 3));
         assert_eq!(p.ipv4_src_addr(), Some(Ipv4Addr::new(192, 168, 1, 2)));
         assert_eq!(p.ipv4_dst_addr(), Some(Ipv4Addr::new(192, 168, 1, 3)));
+    }
+
+    #[test]
+    fn ecn_field_of_either_version() {
+        let mut v4 = v4_min();
+        v4[1] = 46 << 2;
+        let cs = checksum(&v4[..20]);
+        v4[10..12].copy_from_slice(&cs.to_be_bytes());
+        set_ip_ecn(&mut v4, 3);
+        assert_eq!(ip_ecn(&v4), 3);
+        assert_eq!(v4[1] >> 2, 46, "DSCP kept");
+        assert_eq!(checksum(&v4[..20]), 0, "checksum kept right");
+        let mut v6 = vec![0u8; 40];
+        v6[0] = 0x6A;
+        v6[1] = 0x5F;
+        set_ip_ecn(&mut v6, 2);
+        assert_eq!(ip_ecn(&v6), 2);
+        assert_eq!(Packet::from_slice(&v6).ipv6_ecn(), 2);
+        assert_eq!((v6[0], v6[1] & 0xCF), (0x6A, 0x4F), "the rest kept");
+        assert_eq!(ip_ecn(&[]), 0);
     }
 
     #[test]

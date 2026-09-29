@@ -65,7 +65,10 @@ impl IpEcn {
 
     /// The codepoint of the two low bits of `bits`.
     #[inline]
-    #[cfg_attr(not(feature = "fuzzing"), allow(dead_code))]
+    #[cfg_attr(
+        not(any(feature = "vclient", feature = "slirp", feature = "fuzzing")),
+        allow(dead_code)
+    )]
     pub fn from_bits(bits: u8) -> IpEcn {
         IpEcn(bits & 3)
     }

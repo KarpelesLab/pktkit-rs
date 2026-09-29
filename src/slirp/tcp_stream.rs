@@ -12,6 +12,7 @@
 
 use crate::time::Instant;
 use crate::vtcp::alarm::Alarm;
+use crate::vtcp::ecn::IpEcn;
 use crate::vtcp::segment::Segment;
 use crate::vtcp::{Conn, State};
 use std::collections::VecDeque;
@@ -43,6 +44,19 @@ impl Endpoints {
     /// Wrap a marshaled TCP segment in IP with correct checksums. The segment
     /// travels local→remote (server→client).
     pub(crate) fn wrap(&self, seg: &[u8]) -> Vec<u8> {
+        self.wrap_ecn(seg, IpEcn::NOT_ECT)
+    }
+
+    /// [`wrap`](Self::wrap), with IP-ECN codepoint `ecn`.
+    pub(crate) fn wrap_ecn(&self, seg: &[u8], ecn: IpEcn) -> Vec<u8> {
+        let mut pkt = self.wrap_plain(seg);
+        if ecn != IpEcn::NOT_ECT {
+            crate::packet::set_ip_ecn(&mut pkt, ecn.0);
+        }
+        pkt
+    }
+
+    fn wrap_plain(&self, seg: &[u8]) -> Vec<u8> {
         match self {
             Endpoints::V4 {
                 local_ip,
@@ -129,8 +143,8 @@ pub(crate) struct ConnState {
     pending_accept: Mutex<Option<PendingAccept>>,
     /// The latest segment that would have completed the handshake had the
     /// listener had room (see [`held_back`](Self::held_back)), delivered
-    /// once it has.
-    held: Mutex<Option<Segment>>,
+    /// once it has, and its IP-ECN codepoint.
+    held: Mutex<Option<(Segment, IpEcn)>>,
     /// Why the connection ended, if not by an orderly close: a reset from
     /// the peer, or our timers giving up. Reads report it instead of a clean
     /// end of stream, so a truncated transfer is not mistaken for a whole one.
@@ -140,7 +154,8 @@ pub(crate) struct ConnState {
 /// See [`ConnState::emit`].
 #[derive(Default)]
 struct Outbox {
-    segs: VecDeque<Vec<u8>>,
+    /// Each with the IP-ECN codepoint it goes out with.
+    segs: VecDeque<(Vec<u8>, IpEcn)>,
     /// A thread is feeding the sink from `segs`.
     emitting: bool,
 }
@@ -247,7 +262,7 @@ impl ConnState {
     /// that deadline waiting on backed-off retransmissions while `accept`
     /// sat idle, so the segment is kept (the latest one, which a later one
     /// replaces) and delivered as soon as `accept` makes room.
-    fn held_back(self: &Arc<Self>, seg: &Segment) -> bool {
+    fn held_back(self: &Arc<Self>, seg: &Segment, ecn: IpEcn) -> bool {
         use crate::vtcp::segment::flags;
         if seg.flags & (flags::ACK | flags::SYN | flags::RST) != flags::ACK {
             return false;
@@ -260,7 +275,7 @@ impl ConnState {
             self.conn.lock().expect("poisoned").state() == State::SynReceived && (p.hold)(self);
         // Let in, this one completes the handshake, and one held earlier
         // would only come after it as a stale duplicate.
-        *self.held.lock().expect("poisoned") = hold.then(|| seg.clone());
+        *self.held.lock().expect("poisoned") = hold.then(|| (seg.clone(), ecn));
         hold
     }
 
@@ -285,8 +300,8 @@ impl ConnState {
         // Taken before the pending lock, which delivering it takes. Held
         // back again if there is still no room.
         let held = self.held.lock().expect("poisoned").take();
-        if let Some(seg) = held {
-            self.deliver(&seg);
+        if let Some((seg, ecn)) = held {
+            self.deliver_ecn(&seg, ecn);
         }
         // The offer is made under the lock, which the tick also takes to
         // expire the handshake, so the listener never gets a connection that
@@ -343,6 +358,16 @@ impl ConnState {
     /// Whatever made the segments may also have moved the connection's next
     /// timer, which the tick thread learns here.
     pub(crate) fn emit(&self, conn: MutexGuard<'_, Conn>, segs: Vec<Vec<u8>>) {
+        let marks = conn.ecn_marks(&segs);
+        self.emit_marked(conn, segs.into_iter().zip(marks));
+    }
+
+    /// [`emit`](Self::emit) for segments with their codepoints.
+    fn emit_marked(
+        &self,
+        conn: MutexGuard<'_, Conn>,
+        segs: impl IntoIterator<Item = (Vec<u8>, IpEcn)>,
+    ) {
         if let Some(alarm) = self.alarm.get() {
             alarm.arm(conn.next_deadline());
         }
@@ -353,9 +378,9 @@ impl ConnState {
             return;
         }
         out.emitting = true;
-        while let Some(seg) = out.segs.pop_front() {
+        while let Some((seg, ecn)) = out.segs.pop_front() {
             drop(out);
-            let pkt = self.endpoints.wrap(&seg);
+            let pkt = self.endpoints.wrap_ecn(&seg, ecn);
             (self.sink)(&pkt);
             out = self.outbox.lock().expect("poisoned");
         }
@@ -365,19 +390,27 @@ impl ConnState {
     /// Transmit segments made without the engine (or before anything else
     /// could reach it), after whatever it has queued already.
     pub(crate) fn send(&self, segs: Vec<Vec<u8>>) {
-        self.emit(self.conn.lock().expect("poisoned"), segs);
+        let conn = self.conn.lock().expect("poisoned");
+        self.emit_marked(conn, segs.into_iter().map(|s| (s, IpEcn::NOT_ECT)));
     }
 
-    /// Feed an inbound segment to the engine, transmit its replies, and wake
-    /// any blocked reader/writer.
+    /// [`deliver_ecn`](Self::deliver_ecn) for a segment without ECN marks.
+    #[cfg(test)]
     pub(crate) fn deliver(self: &Arc<Self>, seg: &Segment) {
-        if self.held_back(seg) {
+        self.deliver_ecn(seg, IpEcn::NOT_ECT);
+    }
+
+    /// Feed an inbound segment, which arrived with IP-ECN codepoint `ecn`,
+    /// to the engine, transmit its replies, and wake any blocked
+    /// reader/writer.
+    pub(crate) fn deliver_ecn(self: &Arc<Self>, seg: &Segment, ecn: IpEcn) {
+        if self.held_back(seg, ecn) {
             return;
         }
         let mut conn = self.conn.lock().expect("poisoned");
         // A FIN before the RST means the stream had already ended whole.
         let ended = conn.fin_received();
-        let segs = conn.handle_segment(seg);
+        let segs = conn.handle_segment_ecn(seg, ecn);
         if seg.has_flag(crate::vtcp::segment::flags::RST) && conn.is_closed() && !ended {
             self.fail(io::ErrorKind::ConnectionReset);
         }

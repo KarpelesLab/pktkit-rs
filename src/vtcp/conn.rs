@@ -1081,7 +1081,7 @@ impl Conn {
     /// just returned (from any call, and before the next): what the IP
     /// layer sets in each one's header. Not-ECT for all if they are not
     /// what it returned.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(any(feature = "vclient", feature = "slirp")), allow(dead_code))]
     pub(crate) fn ecn_marks(&self, segs: &[Vec<u8>]) -> Vec<IpEcn> {
         if self.last_marks.len() == segs.len() {
             self.last_marks.clone()

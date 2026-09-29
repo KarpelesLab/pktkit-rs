@@ -15,6 +15,7 @@
 //! which [`Client::next_timer`](super::Client::next_timer) says when to do.
 
 use crate::time::Instant;
+use crate::vtcp::ecn::IpEcn;
 use crate::vtcp::segment::flags;
 use crate::vtcp::syncookie::SynCookies;
 use crate::vtcp::{Conn, ConnConfig, State, segment::Segment};
@@ -170,10 +171,15 @@ impl ConnState {
         if segments.is_empty() {
             return;
         }
+        // Each goes out with the ECN codepoint the engine asked for.
+        let marks = conn.ecn_marks(&segments);
         let mut out = self.outbox.lock().unwrap();
-        for seg in segments {
-            out.queue
-                .push_back(wrap_segment(self.local_ip, self.key.remote, &seg));
+        for (seg, ecn) in segments.iter().zip(marks) {
+            let mut pkt = wrap_segment(self.local_ip, self.key.remote, seg);
+            if ecn != IpEcn::NOT_ECT {
+                crate::packet::set_ip_ecn(&mut pkt, ecn.0);
+            }
+            out.queue.push_back(pkt);
         }
     }
 
@@ -1108,6 +1114,8 @@ impl TcpStack {
             Ok(s) => s,
             Err(_) => return false,
         };
+        // The congestion marks the network put on it, for the engine.
+        let ecn = IpEcn::from_bits(crate::packet::ip_ecn(pkt));
         // Inbound: packet src=remote, dst=us. Key uses remote = src.
         let key = ConnKey {
             local_port: seg.dst_port,
@@ -1145,7 +1153,7 @@ impl TcpStack {
                 // stream that had ended from one cut short.
                 let ended = conn.fin_received();
                 let segs = if state.admit(&seg) {
-                    conn.handle_segment(&seg)
+                    conn.handle_segment_ecn(&seg, ecn)
                 } else {
                     // Its ACK and window still count; the data, and a FIN
                     // that follows it, the peer sends again.
@@ -1154,7 +1162,7 @@ impl TcpStack {
                         flags: seg.flags & !(flags::FIN | flags::PSH),
                         ..seg.clone()
                     };
-                    conn.handle_segment(&bare)
+                    conn.handle_segment_ecn(&bare, ecn)
                 };
                 // Noted under the lock, before sending anything: the reply
                 // can loop back through a synchronous link and close the
@@ -1200,7 +1208,7 @@ impl TcpStack {
                     // its SYN, and by then the application may have made
                     // room.
                 } else if let Some(pending) = listener.reserve_half_open() {
-                    self.accept_syn(pending, dst, src, &seg);
+                    self.accept_syn(pending, dst, src, &seg, ecn);
                 } else {
                     // The backlog is full, which is what a SYN flood looks
                     // like: answer with a cookie and keep no state, so the
@@ -1284,9 +1292,10 @@ impl TcpStack {
         local_ip: IpAddr,
         remote: IpAddr,
         syn: &Segment,
+        ecn: IpEcn,
     ) {
         let mut conn = Conn::new(passive_config(local_ip, remote, syn, self.mss_for(remote)));
-        let synack = conn.accept_syn(syn);
+        let synack = conn.accept_syn_ecn(syn, ecn);
         let key = passive_key(remote, syn);
         let state = ConnState::new(
             key,
@@ -2566,5 +2575,49 @@ mod tests {
             late += gap - rto;
         }
         assert!(late / 3 < Duration::from_millis(40), "late by {late:?}");
+    }
+
+    /// A peer asking for ECN gets it: the SYN-ACK accepts, our data goes
+    /// out ECN-capable, and a CE mark on the peer's data comes back as
+    /// ECN-Echo.
+    #[test]
+    fn a_peer_asking_for_ecn_gets_it() {
+        let (stack, out) = capturing_stack();
+        let listener = stack.listen(own(US), 80).unwrap();
+        let feed = |seg: Segment, ecn: u8| {
+            let mut pkt = inbound(seg);
+            crate::packet::set_ip_ecn(&mut pkt, ecn);
+            stack.handle_inbound(Packet::from_slice(&pkt), IpAddr::V4(US));
+        };
+        let mut syn = syn_from(4002);
+        syn.flags |= flags::ECE | flags::CWR;
+        feed(syn, 0);
+        let synack = last_sent(&out);
+        assert_eq!(synack.flags, flags::SYN | flags::ACK | flags::ECE);
+        let ack = |seq: u32, payload: Vec<u8>| Segment {
+            src_port: 4002,
+            dst_port: 80,
+            seq,
+            ack: synack.seq.wrapping_add(1),
+            flags: flags::ACK,
+            window: 65535,
+            payload,
+            ..Default::default()
+        };
+        feed(ack(2, Vec::new()), 0);
+        let conn = listener.accept().unwrap();
+        out.lock().unwrap().clear();
+        conn.write(&[9; 100]).unwrap();
+        {
+            let out = out.lock().unwrap();
+            let pkt = Packet::from_slice(out.last().unwrap());
+            assert_eq!(pkt.payload().len(), 20 + 100);
+            assert_eq!(pkt.ipv4_ecn(), 2, "data not ECT(0)");
+            assert_eq!(crate::checksum::checksum(&pkt[..20]), 0);
+            assert_eq!(pkt.verify_transport_checksum(), Some(true));
+        }
+        out.lock().unwrap().clear();
+        feed(ack(2, vec![1; 50]), 3);
+        assert!(last_sent(&out).has_flag(flags::ECE), "no ECN-Echo");
     }
 }

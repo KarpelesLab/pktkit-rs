@@ -29,6 +29,7 @@
 use crate::Result;
 use crate::slirp::tcp_stream::{ConnState, Endpoints};
 use crate::time::Instant;
+use crate::vtcp::ecn::IpEcn;
 use crate::vtcp::segment::Segment;
 use crate::vtcp::{Conn, ConnConfig, State};
 
@@ -89,6 +90,8 @@ pub(crate) struct TcpOutConn {
     /// The client's SYN, kept while the real destination is being dialed and
     /// taken once the dial finishes.
     syn: Mutex<Option<Segment>>,
+    /// The IP-ECN codepoint the SYN arrived with, for the SYN-ACK.
+    syn_ecn: IpEcn,
     /// When the stack's tick first saw the virtual side in TIME-WAIT; the
     /// oldest go first when there are too many.
     time_wait_since: OnceLock<Instant>,
@@ -115,6 +118,7 @@ impl TcpOutConn {
     pub(crate) fn pending(
         endpoints: Endpoints,
         syn: &Segment,
+        syn_ecn: IpEcn,
         mss: u16,
         sink: Arc<dyn Fn(&[u8]) + Send + Sync>,
     ) -> Arc<TcpOutConn> {
@@ -167,6 +171,7 @@ impl TcpOutConn {
             remote: Mutex::new(None),
             closed: Arc::new(AtomicBool::new(false)),
             syn: Mutex::new(Some(syn.clone())),
+            syn_ecn,
             time_wait_since: OnceLock::new(),
             on_orphan: Mutex::new(None),
             handshake: Mutex::new(None),
@@ -256,7 +261,7 @@ impl TcpOutConn {
         *self.handshake.lock().expect("poisoned") =
             Some((Instant::now() + HANDSHAKE_TIMEOUT, remote_read));
         let mut conn = self.state.conn.lock().expect("poisoned");
-        let synack = conn.accept_syn(syn);
+        let synack = conn.accept_syn_ecn(syn, self.syn_ecn);
         *pending = None;
         drop(pending);
         self.state.emit(conn, synack);
@@ -320,9 +325,10 @@ impl TcpOutConn {
         true
     }
 
-    /// Feed an inbound TCP segment from the virtual client into the engine and
-    /// transmit its replies. (Called from the stack's packet dispatch path.)
-    pub(crate) fn handle_segment(self: &Arc<Self>, tcp: &[u8]) -> Result<()> {
+    /// Feed an inbound TCP segment from the virtual client, which arrived
+    /// with IP-ECN codepoint `ecn`, into the engine and transmit its
+    /// replies. (Called from the stack's packet dispatch path.)
+    pub(crate) fn handle_segment(self: &Arc<Self>, tcp: &[u8], ecn: IpEcn) -> Result<()> {
         let Ok(seg) = Segment::parse(tcp) else {
             return Ok(());
         };
@@ -336,7 +342,7 @@ impl TcpOutConn {
             }
             return Ok(());
         }
-        self.state.deliver(&seg);
+        self.state.deliver_ecn(&seg, ecn);
         self.start_pumps();
         Ok(())
     }
@@ -684,6 +690,7 @@ mod tests {
                 remote_port: 5000,
             },
             &syn,
+            IpEcn::NOT_ECT,
             1460,
             Arc::new(|_: &[u8]| {}),
         );
