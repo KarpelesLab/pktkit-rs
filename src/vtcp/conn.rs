@@ -5126,15 +5126,26 @@ impl Conn {
     }
 
     /// Immediate teardown: mark the connection closed and return a RST for
-    /// the peer. From SYN-SENT no RST is sent, as RFC 9293 §3.10.5 has it:
-    /// the peer has acknowledged nothing, so it holds nothing to reset.
-    /// Nothing is sent from CLOSED either.
+    /// the peer, where RFC 9293 §3.10.5 has one sent: from SYN-RECEIVED,
+    /// ESTABLISHED, FIN-WAIT-1, FIN-WAIT-2 and CLOSE-WAIT. Not from
+    /// SYN-SENT, where the peer has acknowledged nothing and so holds
+    /// nothing to reset, nor from CLOSING, LAST-ACK or TIME-WAIT, where
+    /// both ends have closed and a reset would only cut the peer's own
+    /// closing short (Linux's `tcp_need_reset` is the same list). Nothing
+    /// is sent from LISTEN or CLOSED either.
     pub fn abort(&mut self) -> Vec<Vec<u8>> {
         self.clock();
         if self.state == State::Closed {
             return Vec::new();
         }
-        let was_established = self.state != State::Closed && self.state != State::SynSent;
+        let was_established = matches!(
+            self.state,
+            State::SynReceived
+                | State::Established
+                | State::FinWait1
+                | State::FinWait2
+                | State::CloseWait
+        );
         let snd_nxt = self.send_buf.as_ref().map(|s| s.nxt()).unwrap_or(0);
         self.tear_down(State::Closed);
         if was_established {
@@ -5563,6 +5574,41 @@ mod tests {
         assert_eq!(pkts.len(), 1);
         let rst = parse(&pkts[0]);
         assert!(rst.has_flag(flags::RST));
+    }
+
+    /// Aborted once both ends have closed (a vclient torn down with
+    /// connections in TIME-WAIT, say), nothing goes out: RFC 9293 §3.10.5
+    /// sends a reset only from the states where the peer may still be
+    /// waiting on us.
+    #[test]
+    fn abort_after_both_fins_sends_nothing() {
+        let (mut client, mut server) = established(40008);
+        let fin = client.close();
+        let mut back = deliver(&mut server, &fin);
+        back.extend(server.close());
+        let last_ack = deliver(&mut client, &back);
+        assert_eq!(client.state(), State::TimeWait);
+        assert!(client.abort().is_empty(), "RST from TIME-WAIT");
+        assert_eq!(client.state(), State::Closed);
+        // LAST-ACK, its FIN not yet acknowledged.
+        assert_eq!(server.state(), State::LastAck);
+        assert!(server.abort().is_empty(), "RST from LAST-ACK");
+        drop(last_ack);
+
+        // Simultaneous close: CLOSING.
+        let (mut a, mut b) = established(40009);
+        let fa = a.close();
+        let fb = b.close();
+        deliver(&mut a, &fb);
+        assert_eq!(a.state(), State::Closing);
+        assert!(a.abort().is_empty(), "RST from CLOSING");
+        drop(fa);
+
+        // Still owed something, the peer gets its reset.
+        let (mut c, _s) = established(40010);
+        c.close();
+        assert_eq!(c.state(), State::FinWait1);
+        assert_eq!(c.abort().len(), 1);
     }
 
     #[test]
