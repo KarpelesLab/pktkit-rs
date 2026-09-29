@@ -6,6 +6,29 @@ semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+## [0.1.10](https://github.com/KarpelesLab/pktkit-rs/compare/v0.1.9...v0.1.10) - 2026-09-29
+
+### Added
+
+- *(vtcp)* TcpInfo reports what the handshake agreed on
+- *(vtcp)* TcpInfo, a snapshot of a connection's internals
+
+### Fixed
+
+- *(interop)* measure slow start over long paths; report the grown buffer
+- *(impair, vtcp)* timer threads wake on time on macOS
+- *(interop)* the guest never outlives the harness
+- *(vtcp)* AccECN no longer reads Linux's thinned ACKs as all CE
+- *(vtcp)* no reset from an abort once both ends have closed
+- *(vtcp)* no_window_scaling leaves the option out
+- *(vclient,slirp)* stop waking blocked handles for every segment
+
+### Other
+
+- take wall-clock bounds out of the default suite
+- run the interop suite against Linux under KVM
+- *(interop)* vtcp against a real Linux TCP, in QEMU
+
 ## [0.1.9](https://github.com/KarpelesLab/pktkit-rs/compare/v0.1.8...v0.1.9) - 2026-09-29
 
 ### Added
