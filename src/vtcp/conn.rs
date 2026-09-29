@@ -5014,7 +5014,7 @@ fn prr_sndcnt(
 #[inline]
 fn wall_clock() -> Instant {
     #[cfg(test)]
-    return Instant::now() + tests::skew();
+    return tests::clock();
     #[cfg(not(test))]
     Instant::now()
 }
@@ -5043,11 +5043,32 @@ mod tests {
 
     thread_local! {
         static SKEW: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
+        /// Set by [`freeze`]: the clock no longer follows the real one.
+        static FROZEN: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
     }
 
     /// How far this thread's connections' clock is ahead of the real one.
-    pub(super) fn skew() -> Duration {
+    fn skew() -> Duration {
         SKEW.with(|s| s.get())
+    }
+
+    /// The clock this thread's connections read: the real one moved on by
+    /// [`advance`], or, once [`freeze`] has been called, a clock that moves
+    /// only by [`advance`].
+    pub(super) fn clock() -> Instant {
+        FROZEN.with(|f| f.get()).unwrap_or_else(Instant::now) + skew()
+    }
+
+    /// Stop this thread's clock where it is: from here on only [`advance`]
+    /// moves it. A simulation that asserts on rates or on how far a search
+    /// got in so much simulated time must not also see the real time its
+    /// own computation takes, which a loaded CI runner stretches.
+    fn freeze() {
+        FROZEN.with(|f| {
+            if f.get().is_none() {
+                f.set(Some(Instant::now()));
+            }
+        });
     }
 
     /// Move this thread's connections' clock on by `d`.
@@ -5057,7 +5078,7 @@ mod tests {
 
     /// The time as this thread's connections see it.
     fn test_now() -> Instant {
-        Instant::now() + skew()
+        clock()
     }
 
     fn cfg(local: u16, remote: u16) -> ConnConfig {
@@ -9517,6 +9538,9 @@ mod tests {
 
     impl Path {
         fn new(conf: ConnConfig, rate: f64, queue: f64, delay: Duration, port: u16) -> Path {
+            // Simulated time only: its rates and deadlines must not depend
+            // on how fast this machine runs the simulation.
+            freeze();
             let mut a = Conn::new(conf.clone().local_port(port).remote_port(80));
             let b = Conn::new(conf.local_port(80).remote_port(port).recv_buf_max(64 << 20));
             let syn = a.connect();

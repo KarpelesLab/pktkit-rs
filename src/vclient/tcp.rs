@@ -2760,10 +2760,12 @@ mod tests {
         assert_eq!(stack.next_deadline(), Some(rto));
     }
 
-    /// The tick thread retransmits as the RTO runs out, not on the next of
-    /// a fixed interval's polls, which would add up to that interval to
-    /// every timeout: measured over three backed-off retransmissions, so
-    /// one late wakeup on a busy machine does not fail it.
+    /// The tick thread retransmits as each backed-off RTO runs out: never
+    /// early. How promptly is not measured here: a loaded CI runner wakes
+    /// threads late by more than any bound worth asserting.
+    /// `sending_data_arms_the_alarm_with_the_rto` checks, without a clock,
+    /// that the thread is woken for the deadline rather than a fixed poll;
+    /// the bound below only catches timers that do not fire at all.
     #[cfg(not(target_family = "wasm"))]
     #[test]
     fn retransmissions_go_out_when_the_rto_runs_out() {
@@ -2787,14 +2789,15 @@ mod tests {
         let t = sends();
         // After a round trip of next to nothing, the RTO starts from its
         // 200 ms floor and doubles with each timeout.
-        let mut late = Duration::ZERO;
         for (i, rto) in [200, 400, 800].into_iter().enumerate() {
             let gap = t[i + 1] - t[i];
             let rto = Duration::from_millis(rto);
             assert!(gap >= rto, "retransmission {i} early: {gap:?}");
-            late += gap - rto;
+            assert!(
+                gap < rto + Duration::from_secs(1),
+                "retransmission {i} not sent when due: {gap:?}"
+            );
         }
-        assert!(late / 3 < Duration::from_millis(40), "late by {late:?}");
     }
 
     /// A peer asking for ECN gets it: the SYN-ACK accepts, our data goes
