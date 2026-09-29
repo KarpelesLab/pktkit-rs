@@ -278,10 +278,14 @@ impl Ecn {
     }
 
     /// Server, in SYN-RECEIVED: the ACK completing the handshake. A pure
-    /// one reports the codepoint our SYN-ACK arrived with in its ACE field
-    /// (RFC 9768 §3.2.2.1, Table 4); one with data carries the count.
-    pub fn on_handshake_ack(&mut self, seg: &Segment) {
+    /// one acknowledging the SYN-ACK alone, `iss1`, reports the codepoint
+    /// our SYN-ACK arrived with in its ACE field (RFC 9768 §3.2.2.1, Table
+    /// 4), as the client's [`mark`](Self::mark) writes it; one with data,
+    /// or acknowledging what a Fast Open server sent after the SYN-ACK
+    /// (its first ACK lost), carries the count.
+    pub fn on_handshake_ack(&mut self, seg: &Segment, iss1: u32) {
         if self.fb != Feedback::Accurate
+            || seg.ack != iss1
             || !seg.payload.is_empty()
             || !get_sack_blocks(&seg.options).is_empty()
         {
@@ -648,7 +652,7 @@ mod tests {
         let mut a = ack(1);
         assert_eq!(client.mark(&mut a, false), IpEcn::ECT0);
         assert_eq!(ace(&a), 0b010);
-        server.on_handshake_ack(&a);
+        server.on_handshake_ack(&a, 1);
         assert!(server.ect && server.respond);
         // Later ACKs carry the count, 5.
         let mut b = ack(100);
@@ -656,7 +660,7 @@ mod tests {
         assert_eq!(ace(&b), CEP_INIT);
 
         let (_, mut server) = accurate_pair();
-        server.on_handshake_ack(&ack(1));
+        server.on_handshake_ack(&ack(1), 1);
         assert!(!server.ect && !server.respond, "zeroed ACE not caught");
 
         // A CE-marked SYN-ACK: counted by the client, and reported.
@@ -666,7 +670,7 @@ mod tests {
         client.mark(&mut a, false);
         assert_eq!(ace(&a), 0b110);
         let (_, mut server) = accurate_pair();
-        server.on_handshake_ack(&a);
+        server.on_handshake_ack(&a, 1);
         let mut b = ack(100);
         client.mark(&mut b, false);
         // The count went up by one, which the server expects.

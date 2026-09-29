@@ -2589,7 +2589,7 @@ impl Conn {
             .as_mut()
             .unwrap()
             .acknowledge(una.wrapping_add(1));
-        self.ecn.on_handshake_ack(seg);
+        self.ecn.on_handshake_ack(seg, una.wrapping_add(1));
         // The SYN-ACK's round trip, unless it was resent (Karn).
         self.rtt_sampled |= self.rto.ack_received(seg.ack, self.now);
         self.retries = 0;
@@ -11019,6 +11019,33 @@ mod tests {
         };
         assert_eq!(out.len(), 1);
         assert_eq!(head(&out[0]), head(&synack[0]), "SYN-ACK not resent");
+    }
+
+    /// A Fast Open server's answer goes before the handshake completes.
+    /// The client's ACK of the SYN-ACK alone is lost; the next, of the
+    /// answer, carries the CE count, not the handshake code a pure ACK of
+    /// the SYN-ACK would (RFC 9768 Table 4): read as one, it would turn ECT
+    /// off, or have the count taken for a mangled path's.
+    #[test]
+    fn fast_open_accecn_takes_a_later_ack_as_a_count() {
+        let cookie = tfo_cookie(41165);
+        let mut c = Conn::new(tfo_cfg(41166, 80).ecn(EcnMode::Accurate));
+        let mut s = Conn::new(tfo_cfg(80, 41166).ecn(EcnMode::Accurate));
+        let (_, syn) = c.connect_fast_open(Some(&cookie), None, b"GET /");
+        let synack = s.accept_syn(&parse(&syn[0]));
+        assert!(s.fast_open_accepted());
+        assert_eq!(s.ecn.fb, Feedback::Accurate);
+        let (_, answer) = s.write(b"200 OK");
+        let _lost = c.handle_segment_ecn(&parse(&synack[0]), IpEcn::NOT_ECT);
+        let mut ack = c.handle_segment_ecn(&parse(&answer[0]), IpEcn::CE);
+        ack.extend(c.take_outgoing());
+        ack.extend(delack_expired(&mut c));
+        let a = parse(&ack[0]);
+        assert_ne!(a.ack, parse(&synack[0]).seq.wrapping_add(1));
+        s.handle_segment(&a);
+        assert_eq!(s.state(), State::Established);
+        assert!(s.ecn.ect, "the count read as a handshake code");
+        assert_eq!(s.ecn.sent_ce(), 1);
     }
 
     /// What a path that meddles with ECN leaves of it (RFC 9768 §3.1.5,
