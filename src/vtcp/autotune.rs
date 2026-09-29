@@ -5,8 +5,8 @@
 //! enough connections could add up to more memory than the host has. Like
 //! Linux's `tcp_mem`, one counter tracks what all connections have grown by
 //! together; once it reaches the budget, buffers stay where they are until
-//! other connections give some back. Running short only caps throughput:
-//! nothing fails.
+//! other connections give some back, which they do when they close and
+//! when they go idle. Running short only caps throughput: nothing fails.
 //!
 //! [`ConnConfig::autotune`]: super::ConnConfig::autotune
 
@@ -109,6 +109,16 @@ impl RcvSpace {
             rtt: None,
             rtt_mark: None,
         }
+    }
+
+    /// Measure afresh from `space`, as a new connection would: after the
+    /// buffer went back to its initial size, the most ever read in a
+    /// round trip would hold its growth off until the application read
+    /// more than that again.
+    pub(crate) fn restart(&mut self, space: usize, now: Instant) {
+        self.space = space.max(1);
+        self.mark = self.copied;
+        self.time = now;
     }
 
     /// Move the start of the current measurement `by` into the past, as if

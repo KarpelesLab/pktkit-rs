@@ -100,6 +100,11 @@ const MAX_QUICKACKS: u32 = 16;
 /// Minimum spacing of challenge ACKs and out-of-window duplicate ACKs on one
 /// connection (RFC 5961 §7); Linux's `tcp_invalid_ratelimit` default.
 const OOW_ACK_INTERVAL: Duration = Duration::from_millis(500);
+
+/// The least idle time after which a connection gives its buffer growth
+/// back: past a short pause, a request/response exchange would otherwise
+/// regrow its buffers for every response.
+const IDLE_SHED_MIN: Duration = Duration::from_secs(1);
 /// How long TS.Recent stays valid without being updated (RFC 7323 §5.5).
 /// A peer's timestamp clock may tick as fast as once per millisecond, so
 /// after about 24.8 days an idle connection's TS.Recent can no longer be
@@ -392,9 +397,11 @@ pub struct ConnConfig {
     /// one buffer per round trip: 1 MiB at 250 ms is 33 Mbit/s.
     ///
     /// Buffers only grow while data flows, and go back to their initial
-    /// sizes when the connection closes. What all connections grow by
-    /// together is bounded process-wide (256 MiB); past that they stay as
-    /// they are. On by default.
+    /// sizes when the connection closes, or once it has sat idle, nothing
+    /// buffered either way, for an RTO (at least a second); a receive
+    /// window already advertised stays open until the peer has used it.
+    /// What all connections grow by together is bounded process-wide
+    /// (256 MiB); past that they stay as they are. On by default.
     pub autotune: bool,
     /// How long FIN-WAIT-2 may go without hearing from the peer before the
     /// connection is reset, once it has been [released](Conn::release).
@@ -709,6 +716,10 @@ pub struct Conn {
     budget: &'static Budget,
     /// What this connection's buffers have grown by, drawn from `budget`.
     grown: usize,
+    /// The receive buffer's share of `grown`. Its limit may stand higher
+    /// after an idle spell gave the growth back: a window already
+    /// advertised is not taken back, and the limit settles as it is used.
+    rcv_grown: usize,
     /// The application's last write did not fit the send buffer (Linux's
     /// `SOCK_NOSPACE`): only then can a larger one help.
     snd_nospace: bool,
@@ -930,6 +941,7 @@ impl Conn {
             ack_pushed: false,
             budget: &autotune::GLOBAL,
             grown: 0,
+            rcv_grown: 0,
             snd_nospace: false,
             // What the peer's initial window brings in the first round trip.
             rcv_space: RcvSpace::new(10 * mss as usize),
@@ -2971,9 +2983,73 @@ impl Conn {
         if cur == 0 || want <= cur {
             return;
         }
-        let got = budget.reserve(want - cur);
-        rb.set_limit(cur + got);
+        // Charged from the initial size up: after an idle spell, some of
+        // the limit may be a window advertised before and no longer paid
+        // for.
+        let funded = self.cfg.recv_buf_size + self.rcv_grown;
+        let got = budget.reserve(want - funded);
+        self.rcv_grown += got;
         self.grown += got;
+        rb.set_limit(cur.max(funded + got));
+    }
+
+    /// Bring a receive limit left above what is paid for (after an idle
+    /// spell gave its growth back) down as far as the window already
+    /// advertised allows: that stays open, so the edge stands still until
+    /// the peer has filled it, and the window reopens no wider than paid.
+    fn settle_recv_limit(&mut self) {
+        let funded = self.cfg.recv_buf_size + self.rcv_grown;
+        let adv = self.rcv_adv;
+        let Some(rb) = self.recv_buf.as_mut() else {
+            return;
+        };
+        if rb.limit() <= funded {
+            return;
+        }
+        let nxt = rb.nxt();
+        let promised = adv
+            .filter(|&a| seq_after(a, nxt))
+            .map_or(0, |a| a.wrapping_sub(nxt) as usize);
+        rb.set_limit(rb.limit().min(funded.max(promised + rb.readable())));
+    }
+
+    /// When an idle connection gives back what its buffers grew by: once
+    /// nothing is buffered either way and no data has moved for an RTO (at
+    /// least a second), as long as the window restart after idle takes to
+    /// judge the path unknown again. Growth held by connections left open
+    /// and idle would otherwise be lost to the rest for as long as they
+    /// live, and a peer could open enough of them to take it all.
+    fn idle_shed_deadline(&self) -> Option<Instant> {
+        if self.grown == 0 || self.closed || !self.state.is_synchronized() {
+            return None;
+        }
+        let sb = self.send_buf.as_ref()?;
+        let rb = self.recv_buf.as_ref()?;
+        if sb.pending() > 0 || sb.unacked() > 0 || rb.readable() > 0 || rb.has_ooo() {
+            return None;
+        }
+        let last = match (self.last_data_sent, self.last_data_recv) {
+            (Some(a), Some(b)) => a.max(b),
+            (a, b) => a.or(b)?,
+        };
+        last.checked_add(self.rto.rto().max(IDLE_SHED_MIN))
+    }
+
+    /// Give back an idle connection's buffer growth (see
+    /// [`idle_shed_deadline`](Self::idle_shed_deadline)). The send buffer
+    /// is empty and goes straight back to its initial size; the receive
+    /// buffer's limit settles as the window already advertised allows.
+    /// Both grow again as the path calls for, the receiver's measure of
+    /// what a round trip carries starting afresh.
+    fn shed_idle_growth(&mut self) {
+        if let Some(sb) = self.send_buf.as_mut() {
+            sb.set_capacity(self.cfg.send_buf_size);
+        }
+        self.budget.release(std::mem::take(&mut self.grown));
+        self.rcv_grown = 0;
+        self.settle_recv_limit();
+        self.rcv_space
+            .restart(10 * self.cfg.mss.max(1) as usize, self.now);
     }
 
     /// Send-buffer auto-tuning after an ACK (Linux's `tcp_sndbuf_expand`):
@@ -3019,6 +3095,7 @@ impl Conn {
         if let Some(rb) = self.recv_buf.as_mut() {
             rb.set_limit(self.cfg.recv_buf_size);
         }
+        self.rcv_grown = 0;
         self.budget.release(std::mem::take(&mut self.grown));
     }
 
@@ -4554,6 +4631,7 @@ impl Conn {
             consider(self.persist_deadline);
             consider(self.keepalive_deadline);
             consider(self.delack_deadline);
+            consider(self.idle_shed_deadline());
         }
         consider(self.fin_wait2_deadline());
         next
@@ -4661,6 +4739,9 @@ impl Conn {
             && self.state != State::Closed
         {
             self.on_keepalive();
+        }
+        if self.idle_shed_deadline().is_some_and(|d| now >= d) {
+            self.shed_idle_growth();
         }
         // Delayed ACK, last: anything the timers above sent carried it.
         if let Some(d) = self.delack_deadline
@@ -5047,6 +5128,9 @@ impl Conn {
             return 0;
         };
         let n = rb.read(buf);
+        if n > 0 {
+            self.settle_recv_limit();
+        }
         if n > 0
             && self.cfg.autotune
             && matches!(
@@ -9328,8 +9412,20 @@ mod tests {
             );
         }
         if let Some(rb) = c.recv_buf.as_ref() {
-            let grown = (sb.capacity() - c.cfg.send_buf_size) + (rb.limit() - c.cfg.recv_buf_size);
-            assert_eq!(grown, c.grown, "{}: growth not accounted", ctx());
+            // The receive limit may stand above what is paid for, after an
+            // idle spell, but never below.
+            let snd = sb.capacity() - c.cfg.send_buf_size;
+            assert_eq!(
+                snd + c.rcv_grown,
+                c.grown,
+                "{}: growth not accounted",
+                ctx()
+            );
+            assert!(
+                rb.limit() >= c.cfg.recv_buf_size + c.rcv_grown,
+                "{}: receive growth not accounted",
+                ctx()
+            );
             assert!(
                 sb.capacity() <= c.cfg.send_max(),
                 "{}: send buffer past max",
@@ -9805,6 +9901,97 @@ mod tests {
         assert!(server.grown > 0);
         drop(server);
         assert_eq!(budget.used(), client.grown);
+    }
+
+    /// Stream `rounds` round trips from `tx` to `rx` as [`tuned_rounds`]
+    /// does, then let everything be delivered and acknowledged. Returns
+    /// each right edge `rx` advertised, in order.
+    fn tuned_run(tx: &mut Conn, rx: &mut Conn, rounds: usize) -> Vec<u32> {
+        let chunk = vec![7u8; 1 << 18];
+        let (_, mut out) = tx.write(&chunk);
+        let mut edges = Vec::new();
+        for i in 0..rounds + 20 {
+            advance(Duration::from_millis(5));
+            let mut acks = deliver(rx, &out);
+            rx.rcv_space.backdate(Duration::from_secs(1));
+            read_all(rx);
+            acks.extend(rx.take_outgoing());
+            acks.extend(delack_expired(rx));
+            for a in &acks {
+                let s = parse(a);
+                edges.push(s.ack.wrapping_add(u32::from(s.window) << rx.rcv_wnd_shift));
+            }
+            advance(Duration::from_millis(5));
+            out = deliver(tx, &acks);
+            if i < rounds {
+                out.extend(tx.write(&chunk).1);
+            } else if out.is_empty() && tx.send_buf.as_ref().unwrap().unacked() == 0 {
+                return edges;
+            }
+        }
+        panic!("never drained");
+    }
+
+    /// A connection left idle gives its buffer growth back, so that
+    /// connections held open and silent cannot keep the budget from the
+    /// rest. The window already advertised stays open: the receive limit
+    /// comes down behind it as it is used, and grows again as reading
+    /// calls for.
+    #[test]
+    fn idle_connection_gives_growth_back() {
+        freeze();
+        let (mut client, mut server) = tuned_pair(40509, tuned, 1 << 20);
+        let budget = client.budget;
+        tuned_run(&mut client, &mut server, 12);
+        assert!(client.grown > 0 && server.grown > 0);
+        // Another connection finds the budget taken.
+        let (mut c2, mut s2) = tuned_pair(40510, tuned, usize::MAX);
+        (c2.budget, s2.budget) = (budget, budget);
+        let held = budget.used();
+        assert!(held > 1 << 19, "{held}");
+
+        // A short pause keeps it.
+        advance(Duration::from_millis(500));
+        client.tick();
+        server.tick();
+        assert_eq!(budget.used(), held);
+        // Idle for longer, it goes back.
+        let rto = client.rto.rto().max(server.rto.rto());
+        advance(rto.max(IDLE_SHED_MIN));
+        let _ = client.tick();
+        let _ = server.tick();
+        assert_eq!((client.grown, server.grown, budget.used()), (0, 0, 0));
+        assert_eq!(client.send_buf.as_ref().unwrap().capacity(), 1 << 16);
+        let rb = server.recv_buf.as_ref().unwrap();
+        let promised = server.rcv_adv.unwrap().wrapping_sub(rb.nxt()) as usize;
+        assert!(rb.limit() >= promised, "window taken back");
+        // Nothing more to do: a driver does not spin on it.
+        assert!(server.next_deadline().is_none_or(|d| d > test_now()));
+        assert!(client.next_deadline().is_none_or(|d| d > test_now()));
+
+        // The other connection can grow now.
+        tuned_run(&mut c2, &mut s2, 12);
+        assert!(c2.grown > 0 && s2.grown > 0);
+        drop((c2, s2));
+
+        // Data moves again: the edge never goes back by a unit of the
+        // window scale or more (less is the rounding of a scaled window,
+        // not the limit's doing), the limit settles to what is paid for,
+        // and growth resumes.
+        let unit = 1u32 << server.rcv_wnd_shift;
+        let mut max = server.rcv_adv.unwrap();
+        for e in tuned_run(&mut client, &mut server, 12) {
+            assert!(
+                seq_after(e.wrapping_add(unit), max),
+                "edge went back from {max} to {e}"
+            );
+            if seq_after(e, max) {
+                max = e;
+            }
+        }
+        assert!(server.grown > 0, "no growth after the idle spell");
+        let rb = server.recv_buf.as_ref().unwrap();
+        assert_eq!(rb.limit(), (1 << 16) + server.rcv_grown);
     }
 
     /// next_deadline is the earliest timer tick() would act on, and
