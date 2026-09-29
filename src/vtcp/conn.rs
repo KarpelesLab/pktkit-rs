@@ -1957,8 +1957,10 @@ impl Conn {
         let avail = rb.window();
         let thresh = self.sws_thresh();
         // Receiver SWS avoidance (RFC 9293 §3.8.6.2.2): move the right edge
-        // only in steps of at least `thresh`, and never back — a shrinking
-        // window strands data the peer was already allowed to send.
+        // only in steps of at least `thresh`, and not back: a shrinking
+        // window strands data the peer was already allowed to send. Scaled,
+        // the edge can still come back by less than a unit (see
+        // `rcv_window`).
         let Some(adv) = self.rcv_adv else {
             return if avail < thresh { 0 } else { avail };
         };
@@ -1982,6 +1984,19 @@ impl Conn {
             // takes (RecvBuf::set_adv_edge). The edge is rounded from the
             // buffer's end each time, not from the last edge, so it never
             // passes that end by more, however often it is sent.
+            //
+            // So an edge already past the end, by less than a unit, comes
+            // back by less than a unit when RCV.NXT has moved by other than
+            // whole units, as RFC 7323 §2.4 and its Appendix F expect: the
+            // units count from RCV.NXT, and no whole number of them from
+            // there reaches the old edge without going past it. What the
+            // peer sends up to that edge is still taken (`rcv_space`, and
+            // the buffer's), as §2.4 requires. Going past it instead, as
+            // Linux does unless `tcp_shrink_window` is set, would move the
+            // edge on by what each segment falls short of a unit: against
+            // an application that has stopped reading, a sender whose
+            // segments are not whole units would never see the window
+            // close, and the buffer would grow without bound.
             w = w.div_ceil(1 << self.rcv_wnd_shift);
         }
         w.min(65535) as u16
@@ -9628,6 +9643,51 @@ mod tests {
         assert!(!pkts.is_empty());
         deliver(&mut server, &pkts);
         assert_eq!(server.recv_buf.as_ref().unwrap().readable(), 4496);
+    }
+
+    /// An application that stops reading closes the window, whatever the
+    /// sender's segment size: the edge may come back by less than a unit as
+    /// it closes (RFC 7323 §2.4), but not move on past the buffer, and
+    /// whatever the peer sent up to the furthest edge advertised is taken.
+    #[test]
+    fn a_scaled_window_closes_on_a_stalled_reader() {
+        let conf = |l, r| cfg(l, r).autotune(true).recv_buf_max(16 << 20);
+        let (mut client, mut server) = tuned_pair(40509, conf, usize::MAX);
+        let unit = 1u32 << server.rcv_wnd_shift;
+        assert!(unit > 1);
+        let limit = server.recv_buf.as_ref().unwrap().limit() as u32;
+        let (_, mut pkts) = client.write(&[1; 20_000]);
+        let (mut furthest, mut retracted) = (0u32, false);
+        for _ in 0..1000 {
+            if pkts.is_empty() {
+                advance(Duration::from_secs(1));
+                pkts = client.tick();
+                if pkts.is_empty() {
+                    break;
+                }
+            }
+            let acks = deliver(&mut server, &pkts);
+            for a in &acks {
+                let a = parse(a);
+                let edge = a.ack.wrapping_add(u32::from(a.window) * unit);
+                if seq_after(edge, furthest) || furthest == 0 {
+                    furthest = edge;
+                } else if seq_before(edge, furthest) {
+                    retracted = true;
+                    assert!(
+                        furthest.wrapping_sub(edge) < unit,
+                        "shrunk by a unit or more"
+                    );
+                }
+            }
+            pkts = deliver(&mut client, &acks);
+        }
+        let held = server.recv_buf.as_ref().unwrap().readable() as u32;
+        assert!(held < limit + unit, "{held} held for a buffer of {limit}");
+        assert_eq!(client.snd_wnd, 0, "the window never closed");
+        let sb = client.send_buf.as_ref().unwrap();
+        assert_eq!(sb.una(), sb.nxt(), "data sent within the window dropped");
+        assert!(retracted, "no edge came back: nothing tested");
     }
 
     /// The send buffer grows with cwnd while the application keeps it full,
