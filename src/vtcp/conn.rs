@@ -6600,7 +6600,10 @@ mod tests {
         );
         advance(rtt / 2);
         let acks = deliver(&mut server, &probe);
-        advance(rtt / 2);
+        // A little over the round trip: RACK takes no sample from a
+        // retransmission delivered sooner than the minimum RTT, and what
+        // the real clock adds between calls would decide which it is.
+        advance(rtt / 2 + Duration::from_millis(1));
         let mut out = deliver(&mut client, &acks);
         if out.is_empty() {
             // One SACKed segment: RACK waits out its reordering window.
