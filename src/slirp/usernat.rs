@@ -225,6 +225,8 @@ struct Inner {
     listeners6: Mutex<HashMap<ListenerKey6, Weak<Listener6>>>,
     // Per-namespace sides (each device attached via ConnectL3).
     ns_sides: Mutex<HashMap<u64, Arc<NsSide>>>,
+    /// Namespace 0's Fast Open cookie scope (see [`tfo_scope`]).
+    tfo_scope: u64,
     /// Namespace 0's share of the buffer auto-tuning budget, which it is
     /// held to once peers are attached (see [`budget_share`]).
     ns0_budget: Arc<Budget>,
@@ -264,6 +266,8 @@ pub struct NsSide {
     addr: RwLock<IpPrefix>,
     /// Its connections' share of the buffer auto-tuning budget.
     budget: Arc<Budget>,
+    /// Its Fast Open cookie scope (see [`tfo_scope`]).
+    tfo_scope: u64,
 }
 
 impl core::fmt::Debug for NsSide {
@@ -344,6 +348,7 @@ impl Stack {
             listeners6: Mutex::new(HashMap::new()),
             ns_sides: Mutex::new(HashMap::new()),
             ns0_budget: Arc::new(Budget::new(AUTOTUNE_BUDGET / NS_SHARE)),
+            tfo_scope: fastopen::new_scope(),
             ns_counter: AtomicU64::new(0),
             dials: Arc::new(Mutex::new(Dials::default())),
             defrag: Mutex::new(HashMap::new()),
@@ -986,9 +991,13 @@ impl Stack {
             sink,
         );
         conn.state().set_alarm(inner.alarm.clone());
-        if let Some(share) = budget_share(inner, ns) {
+        let (share, scope) = (budget_share(inner, ns), tfo_scope(inner, ns));
+        {
             let mut c = conn.state().conn.lock().expect("poisoned");
-            c.set_budget_share(share);
+            c.set_fast_open_scope(scope);
+            if let Some(share) = share {
+                c.set_budget_share(share);
+            }
         }
         // Register before the dial can answer, so the client's ACK of the
         // SYN-ACK resolves to this connection rather than drawing a RST.
@@ -1134,6 +1143,7 @@ impl Stack {
         // Fast Open data is readable before the handshake completes, which
         // takes a place in the accept queue at once.
         conn.set_fast_open_gate(Some(inner.fast_open_gate.clone()), listener.queue_full());
+        conn.set_fast_open_scope(tfo_scope(inner, ns));
         let synack = conn.accept_syn_ecn(&seg, ecn);
         let state = ConnState::new_in(ns, endpoints, conn, Self::sink(inner, ns));
         state.set_alarm(inner.alarm.clone());
@@ -1488,9 +1498,13 @@ impl Stack {
             sink,
         );
         conn.state().set_alarm(inner.alarm.clone());
-        if let Some(share) = budget_share(inner, ns) {
+        let (share, scope) = (budget_share(inner, ns), tfo_scope(inner, ns));
+        {
             let mut c = conn.state().conn.lock().expect("poisoned");
-            c.set_budget_share(share);
+            c.set_fast_open_scope(scope);
+            if let Some(share) = share {
+                c.set_budget_share(share);
+            }
         }
         // Register before the dial can answer (see the v4 path).
         inner
@@ -1797,6 +1811,7 @@ impl Stack {
             stack: self.inner.clone(),
             ns,
             budget: Arc::new(Budget::new(AUTOTUNE_BUDGET / NS_SHARE)),
+            tfo_scope: fastopen::new_scope(),
             handler: Mutex::new(None),
             addr: RwLock::new(*self.inner.addr.read().expect("poisoned")),
         });
@@ -1929,6 +1944,20 @@ fn budget_share(inner: &Inner, ns: u64) -> Option<Arc<Budget>> {
         return (!sides.is_empty()).then(|| inner.ns0_budget.clone());
     }
     sides.get(&ns).map(|s| s.budget.clone())
+}
+
+/// The scope of namespace `ns`'s Fast Open cookies. The guests choose
+/// their own addresses, and two may well be at the same one: a cookie is
+/// proof of a guest's address only in the namespace that issued it, so
+/// each namespace, of each stack, issues and takes its own.
+fn tfo_scope(inner: &Inner, ns: u64) -> u64 {
+    if ns == 0 {
+        return inner.tfo_scope;
+    }
+    let sides = inner.ns_sides.lock().expect("poisoned");
+    // A namespace detached as its SYN came in: a scope nobody's cookie is
+    // valid in.
+    sides.get(&ns).map_or(u64::MAX, |s| s.tfo_scope)
 }
 
 /// Hold `conn` to namespace `ns`'s share of the auto-tuning budget.
@@ -3811,6 +3840,57 @@ mod tests {
             held.keys().any(|k| k.src_port == 5555),
             "another namespace's SYN found no room"
         );
+    }
+
+    /// A Fast Open cookie proves a guest's address only in the namespace
+    /// that issued it: another guest at the same address, in another
+    /// namespace, cannot use it to have its SYN's data taken.
+    #[test]
+    fn fast_open_cookies_are_per_namespace() {
+        let s = Stack::new();
+        s.set_tcp(Tuning::default().fast_open(true));
+        let _l = s.listen("tcp", "10.0.0.1:80").unwrap();
+        let (ra, _ca, inject_a) = attach_recorder(&s);
+        let (rb, _cb, inject_b) = attach_recorder(&s);
+        let syn = |port: u16, cookie: &[u8], data: &[u8]| {
+            let seg = Segment {
+                src_port: port,
+                dst_port: 80,
+                seq: 1,
+                flags: tcp_flags::SYN,
+                window: 65535,
+                options: vec![fastopen::option(cookie)],
+                payload: data.to_vec(),
+                ..Default::default()
+            };
+            crate::slirp::packet::build_packet4(
+                Ipv4Addr::new(10, 0, 0, 5),
+                Ipv4Addr::new(10, 0, 0, 1),
+                &seg.marshal(),
+            )
+        };
+        let synack = |r: &Recorder| {
+            let got = r.got.lock().unwrap();
+            let p = got.last().expect("no SYN-ACK");
+            Segment::parse(Packet::from_slice(p).payload()).unwrap()
+        };
+        inject_a(Packet::from_slice(&syn(4000, &[], b""))).unwrap();
+        let reply = synack(&ra);
+        let cookie = match fastopen::offer(&reply.options) {
+            Some(fastopen::Offer::Cookie(c)) => c.to_vec(),
+            o => panic!("no cookie: {o:?}"),
+        };
+        // Good where it was issued: the data is taken.
+        inject_a(Packet::from_slice(&syn(4001, &cookie, b"GET /"))).unwrap();
+        assert_eq!(synack(&ra).ack, 7, "own namespace's cookie refused");
+        // No good in another namespace: only the SYN is.
+        inject_b(Packet::from_slice(&syn(4001, &cookie, b"GET /"))).unwrap();
+        let reply = synack(&rb);
+        assert_eq!(reply.ack, 2, "another namespace's cookie taken");
+        assert!(matches!(
+            fastopen::offer(&reply.options),
+            Some(fastopen::Offer::Cookie(c)) if c != cookie
+        ));
     }
 
     /// Each namespace's connections draw on a share of the buffer

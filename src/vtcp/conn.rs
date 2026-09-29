@@ -1589,6 +1589,13 @@ impl Conn {
         self.tfo.accepted
     }
 
+    /// Server side, before [`accept_syn`](Self::accept_syn): issue and take
+    /// Fast Open cookies in `scope` (see [`fastopen`]).
+    #[cfg_attr(any(not(feature = "slirp"), target_family = "wasm"), allow(dead_code))]
+    pub(crate) fn set_fast_open_scope(&mut self, scope: u64) {
+        self.tfo.scope = scope;
+    }
+
     /// Server side, before [`accept_syn`](Self::accept_syn): count this
     /// connection, if it takes Fast Open data, at `gate` rather than the
     /// process's, and take none at all if `refuse_data` (the driver has no
@@ -1723,8 +1730,10 @@ impl Conn {
             return None;
         };
         let (server, client) = (local.ip(), remote.ip());
-        if !matches!(offer, fastopen::Offer::Cookie(c) if fastopen::valid(server, client, c)) {
-            self.tfo.reply = Some(fastopen::cookie(server, client));
+        let scope = self.tfo.scope;
+        if !matches!(offer, fastopen::Offer::Cookie(c) if fastopen::valid(scope, server, client, c))
+        {
+            self.tfo.reply = Some(fastopen::cookie(scope, server, client));
             return Some(false);
         }
         if syn.payload.is_empty() || self.tfo.refuse_data {
@@ -9522,7 +9531,7 @@ mod tests {
         let syn = match sc.fast_open {
             0 => sides[0].conn.connect(),
             k => {
-                let valid = fastopen::cookie([10, 0, 0, 1].into(), [10, 0, 0, 2].into());
+                let valid = fastopen::cookie(0, [10, 0, 0, 1].into(), [10, 0, 0, 2].into());
                 let cookie = [None, Some(&valid[..]), Some(&[0xAA; 8][..])][k as usize - 1];
                 let s = &mut sides[0];
                 let (n, syn) = s.conn.connect_fast_open(cookie, None, &s.to_send);

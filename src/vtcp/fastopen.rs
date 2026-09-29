@@ -12,14 +12,18 @@
 //! The cookie's MAC is the keyed SipHash vtcp also derives its ISNs and SYN
 //! cookies from (see `secret`), which is what Linux has computed its Fast
 //! Open cookies with since 2019, when SipHash replaced AES there, over the
-//! server's and the client's address and a key generation. The generation
+//! server's and the client's address, a key generation, and the scope the
+//! server stands in: a driver serving several networks whose addresses may
+//! overlap (slirp's namespaces, as Linux keys its cookies per network
+//! namespace) gives each a scope of its own, so that a cookie earned in
+//! one is no good in another. The generation
 //! advances every [`KEY_PERIOD`], and a cookie of the one before is still
 //! taken: that is the key rotation RFC 7413 §4.1.2 asks for, with no key
 //! to change by hand. A client whose cookie has aged out is given a fresh
 //! one and pays a round trip once.
 
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -67,22 +71,35 @@ pub(crate) fn offer(opts: &[TcpOption]) -> Option<Offer<'_>> {
     }
 }
 
-fn mac(generation: u64, server: IpAddr, client: IpAddr) -> [u8; COOKIE_LEN] {
-    secret::keyed_hash(("tfo", generation, server, client)).to_be_bytes()
+fn mac(generation: u64, scope: u64, server: IpAddr, client: IpAddr) -> [u8; COOKIE_LEN] {
+    secret::keyed_hash(("tfo", generation, scope, server, client)).to_be_bytes()
+}
+
+/// A cookie scope no other has: see the module's documentation. Scope 0,
+/// which none of these is, is every server's that has none of its own.
+#[cfg_attr(any(not(feature = "slirp"), target_family = "wasm"), allow(dead_code))]
+pub(crate) fn new_scope() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 fn generation() -> u64 {
     secret::elapsed().as_secs() / KEY_PERIOD.as_secs()
 }
 
-/// The cookie for `client` at our address `server`.
-pub(crate) fn cookie(server: IpAddr, client: IpAddr) -> [u8; COOKIE_LEN] {
-    mac(generation(), server.to_canonical(), client.to_canonical())
+/// The cookie for `client` at our address `server`, in `scope`.
+pub(crate) fn cookie(scope: u64, server: IpAddr, client: IpAddr) -> [u8; COOKIE_LEN] {
+    mac(
+        generation(),
+        scope,
+        server.to_canonical(),
+        client.to_canonical(),
+    )
 }
 
-/// Whether `cookie` is one this process issued `client` at `server`, in
-/// this key generation or the last.
-pub(crate) fn valid(server: IpAddr, client: IpAddr, cookie: &[u8]) -> bool {
+/// Whether `cookie` is one this process issued `client` at `server` in
+/// `scope`, in this key generation or the last.
+pub(crate) fn valid(scope: u64, server: IpAddr, client: IpAddr, cookie: &[u8]) -> bool {
     if cookie.len() != COOKIE_LEN {
         return false;
     }
@@ -91,7 +108,7 @@ pub(crate) fn valid(server: IpAddr, client: IpAddr, cookie: &[u8]) -> bool {
     [Some(now), now.checked_sub(1)]
         .into_iter()
         .flatten()
-        .any(|g| same(&mac(g, server, client), cookie))
+        .any(|g| same(&mac(g, scope, server, client), cookie))
 }
 
 /// Constant-time comparison: how far a guess matched must not show in how
@@ -173,6 +190,8 @@ pub(crate) struct FastOpen {
     /// The cookie for our SYN-ACK: the SYN asked for one, or carried one
     /// no longer valid.
     pub reply: Option<[u8; COOKIE_LEN]>,
+    /// The scope our cookies are issued and taken in.
+    pub scope: u64,
     /// The SYN's data was taken: the connection holds `slot` until its
     /// handshake completes.
     pub accepted: bool,
@@ -189,32 +208,44 @@ mod tests {
 
     #[test]
     fn cookies_are_per_address_pair() {
-        let c = cookie(S, C);
-        assert!(valid(S, C, &c));
-        assert!(!valid(S, S, &c), "another client's");
-        assert!(!valid(C, C, &c), "another server's");
+        let c = cookie(0, S, C);
+        assert!(valid(0, S, C, &c));
+        assert!(!valid(0, S, S, &c), "another client's");
+        assert!(!valid(0, C, C, &c), "another server's");
         let mut bad = c;
         bad[0] ^= 1;
-        assert!(!valid(S, C, &bad));
-        assert!(!valid(S, C, &c[..4]));
+        assert!(!valid(0, S, C, &bad));
+        assert!(!valid(0, S, C, &c[..4]));
         // An IPv4-mapped address is its IPv4 one.
         let mapped = match C {
             IpAddr::V4(v4) => IpAddr::V6(v4.to_ipv6_mapped()),
             _ => unreachable!(),
         };
-        assert!(valid(S, mapped, &c));
+        assert!(valid(0, S, mapped, &c));
+    }
+
+    /// The same addresses in another scope (another network, whose
+    /// addresses only happen to be the same) have cookies of their own.
+    #[test]
+    fn cookies_are_per_scope() {
+        let (a, b) = (new_scope(), new_scope());
+        assert_ne!(a, b);
+        let c = cookie(a, S, C);
+        assert!(valid(a, S, C, &c));
+        assert!(!valid(b, S, C, &c), "another scope's");
+        assert!(!valid(0, S, C, &c), "the default scope's");
     }
 
     #[test]
     fn the_last_generation_is_still_taken() {
         let g = generation();
         if let Some(prev) = g.checked_sub(1) {
-            assert!(valid(S, C, &mac(prev, S, C)));
+            assert!(valid(0, S, C, &mac(prev, 0, S, C)));
         }
         if let Some(older) = g.checked_sub(2) {
-            assert!(!valid(S, C, &mac(older, S, C)));
+            assert!(!valid(0, S, C, &mac(older, 0, S, C)));
         }
-        assert!(!valid(S, C, &mac(g + 1, S, C)));
+        assert!(!valid(0, S, C, &mac(g + 1, 0, S, C)));
     }
 
     #[test]

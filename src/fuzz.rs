@@ -387,7 +387,7 @@ pub fn vtcp_conversation(data: &[u8]) {
     let mut wire: VecDeque<Vec<u8>> = VecDeque::new();
 
     let syn = if fast_open {
-        let cookie = crate::vtcp::fastopen::cookie(addr(80).ip(), addr(40000).ip());
+        let cookie = crate::vtcp::fastopen::cookie(0, addr(80).ip(), addr(40000).ip());
         us.connect_fast_open(Some(&cookie), None, b"hello").1
     } else {
         us.connect()
