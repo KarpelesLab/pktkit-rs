@@ -246,9 +246,7 @@ impl CongestionController for Cubic {
     }
 
     fn on_ack(&mut self, a: &Ack) {
-        if let Some(rtt) = a.rtt
-            && !rtt.is_zero()
-        {
+        if let Some(rtt) = ack_rtt(a) {
             self.delay_min = Some(self.delay_min.map_or(rtt, |m| m.min(rtt)));
         }
         let limited = cwnd_limited(self.cwnd, self.ssthresh, self.mss, a.flight);
@@ -365,6 +363,14 @@ impl CongestionController for Cubic {
     }
 }
 
+/// The round trip an ACK measured, for the minimum RTT and HyStart++: the
+/// time since the newest segment it delivered was sent, as Linux feeds
+/// both. The RTO's sample (`a.rtt`) is Karn's one timed segment per round
+/// trip without timestamps, too few for HyStart++'s N_RTT_SAMPLE a round.
+fn ack_rtt(a: &Ack) -> Option<Duration> {
+    a.newest_rtt.or(a.rtt).filter(|r| !r.is_zero())
+}
+
 // --- HyStart++ (RFC 9406) --------------------------------------------------
 
 /// Where HyStart++ stands.
@@ -441,7 +447,7 @@ impl HyStart {
             }
             Some(_) => {}
         }
-        if let Some(rtt) = a.rtt {
+        if let Some(rtt) = ack_rtt(a) {
             self.round_min = Some(self.round_min.map_or(rtt, |m| m.min(rtt)));
             self.samples += 1;
         }
@@ -744,6 +750,19 @@ mod tests {
     /// Drive HyStart++ through rounds of `per_round` ACKs, each round's
     /// ACKs measuring the RTT `rtt(round)`. Returns the controller.
     fn slow_start(rounds: u32, per_round: u32, rtt: impl Fn(u32) -> Duration) -> (Cubic, Vec<u32>) {
+        slow_start_timed(rounds, per_round, rtt, true)
+    }
+
+    /// As [`slow_start`], but with `every_ack` false the RTO's sample
+    /// (`Ack::rtt`) comes only with a round's first ACK, as Karn's one
+    /// timed segment does without timestamps; every ACK still reports the
+    /// round trip of the newest segment it delivered (`newest_rtt`).
+    fn slow_start_timed(
+        rounds: u32,
+        per_round: u32,
+        rtt: impl Fn(u32) -> Duration,
+        every_ack: bool,
+    ) -> (Cubic, Vec<u32>) {
         let mut c = Cubic::new(MSS);
         let mut seq = 0u32;
         let mut now = Instant::now();
@@ -758,7 +777,8 @@ mod tests {
                     now,
                     bytes_acked: 2 * MSS,
                     flight: c.cwnd(),
-                    rtt: Some(rtt(r)),
+                    rtt: (every_ack || i == 0).then(|| rtt(r)),
+                    newest_rtt: Some(rtt(r)),
                     ack: seq,
                     snd_nxt: end + (i + 1) * 2 * MSS,
                     ..Ack::of(now, 2 * MSS, c.cwnd())
@@ -806,6 +826,20 @@ mod tests {
         c.on_ack(&ack(Instant::now(), MSS, c.cwnd()));
         let e = c.epoch.unwrap();
         assert_eq!((e.k, e.origin), (0.0, c.cwnd_prior));
+    }
+
+    /// Without timestamps the RTO gets one sample per round trip, but
+    /// HyStart++ still sees every ACK's round trip: it leaves slow start
+    /// on the rise as it does with timestamps, and the minimum RTT the
+    /// curve is read ahead by comes from the same samples.
+    #[test]
+    fn hystart_runs_without_timestamps() {
+        let rtt = |r| Duration::from_millis(if r < 4 { 50 } else { 60 });
+        let (c, css) = slow_start_timed(20, 16, rtt, false);
+        assert_eq!(css.first(), Some(&4), "CSS once the RTT rose");
+        assert!(c.hystart.exited());
+        assert_eq!(c.ssthresh(), c.cwnd());
+        assert_eq!(c.delay_min, Some(Duration::from_millis(50)));
     }
 
     /// A rise of less than the threshold is not a queue.

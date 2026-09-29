@@ -9957,6 +9957,41 @@ mod tests {
         assert!(parse(&data[0]).options.is_empty());
     }
 
+    /// HyStart++ sees the queue build against a peer without timestamps
+    /// too: the RTO then times one segment per round trip, but each ACK
+    /// still carries the round trip of the newest segment it delivered.
+    #[test]
+    fn hystart_runs_against_a_peer_without_timestamps() {
+        let conf = |l, r| {
+            let mut c = big(l, r).enable_timestamps(false).autotune(false);
+            c.send_buf_size = 16 << 20;
+            c.recv_buf_size = 16 << 20;
+            c
+        };
+        let (mut client, mut server) = rtt_pair(conf, 40632, Duration::from_millis(50));
+        assert!(!client.ts_ok);
+        let mut out = Vec::new();
+        for r in 0..8 {
+            // The queue starts to fill in the sixth round.
+            let rtt = Duration::from_millis(if r < 5 { 50 } else { 80 });
+            let (_, segs) = client.write(&vec![0; 1 << 20]);
+            out.extend(segs);
+            advance(rtt / 2);
+            let mut acks = deliver(&mut server, &out);
+            read_all(&mut server);
+            acks.extend(server.take_outgoing());
+            acks.extend(delack_expired(&mut server));
+            advance(rtt / 2);
+            out = deliver(&mut client, &acks);
+        }
+        assert_eq!(
+            client.cc.hystart(),
+            Some((info::HyStartPhase::Conservative, 1)),
+            "HyStart++ missed the rise"
+        );
+        assert_eq!(client.cc.ssthresh(), u32::MAX);
+    }
+
     /// A later connection between the same two hosts sends TSvals past an
     /// earlier one's, whatever the ports, so its SYN passes RFC 6191's test
     /// against the old one in TIME-WAIT.
