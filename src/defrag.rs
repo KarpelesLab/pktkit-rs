@@ -76,6 +76,8 @@ struct Partial {
     /// The piece ending at `total` came with "more fragments" clear (it
     /// did not if an empty last fragment fixed the total after it).
     last_piece_final: bool,
+    /// The ECN codepoints the fragments came with, a bit for each.
+    ecn: u8,
 }
 
 /// Where a fragment goes in its datagram.
@@ -86,6 +88,8 @@ struct Piece<'a> {
     data: &'a [u8],
     /// Set for the offset-0 fragment: the header of the rebuilt packet.
     header: Option<Vec<u8>>,
+    /// Its ECN codepoint.
+    ecn: u8,
 }
 
 #[derive(Default)]
@@ -131,13 +135,17 @@ impl Reassembler {
             more: frag & 0x2000 != 0,
             data: &pkt[ihl..],
             header,
+            ecn: pkt[1] & 3,
         };
-        let (header, payload) = self.push(now, piece)?;
+        let (header, payload, ecn) = self.push(now, piece)?;
         let total = 20 + payload.len();
         if total > MAX_PAYLOAD {
             return None;
         }
         let mut out = header;
+        if let Some(e) = ecn {
+            out[1] = (out[1] & 0xFC) | e;
+        }
         out[2..4].copy_from_slice(&(total as u16).to_be_bytes());
         out[6..8].copy_from_slice(&[0, 0]);
         out[10..12].copy_from_slice(&[0, 0]);
@@ -186,14 +194,21 @@ impl Reassembler {
             more: off_flags & 1 != 0,
             data: &pkt[frag_off + 8..],
             header,
+            ecn: crate::packet::ip_ecn(pkt),
         };
-        let (mut out, payload) = self.push(now, piece)?;
+        let (mut out, payload, ecn) = self.push(now, piece)?;
+        if let Some(e) = ecn {
+            crate::packet::set_ip_ecn(&mut out, e);
+        }
         out[4..6].copy_from_slice(&(payload.len() as u16).to_be_bytes());
         out.extend_from_slice(&payload);
         Some(out)
     }
 
-    fn push(&mut self, now: Instant, p: Piece<'_>) -> Option<(Vec<u8>, Vec<u8>)> {
+    /// The header, the data and the ECN field to set, if any, of the
+    /// datagram `p` completes.
+    #[allow(clippy::type_complexity)]
+    fn push(&mut self, now: Instant, p: Piece<'_>) -> Option<(Vec<u8>, Vec<u8>, Option<u8>)> {
         let bytes = &mut self.bytes;
         self.partial.retain(|_, d| {
             let keep = now.duration_since(d.started) < REASSEMBLY_TIMEOUT;
@@ -224,6 +239,7 @@ impl Reassembler {
             received: 0,
             total: None,
             last_piece_final: false,
+            ecn: 0,
         });
 
         let before = d.data.capacity();
@@ -247,9 +263,10 @@ impl Reassembler {
         let d = self.partial.remove(&p.key)?;
         self.bytes -= d.data.capacity();
         let header = d.header?;
+        let ecn = crate::packet::reassembled_ecn(d.ecn)?;
         let mut data = d.data;
         data.truncate(total);
-        Some((header, data))
+        Some((header, data, ecn))
     }
 
     fn discard(&mut self, key: &Key) {
@@ -320,6 +337,7 @@ impl Partial {
                     && p.more != was_final;
             }
         }
+        self.ecn |= 1 << (p.ecn & 3);
         if p.data.is_empty() {
             // Zero-length last fragment: it only fixes the total.
             return true;
@@ -474,6 +492,23 @@ mod tests {
         );
         assert_eq!(&whole[6..8], &[0, 0]);
         assert_eq!(r.in_progress(), 0);
+    }
+
+    /// RFC 3168 §5.3: a CE mark on one fragment marks the datagram; Not-ECT
+    /// fragments mixed with ECN-capable ones drop it.
+    #[test]
+    fn v4_reassembly_keeps_ce_marks() {
+        let mut dgram = v4_datagram(3000);
+        dgram[1] = 2; // ECT(0)
+        let mut frags = split(&dgram, 1000);
+        crate::packet::set_ip_ecn(&mut frags[1], 3);
+        let whole = push_all(&mut Reassembler::default(), &frags).expect("reassembled");
+        assert_eq!(crate::packet::ip_ecn(&whole), 3);
+        assert_eq!(crate::checksum::checksum(&whole[..20]), 0);
+
+        let mut frags = split(&dgram, 1000);
+        crate::packet::set_ip_ecn(&mut frags[2], 0);
+        assert!(push_all(&mut Reassembler::default(), &frags).is_none());
     }
 
     #[test]
@@ -709,6 +744,20 @@ mod tests {
             body.len()
         );
         assert_eq!(whole[40..], body[..]);
+    }
+
+    #[test]
+    fn v6_reassembly_keeps_ce_marks() {
+        let body = [5u8; 1400];
+        let mut f1 = v6_fragment(8, 0, true, 17, &body[..1232]);
+        let mut f2 = v6_fragment(8, 1232, false, 17, &body[1232..]);
+        crate::packet::set_ip_ecn(&mut f1, 1);
+        crate::packet::set_ip_ecn(&mut f2, 3);
+        let mut r = Reassembler::default();
+        let now = Instant::now();
+        assert!(r.push_v6(now, 0, &f1, 40).is_none());
+        let whole = r.push_v6(now, 0, &f2, 40).expect("reassembled");
+        assert_eq!(crate::packet::ip_ecn(&whole), 3);
     }
 
     #[test]

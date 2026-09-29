@@ -3131,6 +3131,67 @@ mod tests {
         assert_eq!(new_dport, 44444);
     }
 
+    /// ECN crosses the NAT both ways: the IP field (a CE mark included)
+    /// and the TCP flags that negotiate and echo it, with the checksums
+    /// kept right.
+    #[test]
+    fn ecn_crosses_the_nat_both_ways() {
+        let (nat, i, o) = setup();
+        let ip_ok = |p: &[u8]| checksum(&p[..20]) == 0;
+        // An ECN SYN (ECE|CWR), and data marked ECT(0), then CE.
+        let mut syn = build_tcp(
+            Ipv4Addr::new(10, 0, 0, 5),
+            45000,
+            Ipv4Addr::new(8, 8, 8, 8),
+            80,
+            0xC2,
+        );
+        crate::packet::set_ip_ecn(&mut syn, 0);
+        nat.inside().send(Packet::from_slice(&syn)).unwrap();
+        for ecn in [2, 3] {
+            let mut p = build_tcp(
+                Ipv4Addr::new(10, 0, 0, 5),
+                45000,
+                Ipv4Addr::new(8, 8, 8, 8),
+                80,
+                0x10,
+            );
+            crate::packet::set_ip_ecn(&mut p, ecn);
+            nat.inside().send(Packet::from_slice(&p)).unwrap();
+        }
+        let out = o.lock().unwrap().clone();
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0][33], 0xC2, "ECN setup flags");
+        let got: Vec<u8> = out.iter().map(|p| crate::packet::ip_ecn(p)).collect();
+        assert_eq!(got, [0, 2, 3]);
+        assert!(
+            out.iter()
+                .all(|p| ip_ok(p) && crate::nat::l4::v4_l4_checksum_ok(p, 20))
+        );
+
+        // The answer: an ECN SYN-ACK (ECE), and a CE-marked ACK echoing ECE.
+        let mapped = u16::from_be_bytes([out[0][20], out[0][21]]);
+        for (flags, ecn) in [(0x52, 0), (0x50, 3)] {
+            let mut p = build_tcp(
+                Ipv4Addr::new(8, 8, 8, 8),
+                80,
+                Ipv4Addr::new(203, 0, 113, 1),
+                mapped,
+                flags,
+            );
+            crate::packet::set_ip_ecn(&mut p, ecn);
+            nat.outside().send(Packet::from_slice(&p)).unwrap();
+        }
+        let back = i.lock().unwrap().clone();
+        assert_eq!(back.len(), 2);
+        assert_eq!((back[0][33], back[1][33]), (0x52, 0x50));
+        assert_eq!(crate::packet::ip_ecn(&back[1]), 3);
+        assert!(
+            back.iter()
+                .all(|p| ip_ok(p) && crate::nat::l4::v4_l4_checksum_ok(p, 20))
+        );
+    }
+
     #[test]
     fn outbound_udp_rewrites_src_no_csum() {
         let (nat, _i, o) = setup();

@@ -125,6 +125,24 @@ pub(crate) fn ip_ecn(pkt: &[u8]) -> u8 {
     }
 }
 
+/// The ECN field of a datagram whose fragments came with the codepoints in
+/// `seen` (a bit for each), as RFC 3168 §5.3 has reassembly set it: CE if
+/// any fragment was marked, so the mark is not lost; `None` for a mix of
+/// Not-ECT and ECN-capable fragments, which no sender makes and which is
+/// dropped (Linux's `ip_frag_ecn_table`); otherwise unchanged.
+#[cfg_attr(
+    not(any(feature = "vclient", feature = "slirp", feature = "nat")),
+    allow(dead_code)
+)]
+pub(crate) fn reassembled_ecn(seen: u8) -> Option<Option<u8>> {
+    const NOT_ECT: u8 = 1;
+    const CE: u8 = 1 << 3;
+    if seen & NOT_ECT != 0 && seen != NOT_ECT {
+        return None;
+    }
+    Some((seen & CE != 0).then_some(3))
+}
+
 /// Set the ECN field of the IPv4 or IPv6 header `pkt` starts with,
 /// keeping an IPv4 header checksum right. Anything else is left alone.
 #[cfg_attr(

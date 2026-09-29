@@ -67,6 +67,8 @@ struct FragEntry {
     /// Payload bytes the fragments hold. Overlaps are refused on arrival,
     /// so once it reaches `total` the datagram is whole.
     covered: usize,
+    /// The ECN codepoints the fragments came with, a bit for each.
+    ecn: u8,
     /// What the entry's fragments cost, counted against
     /// [`DEFRAG_MAX_BYTES`].
     charge: usize,
@@ -279,6 +281,7 @@ impl Defragger {
             created: now,
             total: None,
             covered: 0,
+            ecn: 0,
             charge: 0,
             max_size: 0,
             max_df_size: 0,
@@ -329,6 +332,7 @@ impl Defragger {
         };
         let charge = frag.charge();
         entry.covered += frag.data.len();
+        entry.ecn |= 1 << (pkt[1] & 3);
         entry.charge += charge;
         entry.frags.insert(at, frag);
         inner.charge += charge;
@@ -366,7 +370,9 @@ impl Defragger {
             size: entry.max_size,
             df: entry.max_df_size == entry.max_size,
         };
+        let ecn = crate::packet::reassembled_ecn(entry.ecn);
         inner.drop_entry(&k);
+        let ecn = ecn?;
 
         let total_len = hdr.len() + reassembled.len();
         if total_len > 65535 {
@@ -380,6 +386,9 @@ impl Defragger {
         let tl = total_len as u16;
         result[2..4].copy_from_slice(&tl.to_be_bytes());
         result[6..8].copy_from_slice(&[if max.df { 0x40 } else { 0 }, 0]);
+        if let Some(e) = ecn {
+            result[1] = (result[1] & 0xFC) | e;
+        }
         result[10..12].copy_from_slice(&[0, 0]);
         let csum = checksum(&result[..hdr.len()]);
         result[10..12].copy_from_slice(&csum.to_be_bytes());
@@ -451,6 +460,35 @@ mod tests {
         assert_eq!(flags_off, 0);
         assert_eq!(&reassembled[20..28], &[1u8; 8]);
         assert_eq!(&reassembled[28..32], &[2u8; 4]);
+    }
+
+    /// `p` with ECN field `ecn`, its checksum kept right.
+    fn with_ecn(mut p: Vec<u8>, ecn: u8) -> Vec<u8> {
+        crate::packet::set_ip_ecn(&mut p, ecn);
+        p
+    }
+
+    /// RFC 3168 §5.3: a CE mark on any fragment survives reassembly, and a
+    /// mix of Not-ECT and ECN-capable fragments is dropped.
+    #[test]
+    fn reassembly_keeps_ce_marks() {
+        let d = Defragger::new();
+        let f1 = with_ecn(build_ipv4(1, true, 0, &[1u8; 8]), 2);
+        let f2 = with_ecn(build_ipv4(1, false, 8, &[2u8; 4]), 3);
+        assert!(d.process(&f1).is_none());
+        let whole = d.process(&f2).unwrap();
+        assert_eq!(crate::packet::ip_ecn(&whole), 3, "the mark was lost");
+        assert_eq!(checksum(&whole[..20]), 0);
+
+        let f1 = with_ecn(build_ipv4(2, true, 0, &[1u8; 8]), 2);
+        let f2 = with_ecn(build_ipv4(2, false, 8, &[2u8; 4]), 1);
+        assert!(d.process(&f1).is_none());
+        assert_eq!(crate::packet::ip_ecn(&d.process(&f2).unwrap()), 2);
+
+        let f1 = build_ipv4(3, true, 0, &[1u8; 8]);
+        let f2 = with_ecn(build_ipv4(3, false, 8, &[2u8; 4]), 3);
+        assert!(d.process(&f1).is_none());
+        assert!(d.process(&f2).is_none(), "Not-ECT and CE mixed");
     }
 
     #[test]
