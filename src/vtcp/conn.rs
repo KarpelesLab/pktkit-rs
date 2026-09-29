@@ -1259,12 +1259,13 @@ impl Conn {
         self.set_path_mtu(mtu)
     }
 
-    /// Everything in flight was sent at an MSS the path cannot carry: mark
-    /// it lost and resend it, cut to the new size, from SND.UNA on as cwnd
-    /// allows, as Linux's `tcp_simple_retransmit` does. What the peer
-    /// SACKed got through and stays. Unlike a timeout, no congestion is
-    /// inferred, so ssthresh and the RTO are left alone, and cwnd too
-    /// outside fast recovery.
+    /// What is in flight was sent at an MSS the path cannot carry: mark
+    /// lost what is larger than the new one and resend it, cut to the new
+    /// size, from SND.UNA on as cwnd allows, as Linux's
+    /// `tcp_simple_retransmit` does. Segments that fit the path got
+    /// through, or will, and so did what the peer SACKed: those stay.
+    /// Unlike a timeout, no congestion is inferred, so ssthresh and the
+    /// RTO are left alone, and cwnd too outside fast recovery.
     fn resend_after_mtu_drop(&mut self) {
         if !self.state.is_synchronized() {
             return;
@@ -1278,7 +1279,10 @@ impl Conn {
             return;
         }
         self.mtu_probe = None;
-        self.score.mark_all_lost();
+        self.score.mark_longer_lost(self.send_mss() as u32);
+        if self.score.lost_bytes() == 0 {
+            return;
+        }
         self.enter_simple_loss();
         self.reo_deadline = None;
         self.flush_send_queue();
@@ -8780,6 +8784,33 @@ mod tests {
     /// Wire bytes of a segment as sent over IPv6.
     fn v6_len(p: &[u8]) -> u32 {
         40 + p.len() as u32
+    }
+
+    // Only what is larger than the path now carries goes again, as Linux's
+    // tcp_simple_retransmit has it: a segment that fits got through, or
+    // will. With nothing too large in flight, nothing does.
+    #[test]
+    fn packet_too_big_resends_only_what_does_not_fit() {
+        let (mut client, _server) = v6_pair(40406);
+        client.set_nodelay(true);
+        let (_, flight) = client.write(&[7; 5000]);
+        let last = parse(flight.last().unwrap());
+        assert!(v6_len(flight.last().unwrap()) < 1400);
+        let resent = client.on_icmp_too_big(1400, parse(&flight[0]).seq);
+        assert_eq!(client.mss(), 1340);
+        let resent = seqs(&resent);
+        assert!(!resent.is_empty());
+        assert!(!resent.contains(&last.seq), "a segment that fits resent");
+        assert_eq!(client.score.lost_bytes(), 0);
+
+        let (mut client, _server) = v6_pair(40407);
+        client.set_nodelay(true);
+        let (_, flight) = client.write(&[7; 1000]);
+        assert!(v6_len(&flight[0]) < 1400);
+        let resent = client.on_icmp_too_big(1400, parse(&flight[0]).seq);
+        assert_eq!(client.mss(), 1340);
+        assert!(resent.is_empty(), "resent what fits");
+        assert_eq!(client.ca, LossState::Open);
     }
 
     // RFC 8201: a Packet Too Big lowers the MSS to what fits the reported

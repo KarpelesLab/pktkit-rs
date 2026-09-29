@@ -914,8 +914,7 @@ impl Scoreboard {
         }
     }
 
-    /// Everything not SACKed is lost: after a timeout without RACK, or when
-    /// the path MTU dropped under what was sent.
+    /// Everything not SACKed is lost: after a timeout without RACK.
     pub fn mark_all_lost(&mut self) {
         for i in 0..self.segs.len() {
             self.mark_lost(i);
