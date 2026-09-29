@@ -611,6 +611,13 @@ impl Scoreboard {
         &self.rate
     }
 
+    /// ECN feedback on the ACK being processed reports `len` bytes of what
+    /// it delivered CE-marked. Before [`rate_sample`](Self::rate_sample).
+    #[inline]
+    pub fn on_ce(&mut self, len: u64) {
+        self.rate.on_ce(len);
+    }
+
     /// The sender has run out of data while the window had room: samples
     /// until what is in flight is delivered are application-limited.
     pub fn mark_app_limited(&mut self) {

@@ -22,12 +22,27 @@
 //! Where the draft leaves a detail to the implementation, Linux's
 //! `tcp_bbr.c` (BBRv3) is followed: Startup's exit on loss counts ACKs with
 //! losses in a round, and the `max_bw` and `extra_acked` windowed filters
-//! keep two slots. There is no ECN here, so neither its Startup exit nor its
-//! bound applies.
+//! keep two slots.
+//!
+//! The draft leaves the response to ECN open, asking only that CE marks
+//! count as congestion (§3.7); Linux's BBRv3 answer is followed. The
+//! fraction of what a round delivered that came back marked is smoothed
+//! into `ecn_alpha` (gain 1/16). A round with marks outside a bandwidth
+//! probe cuts `inflight_shortterm` by `ecn_alpha / 3`; a probe whose
+//! samples come back more than half marked is inflight too high, as it
+//! would be with over 2% lost; and two rounds in a row that much marked
+//! end Startup. Linux keeps all this to paths whose marks are L4S-style
+//! (shallow, per packet) and whose round trip is under 5 ms, and
+//! otherwise ignores them. Here every ECN connection uses it, so a queue
+//! that marks is heeded before it overflows: with AccECN the fraction is
+//! exact; with classic ECN every ACK echoing a mark counts all it
+//! delivered, and one mark reads as a round's worth, which the
+//! once-per-round cut and the halfway thresholds take in their stride.
 //!
 //! Amounts are bytes, rates bytes per second.
 
 use super::congestion::{Ack, CongestionController, Lost, initial_window};
+use super::rate::RateSample;
 use crate::time::Instant;
 use std::time::Duration;
 
@@ -63,6 +78,14 @@ const EXTRA_ACKED_WIN_RTTS: u32 = 5;
 const MAX_SEND_QUANTUM: u64 = 64 * 1024;
 /// Reno-coexistence bound on the rounds between probes (§5.3.3.8).
 const RENO_ROUNDS_BOUND: u64 = 63;
+/// ECN (Linux's BBRv3): the gain `ecn_alpha` follows each round's marked
+/// fraction with, how much of `ecn_alpha` a marked round cuts
+/// `inflight_shortterm` by, the marked fraction that is too high, and the
+/// rounds of it that end Startup.
+const ECN_ALPHA_GAIN: f64 = 1.0 / 16.0;
+const ECN_FACTOR: f64 = 1.0 / 3.0;
+const ECN_THRESH: f64 = 0.5;
+const FULL_ECN_CNT: u32 = 2;
 
 /// Where the state machine stands (§5.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,6 +177,18 @@ pub struct Bbr {
     prev_probe_precautionary: bool,
 
     // Congestion signals.
+    /// ECN feedback is in use.
+    ecn: bool,
+    /// A CE mark was reported in the round.
+    ecn_in_round: bool,
+    /// The smoothed fraction of what was delivered CE-marked, per round;
+    /// from 1, so the first marks are answered in full.
+    ecn_alpha: f64,
+    /// C.delivered and C.delivered_ce when `ecn_alpha` was last updated.
+    alpha_last_delivered: u64,
+    alpha_last_delivered_ce: u64,
+    /// Rounds in a row in Startup more than half marked.
+    startup_ecn_rounds: u32,
     is_loss_in_round: bool,
     loss_round_delivered: u64,
     loss_round_start: bool,
@@ -235,6 +270,12 @@ impl Bbr {
             cycle_stamp: now,
             prev_probe_too_high: false,
             prev_probe_precautionary: false,
+            ecn: false,
+            ecn_in_round: false,
+            ecn_alpha: 1.0,
+            alpha_last_delivered: 0,
+            alpha_last_delivered_ce: 0,
+            startup_ecn_rounds: 0,
             is_loss_in_round: false,
             loss_round_delivered: 0,
             loss_round_start: false,
@@ -564,6 +605,7 @@ impl Bbr {
 
     fn reset_congestion_signals(&mut self) {
         self.is_loss_in_round = false;
+        self.ecn_in_round = false;
         self.bw_latest = 0;
         self.inflight_latest = 0;
     }
@@ -592,13 +634,23 @@ impl Bbr {
         }
     }
 
-    /// AdaptLowerBoundsFromCongestion (§5.5.10.3), once per round.
+    /// AdaptLowerBoundsFromCongestion (§5.5.10.3), once per round: for
+    /// losses, and CE marks (Linux's bbr_adapt_lower_bounds), whichever
+    /// cuts `inflight_shortterm` more.
     fn adapt_lower_bounds_from_congestion(&mut self) {
         if matches!(
             self.state,
             State::Startup | State::ProbeBwRefill | State::ProbeBwUp
         ) {
             return;
+        }
+        let mut ecn_inflight = u64::MAX;
+        if self.ecn_in_round {
+            if self.inflight_shortterm == u64::MAX {
+                self.inflight_shortterm = u64::from(self.cwnd);
+            }
+            let cut = 1.0 - self.ecn_alpha * ECN_FACTOR;
+            ecn_inflight = (self.inflight_shortterm as f64 * cut) as u64;
         }
         if self.is_loss_in_round {
             if self.bw_shortterm == u64::MAX {
@@ -612,6 +664,42 @@ impl Bbr {
                 .inflight_latest
                 .max((BETA * self.inflight_shortterm as f64) as u64);
         }
+        self.inflight_shortterm = self.inflight_shortterm.min(ecn_inflight);
+    }
+
+    /// Once per round: fold the round's marked fraction into `ecn_alpha`
+    /// (Linux's bbr_update_ecn_alpha), and end Startup after two rounds
+    /// more than half marked (bbr_check_ecn_too_high_in_startup): the
+    /// queue has been building for that long.
+    fn update_ecn(&mut self, delivered: u64, delivered_ce: u64) {
+        let d = delivered.saturating_sub(self.alpha_last_delivered);
+        if d == 0 {
+            return;
+        }
+        let ce = delivered_ce.saturating_sub(self.alpha_last_delivered_ce);
+        let ratio = (ce as f64 / d as f64).min(1.0);
+        self.ecn_alpha =
+            ((1.0 - ECN_ALPHA_GAIN) * self.ecn_alpha + ECN_ALPHA_GAIN * ratio).min(1.0);
+        self.alpha_last_delivered = delivered;
+        self.alpha_last_delivered_ce = delivered_ce;
+        if self.full_bw_reached {
+            return;
+        }
+        if ratio >= ECN_THRESH {
+            self.startup_ecn_rounds += 1;
+        } else {
+            self.startup_ecn_rounds = 0;
+        }
+        if self.startup_ecn_rounds >= FULL_ECN_CNT {
+            self.full_bw_reached = true;
+            self.inflight_longterm = self.inflight(self.max_bw, 1.0).max(self.inflight_latest);
+        }
+    }
+
+    /// A sample more than half of it CE-marked: inflight too high, as with
+    /// over 2% lost (Linux's bbr_is_inflight_too_high).
+    fn is_ecn_too_high(&self, rs: &RateSample) -> bool {
+        self.ecn && rs.delivered_ce > 0 && rs.delivered_ce as f64 > rs.delivered as f64 * ECN_THRESH
     }
 
     /// IsInflightTooHigh (§5.5.10.2).
@@ -729,7 +817,15 @@ impl Bbr {
                 return true;
             }
         }
-        if !Self::is_inflight_too_high(rs.lost, rs.tx_in_flight, a.sack) {
+        if self.is_ecn_too_high(&rs) {
+            // Losses are answered as they are marked (`on_lost`); marks
+            // come on the ACKs.
+            if self.is_bw_probe_sample {
+                let state = self.state;
+                self.handle_inflight_too_high(u64::from(rs.tx_in_flight), rs.is_app_limited);
+                return self.state != state;
+            }
+        } else if !Self::is_inflight_too_high(rs.lost, rs.tx_in_flight, a.sack) {
             if self.inflight_longterm == u64::MAX {
                 return false;
             }
@@ -908,6 +1004,8 @@ impl CongestionController for Bbr {
         self.inflight = a.inflight;
         self.cwnd_limited_now |= a.cwnd_limited;
         self.sack = a.sack;
+        self.ecn = a.ecn;
+        self.ecn_in_round |= a.ecn && a.ce;
         let rtt = a.newest_rtt.or(a.rtt).filter(|r| !r.is_zero());
         if !self.has_seen_rtt && rtt.is_some() {
             self.has_seen_rtt = true;
@@ -921,9 +1019,13 @@ impl CongestionController for Bbr {
             self.update_latest_delivery_signals(rate, delivered, rs.prior_delivered);
             self.update_round(rs.prior_delivered);
             self.update_max_bw(rate, rs.is_app_limited);
+            if self.round_start && self.ecn {
+                self.update_ecn(a.delivered, a.delivered_ce);
+            }
             if self.loss_round_start {
                 self.adapt_lower_bounds_from_congestion();
                 self.is_loss_in_round = false;
+                self.ecn_in_round = false;
             }
         } else {
             self.round_start = false;
@@ -1088,6 +1190,7 @@ mod tests {
         now: Instant,
         delivered: u64,
         lost: u64,
+        delivered_ce: u64,
     }
 
     impl Feed {
@@ -1098,7 +1201,40 @@ mod tests {
                 now,
                 delivered: 0,
                 lost: 0,
+                delivered_ce: 0,
             }
+        }
+
+        /// A round trip at `rate`, `ce` of what it delivered CE-marked, as
+        /// AccECN reports it.
+        fn round_ce(&mut self, rate: u64, inflight: u32, ce: f64) {
+            self.now += RTT;
+            let prior = self.delivered;
+            let bytes = (rate as f64 * RTT.as_secs_f64()) as u64;
+            let marked = (bytes as f64 * ce) as u64;
+            self.delivered += bytes;
+            self.delivered_ce += marked;
+            let rs = RateSample {
+                delivery_rate: rate,
+                delivered: bytes,
+                interval: RTT,
+                prior_delivered: prior,
+                tx_in_flight: inflight,
+                delivered_ce: marked,
+                ..RateSample::default()
+            };
+            let a = Ack {
+                rs: Some(rs),
+                newly_acked: bytes as u32,
+                inflight,
+                delivered: self.delivered,
+                newest_rtt: Some(RTT),
+                ecn: true,
+                ce: marked > 0,
+                delivered_ce: self.delivered_ce,
+                ..Ack::of(self.now, bytes as u32, inflight)
+            };
+            self.b.on_ack(&a);
         }
 
         /// A round trip at `rate` with `inflight` in flight after it.
@@ -1119,6 +1255,7 @@ mod tests {
                 is_app_limited: app_limited,
                 tx_in_flight: inflight,
                 lost: 0,
+                delivered_ce: 0,
             };
             let a = Ack {
                 rs: Some(rs),
@@ -1228,6 +1365,75 @@ mod tests {
         assert_eq!(f.b.pacing_gain, 1.0);
         // Paced at the bandwidth, 1% under.
         assert_eq!(f.b.pacing_rate(), Some(3_960_000));
+    }
+
+    /// Two rounds in a row more than half CE-marked end Startup, however
+    /// fast the rate still grows: the queue has been building meanwhile.
+    #[test]
+    fn startup_exits_on_ecn_marks() {
+        let mut f = Feed::new();
+        f.round_ce(1_000_000, 0, 0.0);
+        f.round_ce(2_000_000, 0, 0.6);
+        assert_eq!(f.b.state, State::Startup, "one round is not enough");
+        f.round_ce(4_000_000, 0, 0.1);
+        f.round_ce(8_000_000, 0, 0.6);
+        assert_eq!(f.b.state, State::Startup, "not in a row");
+        f.round_ce(16_000_000, 0, 0.7);
+        assert!(f.b.full_bw_reached);
+        assert_ne!(f.b.state, State::Startup);
+        assert!(f.b.inflight_longterm < u64::MAX, "the bound is set");
+    }
+
+    /// Outside a probe, a round with marks cuts inflight_shortterm by
+    /// ecn_alpha/3, once; ecn_alpha follows the marked fraction.
+    #[test]
+    fn ecn_marks_cut_inflight_shortterm() {
+        let rate = 10_000_000;
+        let mut f = Feed::new();
+        for _ in 0..5 {
+            f.round_ce(rate, 0, 0.0);
+        }
+        assert!(f.b.state.is_probe_bw(), "{:?}", f.b.state);
+        // Unmarked rounds bring alpha down from 1 towards 0.
+        let alpha = f.b.ecn_alpha;
+        assert!(alpha < 1.0 && alpha > 0.5, "{alpha}");
+        assert_eq!(f.b.inflight_shortterm, u64::MAX);
+        let cwnd = f.b.cwnd;
+        f.round_ce(rate, 0, 0.2);
+        // The cut lands at the end of the marked round.
+        f.round_ce(rate, 0, 0.0);
+        let want = (f64::from(cwnd) * (1.0 - f.b.ecn_alpha * ECN_FACTOR)) as u64;
+        let got = f.b.inflight_shortterm;
+        assert!(got < u64::from(cwnd), "no cut: {got}");
+        assert!(got.abs_diff(want) < u64::from(cwnd) / 10, "{got} vs {want}");
+        // Rounds without marks leave it be.
+        f.round_ce(rate, 0, 0.0);
+        f.round_ce(rate, 0, 0.0);
+        assert_eq!(f.b.inflight_shortterm, got);
+    }
+
+    /// A bandwidth probe coming back more than half marked is inflight
+    /// too high, as more than 2% lost would be: the probe ends, and
+    /// inflight_longterm bounds the next.
+    #[test]
+    fn marked_probe_is_inflight_too_high() {
+        let rate = 10_000_000;
+        let mut f = Feed::new();
+        for _ in 0..5 {
+            f.round_ce(rate, 0, 0.0);
+        }
+        // Up to ProbeBW_UP.
+        let mut rounds = 0;
+        while f.b.state != State::ProbeBwUp {
+            f.now += Duration::from_millis(500);
+            f.round_ce(rate, 50_000, 0.0);
+            rounds += 1;
+            assert!(rounds < 50, "never probed: {:?}", f.b.state);
+        }
+        f.round_ce(rate, 60_000, 0.8);
+        assert_eq!(f.b.state, State::ProbeBwDown);
+        // What was in flight, or β of the BDP (500 kB), whichever is more.
+        assert_eq!(f.b.inflight_longterm, 350_000);
     }
 
     /// Drain gives up after three rounds even if the queue stays.
@@ -1377,6 +1583,7 @@ mod tests {
                 is_app_limited: false,
                 tx_in_flight: 400_000,
                 lost: 1000 * (i + 2),
+                delivered_ce: 0,
             };
             f.delivered += 10_000;
             let a = Ack {

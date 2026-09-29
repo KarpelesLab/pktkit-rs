@@ -437,7 +437,6 @@ impl Ecn {
 
     /// Whether ECN feedback is in use and acted on.
     #[inline]
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn active(&self) -> bool {
         self.fb != Feedback::Off && self.respond
     }

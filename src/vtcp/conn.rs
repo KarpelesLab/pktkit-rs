@@ -2494,12 +2494,16 @@ impl Conn {
                 d.merge(self.score.sack(rest, now, ecr));
             }
         }
-        // ECN feedback: whether it reports congestion.
+        // ECN feedback, before the rate sample, which counts what it
+        // reports marked.
         let progress = advanced || d.delivered > 0;
         let delivered_now = d.delivered.max(acked);
         let ce_bytes = self
             .ecn
             .on_ack(seg, progress, delivered_now, self.mss as u32);
+        if let Some(b) = ce_bytes {
+            self.score.on_ce(u64::from(b));
+        }
         let rs = self.score.rate_sample();
         if let Some(r) = self.score.ack_rtt() {
             self.pace_srtt = Some(self.pace_srtt.map_or(r, |s| (s * 7 + r) / 8));
@@ -2748,7 +2752,8 @@ impl Conn {
             let newly_lost = (self.score.rate().lost() - lost_before) as u32;
             if advanced || delivered > 0 || newly_lost > 0 {
                 let bytes = if self.sack_ok { d.delivered } else { acked };
-                let a = self.ack_info(bytes, flight, rtt, ack, rs, delivered, newly_lost);
+                let mut a = self.ack_info(bytes, flight, rtt, ack, rs, delivered, newly_lost);
+                a.ce = ce;
                 self.cc.on_ack(&a);
                 if self.cc.take_app_limited() {
                     self.score.mark_app_limited();
@@ -2785,6 +2790,9 @@ impl Conn {
             newest_rtt: self.score.ack_rtt(),
             cwnd_limited: std::mem::take(&mut self.cwnd_blocked),
             sack: self.sack_ok,
+            ecn: self.ecn.active(),
+            ce: false,
+            delivered_ce: self.score.rate().delivered_ce(),
         }
     }
 
@@ -9534,5 +9542,30 @@ mod tests {
             "without ECN: {} drops, {median:?}",
             p.drops
         );
+    }
+
+    /// BBR over the same marking queue, with AccECN: it keeps the link
+    /// full, the queue short and nothing lost, and its ecn_alpha follows
+    /// the marks.
+    #[test]
+    fn bbr_heeds_ecn_marks() {
+        let conf = ConnConfig::default()
+            .congestion(CongestionKind::Bbr)
+            .ecn(EcnMode::Accurate);
+        let mut p = bulk(conf, 2.0, 41150);
+        p.mark_bytes = 0.2 * p.rate * 0.04;
+        p.run_for(Duration::from_secs(3));
+        p.queue_delays.clear();
+        let goodput = p.goodput(Duration::from_secs(10));
+        assert!(goodput > 0.85 * p.rate, "goodput {goodput}");
+        assert_eq!(p.drops, 0);
+        let mut q = p.queue_delays.clone();
+        q.sort();
+        assert!(
+            q[q.len() / 2] < Duration::from_millis(10),
+            "{:?}",
+            q[q.len() / 2]
+        );
+        assert!(p.a.ecn.sent_ce() > 0, "never marked");
     }
 }

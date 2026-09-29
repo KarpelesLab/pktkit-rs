@@ -52,6 +52,13 @@ pub struct Ack {
     pub cwnd_limited: bool,
     /// The peer SACKs: losses show up several per round trip.
     pub sack: bool,
+    /// ECN feedback is in use (RFC 3168 or RFC 9768).
+    pub ecn: bool,
+    /// ECN feedback on it reports CE marks: congestion, without loss.
+    pub ce: bool,
+    /// Bytes delivered CE-marked over the connection's life
+    /// (C.delivered_ce).
+    pub delivered_ce: u64,
 }
 
 /// A segment just marked lost: what it was sent with, its size, and the
@@ -86,6 +93,9 @@ impl Ack {
             newest_rtt: None,
             cwnd_limited: false,
             sack: true,
+            ecn: false,
+            ce: false,
+            delivered_ce: 0,
         }
     }
 }

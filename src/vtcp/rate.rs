@@ -30,6 +30,8 @@ pub(crate) struct TxState {
     pub first_sent: u64,
     /// C.lost when it was sent.
     pub lost: u64,
+    /// C.delivered_ce when it was sent.
+    pub delivered_ce: u64,
     /// Bytes in flight just after it was sent, itself included.
     pub tx_in_flight: u32,
     /// Sent while the connection was application-limited.
@@ -56,6 +58,8 @@ pub(crate) struct RateSample {
     pub tx_in_flight: u32,
     /// Bytes marked lost between its transmission and now.
     pub lost: u64,
+    /// Of `delivered`, the bytes ECN feedback reported CE-marked.
+    pub delivered_ce: u64,
 }
 
 /// What the newest segment delivered by the ACK being processed said.
@@ -84,6 +88,9 @@ pub(crate) struct Rate {
     app_limited: u64,
     /// Bytes marked lost over the connection's life.
     lost: u64,
+    /// Bytes delivered that ECN feedback reported CE-marked (Linux's
+    /// `delivered_ce`, in bytes).
+    delivered_ce: u64,
     /// The sample the ACK in progress is building.
     newest: Option<Newest>,
 }
@@ -99,6 +106,19 @@ impl Rate {
     #[inline]
     pub fn lost(&self) -> u64 {
         self.lost
+    }
+
+    /// Bytes delivered CE-marked so far.
+    #[inline]
+    pub fn delivered_ce(&self) -> u64 {
+        self.delivered_ce
+    }
+
+    /// ECN feedback reports `len` of the bytes the ACK in progress
+    /// delivered CE-marked.
+    #[inline]
+    pub fn on_ce(&mut self, len: u64) {
+        self.delivered_ce += len;
     }
 
     /// Whether the connection is application-limited now.
@@ -121,6 +141,7 @@ impl Rate {
             delivered_time: self.delivered_time,
             first_sent: self.first_sent,
             lost: self.lost,
+            delivered_ce: self.delivered_ce,
             tx_in_flight: in_flight.saturating_add(len),
             app_limited: self.app_limited != 0,
         }
@@ -179,6 +200,9 @@ impl Rate {
             is_app_limited: n.tx.app_limited,
             tx_in_flight: n.tx.tx_in_flight,
             lost: self.lost - n.tx.lost,
+            // Feedback may report marks on segments the ACK did not
+            // deliver, such as our pure ACKs: never more than it did.
+            delivered_ce: (self.delivered_ce - n.tx.delivered_ce).min(delivered),
         };
         if interval > 0 && min_rtt.is_none_or(|m| interval >= m) {
             let rate = u128::from(delivered) * 1_000_000_000 / u128::from(interval);
