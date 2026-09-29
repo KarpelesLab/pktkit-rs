@@ -435,6 +435,16 @@ impl Ecn {
         }
     }
 
+    /// The feedback the handshake settled on, as the mode that asks for
+    /// it.
+    pub fn negotiated(&self) -> EcnMode {
+        match self.fb {
+            Feedback::Off => EcnMode::Off,
+            Feedback::Classic => EcnMode::Classic,
+            Feedback::Accurate => EcnMode::Accurate,
+        }
+    }
+
     /// Whether ECN feedback is in use and acted on.
     #[inline]
     pub fn active(&self) -> bool {

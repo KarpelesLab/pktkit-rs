@@ -92,6 +92,12 @@
 //!   `vclient`'s listener).
 //! - RFC 2525 §2.17: releasing a connection with unread data resets it.
 //!
+//! [`Conn::info`] takes a [`TcpInfo`] snapshot, Linux's `TCP_INFO`: the
+//! window, round trips, losses and their repair, rates, buffers, and the
+//! time the sender spent held back by the receiver's window or its own
+//! send buffer, which is where to look when a transfer is slower than the
+//! path.
+//!
 //! # Layering: blocking I/O and accept live above this engine
 //!
 //! `Conn` is intentionally a pure, non-blocking, socket-less state machine —
@@ -123,6 +129,7 @@ pub(crate) mod cubic;
 pub(crate) mod cwv;
 pub(crate) mod ecn;
 pub(crate) mod fastopen;
+pub(crate) mod info;
 pub(crate) mod options;
 pub(crate) mod plpmtud;
 pub(crate) mod rate;
@@ -140,6 +147,7 @@ pub(crate) mod syncookie;
 
 pub use conn::{CongestionKind, Conn, ConnConfig, State};
 pub use ecn::EcnMode;
+pub use info::{CaState, HyStartPhase, SlowStartExit, TcpInfo};
 pub use options::{TcpOption, kind};
 pub use plpmtud::MtuProbing;
 pub use segment::{Segment, flags};

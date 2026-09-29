@@ -499,6 +499,14 @@ impl TcpStream {
         Ok(self.state.conn.lock().expect("poisoned").nodelay())
     }
 
+    /// A snapshot of the connection's TCP state and counters (the window,
+    /// round trips, losses, rates, buffers, and what has limited the
+    /// sender), as `getsockopt(TCP_INFO)` gives on Linux. See
+    /// [`TcpInfo`](crate::vtcp::TcpInfo).
+    pub fn info(&self) -> crate::vtcp::TcpInfo {
+        self.state.conn.lock().expect("poisoned").info()
+    }
+
     /// Set a read timeout. `None` blocks indefinitely.
     pub fn set_read_timeout(&self, t: Option<Duration>) {
         *self.read_timeout.lock().expect("poisoned") = t;

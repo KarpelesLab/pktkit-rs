@@ -24,6 +24,7 @@ use super::cubic::Cubic;
 use super::cwv::{self, PipeAck};
 use super::ecn::{Ecn, EcnMode, IpEcn};
 use super::fastopen::{self, FastOpen, Gate};
+use super::info::{self, Chrono, Chronos, Counters, SlowStartExit, TcpInfo};
 use super::options::{
     self, SackBlock, TcpOption, get_sack_blocks, get_timestamp, get_wscale, has_sack_perm,
     mss_option, sack_option, sack_perm_option, timestamp_option, wscale_option,
@@ -170,7 +171,7 @@ impl State {
 /// Where loss recovery stands (Linux's `icsk_ca_state`, less its CWR and
 /// Disorder, which nothing here needs apart).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CaState {
+enum LossState {
     /// Nothing deemed lost.
     Open,
     /// Fast recovery (RFC 6675 §5): losses found by RACK, or by duplicate
@@ -591,7 +592,7 @@ pub struct Conn {
     /// What is in flight, SACKed and deemed lost, segment by segment.
     score: Scoreboard,
     /// Where loss recovery stands.
-    ca: CaState,
+    ca: LossState,
     /// RecoveryPoint (RFC 6675), RFC 6582's `recover`: SND.NXT when the
     /// current, or last, recovery episode began. Whatever was sent before
     /// it and is deemed lost is resent before new data, as the window
@@ -812,6 +813,12 @@ pub struct Conn {
     /// half a dozen times, which on some hosts costs as much as the rest
     /// of it together.
     now: Instant,
+
+    /// What [`info`](Self::info) reports: counters, what the sender has
+    /// been limited by, and how the first slow start ended (and cwnd then).
+    stats: Counters,
+    chrono: Chronos,
+    ss_exit: Option<(SlowStartExit, u32)>,
 }
 
 impl std::fmt::Debug for Conn {
@@ -871,7 +878,7 @@ impl Conn {
             rto_deadline: None,
             retries: 0,
             score: Scoreboard::new(0, now),
-            ca: CaState::Open,
+            ca: LossState::Open,
             recover: 0,
             syn_lost: false,
             last_oow_ack: None,
@@ -952,6 +959,9 @@ impl Conn {
             rx_ecn: IpEcn::NOT_ECT,
             cwr_high: None,
             now,
+            stats: Counters::default(),
+            chrono: Chronos::new(now),
+            ss_exit: None,
         }
     }
 
@@ -989,6 +999,99 @@ impl Conn {
     #[inline]
     pub fn fin_received(&self) -> bool {
         self.fin_recvd_signaled
+    }
+
+    /// A snapshot of the connection's state and counters, for diagnosis:
+    /// the window and what limits it, round-trip estimates, losses and
+    /// how they were repaired, rates, buffers, and where the sender's time
+    /// went. See [`TcpInfo`].
+    pub fn info(&self) -> TcpInfo {
+        let mss = u32::from(self.mss).max(1);
+        let cwnd = self.cc.cwnd();
+        let ssthresh = self.cc.ssthresh();
+        let measured = !self.rto.srtt().is_zero();
+        let sb = self.send_buf.as_ref();
+        let rb = self.recv_buf.as_ref();
+        let ca_state = match self.ca {
+            LossState::Loss => info::CaState::Loss,
+            LossState::Recovery => info::CaState::Recovery,
+            LossState::Open if self.cwr_high.is_some() => info::CaState::Cwr,
+            LossState::Open if self.score.sacked_bytes() > 0 || self.dup_acks > 0 => {
+                info::CaState::Disorder
+            }
+            LossState::Open => info::CaState::Open,
+        };
+        let (rcv_rtt, rcv_space) = self.rcv_space.snapshot();
+        let (busy_time, rwnd_limited, sndbuf_limited) = self.chrono.totals(wall_clock());
+        let hystart = self.cc.hystart();
+        let st = &self.stats;
+        TcpInfo {
+            state: self.state,
+            ca_state,
+            congestion: self.cc.name(),
+            cwnd,
+            cwnd_segs: cwnd / mss,
+            ssthresh: (ssthresh != u32::MAX).then_some(ssthresh),
+            snd_mss: mss,
+            rcv_mss: self.rcv_mss,
+            path_mtu: self.path_mtu(),
+            srtt: measured.then(|| self.rto.srtt()),
+            rttvar: measured.then(|| self.rto.rttvar()),
+            min_rtt: self.score.min_rtt(),
+            rto: self.rto.rto(),
+            backoff: self.retries,
+            rcv_rtt,
+            rcv_space,
+            bytes_sent: st.bytes_sent,
+            bytes_retrans: st.bytes_retrans,
+            bytes_acked: st.bytes_acked,
+            bytes_received: st.bytes_received,
+            segs_out: st.segs_out,
+            segs_in: st.segs_in,
+            data_segs_out: st.data_segs_out,
+            data_segs_in: st.data_segs_in,
+            total_retrans: st.total_retrans,
+            timeouts: st.timeouts,
+            recoveries: st.recoveries,
+            lost: self.score.lost_bytes(),
+            sacked: self.score.sacked_bytes(),
+            in_flight: self.in_flight(),
+            reord_seen: self.score.reordered(),
+            dsack_dups: st.dsack_dups,
+            undos: st.undos,
+            pacing_rate: self.pace_rate(),
+            delivery_rate: st.delivery_rate.map(|(r, _)| r),
+            delivery_rate_app_limited: st.delivery_rate.is_some_and(|(_, a)| a),
+            delivered: st.delivered_before + self.score.rate().delivered(),
+            delivered_ce: st.delivered_ce_before + self.score.rate().delivered_ce(),
+            send_buf: sb.map_or(self.cfg.send_buf_size, |s| s.capacity()),
+            recv_buf: rb.map_or(self.cfg.recv_buf_size, |r| r.limit()),
+            autotune_grown: self.grown,
+            send_queued: sb.map_or(0, |s| s.pending()),
+            unacked: sb.map_or(0, |s| s.unacked() as u32),
+            recv_queued: rb.map_or(0, |r| r.readable()),
+            snd_wnd: self.snd_wnd,
+            rcv_wnd: self.rcv_wnd_bytes(),
+            hystart: hystart.map(|(p, _)| p),
+            slow_start_exit: self.ss_exit.map(|(r, _)| r),
+            slow_start_exit_cwnd: self.ss_exit.map(|(_, c)| c),
+            hystart_css_entries: hystart.map_or(0, |(_, n)| n),
+            ecn: self.ecn.negotiated(),
+            ce_received: st.ce_received,
+            ecn_reductions: st.ecn_reductions,
+            busy_time,
+            rwnd_limited,
+            sndbuf_limited,
+        }
+    }
+
+    /// The first slow start may have just ended, for `reason`, with cwnd
+    /// at `cwnd`: note it for [`info`](Self::info).
+    #[inline]
+    fn note_ss_exit(&mut self, reason: SlowStartExit, cwnd: u32) {
+        if self.ss_exit.is_none() && self.cc.ssthresh() != u32::MAX {
+            self.ss_exit = Some((reason, cwnd));
+        }
     }
 
     /// The configuration the connection was made with.
@@ -1141,10 +1244,10 @@ impl Conn {
         // ending it just brings cwnd down to that.
         // So does a reduction for ECN. BBR sets cwnd by its model.
         let reducing = self.cwr_high.take().is_some();
-        if (self.ca == CaState::Recovery || reducing) && !self.cc.model_based() {
+        if (self.ca == LossState::Recovery || reducing) && !self.cc.model_based() {
             self.cc.set_cwnd(self.cc.ssthresh());
         }
-        self.ca = CaState::Loss;
+        self.ca = LossState::Loss;
         self.recover = nxt;
         // Nothing to undo, nor a timeout for F-RTO to judge.
         self.undo.marker = None;
@@ -1218,7 +1321,7 @@ impl Conn {
         rcv_room: u32,
     ) -> Option<(usize, u32)> {
         if self.mtu_probe.is_some()
-            || self.ca != CaState::Open
+            || self.ca != LossState::Open
             || self.cwr_high.is_some()
             || !matches!(self.state, State::Established | State::CloseWait)
             || self.cc.cwnd() < 11 * u32::from(self.mss)
@@ -1436,6 +1539,7 @@ impl Conn {
     pub(crate) fn accept_syn_ecn(&mut self, syn: &Segment, ecn: IpEcn) -> Vec<Vec<u8>> {
         self.clock();
         self.rx_ecn = ecn;
+        self.stats.segs_in += 1;
         let iss = self.new_iss();
         self.open_passive(syn, iss)
     }
@@ -1566,6 +1670,7 @@ impl Conn {
     #[cfg_attr(not(any(feature = "vclient", feature = "slirp")), allow(dead_code))]
     pub(crate) fn accept_cookie(&mut self, ack: &Segment, our_iss: u32, mss: u16) -> Vec<Vec<u8>> {
         self.clock();
+        self.stats.segs_in += 1;
         let remote_seq = ack.seq;
         let initial_data = &ack.payload[..];
         if self.state != State::Closed && self.state != State::Listen {
@@ -1849,6 +1954,7 @@ impl Conn {
                 rb.set_adv_edge(edge);
             }
         }
+        self.stats.segs_out += 1;
         self.outgoing.push(seg.marshal());
     }
 
@@ -1946,6 +2052,10 @@ impl Conn {
     pub(crate) fn handle_segment_ecn(&mut self, seg: &Segment, ecn: IpEcn) -> Vec<Vec<u8>> {
         self.clock();
         self.rx_ecn = ecn;
+        self.stats.segs_in += 1;
+        if ecn == IpEcn::CE {
+            self.stats.ce_received += 1;
+        }
         match self.state {
             State::Closed => self.handle_closed(seg),
             State::Listen => Vec::new(), // pure passive open uses accept_syn
@@ -1985,7 +2095,7 @@ impl Conn {
             self.cc.on_handshake_loss();
             self.rto.reset_after_syn_loss();
         }
-        self.ca = CaState::Open;
+        self.ca = LossState::Open;
         self.dup_acks = 0;
         self.reno_sacked = 0;
         if let Some(sb) = self.send_buf.as_ref() {
@@ -2687,6 +2797,10 @@ impl Conn {
             .as_mut()
             .unwrap()
             .insert(seg.seq, &seg.payload);
+        if !seg.payload.is_empty() {
+            self.stats.data_segs_in += 1;
+            self.stats.bytes_received += n as u64;
+        }
         if n > 0 && self.cfg.autotune {
             self.rcv_rtt_measure(seg);
         }
@@ -2899,6 +3013,13 @@ impl Conn {
             self.sync_mss();
         }
         let rs = self.score.rate_sample();
+        self.stats.bytes_acked += u64::from(acked);
+        if dsack.is_some() {
+            self.stats.dsack_dups += 1;
+        }
+        if let Some(r) = rs.filter(|r| r.delivery_rate > 0) {
+            self.stats.delivery_rate = Some((r.delivery_rate, r.is_app_limited));
+        }
         if let Some(r) = self.score.ack_rtt() {
             self.pace_srtt = Some(self.pace_srtt.map_or(r, |s| (s * 7 + r) / 8));
         }
@@ -3021,7 +3142,7 @@ impl Conn {
                 // gone out past what it marked lost (F-RTO's, Linux's
                 // tcp_process_loss): they report that new data arriving.
                 let nxt = self.send_buf.as_ref().unwrap().nxt();
-                if self.ca != CaState::Loss || seq_after(nxt, self.recover) {
+                if self.ca != LossState::Loss || seq_after(nxt, self.recover) {
                     let unacked = self.send_buf.as_ref().unwrap().unacked() as u32;
                     let holes = self.score.lost_bytes().max(mss);
                     self.reno_sacked = (self.reno_sacked + mss).min(unacked.saturating_sub(holes));
@@ -3055,7 +3176,7 @@ impl Conn {
                 && seq_after_eq(ack, end)
             {
                 self.undo.eifel_end = None;
-                if self.ca != CaState::Open
+                if self.ca != LossState::Open
                     && let (Some(e), Some(ts)) = (ecr, self.undo.retrans_ts)
                     && (e.wrapping_sub(ts) as i32) < 0
                 {
@@ -3064,27 +3185,27 @@ impl Conn {
             }
         }
         let frto_was = self.frto;
-        if !undone && self.ca == CaState::Loss && self.frto != Frto::Off {
+        if !undone && self.ca == LossState::Loss && self.frto != Frto::Off {
             undone = self.frto_on_ack(ev);
         }
         if advanced && std::mem::take(&mut self.black_hole_undo) {
             self.undo_black_hole(acked);
         }
 
-        let mut exiting = undone && was != CaState::Open;
-        if advanced && self.ca != CaState::Open && self.recovered(ack) {
+        let mut exiting = undone && was != LossState::Open;
+        if advanced && self.ca != LossState::Open && self.recovered(ack) {
             // RFC 6675 §5: done once RecoveryPoint is acknowledged; without
             // SACK, only past it (RFC 6582 §3.2 step 1 and §4.1: segments
             // resent needlessly draw duplicates right at it).
             if model {
                 self.cc.on_recovery_exit();
-            } else if self.ca == CaState::Recovery {
+            } else if self.ca == LossState::Recovery {
                 self.cc.set_cwnd(self.cc.ssthresh());
             }
-            self.ca = CaState::Open;
+            self.ca = LossState::Open;
             self.reno_sacked = 0;
             exiting = true;
-        } else if advanced && self.ca == CaState::Recovery && !self.sack_ok {
+        } else if advanced && self.ca == LossState::Recovery && !self.sack_ok {
             // A partial ACK (RFC 6582 §3.2 step 5): the segment it stops at
             // was lost too.
             self.score.mark_head_lost();
@@ -3094,7 +3215,7 @@ impl Conn {
         // the CWR it sent has reached the receiver.
         if advanced && self.cwr_high.is_some_and(|h| seq_after(ack, h)) {
             self.cwr_high = None;
-            if !model && self.ca == CaState::Open {
+            if !model && self.ca == LossState::Open {
                 self.cc.set_cwnd(self.cc.ssthresh());
             }
         }
@@ -3108,19 +3229,24 @@ impl Conn {
         // Growth, outside fast recovery: in slow start after a timeout too.
         // Not on the ACK that undid a response: RFC 4015 step (9) has just
         // set cwnd for it. Nor during a reduction for ECN, which PRR runs.
-        if advanced && self.ca != CaState::Recovery && !undone && !model && self.cwr_high.is_none()
+        if advanced
+            && self.ca != LossState::Recovery
+            && !undone
+            && !model
+            && self.cwr_high.is_none()
         {
             let bytes = if self.sack_ok { d.delivered } else { acked };
             let use_ = self.cwnd_use(flight);
             let a = self.ack_info(bytes, use_, rtt, ack, rs, delivered, 0);
             self.cc.on_ack(&a);
+            self.note_ss_exit(SlowStartExit::Delay, self.cc.cwnd());
         }
         // RFC 7661: what the path carried, sampled outside loss recovery
         // only, and forgotten once one is over (§4.2, §4.4.1).
         if exiting {
             self.pipe_ack.reset();
             self.nvp_since = None;
-        } else if advanced && self.ca == CaState::Open {
+        } else if advanced && self.ca == LossState::Open {
             self.pipe_ack.on_ack(self.now, ack, self.rto.srtt());
             self.validate_cwnd();
         }
@@ -3132,14 +3258,15 @@ impl Conn {
 
         if self.sack_ok {
             self.rack_detect(dsack.is_some(), exiting);
-        } else if dup && self.dup_acks == DUP_THRESH && self.ca == CaState::Open {
+        } else if dup && self.dup_acks == DUP_THRESH && self.ca == LossState::Open {
             // RFC 5681 §3.2: the third duplicate ACK.
             self.score.mark_head_lost();
         }
-        if self.ca == CaState::Open && self.score.lost_bytes() > 0 {
+        if self.ca == LossState::Open && self.score.lost_bytes() > 0 {
             self.on_losses_found();
         }
-        if self.ca == CaState::Recovery || (self.ca == CaState::Open && self.cwr_high.is_some()) {
+        if self.ca == LossState::Recovery || (self.ca == LossState::Open && self.cwr_high.is_some())
+        {
             self.prr_update(delivered);
         }
         // A model-based controller takes every ACK, once the losses it
@@ -3254,7 +3381,7 @@ impl Conn {
     /// Note a retransmission of `[seq, seq+len)` carrying `tsval`, for the
     /// episode's undo.
     fn note_retransmission(&mut self, seq: u32, len: u32, tsval: u32) {
-        if self.ca == CaState::Open || self.undo.marker.is_none() {
+        if self.ca == LossState::Open || self.undo.marker.is_none() {
             return;
         }
         let end = seq.wrapping_add(len);
@@ -3316,6 +3443,7 @@ impl Conn {
     /// retransmissions; RACK marks anything really lost again. `acked` is
     /// what the ACK acknowledged. Returns true.
     fn undo_recovery(&mut self, acked: u32) -> bool {
+        self.stats.undos += 1;
         self.score.unmark_lost();
         let mss = self.mss as u32;
         // cwnd = FlightSize + min(bytes_acked, IW): no burst, and slow
@@ -3330,7 +3458,7 @@ impl Conn {
             self.rto_adapt = Some((self.undo.srtt_prev, self.undo.rttvar_prev, self.recover));
         }
         self.undo.marker = None;
-        self.ca = CaState::Open;
+        self.ca = LossState::Open;
         self.frto = Frto::Off;
         self.reno_sacked = 0;
         self.retries = 0;
@@ -3435,7 +3563,7 @@ impl Conn {
     /// Count `len` bytes sent, for PRR and pacing.
     #[inline]
     fn note_sent(&mut self, len: u32) {
-        if self.ca == CaState::Recovery || self.cwr_high.is_some() {
+        if self.ca == LossState::Recovery || self.cwr_high.is_some() {
             self.prr_out += u64::from(len);
         }
         if self.pacing_on() {
@@ -3455,7 +3583,7 @@ impl Conn {
     /// RACK (RFC 8985 §6.2 steps 4 and 5) after an ACK, or when the
     /// reordering timer fires: mark what is overdue lost, and time the rest.
     fn rack_detect(&mut self, dsack: bool, exiting: bool) {
-        let recovering = self.ca != CaState::Open;
+        let recovering = self.ca != LossState::Open;
         let reo = self
             .score
             .reo_wnd(dsack, recovering, exiting, self.rto.srtt());
@@ -3478,7 +3606,9 @@ impl Conn {
             self.undo.pipe_prev = self.cc.ssthresh();
         } else {
             let flight_used = self.loss_flight(flight);
+            let cwnd = self.cc.cwnd();
             self.cc.on_loss(flight_used);
+            self.note_ss_exit(SlowStartExit::Loss, cwnd);
             // RFC 6937 §3's RecoverFS: the flight the reduction is spread
             // over.
             self.recover_fs = flight.max(1);
@@ -3486,7 +3616,8 @@ impl Conn {
             self.prr_out = 0;
         }
         self.recover = nxt;
-        self.ca = CaState::Recovery;
+        self.ca = LossState::Recovery;
+        self.stats.recoveries += 1;
         self.ecn.queue_cwr();
         // RFC 8985 §7.1: a probe of the flight this recovery repairs is
         // moot.
@@ -3510,7 +3641,7 @@ impl Conn {
     ///
     /// A model-based controller answers from the ACK itself.
     fn enter_cwr(&mut self) {
-        if self.ca != CaState::Open || self.cwr_high.is_some() {
+        if self.ca != LossState::Open || self.cwr_high.is_some() {
             return;
         }
         let sb = self.send_buf.as_ref().unwrap();
@@ -3520,8 +3651,11 @@ impl Conn {
         if self.cc.model_based() {
             return;
         }
+        self.stats.ecn_reductions += 1;
         let used = self.loss_flight(flight);
+        let cwnd = self.cc.cwnd();
         self.cc.on_ecn(used);
+        self.note_ss_exit(SlowStartExit::Ecn, cwnd);
         self.recover_fs = flight.max(1);
         self.prr_delivered = 0;
         self.prr_out = 0;
@@ -3573,7 +3707,7 @@ impl Conn {
     /// (§4.4.3).
     fn restart_idle_window(&mut self) {
         // BBR restarts from idle by its own model (draft §5.4).
-        if self.ca != CaState::Open || self.cc.model_based() {
+        if self.ca != LossState::Open || self.cc.model_based() {
             return;
         }
         let mss = self.mss as u32;
@@ -3617,7 +3751,7 @@ impl Conn {
     /// In fast recovery.
     #[cfg(test)]
     fn in_recovery(&self) -> bool {
-        self.ca == CaState::Recovery
+        self.ca == LossState::Recovery
     }
 
     /// Take the RTT samples an ACK that advanced SND.UNA offers: the timed
@@ -3683,7 +3817,7 @@ impl Conn {
             return;
         };
         if !self.sack_ok
-            || self.ca != CaState::Open
+            || self.ca != LossState::Open
             || self.score.sacked_segs() > 0
             || sb.unacked() == 0
             || !self.state.is_synchronized()
@@ -3722,7 +3856,7 @@ impl Conn {
         }
         if self.tlp_end.is_none()
             && self.rtt_sampled
-            && self.ca == CaState::Open
+            && self.ca == LossState::Open
             && self.score.sacked_segs() == 0
             && self.snd_wnd > 0
             && self.state.is_synchronized()
@@ -3765,7 +3899,7 @@ impl Conn {
         } else if seq_after(ack, end) {
             // The probe repaired a loss: respond to it as to any other.
             self.tlp_end = None;
-            if self.ca == CaState::Open && !self.cc.model_based() && self.cwr_high.is_none() {
+            if self.ca == LossState::Open && !self.cc.model_based() && self.cwr_high.is_none() {
                 let flight = self.send_buf.as_ref().unwrap().unacked() as u32;
                 let flight = self.loss_flight(flight);
                 self.cc.on_loss(flight);
@@ -3786,13 +3920,13 @@ impl Conn {
             return;
         }
         self.rack_detect(false, false);
-        if self.ca == CaState::Open && self.score.lost_bytes() > 0 {
+        if self.ca == LossState::Open && self.score.lost_bytes() > 0 {
             self.on_losses_found();
         }
         if self.cc.model_based() {
             self.feed_losses();
         }
-        if self.ca == CaState::Recovery {
+        if self.ca == LossState::Recovery {
             self.prr_update(0);
         }
         self.flush_send_queue();
@@ -3844,6 +3978,12 @@ impl Conn {
         let tsval = self.ts_now();
         self.score.on_retransmit(seq, len, self.now, tsval);
         self.note_sent(len);
+        self.stats.total_retrans += 1;
+        if !fin {
+            self.stats.data_segs_out += 1;
+            self.stats.bytes_sent += u64::from(len);
+            self.stats.bytes_retrans += u64::from(len);
+        }
         self.note_retransmission(seq, len, tsval);
         self.last_data_sent = Some(self.now);
         // Karn's algorithm: no timing of a segment that went twice.
@@ -3918,6 +4058,8 @@ impl Conn {
         self.score
             .on_send(snd_nxt, len as u32, false, self.now, tsval);
         self.note_sent(len as u32);
+        self.stats.data_segs_out += 1;
+        self.stats.bytes_sent += len as u64;
         self.last_data_sent = Some(self.now);
         // Answering the peer's data within a delayed ACK's time (Linux's
         // tcp_event_data_sent).
@@ -4053,6 +4195,26 @@ impl Conn {
             self.schedule_loss_probe();
         }
         self.cwnd_validate();
+        self.update_chrono();
+    }
+
+    /// Note what the sender is limited by now, for [`info`](Self::info)'s
+    /// times, as Linux's tcp_chrono does: after each chance to send.
+    fn update_chrono(&mut self) {
+        let sb = self.send_buf.as_ref().unwrap();
+        let (pending, unacked) = (sb.pending(), sb.unacked() as u32);
+        let c = if pending == 0 && unacked == 0 {
+            Chrono::Idle
+        } else if pending > 0
+            && (self.snd_wnd.saturating_sub(unacked) as usize) < pending.min(self.mss as usize)
+        {
+            Chrono::RwndLimited
+        } else if pending == 0 && self.snd_nospace {
+            Chrono::SndbufLimited
+        } else {
+            Chrono::Busy
+        };
+        self.chrono.set(c, self.now);
     }
 
     /// Note, after sending what may be sent, whether cwnd held anything
@@ -4414,6 +4576,7 @@ impl Conn {
                 return;
             }
         }
+        self.stats.timeouts += 1;
         self.rto.backoff();
         self.rto.invalidate_timing();
         let synchronized = self.state.is_synchronized();
@@ -4429,7 +4592,7 @@ impl Conn {
             // Nor one during a reduction for ECN, which has set it for this
             // window already (Linux's tcp_enter_loss).
             let repeated = self.retries > 1
-                || (zero_window && self.ca == CaState::Loss)
+                || (zero_window && self.ca == LossState::Loss)
                 || (self.cwr_high.take().is_some() && !self.cc.model_based());
             self.cwr_high = None;
             self.ecn.queue_cwr();
@@ -4437,7 +4600,7 @@ impl Conn {
             let (flight, nxt) = (sb.unacked() as u32, sb.nxt());
             // A new episode keeps what undoing it would take; a timeout in
             // fast recovery, or a repeated one, keeps the episode's.
-            let fresh = self.ca == CaState::Open;
+            let fresh = self.ca == LossState::Open;
             if fresh && !self.score.is_empty() {
                 self.begin_undo(true);
             } else {
@@ -4448,7 +4611,9 @@ impl Conn {
             // progress), but again on a timeout repeated while it runs.
             frto = !zero_window && (fresh || self.frto != Frto::Off);
             self.frto = Frto::Off;
+            let cwnd = self.cc.cwnd();
             self.cc.on_retransmit_timeout(flight, repeated);
+            self.note_ss_exit(SlowStartExit::Timeout, cwnd);
             // RFC 7661 §4.4: a timeout ends the non-validated phase.
             self.pipe_ack.reset();
             self.nvp_since = None;
@@ -4469,7 +4634,7 @@ impl Conn {
                 } else {
                     self.score.mark_all_lost();
                 }
-                self.ca = CaState::Loss;
+                self.ca = LossState::Loss;
                 self.recover = nxt;
             }
             // BBR: what is in flight and one segment (draft §5.6.4.4).
@@ -4532,7 +4697,7 @@ impl Conn {
                 let room = self.send_mss() as u32;
                 if let Some((seq, len, fin)) = self.score.head(room) {
                     self.resend(seq, len, fin);
-                    if frto && !black_hole && self.ca == CaState::Loss {
+                    if frto && !black_hole && self.ca == LossState::Loss {
                         self.frto = Frto::First {
                             head_end: seq.wrapping_add(len),
                         };
@@ -4938,6 +5103,7 @@ impl Conn {
     }
 
     fn tear_down(&mut self, new_state: State) {
+        self.chrono.set(Chrono::Idle, self.now);
         self.state = new_state;
         self.closed = new_state == State::Closed;
         self.stop_rto();
@@ -4966,7 +5132,11 @@ impl Conn {
         if let Some(sb) = self.send_buf.as_mut() {
             sb.release_memory();
             // Nothing will be resent: the scoreboard goes too.
+            let reordered = self.score.reordered();
+            self.stats.delivered_before += self.score.rate().delivered();
+            self.stats.delivered_ce_before += self.score.rate().delivered_ce();
             self.score = Scoreboard::new(sb.una(), self.now);
+            self.score.inherit_reordered(reordered);
         }
         let keep_unread = self.released.is_none();
         if let Some(rb) = self.recv_buf.as_mut() {
@@ -5162,6 +5332,81 @@ mod tests {
         // Client sees the ACK, send-buffer drains.
         let ack = parse(&ack_pkts[0]);
         let _ = client.handle_segment(&ack);
+    }
+
+    /// The counters behind `info` add up across the two ends.
+    #[test]
+    fn info_counts_a_transfer() {
+        freeze();
+        let conf = |l, r| cfg(l, r).send_buf_size(1 << 16).recv_buf_size(1 << 16);
+        let mut client = Conn::new(conf(40003, 80));
+        let mut server = Conn::new(conf(80, 40003));
+        drive_handshake(&mut client, &mut server);
+        let data = vec![7u8; 50_000];
+        let (n, mut out) = client.write(&data);
+        assert_eq!(n, data.len());
+        let mut got = 0;
+        for _ in 0..100 {
+            advance(Duration::from_millis(10));
+            let mut acks = deliver(&mut server, &out);
+            got += read_all(&mut server).len();
+            acks.extend(server.take_outgoing());
+            acks.extend(delack_expired(&mut server));
+            advance(Duration::from_millis(10));
+            out = deliver(&mut client, &acks);
+            if out.is_empty() && client.info().unacked == 0 {
+                break;
+            }
+        }
+        assert_eq!(got, data.len());
+        let (c, s) = (client.info(), server.info());
+        assert_eq!(c.state, State::Established);
+        assert_eq!(c.congestion, "cubic");
+        assert_eq!((c.bytes_sent, c.bytes_acked), (50_000, 50_000));
+        assert_eq!(s.bytes_received, 50_000);
+        assert_eq!(c.data_segs_out, s.data_segs_in);
+        assert_eq!(c.data_segs_out, 50_000u64.div_ceil(1460));
+        assert_eq!((c.segs_out, c.segs_in), (s.segs_in, s.segs_out));
+        assert_eq!((c.total_retrans, c.timeouts, c.undos), (0, 0, 0));
+        assert_eq!(c.delivered, 50_000);
+        assert_eq!(c.ca_state, info::CaState::Open);
+        assert_eq!(c.hystart, Some(info::HyStartPhase::SlowStart));
+        assert_eq!((c.ssthresh, c.slow_start_exit), (None, None));
+        assert_eq!(c.cwnd_segs, c.cwnd / 1460);
+        assert!(c.srtt.is_some() && c.rttvar.is_some() && c.min_rtt.is_some());
+        assert!(c.delivery_rate.is_some());
+        assert_eq!((c.unacked, c.send_queued, s.recv_queued), (0, 0, 0));
+        assert_eq!(c.pacing_rate, None, "pacing is off");
+        assert_eq!(c.ecn, EcnMode::Off);
+        assert!(
+            c.busy_time >= Duration::from_millis(20),
+            "{:?}",
+            c.busy_time
+        );
+        assert_eq!(c.rwnd_limited, Duration::ZERO);
+    }
+
+    /// Time with data waiting on a closed receive window counts as
+    /// receive-window-limited, and as busy.
+    #[test]
+    fn info_times_a_receive_window_stall() {
+        freeze();
+        let (mut client, mut server) = established(40004);
+        let (_, out) = client.write(&[1; 4096]);
+        let acks = deliver(&mut server, &out);
+        deliver(&mut client, &acks);
+        client.write(&[2; 1000]);
+        advance(Duration::from_millis(100));
+        let i = client.info();
+        assert_eq!(i.unacked, i.snd_wnd);
+        assert_eq!(i.send_queued, 1000);
+        assert!(
+            i.rwnd_limited >= Duration::from_millis(100),
+            "{:?}",
+            i.rwnd_limited
+        );
+        assert!(i.busy_time >= i.rwnd_limited);
+        assert_eq!(i.sndbuf_limited, Duration::ZERO);
     }
 
     #[test]
@@ -6198,7 +6443,7 @@ mod tests {
         assert_eq!(server.state(), State::Established);
         assert_eq!(
             client.ca,
-            CaState::Open,
+            LossState::Open,
             "timeout recovery outlived the SYN"
         );
         // After the lost SYN data starts from one segment. Stand in for the
@@ -6442,7 +6687,7 @@ mod tests {
         let acks = deliver(&mut server, &out);
         assert_eq!(read_all(&mut server).len(), 10_000);
         assert!(deliver(&mut client, &acks).is_empty(), "hole resent twice");
-        assert_eq!(client.ca, CaState::Open);
+        assert_eq!(client.ca, LossState::Open);
     }
 
     /// With SACK, an ACK reporting newly SACKed data is a duplicate even
@@ -6778,9 +7023,15 @@ mod tests {
         assert!(!blocks.is_empty(), "a D-SACK");
         advance(Duration::from_millis(50));
         deliver(&mut client, &dsack);
-        assert_eq!(client.ca, CaState::Open);
+        assert_eq!(client.ca, LossState::Open);
         assert_eq!(client.cc.ssthresh(), u32::MAX, "ssthresh put back");
         assert!(client.score.reo_wnd_mult() > 1, "RACK's window widened");
+        let i = client.info();
+        assert_eq!((i.recoveries, i.undos, i.dsack_dups), (1, 1, 1));
+        assert_eq!(i.total_retrans, 1);
+        assert_eq!(i.bytes_retrans, u64::from(client.mss));
+        assert_eq!(i.slow_start_exit, Some(info::SlowStartExit::Loss));
+        assert_eq!(i.ca_state, info::CaState::Open);
     }
 
     /// With timestamps, the ACK of the late original echoes its TSval,
@@ -6790,7 +7041,7 @@ mod tests {
         let (mut client, _server, _, late_and_rexmit) = spurious_fast_retransmit(true, 40731);
         advance(Duration::from_millis(50));
         deliver(&mut client, &late_and_rexmit[..1]);
-        assert_eq!(client.ca, CaState::Open);
+        assert_eq!(client.ca, LossState::Open);
         assert_eq!(client.cc.ssthresh(), u32::MAX);
     }
 
@@ -6821,7 +7072,7 @@ mod tests {
             advance(Duration::from_millis(1));
             sent.extend(client.handle_segment(&parse(a)));
         }
-        assert_eq!(client.ca, CaState::Open, "timeout undone");
+        assert_eq!(client.ca, LossState::Open, "timeout undone");
         assert_eq!(client.frto, Frto::Off);
         assert_eq!(client.cc.ssthresh(), u32::MAX);
         let resent: Vec<u32> = seqs(&sent)
@@ -6846,7 +7097,7 @@ mod tests {
         for a in &acks {
             client.handle_segment(&parse(a));
         }
-        assert_eq!(client.ca, CaState::Open);
+        assert_eq!(client.ca, LossState::Open);
         assert_eq!(client.cc.ssthresh(), u32::MAX);
     }
 
@@ -8615,11 +8866,11 @@ mod tests {
                 sb.unacked()
             );
             assert!(
-                c.ca != CaState::Open || c.score.lost_bytes() == 0,
+                c.ca != LossState::Open || c.score.lost_bytes() == 0,
                 "{}: losses left unrepaired",
                 ctx()
             );
-            if c.ca != CaState::Open {
+            if c.ca != LossState::Open {
                 assert!(
                     seq_before_eq(c.recover, nxt),
                     "{}: recover past SND.NXT",
@@ -10275,7 +10526,7 @@ mod tests {
             let st = c.cc.ssthresh();
             assert!(st <= 7_000, "not cut by β: {st}");
             assert_eq!(*ssthresh.get_or_insert(st), st, "cut twice");
-            assert_eq!(c.ca, CaState::Open, "no loss recovery");
+            assert_eq!(c.ca, LossState::Open, "no loss recovery");
             assert_eq!(c.score.lost_bytes(), 0);
         }
         assert!(c.cwr_high.is_some());

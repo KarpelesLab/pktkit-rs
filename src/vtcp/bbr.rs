@@ -984,6 +984,10 @@ impl Bbr {
 }
 
 impl CongestionController for Bbr {
+    fn name(&self) -> &'static str {
+        "bbr"
+    }
+
     fn model_based(&self) -> bool {
         true
     }

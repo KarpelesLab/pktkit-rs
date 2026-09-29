@@ -129,6 +129,8 @@ struct Rack {
     rtt_from: Option<u64>,
     fack: u64,
     reordering_seen: bool,
+    /// Segments delivered out of order, for `TcpInfo`.
+    reordered: u64,
     reo_wnd_mult: u32,
     reo_wnd_persist: u32,
     dsack_round: Option<u64>,
@@ -233,6 +235,7 @@ impl Scoreboard {
                 rtt_from: None,
                 fack: 0,
                 reordering_seen: false,
+                reordered: 0,
                 reo_wnd_mult: 1,
                 reo_wnd_persist: 0,
                 dsack_round: None,
@@ -304,6 +307,29 @@ impl Scoreboard {
     #[inline]
     pub fn lost_bytes(&self) -> u32 {
         self.lost as u32
+    }
+
+    /// Bytes SACKed above SND.UNA.
+    #[inline]
+    pub fn sacked_bytes(&self) -> u32 {
+        self.sacked as u32
+    }
+
+    /// RACK's windowed minimum RTT.
+    pub fn min_rtt(&self) -> Option<Duration> {
+        self.rack.min_rtt.get().map(Duration::from_nanos)
+    }
+
+    /// Segments found delivered out of order so far.
+    #[inline]
+    pub fn reordered(&self) -> u64 {
+        self.rack.reordered
+    }
+
+    /// Carry the count of [`reordered`](Self::reordered) segments over
+    /// from a scoreboard this one replaces.
+    pub fn inherit_reordered(&mut self, n: u64) {
+        self.rack.reordered = n;
     }
 
     /// Index of the segment holding `off`.
@@ -418,6 +444,7 @@ impl Scoreboard {
             self.rack.fack = s.end;
         } else if s.end < self.rack.fack && !retrans {
             self.rack.reordering_seen = true;
+            self.rack.reordered += 1;
         }
         let rtt = now.saturating_sub(s.xmit);
         if retrans {

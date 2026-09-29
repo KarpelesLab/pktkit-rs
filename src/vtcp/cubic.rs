@@ -20,6 +20,7 @@
 //! curve scales by the MSS.
 
 use super::congestion::{Ack, CongestionController, cwnd_limited, initial_window};
+use super::info::HyStartPhase;
 use super::seqspace::seq_after_eq;
 use crate::time::Instant;
 use std::time::Duration;
@@ -98,6 +99,8 @@ pub struct Cubic {
     saved: Option<Saved>,
     /// Sending is paced (see [`SS_LIMIT`]).
     paced: bool,
+    /// Times HyStart++ entered Conservative Slow Start, for `TcpInfo`.
+    css_entries: u32,
 }
 
 impl Cubic {
@@ -117,6 +120,7 @@ impl Cubic {
             hystart: HyStart::new(),
             saved: None,
             paced: false,
+            css_entries: 0,
         }
     }
 
@@ -220,6 +224,19 @@ impl Cubic {
 }
 
 impl CongestionController for Cubic {
+    fn name(&self) -> &'static str {
+        "cubic"
+    }
+
+    fn hystart(&self) -> Option<(HyStartPhase, u32)> {
+        let phase = match self.hystart.phase {
+            Phase::SlowStart => HyStartPhase::SlowStart,
+            Phase::Css { .. } => HyStartPhase::Conservative,
+            Phase::Done => HyStartPhase::Done,
+        };
+        Some((phase, self.css_entries))
+    }
+
     fn set_mss(&mut self, mss: u32) {
         self.mss = mss.max(1);
     }
@@ -244,7 +261,11 @@ impl CongestionController for Cubic {
         self.last_ack = Some(a.now);
 
         if self.cwnd < self.ssthresh {
+            let was_css = self.hystart.in_css();
             let (divisor, exit) = self.hystart.on_ack(a, self.ssthresh == u32::MAX);
+            if !was_css && self.hystart.in_css() {
+                self.css_entries += 1;
+            }
             if limited {
                 let limit = if self.paced {
                     u32::MAX
@@ -469,7 +490,6 @@ impl HyStart {
         self.phase = Phase::Done;
     }
 
-    #[cfg(test)]
     fn in_css(&self) -> bool {
         matches!(self.phase, Phase::Css { .. })
     }

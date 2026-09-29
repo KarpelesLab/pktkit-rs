@@ -10,6 +10,7 @@
 //! letting one stretch ACK burst the window open; CUBIC's HyStart++ takes
 //! RFC 9406's L = 8, or no limit when paced.
 
+use super::info::HyStartPhase;
 use super::rate::{RateSample, TxState};
 use crate::time::Instant;
 use std::time::Duration;
@@ -201,6 +202,13 @@ pub trait CongestionController: Send {
     fn cwnd(&self) -> u32;
     /// The slow-start threshold, in bytes; `u32::MAX` until the first loss.
     fn ssthresh(&self) -> u32;
+    /// The controller's name, as Linux's `tcp_congestion_ops` has it.
+    fn name(&self) -> &'static str;
+    /// Where HyStart++ stands, and how many times it has entered
+    /// Conservative Slow Start, for a controller that runs it.
+    fn hystart(&self) -> Option<(HyStartPhase, u32)> {
+        None
+    }
 }
 
 /// RFC 6928's initial window, `min(10*MSS, max(2*MSS, 14600))`.
@@ -238,6 +246,10 @@ pub(crate) fn slow_start_inc(bytes_acked: u32, mss: u32) -> u32 {
 }
 
 impl CongestionController for NewReno {
+    fn name(&self) -> &'static str {
+        "reno"
+    }
+
     fn set_mss(&mut self, mss: u32) {
         self.mss = mss.max(1);
     }
@@ -388,6 +400,10 @@ impl HighSpeed {
 }
 
 impl CongestionController for HighSpeed {
+    fn name(&self) -> &'static str {
+        "highspeed"
+    }
+
     fn set_mss(&mut self, mss: u32) {
         self.mss = mss.max(1);
     }

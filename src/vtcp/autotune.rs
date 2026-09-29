@@ -151,6 +151,12 @@ impl RcvSpace {
         self.rtt = Some(self.rtt.map_or(sample, |r| (r * 7 + sample) / 8));
     }
 
+    /// The receiver's round-trip estimate, and the most read in a round
+    /// trip so far, for `TcpInfo`.
+    pub(crate) fn snapshot(&self) -> (Option<Duration>, usize) {
+        (self.rtt, self.space)
+    }
+
     /// The round trip that paces the measurement: the receiver's own
     /// estimate, or `srtt` from our sending if smaller (or the only one).
     fn rtt(&self, srtt: Option<Duration>) -> Option<Duration> {

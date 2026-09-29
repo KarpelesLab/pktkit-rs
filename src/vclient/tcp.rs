@@ -391,6 +391,14 @@ impl TcpConn {
         Ok(self.state.conn.lock().unwrap().nodelay())
     }
 
+    /// A snapshot of the connection's TCP state and counters (the window,
+    /// round trips, losses, rates, buffers, and what has limited the
+    /// sender), as `getsockopt(TCP_INFO)` gives on Linux. See
+    /// [`TcpInfo`](crate::vtcp::TcpInfo).
+    pub fn info(&self) -> crate::vtcp::TcpInfo {
+        self.state.conn.lock().unwrap().info()
+    }
+
     /// Check on a connection opened with
     /// [`Client::dial_tcp_nonblocking`](super::Client::dial_tcp_nonblocking):
     /// `Ok(true)` once the handshake has completed, `Ok(false)` while it is
