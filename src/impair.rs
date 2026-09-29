@@ -1,4 +1,5 @@
-//! Link impairment: delay, jitter, loss, duplication, corruption and rate limits.
+//! Link impairment: delay, jitter, loss, duplication, corruption, rate
+//! limits and ECN marking.
 //!
 //! A virtual topology is a perfect network — packets arrive instantly, in
 //! order, uncorrupted. Real ones do not, and code that has only ever run on a
@@ -30,6 +31,16 @@
 //! seed drops and delays the same packets, which is what turns a flaky failure
 //! into a test case.
 //!
+//! # ECN
+//!
+//! A congested router with an AQM marks ECN-capable packets Congestion
+//! Experienced (RFC 3168) rather than drop them. [`Impairment::ecn_mark`]
+//! does so at random; [`Impairment::ecn_threshold`] is a step AQM on a
+//! rate-limited link, marking what queues longer than a threshold, as an
+//! L4S or DCTCP queue does. Only IP packets whose ECN field says ECT(0)
+//! or ECT(1) are marked, over IPv4 (checksum kept right) or IPv6, bare or
+//! in an Ethernet frame; the rest pass as they are.
+//!
 //! # Ordering
 //!
 //! Packets are released in deadline order, so jitter reorders traffic exactly
@@ -45,7 +56,8 @@
 
 use crate::time::Instant;
 use crate::{
-    DeviceStats, Frame, IpPrefix, L2Device, L2Handler, L3Device, L3Handler, MacAddr, Packet, Result,
+    DeviceStats, EtherType, Frame, IpPrefix, L2Device, L2Handler, L3Device, L3Handler, MacAddr,
+    Packet, Result,
 };
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -83,6 +95,18 @@ pub struct Impairment {
     /// Seed for the impairment RNG. Zero picks an arbitrary seed; any other
     /// value makes the run reproducible.
     pub seed: u64,
+    /// Probability an ECN-capable message is marked Congestion
+    /// Experienced (see [ECN](self#ecn)). Messages that are not
+    /// ECN-capable are left alone: an AQM would drop them, which `loss`
+    /// stands for.
+    pub ecn_mark: f64,
+    /// A step-marking AQM for a rate-limited link: an ECN-capable message
+    /// that waits longer than this for the link, behind what is queued
+    /// ahead of it, is marked Congestion Experienced. A fraction of the
+    /// round trip marks where a classic AQM would; a millisecond, where
+    /// an L4S one would. `None` (the default) marks nothing. Needs
+    /// `rate_bps`: without it nothing queues.
+    pub ecn_threshold: Option<Duration>,
 }
 
 setters! {
@@ -95,6 +119,8 @@ setters! {
         set rate_bps: u64;
         set queue_limit: usize;
         set seed: u64;
+        set ecn_mark: f64;
+        some ecn_threshold: Duration;
     }
 }
 
@@ -109,6 +135,8 @@ impl Default for Impairment {
             rate_bps: 0,
             queue_limit: 1024,
             seed: 0,
+            ecn_mark: 0.0,
+            ecn_threshold: None,
         }
     }
 }
@@ -122,6 +150,25 @@ impl Impairment {
             && self.duplicate == 0.0
             && self.corrupt == 0.0
             && self.rate_bps == 0
+            && self.ecn_mark == 0.0
+    }
+}
+
+/// Mark `msg` Congestion Experienced if it is an ECN-capable IP packet,
+/// or one in an Ethernet frame when `l2`.
+fn mark_ce(msg: &mut [u8], l2: bool) {
+    let ip = if l2 {
+        let f = Frame::from_mut(msg);
+        if !matches!(f.ether_type(), EtherType::IPV4 | EtherType::IPV6) {
+            return;
+        }
+        f.payload_mut()
+    } else {
+        msg
+    };
+    // ECT(1) or ECT(0); never Not-ECT, whose sender could not answer.
+    if matches!(crate::packet::ip_ecn(ip), 1 | 2) {
+        crate::packet::set_ip_ecn(ip, 3);
     }
 }
 
@@ -231,6 +278,8 @@ struct Engine {
     /// two never interleave out of order.
     delivering: DeliveryLock,
     stats: DeviceStats,
+    /// Messages are Ethernet frames, not IP packets.
+    l2: bool,
 }
 
 /// A lock a thread cannot take twice: the second, nested attempt is told so
@@ -306,7 +355,7 @@ impl core::fmt::Debug for Engine {
 }
 
 impl Engine {
-    fn new(cfg: Impairment) -> Arc<Engine> {
+    fn new(cfg: Impairment, l2: bool) -> Arc<Engine> {
         let rng = Rng::new(cfg.seed);
         Arc::new(Engine {
             cfg: Mutex::new(cfg),
@@ -318,6 +367,7 @@ impl Engine {
             wake: Condvar::new(),
             delivering: DeliveryLock::default(),
             stats: DeviceStats::new(),
+            l2,
         })
     }
 
@@ -453,6 +503,9 @@ impl Engine {
             Duration::from_nanos(rng.below(cfg.jitter.as_nanos().min(u64::MAX as u128) as u64))
         };
         let duplicate = cfg.duplicate > 0.0 && rng.next_f64() < cfg.duplicate;
+        // Drawn last, and only when asked for, so a seed that did not ask
+        // keeps the run it had.
+        let mut mark = cfg.ecn_mark > 0.0 && rng.next_f64() < cfg.ecn_mark;
         drop(rng);
 
         let now = Instant::now();
@@ -475,6 +528,10 @@ impl Engine {
             Some(t) if t > now => t,
             _ => now,
         };
+        mark |= cfg.ecn_threshold.is_some_and(|t| ready - now > t);
+        if mark {
+            mark_ce(&mut buf, self.l2);
+        }
         // Time to clock this many bits onto the link; an unset rate is
         // instantaneous.
         let serialize = (buf.len() as u64)
@@ -608,7 +665,7 @@ fn join_unless_current(_w: JoinHandle<()>) {}
 
 macro_rules! impaired_device {
     (
-        $name:ident, $device:ident, $handler:ident, $msg:ident, $doc:literal
+        $name:ident, $device:ident, $handler:ident, $msg:ident, $l2:literal, $doc:literal
     ) => {
         #[doc = $doc]
         pub struct $name {
@@ -633,7 +690,7 @@ macro_rules! impaired_device {
         impl $name {
             /// Wrap `inner`, impairing traffic in both directions.
             pub fn new(inner: Arc<dyn $device>, cfg: Impairment) -> Arc<$name> {
-                let engine = Engine::new(cfg);
+                let engine = Engine::new(cfg, $l2);
                 let me = Arc::new_cyclic(|this| $name {
                     inner,
                     handler: Mutex::new(None),
@@ -778,6 +835,7 @@ impaired_device!(
     L2Device,
     L2Handler,
     Frame,
+    true,
     "An [`L2Device`] that applies an [`Impairment`] to every frame crossing it."
 );
 
@@ -786,6 +844,7 @@ impaired_device!(
     L3Device,
     L3Handler,
     Packet,
+    false,
     "An [`L3Device`] that applies an [`Impairment`] to every packet crossing it."
 );
 
@@ -1504,5 +1563,68 @@ mod tests {
         let (idle, elapsed) = took.lock().unwrap().expect("handler ran");
         assert!(!idle, "idle while its own delivery was in progress");
         assert!(elapsed < Duration::from_secs(1), "waited {elapsed:?}");
+    }
+
+    /// An IPv4 packet with ECN field `ecn` and a valid header checksum,
+    /// in a frame.
+    fn v4_frame(ecn: u8, tag: u8) -> Vec<u8> {
+        let mut ip = vec![0u8; 40];
+        ip[0] = 0x45;
+        ip[1] = (10 << 2) | ecn;
+        ip[2..4].copy_from_slice(&40u16.to_be_bytes());
+        ip[8] = 64;
+        ip[9] = 17;
+        ip[20] = tag;
+        let cs = crate::checksum::checksum(&ip[..20]);
+        ip[10..12].copy_from_slice(&cs.to_be_bytes());
+        build_frame(MacAddr::broadcast(), MacAddr::zero(), EtherType::IPV4, &ip)
+    }
+
+    fn ecn_of(f: &[u8]) -> u8 {
+        crate::packet::ip_ecn(&f[14..])
+    }
+
+    /// Marking at random touches only ECN-capable packets, and keeps the
+    /// IPv4 checksum right.
+    #[test]
+    fn ecn_mark_sets_ce_on_ect_only() {
+        let (wire, link) = wrap(Impairment::default().ecn_mark(1.0).seed(3));
+        for (i, ecn) in [0u8, 1, 2, 3].into_iter().enumerate() {
+            link.send(Frame::from_slice(&v4_frame(ecn, i as u8)))
+                .unwrap();
+        }
+        link.send(Frame::from_slice(&frame(9))).unwrap();
+        assert!(link.wait_idle(Duration::from_secs(5)));
+        let sent = wire.sent.lock().unwrap();
+        let got: Vec<u8> = sent[..4].iter().map(|f| ecn_of(f)).collect();
+        assert_eq!(got, [0, 3, 3, 3], "Not-ECT marked, or ECT not");
+        for f in &sent[..4] {
+            assert_eq!(crate::checksum::checksum(&f[14..34]), 0, "checksum");
+            assert_eq!(f[15] >> 2, 10, "DSCP kept");
+        }
+        assert_eq!(sent[4], frame(9), "a frame without IP is left alone");
+    }
+
+    /// The step AQM marks what queues past its threshold on a
+    /// rate-limited link, not what goes straight out.
+    #[test]
+    fn ecn_threshold_marks_what_queues() {
+        // 54-byte frames at 432 kbit/s: a millisecond each.
+        let (wire, link) = wrap(
+            Impairment::default()
+                .rate_bps(432_000)
+                .ecn_threshold(Duration::from_micros(2500)),
+        );
+        for i in 0..8 {
+            link.send(Frame::from_slice(&v4_frame(2, i))).unwrap();
+        }
+        assert!(link.wait_idle(Duration::from_secs(5)));
+        let sent = wire.sent.lock().unwrap();
+        let got: Vec<u8> = sent.iter().map(|f| ecn_of(f)).collect();
+        // The first three wait 0, 1 and 2 ms; the rest longer. A slow
+        // test host only makes the queue shorter, never longer.
+        assert_eq!(got[..3], [2, 2, 2], "{got:?}");
+        assert!(got[3..].iter().all(|&e| e == 3 || e == 2), "{got:?}");
+        assert_eq!(got[7], 3, "{got:?}");
     }
 }

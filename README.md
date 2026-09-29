@@ -53,12 +53,12 @@ than the Go code, and the design is idiomatic Rust:
 | `dhcp`       | DHCP client codec + `DHCPServer` (DISCOVER/OFFER/REQUEST/ACK/…)               |
 | `qemu`       | QEMU userspace network socket protocol (listener + dialer)                    |
 | `pcap`       | Mirror a device's traffic to a `.pcap` file (`TapL2` / `TapL3`)              |
-| `impair`     | Delay, jitter, loss, duplication, corruption and rate limits on a link       |
+| `impair`     | Delay, jitter, loss, duplication, corruption, rate limits, ECN marking      |
 | `tuntap`     | TUN/TAP devices on Linux and macOS                                            |
 | `afpacket`   | Bind an L2 device to an existing interface (Linux `AF_PACKET`)               |
 | `xdp`        | Linux XDP: load/attach eBPF on a device's RX path, capture chosen IP prefixes |
 | `afxdp`      | Linux AF_XDP zero-copy sockets (builds on `xdp`)                             |
-| `vtcp`       | Pure-Rust TCP engine (congestion, SACK, timestamps, window scaling, SYN cookies) |
+| `vtcp`       | Pure-Rust TCP engine (congestion, SACK, timestamps, window scaling, ECN, SYN cookies) |
 | `slirp`      | Userspace NAT stack routing virtual traffic to real sockets                    |
 | `vclient`    | High-level virtual client: `dial`, `listen`, DNS, minimal HTTP                |
 | `nat`        | Packet-level IPv4 NAT + NAT64 + ALGs (FTP, SIP, H.323, PPTP, TFTP, IRC)      |

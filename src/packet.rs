@@ -113,7 +113,10 @@ pub const MAX_EXT_HEADERS: usize = 16;
 
 /// The ECN field (RFC 3168 §5) of the IPv4 or IPv6 header `pkt` starts
 /// with; zero (Not-ECT) for anything else.
-#[cfg_attr(not(any(feature = "vclient", feature = "slirp")), allow(dead_code))]
+#[cfg_attr(
+    not(any(feature = "impair", feature = "vclient", feature = "slirp")),
+    allow(dead_code)
+)]
 pub(crate) fn ip_ecn(pkt: &[u8]) -> u8 {
     match (pkt.first().map(|b| b >> 4), pkt.get(1)) {
         (Some(4), Some(b)) => b & 3,
@@ -124,7 +127,10 @@ pub(crate) fn ip_ecn(pkt: &[u8]) -> u8 {
 
 /// Set the ECN field of the IPv4 or IPv6 header `pkt` starts with,
 /// keeping an IPv4 header checksum right. Anything else is left alone.
-#[cfg_attr(not(any(feature = "vclient", feature = "slirp")), allow(dead_code))]
+#[cfg_attr(
+    not(any(feature = "impair", feature = "vclient", feature = "slirp")),
+    allow(dead_code)
+)]
 pub(crate) fn set_ip_ecn(pkt: &mut [u8], ecn: u8) {
     let ecn = ecn & 3;
     match pkt.first().map(|b| b >> 4) {
