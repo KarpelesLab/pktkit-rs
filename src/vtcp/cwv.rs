@@ -59,9 +59,14 @@ impl PipeAck {
             return;
         }
         // A sample that spans an idle spell measured the spell, not the
-        // path's rate: it starts afresh instead.
+        // path's rate: it starts afresh instead. One that ran past a round
+        // trip, the ACKs being sparse, counts one round trip's worth of
+        // it (§4.2): whole, a sample of nearly two would read up to twice
+        // what the path carries per round trip.
         if took <= 2 * rtt {
-            self.push(now, high_ack.wrapping_sub(from), rtt);
+            let acked = u128::from(high_ack.wrapping_sub(from));
+            let sample = acked * rtt.as_nanos() / took.as_nanos();
+            self.push(now, sample as u32, rtt);
         }
         self.cur = Some((now, high_ack));
     }
@@ -162,6 +167,19 @@ mod tests {
         assert!(non_validated(Some(0), 10_000));
         assert!(!non_validated(None, 10_000));
         assert!(!non_validated(Some(5_000), 10_000));
+    }
+
+    /// A sample that took longer than a round trip counts what one round
+    /// trip of it carried.
+    #[test]
+    fn sample_covers_one_round_trip() {
+        let t0 = Instant::now();
+        let mut p = PipeAck::new(t0);
+        p.on_ack(t0, 0, RTT);
+        // 10 kB per round trip, the ACK after one coming 1.9 RTTs in.
+        let now = t0 + RTT * 19 / 10;
+        p.on_ack(now, 19_000, RTT);
+        assert_eq!(p.value(now, RTT), Some(10_000));
     }
 
     /// A sample across an idle spell is not taken.
