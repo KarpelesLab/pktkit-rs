@@ -6,7 +6,7 @@ semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
-## [0.2.0](https://github.com/KarpelesLab/pktkit-rs/compare/v0.1.8...v0.2.0) - 2026-09-29
+## [0.1.9](https://github.com/KarpelesLab/pktkit-rs/compare/v0.1.8...v0.1.9) - 2026-09-29
 
 ### Added
 
