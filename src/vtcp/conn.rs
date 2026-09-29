@@ -758,6 +758,10 @@ pub struct Conn {
     /// §3.10.7.2-3): before the handshake completes, the SYN may come from
     /// a spoofed source.
     syn_data: Vec<u8>,
+    /// The peer's initial sequence number, which a retransmission of its
+    /// SYN repeats. RCV.NXT alone does not give it once Fast Open data has
+    /// moved it past the SYN.
+    irs: u32,
 
     // Deferred FIN.
     fin_pending: bool,
@@ -941,6 +945,7 @@ impl Conn {
             snd_wl: None,
             rcv_adv: None,
             syn_data: Vec::new(),
+            irs: 0,
             fin_pending: false,
             pending_fin_seq: 0,
             fin_queued: false,
@@ -1625,6 +1630,7 @@ impl Conn {
 
         self.send_buf = Some(SendBuf::new(self.cfg.send_buf_size, iss));
         self.score = Scoreboard::new(iss, self.now);
+        self.irs = syn.seq;
         self.recv_buf = Some(RecvBuf::new(
             syn.seq.wrapping_add(1),
             self.cfg.recv_buf_size,
@@ -2323,10 +2329,13 @@ impl Conn {
         // A retransmitted SYN means our SYN-ACK was lost. The RFC's answer,
         // an ACK for an unacceptable segment, is useless to a peer in
         // SYN-SENT, which then has to outlast our RTO; resend the SYN-ACK
-        // now, as Linux does.
+        // now, as Linux does. Only a SYN restating the IRS is the peer's
+        // again: any SEQ before RCV.NXT, half the sequence space, would let
+        // a blind attacker turn off ECT (see `Ecn::on_syn_again`) and draw
+        // SYN-ACKs at will.
         if self.state == State::SynReceived
             && seg.flags & (flags::SYN | flags::ACK | flags::RST) == flags::SYN
-            && seq_before(seg.seq, self.recv_buf.as_ref().unwrap().nxt())
+            && seg.seq == self.irs
         {
             self.ecn.on_syn_again(seg);
             self.resend_syn_ack();
@@ -2488,6 +2497,7 @@ impl Conn {
             }
             self.retries = 0;
             self.stop_rto();
+            self.irs = seg.seq;
             self.recv_buf = Some(RecvBuf::new(
                 seg.seq.wrapping_add(1),
                 self.cfg.recv_buf_size,
@@ -2522,6 +2532,7 @@ impl Conn {
             let sb = self.send_buf.as_mut().unwrap();
             sb.rewind_to(sb.una().wrapping_add(1));
         }
+        self.irs = seg.seq;
         self.recv_buf = Some(RecvBuf::new(
             seg.seq.wrapping_add(1),
             self.cfg.recv_buf_size,
@@ -10960,6 +10971,54 @@ mod tests {
         assert_eq!(s.ecn.fb, Feedback::Off);
         deliver(&mut c, &synack);
         assert_eq!(c.ecn.fb, Feedback::Off);
+    }
+
+    /// In SYN-RECEIVED only the peer's SYN again, restating the IRS, has
+    /// the SYN-ACK resent and, if it no longer asks for AccECN, ECT turned
+    /// off: a blind attacker's SYN, anywhere before RCV.NXT, does neither.
+    #[test]
+    fn only_the_peer_s_syn_again_is_taken_in_syn_received() {
+        let mut c = Conn::new(big(41162, 80).ecn(EcnMode::Accurate));
+        let mut s = Conn::new(big(80, 41162).ecn(EcnMode::Accurate));
+        let syn = parse(&c.connect()[0]);
+        s.accept_syn(&syn);
+        assert!(s.ecn.ect);
+        let blind = Segment {
+            seq: syn.seq.wrapping_sub(1 << 30),
+            ..syn.clone()
+        };
+        let mut fallback = blind.clone();
+        fallback.ae = false;
+        fallback.flags = flags::SYN;
+        let out = s.handle_segment(&fallback);
+        assert!(
+            out.iter().all(|p| !parse(p).has_flag(flags::SYN)),
+            "a blind SYN drew a SYN-ACK"
+        );
+        assert!(s.ecn.ect, "a blind SYN turned ECT off");
+        fallback.seq = syn.seq;
+        let out = s.handle_segment(&fallback);
+        assert!(parse(&out[0]).has_flag(flags::SYN | flags::ACK));
+        assert!(!s.ecn.ect);
+    }
+
+    /// With Fast Open, RCV.NXT is past the SYN's data: its retransmission,
+    /// the same SYN, still has the SYN-ACK resent.
+    #[test]
+    fn a_fast_open_syn_again_is_answered() {
+        let cookie = tfo_cookie(41163);
+        let mut c = Conn::new(tfo_cfg(41164, 80));
+        let mut s = Conn::new(tfo_cfg(80, 41164));
+        let (_, syn) = c.connect_fast_open(Some(&cookie), None, b"GET /");
+        let synack = deliver_syn(&mut s, &syn);
+        assert!(s.fast_open_accepted());
+        let out = s.handle_segment(&parse(&syn[0]));
+        let head = |p: &Vec<u8>| {
+            let p = parse(p);
+            (p.seq, p.ack, p.flags)
+        };
+        assert_eq!(out.len(), 1);
+        assert_eq!(head(&out[0]), head(&synack[0]), "SYN-ACK not resent");
     }
 
     /// What a path that meddles with ECN leaves of it (RFC 9768 §3.1.5,
