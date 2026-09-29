@@ -413,14 +413,19 @@ impl Bbr {
         self.full_bw_now = false;
     }
 
-    /// CheckFullBWReached (§5.3.1.2): three rounds without 25% growth.
-    fn check_full_bw_reached(&mut self, rate: u64, app_limited: bool) {
+    /// CheckFullBWReached (§5.3.1.2): three rounds without 25% growth. Of
+    /// max_bw, as Linux's bbr_check_full_bw_reached has it, where the
+    /// draft compares the round's one sample: on a path that reorders, the
+    /// samples scatter, and one in a few landing 25% over the last would
+    /// keep Startup going for good.
+    fn check_full_bw_reached(&mut self, app_limited: bool) {
         if self.full_bw_now || !self.round_start || app_limited {
             return;
         }
-        if rate as f64 >= self.full_bw as f64 * FULL_BW_GROWTH {
+        let bw = self.max_bw;
+        if bw as f64 >= self.full_bw as f64 * FULL_BW_GROWTH {
             self.reset_full_bw();
-            self.full_bw = rate;
+            self.full_bw = bw;
             return;
         }
         self.full_bw_count += 1;
@@ -926,7 +931,7 @@ impl CongestionController for Bbr {
         }
         self.update_ack_aggregation(u64::from(a.newly_acked));
         if a.rs.is_some() {
-            self.check_full_bw_reached(rate, rs.is_app_limited);
+            self.check_full_bw_reached(rs.is_app_limited);
         }
         self.check_startup_high_loss(a);
         if self.state == State::Startup && self.full_bw_reached {
@@ -1184,6 +1189,23 @@ mod tests {
         assert_eq!(f.b.max_bw(), 9_900_000);
         assert_eq!(f.b.pacing_gain, 0.5);
         assert_eq!(f.b.min_rtt(), Some(RTT));
+    }
+
+    /// On a path that reorders, samples scatter around the rate: one in a
+    /// few a third over it must not keep Startup going; the plateau is in
+    /// max_bw.
+    #[test]
+    fn startup_exits_through_scattered_samples() {
+        let mut f = Feed::new();
+        for rate in [1_000_000, 2_000_000, 4_000_000, 8_000_000] {
+            f.round(rate, 0, false);
+        }
+        for i in 0..8 {
+            let rate = if i % 3 == 2 { 11_000_000 } else { 7_000_000 };
+            f.round(rate, 0, false);
+        }
+        assert!(f.b.full_bw_reached);
+        assert_ne!(f.b.state, State::Startup);
     }
 
     /// Drain holds until what is in flight is down to the BDP, then
