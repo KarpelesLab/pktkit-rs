@@ -3039,6 +3039,7 @@ impl Conn {
                 sack_seen = true;
                 dsack = dsack_block(&blocks, ack);
                 let rest = &blocks[dsack.is_some() as usize..];
+                self.score.set_mss(u32::from(self.mss));
                 d.merge(self.score.sack(rest, now, ecr));
             }
         }

@@ -34,6 +34,11 @@ const MIN_RTT_WINDOW: u64 = 300_000_000_000;
 /// Reordering windows kept inflated after a D-SACK (RFC 8985 §6.2 step 4).
 const REO_WND_PERSIST: u32 = 16;
 
+/// Records a SACK may split the scoreboard into beyond two per MSS in
+/// flight: rounding to whole MSS keeps an honest receiver well under that,
+/// so only a peer SACKing odd bytes to fragment the scoreboard meets it.
+const SPLIT_SLACK: u64 = 64;
+
 /// A segment, as last sent. The pieces of a split segment share `tx`.
 #[derive(Debug, Clone, Copy)]
 struct Seg {
@@ -207,6 +212,8 @@ pub(crate) struct Scoreboard {
     sack_cache: Vec<(u64, u64)>,
     /// Delivery rate estimation.
     rate: Rate,
+    /// The MSS, which SACKs split segments in multiples of.
+    mss: u64,
     /// Segments marked lost since last taken, with their size, for a
     /// controller that reacts to each loss (BBR); `None` when none does.
     lost_log: Option<Vec<(TxState, u32)>>,
@@ -243,8 +250,15 @@ impl Scoreboard {
             },
             sack_cache: Vec::new(),
             rate: Rate::default(),
+            mss: u64::from(super::options::MIN_MSS),
             lost_log: None,
         }
+    }
+
+    /// The MSS segments go out at: a SACK splits a segment only in whole
+    /// multiples of it.
+    pub fn set_mss(&mut self, mss: u32) {
+        self.mss = u64::from(mss.max(1));
     }
 
     /// Run RACK (it needs SACK, RFC 8985 §4).
@@ -353,6 +367,34 @@ impl Scoreboard {
         self.segs.insert(i + 1, second);
     }
 
+    /// Whether segment `i` and the next one can be sent as one: pieces of
+    /// one transmission, data, neither SACKed, and both deemed lost or
+    /// both not. Segments sent apart stay apart: an MTU probe resent with
+    /// what went before it would no longer show which of them was lost.
+    fn mergeable(&self, i: usize) -> bool {
+        let (Some(a), Some(b)) = (self.segs.get(i), self.segs.get(i + 1)) else {
+            return false;
+        };
+        let (fa, fb) = (
+            a.flags & (SACKED | LOST | FIN),
+            b.flags & (SACKED | LOST | FIN),
+        );
+        a.tx == b.tx && fa == fb && fa & (SACKED | FIN) == 0
+    }
+
+    /// Join segment `i` and the next, which are [`mergeable`](Self::mergeable),
+    /// for a retransmission covering both: what each last went out as is
+    /// about to be replaced.
+    fn merge_next(&mut self, i: usize) {
+        let b = self.segs.remove(i + 1).unwrap();
+        if b.has(LOST) {
+            self.lost_set.remove(&b.start);
+        }
+        let a = &mut self.segs[i];
+        a.end = b.end;
+        a.flags |= b.flags & RETRANS;
+    }
+
     fn push_tx(&mut self, start: u64, end: u64, xmit: u64, tx: u64) {
         if self.rack_on {
             self.tq.push_back(TxRec {
@@ -402,6 +444,11 @@ impl Scoreboard {
             i += 1;
         }
         let end = start + u64::from(len.max(1));
+        // Pieces going out as one segment become one record again, as
+        // [`next_lost`](Self::next_lost) put them together.
+        while self.segs[i].end < end && self.mergeable(i) {
+            self.merge_next(i);
+        }
         if end < self.segs[i].end && !self.segs[i].has(FIN) {
             self.split(i, end);
         }
@@ -572,32 +619,68 @@ impl Scoreboard {
                 parts = next;
             }
             for (pl, pr) in parts {
-                self.mark_sacked(pl, pr, now_ns, ecr, &mut d);
+                self.mark_sacked((l, r), pl, pr, now_ns, ecr, &mut d);
             }
         }
         self.sack_cache = ranges;
         d
     }
 
-    fn mark_sacked(&mut self, l: u64, r: u64, now: u64, ecr: Option<u32>, d: &mut Delivery) {
-        let Some(mut i) = self.idx(l) else {
+    /// Mark SACKed the segments in `[pl, pr)`, a part of `block` not
+    /// reported before, that `block` covers.
+    ///
+    /// A peer SACKing a byte in every two would otherwise split the
+    /// scoreboard into single bytes (CVE-2019-11478): megabytes of records,
+    /// every ACK and RACK scan walking them, retransmissions going out a
+    /// byte at a time. As Linux's `tcp_match_skb_to_sack`, a block's edge
+    /// splits a segment only at a whole number of MSS from its start, a
+    /// segment of one MSS or less is SACKed whole or not at all, and past
+    /// a cap on records nothing is split. The bytes left out are resent if
+    /// need be, which costs an honest receiver nothing: it SACKs what it
+    /// received, whole segments.
+    fn mark_sacked(
+        &mut self,
+        block: (u64, u64),
+        pl: u64,
+        pr: u64,
+        now: u64,
+        ecr: Option<u32>,
+        d: &mut Delivery,
+    ) {
+        let Some(mut i) = self.idx(pl) else {
             return;
         };
-        if self.segs[i].start < l {
-            if self.segs[i].has(SACKED) {
-                i += 1;
-            } else {
-                self.split(i, l);
-                i += 1;
-            }
-        }
-        while i < self.segs.len() && self.segs[i].start < r {
-            if self.segs[i].has(SACKED) {
+        let (l, r) = block;
+        while i < self.segs.len() && self.segs[i].start < pr {
+            let s = self.segs[i];
+            if s.has(SACKED) {
                 i += 1;
                 continue;
             }
-            if self.segs[i].end > r {
-                self.split(i, r);
+            let (mut lo, mut hi) = (s.start.max(l), s.end.min(r));
+            if lo > s.start || hi < s.end {
+                if s.len() <= self.mss || s.has(FIN) {
+                    i += 1;
+                    continue;
+                }
+                if lo > s.start {
+                    lo = s.start + (lo - s.start).div_ceil(self.mss) * self.mss;
+                }
+                if hi < s.end {
+                    hi = s.start + (hi - s.start) / self.mss * self.mss;
+                }
+                let cuts = usize::from(lo > s.start) + usize::from(hi < s.end);
+                if lo >= hi || !self.may_split(cuts) {
+                    i += 1;
+                    continue;
+                }
+                if lo > s.start {
+                    self.split(i, lo);
+                    i += 1;
+                }
+                if hi < self.segs[i].end {
+                    self.split(i, hi);
+                }
             }
             let s = self.segs[i];
             let seg = &mut self.segs[i];
@@ -615,6 +698,13 @@ impl Scoreboard {
             self.rack_delivered(&s, now, ecr);
             i += 1;
         }
+    }
+
+    /// Whether a SACK may add `n` records: at most two per MSS in flight,
+    /// and some.
+    fn may_split(&self, n: usize) -> bool {
+        let cap = 2 * (self.end_off() - self.una_off) / self.mss + SPLIT_SLACK;
+        (self.segs.len() + n) as u64 <= cap
     }
 
     /// Feed an RTT sample to the windowed minimum (RFC 8985 §6.2 step 1).
@@ -936,11 +1026,26 @@ impl Scoreboard {
         (self.seq_of(s.start), len, fin)
     }
 
-    /// The lowest segment deemed lost and not yet sent again, cut to `max`.
+    /// The lowest segment deemed lost and not yet sent again, cut to `max`,
+    /// and joined with the lost ones right after it up to `max`: pieces of
+    /// what went out as one go out again as one, not one by one.
     pub fn next_lost(&self, max: u32) -> Option<SegRef> {
         let &start = self.lost_set.first()?;
         let i = self.idx(start)?;
-        Some(self.seg_ref(&self.segs[i], max))
+        let (seq, len, fin) = self.seg_ref(&self.segs[i], max);
+        let max = u64::from(max.max(1));
+        let mut end = self.segs[i].end;
+        let mut j = i;
+        while !fin && end - start < max && self.mergeable(j) && self.segs[j + 1].has(LOST) {
+            j += 1;
+            end = self.segs[j].end;
+        }
+        let len = if j == i {
+            len
+        } else {
+            (end - start).min(max) as u32
+        };
+        Some((seq, len, fin))
     }
 
     /// The first outstanding segment, cut to `max`.
@@ -1017,6 +1122,7 @@ mod tests {
     fn board(n: u32, t0: Instant) -> Scoreboard {
         let mut b = Scoreboard::new(u32::MAX - 2500, t0);
         b.set_rack(true);
+        b.set_mss(MSS);
         for i in 0..n {
             b.on_send(
                 (u32::MAX - 2500).wrapping_add(i * MSS),
@@ -1116,7 +1222,7 @@ mod tests {
         assert_eq!(d.delivered, 2 * MSS, "segments 0 and 1; 2 was SACKed");
         b.check();
         assert_eq!(b.pipe(), 4 * MSS);
-        // A block edge inside a segment splits it.
+        // A block edge inside a segment of an MSS SACKs none of it.
         let d = b.sack(
             &[SackBlock {
                 left: seq(8) + 500,
@@ -1125,10 +1231,10 @@ mod tests {
             now,
             None,
         );
-        assert_eq!(d.delivered, 500);
+        assert_eq!(d.delivered, 0);
         b.check();
         let d = b.ack(seq(10), now, None);
-        assert_eq!(d.delivered, 3 * MSS + 500);
+        assert_eq!(d.delivered, 4 * MSS);
         assert!(b.is_empty());
         b.check();
     }
@@ -1243,6 +1349,118 @@ mod tests {
         b.unmark_lost();
         b.check();
         assert_eq!(b.pipe(), 3 * MSS);
+    }
+
+    /// A peer SACKing one byte in every two (CVE-2019-11478) splits
+    /// nothing: segments of an MSS are SACKed whole or not at all, so the
+    /// scoreboard keeps a record per segment and a retransmission is a
+    /// whole segment, not a byte.
+    #[test]
+    fn odd_byte_sacks_do_not_fragment() {
+        let t0 = Instant::now();
+        let n = 20;
+        let mut b = board(n, t0);
+        let mut off = 1;
+        while off + 8 < n * MSS {
+            let blocks: Vec<SackBlock> = (0..4)
+                .map(|k| SackBlock {
+                    left: seq(0).wrapping_add(off + 2 * k),
+                    right: seq(0).wrapping_add(off + 2 * k + 1),
+                })
+                .collect();
+            b.begin_ack();
+            b.sack(&blocks, t0 + Duration::from_millis(50), None);
+            b.detect_loss(t0 + Duration::from_millis(50), Duration::ZERO);
+            off += 8;
+        }
+        b.check();
+        assert_eq!(b.segs.len(), n as usize, "the scoreboard was fragmented");
+        assert_eq!(b.sacked_bytes(), 0);
+        b.mark_all_lost();
+        assert_eq!(b.next_lost(MSS), Some((seq(0), MSS, false)));
+    }
+
+    /// A segment longer than an MSS (an MTU probe, or one sent before the
+    /// MSS came down) is split at whole MSS from its start: the block's
+    /// left edge rounds up, its right edge down.
+    #[test]
+    fn sack_splits_at_whole_mss() {
+        let t0 = Instant::now();
+        let mut b = Scoreboard::new(seq(0), t0);
+        b.set_rack(true);
+        b.set_mss(MSS);
+        b.on_send(seq(0), 3 * MSS, false, t0, 0);
+        b.on_send(seq(3), MSS, false, t0, 0);
+        let d = b.sack(
+            &[SackBlock {
+                left: seq(0) + 500,
+                right: seq(2) + 500,
+            }],
+            t0,
+            None,
+        );
+        assert_eq!(d.delivered, MSS);
+        assert!(!b.sacked_at(seq(0) + 999) && b.sacked_at(seq(1)) && !b.sacked_at(seq(2)));
+        b.check();
+        // The block grown over the whole segment SACKs the rest of it,
+        // though the previous ACK reported part of it already.
+        let d = b.sack(
+            &[SackBlock {
+                left: seq(0),
+                right: seq(3),
+            }],
+            t0,
+            None,
+        );
+        assert_eq!(d.delivered, 2 * MSS);
+        assert_eq!(b.sacked_bytes(), 3 * MSS);
+        b.check();
+    }
+
+    /// Past two records per MSS in flight, and some, nothing is split: a
+    /// flight of tiny segments has no room to spare.
+    #[test]
+    fn sack_splits_are_capped() {
+        let t0 = Instant::now();
+        let mut b = Scoreboard::new(0, t0);
+        b.set_mss(MSS);
+        for i in 0..100 {
+            b.on_send(i, 1, false, t0, 0);
+        }
+        b.on_send(100, 3 * MSS, false, t0, 0);
+        let d = b.sack(
+            &[SackBlock {
+                left: 100 + MSS,
+                right: 100 + 2 * MSS,
+            }],
+            t0,
+            None,
+        );
+        assert_eq!(d.delivered, 0);
+        assert_eq!(b.segs.len(), 101);
+        b.check();
+    }
+
+    /// Lost pieces of what went out as one go out again as one, up to the
+    /// room, and are one record after; what went out apart stays apart.
+    #[test]
+    fn lost_pieces_are_resent_together() {
+        let t0 = Instant::now();
+        let mut b = Scoreboard::new(seq(0), t0);
+        b.set_mss(MSS);
+        b.on_send(seq(0), 3 * MSS, false, t0, 0);
+        b.on_send(seq(3), MSS, false, t0, 1);
+        b.mark_range_lost(seq(0), seq(1));
+        b.mark_range_lost(seq(1), seq(2));
+        b.mark_all_lost();
+        assert_eq!(b.segs.len(), 4);
+        assert_eq!(b.next_lost(4 * MSS), Some((seq(0), 3 * MSS, false)));
+        assert_eq!(b.next_lost(2 * MSS), Some((seq(0), 2 * MSS, false)));
+        b.on_retransmit(seq(0), 2 * MSS, t0, 7);
+        b.check();
+        assert_eq!(b.segs.len(), 3);
+        assert_eq!(b.lost_bytes(), 2 * MSS);
+        assert_eq!(b.next_lost(4 * MSS), Some((seq(2), MSS, false)));
     }
 
     #[test]
