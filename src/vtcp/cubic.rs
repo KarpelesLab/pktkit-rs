@@ -70,10 +70,13 @@ struct Epoch {
 /// What undoing a spurious loss response puts back (RFC 9438 §4.9.2).
 #[derive(Debug, Clone, Copy)]
 struct Saved {
+    /// cwnd as the response began: undoing is worth it only below it.
+    cwnd: f64,
     w_max: Option<f64>,
     cwnd_prior: f64,
     epoch: Option<Epoch>,
     hystart: HyStart,
+    delay_min: Option<Duration>,
 }
 
 /// CUBIC congestion control (RFC 9438).
@@ -322,10 +325,12 @@ impl CongestionController for Cubic {
 
     fn save_undo(&mut self) {
         self.saved = Some(Saved {
+            cwnd: f64::from(self.cwnd),
             w_max: self.w_max,
             cwnd_prior: self.cwnd_prior,
             epoch: self.epoch,
             hystart: self.hystart,
+            delay_min: self.delay_min,
         });
     }
 
@@ -333,14 +338,23 @@ impl CongestionController for Cubic {
         // RFC 9438 §4.9.2: the curve before the cut, unless the window has
         // grown back past it already. Linux keeps the cut W_max and starts
         // a new epoch; putting the curve back is what makes the spurious
-        // loss cost nothing.
+        // loss cost nothing. The test is against cwnd as the response
+        // began (the RFC's cwnd_prior, which the cut has just set): the
+        // saved cwnd_prior is the one before, from an earlier cut or none.
         if let Some(s) = self.saved.take()
-            && f64::from(self.cwnd) < s.cwnd_prior
+            && f64::from(self.cwnd) < s.cwnd
         {
             self.w_max = s.w_max;
             self.cwnd_prior = s.cwnd_prior;
             self.epoch = s.epoch;
+            // A first slow start the loss ended goes on, HyStart++ with it.
             self.hystart = s.hystart;
+            // A timeout forgets the minimum RTT in case the path changed
+            // under it; a spurious one says it did not.
+            self.delay_min = match (self.delay_min, s.delay_min) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
         }
         self.cwnd = cwnd.max(self.mss);
         self.ssthresh = ssthresh;
@@ -694,6 +708,70 @@ mod tests {
         c.set_cwnd(4 * cwnd);
         c.undo(4 * cwnd, ssthresh);
         assert_eq!(c.w_max, w_max);
+    }
+
+    /// Undo is judged against the window the response cut, not the one an
+    /// earlier cut left in cwnd_prior: in the convex region, past that
+    /// earlier W_max, the curve comes back as it was too.
+    #[test]
+    fn undo_restores_the_curve_in_the_convex_region() {
+        let rtt = Duration::from_millis(50);
+        let mut c = after_loss(200, rtt);
+        let t0 = Instant::now();
+        // Well past K (about 5.2 s): even cut, cwnd is beyond the old
+        // W_max.
+        trajectory(&mut c, t0, rtt, 300);
+        assert!(
+            f64::from(c.cwnd()) * BETA > c.cwnd_prior,
+            "not convex enough"
+        );
+        let (w_max, prior, epoch) = (c.w_max, c.cwnd_prior, c.epoch.unwrap());
+        let (cwnd, ssthresh) = (c.cwnd(), c.ssthresh());
+        c.save_undo();
+        c.on_loss(cwnd);
+        c.set_cwnd(c.ssthresh());
+        c.undo(cwnd, ssthresh);
+        assert_eq!((c.w_max, c.cwnd_prior), (w_max, prior));
+        let e = c.epoch.expect("epoch dropped");
+        assert_eq!(
+            (e.start, e.k, e.origin),
+            (epoch.start, epoch.k, epoch.origin)
+        );
+    }
+
+    /// A spurious loss in the first slow start: undone, slow start goes on
+    /// with HyStart++, and no W_max is left behind from the cut.
+    #[test]
+    fn undo_in_first_slow_start_resumes_it() {
+        let mut c = Cubic::new(MSS);
+        c.set_cwnd(64 * MSS);
+        let cwnd = c.cwnd();
+        c.save_undo();
+        c.on_loss(cwnd);
+        c.set_cwnd(c.ssthresh());
+        assert!(c.hystart.exited());
+        c.undo(cwnd, u32::MAX);
+        assert_eq!((c.cwnd(), c.ssthresh()), (cwnd, u32::MAX));
+        assert_eq!(c.w_max, None);
+        assert!(!c.hystart.exited(), "HyStart++ left done");
+    }
+
+    /// A spurious timeout puts back what it forgot: W_max, the curve and
+    /// the minimum RTT.
+    #[test]
+    fn undo_of_a_timeout_restores_the_minimum_rtt() {
+        let rtt = Duration::from_millis(50);
+        let mut c = after_loss(200, rtt);
+        trajectory(&mut c, Instant::now(), rtt, 20);
+        let (w_max, epoch) = (c.w_max, c.epoch.unwrap());
+        let (cwnd, ssthresh) = (c.cwnd(), c.ssthresh());
+        c.save_undo();
+        c.on_retransmit_timeout(cwnd, false);
+        assert_eq!(c.delay_min, None);
+        c.undo(cwnd, ssthresh);
+        assert_eq!(c.delay_min, Some(rtt));
+        assert_eq!(c.w_max, w_max);
+        assert_eq!(c.epoch.unwrap().start, epoch.start);
     }
 
     /// Congestion avoidance takes bytes acknowledged, not ACKs: with an
