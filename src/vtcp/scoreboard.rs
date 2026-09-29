@@ -1007,13 +1007,48 @@ impl Scoreboard {
         self.segs.front().is_some_and(|s| s.has(SACKED))
     }
 
-    /// Nothing is lost after all: a loss response turned out spurious.
+    /// Nothing is lost after all: a timeout turned out spurious. What it
+    /// marked lost is back in flight as it was sent, and back in RACK's
+    /// queue too, which dropped each segment as it marked it: whatever was
+    /// really lost, RACK marks again once something sent after it is
+    /// delivered, rather than the next timeout.
     pub fn unmark_lost(&mut self) {
+        let mut back: Vec<TxRec> = Vec::new();
         for s in self.segs.iter_mut() {
+            if !s.has(LOST) {
+                continue;
+            }
             s.flags &= !LOST;
+            if !self.rack_on {
+                continue;
+            }
+            match back.last_mut() {
+                Some(r) if r.tx == s.tx && r.end == s.start => r.end = s.end,
+                _ => back.push(TxRec {
+                    start: s.start,
+                    end: s.end,
+                    xmit: s.xmit,
+                    tx: s.tx,
+                }),
+            }
         }
         self.lost = 0;
         self.lost_set.clear();
+        if !back.is_empty() {
+            // In the order of transmission, which the scan relies on to
+            // stop at the first record sent after RACK.segment.
+            let mut all: Vec<TxRec> = self.tq.drain(..).chain(back).collect();
+            all.sort_by_key(|r| (r.xmit, r.end));
+            self.tq = all.into();
+        }
+    }
+
+    /// Whether a retransmission is in flight: resent, and neither delivered
+    /// nor deemed lost again since (Linux's `retrans_out`).
+    pub fn retrans_in_flight(&self) -> bool {
+        self.segs
+            .iter()
+            .any(|s| s.flags & (RETRANS | SACKED | LOST) == RETRANS)
     }
 
     fn seg_ref(&self, s: &Seg, max: u32) -> SegRef {
@@ -1461,6 +1496,33 @@ mod tests {
         assert_eq!(b.segs.len(), 3);
         assert_eq!(b.lost_bytes(), 2 * MSS);
         assert_eq!(b.next_lost(4 * MSS), Some((seq(2), MSS, false)));
+    }
+
+    /// A timeout found spurious unmarks what it deemed lost, and RACK,
+    /// which dropped those segments from its queue when it marked them,
+    /// has them back: one really lost is marked again once something sent
+    /// after it is delivered.
+    #[test]
+    fn unmarked_losses_are_rack_s_again() {
+        let t0 = Instant::now();
+        let mut b = board(4, t0);
+        b.rtt_sample(Duration::from_millis(10), t0);
+        let now = t0 + Duration::from_millis(20);
+        b.begin_ack();
+        b.sack(&[blk(1, 2)], now, None);
+        assert!(b.detect_loss(now, Duration::ZERO).0);
+        assert_eq!(b.next_lost(MSS), Some((seq(0), MSS, false)));
+        b.unmark_lost();
+        assert_eq!(b.lost_bytes(), 0);
+        let later = now + Duration::from_millis(20);
+        b.begin_ack();
+        b.sack(&[blk(1, 4)], later, None);
+        assert!(
+            b.detect_loss(later, Duration::ZERO).0,
+            "segment 0 forgotten"
+        );
+        assert_eq!(b.next_lost(MSS), Some((seq(0), MSS, false)));
+        b.check();
     }
 
     #[test]

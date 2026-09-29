@@ -3224,11 +3224,22 @@ impl Conn {
                 && let Some(end) = self.undo.eifel_end
                 && seq_after_eq(ack, end)
             {
-                self.undo.eifel_end = None;
-                if self.ca != LossState::Open
-                    && let (Some(e), Some(ts)) = (ecr, self.undo.retrans_ts)
-                    && (e.wrapping_sub(ts) as i32) < 0
-                {
+                let delayed = self.ca != LossState::Open
+                    && matches!((ecr, self.undo.retrans_ts),
+                        (Some(e), Some(ts)) if (e.wrapping_sub(ts) as i32) < 0);
+                // A segment only delayed says nothing of the rest of the
+                // flight. In fast recovery, as Linux's
+                // tcp_try_undo_partial, undoing waits until no
+                // retransmission is in flight and nothing is deemed lost:
+                // the losses found alongside may well be real, and
+                // declaring them in flight would leave them for the RTO.
+                // Later ACKs are judged the same way.
+                let wait = self.ca == LossState::Recovery
+                    && (self.score.lost_bytes() > 0 || self.score.retrans_in_flight());
+                if !(delayed && wait) {
+                    self.undo.eifel_end = None;
+                }
+                if delayed && !wait {
                     undone = self.undo_recovery(acked);
                 }
             }
@@ -3487,13 +3498,21 @@ impl Conn {
     }
 
     /// The loss response was spurious: put the window back, per RFC 4015
-    /// steps (8) and (9), and return to the open state. What is still
-    /// marked lost is unmarked, so new data goes out rather than needless
-    /// retransmissions; RACK marks anything really lost again. `acked` is
-    /// what the ACK acknowledged. Returns true.
+    /// steps (8) and (9), and return to the open state. `acked` is what the
+    /// ACK acknowledged. Returns true.
+    ///
+    /// After a timeout, what it marked lost is unmarked, so new data goes
+    /// out rather than go-back-N's needless retransmissions, and RACK marks
+    /// anything really lost again (Linux's tcp_try_undo_loss). Fast
+    /// recovery's losses stay marked (tcp_try_undo_recovery and
+    /// tcp_try_undo_dsack): each was found on its own evidence, which one
+    /// needless retransmission does not refute, and any left start a new
+    /// episode, as Linux's do.
     fn undo_recovery(&mut self, acked: u32) -> bool {
         self.stats.undos += 1;
-        self.score.unmark_lost();
+        if self.ca == LossState::Loss {
+            self.score.unmark_lost();
+        }
         let mss = self.mss as u32;
         // cwnd = FlightSize + min(bytes_acked, IW): no burst, and slow
         // start back to where ssthresh was.
@@ -7162,6 +7181,67 @@ mod tests {
         (client, server, segs, [late, rexmit].concat())
     }
 
+    /// A burst loses segments 1 to 20, and segment 0 is only delayed. The
+    /// late original's ACK shows its own retransmission needless, but not
+    /// the others: retransmissions are in flight and more is deemed lost,
+    /// so fast recovery goes on and repairs the burst, rather than undo
+    /// and leave what it had not resent yet for the RTO.
+    #[test]
+    fn eifel_does_not_undo_real_losses() {
+        let rtt = Duration::from_millis(100);
+        let (mut client, mut server) =
+            rtt_pair(|l, r| big(l, r).enable_timestamps(true), 40736, rtt);
+        client.cc.set_cwnd(60_000);
+        let (_, segs) = client.write(&[5; 40_000]);
+        let (s0, s1) = (parse(&segs[0]).seq, parse(&segs[1]).seq);
+        let idx = |s: u32| s.wrapping_sub(s0) / s1.wrapping_sub(s0);
+        advance(rtt / 2);
+        let mut acks = Vec::new();
+        for seg in &segs[21..25] {
+            acks.extend(deliver(&mut server, std::slice::from_ref(seg)));
+        }
+        advance(rtt / 2);
+        let mut rexmits = Vec::new();
+        for a in &acks {
+            rexmits.extend(deliver(&mut client, std::slice::from_ref(a)));
+        }
+        assert!(client.in_recovery());
+        assert!(
+            client.score.lost_bytes() > 0,
+            "more to resend than cwnd let go"
+        );
+        advance(Duration::from_millis(5));
+        let late = deliver(&mut server, &segs[..1]);
+        let out = deliver(&mut client, &late);
+        assert!(client.in_recovery(), "undone with losses unrepaired");
+        assert_eq!(client.info().undos, 0);
+        // The rest arrives: the originals from 25 on, and the resends.
+        let mut to_server: Vec<Vec<u8>> = segs[25..].to_vec();
+        to_server.extend(rexmits);
+        to_server.extend(out);
+        let t0 = test_now();
+        let rto_in = client.rto_deadline.unwrap().saturating_duration_since(t0);
+        let mut resent_20 = None;
+        for _ in 0..40 {
+            advance(Duration::from_millis(10));
+            let mut acks = deliver(&mut server, &to_server);
+            read_all(&mut server);
+            acks.extend(server.take_outgoing());
+            acks.extend(delack_expired(&mut server));
+            advance(Duration::from_millis(10));
+            let mut out = deliver(&mut client, &acks);
+            out.extend(client.tick());
+            if resent_20.is_none() && seqs(&out).into_iter().any(|s| idx(s) == 20) {
+                resent_20 = Some(test_now() - t0);
+            }
+            to_server = out;
+        }
+        assert!(
+            resent_20.is_some_and(|t| t < rto_in),
+            "segment 20 resent after {resent_20:?}, the RTO due in {rto_in:?}"
+        );
+    }
+
     /// Without timestamps, the D-SACK the needless retransmission draws
     /// shows every retransmission of the episode arrived twice (RFC 3708),
     /// and the window is put back (RFC 4015).
@@ -7186,6 +7266,24 @@ mod tests {
         assert_eq!(i.bytes_retrans, u64::from(client.mss));
         assert_eq!(i.slow_start_exit, Some(info::SlowStartExit::Loss));
         assert_eq!(i.ca_state, info::CaState::Open);
+    }
+
+    /// A D-SACK shows the fast retransmission needless, but not a loss
+    /// found beside it: that stays marked, and is resent.
+    #[test]
+    fn dsack_undo_keeps_other_losses() {
+        let (mut client, mut server, segs, late_and_rexmit) =
+            spurious_fast_retransmit(false, 40737);
+        let (late, rexmit) = late_and_rexmit.split_at(1);
+        advance(Duration::from_millis(50));
+        deliver(&mut client, late);
+        let lost = parse(&segs[6]).seq;
+        client.score.mark_range_lost(lost, parse(&segs[7]).seq);
+        let dsack = deliver(&mut server, &rexmit[..1]);
+        advance(Duration::from_millis(50));
+        let out = deliver(&mut client, &dsack);
+        assert_eq!(client.info().undos, 1);
+        assert!(seqs(&out).contains(&lost), "the other loss was dropped");
     }
 
     /// With timestamps, the ACK of the late original echoes its TSval,
