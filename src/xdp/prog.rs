@@ -1,15 +1,18 @@
 //! Loading XDP programs and attaching them to an interface.
 
+use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::path::{Path, PathBuf};
 
 use super::insn::{Insn, encode};
 use super::netlink;
 use super::sys::{
-    self, GetFdByIdAttr, LinkCreateAttr, ObjInfoAttr, ProgInfo, ProgLoadAttr, ProgTestRunAttr,
-    bpf_cmd, ctx_err,
+    self, GetFdByIdAttr, LinkCreateAttr, LinkDetachAttr, LinkInfo, LinkUpdateAttr, ObjAttr,
+    ObjInfoAttr, ProgInfo, ProgLoadAttr, ProgTestRunAttr, bpf_cmd, ctx_err,
 };
 use crate::Result;
+use crate::syscall::{EEXIST, ENOENT, EPERM};
 
 /// The verdict an XDP program returns for a packet.
 #[repr(transparent)]
@@ -187,28 +190,16 @@ impl Program {
         // BPF_LINK_CREATE is the modern path: the attachment is owned by an fd,
         // so it cannot leak if we crash, and it refuses to displace an existing
         // program without us asking.
-        let mut attr = LinkCreateAttr {
-            prog_fd: self.fd.as_raw_fd() as u32,
-            target_ifindex: ifindex,
-            attach_type: sys::BPF_ATTACH_TYPE_XDP,
-            // UPDATE_IF_NOEXIST/REPLACE are rejected on the link path; link
-            // attachment is already non-displacing.
-            flags: mode.0,
-        };
-        // SAFETY: attr matches BPF_LINK_CREATE and holds no pointers.
-        let link = unsafe { bpf_cmd(sys::BPF_LINK_CREATE, &mut attr) };
-        if let Ok(fd) = link {
+        if let Ok(fd) = self.link_create(ifindex, mode) {
             return Ok(Link {
-                // SAFETY: fresh owned fd on success.
-                kind: LinkKind::Bpf {
-                    _link: unsafe { OwnedFd::from_raw_fd(fd) },
-                },
+                kind: LinkKind::Bpf { fd },
                 ifindex,
                 mode,
+                pin: None,
             });
         }
 
-        // Pre-5.7 kernels have no XDP bpf_link; fall back to rtnetlink.
+        // Before 5.9 there is no XDP bpf_link; fall back to rtnetlink.
         netlink::set_xdp(
             ifindex,
             self.fd.as_raw_fd(),
@@ -221,7 +212,60 @@ impl Program {
             },
             ifindex,
             mode,
+            pin: None,
         })
+    }
+
+    fn link_create(&self, ifindex: u32, mode: Mode) -> Result<OwnedFd> {
+        let mut attr = LinkCreateAttr {
+            prog_fd: self.fd.as_raw_fd() as u32,
+            target_ifindex: ifindex,
+            attach_type: sys::BPF_ATTACH_TYPE_XDP,
+            // UPDATE_IF_NOEXIST/REPLACE are rejected on the link path; link
+            // attachment is already non-displacing.
+            flags: mode.0,
+        };
+        // SAFETY: attr matches BPF_LINK_CREATE and holds no pointers.
+        let fd = unsafe { bpf_cmd(sys::BPF_LINK_CREATE, &mut attr) }?;
+        // SAFETY: fresh owned fd on success.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    /// As [`Program::attach`], but the attachment is pinned at `path` on a
+    /// bpf filesystem, where the kernel keeps it after the process is gone.
+    ///
+    /// Only a bpf_link can be pinned, so there is no netlink fallback here:
+    /// before Linux 5.9 this fails.
+    pub fn attach_pinned(&self, ifindex: u32, mode: Mode, path: &Path) -> Result<Link> {
+        check_attach_mode(mode)?;
+        let mut last: Option<io::Error> = None;
+        for &m in mode.candidates() {
+            match self.link_create(ifindex, m) {
+                Ok(fd) => {
+                    // A link that could not be pinned is dropped, and
+                    // detaches: the caller asked for one that outlives us.
+                    pin(fd.as_raw_fd(), path)?;
+                    return Ok(Link {
+                        kind: LinkKind::Bpf { fd },
+                        ifindex,
+                        mode: m,
+                        pin: Some(path.to_path_buf()),
+                    });
+                }
+                Err(e) => {
+                    last = Some(ctx_err(
+                        &format!(
+                            "attach {} mode through a bpf_link (needed to pin; Linux 5.9+)",
+                            m.name()
+                        ),
+                        e,
+                    ))
+                }
+            }
+        }
+        Err(last.unwrap_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "xdp: no attach mode to try")
+        }))
     }
 }
 
@@ -287,20 +331,24 @@ impl AsRawFd for Program {
 
 #[derive(Debug)]
 enum LinkKind {
-    /// Held by an fd: the kernel detaches when it closes, so the fd is never
-    /// read — only kept.
-    Bpf { _link: OwnedFd },
+    /// Held by an fd: the kernel detaches when the last reference goes, which
+    /// is when the fd closes unless the link is pinned too.
+    Bpf { fd: OwnedFd },
     /// Attached through `RTM_SETLINK`; must be cleared explicitly, and only
     /// while the program there is still ours: `prog_id`, if it could be read.
     Netlink { prog_id: Option<u32> },
 }
 
-/// A live attachment of a [`Program`] to an interface. Detaches on drop.
+/// A live attachment of a [`Program`] to an interface. Detaches on drop,
+/// unless it is pinned.
 #[derive(Debug)]
 pub struct Link {
     kind: LinkKind,
     ifindex: u32,
     mode: Mode,
+    /// Where the link is pinned. The pin is a reference of its own, so a
+    /// pinned link stays attached when this is dropped.
+    pin: Option<PathBuf>,
 }
 
 impl Link {
@@ -310,15 +358,257 @@ impl Link {
     pub fn mode(&self) -> Mode {
         self.mode
     }
+
+    /// Where this link is pinned, if it is.
+    #[inline]
+    pub fn pin_path(&self) -> Option<&Path> {
+        self.pin.as_deref()
+    }
+
+    /// Open the link pinned at `path` and attached to `ifindex` in a mode
+    /// `mode` accepts, ready for [`Link::update`]. `None` if there is nothing
+    /// to adopt: no pin, or a pin whose interface has gone.
+    ///
+    /// A pin on another interface is an error; it is somebody else's. One in
+    /// a mode `mode` does not accept is detached and removed, because a link
+    /// cannot change modes in place: taking the link down once is the price
+    /// of the configuration having changed.
+    pub fn adopt_pinned(path: &Path, ifindex: u32, mode: Mode) -> Result<Option<Link>> {
+        check_attach_mode(mode)?;
+        let Some((fd, info)) = open_pinned(path)? else {
+            return Ok(None);
+        };
+        let mut link = Link {
+            kind: LinkKind::Bpf { fd },
+            ifindex: info.ifindex,
+            // Not known yet; read from the interface below.
+            mode,
+            pin: Some(path.to_path_buf()),
+        };
+        if info.ifindex == 0 {
+            // The interface went away and took the attachment with it; only
+            // the pin is left.
+            link.remove_pin()?;
+            return Ok(None);
+        }
+        if info.ifindex != ifindex {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "xdp: the link pinned at {} is attached to interface {}, not {ifindex}",
+                    path.display(),
+                    info.ifindex
+                ),
+            ));
+        }
+        match attached_mode(ifindex, info.prog_id)? {
+            Some(held) if satisfies(mode, held) => {
+                link.mode = held;
+                Ok(Some(link))
+            }
+            _ => {
+                link.detach()?;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Swap `prog` in for the program this link runs, in place. The interface
+    /// is never without a program, so a driver that resets the NIC when XDP
+    /// comes or goes does not.
+    pub fn update(&self, prog: &Program) -> Result<()> {
+        let LinkKind::Bpf { fd } = &self.kind else {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "xdp: a netlink attachment cannot be updated in place",
+            ));
+        };
+        let mut attr = LinkUpdateAttr {
+            link_fd: fd.as_raw_fd() as u32,
+            new_prog_fd: prog.as_raw_fd() as u32,
+            ..Default::default()
+        };
+        // SAFETY: attr matches BPF_LINK_UPDATE and holds no pointers.
+        unsafe { bpf_cmd(sys::BPF_LINK_UPDATE, &mut attr) }
+            .map_err(|e| ctx_err("link update", e))?;
+        Ok(())
+    }
+
+    /// Take the program off the interface now, whoever else holds the link,
+    /// and remove its pin.
+    pub fn detach(mut self) -> Result<()> {
+        if let LinkKind::Bpf { fd } = &self.kind {
+            let mut attr = LinkDetachAttr {
+                link_fd: fd.as_raw_fd() as u32,
+            };
+            // SAFETY: attr matches BPF_LINK_DETACH and holds no pointers.
+            unsafe { bpf_cmd(sys::BPF_LINK_DETACH, &mut attr) }
+                .map_err(|e| ctx_err("link detach", e))?;
+        }
+        // Detached first: if that fails, the pin is still there to retry with.
+        self.remove_pin()
+        // A netlink attachment is cleared by Drop.
+    }
+
+    fn remove_pin(&mut self) -> Result<()> {
+        if let Some(path) = self.pin.take() {
+            match crate::syscall::unlink(&c_path(&path)?) {
+                Err(e) if e.raw_os_error() != Some(ENOENT) => {
+                    self.pin = Some(path.clone());
+                    return Err(ctx_err(&format!("unpin {}", path.display()), e));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Drop for Link {
     fn drop(&mut self) {
-        // The bpf_link case detaches itself when the fd closes.
+        // The bpf_link case detaches itself when the fd closes, if unpinned.
         if let LinkKind::Netlink { prog_id } = self.kind {
             detach_own(self.ifindex, self.mode, prog_id);
         }
     }
+}
+
+/// Whether an attachment in `actual` mode is one `requested` would have made.
+fn satisfies(requested: Mode, actual: Mode) -> bool {
+    requested.candidates().contains(&actual)
+}
+
+/// The mode the program with id `prog_id` is attached to `ifindex` in.
+fn attached_mode(ifindex: u32, prog_id: u32) -> Result<Option<Mode>> {
+    for m in [Mode::DRIVER, Mode::GENERIC, Mode::HARDWARE] {
+        if netlink::attached_prog_id(ifindex, m.0)? == prog_id {
+            return Ok(Some(m));
+        }
+    }
+    Ok(None)
+}
+
+/// `path` as the NUL-terminated string `bpf(2)` takes.
+fn c_path(path: &Path) -> Result<CString> {
+    CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("xdp: pin path {} contains a NUL", path.display()),
+        )
+    })
+}
+
+/// The directories `path` sits in, outermost first, down to its parent.
+fn parent_dirs(path: &Path) -> Vec<&Path> {
+    let mut dirs: Vec<&Path> = path
+        .ancestors()
+        .skip(1)
+        .filter(|p| !p.as_os_str().is_empty())
+        .collect();
+    dirs.reverse();
+    dirs
+}
+
+/// Pin the bpf object `fd` at `path`, making the directories leading to it
+/// if they are missing.
+fn pin(fd: RawFd, path: &Path) -> Result<()> {
+    let c = c_path(path)?;
+    let pin_once = || {
+        let mut attr = ObjAttr {
+            pathname: c.as_ptr() as u64,
+            bpf_fd: fd as u32,
+            file_flags: 0,
+        };
+        // SAFETY: attr matches BPF_OBJ_PIN; the path outlives the call.
+        unsafe { bpf_cmd(sys::BPF_OBJ_PIN, &mut attr) }
+    };
+    let mut r = pin_once();
+    if matches!(&r, Err(e) if e.raw_os_error() == Some(ENOENT)) {
+        r = make_dirs(path).and_then(|()| pin_once());
+    }
+    r.map(drop).map_err(|e| {
+        // The kernel's answer for a path outside a bpf filesystem.
+        let hint = if e.raw_os_error() == Some(EPERM) {
+            " (is a bpf filesystem mounted there?)"
+        } else {
+            ""
+        };
+        ctx_err(&format!("pin at {}{hint}", path.display()), e)
+    })
+}
+
+/// Make the directories leading to `path` that are missing.
+fn make_dirs(path: &Path) -> Result<()> {
+    for dir in parent_dirs(path) {
+        match crate::syscall::mkdir(&c_path(dir)?, 0o700) {
+            // Left bare, so the caller's hint can read the errno.
+            Err(e) if e.raw_os_error() != Some(EEXIST) => return Err(e),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// The bpf_link pinned at `path` and what the kernel says about it, or
+/// `None` if nothing is pinned there.
+fn open_pinned(path: &Path) -> Result<Option<(OwnedFd, LinkInfo)>> {
+    let c = c_path(path)?;
+    let mut attr = ObjAttr {
+        pathname: c.as_ptr() as u64,
+        ..Default::default()
+    };
+    // SAFETY: attr matches BPF_OBJ_GET; the path outlives the call.
+    let fd = match unsafe { bpf_cmd(sys::BPF_OBJ_GET, &mut attr) } {
+        Ok(fd) => fd,
+        Err(e) if e.raw_os_error() == Some(ENOENT) => return Ok(None),
+        Err(e) => return Err(ctx_err(&format!("open pin {}", path.display()), e)),
+    };
+    // SAFETY: fresh owned fd on success.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+
+    let mut info = LinkInfo::default();
+    let mut attr = ObjInfoAttr {
+        bpf_fd: fd.as_raw_fd() as u32,
+        info_len: std::mem::size_of::<LinkInfo>() as u32,
+        info: &mut info as *mut LinkInfo as u64,
+    };
+    // SAFETY: `info` is writable for `info_len` bytes, which caps what the
+    // kernel copies out, and outlives the call.
+    unsafe { bpf_cmd(sys::BPF_OBJ_GET_INFO_BY_FD, &mut attr) }
+        .map_err(|e| ctx_err(&format!("read pin {}", path.display()), e))?;
+    if info.link_type != sys::BPF_LINK_TYPE_XDP {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "xdp: {} does not hold an XDP link (link type {})",
+                path.display(),
+                info.link_type
+            ),
+        ));
+    }
+    Ok(Some((fd, info)))
+}
+
+/// Take the attachment pinned at `path` off its interface and remove the
+/// pin. Returns `false` if nothing was pinned there.
+///
+/// This is the explicit removal step for an attachment made with
+/// [`CaptureConfig::pin`](super::CaptureConfig::pin), which stays attached
+/// when the process that made it exits. It takes effect even while another
+/// process still holds the link: that process's capture stops receiving.
+pub fn detach_pinned(path: impl AsRef<Path>) -> Result<bool> {
+    let path = path.as_ref();
+    let Some((fd, info)) = open_pinned(path)? else {
+        return Ok(false);
+    };
+    Link {
+        kind: LinkKind::Bpf { fd },
+        ifindex: info.ifindex,
+        mode: Mode::AUTO,
+        pin: Some(path.to_path_buf()),
+    }
+    .detach()?;
+    Ok(true)
 }
 
 /// Detach the netlink attachment in `mode` on `ifindex`, but only if the
@@ -382,7 +672,8 @@ fn prog_fd_by_id(id: u32) -> Result<OwnedFd> {
 /// it could detach it (dropping a [`Capture`](super::Capture) does). Clears every mode that has a program: an interface
 /// can hold a generic, a driver and an offloaded one at once. Has no effect
 /// on a `bpf_link` attachment, which the kernel already cleaned up when its
-/// owner died; one whose owner is still alive fails with `EBUSY`.
+/// owner died; one whose owner is still alive, or that is pinned, fails with
+/// `EBUSY`. A pinned one is removed with [`detach_pinned`].
 pub fn detach(ifindex: u32) -> Result<()> {
     // Each mode is cleared by name. With no mode flag the kernel picks one
     // for us (dev_xdp_mode: driver if the NIC has a native hook, else
@@ -483,6 +774,45 @@ mod tests {
         .unwrap_err();
         assert_eq!(seen, [Mode::GENERIC.0, Mode::DRIVER.0]);
         assert_eq!(e.raw_os_error(), Some(crate::syscall::EBUSY));
+    }
+
+    #[test]
+    fn an_adopted_link_must_be_in_a_mode_the_caller_accepts() {
+        assert!(satisfies(Mode::AUTO, Mode::DRIVER));
+        assert!(satisfies(Mode::AUTO, Mode::GENERIC));
+        assert!(!satisfies(Mode::AUTO, Mode::HARDWARE));
+        assert!(satisfies(Mode::DRIVER, Mode::DRIVER));
+        assert!(!satisfies(Mode::DRIVER, Mode::GENERIC));
+        assert!(!satisfies(Mode::GENERIC, Mode::DRIVER));
+    }
+
+    #[test]
+    fn pin_directories_are_made_outermost_first() {
+        let p = Path::new("/sys/fs/bpf/grouterd/eth0");
+        let want: Vec<&Path> = [
+            "/",
+            "/sys",
+            "/sys/fs",
+            "/sys/fs/bpf",
+            "/sys/fs/bpf/grouterd",
+        ]
+        .iter()
+        .map(Path::new)
+        .collect();
+        assert_eq!(parent_dirs(p), want);
+        // A relative path stops short of the empty one.
+        assert_eq!(parent_dirs(Path::new("a/b")), [Path::new("a")]);
+        assert!(parent_dirs(Path::new("a")).is_empty());
+    }
+
+    #[test]
+    fn a_pin_path_with_a_nul_is_refused() {
+        let e = c_path(Path::new("/sys/fs/bpf/a\0b")).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            c_path(Path::new("/sys/fs/bpf/x")).unwrap().as_bytes(),
+            b"/sys/fs/bpf/x"
+        );
     }
 
     #[test]

@@ -20,16 +20,22 @@ pub const BPF_MAP_LOOKUP_ELEM: i32 = 1;
 pub const BPF_MAP_UPDATE_ELEM: i32 = 2;
 pub const BPF_MAP_DELETE_ELEM: i32 = 3;
 pub const BPF_PROG_LOAD: i32 = 5;
+pub const BPF_OBJ_PIN: i32 = 6;
+pub const BPF_OBJ_GET: i32 = 7;
 pub const BPF_PROG_TEST_RUN: i32 = 10;
 pub const BPF_PROG_GET_FD_BY_ID: i32 = 13;
 pub const BPF_OBJ_GET_INFO_BY_FD: i32 = 15;
 pub const BPF_LINK_CREATE: i32 = 28;
+pub const BPF_LINK_UPDATE: i32 = 29;
+pub const BPF_LINK_DETACH: i32 = 34;
 
 // --- program / attach types ------------------------------------------------
 
 pub const BPF_PROG_TYPE_XDP: u32 = 6;
 /// `bpf_attach_type::BPF_XDP`.
 pub const BPF_ATTACH_TYPE_XDP: u32 = 37;
+/// `bpf_link_type::BPF_LINK_TYPE_XDP`.
+pub const BPF_LINK_TYPE_XDP: u32 = 6;
 
 /// `bpf_attr` for `BPF_MAP_CREATE`.
 #[repr(C)]
@@ -84,6 +90,50 @@ pub struct MapInfo {
 pub struct ProgInfo {
     pub prog_type: u32,
     pub id: u32,
+}
+
+/// The leading fields of `struct bpf_link_info`, through the XDP member of
+/// its union. The union holds 64-bit fields, so it starts 8-aligned, after a
+/// hole the kernel leaves zero.
+#[repr(C)]
+#[derive(Default)]
+pub struct LinkInfo {
+    pub link_type: u32,
+    pub id: u32,
+    pub prog_id: u32,
+    pub _hole: u32,
+    /// `xdp.ifindex`: 0 once the interface it was attached to is gone.
+    pub ifindex: u32,
+    pub _pad: u32,
+}
+
+/// `bpf_attr` for `BPF_OBJ_PIN` and `BPF_OBJ_GET`. `pathname` is a
+/// NUL-terminated userspace string; `bpf_fd` is what gets pinned, and must
+/// be 0 for a get.
+#[repr(C)]
+#[derive(Default)]
+pub struct ObjAttr {
+    pub pathname: u64,
+    pub bpf_fd: u32,
+    pub file_flags: u32,
+}
+
+/// `bpf_attr` for `BPF_LINK_UPDATE`. Without `BPF_F_REPLACE` in `flags`,
+/// `old_prog_fd` is ignored and must be 0.
+#[repr(C)]
+#[derive(Default)]
+pub struct LinkUpdateAttr {
+    pub link_fd: u32,
+    pub new_prog_fd: u32,
+    pub flags: u32,
+    pub old_prog_fd: u32,
+}
+
+/// `bpf_attr` for `BPF_LINK_DETACH`.
+#[repr(C)]
+#[derive(Default)]
+pub struct LinkDetachAttr {
+    pub link_fd: u32,
 }
 
 /// `bpf_attr` for `BPF_PROG_GET_FD_BY_ID`.
@@ -151,6 +201,11 @@ const _: () = {
     assert!(std::mem::size_of::<MapInfo>() == 6 * 4);
     assert!(std::mem::size_of::<ProgInfo>() == 2 * 4);
     assert!(std::mem::size_of::<GetFdByIdAttr>() == 3 * 4);
+    assert!(std::mem::size_of::<LinkInfo>() == 6 * 4);
+    assert!(std::mem::offset_of!(LinkInfo, ifindex) == 16);
+    assert!(std::mem::size_of::<ObjAttr>() == 8 + 2 * 4);
+    assert!(std::mem::size_of::<LinkUpdateAttr>() == 4 * 4);
+    assert!(std::mem::size_of::<LinkDetachAttr>() == 4);
 };
 
 /// `bpf_attr` for `BPF_LINK_CREATE` against an XDP target.

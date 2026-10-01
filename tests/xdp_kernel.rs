@@ -20,6 +20,7 @@
 #![cfg(all(feature = "afxdp", target_os = "linux", target_pointer_width = "64"))]
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -981,6 +982,153 @@ fn a_batch_is_transmitted_in_full() {
     assert_eq!(stats.tx_invalid_descs, 0);
 
     dev.close().unwrap();
+}
+
+// --- pinning ----------------------------------------------------------------
+
+/// Where the pinning tests pin for `veth`, cleared of anything a killed run
+/// left behind.
+fn pin_path(veth: &Veth) -> PathBuf {
+    let p = PathBuf::from(format!("/sys/fs/bpf/pktkit-test/{}", veth.host));
+    pktkit::xdp::detach_pinned(&p).expect("clear a stale pin");
+    p
+}
+
+/// The id of the XDP program on `dev`, as ip(8) reports it.
+fn xdp_prog_id(dev: &str) -> Option<u32> {
+    let out = output_of("ip", &["link", "show", "dev", dev]);
+    let at = out.find("prog/xdp")?;
+    let rest = &out[at + out[at..].find(" id ")? + " id ".len()..];
+    rest.split(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// What pinning is for: a capture that goes away leaves its program
+/// attached, and the next one swaps its own program in rather than
+/// attaching again.
+#[test]
+#[ignore = "needs CAP_BPF + CAP_NET_ADMIN"]
+fn a_pinned_capture_outlives_its_owner_and_is_swapped_in_place() {
+    if !root() {
+        return;
+    }
+    let veth = Veth::new("pin");
+    let ifindex = ifindex(&veth.host);
+    let path = pin_path(&veth);
+
+    let cfg = CaptureConfig::default().pin(&path);
+    let first = Capture::attach(ifindex, cfg.clone(), Mode::GENERIC).expect("attach and pin");
+    let first_id = xdp_prog_id(&veth.host).expect("nothing attached");
+    drop(first);
+    assert_eq!(
+        xdp_prog_id(&veth.host),
+        Some(first_id),
+        "dropping a pinned capture detached it"
+    );
+
+    let addr = IpAddr::V4(Ipv4Addr::new(10, 99, 0, 5));
+    let second = Capture::attach(
+        ifindex,
+        cfg.rule(v4([10, 99, 0, 5], 32), Rule::Any),
+        Mode::AUTO,
+    )
+    .expect("adopt the pin");
+    // AUTO accepts the generic attachment it found instead of replacing it.
+    assert_eq!(second.mode(), Mode::GENERIC);
+    let second_id = xdp_prog_id(&veth.host).expect("the swap detached the program");
+    assert_ne!(
+        second_id, first_id,
+        "the old program is still the one running"
+    );
+    assert!(
+        second.contains(addr).unwrap(),
+        "the starting rules are missing"
+    );
+    drop(second);
+
+    // A mode the pin is not in cannot be had in place; it is replaced.
+    let third = Capture::attach(ifindex, CaptureConfig::default().pin(&path), Mode::DRIVER)
+        .expect("replace the pin");
+    assert_eq!(third.mode(), Mode::DRIVER);
+    drop(third);
+    assert!(xdp_prog_id(&veth.host).is_some());
+
+    assert!(pktkit::xdp::detach_pinned(&path).unwrap());
+    assert_eq!(
+        xdp_prog_id(&veth.host),
+        None,
+        "detach_pinned left a program attached"
+    );
+    assert!(!path.exists());
+    assert!(!pktkit::xdp::detach_pinned(&path).unwrap());
+}
+
+/// The restart a pinned device is for: the old one closes, its program stays,
+/// and the new one receives what it captures once the swap is done.
+#[test]
+#[ignore = "needs CAP_BPF + CAP_NET_ADMIN"]
+fn a_pinned_device_hands_the_interface_to_its_successor() {
+    if !root() {
+        return;
+    }
+    let veth = Veth::new("pindev");
+    let path = pin_path(&veth);
+    assert!(veth.ip_ns(&[
+        "neigh",
+        "add",
+        "10.99.0.5",
+        "lladdr",
+        &veth.host_mac(),
+        "dev",
+        &veth.peer,
+    ]));
+    let open = || {
+        Device::open(
+            Config::new(veth.host.clone())
+                .zerocopy(Zerocopy::Off)
+                .program(ProgramSource::Capture(
+                    CaptureConfig::default()
+                        .pin(&path)
+                        .rule(v4([10, 99, 0, 5], 32), Rule::Any),
+                )),
+        )
+        .expect("open AF_XDP on veth")
+    };
+
+    let first = open();
+    let first_id = xdp_prog_id(&veth.host).expect("nothing attached");
+    first.close().unwrap();
+    drop(first);
+    assert_eq!(
+        xdp_prog_id(&veth.host),
+        Some(first_id),
+        "closing a pinned device detached it"
+    );
+
+    let second = open();
+    assert_ne!(xdp_prog_id(&veth.host), Some(first_id));
+    let n = Arc::new(AtomicUsize::new(0));
+    {
+        let n = n.clone();
+        second.set_handler(Arc::new(move |f: &Frame| {
+            if ipv4_dst(f.as_bytes()) == Some([10, 99, 0, 5]) {
+                n.fetch_add(1, Ordering::Release);
+            }
+            Ok(())
+        }));
+    }
+    veth.exec(&["ping", "-c", "2", "-W", "1", "10.99.0.5"]);
+    wait_for(&n, 1, Duration::from_secs(3));
+    assert!(
+        n.load(Ordering::Acquire) > 0,
+        "the successor received nothing for its captured address"
+    );
+    second.close().unwrap();
+
+    assert!(pktkit::xdp::detach_pinned(&path).unwrap());
+    assert_eq!(xdp_prog_id(&veth.host), None);
 }
 
 fn wait_for(n: &AtomicUsize, target: usize, timeout: Duration) {

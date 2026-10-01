@@ -468,6 +468,30 @@ individually but not together. Both checks run before anything reaches the
 kernel, so a refused call leaves the set unchanged. Traffic that matches nothing
 returns `XDP_PASS` and goes to the host stack as usual.
 
+**Staying up across restarts.** Many drivers (ixgbe among them) reset the NIC
+whenever an interface goes between having an XDP program and having none, so a
+plain restart takes the link down twice. Pinning the attachment keeps the
+program on the interface after the process exits, and the next one swaps its own
+program in place — once its sockets are bound and its starting rules are in the
+maps — instead of attaching again:
+
+```rust
+use pktkit::afxdp::ProgramSource;
+use pktkit::xdp::CaptureConfig;
+
+let ccfg = CaptureConfig::default()
+    .pin("/sys/fs/bpf/myapp/eth0")
+    .rule(IpPrefix::new(Ipv4Addr::new(10, 0, 0, 7).into(), 32), Rule::Any);
+let dev = Device::open(Config::new("eth0").program(ProgramSource::Capture(ccfg)))?;
+// Closing or dropping `dev`, or exiting, leaves the program attached. Taking
+// it off is a separate, deliberate step:
+pktkit::xdp::detach_pinned("/sys/fs/bpf/myapp/eth0")?;
+```
+
+Between the two processes, what the old program would capture goes to the host
+stack, as it would with no program at all. Pinning needs Linux 5.9 and a bpf
+filesystem at the path.
+
 That uncaptured traffic is what the program is tuned for: a miss costs the
 bounds checks, one key and one lookup, and the transport header is parsed only
 after an address hit on a prefix with a narrow rule. `Capture::test_run` runs

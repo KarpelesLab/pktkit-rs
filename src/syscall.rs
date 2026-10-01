@@ -18,6 +18,7 @@
 // Most of this is AF_XDP's; `xdp` alone needs only sockets and `bpf(2)`.
 #![cfg_attr(not(feature = "afxdp"), allow(dead_code, unused_imports))]
 
+use std::ffi::CStr;
 use std::io;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 
@@ -30,9 +31,9 @@ compile_error!("pktkit's XDP support on fullrust only knows the x86-64 syscall A
 mod nr {
     pub use libc::{
         SYS_bind as BIND, SYS_bpf as BPF, SYS_getsockopt as GETSOCKOPT, SYS_ioctl as IOCTL,
-        SYS_mmap as MMAP, SYS_munmap as MUNMAP, SYS_ppoll as PPOLL, SYS_recvfrom as RECVFROM,
-        SYS_sched_setaffinity as SCHED_SETAFFINITY, SYS_sendto as SENDTO,
-        SYS_setsockopt as SETSOCKOPT, SYS_socket as SOCKET,
+        SYS_mkdirat as MKDIRAT, SYS_mmap as MMAP, SYS_munmap as MUNMAP, SYS_ppoll as PPOLL,
+        SYS_recvfrom as RECVFROM, SYS_sched_setaffinity as SCHED_SETAFFINITY, SYS_sendto as SENDTO,
+        SYS_setsockopt as SETSOCKOPT, SYS_socket as SOCKET, SYS_unlinkat as UNLINKAT,
     };
     #[cfg(test)]
     pub use libc::{SYS_fcntl as FCNTL, SYS_sched_getaffinity as SCHED_GETAFFINITY};
@@ -55,15 +56,17 @@ mod nr {
     pub const SCHED_SETAFFINITY: i64 = 203;
     #[cfg(test)]
     pub const SCHED_GETAFFINITY: i64 = 204;
+    pub const MKDIRAT: i64 = 258;
+    pub const UNLINKAT: i64 = 263;
     pub const PPOLL: i64 = 271;
     pub const BPF: i64 = 321;
 }
 
 #[cfg(target_os = "linux")]
 pub(crate) use libc::{
-    AF_INET, AF_NETLINK, AF_UNSPEC, AF_XDP, EAGAIN, EBUSY, EINVAL, ENODEV, ENOENT, MAP_ANONYMOUS,
-    MAP_HUGETLB, MAP_POPULATE, MAP_PRIVATE, MAP_SHARED, MSG_DONTWAIT, POLLIN, PROT_READ,
-    PROT_WRITE, SOCK_CLOEXEC, SOCK_DGRAM, SOCK_RAW, SOL_SOCKET,
+    AF_INET, AF_NETLINK, AF_UNSPEC, AF_XDP, EAGAIN, EBUSY, EEXIST, EINVAL, ENODEV, ENOENT, EPERM,
+    MAP_ANONYMOUS, MAP_HUGETLB, MAP_POPULATE, MAP_PRIVATE, MAP_SHARED, MSG_DONTWAIT, POLLIN,
+    PROT_READ, PROT_WRITE, SOCK_CLOEXEC, SOCK_DGRAM, SOCK_RAW, SOL_SOCKET,
 };
 
 #[cfg(target_os = "fullrust")]
@@ -85,9 +88,11 @@ mod consts {
     pub(crate) const MAP_ANONYMOUS: i32 = 0x20;
     pub(crate) const MAP_POPULATE: i32 = 0x8000;
     pub(crate) const MAP_HUGETLB: i32 = 0x40000;
+    pub(crate) const EPERM: i32 = 1;
     pub(crate) const ENOENT: i32 = 2;
     pub(crate) const EAGAIN: i32 = 11;
     pub(crate) const EBUSY: i32 = 16;
+    pub(crate) const EEXIST: i32 = 17;
     pub(crate) const ENODEV: i32 = 19;
     pub(crate) const EINVAL: i32 = 22;
 }
@@ -375,6 +380,41 @@ pub(crate) unsafe fn bpf(cmd: i32, attr: *mut u8, size: usize) -> Result<i32> {
     Ok(r as i32)
 }
 
+/// The `dirfd` that makes the `*at` syscalls resolve a relative path the way
+/// the plain ones do. They are the only ones every architecture has.
+const AT_FDCWD: isize = -100;
+
+/// `mkdir(2)`, as `mkdirat(AT_FDCWD, ...)`.
+pub(crate) fn mkdir(path: &CStr, mode: u32) -> Result<()> {
+    // SAFETY: `path` is NUL-terminated and outlives the call.
+    unsafe {
+        syscall(
+            nr::MKDIRAT,
+            [
+                AT_FDCWD as usize,
+                path.as_ptr() as usize,
+                mode as usize,
+                0,
+                0,
+                0,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+/// `unlink(2)`, as `unlinkat(AT_FDCWD, ...)`.
+pub(crate) fn unlink(path: &CStr) -> Result<()> {
+    // SAFETY: `path` is NUL-terminated and outlives the call.
+    unsafe {
+        syscall(
+            nr::UNLINKAT,
+            [AT_FDCWD as usize, path.as_ptr() as usize, 0, 0, 0, 0],
+        )?;
+    }
+    Ok(())
+}
+
 /// A CPU mask, laid out as glibc's `cpu_set_t`: 1024 bits.
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -600,6 +640,21 @@ mod tests {
         let mut buf = [0u8; 8];
         assert_eq!(recv(fd, &mut buf, MSG_DONTWAIT).unwrap(), 2);
         assert_eq!(&buf[..2], b"hi");
+    }
+
+    #[test]
+    fn directories_are_made_and_removed() {
+        let dir = std::env::temp_dir().join(format!("pktkit-mkdir-{}", std::process::id()));
+        let c = std::ffi::CString::new(dir.to_str().unwrap()).unwrap();
+        let file = std::ffi::CString::new(dir.join("f").to_str().unwrap()).unwrap();
+        mkdir(&c, 0o700).unwrap();
+        let e = mkdir(&c, 0o700).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(EEXIST));
+        std::fs::write(dir.join("f"), b"").unwrap();
+        unlink(&file).unwrap();
+        let e = unlink(&file).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(ENOENT));
+        std::fs::remove_dir(&dir).unwrap();
     }
 
     #[test]

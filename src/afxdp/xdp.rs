@@ -561,10 +561,12 @@ impl Device {
             q
         };
 
-        // The program goes on before any socket binds, so no frame can be
-        // redirected at a map slot we have not filled in yet.
+        // A new attachment goes on before any socket binds; until a slot is
+        // filled in, what the program captures on that queue goes to the host
+        // stack. A pinned one an earlier process left keeps running its own
+        // program until every socket is bound, and is swapped below.
         let capture = match &cfg.program {
-            ProgramSource::Capture(ccfg) => Some(Capture::attach(
+            ProgramSource::Capture(ccfg) => Some(Capture::prepare(
                 ifindex,
                 capture_config_for(ccfg, &queue_ids),
                 cfg.mode,
@@ -617,6 +619,9 @@ impl Device {
             xdp::set_socket_raw(xskmap_fd, queue_id, sock.raw())?;
             sockets.push(Arc::new(sock));
             rx_rings.push(rx);
+        }
+        if let Some(c) = &capture {
+            c.go_live()?;
         }
 
         let inner = Arc::new(Inner {
@@ -789,14 +794,17 @@ impl crate::L2Device for Device {
         // their RX rings until the device is dropped, black-holing every
         // captured prefix, so our own program is taken off now: its slots in
         // the XSKMAP first, which on its own makes a 5.3+ program pass the
-        // traffic, then the attachment. Mappings and fds are released when
-        // the last Arc drops. An external program is its owner's to detach;
-        // the kernel clears our sockets from its XSKMAP when they close.
+        // traffic, then the attachment — unless it is pinned, and meant to
+        // outlive us. Mappings and fds are released when the last Arc drops.
+        // An external program is its owner's to detach; the kernel clears our
+        // sockets from its XSKMAP when they close.
         if let Some(c) = &self.inner.capture {
             for s in &self.inner.sockets {
                 let _ = c.xsk_map().delete(&s.queue_id.to_ne_bytes());
             }
-            c.detach();
+            if !c.is_pinned() {
+                c.detach();
+            }
         }
         Ok(())
     }

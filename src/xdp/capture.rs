@@ -6,6 +6,7 @@
 use std::io;
 use std::net::IpAddr;
 use std::os::fd::{AsRawFd, BorrowedFd};
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use super::insn::{
@@ -275,6 +276,33 @@ pub struct CaptureConfig {
     /// XSKMAP slots: one past the highest NIC queue index that can be bound.
     /// `afxdp::Device::open` raises it to cover every queue it binds.
     pub max_queues: u32,
+    /// Pin the attachment at this path on a bpf filesystem, e.g.
+    /// `/sys/fs/bpf/myapp/eth0`, so that it outlives the process. `None`, the
+    /// default, detaches when the [`Capture`] is dropped.
+    ///
+    /// With a pin, dropping the capture — or the process exiting, crashing or
+    /// `exec`ing — leaves the program attached, and the next attach with the
+    /// same path swaps its new program into the pinned attachment in place
+    /// (`BPF_LINK_UPDATE`) instead of attaching again. Drivers that reset the
+    /// NIC when an interface goes between having an XDP program and having
+    /// none, such as ixgbe, then keep the link up across a restart.
+    ///
+    /// Missing directories leading to the path are created. A pin there that
+    /// is attached to another interface is refused; one in a mode the attach
+    /// would not have chosen (a generic-mode pin under [`Mode::DRIVER`]) is
+    /// replaced, which takes the link down once. Remove it with
+    /// [`detach_pinned`](super::detach_pinned) or [`Capture::detach`].
+    /// Pinning needs Linux 5.9 or later.
+    pub pin: Option<PathBuf>,
+    /// Rules written into the maps before the program goes live: the capture
+    /// set it starts with, as [`Capture::add_rule`] would build it. See
+    /// [`CaptureConfig::rule`].
+    ///
+    /// With a pinned attachment from an earlier process, what goes live is a
+    /// swap; rules given here are in place at that moment, while those added
+    /// afterwards leave the traffic they select with the host stack for as
+    /// long as that takes.
+    pub rules: Vec<(IpPrefix, Rule)>,
 }
 
 setters! {
@@ -288,6 +316,22 @@ setters! {
         set max_prefixes: u32;
         set max_rules_per_prefix: u8;
         set max_queues: u32;
+    }
+}
+
+impl CaptureConfig {
+    /// Set [`pin`](Self::pin) to `path`.
+    #[must_use]
+    pub fn pin(mut self, path: impl Into<PathBuf>) -> Self {
+        self.pin = Some(path.into());
+        self
+    }
+
+    /// Add `rule` for `prefix` to the starting [`rules`](Self::rules).
+    #[must_use]
+    pub fn rule(mut self, prefix: IpPrefix, rule: Rule) -> Self {
+        self.rules.push((prefix, rule));
+        self
     }
 }
 
@@ -307,6 +351,8 @@ impl Default for CaptureConfig {
             max_prefixes: 1024,
             max_rules_per_prefix: 8,
             max_queues: 64,
+            pin: None,
+            rules: Vec::new(),
         }
     }
 }
@@ -826,7 +872,10 @@ struct Entry {
 /// to a set of IP prefixes and passes everything else to the kernel, together
 /// with the maps that drive it.
 ///
-/// Dropping this detaches the program and frees the maps.
+/// Dropping this detaches the program and frees the maps, unless the
+/// attachment is pinned ([`CaptureConfig::pin`]): then the program and its
+/// maps stay on the interface until another capture with the same pin
+/// replaces them, or they are removed explicitly.
 ///
 /// The set lives in two `LPM_TRIE` maps (one per address family) rather than
 /// being baked into the instruction stream, so [`add`](Self::add) and
@@ -919,8 +968,7 @@ struct Entry {
 pub struct Capture {
     maps: CaptureMaps,
     prog: Program,
-    /// `None` once [`Capture::detach`] has taken the program off.
-    link: Mutex<Option<Link>>,
+    link: Mutex<Attachment>,
     mode: Mode,
     cfg: CaptureConfig,
     /// What the caller added, kept so a rule can be added to a prefix without
@@ -928,12 +976,38 @@ pub struct Capture {
     entries: Mutex<Vec<Entry>>,
 }
 
+/// Where a [`Capture`]'s program stands on the interface.
+#[derive(Debug)]
+enum Attachment {
+    /// Attached and running.
+    Live(Link),
+    /// A pinned attachment an earlier process left, still running that
+    /// process's program until [`Capture::go_live`] swaps ours in.
+    Adopted(Link),
+    /// Taken off by [`Capture::detach`].
+    Detached,
+}
+
 impl Capture {
     /// Build, load and attach a capture program on `ifindex`.
     ///
-    /// The capture set starts empty, so nothing is diverted from the host
-    /// stack until [`Capture::add`] is called.
+    /// The capture set starts as [`CaptureConfig::rules`], which by default
+    /// is empty, so nothing is diverted from the host stack until
+    /// [`Capture::add`] is called. With [`CaptureConfig::pin`], a pinned
+    /// attachment already on `ifindex` gets the new program swapped in rather
+    /// than a new attachment.
     pub fn attach(ifindex: u32, cfg: CaptureConfig, mode: Mode) -> Result<Capture> {
+        let cap = Capture::prepare(ifindex, cfg, mode)?;
+        cap.go_live()?;
+        Ok(cap)
+    }
+
+    /// Everything [`Capture::attach`] does short of swapping into an adopted
+    /// pinned attachment, so that whatever the new program redirects to —
+    /// the sockets in its XSKMAP — can be in place first. A new attachment
+    /// is made here: with nothing of ours on the interface there is nothing
+    /// to keep running in the meantime, and the caller needs its mode.
+    pub(crate) fn prepare(ifindex: u32, cfg: CaptureConfig, mode: Mode) -> Result<Capture> {
         cfg.validate()?;
         let maps = CaptureMaps::create(&cfg)?;
         let insns = build_program_inner(
@@ -944,15 +1018,57 @@ impl Capture {
             probe_redirect_flags(&maps.xskmap),
         )?;
         let prog = Program::load(&insns, "pktkit_cap")?;
-        let link = prog.attach(ifindex, mode)?;
-        Ok(Capture {
+        let adopted = match &cfg.pin {
+            Some(path) => Link::adopt_pinned(path, ifindex, mode)?,
+            None => None,
+        };
+        let rules = cfg.rules.clone();
+        let mut cap = Capture {
             maps,
             prog,
-            mode: link.mode(),
-            link: Mutex::new(Some(link)),
+            link: Mutex::new(Attachment::Detached),
+            mode,
             cfg,
             entries: Mutex::new(Vec::new()),
-        })
+        };
+        for (prefix, rule) in rules {
+            cap.add_rule(prefix, rule)?;
+        }
+        let link = match adopted {
+            Some(link) => Attachment::Adopted(link),
+            None => Attachment::Live(match &cap.cfg.pin {
+                Some(path) => cap.prog.attach_pinned(ifindex, mode, path)?,
+                None => cap.prog.attach(ifindex, mode)?,
+            }),
+        };
+        if let Attachment::Live(l) | Attachment::Adopted(l) = &link {
+            cap.mode = l.mode();
+        }
+        *cap.link.get_mut().unwrap() = link;
+        Ok(cap)
+    }
+
+    /// Swap this capture's program into an adopted pinned attachment. A
+    /// no-op once it is running.
+    pub(crate) fn go_live(&self) -> Result<()> {
+        let mut st = self.link.lock().unwrap();
+        if let Attachment::Adopted(link) = &*st {
+            link.update(&self.prog)?;
+            let Attachment::Adopted(link) = std::mem::replace(&mut *st, Attachment::Detached)
+            else {
+                unreachable!()
+            };
+            *st = Attachment::Live(link);
+        }
+        Ok(())
+    }
+
+    /// Whether the attachment is pinned, and so outlives this capture.
+    pub(crate) fn is_pinned(&self) -> bool {
+        match &*self.link.lock().unwrap() {
+            Attachment::Live(l) | Attachment::Adopted(l) => l.pin_path().is_some(),
+            Attachment::Detached => false,
+        }
     }
 
     /// The mode the program attached in.
@@ -965,9 +1081,18 @@ impl Capture {
     /// dropped, e.g. once the sockets it redirects to have stopped reading.
     /// The maps and the capture set stay as they are, but nothing is diverted
     /// any more. Idempotent.
+    ///
+    /// A pinned attachment is detached and its pin removed, so the next
+    /// process attaches afresh. Failing that, it stays as it is; use
+    /// [`detach_pinned`](super::detach_pinned) to see why.
     pub fn detach(&self) {
-        // Dropping the link is what detaches it.
-        drop(self.link.lock().unwrap().take());
+        let st = std::mem::replace(&mut *self.link.lock().unwrap(), Attachment::Detached);
+        if let Attachment::Live(link) | Attachment::Adopted(link) = st {
+            // Unpinned, dropping the link is what detaches it.
+            if link.pin_path().is_some() {
+                let _ = link.detach();
+            }
+        }
     }
 
     /// The XSKMAP an AF_XDP socket registers itself in: the program

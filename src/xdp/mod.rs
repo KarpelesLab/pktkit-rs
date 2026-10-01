@@ -60,6 +60,37 @@
 //! [`Mode::AUTO`] tries the former and falls back to the latter, and
 //! [`Capture::mode`] reports which one took effect.
 //!
+//! # Staying attached across restarts
+//!
+//! A capture's program is normally detached when the process exits, and many
+//! drivers reset the NIC whenever an interface goes between having an XDP
+//! program and having none — so a restart takes the link down twice, once on
+//! exit and once on the next attach. [`CaptureConfig::pin`] avoids both:
+//!
+//! ```no_run
+//! use pktkit::xdp::{Capture, CaptureConfig, Mode, Rule};
+//! use pktkit::IpPrefix;
+//! use std::net::Ipv4Addr;
+//!
+//! # fn main() -> std::io::Result<()> {
+//! let cfg = CaptureConfig::default()
+//!     .pin("/sys/fs/bpf/myapp/eth0")
+//!     // In place before the program goes live.
+//!     .rule(IpPrefix::new(Ipv4Addr::new(10, 0, 0, 7).into(), 32), Rule::Any);
+//! let cap = Capture::attach(2, cfg, Mode::AUTO)?;
+//! // Exiting leaves the program attached. The next `attach` with the same pin
+//! // swaps its own program in, in place, instead of attaching again.
+//! # drop(cap);
+//! // Removing it is a deliberate step:
+//! pktkit::xdp::detach_pinned("/sys/fs/bpf/myapp/eth0")?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Between processes the old program stays on the interface. Its sockets are
+//! gone, so what it would have captured goes to the host stack, as it does
+//! with no program at all.
+//!
 //! # Requirements
 //!
 //! Loading and attaching needs `CAP_BPF` + `CAP_NET_ADMIN` (or root) and a real
@@ -79,4 +110,4 @@ mod sys;
 pub use capture::{Capture, CaptureConfig, MAX_RULES_PER_PREFIX, MatchField, Rule};
 #[cfg(feature = "afxdp")]
 pub(crate) use map::set_socket_raw;
-pub use prog::{Action, Mode, TestRun, detach};
+pub use prog::{Action, Mode, TestRun, detach, detach_pinned};
