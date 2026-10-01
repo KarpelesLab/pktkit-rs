@@ -170,6 +170,27 @@ jobs:
           command: test
           args: --features afxdp --lib -- xdp syscall
 
+  xdp-kernel:
+    name: XDP against the runner's kernel (root)
+    runs-on: ubuntu-latest
+    env:
+      # Cargo stays the runner user, so the target dir and the cache stay
+      # its own; only the test binaries run as root, which loading and
+      # attaching programs, pinning and making veths all need.
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: sudo -E
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Kernel and bpffs
+        run: |
+          uname -r
+          mount | grep -E ' type bpf ' || sudo mount -t bpf bpf /sys/fs/bpf
+      - name: Verifier and map layout (lib)
+        run: cargo test --features afxdp --lib xdp::kernel_tests -- --ignored --test-threads=1
+      - name: Live captures on veth
+        run: cargo test --features afxdp --test xdp_kernel -- --ignored --test-threads=1
+
   macos:
     name: Build + test (macOS)
     runs-on: macos-latest
