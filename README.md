@@ -521,9 +521,10 @@ complete and tested; a few have documented `// TODO(<feature>)` gaps:
   timers run from `Peer::tick`, which `ovpn::Server` drives.)
 - **xdp / afxdp**: program codegen, map key layout and ring math are
   unit-tested, and `src/xdp/kernel_tests.rs` (verifier acceptance) and
-  `tests/xdp_kernel.rs` (the veth datapath) cover the kernel side — but
-  those are `#[ignore]`d because they need root, so the
-  kernel-facing paths stay marked `// TODO(afxdp)` until CI runs them.
+  `tests/xdp_kernel.rs` (the veth datapath) cover the kernel side. They are
+  `#[ignore]`d because they need root, and CI runs them as root against the
+  runner's kernel. A veth exercises copy mode only, so the zero-copy paths
+  stay marked `// TODO(afxdp)`.
   Zero-copy additionally needs a driver that supports it; `Device::zerocopy()`
   reports what was actually negotiated.
 - **tuntap**: macOS `utun` is type-checked against the Apple target but not yet

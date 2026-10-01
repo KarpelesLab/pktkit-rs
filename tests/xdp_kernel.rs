@@ -947,10 +947,13 @@ fn a_batch_is_transmitted_in_full() {
     assert_eq!(dev.send_batch(&[runt, one]).unwrap(), 2);
 
     // More than the pool holds: part of it is taken, and the count is honest.
+    // Part, not at most a pool's worth: the call takes completions back as
+    // it goes, and a copy-mode veth completes a frame as soon as it is
+    // kicked, so one call can recycle the pool several times over.
     let first = dev.send_batch(&burst).expect("send_batch");
     assert!(
-        first > 0 && first <= (POOL / 2) as usize,
-        "{first} frames taken from a pool of {}",
+        first > 0 && first < FRAMES,
+        "{first} of {FRAMES} frames taken from a pool of {}",
         POOL / 2
     );
 
@@ -1085,16 +1088,29 @@ fn a_pinned_device_hands_the_interface_to_its_successor() {
         &veth.peer,
     ]));
     let open = || {
-        Device::open(
-            Config::new(veth.host.clone())
-                .zerocopy(Zerocopy::Off)
-                .program(ProgramSource::Capture(
-                    CaptureConfig::default()
-                        .pin(&path)
-                        .rule(v4([10, 99, 0, 5], 32), Rule::Any),
-                )),
-        )
-        .expect("open AF_XDP on veth")
+        // A dropped device's poll threads hold its sockets, and so its
+        // queues, until they next wake: up to a second. Across a restart the
+        // exit closes them at once; in one process, wait for the queue.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            match Device::open(
+                Config::new(veth.host.clone())
+                    .zerocopy(Zerocopy::Off)
+                    .program(ProgramSource::Capture(
+                        CaptureConfig::default()
+                            .pin(&path)
+                            .rule(v4([10, 99, 0, 5], 32), Rule::Any),
+                    )),
+            ) {
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::ResourceBusy
+                        && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                r => break r.expect("open AF_XDP on veth"),
+            }
+        }
     };
 
     let first = open();
