@@ -6,6 +6,40 @@ semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+## [0.1.11](https://github.com/KarpelesLab/pktkit-rs/compare/v0.1.10...v0.1.11) - 2026-10-01
+
+### Added
+
+- *(xdp)* pinned attachments survive a restart without a link reset
+
+### Fixed
+
+- *(slirp)* Fast Open cookies are per namespace
+- *(vclient)* SYN data the engine drops is not charged to the listener
+- *(vclient)* close() wakes threads blocked on the connection
+- *(slirp)* each namespace grows its buffers from a share of its own
+- *(vtcp)* idle connections give their buffer growth back
+- *(vtcp)* a pipeACK sample covers one round trip
+- *(vtcp)* CUBIC leaves idle time off its curve
+- *(vtcp)* BBR conserves packets in fast recovery
+- *(vtcp)* CUBIC undo judges against the window it cut
+- *(vtcp)* HyStart++ runs against peers without timestamps
+- *(vtcp)* ignore D-SACK blocks that reach past SND.NXT
+- *(vtcp)* a Packet Too Big resends only what does not fit
+- *(vtcp)* SYN data sent again after the handshake is a retransmission to ECN
+- *(vtcp)* AccECN handshake code only on the ACK of the SYN-ACK alone
+- *(vtcp)* in SYN-RECEIVED, take only a SYN restating the IRS as resent
+- *(vtcp)* take ECN signals only from segments whose ACK checks out
+- *(vtcp)* undoing a loss response keeps the losses it did not refute
+- *(vtcp)* SACKs split the scoreboard only at whole MSS
+
+### Other
+
+- *(xdp)* fix two kernel tests' assumptions, now that CI runs them
+- run the root-only XDP tests against the runner's kernel
+- Fast Open cookies can be forged on wasm32-unknown-unknown
+- *(vtcp)* a scaled window's edge may come back by less than a unit
+
 ## [0.1.10](https://github.com/KarpelesLab/pktkit-rs/compare/v0.1.9...v0.1.10) - 2026-09-29
 
 ### Added
