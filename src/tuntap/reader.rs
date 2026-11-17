@@ -1,4 +1,4 @@
-//! What the Linux and macOS backends share: a device fd that can be closed
+//! What the Linux and Darwin backends share: a device fd that can be closed
 //! under a reader blocked on it, and the handler slot that reader waits on.
 //!
 //! A blocked `read(2)` on a TUN/TAP fd does not return when another thread
@@ -79,14 +79,62 @@ impl DevFd {
             };
             if n < 0 {
                 let e = io::Error::last_os_error();
+                match e.kind() {
+                    io::ErrorKind::Interrupted => continue,
+                    // An fd handed to `from_fd` may be non-blocking: Android's
+                    // `VpnService.Builder.establish()` makes it so by default.
+                    io::ErrorKind::WouldBlock => {
+                        self.wait_writable(fd.as_raw_fd())?;
+                        continue;
+                    }
+                    _ => return Err(e),
+                }
+            }
+            written += n as usize;
+        }
+        Ok(())
+    }
+
+    /// Wait for a non-blocking `fd` to take a write, or for a close.
+    ///
+    /// The wake pipe is polled too: `close` takes the write lock that the
+    /// caller's read lock holds off, so a sender stuck here for good would
+    /// keep the device from ever closing. Nothing drains the pipe, so once
+    /// `close` has written to it every wait here returns at once.
+    fn wait_writable(&self, fd: libc::c_int) -> Result<()> {
+        loop {
+            let mut fds = [
+                libc::pollfd {
+                    fd,
+                    events: libc::POLLOUT,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: self.wake_rx.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            // SAFETY: two live pollfds; the kernel writes only `revents`.
+            let r = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+            if r < 0 {
+                let e = io::Error::last_os_error();
                 if e.kind() == io::ErrorKind::Interrupted {
                     continue;
                 }
                 return Err(e);
             }
-            written += n as usize;
+            if fds[1].revents != 0 || self.closed.load(Ordering::Acquire) {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "tuntap: device is closed",
+                ));
+            }
+            // POLLOUT, or POLLERR / POLLHUP for the write to report.
+            if fds[0].revents != 0 {
+                return Ok(());
+            }
         }
-        Ok(())
     }
 
     /// Block until one message has been read into `buf` and return its
@@ -262,10 +310,10 @@ impl<H: Clone> HandlerSlot<H> {
 /// A close-on-exec pipe: `(read end, write end)`.
 fn pipe() -> Result<(OwnedFd, OwnedFd)> {
     let mut fds = [0 as libc::c_int; 2];
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     // SAFETY: `fds` has room for the two fds pipe2 writes.
     let r = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     // SAFETY: `fds` has room for the two fds pipe writes.
     let r = unsafe { libc::pipe(fds.as_mut_ptr()) };
     if r < 0 {
@@ -273,7 +321,7 @@ fn pipe() -> Result<(OwnedFd, OwnedFd)> {
     }
     // SAFETY: two fresh fds nothing else owns.
     let (rx, tx) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     for fd in [&rx, &tx] {
         // SAFETY: plain fcntl on an fd we own. Best effort: without it the
         // pipe merely leaks into a child that execs.

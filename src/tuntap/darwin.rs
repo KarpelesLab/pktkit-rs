@@ -1,4 +1,6 @@
-//! macOS TUN via the `utun` kernel control (`AF_SYSTEM` / `SYSPROTO_CONTROL`).
+//! macOS and iOS TUN via the `utun` kernel control (`AF_SYSTEM` /
+//! `SYSPROTO_CONTROL`), or over a utun fd opened elsewhere
+//! ([`Tun::from_fd`]).
 //!
 //! utun frames carry a 4-byte protocol-family header (`AF_INET` / `AF_INET6`)
 //! ahead of the IP packet; we strip it on read and prepend it on write.
@@ -6,8 +8,8 @@
 //! TAP mode has no macOS kernel driver, so [`Tap::open`] returns
 //! `ErrorKind::Unsupported`.
 //!
-//! This module is compiled for `target_os = "macos"` and type-checked via
-//! `cargo check --target x86_64-apple-darwin`, but the live device paths
+//! This module is compiled for `target_os = "macos"` and `"ios"`, and
+//! type-checked for both Apple targets in CI, but the live device paths
 //! require a real macOS host + root and are marked
 //! `// TODO(tuntap): needs macOS to verify`.
 
@@ -16,21 +18,24 @@ use crate::{
     DeviceStats, Frame, IpPrefix, L2Device, L2Handler, L3Device, L3Handler, MacAddr, Packet, Result,
 };
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::{Arc, Mutex};
 
+#[cfg(target_os = "macos")]
 const UTUN_CONTROL_NAME: &[u8] = b"com.apple.net.utun_control";
 const UTUN_OPT_IFNAME: libc::c_int = 2;
 
-/// Knobs for opening a utun device. `name` is ignored on macOS (the kernel
-/// assigns `utunN`); present for API parity with the Linux backend.
+/// Knobs for opening a utun device.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct TuntapConfig {
+    /// Ignored by [`Tun::open`] (the kernel assigns `utunN`); present for API
+    /// parity with the Linux backend. [`Tun::from_fd`] reports it only if the
+    /// fd cannot name itself.
     pub name: String,
 }
 
-/// macOS TUN device — raw IPv4/IPv6 packets.
+/// macOS/iOS TUN device — raw IPv4/IPv6 packets.
 ///
 /// Dropping it closes the device, as [`L3Device::close`] does.
 pub struct Tun {
@@ -50,9 +55,38 @@ impl core::fmt::Debug for Tun {
 }
 
 impl Tun {
-    /// Open a utun device. Requires root.
+    /// Open a utun device. Requires root. On iOS, where an app may not create
+    /// one, this fails with [`io::ErrorKind::Unsupported`]; use
+    /// [`Tun::from_fd`].
     pub fn open(_cfg: TuntapConfig) -> Result<Tun> {
         let (fd, name) = open_utun()?;
+        Tun::adopt(fd, name)
+    }
+
+    /// Run over a utun fd that is already open and connected, such as the
+    /// one behind an iOS or macOS Packet Tunnel extension's
+    /// `NEPacketTunnelFlow`. Blocking or non-blocking both work.
+    ///
+    /// Packets keep the utun framing: a 4-byte protocol-family header is
+    /// stripped from each read and put in front of each write.
+    ///
+    /// The name is asked of the fd (`UTUN_OPT_IFNAME`, else the unit it is
+    /// connected to); `cfg.name` stands in when it cannot say.
+    ///
+    /// The `Tun` owns the fd from here on: closing or dropping it closes the
+    /// fd, and the interface goes once its last fd is closed. An fd number
+    /// found behind `NEPacketTunnelFlow` is not the app's to close, so pass
+    /// a duplicate of it
+    /// ([`BorrowedFd::try_clone_to_owned`](std::os::fd::BorrowedFd::try_clone_to_owned)).
+    pub fn from_fd(fd: OwnedFd, cfg: TuntapConfig) -> Result<Tun> {
+        let raw = fd.as_raw_fd();
+        let name = getsockopt_ifname(raw)
+            .or_else(|| peer_unit(raw).and_then(utun_name))
+            .unwrap_or(cfg.name);
+        Tun::adopt(fd, name)
+    }
+
+    fn adopt(fd: OwnedFd, name: String) -> Result<Tun> {
         let dev = Arc::new(DevFd::new(fd)?);
         let handler: Arc<HandlerSlot<L3Handler>> = Arc::new(HandlerSlot::new());
         let stats = Arc::new(DeviceStats::new());
@@ -139,18 +173,18 @@ impl Drop for Tun {
     }
 }
 
-/// macOS TAP placeholder — no kernel driver exists, so this always fails.
+/// macOS/iOS TAP placeholder — no kernel driver exists, so this always fails.
 #[derive(Debug)]
 pub struct Tap {
     _private: (),
 }
 
 impl Tap {
-    /// Always returns `ErrorKind::Unsupported` on macOS.
+    /// Always returns `ErrorKind::Unsupported` on macOS and iOS.
     pub fn open(_cfg: TuntapConfig) -> Result<Tap> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "TAP mode is not supported on macOS",
+            "TAP mode is not supported on macOS or iOS",
         ))
     }
 
@@ -159,11 +193,11 @@ impl Tap {
         ""
     }
 
-    /// Always returns `ErrorKind::Unsupported` on macOS.
+    /// Always returns `ErrorKind::Unsupported` on macOS and iOS.
     pub fn kernel_hw_addr(&self) -> Result<MacAddr> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "TAP mode is not supported on macOS",
+            "TAP mode is not supported on macOS or iOS",
         ))
     }
 }
@@ -173,7 +207,7 @@ impl L2Device for Tap {
     fn send(&self, _f: &Frame) -> Result<()> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "TAP mode is not supported on macOS",
+            "TAP mode is not supported on macOS or iOS",
         ))
     }
     fn hw_addr(&self) -> MacAddr {
@@ -186,13 +220,25 @@ impl L2Device for Tap {
 
 // --- syscalls --------------------------------------------------------------
 
+/// An iOS app cannot make a utun (the sandbox keeps it from the kernel
+/// control), and has one handed to it instead: [`Tun::from_fd`].
+#[cfg(not(target_os = "macos"))]
+fn open_utun() -> Result<(OwnedFd, String)> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "utun: creating one is not supported here; adopt the system's with Tun::from_fd",
+    ))
+}
+
+#[cfg(target_os = "macos")]
 fn open_utun() -> Result<(OwnedFd, String)> {
     // socket(AF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL)
     let fd = unsafe { libc::socket(libc::AF_SYSTEM, libc::SOCK_DGRAM, libc::SYSPROTO_CONTROL) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
-    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    // SAFETY: a fresh fd nothing else owns.
+    let owned: OwnedFd = unsafe { std::os::fd::FromRawFd::from_raw_fd(fd) };
     // macOS has no SOCK_CLOEXEC, so this is as early as it can be set. A
     // child that inherited the fd would keep the interface alive after we
     // close it.
@@ -246,13 +292,46 @@ fn utun_name(sc_unit: u32) -> Option<String> {
     sc_unit.checked_sub(1).map(|n| format!("utun{n}"))
 }
 
+// The libc crate binds the kernel-control ABI for macOS only, though iOS has
+// the same one (`<sys/sys_domain.h>`, `<sys/kern_control.h>`) and an adopted
+// utun fd there needs it to name itself. So the little that naming takes is
+// spelled out here, and checked against libc's on macOS.
+const AF_SYSTEM: u8 = 32;
+const SYSPROTO_CONTROL: libc::c_int = 2;
+
+/// `struct sockaddr_ctl`. Only filled in by the kernel and partly read, but
+/// every field is there for the layout.
+#[repr(C)]
+#[allow(dead_code)]
+struct SockaddrCtl {
+    sc_len: u8,
+    sc_family: u8,
+    ss_sysaddr: u16,
+    sc_id: u32,
+    sc_unit: u32,
+    sc_reserved: [u32; 5],
+}
+
+#[cfg(target_os = "macos")]
+const _: () = {
+    assert!(AF_SYSTEM as libc::c_int == libc::AF_SYSTEM);
+    assert!(SYSPROTO_CONTROL == libc::SYSPROTO_CONTROL);
+    assert!(std::mem::size_of::<SockaddrCtl>() == std::mem::size_of::<libc::sockaddr_ctl>());
+    assert!(
+        std::mem::offset_of!(SockaddrCtl, sc_unit)
+            == std::mem::offset_of!(libc::sockaddr_ctl, sc_unit)
+    );
+};
+
 /// The `sc_unit` the control socket `fd` is connected to.
 fn peer_unit(fd: i32) -> Option<u32> {
-    let mut addr: libc::sockaddr_ctl = unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of::<libc::sockaddr_ctl>() as libc::socklen_t;
+    // SAFETY: all-zero is a valid value of this plain-integer struct.
+    let mut addr: SockaddrCtl = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<SockaddrCtl>() as libc::socklen_t;
     // SAFETY: `addr` is writable for `len` bytes, which caps what is copied.
     let r = unsafe { libc::getpeername(fd, &mut addr as *mut _ as *mut libc::sockaddr, &mut len) };
-    if r < 0 || (len as usize) < std::mem::size_of::<libc::sockaddr_ctl>() {
+    // An adopted fd need not be a control socket at all.
+    if r < 0 || (len as usize) < std::mem::size_of::<SockaddrCtl>() || addr.sc_family != AF_SYSTEM {
         return None;
     }
     Some(addr.sc_unit)
@@ -264,7 +343,7 @@ fn getsockopt_ifname(fd: i32) -> Option<String> {
     let r = unsafe {
         libc::getsockopt(
             fd,
-            libc::SYSPROTO_CONTROL,
+            SYSPROTO_CONTROL,
             UTUN_OPT_IFNAME,
             buf.as_mut_ptr() as *mut libc::c_void,
             &mut len,
@@ -330,6 +409,42 @@ mod tests {
         dev.close();
         slot.wake();
         reader.join().unwrap();
+    }
+
+    /// A datagram socket pair stands in for the utun fd: the header is
+    /// stripped on the way in and put back on the way out.
+    #[test]
+    fn from_fd_keeps_the_utun_framing() {
+        use std::os::unix::net::UnixDatagram;
+        let (dev, peer) = UnixDatagram::pair().unwrap();
+        dev.set_nonblocking(true).unwrap();
+        let tun = Tun::from_fd(OwnedFd::from(dev), TuntapConfig::new("utun7")).unwrap();
+        // Not a control socket, so the configured name stands.
+        assert_eq!(tun.name(), "utun7");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let tx = Mutex::new(tx);
+        tun.set_handler(Arc::new(move |p: &Packet| {
+            let _ = tx.lock().unwrap().send(p.as_bytes().to_vec());
+            Ok(())
+        }));
+        let mut framed = (libc::AF_INET as u32).to_be_bytes().to_vec();
+        framed.extend_from_slice(&[0x45; 20]);
+        peer.send(&framed).unwrap();
+        let got = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("nothing delivered");
+        assert_eq!(got, [0x45; 20]);
+
+        let v6 = [0x60_u8; 40];
+        tun.send(Packet::from_slice(&v6)).unwrap();
+        let mut buf = [0u8; 128];
+        let n = peer.recv(&mut buf).unwrap();
+        assert_eq!(&buf[..4], (libc::AF_INET6 as u32).to_be_bytes());
+        assert_eq!(&buf[4..n], v6);
+
+        drop(tun);
+        assert!(peer.send(&framed).is_err(), "drop left the fd open");
     }
 
     #[test]

@@ -17,7 +17,7 @@ pub struct TuntapConfig {
 fn unsupported<T>() -> Result<T> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "TUN/TAP is only implemented for Linux and macOS",
+        "TUN/TAP is only implemented for Linux, Android, macOS and iOS",
     ))
 }
 
@@ -28,6 +28,12 @@ pub struct Tun(());
 impl Tun {
     /// Always fails with [`io::ErrorKind::Unsupported`] here.
     pub fn open(_cfg: TuntapConfig) -> Result<Tun> {
+        unsupported()
+    }
+
+    /// Always fails with [`io::ErrorKind::Unsupported`] here, and closes `fd`.
+    #[cfg(unix)]
+    pub fn from_fd(_fd: std::os::fd::OwnedFd, _cfg: TuntapConfig) -> Result<Tun> {
         unsupported()
     }
 

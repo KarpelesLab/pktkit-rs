@@ -1,6 +1,7 @@
 //! Small Linux syscall helpers shared by the OS-touching device features.
 //!
-//! Only compiled on Linux, and only when a feature that needs it is enabled.
+//! Only compiled on Linux (and Android, for tuntap), and only when a feature
+//! that needs it is enabled.
 
 use crate::{MacAddr, Result};
 use std::io;

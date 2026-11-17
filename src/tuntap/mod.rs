@@ -17,35 +17,59 @@
 //! holder of the fd. `hw_addr` is the latter's, a locally administered MAC of
 //! its own; the kernel side's is [`Tap::kernel_hw_addr`].
 //!
+//! [`Tun::from_fd`] adopts a TUN fd someone else opened instead: on a phone
+//! the OS creates the interface and hands the app its fd, Android's
+//! `VpnService.Builder.establish()` and the utun of an iOS Packet Tunnel
+//! extension.
+//!
 //! Platform support:
-//! - **Linux**: TUN and TAP via `/dev/net/tun`.
-//! - **macOS**: TUN via the `utun` kernel control. TAP is not available
+//! - **Linux, Android**: TUN and TAP via `/dev/net/tun`. On Android opening
+//!   one needs root like anywhere else; an app gets its TUN fd from
+//!   `VpnService` and adopts it with [`Tun::from_fd`].
+//! - **macOS, iOS**: TUN via the `utun` kernel control. TAP is not available
 //!   (the OS has no kernel TAP driver); [`Tap::open`] returns
-//!   `ErrorKind::Unsupported`. The macOS path is compiled and type-checked
-//!   against the `x86_64-apple-darwin` target but cannot be exercised in the
-//!   Linux CI sandbox; runtime paths are marked `// TODO(tuntap): needs macOS`.
+//!   `ErrorKind::Unsupported`. An iOS app may not create a utun itself, so
+//!   there [`Tun::open`] returns `ErrorKind::Unsupported` too and
+//!   [`Tun::from_fd`] is the way in. The Darwin path is compiled and type-checked against the
+//!   Apple targets but cannot be exercised in the Linux CI sandbox; runtime
+//!   paths are marked `// TODO(tuntap): needs macOS`.
 //! - **Everywhere else**: the types compile but [`Tun::open`] and [`Tap::open`]
 //!   return `ErrorKind::Unsupported`.
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+))]
 mod reader;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod linux;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub use linux::{Tap, Tun, TuntapConfig};
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 mod darwin;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub use darwin::{Tap, Tun, TuntapConfig};
 
 // Everywhere else the types still exist so that `full` -- and any
 // cross-platform code naming them -- compiles; opening one reports
 // `Unsupported` rather than failing the build.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+)))]
 mod unsupported;
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+)))]
 pub use unsupported::{Tap, Tun, TuntapConfig};
 
 setters! {
@@ -55,7 +79,8 @@ setters! {
 }
 
 impl TuntapConfig {
-    /// Ask for the device `name`. Empty lets the kernel pick one.
+    /// Ask for the device `name`. Empty lets the kernel pick one. For
+    /// [`Tun::from_fd`], the name to report if the fd cannot say its own.
     pub fn new(name: impl Into<String>) -> TuntapConfig {
         TuntapConfig::default().name(name)
     }

@@ -108,7 +108,11 @@ pub use stats::{DeviceStats, HubCounters, Stats};
 pub type Result<T> = std::io::Result<T>;
 
 // Linux syscall helpers, compiled only for the features that issue them.
-#[cfg(all(target_os = "linux", any(feature = "tuntap", feature = "afpacket")))]
+// Android is a Linux kernel too, and its tuntap backend is the Linux one.
+#[cfg(any(
+    all(target_os = "linux", any(feature = "tuntap", feature = "afpacket")),
+    all(target_os = "android", feature = "tuntap")
+))]
 mod sys;
 
 // The syscalls XDP and AF_XDP make, on both targets with a Linux kernel

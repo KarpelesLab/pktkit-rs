@@ -205,6 +205,24 @@ jobs:
       - run: cargo build --all-features
       - run: cargo test --all-features
 
+  mobile:
+    name: Check (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-linux-android, aarch64-apple-ios]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      # A phone app gets its TUN fd from the OS and runs WireGuard over it:
+      # `Tun::from_fd` is the only way into tuntap there. Checking a library
+      # needs neither the NDK nor Xcode, so this runs on Linux.
+      - run: cargo check --target ${{ matrix.target }} --features wg,tuntap --all-targets
+
   windows:
     name: Build (Windows)
     runs-on: windows-latest

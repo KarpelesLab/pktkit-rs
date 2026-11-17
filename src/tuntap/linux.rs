@@ -1,4 +1,5 @@
-//! Linux TUN/TAP via `/dev/net/tun` and `ioctl(TUNSETIFF)`.
+//! Linux and Android TUN/TAP via `/dev/net/tun` and `ioctl(TUNSETIFF)`, or
+//! over a TUN fd opened elsewhere ([`Tun::from_fd`]).
 //!
 //! Reader threads call the installed handler synchronously; the buffer
 //! handed to the handler is the read scratch and is only valid for the
@@ -20,6 +21,7 @@ use std::sync::{Arc, Mutex};
 pub struct TuntapConfig {
     /// Requested interface name; empty asks the kernel to pick one
     /// (`tun0`, `tap0`, …). At most 15 bytes: a longer name is refused.
+    /// [`Tun::from_fd`] reports it only if the fd cannot name itself.
     pub name: String,
 }
 
@@ -66,6 +68,36 @@ impl Tun {
     /// Open a TUN (L3) device. Requires `CAP_NET_ADMIN` or root.
     pub fn open(cfg: TuntapConfig) -> Result<Tun> {
         let (fd, name) = open_tuntap(&cfg.name, libc::IFF_TUN | libc::IFF_NO_PI)?;
+        Tun::adopt(fd, name)
+    }
+
+    /// Run over a TUN fd that is already open and attached to an interface,
+    /// such as the one Android's `VpnService.Builder.establish()` returns
+    /// (`ParcelFileDescriptor.detachFd()`). Needs no privileges of its own.
+    ///
+    /// The fd must carry bare IP packets: `IFF_TUN | IFF_NO_PI`, as
+    /// `VpnService` sets up. Blocking or non-blocking both work.
+    ///
+    /// The name is asked of the fd (`TUNGETIFF`); `cfg.name` stands in when
+    /// it cannot say, as when SELinux denies the ioctl. When it can, an fd in
+    /// TAP mode or with the 4-byte packet-information header is refused
+    /// rather than misread.
+    ///
+    /// The `Tun` owns the fd from here on: closing or dropping it closes the
+    /// fd, which for `VpnService` ends the VPN. Pass a duplicate
+    /// ([`OwnedFd::try_clone`]) to keep one of your own.
+    pub fn from_fd(fd: OwnedFd, cfg: TuntapConfig) -> Result<Tun> {
+        let name = match tun_getiff(&fd) {
+            Some((name, flags)) => {
+                check_tun_flags(flags)?;
+                name
+            }
+            None => cfg.name,
+        };
+        Tun::adopt(fd, name)
+    }
+
+    fn adopt(fd: OwnedFd, name: String) -> Result<Tun> {
         let dev = Arc::new(DevFd::new(fd)?);
         let handler: Arc<HandlerSlot<L3Handler>> = Arc::new(HandlerSlot::new());
         let stats = Arc::new(DeviceStats::new());
@@ -257,12 +289,43 @@ fn open_tuntap(name: &str, flags: i32) -> Result<(OwnedFd, String)> {
         return Err(io::Error::last_os_error());
     }
 
-    let mut end = 0;
-    while end < 16 && ifr[end] != 0 {
-        end += 1;
+    Ok((owned, ifr_name(&ifr)))
+}
+
+/// The NUL-terminated name at the front of a `struct ifreq`.
+fn ifr_name(ifr: &[u8; 40]) -> String {
+    let end = ifr[..16].iter().position(|&b| b == 0).unwrap_or(16);
+    String::from_utf8_lossy(&ifr[..end]).into_owned()
+}
+
+/// The interface name and `IFF_*` flags of an attached TUN/TAP fd, or `None`
+/// if the fd will not say (not a TUN fd, or the ioctl is not allowed).
+fn tun_getiff(fd: &OwnedFd) -> Option<(String, u16)> {
+    let mut ifr = [0u8; 40];
+    // SAFETY: TUNGETIFF writes a `struct ifreq`, which `ifr` has room for.
+    let r = unsafe { libc::ioctl(fd.as_raw_fd(), libc::TUNGETIFF as _, &mut ifr) };
+    if r < 0 {
+        return None;
     }
-    let assigned = String::from_utf8_lossy(&ifr[..end]).into_owned();
-    Ok((owned, assigned))
+    Some((ifr_name(&ifr), u16::from_ne_bytes([ifr[16], ifr[17]])))
+}
+
+/// Refuse an fd whose packets are not what [`Tun`] reads and writes.
+fn check_tun_flags(flags: u16) -> Result<()> {
+    let mode = flags & (libc::IFF_TUN | libc::IFF_TAP) as u16;
+    if mode != libc::IFF_TUN as u16 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "tuntap: the fd is not in TUN mode",
+        ));
+    }
+    if flags & libc::IFF_NO_PI as u16 == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "tuntap: the fd carries a packet-information header (no IFF_NO_PI)",
+        ));
+    }
+    Ok(())
 }
 
 /// The largest frame a TAP hands over: a packet at the largest MTU behind an
@@ -364,6 +427,111 @@ mod tests {
         dev.close();
         slot.wake();
         reader.join().unwrap();
+    }
+
+    /// A datagram socket pair stands in for the fd `VpnService` hands over:
+    /// one packet per read and write, with no header, and non-blocking.
+    fn adopted() -> (Tun, std::os::unix::net::UnixDatagram) {
+        let (dev, peer) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        dev.set_nonblocking(true).unwrap();
+        let tun = Tun::from_fd(OwnedFd::from(dev), TuntapConfig::new("tun9")).unwrap();
+        (tun, peer)
+    }
+
+    #[test]
+    fn from_fd_moves_packets_both_ways() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (tun, peer) = adopted();
+        // A socket answers no TUNGETIFF, so the configured name stands.
+        assert_eq!(tun.name(), "tun9");
+
+        // Sent before a handler is installed: held, not lost.
+        let inbound = [0x45_u8; 20];
+        peer.send(&inbound).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let tx = Mutex::new(tx);
+        tun.set_handler(Arc::new(move |p: &Packet| {
+            let _ = tx.lock().unwrap().send(p.as_bytes().to_vec());
+            Ok(())
+        }));
+        let got = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(got, inbound);
+
+        let outbound = [0x60_u8; 40];
+        tun.send(Packet::from_slice(&outbound)).unwrap();
+        let mut buf = [0u8; 128];
+        assert_eq!(peer.recv(&mut buf).unwrap(), outbound.len());
+        assert_eq!(&buf[..outbound.len()], outbound);
+
+        let stats = tun.stats().unwrap().snapshot();
+        assert_eq!((stats.rx_packets, stats.tx_packets), (1, 1));
+    }
+
+    #[test]
+    fn a_send_to_a_full_non_blocking_fd_waits_for_room() {
+        use std::time::Duration;
+
+        let (tun, peer) = adopted();
+        let tun = Arc::new(tun);
+        let pkt = [0x45_u8; 512];
+        // Fill the socket's queue until the next write would block; the send
+        // after that has to wait instead of failing with EAGAIN.
+        let t = tun.clone();
+        let sender = std::thread::spawn(move || {
+            for _ in 0..10_000 {
+                t.send(Packet::from_slice(&pkt))?;
+            }
+            Ok::<_, io::Error>(())
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        let mut buf = [0u8; 1024];
+        for _ in 0..10_000 {
+            assert_eq!(peer.recv(&mut buf).unwrap(), pkt.len());
+        }
+        sender.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn close_releases_a_send_waiting_for_room() {
+        use std::time::Duration;
+
+        let (tun, _peer) = adopted();
+        let tun = Arc::new(tun);
+        let t = tun.clone();
+        let sender = std::thread::spawn(move || {
+            let pkt = [0x45_u8; 512];
+            loop {
+                if let Err(e) = t.send(Packet::from_slice(&pkt)) {
+                    return e;
+                }
+            }
+        });
+        // Nothing reads the peer, so the sender ends up stuck on a full queue.
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!sender.is_finished(), "a full queue failed the send");
+        tun.close().unwrap();
+        let e = sender.join().unwrap();
+        assert_eq!(e.kind(), io::ErrorKind::NotConnected);
+    }
+
+    #[test]
+    fn dropping_an_adopted_tun_closes_the_fd() {
+        let (tun, peer) = adopted();
+        drop(tun);
+        // The device end is gone: nothing can reach it any more.
+        assert!(peer.send(&[0x45; 20]).is_err());
+    }
+
+    #[test]
+    fn only_bare_tun_fds_are_adopted() {
+        let (tun, tap, no_pi) = (libc::IFF_TUN, libc::IFF_TAP, libc::IFF_NO_PI);
+        assert!(check_tun_flags((tun | no_pi) as u16).is_ok());
+        // Other flags leave the packet format alone.
+        assert!(check_tun_flags((tun | no_pi | libc::IFF_MULTI_QUEUE) as u16).is_ok());
+        assert!(check_tun_flags(tun as u16).is_err());
+        assert!(check_tun_flags((tap | no_pi) as u16).is_err());
     }
 
     #[test]
