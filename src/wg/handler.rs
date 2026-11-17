@@ -10,7 +10,7 @@ use std::collections::{HashMap, VecDeque};
 
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, SystemTime};
 
@@ -21,7 +21,7 @@ use crate::wg::constants::{
 };
 use crate::wg::crypto::x25519_public;
 use crate::wg::replay::SlidingWindow;
-use crate::wg::timers::{PeerTimers, TimerAction};
+use crate::wg::timers::{PeerTimers, TimerAction, earliest};
 use crate::wg::transport::EncryptError;
 
 /// How long a peer taken from `on_unknown_peer` stays in the table past its
@@ -116,6 +116,11 @@ pub type UnknownPeerFn = Arc<dyn Fn(NoisePublicKey, SocketAddr, &[u8]) + Send + 
 /// make room for a newcomer), and without being told, those two kept an
 /// endpoint and a device for every key ever accepted.
 pub(crate) type PeerRemovedFn = dyn Fn(&Handler, &[NoisePublicKey]) + Send + Sync;
+
+/// Told, after anything changes a peer's timers, of an instant no later than
+/// the earliest of them now comes due. A driver sleeping until later than
+/// that has to wake and ask [`Handler::next_timer_deadline`] again.
+pub(crate) type TimersChangedFn = dyn Fn(Instant) + Send + Sync;
 
 /// Per-handler configuration.
 #[derive(Clone, Default)]
@@ -377,6 +382,10 @@ pub struct Handler {
     removal_hooks: Mutex<Vec<Weak<PeerRemovedFn>>>,
     /// Taken after `peers`, never before.
     tombstones: Mutex<Tombstones>,
+    /// Who to tell when timers change, held weakly as `removal_hooks` are.
+    /// The flag spares the transport path the lock while nobody listens.
+    timer_hooks: Mutex<Vec<Weak<TimersChangedFn>>>,
+    has_timer_hooks: AtomicBool,
 }
 
 impl std::fmt::Debug for Handler {
@@ -419,6 +428,8 @@ impl Handler {
             group: RwLock::new(Weak::new()),
             removal_hooks: Mutex::default(),
             tombstones: Mutex::default(),
+            timer_hooks: Mutex::default(),
+            has_timer_hooks: AtomicBool::new(false),
         }))
     }
 
@@ -554,6 +565,22 @@ impl Handler {
         {
             hooks.push(Arc::downgrade(hook));
         }
+    }
+
+    /// Call `hook` whenever a peer's timers change, for as long as it is
+    /// alive, with an instant no later than the peer's next timer. It runs
+    /// with none of the handler's locks held.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    pub(crate) fn watch_timers(&self, hook: &Arc<TimersChangedFn>) {
+        let mut hooks = self.timer_hooks.lock().expect("hooks lock");
+        hooks.retain(|w| w.strong_count() > 0);
+        if !hooks
+            .iter()
+            .any(|w| std::ptr::addr_eq(w.as_ptr(), Arc::as_ptr(hook)))
+        {
+            hooks.push(Arc::downgrade(hook));
+        }
+        self.has_timer_hooks.store(true, Ordering::Release);
     }
 
     /// Tear down the session state of peers already out of the table, and
@@ -852,16 +879,22 @@ impl Handler {
 
     /// Keep sending keepalives to `peer_key` whenever nothing else has gone
     /// to it for `interval`, so a NAT or stateful firewall between the two
-    /// keeps its mapping (whitepaper §6.5). `None` turns it off.
+    /// keeps its mapping (whitepaper §6.5). `None` turns it off, and so
+    /// does a zero interval, as in `wg(8)`: taken literally, it asked for a
+    /// keepalive on every poll, and a driver sleeping until
+    /// [`next_timer_deadline`](Self::next_timer_deadline) would never sleep.
     pub fn set_persistent_keepalive(&self, peer_key: &NoisePublicKey, interval: Option<Duration>) {
+        let interval = interval.filter(|i| !i.is_zero());
         self.with_timers(peer_key, |t| t.persistent_keepalive = interval);
     }
 
     /// Run the protocol timers (whitepaper §6) and return what they want
     /// sent: handshake retries and rekeys, keepalives, and notice of
-    /// handshakes abandoned after `REKEY_ATTEMPT_TIME`. Call this every
-    /// 100 ms or so. [`Server`](crate::wg::Server) does it for you; without
-    /// one, the caller sends each packet to the peer's endpoint.
+    /// handshakes abandoned after `REKEY_ATTEMPT_TIME`. Call it when
+    /// [`next_timer_deadline`](Self::next_timer_deadline) comes due, or
+    /// every 100 ms or so: called early, it does nothing.
+    /// [`Server`](crate::wg::Server) does it for you; without one, the
+    /// caller sends each packet to the peer's endpoint.
     pub fn poll_timers(&self) -> Vec<TimerAction> {
         self.poll_timers_at(Instant::now())
     }
@@ -921,15 +954,144 @@ impl Handler {
         out
     }
 
+    /// The earliest instant at which [`poll_timers`](Self::poll_timers) or
+    /// [`maintenance`](Self::maintenance) has something to do for any peer:
+    /// a handshake to retry, give up on (`HandshakeFailed`) or start for a
+    /// rekey, a keepalive (passive or persistent) to send, a keypair,
+    /// handshake or long-expired peer to drop. `None` if nothing is
+    /// pending. A deadline already past is due now.
+    ///
+    /// A driver can sleep until the earlier of this and its next I/O
+    /// instead of polling, then call both `poll_timers` and `maintenance`.
+    /// The deadline is never later than the timer it stands for. It may be
+    /// a little earlier (maintenance drops a keypair the moment after
+    /// `REJECT_AFTER_TIME`, not at it), and then those calls do nothing and
+    /// the next deadline is a moment later.
+    ///
+    /// Only calls into the handler move it earlier: sending data (which
+    /// starts the timer for a reply) and receiving it (which starts the one
+    /// for a keepalive confirming it), through [`encrypt`](Self::encrypt)
+    /// and [`process_packet`](Self::process_packet), and
+    /// [`initiate_handshake`](Self::initiate_handshake) and
+    /// [`set_persistent_keepalive`](Self::set_persistent_keepalive). A
+    /// driver making those calls on its own thread recomputes the deadline
+    /// after each; one making them elsewhere has to wake the sleeper, as
+    /// [`Server`](crate::wg::Server) does.
+    pub fn next_timer_deadline(&self) -> Option<Instant> {
+        let now = Instant::now();
+        earliest(self.timers_deadline_at(now), self.maintenance_deadline())
+    }
+
+    /// When [`poll_timers_at`](Self::poll_timers_at) next acts: sends,
+    /// reports a failure or changes some timer's state. Exactly the
+    /// conditions it acts under: a deadline it would leave in place would
+    /// have its driver spin.
+    pub(crate) fn timers_deadline_at(&self, now: Instant) -> Option<Instant> {
+        let mut next = None;
+        for peer in self.peers() {
+            let Some((handshake, confirm, persistent, want_handshake)) =
+                self.peek_timers(&peer, |t| {
+                    (
+                        t.handshake_deadline(now),
+                        t.confirm_deadline(),
+                        t.persistent_deadline(now),
+                        t.want_handshake,
+                    )
+                })
+            else {
+                continue;
+            };
+            next = earliest(next, earliest(handshake, confirm));
+            // A keepalive due with no session to send it on only clears the
+            // passive one and asks for a handshake, if the peer is still
+            // authorized. Persistent keepalive stays due until a packet goes
+            // out, and does nothing more meanwhile once both are done.
+            if persistent.is_some()
+                && (confirm.is_some()
+                    || self.has_session(&peer)
+                    || (!want_handshake && self.is_authorized_peer(&peer)))
+            {
+                next = earliest(next, persistent);
+            }
+        }
+        next
+    }
+
+    /// When [`maintenance`](Self::maintenance) next drops something. It
+    /// drops what is past its time (compared with `>`), so the deadline is
+    /// the moment after.
+    fn maintenance_deadline(&self) -> Option<Instant> {
+        let after = |t: Instant, d: Duration| t.checked_add(d + Duration::from_nanos(1));
+        let mut next = None;
+        for p in self.peers.read().expect("peers lock").values() {
+            if p.accepted_unknown
+                && let Some(exp) = p.expires_at
+            {
+                next = earliest(next, after(exp, EXPIRED_PEER_GRACE));
+            }
+        }
+        for h in self.handshakes.lock().expect("handshakes lock").values() {
+            next = earliest(next, after(h.created, REJECT_AFTER_TIME));
+        }
+        for s in self.sessions.read().expect("sessions lock").values() {
+            for kp in [&s.keypair_current, &s.keypair_prev, &s.keypair_next]
+                .into_iter()
+                .flatten()
+            {
+                next = earliest(next, after(kp.created, REJECT_AFTER_TIME));
+            }
+            if s.keypair_current.is_none() && s.keypair_next.is_none() {
+                let last_active = s.last_received.max(s.last_sent);
+                next = earliest(next, after(last_active, REJECT_AFTER_TIME));
+            }
+        }
+        next
+    }
+
     pub(crate) fn with_timers<R>(
         &self,
         peer_key: &NoisePublicKey,
         f: impl FnOnce(&mut PeerTimers) -> R,
     ) -> Option<R> {
+        let watched = self.has_timer_hooks.load(Ordering::Acquire);
+        let (r, due) = {
+            let peers = self.peers.read().expect("peers lock");
+            let p = peers.get(peer_key)?;
+            let mut t = p.timers.lock().expect("timers lock");
+            let r = f(&mut t);
+            (
+                r,
+                if watched {
+                    t.earliest(Instant::now())
+                } else {
+                    None
+                },
+            )
+        };
+        // Outside the locks, as the removal hooks are called.
+        if let Some(due) = due {
+            let hooks: Vec<Arc<TimersChangedFn>> = {
+                let g = self.timer_hooks.lock().expect("hooks lock");
+                g.iter().filter_map(Weak::upgrade).collect()
+            };
+            for hook in hooks {
+                hook(due);
+            }
+        }
+        Some(r)
+    }
+
+    /// [`with_timers`](Self::with_timers) for a look that changes nothing,
+    /// and so tells nobody.
+    fn peek_timers<R>(
+        &self,
+        peer_key: &NoisePublicKey,
+        f: impl FnOnce(&PeerTimers) -> R,
+    ) -> Option<R> {
         let peers = self.peers.read().expect("peers lock");
         let p = peers.get(peer_key)?;
-        let mut t = p.timers.lock().expect("timers lock");
-        Some(f(&mut t))
+        let t = p.timers.lock().expect("timers lock");
+        Some(f(&t))
     }
 
     /// Run periodic cleanup: drop peers taken with
@@ -2259,6 +2421,165 @@ mod tests {
             gaps == failed || (gaps + 1 == failed && !last_gap_in_run),
             "{gaps} long gaps for {failed} give-ups: {at:?}"
         );
+    }
+
+    /// Drive the timers of `h` for `secs` seconds from `t0` the way a
+    /// driver sleeping until `timers_deadline_at` does, and check at each
+    /// deadline that nothing would have acted a moment sooner. Returns
+    /// when each action came, by kind.
+    fn drive_by_deadline(h: &Handler, t0: Instant, secs: u64) -> Vec<(Duration, &'static str)> {
+        let end = t0 + Duration::from_secs(secs);
+        let (mut now, mut out, mut idle) = (t0, Vec::new(), 0);
+        while let Some(d) = h.timers_deadline_at(now) {
+            let d = d.max(now);
+            if d > end {
+                break;
+            }
+            // Not late: a poll just before the deadline does nothing, and
+            // leaves it where it was.
+            if let Some(early) = d.checked_sub(Duration::from_millis(1))
+                && early >= now
+            {
+                assert!(h.poll_timers_at(early).is_empty(), "late at {:?}", d - t0);
+                assert_eq!(h.timers_deadline_at(early), Some(d));
+            }
+            let acts = h.poll_timers_at(d);
+            // Nor spinning: a poll at the deadline acts, or at worst only
+            // changes state, once.
+            idle = if acts.is_empty() { idle + 1 } else { 0 };
+            assert!(idle <= 1, "nothing happened at {:?}, twice", d - t0);
+            for a in acts {
+                out.push((
+                    d - t0,
+                    match a {
+                        TimerAction::SendHandshake { .. } => "handshake",
+                        TimerAction::SendKeepalive { .. } => "keepalive",
+                        TimerAction::HandshakeFailed { .. } => "failed",
+                    },
+                ));
+            }
+            now = d;
+        }
+        out
+    }
+
+    /// With no peer, or peers but nothing under way, there is no deadline.
+    #[test]
+    fn no_timer_is_pending_until_something_starts_one() {
+        let h = Handler::new(Config::default()).unwrap();
+        assert_eq!(h.next_timer_deadline(), None);
+        let (a, b) = pair();
+        assert_eq!(a.next_timer_deadline(), None);
+        assert_eq!(b.next_timer_deadline(), None);
+        // A persistent keepalive set to zero is off, as in wg(8).
+        a.set_persistent_keepalive(&b.public_key(), Some(Duration::ZERO));
+        assert_eq!(a.next_timer_deadline(), None);
+    }
+
+    /// After a handshake with persistent keepalive on, the next deadline
+    /// is an interval after the last packet sent, and a poll there sends
+    /// the keepalive.
+    #[test]
+    fn the_deadline_is_the_next_persistent_keepalive() {
+        let (a, b) = pair();
+        let peer = b.public_key();
+        handshake(&a, &b);
+        let every = Duration::from_secs(25);
+        a.set_persistent_keepalive(&peer, Some(every));
+        let last_sent = a.with_timers(&peer, |t| t.last_sent).flatten().unwrap();
+        let d = a.next_timer_deadline().unwrap();
+        assert_eq!(d, last_sent + every);
+        assert!(a.poll_timers_at(d - Duration::from_millis(1)).is_empty());
+        assert!(matches!(
+            a.poll_timers_at(d)[..],
+            [TimerAction::SendKeepalive { .. }]
+        ));
+        // Which moves it on by an interval from that send.
+        let last_sent = a.with_timers(&peer, |t| t.last_sent).flatten().unwrap();
+        assert_eq!(a.next_timer_deadline(), Some(last_sent + every));
+    }
+
+    /// With no timer running, a session still has a deadline: its
+    /// keypair's expiry, when maintenance drops it.
+    #[test]
+    fn the_deadline_covers_key_expiry() {
+        let (a, b) = pair();
+        let before = Instant::now();
+        handshake(&a, &b);
+        let after = Instant::now();
+        assert_eq!(a.timers_deadline_at(Instant::now()), None);
+        let d = a.next_timer_deadline().unwrap();
+        assert!(
+            d > before + REJECT_AFTER_TIME
+                && d <= after + REJECT_AFTER_TIME + Duration::from_nanos(1),
+            "{d:?}"
+        );
+        // Data sent and not answered starts the timer that rekeys for it.
+        let t = Instant::now();
+        a.encrypt(b"ping", &b.public_key()).unwrap();
+        let d = a.next_timer_deadline().unwrap();
+        let rekey = crate::wg::timers::KEEPALIVE_TIMEOUT + crate::wg::timers::REKEY_TIMEOUT;
+        assert!(d >= t + rekey && d <= Instant::now() + rekey, "{d:?}");
+        // And the peer's for confirming it with a keepalive.
+        let ct = a.encrypt(b"pong", &b.public_key()).unwrap();
+        let t = Instant::now();
+        b.process_packet(&ct, &loopback()).unwrap();
+        let d = b.next_timer_deadline().unwrap();
+        let confirm = crate::wg::timers::KEEPALIVE_TIMEOUT;
+        assert!(d >= t + confirm && d <= Instant::now() + confirm, "{d:?}");
+    }
+
+    /// Sent data that draws no reply asks for a handshake exactly
+    /// KEEPALIVE_TIMEOUT + REKEY_TIMEOUT later; one never answered is
+    /// retried, then abandoned, each at its deadline.
+    #[test]
+    fn driving_by_the_deadline_misses_no_timer() {
+        let (a, b) = pair();
+        let t0 = Instant::now();
+        a.with_timers(&b.public_key(), |t| t.packet_sent(t0, true));
+        let acts = drive_by_deadline(&a, t0, 3600);
+        let rekey = crate::wg::timers::KEEPALIVE_TIMEOUT + crate::wg::timers::REKEY_TIMEOUT;
+        assert_eq!(acts[0], (rekey, "handshake"));
+        let inits = acts.iter().filter(|a| a.1 == "handshake").count();
+        assert_eq!(inits, crate::wg::timers::MAX_TIMER_HANDSHAKES as usize + 2);
+        assert_eq!(acts.last().unwrap().1, "failed");
+        assert_eq!(acts.iter().filter(|a| a.1 == "failed").count(), 1);
+
+        // A keepalive due with no session: one attempt, as when polled.
+        let (a, b) = pair();
+        a.with_timers(&b.public_key(), |t| t.keepalive_due_since = Some(t0));
+        let acts = drive_by_deadline(&a, t0, 3600);
+        assert_eq!(acts[0], (crate::wg::timers::KEEPALIVE_TIMEOUT, "handshake"));
+        assert_eq!(acts.iter().filter(|a| a.1 == "failed").count(), 1);
+
+        // Persistent keepalive to a peer that never answers keeps trying,
+        // an interval after each attempt gives up, without spinning while
+        // the keepalive stays due with no session to send it on.
+        let (a, b) = pair();
+        let every = Duration::from_secs(25);
+        a.set_persistent_keepalive(&b.public_key(), Some(every));
+        let acts = drive_by_deadline(&a, t0, 1200);
+        let failed = acts.iter().filter(|a| a.1 == "failed").count();
+        assert!(failed >= 2, "gave up {failed} times");
+        let inits: Vec<Duration> = acts
+            .iter()
+            .filter(|a| a.1 == "handshake")
+            .map(|a| a.0)
+            .collect();
+        assert!(
+            inits
+                .windows(2)
+                .all(|w| w[1] - w[0] >= crate::wg::timers::REKEY_TIMEOUT),
+            "{inits:?}"
+        );
+        assert!(inits.windows(2).filter(|w| w[1] - w[0] >= every).count() >= failed - 1);
+
+        // A peer whose authorization lapsed draws nothing at all.
+        let (a, b) = pair();
+        a.set_persistent_keepalive(&b.public_key(), Some(every));
+        a.with_timers(&b.public_key(), |t| t.keepalive_due_since = Some(t0));
+        a.set_peer_expiry(&b.public_key(), t0 - Duration::from_secs(1));
+        assert_eq!(drive_by_deadline(&a, t0, 600), []);
     }
 
     #[test]

@@ -22,7 +22,7 @@ use crate::wg::constants::{
     MESSAGE_COOKIE_REPLY_TYPE, MESSAGE_INITIATION_TYPE, MESSAGE_RESPONSE_TYPE,
     MESSAGE_TRANSPORT_TYPE,
 };
-use crate::wg::handler::{Handler, PacketResult, PeerRemovedFn};
+use crate::wg::handler::{Handler, PacketResult, PeerRemovedFn, TimersChangedFn};
 use crate::wg::handshake::check_mac1;
 
 /// A processed-packet result tagged with the handler that produced it.
@@ -47,6 +47,8 @@ pub struct MultiHandler {
     me: Weak<MultiHandler>,
     /// Removal hooks to install on members, those added later included.
     removal_hooks: Mutex<Vec<Weak<PeerRemovedFn>>>,
+    /// Timer hooks, likewise.
+    timer_hooks: Mutex<Vec<Weak<TimersChangedFn>>>,
 }
 
 impl MultiHandler {
@@ -76,6 +78,7 @@ impl MultiHandler {
                 handlers: RwLock::new(handlers),
                 me: me.clone(),
                 removal_hooks: Mutex::default(),
+                timer_hooks: Mutex::default(),
             }
         }))
     }
@@ -121,6 +124,13 @@ impl MultiHandler {
                 h.watch_removals(&hook);
             }
         }
+        {
+            let mut hooks = self.timer_hooks.lock().expect("hooks lock");
+            hooks.retain(|w| w.strong_count() > 0);
+            for hook in hooks.iter().filter_map(Weak::upgrade) {
+                h.watch_timers(&hook);
+            }
+        }
         g.push(h);
         Ok(())
     }
@@ -137,6 +147,19 @@ impl MultiHandler {
             .push(Arc::downgrade(hook));
         for h in g.iter() {
             h.watch_removals(hook);
+        }
+    }
+
+    /// [`Handler::watch_timers`] on every member, present and future.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    pub(crate) fn watch_timers(&self, hook: &Arc<TimersChangedFn>) {
+        let g = self.handlers.read().expect("multihandler lock");
+        self.timer_hooks
+            .lock()
+            .expect("hooks lock")
+            .push(Arc::downgrade(hook));
+        for h in g.iter() {
+            h.watch_timers(hook);
         }
     }
 
@@ -267,6 +290,26 @@ impl MultiHandler {
             .into_iter()
             .flat_map(|h| h.poll_timers().into_iter().map(move |a| (h.clone(), a)))
             .collect()
+    }
+
+    /// The earliest [`Handler::next_timer_deadline`] of the members: when
+    /// [`poll_timers`](Self::poll_timers) or
+    /// [`maintenance`](Self::maintenance) next has something to do.
+    pub fn next_timer_deadline(&self) -> Option<crate::time::Instant> {
+        self.handlers()
+            .iter()
+            .map(|h| h.next_timer_deadline())
+            .fold(None, crate::wg::timers::earliest)
+    }
+
+    /// When [`poll_timers`](Self::poll_timers) alone next acts.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    pub(crate) fn timers_deadline(&self) -> Option<crate::time::Instant> {
+        let now = crate::time::Instant::now();
+        self.handlers()
+            .iter()
+            .map(|h| h.timers_deadline_at(now))
+            .fold(None, crate::wg::timers::earliest)
     }
 
     /// Run [`Handler::maintenance`] on every member.

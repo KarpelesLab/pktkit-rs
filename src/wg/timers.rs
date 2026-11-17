@@ -168,6 +168,59 @@ impl PeerTimers {
         });
         confirm || persistent
     }
+
+    /// The earliest instant at which [`handshake_due`](Self::handshake_due)
+    /// returns anything but `Some(false)`, or changes state: the same
+    /// comparisons, solved for `now`. `now` stands for "already due".
+    pub fn handshake_deadline(&self, now: Instant) -> Option<Instant> {
+        if let Some(start) = self.attempt_started {
+            let last = self.last_initiation.unwrap_or(start);
+            return last.checked_add(REKEY_TIMEOUT + self.jitter);
+        }
+        let wanted = if self.want_handshake {
+            now
+        } else {
+            self.reply_due_since?
+                .checked_add(KEEPALIVE_TIMEOUT + REKEY_TIMEOUT)?
+        };
+        match self.last_initiation {
+            Some(t) => Some(wanted.max(t.checked_add(REKEY_TIMEOUT)?)),
+            None => Some(wanted),
+        }
+    }
+
+    /// When a keepalive confirming received data comes due.
+    pub fn confirm_deadline(&self) -> Option<Instant> {
+        self.keepalive_due_since?.checked_add(KEEPALIVE_TIMEOUT)
+    }
+
+    /// When a persistent keepalive comes due; `now` if nothing was ever
+    /// sent.
+    pub fn persistent_deadline(&self, now: Instant) -> Option<Instant> {
+        let every = self.persistent_keepalive?;
+        match self.last_sent {
+            Some(t) => t.checked_add(every),
+            None => Some(now),
+        }
+    }
+
+    /// No later than any timer of this peer acts, whatever the session
+    /// state: what a sleeping driver is woken for when a timer is armed.
+    pub fn earliest(&self, now: Instant) -> Option<Instant> {
+        earliest(
+            earliest(self.handshake_deadline(now), self.confirm_deadline()),
+            self.persistent_deadline(now),
+        )
+    }
+}
+
+/// The earlier of two deadlines, `None` standing for "never".
+#[inline]
+pub(crate) fn earliest(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
 }
 
 #[cfg(test)]

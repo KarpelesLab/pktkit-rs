@@ -11,14 +11,14 @@ use crate::time::Instant;
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::Result;
 use crate::wg::NoisePublicKey;
 use crate::wg::TimerAction;
-use crate::wg::handler::{Handler, PacketResult, PacketType, PeerRemovedFn};
+use crate::wg::handler::{Handler, PacketResult, PacketType, PeerRemovedFn, TimersChangedFn};
 use crate::wg::multihandler::MultiHandler;
 
 /// Callback fired when decrypted transport data arrives.
@@ -104,6 +104,80 @@ pub struct Server {
     /// Installed on the handler(s), which hold it weakly: it lives as long
     /// as the server.
     removal_hook: Arc<PeerRemovedFn>,
+    /// Wakes the maintenance thread, which sleeps until the next timer.
+    alarm: Arc<Alarm>,
+    /// Installed on the handler(s) as `removal_hook` is: rings `alarm` when
+    /// a timer is armed sooner than the maintenance thread sleeps for.
+    timer_hook: Arc<TimersChangedFn>,
+}
+
+/// What the maintenance thread sleeps on. It sleeps until the handlers' next
+/// timer, which calls on any other thread (a send, a packet read, the caller
+/// setting a persistent keepalive) can move earlier: those ring it.
+#[derive(Debug, Default)]
+struct Alarm {
+    state: Mutex<AlarmState>,
+    cv: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct AlarmState {
+    /// Bumped by every ring, so a sleeper sees one that came while it was
+    /// working out how long to sleep.
+    rings: u64,
+    /// How long the maintenance thread sleeps; `None` while it works that
+    /// out, when any timer armed has to ring.
+    until: Option<Instant>,
+}
+
+impl Alarm {
+    fn ring(&self) {
+        let mut st = self.state.lock().expect("alarm lock");
+        st.rings = st.rings.wrapping_add(1);
+        self.cv.notify_all();
+    }
+
+    /// Some timer now comes due no later than `due`.
+    fn timer_armed(&self, due: Instant) {
+        let mut st = self.state.lock().expect("alarm lock");
+        if st.until.is_none_or(|u| due < u) {
+            st.rings = st.rings.wrapping_add(1);
+            self.cv.notify_all();
+        }
+    }
+
+    /// Start working out the next deadline. Pass what this returns to
+    /// [`sleep`](Self::sleep).
+    fn arm(&self) -> u64 {
+        let mut st = self.state.lock().expect("alarm lock");
+        st.until = None;
+        st.rings
+    }
+
+    /// Sleep until `deadline` (for ever if `None`), unless rung since
+    /// `arm` returned `rings`, or `stopped`.
+    fn sleep(&self, rings: u64, deadline: Option<Instant>, stopped: impl Fn() -> bool) {
+        let mut st = self.state.lock().expect("alarm lock");
+        // With several maintenance threads (one per serve), the latest of
+        // their deadlines: a ring may wake one needlessly, never too late.
+        // None, sleeping for ever: any timer armed rings.
+        st.until = match (st.until, deadline) {
+            (Some(u), Some(d)) => Some(u.max(d)),
+            (_, d) => d,
+        };
+        while st.rings == rings && !stopped() {
+            st = match deadline {
+                None => self.cv.wait(st).expect("alarm lock"),
+                Some(d) => {
+                    let left = d.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return;
+                    }
+                    self.cv.wait_timeout(st, left).expect("alarm lock").0
+                }
+            };
+        }
+    }
 }
 
 /// Plaintext held per peer until a handshake gives it a keypair, with the
@@ -167,8 +241,12 @@ const MAX_STAGED_PACKETS: usize = 128;
 /// Bytes held across all peers: a bound on memory whatever the number of
 /// peers with a handshake pending.
 const MAX_STAGED_BYTES: usize = 4 << 20;
-/// How often the maintenance thread runs the protocol timers.
-const TIMER_TICK: Duration = Duration::from_millis(100);
+/// The least time between two runs of the protocol timers when nothing
+/// rang the alarm in between. A timer still due after the run that acted on
+/// it (a keepalive that failed to encrypt, say) would otherwise have the
+/// maintenance thread spin; one that comes due this soon after another
+/// waits for it.
+const MIN_TIMER_GAP: Duration = Duration::from_millis(10);
 
 impl std::fmt::Debug for Server {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -208,6 +286,7 @@ impl Server {
             cfg.read_buffer_size
         };
 
+        let alarm = Arc::new(Alarm::default());
         let server = Arc::new_cyclic(|me: &std::sync::Weak<Server>| {
             let me = me.clone();
             let removal_hook: Arc<PeerRemovedFn> = Arc::new(move |h, gone| {
@@ -215,6 +294,8 @@ impl Server {
                     s.peers_removed(h, gone);
                 }
             });
+            let a = alarm.clone();
+            let timer_hook: Arc<TimersChangedFn> = Arc::new(move |due| a.timer_armed(due));
             Server {
                 handler: cfg.handler,
                 multi_handler: cfg.multi_handler,
@@ -229,12 +310,16 @@ impl Server {
                 peer_handlers: RwLock::new(std::collections::HashMap::new()),
                 staged: Mutex::new(Staged::default()),
                 removal_hook,
+                alarm,
+                timer_hook,
             }
         });
         if let Some(mh) = server.multi_handler.as_ref() {
             mh.watch_removals(&server.removal_hook);
+            mh.watch_timers(&server.timer_hook);
         } else if let Some(h) = server.handler.as_ref() {
             h.watch_removals(&server.removal_hook);
+            h.watch_timers(&server.timer_hook);
         }
         Ok(server)
     }
@@ -251,18 +336,24 @@ impl Server {
         // however the read loop ends, `_stop` tells it to go, rather than
         // leaving it to send keepalives for a server that no longer reads.
         // It holds the server weakly, so it never keeps one alive.
+        //
+        // It sleeps until the next timer comes due or maintenance is next
+        // to run, rather than waking every 100 ms to find nothing to do,
+        // and is woken early when something arms a timer sooner.
         let weak = Arc::downgrade(self);
         let interval = self.maintenance_interval;
         let done = self.done.clone();
+        let alarm = self.alarm.clone();
         let stop = Arc::new(AtomicBool::new(false));
-        let _stop = StopOnDrop(stop.clone());
+        let _stop = StopOnDrop(stop.clone(), alarm.clone());
         let maint = thread::Builder::new()
             .name("wg-maint".into())
             .spawn(move || {
+                let stopped = || done.load(Ordering::SeqCst) || stop.load(Ordering::SeqCst);
                 let mut last = Instant::now();
-                while !done.load(Ordering::SeqCst) && !stop.load(Ordering::SeqCst) {
-                    thread::sleep(TIMER_TICK);
+                while !stopped() {
                     let Some(me) = weak.upgrade() else { break };
+                    let ran = Instant::now();
                     me.run_timers();
                     if last.elapsed() >= interval {
                         if let Some(mh) = me.multi_handler.as_ref() {
@@ -272,6 +363,16 @@ impl Server {
                         }
                         last = Instant::now();
                     }
+                    // Armed before the deadline is read: what changes the
+                    // timers from here on rings, and the sleep ends at once.
+                    let rings = alarm.arm();
+                    let next = crate::wg::timers::earliest(
+                        me.timers_deadline(),
+                        last.checked_add(interval),
+                    );
+                    drop(me);
+                    let floor = ran.checked_add(MIN_TIMER_GAP);
+                    alarm.sleep(rings, next.map(|d| d.max(floor.unwrap_or(d))), stopped);
                 }
             })?;
         self.threads.lock().expect("threads lock").push(maint);
@@ -362,6 +463,17 @@ impl Server {
         self.dispatch(result, &handler, addr, conn);
         if authenticated {
             self.flush_staged(&peer, &handler, addr, conn);
+        }
+    }
+
+    /// When [`run_timers`](Self::run_timers) next has something to do.
+    fn timers_deadline(&self) -> Option<Instant> {
+        if let Some(mh) = self.multi_handler.as_ref() {
+            mh.timers_deadline()
+        } else {
+            self.handler
+                .as_ref()
+                .and_then(|h| h.timers_deadline_at(Instant::now()))
         }
     }
 
@@ -655,6 +767,7 @@ impl Server {
     /// Stop the read loop and maintenance thread.
     pub fn close(&self) -> Result<()> {
         self.done.store(true, Ordering::SeqCst);
+        self.alarm.ring();
         // The reader thread (caller's serve()) will exit on the next timeout.
         let handles: Vec<_> = self
             .threads
@@ -675,12 +788,14 @@ fn catch_callback<T>(f: impl FnOnce() -> T) -> Option<T> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).ok()
 }
 
-/// Sets its flag when dropped, however the scope holding it is left.
-struct StopOnDrop(Arc<AtomicBool>);
+/// Sets its flag when dropped, however the scope holding it is left, and
+/// wakes the thread that watches it.
+struct StopOnDrop(Arc<AtomicBool>, Arc<Alarm>);
 
 impl Drop for StopOnDrop {
     fn drop(&mut self) {
         self.0.store(true, Ordering::SeqCst);
+        self.1.ring();
     }
 }
 
@@ -903,6 +1018,46 @@ mod tests {
         assert_eq!(got, vec![b"first".to_vec(), b"second".to_vec()]);
         a.close().unwrap();
         b.close().unwrap();
+    }
+
+    /// The maintenance thread sleeps until the next timer rather than
+    /// ticking, so a timer armed from another thread has to wake it: here
+    /// a persistent keepalive set while it sleeps until maintenance, ten
+    /// seconds off. Each keepalive then comes an interval after the last.
+    #[test]
+    fn a_timer_armed_from_another_thread_wakes_the_maintenance_thread() {
+        let (s, h, saddr) = server(Arc::new(|_, _, _| {}));
+        let c = Handler::new(Config::default()).unwrap();
+        c.add_peer(h.public_key());
+        h.add_peer(c.public_key());
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        handshake(&c, &sock, saddr, h.public_key());
+        // Confirm the handshake to the server, which then holds a session
+        // it can send on.
+        sock.send_to(&c.generate_keepalive(&h.public_key()).unwrap(), saddr)
+            .unwrap();
+        while !h.has_session(&c.public_key()) {
+            thread::sleep(Duration::from_millis(1));
+        }
+        thread::sleep(Duration::from_millis(50));
+
+        let every = Duration::from_millis(300);
+        let t0 = Instant::now();
+        h.set_persistent_keepalive(&c.public_key(), Some(every));
+        let mut at = Vec::new();
+        for _ in 0..3 {
+            let ka = recv_type(&sock, 4);
+            at.push(t0.elapsed());
+            let r = c.process_packet(&ka, &saddr).unwrap();
+            assert_eq!(r.ty, PacketType::Keepalive);
+        }
+        assert!(at[0] < Duration::from_secs(2), "{at:?}");
+        for w in at.windows(2) {
+            let gap = w[1] - w[0];
+            assert!(gap >= every - Duration::from_millis(50), "{at:?}");
+            assert!(gap < every * 4, "{at:?}");
+        }
+        s.close().unwrap();
     }
 
     /// Complete a handshake between `client` and the server at `saddr`
