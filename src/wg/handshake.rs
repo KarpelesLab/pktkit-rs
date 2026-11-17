@@ -194,6 +194,7 @@ pub(crate) fn initiate_handshake_at(
     // MAC1 (+ MAC2 if a cookie reply has been received for this peer). This
     // writes the trailing 32 bytes of the packet.
     h.cookie_add_macs(peer_key, &mut pkt);
+    h.count_tx(peer_key, pkt.len());
 
     zeroize(&mut key);
     h.with_timers(peer_key, |t| t.initiation_sent(now));
@@ -348,6 +349,7 @@ pub(crate) fn process_handshake_response(h: &Handler, data: &[u8]) -> Result<Pac
 
     // Touch peer last-handshake.
     h.touch_peer_handshake(&peer_key);
+    h.count_rx(&peer_key, data.len());
 
     // Standard WG behaviour: send a keepalive to confirm.
     let keepalive = match crate::wg::transport::encrypt_data_packet(h, &[], &peer_key) {
@@ -619,6 +621,10 @@ pub(crate) fn process_handshake_initiation(
     h.install_responder_keypair(peer_key, kp)?;
 
     h.touch_peer_handshake(&peer_key);
+    // As the kernel does, an initiation counts once it has gone through,
+    // and so does the response it is answered with.
+    h.count_rx(&peer_key, data.len());
+    h.count_tx(&peer_key, pkt.len());
 
     Ok(PacketResult {
         ty: PacketType::HandshakeResponse,

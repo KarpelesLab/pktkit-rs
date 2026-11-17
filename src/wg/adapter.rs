@@ -26,7 +26,7 @@ use crate::wg::handler::{Config as HandlerConfig, Handler, PeerRemovedFn};
 use crate::wg::multihandler::MultiHandler;
 use crate::wg::server::{OnPacketFn, OnPeerConnectedFn, Server, ServerConfig};
 use crate::wg::{NoisePresharedKey, NoisePrivateKey, NoisePublicKey};
-use crate::{IpPrefix, Packet, Result};
+use crate::{DeviceStats, IpPrefix, Packet, Result};
 
 /// Configuration for a [`WireGuard Adapter`](Adapter).
 #[derive(Clone)]
@@ -148,6 +148,11 @@ pub(crate) struct PeerL3Device {
     strict: bool,
     /// What the device reports while the peer has no allowed IPs.
     fallback_addr: IpPrefix,
+    /// Counted at the IP layer, as the device works: decrypted packets
+    /// handed to the handler, and packets taken for the peer. The
+    /// WireGuard messages carrying them are counted per peer by the
+    /// handler ([`PeerInfo`](crate::wg::PeerInfo)).
+    stats: DeviceStats,
 }
 
 impl std::fmt::Debug for PeerL3Device {
@@ -178,6 +183,7 @@ impl PeerL3Device {
             allowed: RwLock::new(None),
             strict,
             fallback_addr,
+            stats: DeviceStats::new(),
         });
         dev.set_allowed(allowed);
         dev
@@ -215,6 +221,7 @@ impl PeerL3Device {
 
     fn deliver(&self, data: &[u8]) {
         if !self.admits(data) {
+            self.stats.record_rx_drop();
             return;
         }
         // Not under the lock: the guard of an `if let` scrutinee lives
@@ -222,8 +229,11 @@ impl PeerL3Device {
         // anything that does) would wait on itself.
         let h = self.handler.lock().expect("handler lock").clone();
         if let Some(h) = h {
+            self.stats.record_rx(data.len());
             let p = Packet::from_slice(data);
             let _ = h(p);
+        } else {
+            self.stats.record_rx_drop();
         }
     }
 }
@@ -235,12 +245,20 @@ impl L3Device for PeerL3Device {
 
     fn send(&self, packet: &Packet) -> Result<()> {
         let Some(adapter) = self.adapter.upgrade() else {
+            self.stats.record_tx_drop();
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
                 "adapter dropped",
             ));
         };
-        adapter.server.send(packet.as_bytes(), &self.key)
+        // A packet held for a handshake still to complete counts as sent:
+        // the server sends it then, or drops it with the handshake.
+        let res = adapter.server.send(packet.as_bytes(), &self.key);
+        match res {
+            Ok(()) => self.stats.record_tx(packet.len()),
+            Err(_) => self.stats.record_tx_drop(),
+        }
+        res
     }
 
     fn addr(&self) -> IpPrefix {
@@ -254,6 +272,10 @@ impl L3Device for PeerL3Device {
 
     fn close(&self) -> Result<()> {
         Ok(())
+    }
+
+    fn stats(&self) -> Option<&DeviceStats> {
+        Some(&self.stats)
     }
 }
 
@@ -699,6 +721,7 @@ mod tests {
             allowed: RwLock::new(None),
             strict: false,
             fallback_addr: "10.0.0.1/24".parse().unwrap(),
+            stats: DeviceStats::new(),
         });
         let (tx, rx) = std::sync::mpsc::channel();
         let tx = Mutex::new(tx);
@@ -1160,6 +1183,28 @@ mod tests {
         // Removing the peer forgets them.
         a.remove_peer(&p);
         assert_eq!(a.allowed_ips(&p), None);
+    }
+
+    /// A peer's device counts what it hands its handler and what it
+    /// refuses, at the IP layer, and a send that goes nowhere as dropped.
+    #[test]
+    fn peer_devices_keep_stats() {
+        let (a, devs, _n) = capture_adapter(|c| c);
+        let p = NoisePublicKey([1; 32]);
+        a.add_peer(p);
+        a.set_allowed_ips(&p, prefixes(&["10.0.0.2/32"]));
+        a.on_peer_connected(p);
+        let dev = devs.lock().unwrap()[0].clone();
+        let ok = from("10.0.0.2");
+        a.on_packet(&ok, p);
+        a.on_packet(&ok, p);
+        a.on_packet(&from("10.0.0.3"), p);
+        // Not serving, and no endpoint known for the peer: it cannot go.
+        assert!(dev.send(Packet::from_slice(&ok)).is_err());
+        let s = dev.stats().expect("no stats").snapshot();
+        assert_eq!((s.rx_packets, s.rx_bytes), (2, 2 * ok.len() as u64));
+        assert_eq!(s.rx_dropped, 1);
+        assert_eq!((s.tx_packets, s.tx_bytes, s.tx_dropped), (0, 0, 1));
     }
 
     /// With `require_allowed_ips`, a peer given no allowed IPs gets nothing

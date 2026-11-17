@@ -10,9 +10,9 @@ use std::collections::{HashMap, VecDeque};
 
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use crate::Result;
 use crate::wg::constants::{
@@ -216,6 +216,39 @@ pub struct PeerInfo {
     /// When a handshake with it last went through (an initiation from it
     /// accepted, or its response to ours), if one has.
     pub last_handshake: Option<Instant>,
+    /// The same moment on the wall clock, read when the handshake went
+    /// through: what `wg show` reports as "latest handshake", and what can
+    /// be shown to a user or compared with times outside the process. Not
+    /// derived from [`last_handshake`](Self::last_handshake), so a clock
+    /// stepped since does not move it.
+    pub last_handshake_time: Option<SystemTime>,
+    /// Bytes received from the peer: the size of each authenticated
+    /// WireGuard message, as the UDP payload it arrived in (transport
+    /// data, keepalives included, and the handshake initiations and
+    /// responses that went through). This is what the Linux kernel counts
+    /// and `wg show` reports as "transfer ... received". Packets that fail
+    /// authentication, replays, and cookie replies are not counted.
+    pub rx_bytes: u64,
+    /// Bytes sent to the peer, counted as [`rx_bytes`](Self::rx_bytes) is:
+    /// the size of each WireGuard message built for it ([`Handler::encrypt`],
+    /// keepalives, handshake initiations and responses). Counted when the
+    /// message is built, as the handler does no I/O: one the caller then
+    /// fails to send is counted all the same.
+    pub tx_bytes: u64,
+    /// Messages counted in [`rx_bytes`](Self::rx_bytes).
+    pub rx_packets: u64,
+    /// Messages counted in [`tx_bytes`](Self::tx_bytes).
+    pub tx_packets: u64,
+}
+
+/// A peer's traffic counters. Relaxed: they are statistics, ordered with
+/// nothing else.
+#[derive(Default)]
+struct PeerCounters {
+    rx_bytes: AtomicU64,
+    tx_bytes: AtomicU64,
+    rx_packets: AtomicU64,
+    tx_packets: AtomicU64,
 }
 
 /// Internal per-peer record.
@@ -226,6 +259,9 @@ struct PeerEntry {
     created_at: Instant,
     expires_at: Option<Instant>,
     last_handshake: Option<Instant>,
+    last_handshake_time: Option<SystemTime>,
+    /// Survive a refresh (add_peer on a known key), not a removal.
+    counters: PeerCounters,
     last_timestamp: [u8; TAI64N_TIMESTAMP_SIZE],
     has_timestamp: bool,
     /// When an initiation from the peer was last accepted.
@@ -249,6 +285,8 @@ impl PeerEntry {
             created_at: Instant::now(),
             expires_at: None,
             last_handshake: None,
+            last_handshake_time: None,
+            counters: PeerCounters::default(),
             last_timestamp: [0u8; TAI64N_TIMESTAMP_SIZE],
             has_timestamp: false,
             last_initiation_consumed: None,
@@ -621,7 +659,32 @@ impl Handler {
             created_at: p.created_at,
             expires_at: p.expires_at,
             last_handshake: p.last_handshake,
+            last_handshake_time: p.last_handshake_time,
+            rx_bytes: p.counters.rx_bytes.load(Ordering::Relaxed),
+            tx_bytes: p.counters.tx_bytes.load(Ordering::Relaxed),
+            rx_packets: p.counters.rx_packets.load(Ordering::Relaxed),
+            tx_packets: p.counters.tx_packets.load(Ordering::Relaxed),
         })
+    }
+
+    /// Count an authenticated message of `bytes` bytes from `peer_key`.
+    pub(crate) fn count_rx(&self, peer_key: &NoisePublicKey, bytes: usize) {
+        if let Some(p) = self.peers.read().expect("peers lock").get(peer_key) {
+            p.counters
+                .rx_bytes
+                .fetch_add(bytes as u64, Ordering::Relaxed);
+            p.counters.rx_packets.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Count a message of `bytes` bytes built for `peer_key`.
+    pub(crate) fn count_tx(&self, peer_key: &NoisePublicKey, bytes: usize) {
+        if let Some(p) = self.peers.read().expect("peers lock").get(peer_key) {
+            p.counters
+                .tx_bytes
+                .fetch_add(bytes as u64, Ordering::Relaxed);
+            p.counters.tx_packets.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Return the preshared key for `peer_key`, or zero if none.
@@ -670,6 +733,7 @@ impl Handler {
             p.last_initiation_consumed = Some(now);
         }
         p.last_handshake = Some(now);
+        p.last_handshake_time = Some(crate::time::system_now());
         Ok(())
     }
 
@@ -677,6 +741,7 @@ impl Handler {
         let mut peers = self.peers.write().expect("peers lock");
         if let Some(p) = peers.get_mut(peer_key) {
             p.last_handshake = Some(Instant::now());
+            p.last_handshake_time = Some(crate::time::system_now());
         }
     }
 
@@ -2541,5 +2606,103 @@ mod tests {
 
         h.remove_peer(&k1);
         assert!(!h.is_authorized_peer(&k1));
+    }
+
+    fn traffic(h: &Handler, peer: &NoisePublicKey) -> (u64, u64, u64, u64) {
+        let i = h.get_peer_info(peer).unwrap();
+        (i.rx_packets, i.rx_bytes, i.tx_packets, i.tx_bytes)
+    }
+
+    /// Both ends count every WireGuard message of a round trip at its wire
+    /// size, as the kernel does: the initiation and response, the
+    /// confirming keepalive, and the data, each once on each side.
+    #[test]
+    fn a_round_trip_is_counted_at_wire_size_on_both_ends() {
+        use crate::wg::constants::{MESSAGE_INITIATION_SIZE, MESSAGE_RESPONSE_SIZE};
+        use crate::wg::transport::encrypted_size;
+        let (a, b) = pair();
+        let (ak, bk) = (a.public_key(), b.public_key());
+        assert_eq!(traffic(&a, &bk), (0, 0, 0, 0));
+        let addr = loopback();
+
+        let init = a.initiate_handshake(&bk).unwrap();
+        let resp = b.process_packet(&init, &addr).unwrap();
+        let ka = a.process_packet(&resp.response, &addr).unwrap();
+        b.process_packet(&ka.response, &addr).unwrap();
+        let ping = a.encrypt(b"ping", &bk).unwrap();
+        assert_eq!(b.process_packet(&ping, &addr).unwrap().data, b"ping");
+        let pong = b.encrypt(b"pong!", &ak).unwrap();
+        assert_eq!(a.process_packet(&pong, &addr).unwrap().data, b"pong!");
+
+        let (init, resp) = (MESSAGE_INITIATION_SIZE as u64, MESSAGE_RESPONSE_SIZE as u64);
+        let ka = encrypted_size(0) as u64;
+        let (ping, pong) = (encrypted_size(4) as u64, encrypted_size(5) as u64);
+        assert_eq!(traffic(&a, &bk), (2, resp + pong, 3, init + ka + ping));
+        assert_eq!(traffic(&b, &ak), (3, init + ka + ping, 2, resp + pong));
+    }
+
+    /// A packet that does not authenticate, or authenticates but is a
+    /// replay, was not the peer's traffic and is not counted; nor is a
+    /// response for a handshake no longer pending.
+    #[test]
+    fn forged_and_replayed_packets_are_not_counted() {
+        let (a, b) = pair();
+        let (ak, bk) = (a.public_key(), b.public_key());
+        let addr = loopback();
+        let init = a.initiate_handshake(&bk).unwrap();
+        let resp = b.process_packet(&init, &addr).unwrap().response;
+
+        let mut forged_resp = resp.clone();
+        forged_resp[44] ^= 1;
+        assert!(a.process_packet(&forged_resp, &addr).is_err());
+        assert_eq!(traffic(&a, &bk).0, 0);
+        let ka = a.process_packet(&resp, &addr).unwrap().response;
+        assert_eq!(traffic(&a, &bk).0, 1);
+        // The same response again: authentic, but its handshake is done.
+        assert!(a.process_packet(&resp, &addr).is_err());
+        assert_eq!(traffic(&a, &bk).0, 1);
+
+        b.process_packet(&ka, &addr).unwrap();
+        let before = traffic(&b, &ak);
+        assert!(b.process_packet(&ka, &addr).is_err(), "replay accepted");
+        let mut forged = a.encrypt(b"data", &bk).unwrap();
+        let last = forged.len() - 1;
+        forged[last] ^= 1;
+        assert!(
+            b.process_packet(&forged, &addr).is_err(),
+            "forgery accepted"
+        );
+        // A replayed initiation, refused on its timestamp.
+        pace();
+        assert!(b.process_packet(&init, &addr).is_err());
+        assert_eq!(traffic(&b, &ak), before);
+    }
+
+    /// The wall-clock handshake time is read when the handshake goes
+    /// through, on both ends, and the counters outlive a refresh of the
+    /// peer but not its removal.
+    #[test]
+    fn the_last_handshake_is_also_on_the_wall_clock() {
+        let (a, b) = pair();
+        let (ak, bk) = (a.public_key(), b.public_key());
+        assert!(a.get_peer_info(&bk).unwrap().last_handshake_time.is_none());
+        let before = crate::time::system_now();
+        handshake(&a, &b);
+        let after = crate::time::system_now();
+        for (h, k) in [(&a, &bk), (&b, &ak)] {
+            let info = h.get_peer_info(k).unwrap();
+            assert!(info.last_handshake.is_some());
+            let t = info.last_handshake_time.expect("no wall-clock handshake");
+            assert!(before <= t && t <= after);
+        }
+
+        let counted = traffic(&b, &ak);
+        assert_ne!(counted, (0, 0, 0, 0));
+        b.add_peer(ak);
+        assert_eq!(traffic(&b, &ak), counted);
+        b.remove_peer(&ak);
+        b.add_peer(ak);
+        assert_eq!(traffic(&b, &ak), (0, 0, 0, 0));
+        assert!(b.get_peer_info(&ak).unwrap().last_handshake_time.is_none());
     }
 }

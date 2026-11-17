@@ -82,6 +82,8 @@ pub(crate) fn process_data_packet(h: &Handler, data: &[u8]) -> Result<PacketResu
     if kp.replay_filter.check_replay(counter) {
         return Err(replay());
     }
+    // Only now, authenticated and not a replay, does it count.
+    h.count_rx(&kp.peer_key, data.len());
     // The initiator sends with a keypair only once it has our response, so
     // this is the confirmation a responder's next keypair waits for.
     h.received_with_keypair(&kp);
@@ -199,6 +201,7 @@ pub(crate) fn encrypt_into(
         &mut dst[MESSAGE_TRANSPORT_HEADER_SIZE..needed],
     );
 
+    h.count_tx(peer_key, needed);
     let rekey = counter >= REKEY_AFTER_MESSAGES || kp_age >= REKEY_AFTER_TIME;
     h.with_timers(peer_key, |t| {
         t.packet_sent(Instant::now(), !data.is_empty());
