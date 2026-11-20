@@ -6,6 +6,18 @@ semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+## [0.1.12](https://github.com/KarpelesLab/pktkit-rs/compare/v0.1.11...v0.1.12) - 2026-11-20
+
+### Added
+
+- *(wg)* Handler::next_timer_deadline, and a Server that sleeps until it
+- *(wg)* per-peer traffic counters and a wall-clock last handshake
+- *(tuntap)* adopt an already-open TUN fd, and build for Android and iOS
+
+### Fixed
+
+- *(tuntap)* only ask a kernel-control socket for its utun name
+
 ## [0.1.11](https://github.com/KarpelesLab/pktkit-rs/compare/v0.1.10...v0.1.11) - 2026-10-01
 
 ### Added
