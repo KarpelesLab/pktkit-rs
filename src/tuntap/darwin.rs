@@ -80,8 +80,12 @@ impl Tun {
     /// ([`BorrowedFd::try_clone_to_owned`](std::os::fd::BorrowedFd::try_clone_to_owned)).
     pub fn from_fd(fd: OwnedFd, cfg: TuntapConfig) -> Result<Tun> {
         let raw = fd.as_raw_fd();
-        let name = getsockopt_ifname(raw)
-            .or_else(|| peer_unit(raw).and_then(utun_name))
+        // Only a kernel-control socket may be asked for UTUN_OPT_IFNAME:
+        // other protocols do not check the level, and a Unix socket reads
+        // optname 2 as LOCAL_PEERPID and hands back the peer's pid as a
+        // "name".
+        let name = peer_unit(raw)
+            .and_then(|unit| getsockopt_ifname(raw).or_else(|| utun_name(unit)))
             .unwrap_or(cfg.name);
         Tun::adopt(fd, name)
     }
@@ -298,6 +302,7 @@ fn utun_name(sc_unit: u32) -> Option<String> {
 // spelled out here, and checked against libc's on macOS.
 const AF_SYSTEM: u8 = 32;
 const SYSPROTO_CONTROL: libc::c_int = 2;
+const AF_SYS_CONTROL: u16 = 2;
 
 /// `struct sockaddr_ctl`. Only filled in by the kernel and partly read, but
 /// every field is there for the layout.
@@ -316,6 +321,7 @@ struct SockaddrCtl {
 const _: () = {
     assert!(AF_SYSTEM as libc::c_int == libc::AF_SYSTEM);
     assert!(SYSPROTO_CONTROL == libc::SYSPROTO_CONTROL);
+    assert!(AF_SYS_CONTROL as libc::c_int == libc::AF_SYS_CONTROL);
     assert!(std::mem::size_of::<SockaddrCtl>() == std::mem::size_of::<libc::sockaddr_ctl>());
     assert!(
         std::mem::offset_of!(SockaddrCtl, sc_unit)
@@ -331,7 +337,11 @@ fn peer_unit(fd: i32) -> Option<u32> {
     // SAFETY: `addr` is writable for `len` bytes, which caps what is copied.
     let r = unsafe { libc::getpeername(fd, &mut addr as *mut _ as *mut libc::sockaddr, &mut len) };
     // An adopted fd need not be a control socket at all.
-    if r < 0 || (len as usize) < std::mem::size_of::<SockaddrCtl>() || addr.sc_family != AF_SYSTEM {
+    if r < 0
+        || (len as usize) < std::mem::size_of::<SockaddrCtl>()
+        || addr.sc_family != AF_SYSTEM
+        || addr.ss_sysaddr != AF_SYS_CONTROL
+    {
         return None;
     }
     Some(addr.sc_unit)
